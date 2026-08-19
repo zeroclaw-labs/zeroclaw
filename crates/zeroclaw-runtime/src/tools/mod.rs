@@ -292,11 +292,13 @@ pub fn default_tools_with_runtime(
 ) -> Vec<Box<dyn Tool>> {
     let persistent_writes = runtime.has_filesystem_access();
     vec![
+        // The shell tool owns its own dialect-aware command + forbidden-path
+        // validation (see `ShellTool::execute`), so it is not wrapped in the
+        // generic POSIX `PathGuardedTool` — matching `SkillShellTool`. Wrapping it
+        // would run a dialect-less path scan ahead of the tool and wrongly reject
+        // the Windows `\\.\nul` device on a native cmd.exe sink.
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new(security.clone(), runtime).with_persistent_writes(persistent_writes),
-                security.clone(),
-            ),
+            ShellTool::new(security.clone(), runtime).with_persistent_writes(persistent_writes),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
@@ -474,6 +476,18 @@ pub const BUILTIN_TOOL_INTEGRATIONS: &[(&str, &str)] = &[
 /// to destructure across many callers.
 #[allow(clippy::type_complexity)]
 pub struct AllToolsResult {
+    /// The eager registry retained by this factory, before the per-agent
+    /// `allowed_tools`/`excluded_tools` filter.
+    ///
+    /// This is the raw material the gated seam consumes, not an
+    /// already-filtered view: `ScopedToolRegistry::assemble` applies the
+    /// `allowed_tools`/`excluded_tools` policy filter (and MCP scoping) when it
+    /// mints the per-agent tool set. Every production caller routes this field
+    /// straight into `assemble`, so an unfiltered value here is correct and is
+    /// not a policy bypass. Documented explicitly because the neighbouring
+    /// `unfiltered_tool_arcs` name implies by contrast that this field is the
+    /// filtered one, which has already misled readers into believing built-ins
+    /// escaped `allowed_tools`.
     pub tools: Vec<Box<dyn Tool>>,
     pub delegate_handle: Option<DelegateParentToolsHandle>,
     pub ask_user_handle: Option<PerToolChannelHandle>,
@@ -599,17 +613,14 @@ pub fn all_tools_with_runtime(
     // snapshot below.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(
-                ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox.clone())
-                    .with_timeout_secs(if security.shell_timeout_secs > 0 {
-                        security.shell_timeout_secs
-                    } else {
-                        root_config.shell_tool.timeout_secs
-                    })
-                    .with_tui_env(tui_env)
-                    .with_persistent_writes(persistent_writes),
-                security.clone(),
-            ),
+            ShellTool::new_with_sandbox(security.clone(), runtime.clone(), sandbox.clone())
+                .with_timeout_secs(if security.shell_timeout_secs > 0 {
+                    security.shell_timeout_secs
+                } else {
+                    root_config.shell_tool.timeout_secs
+                })
+                .with_tui_env(tui_env)
+                .with_persistent_writes(persistent_writes),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
@@ -645,10 +656,11 @@ pub fn all_tools_with_runtime(
             PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
             security.clone(),
         )),
-        Arc::new(CronAddTool::new(
+        Arc::new(CronAddTool::new_with_runtime(
             config.clone(),
             security.clone(),
             agent_alias,
+            runtime.clone(),
         )),
         Arc::new(CronListTool::new(config.clone())),
         Arc::new(CronRemoveTool::new(
@@ -656,22 +668,28 @@ pub fn all_tools_with_runtime(
             security.clone(),
             agent_alias,
         )),
-        Arc::new(CronUpdateTool::new(
+        Arc::new(CronUpdateTool::new_with_runtime(
             config.clone(),
             security.clone(),
             agent_alias,
+            runtime.clone(),
         )),
-        Arc::new(CronRunTool::new(config.clone(), security.clone())),
+        Arc::new(CronRunTool::new_with_runtime(
+            config.clone(),
+            security.clone(),
+            runtime.clone(),
+        )),
         Arc::new(CronRunsTool::new(config.clone())),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryExportTool::new(memory.clone())),
         Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
-        Arc::new(ScheduleTool::new(
+        Arc::new(ScheduleTool::new_with_runtime(
             security.clone(),
             root_config.clone(),
             agent_alias,
+            runtime.clone(),
         )),
         Arc::new(
             SpawnSubagentTool::new(Arc::new(root_config.clone()), agent_alias, security.clone())
@@ -875,6 +893,7 @@ pub fn all_tools_with_runtime(
             http_config.timeout_secs,
             http_config.allow_private_hosts,
             http_config.allowed_private_hosts.clone(),
+            root_config.security.nat64_prefixes.clone(),
             root_config.config_path.clone(),
             root_config.secrets.encrypt,
         ) {
@@ -902,6 +921,7 @@ pub fn all_tools_with_runtime(
             web_fetch_config.timeout_secs,
             web_fetch_config.firecrawl.clone(),
             web_fetch_config.allowed_private_hosts.clone(),
+            root_config.security.nat64_prefixes.clone(),
         ) {
             Ok(tool) => {
                 tool_arcs.push(Arc::new(RateLimitedTool::new(tool, security.clone())));
@@ -925,6 +945,7 @@ pub fn all_tools_with_runtime(
             root_config.text_browser.preferred_browser.clone(),
             root_config.text_browser.timeout_secs,
             root_config.text_browser.allowed_private_hosts.clone(),
+            root_config.security.nat64_prefixes.clone(),
         ) {
             Ok(tool) => {
                 tool_arcs.push(Arc::new(tool));
@@ -1194,13 +1215,25 @@ pub fn all_tools_with_runtime(
 
     // Standalone image generation tool (config-gated)
     if root_config.image_gen.enabled {
-        tool_arcs.push(Arc::new(ImageGenTool::new_with_persistence(
+        match ImageGenTool::new_with_persistence(
             security.clone(),
             workspace_dir.to_path_buf(),
             root_config.image_gen.default_model.clone(),
             root_config.image_gen.api_key_env.clone(),
             persistent_writes,
-        )));
+            root_config.security.nat64_prefixes.clone(),
+        ) {
+            Ok(tool) => tool_arcs.push(Arc::new(tool)),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "image_gen: failed to construct tool, skipping registration"
+                );
+            }
+        }
     }
 
     // File upload tool — enabled iff [file_upload].url is set
@@ -1279,7 +1312,7 @@ pub fn all_tools_with_runtime(
         if root_config.sop.procedural_memory_enabled {
             tool_arcs.push(Arc::new(SopWorkshopTool::new(
                 Arc::clone(sop_engine),
-                workspace_dir.to_path_buf(),
+                root_config.install_root_dir(),
             )));
         }
     }
@@ -1928,9 +1961,6 @@ mod tests {
         fn name(&self) -> &str {
             "capturing-test"
         }
-        fn has_shell_access(&self) -> bool {
-            true
-        }
         fn has_filesystem_access(&self) -> bool {
             self.filesystem_access
         }
@@ -1939,6 +1969,9 @@ mod tests {
         }
         fn supports_long_running(&self) -> bool {
             false
+        }
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
         }
         fn build_shell_command(
             &self,
@@ -2562,9 +2595,6 @@ mod tests {
         fn name(&self) -> &str {
             "ephemeral-test"
         }
-        fn has_shell_access(&self) -> bool {
-            true
-        }
         fn has_filesystem_access(&self) -> bool {
             false
         }
@@ -2573,6 +2603,9 @@ mod tests {
         }
         fn supports_long_running(&self) -> bool {
             false
+        }
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            self.0.shell_dialect()
         }
         fn build_shell_command(
             &self,

@@ -1082,7 +1082,6 @@ const translations: Record<Locale, Record<string, string>> = {
     'unsaved_banner.saving': "Saving…",
     'unsaved_banner.unsaved_change': "unsaved change",
     'unsaved_banner.unsaved_changes': "unsaved changes",
-    'validation_warning.skills_prompt_injection_mode_full_deprecated': 'Skill prompt injection mode "full" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.',
     'workspace.back_to_chat_prefix': "Back to chat",
     'workspace.binary_file_prefix': "Binary file",
     'workspace.binary_file_suffix': "Preview is base64-encoded; download via CLI to inspect.",

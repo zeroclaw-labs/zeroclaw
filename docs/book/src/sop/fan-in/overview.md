@@ -38,7 +38,7 @@ Each source has a dedicated guide in the sidebar. Live sources (delivered by a r
 | SOP never starts from a live source | trigger pattern mismatch or a failing `condition` | Verify the trigger pattern matches the delivered event; check the `condition` against the payload |
 | SOP started but a step did not execute | headless trigger without an active agent loop | Run an agent loop for `ExecuteStep`, or design the run to pause on approvals |
 | Webhook, peripheral, or calendar trigger never fires | event source not wired into the dispatcher | Use a live source ([MQTT](./mqtt.md), [Filesystem](./filesystem.md), [AMQP](./amqp.md)) or start the run with [`sop_execute`](./manual.md) |
-| Cron trigger never fires | maintenance tick not running (no `zeroclaw daemon` or `zeroclaw channel start`; standalone `gateway start` does not run it), `sops_dir` unset, or `maintenance_interval_secs = 0` | Run `zeroclaw daemon` (or `zeroclaw channel start`) with `sop.sops_dir` set and `sop.maintenance_interval_secs` non-zero (default `60`) |
+| Cron trigger never fires | maintenance tick not running (no `zeroclaw daemon` or `zeroclaw channel start`; standalone `gateway start` does not run it), `sops_dir` unset/empty, or `maintenance_interval_secs = 0` | Run `zeroclaw daemon` (or `zeroclaw channel start`) with `sop.sops_dir` set to a non-empty value (unset by default; the documented value is `shared/sops`) and `sop.maintenance_interval_secs` non-zero (default `60`) |
 
 ## See also
 

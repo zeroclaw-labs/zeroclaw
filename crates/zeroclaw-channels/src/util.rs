@@ -1,7 +1,7 @@
-#[cfg(feature = "channel-slack")]
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 use zeroclaw_api::channel::ProgressEvent;
 
-#[cfg(feature = "channel-slack")]
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static str {
     match event {
         ProgressEvent::Received => "channel-runtime-progress-received",
@@ -13,7 +13,7 @@ pub(crate) fn lifecycle_progress_fluent_key(event: ProgressEvent) -> &'static st
     }
 }
 
-#[cfg(feature = "channel-slack")]
+#[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
 pub(crate) fn localized_lifecycle_progress(event: ProgressEvent) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string(lifecycle_progress_fluent_key(event))
 }
@@ -39,6 +39,58 @@ pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+#[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+pub(crate) async fn read_response_body_limited(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(content_length) = response.content_length()
+        && content_length > max_bytes
+    {
+        anyhow::bail!(
+            "response body content length {content_length} exceeds {max_bytes}-byte limit"
+        );
+    }
+
+    let mut body = Vec::new();
+
+    while let Some(chunk) = response.chunk().await? {
+        let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        let next_len = u64::try_from(body.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(chunk_len);
+        if next_len > max_bytes {
+            anyhow::bail!("response body exceeds {max_bytes}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+
+    Ok(body)
+}
+
+#[cfg(all(test, any(feature = "channel-mattermost", feature = "channel-qq")))]
+pub(crate) async fn spawn_raw_http_response(
+    raw_response: Vec<u8>,
+    hold_open: bool,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = zeroclaw_spawn::spawn!(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+        socket.write_all(&raw_response).await.unwrap();
+        if hold_open {
+            std::future::pending::<()>().await;
+        }
+        socket.shutdown().await.unwrap();
+    });
+
+    (format!("http://{address}"), server)
 }
 
 pub const BLOCK_KIT_PREFIX: &str = "__ZEROCLAW_BLOCK_KIT__";
@@ -477,7 +529,78 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 mod tests {
     use super::*;
 
-    #[cfg(feature = "channel-slack")]
+    #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+    async fn response_from_raw_http(
+        raw_response: Vec<u8>,
+        hold_open: bool,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        let (url, server) = spawn_raw_http_response(raw_response, hold_open).await;
+        let response = reqwest::get(url).await.unwrap();
+        (response, server)
+    }
+
+    #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+    #[tokio::test]
+    async fn bounded_response_body_rejects_declared_oversize() {
+        let (response, server) = response_from_raw_http(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n".to_vec(),
+            true,
+        )
+        .await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_response_body_limited(response, 5),
+        )
+        .await
+        .expect("declared oversize must be rejected before reading the body")
+        .unwrap_err();
+        server.abort();
+
+        assert!(
+            error
+                .to_string()
+                .contains("content length 6 exceeds 5-byte limit")
+        );
+    }
+
+    #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+    #[tokio::test]
+    async fn bounded_response_body_accepts_chunked_body_at_limit() {
+        let (response, server) = response_from_raw_http(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n2\r\nab\r\n3\r\ncde\r\n0\r\n\r\n".to_vec(),
+            false,
+        )
+        .await;
+
+        let body = read_response_body_limited(response, 5).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(body, b"abcde");
+    }
+
+    #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
+    #[tokio::test]
+    async fn bounded_response_body_rejects_chunked_body_over_limit() {
+        let (response, server) = response_from_raw_http(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n3\r\ndef\r\n".to_vec(),
+            true,
+        )
+        .await;
+
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read_response_body_limited(response, 5),
+        )
+        .await
+        .expect("chunked oversize must be rejected before the response ends")
+        .unwrap_err();
+        server.abort();
+
+        assert!(error.to_string().contains("exceeds 5-byte limit"));
+    }
+
+    #[cfg(any(feature = "channel-slack", feature = "channel-telegram"))]
     #[test]
     fn lifecycle_progress_maps_typed_events_to_fluent_keys() {
         assert_eq!(
@@ -826,6 +949,7 @@ mod tests {
             include_str!("matrix.rs"),
             include_str!("signal.rs"),
             include_str!("whatsapp.rs"),
+            include_str!("whatsapp_web.rs"),
             include_str!("acp_channel.rs"),
             include_str!("util.rs"),
         ];

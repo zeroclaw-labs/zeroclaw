@@ -55,17 +55,24 @@ struct Choice {
 struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    #[serde(default)]
-    reasoning_content: Option<String>,
 }
 
 impl ResponseMessage {
     fn effective_content(&self) -> String {
-        match &self.content {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => self.reasoning_content.clone().unwrap_or_default(),
-        }
+        self.content.clone().unwrap_or_default()
     }
+}
+
+/// String-only completions have no native tool-call escape hatch. An empty or
+/// reasoning-only result is therefore a typed terminal failure, not a valid
+/// string result for direct callers that do not use the structured chat API.
+fn require_terminal_text(content: String) -> anyhow::Result<String> {
+    if zeroclaw_api::model_provider::strip_think_tags(&content).is_empty() {
+        return Err(anyhow::Error::new(
+            zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+        ));
+    }
+    Ok(content)
 }
 
 #[derive(Debug, Serialize)]
@@ -181,10 +188,10 @@ struct NativeResponseMessage {
 
 impl NativeResponseMessage {
     fn effective_content(&self) -> Option<String> {
-        match &self.content {
-            Some(c) if !c.is_empty() => Some(c.clone()),
-            _ => self.reasoning_content.clone(),
-        }
+        self.content
+            .as_ref()
+            .filter(|content| !content.is_empty())
+            .cloned()
     }
 }
 
@@ -534,7 +541,8 @@ impl ModelProvider for AzureOpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.effective_content())
+            .map(|c| require_terminal_text(c.message.effective_content()))
+            .transpose()?
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -889,6 +897,25 @@ mod tests {
     }
 
     #[test]
+    fn string_completion_rejects_empty_and_think_only_text() {
+        for text in ["", "  \n", "<think>internal reasoning</think>"] {
+            let error = require_terminal_text(text.to_string())
+                .expect_err("a string-only semantic-empty completion must fail");
+            assert!(error.chain().any(|cause| {
+                cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+            }));
+        }
+    }
+
+    #[test]
+    fn string_completion_keeps_visible_text() {
+        assert_eq!(
+            require_terminal_text("final answer".to_string()).unwrap(),
+            "final answer"
+        );
+    }
+
+    #[test]
     fn response_deserializes_empty_choices() {
         let json = r#"{"choices":[]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
@@ -936,6 +963,22 @@ mod tests {
         let parsed = AzureOpenAiModelProvider::parse_native_response(message);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert!(!parsed.tool_calls[0].id.is_empty());
+    }
+
+    #[test]
+    fn reasoning_only_response_remains_semantically_empty() {
+        let json = r#"{"choices":[{"message":{
+            "content":"",
+            "reasoning_content":"internal reasoning"
+        }}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let message = resp.choices.into_iter().next().unwrap().message;
+        let parsed = AzureOpenAiModelProvider::parse_native_response(message);
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("internal reasoning")
+        );
+        assert!(parsed.is_semantically_empty_terminal());
     }
 
     #[tokio::test]

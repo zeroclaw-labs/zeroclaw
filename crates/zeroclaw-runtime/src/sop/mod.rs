@@ -109,9 +109,21 @@ pub struct SopEngineAdapters {
 /// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
 /// handles — never call `SopEngine::new` or `SopAuditLogger::new`
 /// directly outside this module.
+///
+/// The two directory arguments serve different roles and must not be conflated:
+/// - `data_dir` is the daemon state dir. It anchors the durable run store, which
+///   lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
+/// - `install_root` is the install root (`config.install_root_dir()`, i.e.
+///   `config_path`'s parent). It anchors SOP-*definition* loading, so a relative
+///   `[sop] sops_dir` (documented `shared/sops`) resolves to `<install>/shared/sops`
+///   — the same directory the web/RPC SOP author writes to. Passing `data_dir` for
+///   both (the historical bug) made the engine load definitions from `<data_dir>/sops`,
+///   which authored SOPs never populate, so every manual trigger reported "no
+///   matching manual trigger".
 pub fn build_sop_engine(
     config: SopConfig,
-    workspace_dir: &Path,
+    data_dir: &Path,
+    install_root: &Path,
     audit_memory: Arc<dyn Memory>,
     adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
@@ -122,10 +134,10 @@ pub fn build_sop_engine(
     } = adapters;
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
-    // startup, so fall back to in-memory with a loud log. `workspace_dir` here is the
-    // daemon data dir (every caller passes `config.data_dir`), so a durable store
-    // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
-    let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
+    // startup, so fall back to in-memory with a loud log. The run store is anchored
+    // at the daemon data dir, so a durable store lands at `<data_dir>/sop/runs.db`
+    // unless `[sop] run_state_dir` overrides it.
+    let store = store::build_run_store(&config, data_dir).unwrap_or_else(|e| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -158,7 +170,7 @@ pub fn build_sop_engine(
         .with_run_notifier(run_tx)
         .with_approval_broker(approval_broker)
         .with_capabilities(Arc::new(capabilities));
-    engine.reload(workspace_dir);
+    engine.reload(install_root);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
     let audit = Arc::new(SopAuditLogger::new(audit_memory));
@@ -180,24 +192,30 @@ pub fn parse_execution_mode(s: &str) -> SopExecutionMode {
 
 // ── SOP directory helpers ───────────────────────────────────────
 
-/// Return the default SOPs directory: `<workspace>/sops`.
-fn sops_dir(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join("sops")
+/// Canonical fallback SOPs directory: `<install>/shared/sops`.
+fn default_sops_dir(install_root: &Path) -> PathBuf {
+    install_root.join("shared").join("sops")
 }
 
-/// Resolve the SOPs directory from config, falling back to workspace default.
+/// Resolve the SOPs directory from config, falling back to the canonical
+/// shared default.
 ///
-/// A relative `config_dir` (the common case in the documented
-/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
-/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
-/// the base entirely when the joined path is itself absolute).
-pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
+/// A relative `config_dir` resolves against `install_root` (the install root,
+/// `config_path`'s parent), matching the `skill-bundles` convention: the
+/// documented `shared/sops` value yields `<install>/shared/sops`, the same
+/// directory the web/RPC SOP author writes to and the CLI scans. An absolute
+/// or `~`-prefixed value is used as-is (`Path::join` replaces the base entirely
+/// when the joined path is itself absolute). Unset, empty, or whitespace-only
+/// falls back to the canonical `<install>/shared/sops` — the same disabled
+/// sentinel `SopConfig::runtime_enabled()` recognizes, so the CLI/RPC scan root
+/// never diverges from whether the daemon built an engine.
+pub fn resolve_sops_dir(install_root: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
-        Some(dir) if !dir.is_empty() => {
+        Some(dir) if !dir.trim().is_empty() => {
             let expanded = shellexpand::tilde(dir);
-            workspace_dir.join(expanded.as_ref())
+            install_root.join(expanded.as_ref())
         }
-        _ => sops_dir(workspace_dir),
+        _ => default_sops_dir(install_root),
     }
 }
 
@@ -220,13 +238,13 @@ fn resolve_sop_dir(sops_dir: &Path, name: &str) -> Result<PathBuf> {
 
 // ── SOP loading ─────────────────────────────────────────────────
 
-/// Load all SOPs from the configured directory.
+/// Load all SOPs from the configured directory, resolved against `install_root`.
 pub fn load_sops(
-    workspace_dir: &Path,
+    install_root: &Path,
     config_dir: Option<&str>,
     default_execution_mode: SopExecutionMode,
 ) -> Vec<Sop> {
-    let dir = resolve_sops_dir(workspace_dir, config_dir);
+    let dir = resolve_sops_dir(install_root, config_dir);
     load_sops_from_directory(&dir, default_execution_mode)
 }
 
@@ -1129,27 +1147,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_sops_dir_joins_relative_config_value_to_workspace() {
-        let workspace = Path::new("/home/user/.zoder/data");
-        let resolved = resolve_sops_dir(workspace, Some("shared/sops"));
-        assert_eq!(resolved, workspace.join("shared/sops"));
+    fn resolve_sops_dir_joins_relative_config_value_to_install_root() {
+        // The documented `shared/sops` must resolve to `<install>/shared/sops`,
+        // not double the `shared` segment. Regression guard for a config that
+        // carries `sops_dir = "shared/sops"`.
+        let install_root = Path::new("/test/install");
+        let resolved = resolve_sops_dir(install_root, Some("shared/sops"));
+        assert_eq!(resolved, install_root.join("shared").join("sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_joins_bare_relative_value_under_install_root() {
+        let install_root = Path::new("/test/install");
+        let resolved = resolve_sops_dir(install_root, Some("custom-sops"));
+        assert_eq!(resolved, install_root.join("custom-sops"));
     }
 
     #[test]
     fn resolve_sops_dir_keeps_absolute_config_value_as_is() {
-        let workspace = Path::new("/home/user/.zoder/data");
-        let resolved = resolve_sops_dir(workspace, Some("/srv/shared/sops"));
+        let install_root = Path::new("/test/install");
+        let resolved = resolve_sops_dir(install_root, Some("/srv/shared/sops"));
         assert_eq!(resolved, Path::new("/srv/shared/sops"));
     }
 
     #[test]
-    fn resolve_sops_dir_falls_back_to_workspace_sops_when_unset() {
-        let workspace = Path::new("/home/user/.zoder/data");
-        assert_eq!(resolve_sops_dir(workspace, None), workspace.join("sops"));
+    fn resolve_sops_dir_falls_back_to_shared_sops_when_unset() {
+        let install_root = Path::new("/test/install");
+        let canonical = install_root.join("shared").join("sops");
+        assert_eq!(resolve_sops_dir(install_root, None), canonical);
+        assert_eq!(resolve_sops_dir(install_root, Some("")), canonical);
+        // Whitespace-only is the disabled sentinel `runtime_enabled()` also
+        // rejects; the scan root must fall back, not join a garbage segment.
+        assert_eq!(resolve_sops_dir(install_root, Some("   ")), canonical);
+    }
+
+    // Boundary regression: for the documented `sops_dir = "shared/sops"`, the
+    // authoring write path (`create_sop_typed`, used by web/RPC), the runtime/CLI
+    // load path (`load_sops`), and the delete path (`delete_sop_typed`) must all
+    // resolve against the install root and converge on `<install>/shared/sops`.
+    // This is the documented shared-workspace configuration; before the
+    // install-root base it doubled to `<install>/shared/shared/sops` and authored
+    // SOPs were invisible to loading.
+    #[test]
+    fn shared_sops_config_converges_across_author_load_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path();
+        let config_dir = Some("shared/sops");
+        let canonical = install_root.join("shared").join("sops");
+
+        // The authoring surface resolves the write directory the same way the
+        // loader does — one resolver, one root.
+        let author_dir = resolve_sops_dir(install_root, config_dir);
         assert_eq!(
-            resolve_sops_dir(workspace, Some("")),
-            workspace.join("sops")
+            author_dir, canonical,
+            "author path must target <install>/shared/sops"
         );
+
+        // Author a SOP (web/RPC `handle_sop_create` -> `create_sop_typed`).
+        let sop = authoring_sop(vec![titled_step(1, "Do the thing")]);
+        create_sop_typed(&author_dir, &sop).expect("author create should succeed");
+        assert!(
+            canonical.join("authoring").join("SOP.toml").exists(),
+            "authored SOP.toml must land under <install>/shared/sops"
+        );
+        assert!(
+            !install_root
+                .join("shared")
+                .join("shared")
+                .join("sops")
+                .exists(),
+            "resolution must not double the shared segment"
+        );
+
+        // The runtime/CLI loader sees the authored SOP through the same base.
+        let loaded = load_sops(install_root, config_dir, SopExecutionMode::Supervised);
+        assert_eq!(loaded.len(), 1, "loader must see exactly the authored SOP");
+        assert_eq!(loaded[0].name, "authoring");
+
+        // Delete resolves to the same directory and removes it.
+        delete_sop_typed(&author_dir, "authoring").expect("delete should succeed");
+        assert!(
+            !canonical.join("authoring").exists(),
+            "delete must remove the SOP from <install>/shared/sops"
+        );
+        assert!(
+            load_sops(install_root, config_dir, SopExecutionMode::Supervised).is_empty(),
+            "loader must see the SOP gone after delete"
+        );
+    }
+
+    #[test]
+    fn absolute_sops_dir_converges_across_author_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path().join("install");
+        let abs_sops = tmp.path().join("elsewhere").join("sops");
+        std::fs::create_dir_all(&install_root).unwrap();
+        let config_dir = Some(abs_sops.to_string_lossy());
+        let config_dir = config_dir.as_deref();
+
+        // An absolute value ignores the install root entirely.
+        assert_eq!(resolve_sops_dir(&install_root, config_dir), abs_sops);
+
+        let sop = authoring_sop(vec![titled_step(1, "Do the thing")]);
+        create_sop_typed(&abs_sops, &sop).expect("author create should succeed");
+        let loaded = load_sops(&install_root, config_dir, SopExecutionMode::Supervised);
+        assert_eq!(loaded.len(), 1, "absolute-path SOP must load");
+        assert_eq!(loaded[0].name, "authoring");
     }
 
     fn authoring_sop(steps: Vec<SopStep>) -> Sop {

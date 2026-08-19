@@ -116,8 +116,15 @@ impl EventOutcome {
 pub struct EventDescriptor {
     pub category: String,
     pub action: String,
-    #[serde(default, skip_serializing_if = "is_unknown_outcome")]
+    #[serde(
+        default = "default_unknown_outcome",
+        skip_serializing_if = "is_unknown_outcome"
+    )]
     pub outcome: String,
+}
+
+fn default_unknown_outcome() -> String {
+    EventOutcome::Unknown.as_str().to_string()
 }
 
 fn is_unknown_outcome(s: &String) -> bool {
@@ -237,6 +244,7 @@ impl ZeroclawAttribution {
             self.set(alias_field(prefix), alias.to_string());
         } else {
             self.set(type_field(prefix), composite.to_string());
+            self.fields.remove(&alias_field(prefix));
         }
     }
 
@@ -585,9 +593,11 @@ mod tests {
     }
 
     #[test]
-    fn set_composite_bare_type() {
+    fn event_semantics_bare_composite_replacement_clears_alias() {
         let mut attribution = ZeroclawAttribution::default();
+        attribution.set_composite("channel", "discord.clamps");
         attribution.set_composite("channel", "webhook");
+        assert_eq!(attribution.get("channel"), Some("webhook"));
         assert_eq!(attribution.get("channel_type"), Some("webhook"));
         assert!(attribution.get("channel_alias").is_none());
     }
@@ -637,9 +647,22 @@ mod tests {
     }
 
     #[test]
-    fn unknown_outcome_omitted_from_serialization() {
+    fn event_semantics_omitted_unknown_outcome_round_trips_as_unknown() {
         let event = LogEvent::new(Severity::Info, "test", EventCategory::Agent);
         let serialized = serde_json::to_value(&event).unwrap();
         assert!(serialized["event"].get("outcome").is_none());
+
+        let deserialized: LogEvent = serde_json::from_value(serialized.clone()).unwrap();
+        assert_eq!(deserialized.event.outcome, EventOutcome::Unknown.as_str());
+
+        let reserialized = serde_json::to_value(deserialized).unwrap();
+        assert!(reserialized["event"].get("outcome").is_none());
+
+        let mut legacy = serialized;
+        legacy["event"]["outcome"] = serde_json::Value::String(String::new());
+        let legacy: LogEvent = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.event.outcome.is_empty());
+        let reserialized = serde_json::to_value(legacy).unwrap();
+        assert!(reserialized["event"].get("outcome").is_none());
     }
 }

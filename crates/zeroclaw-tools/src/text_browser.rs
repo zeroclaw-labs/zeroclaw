@@ -10,12 +10,22 @@ use crate::helpers::domain_guard;
 /// Text browser tool: renders web pages as plain text using text-based browsers
 /// (lynx, links, w3m). Ideal for headless/SSH environments where graphical
 /// browsers are unavailable.
+///
+/// The selected external browser owns its transport, resolves DNS again, and
+/// follows redirects without ZeroClaw revalidating each destination. Unlike
+/// `web_fetch`, this tool cannot pin the preflight answer. The resolved-address
+/// checks are defense in depth, not a DNS-rebinding or redirect boundary.
+/// Prefer `web_fetch` for attacker-controlled URLs.
 pub struct TextBrowserTool {
     security: Arc<SecurityPolicy>,
     preferred_browser: Option<String>,
     timeout_secs: u64,
     max_response_size: usize,
     allowed_private_hosts: Vec<String>,
+    /// Network-specific NAT64 prefixes this deployment's translator serves.
+    /// Snapshotted at construction like `allowed_private_hosts`; an IPv6
+    /// answer inside one of them is classified by the IPv4 address it embeds.
+    nat64_prefixes: Vec<domain_guard::Nat64Prefix>,
 }
 
 /// The text browsers we support, in order of auto-detection preference.
@@ -28,8 +38,15 @@ impl TextBrowserTool {
         security: Arc<SecurityPolicy>,
         preferred_browser: Option<String>,
         timeout_secs: u64,
+        nat64_prefixes: Vec<String>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_private_hosts(security, preferred_browser, timeout_secs, Vec::new())
+        Self::new_with_private_hosts(
+            security,
+            preferred_browser,
+            timeout_secs,
+            Vec::new(),
+            nat64_prefixes,
+        )
     }
 
     /// Construct with an explicit `allowed_private_hosts` opt-in list (mirrors
@@ -39,6 +56,7 @@ impl TextBrowserTool {
         preferred_browser: Option<String>,
         timeout_secs: u64,
         allowed_private_hosts: Vec<String>,
+        nat64_prefixes: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
@@ -49,70 +67,46 @@ impl TextBrowserTool {
                 allowed_private_hosts,
                 "text_browser.allowed_private_hosts",
             )?,
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
+            )?,
         })
     }
 
+    #[cfg(test)]
     fn validate_url(&self, url: &str) -> anyhow::Result<String> {
-        self.validate_url_with_dns_check(url, validate_resolved_host_is_public)
+        validate_text_browser_url(url, &self.allowed_private_hosts, |host, allow_private| {
+            validate_resolved_host_is_public(host, allow_private, &self.nat64_prefixes)
+        })
     }
 
     /// Internal entry that accepts a pluggable DNS validator. Mirrors
     /// `web_fetch::validate_target_url_with_dns_check` so unit tests can
-    /// drive the resolved-IP SSRF gate without depending on real DNS.
+    /// drive the resolved-IP SSRF gate without depending on real DNS. The
+    /// boolean passed to the validator relaxes the public-address requirement,
+    /// but never the metadata-address exclusion.
+    #[cfg(test)]
     fn validate_url_with_dns_check(
         &self,
         url: &str,
-        validate_dns: impl FnOnce(&str) -> anyhow::Result<()>,
+        validate_dns: impl FnOnce(&str, bool) -> anyhow::Result<()>,
     ) -> anyhow::Result<String> {
-        let url = url.trim();
+        validate_text_browser_url(url, &self.allowed_private_hosts, validate_dns)
+    }
 
-        if url.is_empty() {
-            anyhow::bail!("URL cannot be empty");
-        }
+    async fn validate_url_for_execute(&self, url: &str) -> anyhow::Result<String> {
+        let url = url.to_string();
+        let allowed_private_hosts = self.allowed_private_hosts.clone();
+        let nat64_prefixes = self.nat64_prefixes.clone();
 
-        if url.chars().any(char::is_whitespace) {
-            anyhow::bail!("URL cannot contain whitespace");
-        }
-
-        if !url.starts_with("http://") && !url.starts_with("https://") {
-            anyhow::bail!("Only http:// and https:// URLs are allowed");
-        }
-
-        let parsed = reqwest::Url::parse(url)
-            .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
-
-        if !parsed.username().is_empty() || parsed.password().is_some() {
-            anyhow::bail!("URL userinfo is not allowed");
-        }
-
-        let host_str = parsed
-            .host_str()
-            .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
-
-        let bare_host = host_str.trim_start_matches('[').trim_end_matches(']');
-        let is_ipv6 = bare_host.parse::<std::net::Ipv6Addr>().is_ok();
-        let (host, display_host) = if is_ipv6 {
-            let bare = bare_host.parse::<std::net::Ipv6Addr>().unwrap().to_string();
-            (bare.clone(), format!("[{bare}]"))
-        } else {
-            let h = host_str.to_lowercase();
-            (h.clone(), h)
-        };
-
-        // SSRF gate: deny by default for private/local hosts unless the operator
-        // explicitly listed them. Mirrors `browser`/`http_request`/`web_fetch`.
-        let private_host = domain_guard::is_private_or_local_host(&host);
-        let host_allowed = domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
-
-        if private_host && !host_allowed {
-            anyhow::bail!("Blocked local/private host: {display_host}");
-        }
-
-        if !host_allowed {
-            validate_dns(&host)?;
-        }
-
-        Ok(url.to_string())
+        tokio::task::spawn_blocking(move || {
+            validate_text_browser_url(&url, &allowed_private_hosts, |host, allow_private| {
+                validate_resolved_host_is_public(host, allow_private, &nat64_prefixes)
+            })
+        })
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("text_browser DNS validation task failed: {e}")))?
     }
 
     fn truncate_response(&self, text: &str) -> String {
@@ -213,6 +207,60 @@ impl TextBrowserTool {
     }
 }
 
+fn validate_text_browser_url(
+    url: &str,
+    allowed_private_hosts: &[String],
+    validate_dns: impl FnOnce(&str, bool) -> anyhow::Result<()>,
+) -> anyhow::Result<String> {
+    let url = url.trim();
+
+    if url.is_empty() {
+        anyhow::bail!("URL cannot be empty");
+    }
+
+    if url.chars().any(char::is_whitespace) {
+        anyhow::bail!("URL cannot contain whitespace");
+    }
+
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        anyhow::bail!("Only http:// and https:// URLs are allowed");
+    }
+
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!("URL userinfo is not allowed");
+    }
+
+    let host_str = parsed
+        .host_str()
+        .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
+
+    let bare_host = host_str.trim_start_matches('[').trim_end_matches(']');
+    let is_ipv6 = bare_host.parse::<std::net::Ipv6Addr>().is_ok();
+    let (host, display_host) = if is_ipv6 {
+        let bare = bare_host.parse::<std::net::Ipv6Addr>().unwrap().to_string();
+        (bare.clone(), format!("[{bare}]"))
+    } else {
+        let h = host_str.to_lowercase();
+        (h.clone(), h)
+    };
+
+    // SSRF gate: deny by default for private/local hosts unless the operator
+    // explicitly listed them. Mirrors `browser`/`http_request`/`web_fetch`.
+    let private_host = domain_guard::is_private_or_local_host(&host);
+    let host_allowed = domain_guard::host_matches_allowlist(&host, allowed_private_hosts);
+
+    if private_host && !host_allowed {
+        anyhow::bail!("Blocked local/private host: {display_host}");
+    }
+
+    validate_dns(&host, host_allowed)?;
+
+    Ok(url.to_string())
+}
+
 #[async_trait]
 impl Tool for TextBrowserTool {
     fn name(&self) -> &str {
@@ -222,7 +270,9 @@ impl Tool for TextBrowserTool {
     fn description(&self) -> &str {
         "Render a web page as plain text using a text-based browser (lynx, links, or w3m). \
          Ideal for headless/SSH environments without a graphical browser. \
-         Auto-detects available browser or uses a configured preference."
+         Auto-detects available browser or uses a configured preference. \
+         For untrusted URLs, prefer web_fetch because external browsers can re-resolve DNS and \
+         follow redirects to unvalidated hosts."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -271,8 +321,10 @@ impl Tool for TextBrowserTool {
             });
         }
 
-        let url = match self.validate_url(url) {
-            Ok(v) => v,
+        let requested_browser = args.get("browser").and_then(|v| v.as_str());
+
+        let browser = match self.resolve_browser(requested_browser).await {
+            Ok(b) => b,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
@@ -282,10 +334,10 @@ impl Tool for TextBrowserTool {
             }
         };
 
-        let requested_browser = args.get("browser").and_then(|v| v.as_str());
-
-        let browser = match self.resolve_browser(requested_browser).await {
-            Ok(b) => b,
+        // Keep the unavoidable validation-to-use window as short as possible:
+        // resolve the executable before performing the final DNS preflight.
+        let url = match self.validate_url_for_execute(url).await {
+            Ok(v) => v,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
@@ -360,7 +412,11 @@ impl Tool for TextBrowserTool {
 // ── Helper functions ────────────────────────────────────────────────────────
 
 #[cfg(not(test))]
-fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
+fn validate_resolved_host_is_public(
+    host: &str,
+    allow_private: bool,
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
+) -> anyhow::Result<()> {
     use std::net::ToSocketAddrs;
 
     let ips = (host, 0)
@@ -381,11 +437,19 @@ fn validate_resolved_host_is_public(host: &str) -> anyhow::Result<()> {
         .map(|addr| addr.ip())
         .collect::<Vec<_>>();
 
-    domain_guard::validate_resolved_ips_are_public(host, &ips)
+    if allow_private {
+        domain_guard::validate_resolved_ips_exclude_metadata(host, &ips, nat64_prefixes)
+    } else {
+        domain_guard::validate_resolved_ips_are_public(host, &ips, nat64_prefixes)
+    }
 }
 
 #[cfg(test)]
-fn validate_resolved_host_is_public(_host: &str) -> anyhow::Result<()> {
+fn validate_resolved_host_is_public(
+    _host: &str,
+    _allow_private: bool,
+    _nat64_prefixes: &[domain_guard::Nat64Prefix],
+) -> anyhow::Result<()> {
     // DNS checks are covered by validate_resolved_ips_are_public unit tests.
     Ok(())
 }
@@ -401,7 +465,7 @@ mod tests {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
         });
-        TextBrowserTool::new(security, None, 30).unwrap()
+        TextBrowserTool::new(security, None, 30, Vec::new()).unwrap()
     }
 
     #[test]
@@ -473,10 +537,12 @@ mod tests {
     fn validate_url_with_dns_check_rejects_hostname_resolving_to_private_ip() {
         let tool = test_tool();
         let err = tool
-            .validate_url_with_dns_check("http://internal.corp/", |host| {
+            .validate_url_with_dns_check("http://internal.corp/", |host, allow_private| {
+                assert!(!allow_private);
                 domain_guard::validate_resolved_ips_are_public(
                     host,
                     &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))],
+                    &[],
                 )
             })
             .unwrap_err()
@@ -494,12 +560,14 @@ mod tests {
         // literally private.
         let tool = test_tool();
         let err = tool
-            .validate_url_with_dns_check("http://attacker.example.com/", |host| {
+            .validate_url_with_dns_check("http://attacker.example.com/", |host, allow_private| {
+                assert!(!allow_private);
                 domain_guard::validate_resolved_ips_are_public(
                     host,
                     &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                         169, 254, 169, 254,
                     ))],
+                    &[],
                 )
             })
             .unwrap_err()
@@ -511,39 +579,52 @@ mod tests {
     }
 
     #[test]
-    fn validate_url_with_dns_check_skips_dns_when_private_host_allowlisted() {
+    fn validate_url_with_dns_check_uses_metadata_only_gate_when_private_host_allowlisted() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool =
-            TextBrowserTool::new_with_private_hosts(security, None, 30, vec!["10.0.0.5".into()])
-                .unwrap();
-        // DNS validator should never be called: even if it errors, the call
-        // succeeds because the allowlist lifts the gate.
+        let tool = TextBrowserTool::new_with_private_hosts(
+            security,
+            None,
+            30,
+            vec!["10.0.0.5".into()],
+            Vec::new(),
+        )
+        .unwrap();
         let got = tool
-            .validate_url_with_dns_check("http://10.0.0.5/", |_host| {
-                Err(anyhow::Error::msg("DNS validator should not be invoked"))
+            .validate_url_with_dns_check("http://10.0.0.5/", |host, allow_private| {
+                assert_eq!(host, "10.0.0.5");
+                assert!(allow_private);
+                Ok(())
             })
             .unwrap();
         assert_eq!(got, "http://10.0.0.5/");
     }
 
     #[test]
-    fn validate_url_with_dns_check_skips_dns_when_wildcard_allowlisted() {
+    fn validate_url_with_dns_check_uses_metadata_only_gate_for_wildcard() {
         // Operator's `allowed_private_hosts = ["*"]` is the blanket opt-in.
-        // The resolved-IP gate is skipped for a literal-private host; the
-        // literal-host gate also passes via the wildcard match.
+        // The literal-host gate passes via the wildcard, while the resolved
+        // answer still receives the metadata-only gate.
         let security = Arc::new(SecurityPolicy::default());
-        let tool =
-            TextBrowserTool::new_with_private_hosts(security, None, 30, vec!["*".into()]).unwrap();
+        let tool = TextBrowserTool::new_with_private_hosts(
+            security,
+            None,
+            30,
+            vec!["*".into()],
+            Vec::new(),
+        )
+        .unwrap();
         let got = tool
-            .validate_url_with_dns_check("http://10.0.0.5/", |_host| {
-                Err(anyhow::Error::msg("DNS validator should not be invoked"))
+            .validate_url_with_dns_check("http://10.0.0.5/", |host, allow_private| {
+                assert_eq!(host, "10.0.0.5");
+                assert!(allow_private);
+                Ok(())
             })
             .unwrap();
         assert_eq!(got, "http://10.0.0.5/");
     }
 
     #[test]
-    fn validate_url_with_dns_check_skips_dns_when_public_looking_hostname_allowlisted() {
+    fn validate_url_with_dns_check_uses_metadata_gate_for_allowlisted_hostname() {
         // Regression for Audacity88's 2026-07-04 review of when the
         // operator lists a public-looking hostname (not literally private) in
         // `allowed_private_hosts`, the resolved-IP gate must be skipped even
@@ -554,29 +635,68 @@ mod tests {
             None,
             30,
             vec!["internal.corp".into()],
+            Vec::new(),
         )
         .unwrap();
         let got = tool
-            .validate_url_with_dns_check("http://internal.corp/", |_host| {
-                Err(anyhow::Error::msg("DNS validator should not be invoked"))
+            .validate_url_with_dns_check("http://internal.corp/", |host, allow_private| {
+                assert_eq!(host, "internal.corp");
+                assert!(allow_private);
+                Ok(())
             })
             .unwrap();
         assert_eq!(got, "http://internal.corp/");
     }
 
     #[test]
-    fn validate_url_with_dns_check_skips_dns_when_public_looking_hostname_wildcard() {
+    fn validate_url_with_dns_check_uses_metadata_gate_for_hostname_wildcard() {
         // With `["*"]` wildcard, a public-looking hostname resolving to a
-        // private IP must also skip the DNS gate.
+        // private IP must pass the metadata-only resolved-address gate.
         let security = Arc::new(SecurityPolicy::default());
-        let tool =
-            TextBrowserTool::new_with_private_hosts(security, None, 30, vec!["*".into()]).unwrap();
+        let tool = TextBrowserTool::new_with_private_hosts(
+            security,
+            None,
+            30,
+            vec!["*".into()],
+            Vec::new(),
+        )
+        .unwrap();
         let got = tool
-            .validate_url_with_dns_check("http://internal.corp/", |_host| {
-                Err(anyhow::Error::msg("DNS validator should not be invoked"))
+            .validate_url_with_dns_check("http://internal.corp/", |host, allow_private| {
+                assert_eq!(host, "internal.corp");
+                assert!(allow_private);
+                Ok(())
             })
             .unwrap();
         assert_eq!(got, "http://internal.corp/");
+    }
+
+    #[test]
+    fn private_opt_in_still_rejects_metadata_resolution() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = TextBrowserTool::new_with_private_hosts(
+            security,
+            None,
+            30,
+            vec!["*".into()],
+            Vec::new(),
+        )
+        .unwrap();
+        let err = tool
+            .validate_url_with_dns_check("http://internal.corp/", |host, allow_private| {
+                assert!(allow_private);
+                domain_guard::validate_resolved_ips_exclude_metadata(
+                    host,
+                    &["169.254.170.23".parse().unwrap()],
+                    &[],
+                )
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -585,12 +705,14 @@ mod tests {
         // both gates.
         let tool = test_tool();
         let got = tool
-            .validate_url_with_dns_check("http://example.com/page", |host| {
+            .validate_url_with_dns_check("http://example.com/page", |host, allow_private| {
+                assert!(!allow_private);
                 domain_guard::validate_resolved_ips_are_public(
                     host,
                     &[std::net::IpAddr::V4(std::net::Ipv4Addr::new(
                         93, 184, 216, 34,
                     ))],
+                    &[],
                 )
             })
             .unwrap();
@@ -607,7 +729,7 @@ mod tests {
     #[test]
     fn truncate_over_limit() {
         let security = Arc::new(SecurityPolicy::default());
-        let mut tool = TextBrowserTool::new(security, None, 30).unwrap();
+        let mut tool = TextBrowserTool::new(security, None, 30, Vec::new()).unwrap();
         tool.max_response_size = 10;
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -638,7 +760,7 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = TextBrowserTool::new(security, None, 30).unwrap();
+        let tool = TextBrowserTool::new(security, None, 30, Vec::new()).unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -653,7 +775,7 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = TextBrowserTool::new(security, None, 30).unwrap();
+        let tool = TextBrowserTool::new(security, None, 30, Vec::new()).unwrap();
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -675,6 +797,7 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            Vec::new(),
         )
         .unwrap()
     }
@@ -798,5 +921,90 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("userinfo"), "got: {err}");
+    }
+
+    // ── network-specific NAT64 prefixes ──────────────────────────
+
+    /// A globally-classified NAT64 prefix. The IPv6 documentation range is
+    /// itself non-global, so a documentation prefix would be rejected for an
+    /// unrelated reason and prove nothing about the NAT64 decode.
+    const TEST_NAT64_PREFIX: &str = "2001:67c:2b0:db32:0:1::/96";
+
+    #[test]
+    fn configured_nat64_prefix_reaches_the_resolved_address_gate() {
+        let tool = TextBrowserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            None,
+            30,
+            vec![TEST_NAT64_PREFIX.to_string()],
+        )
+        .unwrap();
+
+        let err = tool
+            .validate_url_with_dns_check("http://attacker.example.com/", |host, allow_private| {
+                validate_resolved_host_is_public_for_test(
+                    host,
+                    allow_private,
+                    &["2001:67c:2b0:db32:0:1:a00:1".parse().unwrap()],
+                    &tool.nat64_prefixes,
+                )
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global address 10.0.0.1"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn nat64_embedded_private_v4_passes_without_a_configured_prefix() {
+        // Honest boundary: nothing in the address marks it as NAT64.
+        let tool = test_tool();
+        let got = tool
+            .validate_url_with_dns_check("http://attacker.example.com/", |host, allow_private| {
+                validate_resolved_host_is_public_for_test(
+                    host,
+                    allow_private,
+                    &["2001:67c:2b0:db32:0:1:a00:1".parse().unwrap()],
+                    &tool.nat64_prefixes,
+                )
+            })
+            .unwrap();
+        assert_eq!(got, "http://attacker.example.com/");
+    }
+
+    #[test]
+    fn malformed_nat64_prefix_fails_tool_construction() {
+        let err = TextBrowserTool::new(
+            Arc::new(SecurityPolicy::default()),
+            None,
+            30,
+            vec![TEST_NAT64_PREFIX.to_string(), "2001:db8::/33".into()],
+        )
+        .err()
+        .expect("malformed nat64 prefix must fail construction")
+        .to_string();
+        assert!(
+            err.contains("security.nat64_prefixes"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("2001:db8::/33"), "unexpected error: {err}");
+    }
+
+    /// Stand-in for the `#[cfg(not(test))]` resolver: applies the same
+    /// private/public branch to a caller-supplied answer, so the test drives
+    /// the real `domain_guard` gate without touching DNS.
+    fn validate_resolved_host_is_public_for_test(
+        host: &str,
+        allow_private: bool,
+        ips: &[std::net::IpAddr],
+        nat64_prefixes: &[domain_guard::Nat64Prefix],
+    ) -> anyhow::Result<()> {
+        if allow_private {
+            domain_guard::validate_resolved_ips_exclude_metadata(host, ips, nat64_prefixes)
+        } else {
+            domain_guard::validate_resolved_ips_are_public(host, ips, nat64_prefixes)
+        }
     }
 }

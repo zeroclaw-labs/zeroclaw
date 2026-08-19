@@ -1386,11 +1386,16 @@ impl RpcClient {
     }
 
     /// List run summaries, optionally filtered to one SOP by name. The
-    /// daemon returns `{ "runs": [SopRunSummary...] }`; rows that fail to
-    /// deserialize are impossible by construction (every view field
-    /// defaults), so a newer daemon cannot break this surface.
-    // Staged for the SOP pane status-icon surface; no pane consumer yet.
-    #[allow(dead_code)]
+    /// daemon returns `{ "runs": [SopRunSummary...] }`.
+    ///
+    /// Forward compatibility is bounded, not total. `#[serde(default)]` on
+    /// [`SopRunSummaryView`] tolerates fields a newer daemon omits, and
+    /// `#[serde(other)]` on [`SopRunStatusView`] folds an unrecognized status
+    /// string to `Unknown` instead of failing the row. Anything else — a
+    /// field whose JSON type changed, a `runs` value that is not an array, or
+    /// a missing `runs` key — still fails closed with an error, which the
+    /// pane surfaces as a stale-poll indication rather than silently
+    /// rendering an empty list.
     pub async fn sops_runs(&self, sop: Option<&str>) -> Result<Vec<SopRunSummaryView>> {
         let value: Value = self
             .call(method::SOPS_RUNS, serde_json::json!({ "sop": sop }))
@@ -2621,8 +2626,6 @@ pub struct TriggerSourceRegistryView {
 /// Run status as serialized by the runtime's `SopRunStatus`. Unknown
 /// variants from a newer daemon fold into [`SopRunStatusView::Unknown`]
 /// so an older zerocode keeps rendering rather than dropping the run.
-// Staged for the SOP pane status-icon surface; no pane consumer yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SopRunStatusView {
@@ -2641,15 +2644,11 @@ pub enum SopRunStatusView {
 impl SopRunStatusView {
     /// True while the run is parked on an operator decision (approval gate
     /// or deterministic checkpoint).
-    // Staged for the status-icon surface; consumed by the icon aggregation rule.
-    #[allow(dead_code)]
     pub fn needs_input(self) -> bool {
         matches!(self, Self::WaitingApproval | Self::PausedCheckpoint)
     }
 
     /// True once the run has reached a terminal state.
-    // Staged for the status-icon surface; consumed by the icon aggregation rule.
-    #[allow(dead_code)]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
     }
@@ -2658,8 +2657,6 @@ impl SopRunStatusView {
 /// One run row from `sops/runs`; mirrors the runtime `SopRunSummary`.
 /// Every field defaults so a field added daemon-side never breaks an
 /// older zerocode.
-// Staged for the SOP pane status-icon surface; no pane consumer yet.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct SopRunSummaryView {
@@ -3656,6 +3653,58 @@ mod sop_method_tests {
             .unwrap()
             .expect_err("a response without `runs` must error, not silently return empty");
         assert!(err.to_string().contains("missing runs"));
+    }
+
+    #[tokio::test]
+    async fn sops_runs_tolerates_omissions_but_still_fails_closed_on_bad_shapes() {
+        // The three cases the doc comment on `sops_runs` promises to tolerate
+        // and to reject. A regression here means the compatibility claim on
+        // the method has drifted from what serde actually does.
+        async fn call_with(runs: serde_json::Value) -> anyhow::Result<Vec<SopRunSummaryView>> {
+            let (rpc, mut write_rx) = make_rpc();
+            let client = RpcClient::with_rpc(rpc.clone());
+            let task = tokio::spawn(async move { client.sops_runs(None).await });
+            let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+                .await
+                .expect("client.sops_runs must send a wire request")
+                .unwrap();
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let id = req["id"].as_str().unwrap().to_string();
+            rpc.dispatch_response(&id, Some(json!({ "runs": runs })), None);
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("client.sops_runs must resolve after the response is dispatched")
+                .unwrap()
+        }
+
+        // Tolerated: every field omitted, plus an unknown status string.
+        let runs = call_with(json!([{ "status": "invented_by_a_newer_daemon" }]))
+            .await
+            .expect("omitted fields and an unknown status must deserialize, not fail the list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, SopRunStatusView::Unknown);
+        assert_eq!(runs[0].run_id, "");
+        assert!(!runs[0].active);
+
+        // Fails closed: a field whose JSON type changed.
+        let err = call_with(json!([{ "run_id": "r1", "current_step": "not-a-number" }]))
+            .await
+            .expect_err("an incompatible field type must fail closed, not default silently");
+        assert!(
+            err.to_string().contains("current_step")
+                || err.to_string().contains("invalid type")
+                || err.to_string().contains("expected"),
+            "error should name the type problem, got: {err}"
+        );
+
+        // Fails closed: `runs` present but not an array.
+        let err = call_with(json!({ "unexpected": "container" }))
+            .await
+            .expect_err("a malformed runs container must fail closed");
+        assert!(
+            err.to_string().contains("invalid type") || err.to_string().contains("expected"),
+            "error should name the container problem, got: {err}"
+        );
     }
 
     #[tokio::test]

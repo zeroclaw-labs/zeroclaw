@@ -1,8 +1,11 @@
 //! Streaming provider-response consumption for the turn loop.
 
 use super::events::{DraftEvent, StreamDelta};
-use super::outcome::{StreamCancelledAfterOutput, StreamInterruptedAfterOutput, ToolLoopCancelled};
-use super::stream_guard::{StreamTextGuard, StreamThinkTagStripper};
+use super::outcome::{
+    StreamCancelledAfterOutput, StreamInterruptedAfterOutput,
+    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+};
+use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
 use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -23,6 +26,7 @@ pub(crate) struct StreamedChatOutcome {
     pub(crate) forwarded_visible_text: String,
     pub(crate) suppressed_protocol: bool,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    pub(crate) saw_pre_executed_tool_activity: bool,
 }
 
 pub(crate) async fn consume_provider_streaming_response(
@@ -51,8 +55,9 @@ pub(crate) async fn consume_provider_streaming_response(
     );
     let mut outcome = StreamedChatOutcome::default();
     let mut delta_sender = on_delta;
-    let mut text_guard = StreamTextGuard::new(request_tools);
     let mut think_stripper = StreamThinkTagStripper::default();
+    let mut marker_stripper = StreamTerminalMarkerStripper::new();
+    let mut text_guard = StreamTextGuard::new(request_tools);
     // Correlates PreExecutedToolCall events with their later results so both
     // TurnEvents share a stable id (FIFO per tool name).
     let mut pre_executed_ids: std::collections::HashMap<
@@ -69,22 +74,31 @@ pub(crate) async fn consume_provider_streaming_response(
     macro_rules! forward_visible {
         ($text:expr, $count_visible:tt) => {{
             let visible = $text;
-            if event_tx.is_some() || delta_sender.is_some() {
-                outcome.forwarded_visible_text.push_str(&visible);
-            }
-            if let Some(tx) = event_tx {
-                outcome.forwarded_live_deltas = true;
-                forward_visible!(@count $count_visible, visible);
-                let _ = tx
-                    .send(TurnEvent::Chunk {
-                        delta: visible.clone(),
-                    })
-                    .await;
-            }
-            if let Some(tx) = delta_sender {
-                outcome.forwarded_live_deltas = true;
-                if tx.send(StreamDelta::Text(visible)).await.is_err() {
-                    delta_sender = None;
+            // Empty visible text is not output: a strict-mode marker-only delta
+            // (or a trailing flush that stripped a marker) yields an empty
+            // string here, and forwarding it would record an empty Chunk as
+            // visible output. That would make a later provider error take the
+            // StreamInterruptedAfterOutput path and disable the non-streaming
+            // fallback even though the user saw no text. Guard so empty text is
+            // never counted as visible output.
+            if !visible.is_empty() {
+                if event_tx.is_some() || delta_sender.is_some() {
+                    outcome.forwarded_visible_text.push_str(&visible);
+                }
+                if let Some(tx) = event_tx {
+                    outcome.forwarded_live_deltas = true;
+                    forward_visible!(@count $count_visible, visible);
+                    let _ = tx
+                        .send(TurnEvent::Chunk {
+                            delta: visible.clone(),
+                        })
+                        .await;
+                }
+                if let Some(tx) = delta_sender {
+                    outcome.forwarded_live_deltas = true;
+                    if tx.send(StreamDelta::Text(visible)).await.is_err() {
+                        delta_sender = None;
+                    }
                 }
             }
         }};
@@ -155,6 +169,7 @@ pub(crate) async fn consume_provider_streaming_response(
             // relayed as TurnEvents but do not affect the agent's tool
             // dispatch loop.
             StreamEvent::PreExecutedToolCall { name, args } => {
+                outcome.saw_pre_executed_tool_activity = true;
                 let id = Uuid::new_v4().to_string();
                 pre_executed_ids
                     .entry(name.clone())
@@ -172,6 +187,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 }
             }
             StreamEvent::PreExecutedToolResult { name, output } => {
+                outcome.saw_pre_executed_tool_activity = true;
                 let id = pre_executed_ids
                     .get_mut(&name)
                     .and_then(|ids| ids.pop_front())
@@ -214,14 +230,18 @@ pub(crate) async fn consume_provider_streaming_response(
                     continue;
                 }
 
-                outcome.response_text.push_str(&sanitized_delta);
+                // First pass through the marker stripper to strip terminal markers
+                let stripped = marker_stripper.push(&sanitized_delta);
+
+                // Append the stripped text to response_text (single accumulation path)
+                outcome.response_text.push_str(&stripped);
 
                 if strict_tool_parsing {
-                    forward_visible!(sanitized_delta, true);
+                    forward_visible!(stripped, true);
                     continue;
                 }
 
-                let Some(forward_text) = text_guard.push(&sanitized_delta) else {
+                let Some(forward_text) = text_guard.push(&stripped) else {
                     continue;
                 };
 
@@ -230,12 +250,25 @@ pub(crate) async fn consume_provider_streaming_response(
         }
     }
 
+    // Process trailing delta from think stripper through marker stripper
     let trailing_delta = think_stripper.finish();
     if !trailing_delta.is_empty() {
-        outcome.response_text.push_str(&trailing_delta);
+        let trailing_stripped = marker_stripper.push(&trailing_delta);
+        outcome.response_text.push_str(&trailing_stripped);
         if strict_tool_parsing {
-            forward_visible!(trailing_delta, false);
-        } else if let Some(forward_text) = text_guard.push(&trailing_delta) {
+            forward_visible!(trailing_stripped, false);
+        } else if let Some(forward_text) = text_guard.push(&trailing_stripped) {
+            forward_visible!(forward_text, false);
+        }
+    }
+
+    // Flush any remaining terminal markers held by the marker stripper
+    let remaining = marker_stripper.finish();
+    if !remaining.is_empty() {
+        outcome.response_text.push_str(&remaining);
+        if strict_tool_parsing {
+            forward_visible!(remaining, false);
+        } else if let Some(forward_text) = text_guard.push(&remaining) {
             forward_visible!(forward_text, false);
         }
     }
@@ -246,6 +279,30 @@ pub(crate) async fn consume_provider_streaming_response(
     // Final forward may null delta_sender on send failure; mark it read.
     let _ = delta_sender;
     outcome.suppressed_protocol = text_guard.suppressed_protocol;
+
+    if outcome.response_text.trim().is_empty() && outcome.tool_calls.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_category(::zeroclaw_log::EventCategory::Provider)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "has_reasoning": !outcome.reasoning_content.trim().is_empty(),
+                    "protocol_suppressed": outcome.suppressed_protocol,
+                })),
+            "model_provider stream completed without final text or tool calls"
+        );
+        if outcome.saw_pre_executed_tool_activity {
+            return Err(StreamPreExecutedToolsWithoutFinalResponse {
+                usage: outcome.usage,
+            }
+            .into());
+        }
+        return Err(StreamSemanticEmptyCompletion {
+            usage: outcome.usage,
+        }
+        .into());
+    }
 
     Ok(outcome)
 }
@@ -263,6 +320,8 @@ mod tests {
 
     struct ToolThenTextProvider;
 
+    struct EmptyStreamProvider;
+
     impl ::zeroclaw_api::attribution::Attributable for ToolThenTextProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Provider(
@@ -273,6 +332,19 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "ToolThenTextProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyStreamProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EmptyStreamProvider"
         }
     }
 
@@ -338,6 +410,42 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for EmptyStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![Ok(StreamEvent::Final)]))
+        }
+    }
+
     #[tokio::test]
     async fn forwards_text_deltas_emitted_after_a_native_tool_call() {
         let provider = ToolThenTextProvider;
@@ -369,6 +477,490 @@ mod tests {
         assert!(
             forwarded.contains("check the count."),
             "narration emitted after the native tool call must be forwarded live; forwarded={forwarded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_completed_stream_without_text_or_tool_calls() {
+        let err = consume_provider_streaming_response(
+            &EmptyStreamProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("a semantically empty stream must not complete successfully");
+
+        assert_eq!(
+            err.to_string(),
+            "provider stream completed without final text or tool calls"
+        );
+    }
+
+    struct MarkerTestProvider {
+        text_sequence: Vec<&'static str>,
+    }
+
+    impl MarkerTestProvider {
+        fn with_text_sequence(texts: Vec<&'static str>) -> Self {
+            Self {
+                text_sequence: texts,
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MarkerTestProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "MarkerTestProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MarkerTestProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let events: Vec<StreamResult<StreamEvent>> = self
+                .text_sequence
+                .iter()
+                .map(|text| Ok(StreamEvent::TextDelta(StreamChunk::delta(*text))))
+                .chain(std::iter::once(Ok(StreamEvent::Final)))
+                .collect();
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    #[tokio::test]
+    async fn strips_terminal_marker_same_chunk() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Summary<eom>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        // Critical: response_text should NOT contain the marker
+        assert_eq!(
+            outcome.response_text, "Summary",
+            "terminal marker <eom> should be stripped from response_text"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_terminal_marker_in_strict_mode() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Summary<eom>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            true, // strict_tool_parsing = true
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        // Critical: strict mode should also strip terminal markers
+        assert_eq!(
+            outcome.response_text, "Summary",
+            "terminal marker <eom> should be stripped even in strict_tool_parsing mode"
+        );
+    }
+
+    /// Provider that emits a single marker-only text delta (`<eom>`) and then
+    /// a stream error, with no text ever produced. Used to pin the strict-mode
+    /// fallback eligibility: a marker-only delta yields empty stripped text,
+    /// which must NOT count as visible output.
+    struct MarkerOnlyThenErrorProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for MarkerOnlyThenErrorProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "MarkerOnlyThenErrorProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MarkerOnlyThenErrorProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let events: Vec<StreamResult<StreamEvent>> = vec![
+                Ok(StreamEvent::TextDelta(StreamChunk::delta("<eom>"))),
+                Err(::zeroclaw_api::model_provider::StreamError::ModelProvider(
+                    "provider exploded after marker-only delta".into(),
+                )),
+            ];
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    /// Strict-mode marker-only deltas must not count as visible output: if a
+    /// marker-only delta (stripped to empty text) is forwarded as a visible
+    /// Chunk, a later provider error turns the failure into
+    /// `StreamInterruptedAfterOutput`, which disables the non-streaming
+    /// fallback even though the user received no text. The error must instead
+    /// surface as a plain error with an empty visible prefix, keeping the
+    /// pre-output fallback eligible.
+    #[tokio::test]
+    async fn strict_marker_only_delta_does_not_disable_fallback_on_provider_error() {
+        let provider = MarkerOnlyThenErrorProvider;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+        let result = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,      // on_delta (draft sink)
+            Some(&tx), // event_tx
+            true,      // strict_tool_parsing = true
+        )
+        .await;
+
+        // The event sink must have seen zero Chunks (the marker-only delta was
+        // stripped to empty and must not be forwarded).
+        drop(tx);
+        let mut chunks = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            chunks.push(ev);
+        }
+        assert!(
+            chunks.is_empty(),
+            "no Chunk event may be forwarded for a marker-only delta: {chunks:?}"
+        );
+
+        // The failure must be a plain error, NOT StreamInterruptedAfterOutput
+        // (which would disable the non-streaming fallback despite no visible
+        // text). Asserting the error type is not the interruption type is the
+        // observable fallback-eligibility signal.
+        let err = result.expect_err("provider error must surface");
+        assert!(
+            err.downcast_ref::<crate::agent::turn::outcome::StreamInterruptedAfterOutput>()
+                .is_none(),
+            "a marker-only delta followed by a provider error must stay eligible for the \
+             non-streaming fallback; got StreamInterruptedAfterOutput instead"
+        );
+        assert!(
+            err.to_string().contains("provider exploded"),
+            "the underlying provider error must be surfaced: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_fragmented_terminal_marker() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Summary<", "eom>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        assert_eq!(
+            outcome.response_text, "Summary",
+            "fragmented terminal marker across chunks should be stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn strips_stacked_terminal_markers() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Summary<eom><|eom|>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        assert_eq!(
+            outcome.response_text, "Summary",
+            "stacked terminal markers should be stripped"
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_inline_marker_but_strips_terminal() {
+        let provider = MarkerTestProvider::with_text_sequence(vec!["Text <eom> inline<eom>"]);
+
+        let outcome = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect("stream consume should succeed");
+
+        // The inline <eom> should be preserved, terminal <eom> stripped
+        assert_eq!(
+            outcome.response_text, "Text <eom> inline",
+            "inline marker should be preserved but terminal marker stripped"
+        );
+    }
+
+    /// Provider that emits one text delta ending in a terminal marker, then
+    /// delays before `Final` so the test can observe whether the answer
+    /// streamed live or was buffered until completion.
+    struct LiveMarkerTimingProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for LiveMarkerTimingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "LiveMarkerTimingProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for LiveMarkerTimingProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn supports_streaming_tool_events(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            // Emit the delta immediately, then pause before Final so the
+            // consumer's forwarding timing is observable: if the stripper
+            // buffers the whole chunk, no Chunk event is sent until the
+            // (delayed) finish path and the test times out.
+            Box::pin(futures_util::stream::unfold(0u8, |state| async move {
+                match state {
+                    0 => Some((
+                        Ok(StreamEvent::TextDelta(StreamChunk::delta(
+                            "A large answer<eom>",
+                        ))),
+                        1,
+                    )),
+                    _ => {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        Some((Ok(StreamEvent::Final), 2))
+                    }
+                }
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_single_marker_chunk_live_before_final() {
+        let provider = LiveMarkerTimingProvider;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(16);
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            consume_provider_streaming_response(
+                &provider,
+                &[ChatMessage::user("go")],
+                None,
+                "mock-model",
+                Some(0.0),
+                None,
+                None,
+                Some(&event_tx),
+                false,
+            )
+            .await
+        });
+
+        // The answer must be forwarded as a live Chunk before the provider's
+        // Final (which is delayed 500ms). The old stripper held the whole
+        // chunk until `finish()` after Final, so nothing arrived in time.
+        let chunk = tokio::time::timeout(std::time::Duration::from_millis(200), event_rx.recv())
+            .await
+            .expect("the answer must stream live before the provider's Final event")
+            .expect("event channel remains open");
+
+        match chunk {
+            TurnEvent::Chunk { delta } => assert_eq!(
+                delta, "A large answer",
+                "the live chunk must be the stripped answer, without the terminal marker"
+            ),
+            other => panic!("expected the stripped answer as a live Chunk, got {other:?}"),
+        }
+
+        let outcome = handle
+            .await
+            .expect("consume task completes")
+            .expect("stream consume should succeed");
+        assert_eq!(
+            outcome.response_text, "A large answer",
+            "the final accumulated response strips the terminal marker"
         );
     }
 }

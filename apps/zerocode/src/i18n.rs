@@ -324,6 +324,51 @@ mod tests {
     }
 
     #[test]
+    fn daemon_process_labels_are_explicit_in_all_builtin_catalogues() {
+        let catalogues = [
+            ("en", EN_FTL, "Daemon Memory", "Daemon CPU"),
+            (
+                "es",
+                include_str!("../locales/es/zerocode.ftl"),
+                "Memoria del demonio",
+                "CPU del demonio",
+            ),
+            (
+                "fr",
+                include_str!("../locales/fr/zerocode.ftl"),
+                "Mémoire du démon",
+                "CPU du démon",
+            ),
+            (
+                "ja",
+                include_str!("../locales/ja/zerocode.ftl"),
+                "デーモンメモリ",
+                "デーモン CPU",
+            ),
+            (
+                "zh-CN",
+                include_str!("../locales/zh-CN/zerocode.ftl"),
+                "守护进程内存",
+                "守护进程 CPU",
+            ),
+        ];
+
+        for (locale, source, expected_memory, expected_cpu) in catalogues {
+            assert_eq!(
+                format_ftl_message(source, locale, "zc-dashboard-label-daemon-memory", &[],)
+                    .as_deref(),
+                Some(expected_memory),
+                "daemon memory label for {locale}"
+            );
+            assert_eq!(
+                format_ftl_message(source, locale, "zc-dashboard-label-daemon-cpu", &[]).as_deref(),
+                Some(expected_cpu),
+                "daemon CPU label for {locale}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_key_returns_brace_form() {
         let value = t("zc-definitely-not-a-real-key");
         assert_eq!(value, "{zc-definitely-not-a-real-key}");

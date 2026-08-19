@@ -5,9 +5,13 @@ use anyhow::Result;
 use zeroclaw_runtime::i18n::{get_required_cli_string, get_required_cli_string_with_args};
 
 pub fn handle_command(command: crate::SopCommands, config: &crate::config::Config) -> Result<()> {
-    let workspace_dir = &config.data_dir;
+    // SOP definitions resolve against the install root, so the documented
+    // `shared/sops` lands at `<install>/shared/sops` — the same root the web/RPC
+    // author writes to. Loading them from `data_dir` instead would never see
+    // authored SOPs.
+    let install_root = config.install_root_dir();
     let default_mode = parse_execution_mode(&config.sop.default_execution_mode);
-    let sops = load_sops(workspace_dir, config.sop.sops_dir.as_deref(), default_mode);
+    let sops = load_sops(&install_root, config.sop.sops_dir.as_deref(), default_mode);
 
     match command {
         crate::SopCommands::List => {
@@ -228,7 +232,7 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             Ok(())
         }
         crate::SopCommands::Delete { name } => {
-            let dir = resolve_sops_dir(workspace_dir, config.sop.sops_dir.as_deref());
+            let dir = resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
             delete_sop(&dir, &name)?;
             println!(
                 "{}",
@@ -492,15 +496,16 @@ type = "manual"
 
     #[test]
     fn resolve_sops_dir_default() {
-        let ws = Path::new("/home/user/.zeroclaw/workspace");
-        let dir = resolve_sops_dir(ws, None);
-        assert_eq!(dir, ws.join("sops"));
+        // Unset falls back to the canonical `<install>/shared/sops`.
+        let install_root = Path::new("/test/install");
+        let dir = resolve_sops_dir(install_root, None);
+        assert_eq!(dir, install_root.join("shared").join("sops"));
     }
 
     #[test]
     fn resolve_sops_dir_override() {
-        let ws = Path::new("/home/user/.zeroclaw/workspace");
-        let dir = resolve_sops_dir(ws, Some("/custom/sops"));
+        let install_root = Path::new("/test/install");
+        let dir = resolve_sops_dir(install_root, Some("/custom/sops"));
         assert_eq!(dir, PathBuf::from("/custom/sops"));
     }
 

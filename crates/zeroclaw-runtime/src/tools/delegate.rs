@@ -1,3 +1,4 @@
+use crate::agent::dispatcher::{ToolDispatcher, XmlToolDispatcher};
 use crate::agent::loop_::{
     LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
     TOOL_LOOP_SESSION_KEY, ToolLoop, apply_text_tool_prompt_policy, run_tool_call_loop,
@@ -30,6 +31,15 @@ use zeroclaw_tools::memory_store::MemoryStoreTool;
 
 fn current_tool_loop_session_key() -> Option<String> {
     TOOL_LOOP_SESSION_KEY.try_with(Clone::clone).ok().flatten()
+}
+
+fn invalid_semantic_completion_error(agent_name: &str) -> String {
+    crate::agent::turn::outcome::semantic_empty_terminal_completion_message(Some(agent_name))
+}
+
+fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
+    crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
+        .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output
@@ -636,24 +646,17 @@ impl DelegateTool {
         model_provider: &str,
         provider_type: &str,
         credential: Option<&str>,
-    ) -> anyhow::Result<Box<dyn ModelProvider>> {
-        if let Some(config) = self.root_config.as_deref()
-            && let Some((family, alias)) = model_provider.split_once('.')
-        {
-            let mut options =
-                zeroclaw_providers::provider_runtime_options_for_alias(config, family, alias);
-            if options.zeroclaw_dir.is_none() {
-                options.zeroclaw_dir = self.provider_runtime_options.zeroclaw_dir.clone();
-            }
-            return zeroclaw_providers::create_model_provider_for_alias(
-                config, family, alias, credential, &options,
-            );
+    ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
+        if let Some(config) = self.root_config.as_deref() {
+            return crate::agent::agent::build_session_model_provider(config, model_provider, None);
         }
-        zeroclaw_providers::create_model_provider_with_options(
+        let provider = zeroclaw_providers::create_model_provider_with_options(
             provider_type,
             credential,
             &self.provider_runtime_options,
-        )
+        )?;
+        let (_, _, model, _) = self.resolve_brain(model_provider);
+        Ok((provider, provider_type.to_string(), model))
     }
 
     async fn memory_for_target_agent(
@@ -1196,6 +1199,60 @@ impl DelegateTool {
         args: &serde_json::Value,
         admission: DelegateAdmission,
     ) -> anyhow::Result<ToolResult> {
+        // Keep target recovery metadata local: the parent channel scope belongs to its own model call.
+        let (result, fallback) = zeroclaw_providers::reliable::scope_provider_fallback(async {
+            let result = self
+                .execute_sync_with_admission_inner(agent_name, prompt, args, admission)
+                .await;
+            let fallback = zeroclaw_providers::reliable::take_last_provider_fallback_attribution();
+            (result, fallback)
+        })
+        .await;
+
+        let mut result = result?;
+        if result.success
+            && let Some(fallback) = fallback
+        {
+            let agentic = self
+                .agents
+                .get(agent_name)
+                .is_some_and(|config| self.resolve_agentic(&config.runtime_profile));
+            let warning =
+                crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+            let header_key = if agentic {
+                "delegate-provider-fallback-header-agentic"
+            } else {
+                "delegate-provider-fallback-header"
+            };
+            let header = crate::i18n::get_required_cli_string_with_args(
+                header_key,
+                &[
+                    ("agent", agent_name),
+                    ("requested_provider", &fallback.requested_candidate),
+                    ("requested_model", &fallback.fallback.requested_model),
+                    ("actual_provider", &fallback.actual_candidate),
+                    ("actual_model", &fallback.fallback.actual_model),
+                ],
+            );
+            // Successful delegate results are always headed by one generated line. Re-rendering
+            // it here keeps the caller-visible provenance accurate without exposing rejected
+            // provider diagnostics, endpoints, or credentials.
+            let rendered = result
+                .output
+                .split_once('\n')
+                .map_or(result.output.as_str(), |(_, rendered)| rendered);
+            result.output = format!("{header}\n{rendered}\n\n{warning}").into();
+        }
+        Ok(result)
+    }
+
+    async fn execute_sync_with_admission_inner(
+        &self,
+        agent_name: &str,
+        prompt: &str,
+        args: &serde_json::Value,
+        admission: DelegateAdmission,
+    ) -> anyhow::Result<ToolResult> {
         let context = args
             .get("context")
             .and_then(|v| v.as_str())
@@ -1225,7 +1282,7 @@ impl DelegateTool {
 
         // Resolve profile references
         let max_depth = self.resolve_max_depth(&agent_config.runtime_profile);
-        let (provider_type, credential, model, temperature) =
+        let (legacy_provider_type, credential, _, temperature) =
             self.resolve_brain(&agent_config.model_provider);
         let agentic = self.resolve_agentic(&agent_config.runtime_profile);
 
@@ -1268,18 +1325,18 @@ impl DelegateTool {
         }
 
         // Create model_provider for this agent
-        let model_provider: Box<dyn ModelProvider> = match self.build_target_provider(
+        let (model_provider, provider_type, model) = match self.build_target_provider(
             &agent_config.model_provider,
-            &provider_type,
+            &legacy_provider_type,
             credential.as_deref(),
         ) {
-            Ok(p) => p,
+            Ok(provider) => provider,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!(
-                        "Failed to create model_provider '{provider_type}' for agent '{agent_name}': {e}"
+                        "Failed to create model_provider '{legacy_provider_type}' for agent '{agent_name}': {e}"
                     )),
                 });
             }
@@ -1344,26 +1401,41 @@ impl DelegateTool {
             }
         };
 
-        match result {
-            Ok(response) => {
-                let mut rendered = response;
-                if rendered.trim().is_empty() {
-                    rendered = "[Empty response]".to_string();
-                }
+        Ok(Self::render_non_agentic_result(
+            agent_name,
+            &provider_type,
+            &model,
+            result,
+        ))
+    }
 
-                Ok(ToolResult {
-                    success: true,
-                    output:
-                        format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{rendered}",)
-                            .into(),
-                    error: None,
-                })
+    fn render_non_agentic_result(
+        agent_name: &str,
+        provider_type: &str,
+        model: &str,
+        result: anyhow::Result<String>,
+    ) -> ToolResult {
+        match result {
+            Ok(response)
+                if zeroclaw_api::model_provider::strip_think_tags(&response).is_empty() =>
+            {
+                ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(invalid_semantic_completion_error(agent_name)),
+                }
             }
-            Err(e) => Ok(ToolResult {
+            Ok(response) => ToolResult {
+                success: true,
+                output: format!("[Agent '{agent_name}' ({provider_type}/{model})]\n{response}",)
+                    .into(),
+                error: None,
+            },
+            Err(e) => ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}",)),
-            }),
+                error: Some(delegate_failure_error(agent_name, &e)),
+            },
         }
     }
 }
@@ -2377,6 +2449,11 @@ impl DelegateTool {
         };
 
         // Build structured operational context using SystemPromptBuilder sections.
+        let dispatcher_instructions = if sends_native_tool_specs || prompt_tools.is_empty() {
+            String::new()
+        } else {
+            XmlToolDispatcher.prompt_instructions(prompt_tools)
+        };
         let ctx = PromptContext {
             workspace_dir,
             agent_workspace_dir: workspace_dir,
@@ -2385,7 +2462,7 @@ impl DelegateTool {
             skills,
             skills_prompt_mode: agent_config.resolved.prompt_injection_mode,
             identity_config: None,
-            dispatcher_instructions: "",
+            dispatcher_instructions: &dispatcher_instructions,
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
 
             security_summary: None,
@@ -2580,6 +2657,24 @@ impl DelegateTool {
         };
 
         let loop_runtime = self.resolve_loop_runtime(agent_name, agent_config);
+        let native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling;
+
+        // Independent delegates execute as target-owned turns, so their thinking policy
+        // must override the parent task-local scope for the child loop. Bounded delegates
+        // deliberately retain the caller's turn context.
+        let thinking_params = (target_mode == DelegateExecutionMode::Independent).then(|| {
+            crate::agent::thinking::apply_thinking_level_with_config(
+                loop_runtime.thinking.default_level,
+                &loop_runtime.thinking,
+            )
+        });
+        let effective_temperature = thinking_params.as_ref().map_or(temperature, |params| {
+            temperature.map(|value| {
+                crate::agent::thinking::clamp_temperature(value + params.temperature_adjustment)
+            })
+        });
 
         // Build enriched system prompt with tools, skills, workspace, datetime context.
         // Independent delegation builds it from the TARGET's workspace (`sub_workspace`), so
@@ -2592,7 +2687,7 @@ impl DelegateTool {
             model,
             &sub_tools,
             prompt_workspace,
-            model_provider.supports_native_tools(),
+            native_tools,
             sub_skills.as_deref(),
         );
         // Independent delegates surface the target's deferred MCP tools the way a fresh
@@ -2602,9 +2697,19 @@ impl DelegateTool {
         let enriched_system_prompt = Self::compose_independent_system_prompt(
             enriched_system_prompt,
             sub_deferred_section,
-            model_provider.supports_native_tools(),
+            native_tools,
             loop_runtime.strict_tool_parsing,
         );
+        let enriched_system_prompt = match (
+            enriched_system_prompt,
+            thinking_params
+                .as_ref()
+                .and_then(|params| params.system_prompt_prefix.as_deref()),
+        ) {
+            (Some(prompt), Some(prefix)) => Some(format!("{prefix}\n\n{prompt}")),
+            (None, Some(prefix)) => Some(prefix.to_string()),
+            (prompt, None) => prompt,
+        };
 
         let mut history = Vec::new();
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
@@ -2624,7 +2729,9 @@ impl DelegateTool {
         let receipt_generator = receipt_scope.as_ref().map(|s| &s.generator);
         let collected_receipts = receipt_scope.as_ref().map(|s| s.collector.as_ref());
         let turn_id = uuid::Uuid::new_v4().to_string();
-        let result = tokio::time::timeout(
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let loop_knobs = LoopKnobs::default();
+        let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
                 sop_reassembly: None,
@@ -2633,7 +2740,7 @@ impl DelegateTool {
                         model_provider,
                         provider_name: provider_type,
                         model,
-                        temperature,
+                        temperature: effective_temperature,
                     },
                     ResolvedIo {
                         tools_registry: &sub_tools,
@@ -2660,14 +2767,14 @@ impl DelegateTool {
                         max_tool_iterations: loop_runtime.max_tool_iterations,
                         excluded_tools: &[],
                         dedup_exempt_tools: tool_policy.excluded_tools.as_deref().unwrap_or(&[]),
-                        pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                        pacing: &pacing,
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
                         // Keep delegate subagent context pruning aligned with top-level
                         // agents instead of preserving the old disabled-by-zero path.
                         context_token_budget: loop_runtime.max_context_tokens,
-                        knobs: &LoopKnobs::default(),
+                        knobs: &loop_knobs,
                     },
                 ),
                 history: &mut history,
@@ -2694,30 +2801,34 @@ impl DelegateTool {
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
-        )
-        .await;
+        );
+        let result = match thinking_params {
+            Some(params) => {
+                zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                    .scope(params.native_thinking, execution)
+                    .await
+            }
+            None => execution.await,
+        };
 
         match result {
-            Ok(Ok(response)) => {
-                let rendered = if response.trim().is_empty() {
-                    "[Empty response]".to_string()
-                } else {
-                    response
-                };
-
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{rendered}",
-                    )
-                    .into(),
-                    error: None,
-                })
-            }
+            Ok(Ok(response)) if response.trim().is_empty() => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(invalid_semantic_completion_error(agent_name)),
+            }),
+            Ok(Ok(response)) => Ok(ToolResult {
+                success: true,
+                output: format!(
+                    "[Agent '{agent_name}' ({provider_type}/{model}, agentic)]\n{response}",
+                )
+                .into(),
+                error: None,
+            }),
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}")),
+                error: Some(delegate_failure_error(agent_name, &e)),
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -2808,10 +2919,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use tokio::time::{Instant, sleep};
+    use zeroclaw_config::scattered_types::{ThinkingConfig, ThinkingLevel};
     use zeroclaw_config::schema::{
         Config, CustomModelProviderConfig, DEFAULT_DELEGATE_AGENTIC_TIMEOUT_SECS,
         DEFAULT_DELEGATE_TIMEOUT_SECS, DelegateExecutionMode, DelegateTargetConfig,
-        ModelProviderConfig,
+        ModelProviderConfig, ModelRouteConfig,
     };
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
     use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
@@ -2953,10 +3065,6 @@ mod tests {
             "delegate-test-runtime"
         }
 
-        fn has_shell_access(&self) -> bool {
-            true
-        }
-
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -2967,6 +3075,10 @@ mod tests {
 
         fn supports_long_running(&self) -> bool {
             false
+        }
+
+        fn shell_dialect(&self) -> crate::platform::ShellDialect {
+            crate::platform::ShellDialect::Posix
         }
 
         fn build_shell_command(
@@ -3669,6 +3781,16 @@ mod tests {
         buf
     }
 
+    fn http_request_json(request: &[u8]) -> serde_json::Value {
+        let body_start = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+            .expect("captured HTTP request has a header terminator");
+        serde_json::from_slice(&request[body_start..])
+            .expect("captured HTTP request body is valid JSON")
+    }
+
     async fn write_json_response(socket: &mut tokio::net::TcpStream, body: serde_json::Value) {
         use tokio::io::AsyncWriteExt;
 
@@ -3679,6 +3801,148 @@ mod tests {
             body
         );
         socket.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn start_failing_chat_server(
+        status: u16,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        start_failing_chat_server_with_error(status, "synthetic primary failure").await
+    }
+
+    async fn start_failing_chat_server_with_error(
+        status: u16,
+        error_message: &'static str,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = format!(r#"{{"error":{{"message":"{error_message}"}}}}"#);
+            let response = format!(
+                "HTTP/1.1 {status} Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_primary_failure_then_final_chat_server()
+    -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut first_socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut first_socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = r#"{"error":{"message":"synthetic primary failure"}}"#;
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            first_socket.write_all(response.as_bytes()).await.unwrap();
+
+            let (mut second_socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut second_socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_json_response(
+                &mut second_socket,
+                serde_json::json!({
+                    "choices": [{"message": {"content": "final primary reply"}}]
+                }),
+            )
+            .await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_tool_call_chat_server() -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>)
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            write_json_response(
+                &mut socket,
+                chat_completion_tool_call(
+                    "echo_tool",
+                    "fallback_tool",
+                    serde_json::json!({"value": "ping"}),
+                ),
+            )
+            .await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_text_tool_then_final_chat_server() -> (
+        LocalChatServer,
+        Arc<std::sync::atomic::AtomicUsize>,
+        Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let request_bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_bodies = Arc::clone(&request_bodies);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let responses = [
+                serde_json::json!({
+                    "choices": [{"message": {"content": "<tool_call>{\"name\":\"echo_tool\",\"arguments\":{\"value\":\"fallback\"}}</tool_call>"}}]
+                }),
+                serde_json::json!({
+                    "choices": [{"message": {"content": "fallback final reply"}}]
+                }),
+            ];
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let request = read_http_request(&mut socket).await;
+                request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                captured_bodies.lock().unwrap().push(request);
+                write_json_response(&mut socket, response).await;
+            }
+        });
+
+        (
+            LocalChatServer { uri, _task: task },
+            requests,
+            request_bodies,
+        )
+    }
+
+    async fn start_slow_chat_server(
+        delay: Duration,
+    ) -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let _request = read_http_request(&mut socket).await;
+            request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(delay).await;
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
     }
 
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {
@@ -4513,6 +4777,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_agentic_delegate_persists_localized_semantic_empty_error() {
+        // The configured Reliable wrapper retries a semantic-empty completion
+        // twice before terminal delivery. Supply one empty response per
+        // attempt so this boundary test proves the final semantic-empty cause,
+        // not a connection error after the fixture exhausts its responses.
+        let server = start_final_chat_server(vec!["", "", ""]).await;
+        let fixture = delegate_memory_fixture(Some(server.uri.clone())).await;
+
+        let result = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "return a final answer",
+                "background": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "background task should start: {result:?}");
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background task id")
+            .trim_start_matches("task_id: ")
+            .trim();
+        let background = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+
+        assert_eq!(
+            background.status,
+            BackgroundTaskStatus::Failed,
+            "{background:?}"
+        );
+        assert!(background.output.is_none(), "{background:?}");
+        assert_eq!(
+            background.error.as_deref(),
+            Some(invalid_semantic_completion_error("target").as_str()),
+            "{background:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn parallel_agentic_delegate_rebinds_memory_tools_to_target_agent_scope() {
         // Parallel fan-out gets its own coverage because each spawned worker
         // rebuilds a delegate tool instance before entering the agentic loop.
@@ -4846,7 +5152,7 @@ mod tests {
                 test_security(),
             ))])));
 
-        let model_provider = OneToolThenFinalModelProvider;
+        let model_provider = ToolCountModelProvider { expected_tools: 0 };
         let result = tool
             .execute_agentic(
                 "agentic",
@@ -4931,6 +5237,122 @@ mod tests {
             "delegate sub-loop should apply the target runtime profile's max_tool_result_chars, got: {}",
             tool_message
         );
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_rejects_empty_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok(" \n\t".to_string()),
+        );
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_rejects_think_only_terminal_completion() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Ok("<think>internal reasoning</think>".to_string()),
+        );
+
+        assert!(!result.success, "think-only terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("delegate"));
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_projects_typed_terminal_failure() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "test-provider",
+            "test-model",
+            Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            )),
+        );
+
+        assert!(!result.success);
+        assert!(result.output.is_empty());
+        let expected = invalid_semantic_completion_error("delegate");
+        assert_eq!(result.error.as_deref(), Some(expected.as_str()));
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_terminal_completion() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(Vec::new()))
+            .with_parent_tools(Arc::new(RwLock::new(Vec::new())));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &EmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert_eq!(error, invalid_semantic_completion_error("agentic"));
+        assert!(!error.contains("[Empty response]"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn execute_agentic_rejects_empty_completion_after_tool_result() {
+        let config = agentic_agent_config();
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_runtime_profiles(agentic_runtime_profiles(10))
+            .with_risk_profiles(agentic_risk_profiles(vec!["echo_tool".to_string()]))
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "test-provider",
+                "test-model",
+                &ToolThenEmptyTerminalModelProvider,
+                "run",
+                Some(0.2),
+            )
+            .await
+            .expect("delegate returns a failed tool result rather than an error");
+
+        assert!(!result.success, "empty terminal completion must fail");
+        assert!(
+            result.output.is_empty(),
+            "failed delegate must not emit output"
+        );
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert!(!error.contains("[Empty response]"), "{error}");
     }
 
     #[tokio::test]
@@ -5158,6 +5580,10 @@ mod tests {
 
     struct FinalOnlyModelProvider;
 
+    struct EmptyTerminalModelProvider;
+
+    struct ToolThenEmptyTerminalModelProvider;
+
     #[async_trait]
     impl ModelProvider for FinalOnlyModelProvider {
         async fn chat_with_system(
@@ -5194,6 +5620,108 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "FinalOnlyModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for EmptyTerminalModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: Some("reasoning only".to_string()),
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "EmptyTerminalModelProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ToolThenEmptyTerminalModelProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            if request
+                .messages
+                .iter()
+                .any(|message| message.role == "tool")
+            {
+                return Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: Some("reasoning only".to_string()),
+                });
+            }
+
+            Ok(ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_string(),
+                    name: "echo_tool".to_string(),
+                    arguments: "{\"value\":\"ping\"}".to_string(),
+                    extra_content: None,
+                }],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ToolThenEmptyTerminalModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ToolThenEmptyTerminalModelProvider"
         }
     }
 
@@ -5249,6 +5777,282 @@ mod tests {
         fn alias(&self) -> &str {
             "ToolCountModelProvider"
         }
+    }
+
+    #[derive(Debug)]
+    struct RecordedThinkingRequest {
+        thinking_budget: Option<u32>,
+        system_prompt: Option<String>,
+        temperature: Option<f64>,
+    }
+
+    #[derive(Default)]
+    struct ThinkingRecordingModelProvider {
+        requests: std::sync::Mutex<Vec<RecordedThinkingRequest>>,
+    }
+
+    impl ThinkingRecordingModelProvider {
+        fn request(&self) -> RecordedThinkingRequest {
+            let mut requests = self.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1, "expected exactly one provider request");
+            requests.pop().unwrap()
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ThinkingRecordingModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("tool loop must use ChatRequest")
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let thinking_budget = request.thinking.map(|params| params.budget_tokens);
+            let system_prompt = request
+                .messages
+                .iter()
+                .find(|message| message.role == "system")
+                .map(|message| message.content.clone());
+            self.requests.lock().unwrap().push(RecordedThinkingRequest {
+                thinking_budget,
+                system_prompt,
+                temperature,
+            });
+            Ok(ChatResponse {
+                text: Some("delegate complete".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ThinkingRecordingModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ThinkingRecordingModelProvider"
+        }
+    }
+
+    fn thinking_delegate_fixture(
+        mode: DelegateExecutionMode,
+        thinking: ThinkingConfig,
+    ) -> (DelegateTool, AliasedAgentConfig) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.risk_profiles.insert(
+            "caller".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "target-runtime".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                thinking,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                risk_profile: "caller".into(),
+                model_provider: "custom.unused".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let target = AliasedAgentConfig {
+            risk_profile: "target".into(),
+            runtime_profile: "target-runtime".into(),
+            model_provider: "custom.unused".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("target".to_string(), target.clone());
+
+        let config = Arc::new(config);
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(Arc::clone(&config))
+            .with_caller_alias("caller")
+            .with_runtime(Arc::new(DelegateTestRuntime))
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+        (tool, target)
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_uses_target_native_thinking_and_restores_parent_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "the target scope must not leak into the parent turn"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(50_000));
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_delegate_prepends_target_non_native_thinking_prompt() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: false,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Independent, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+                assert_eq!(
+                    zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                        .try_with(Clone::clone)
+                        .unwrap(),
+                    parent,
+                    "a non-native target must clear the override only inside its child scope"
+                );
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, None);
+        assert!(
+            request
+                .system_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.starts_with("Think very carefully and exhaustively.")),
+            "target thinking prefix must precede the delegated system prompt: {request:?}"
+        );
+        assert!(
+            request
+                .temperature
+                .is_some_and(|temperature| (temperature - 0.3).abs() < f64::EPSILON)
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_delegate_retains_parent_thinking_scope() {
+        let target_thinking = ThinkingConfig {
+            default_level: ThinkingLevel::Max,
+            native_thinking: true,
+            ..ThinkingConfig::default()
+        };
+        let (tool, target) =
+            thinking_delegate_fixture(DelegateExecutionMode::Bounded, target_thinking);
+        let provider = ThinkingRecordingModelProvider::default();
+        let parent = Some(zeroclaw_config::scattered_types::NativeThinkingParams {
+            budget_tokens: 10_000,
+        });
+
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(parent, async {
+                let result = tool
+                    .execute_agentic(
+                        "target",
+                        &target,
+                        "custom",
+                        "test-model",
+                        &provider,
+                        "analyze this",
+                        Some(0.2),
+                    )
+                    .await
+                    .unwrap();
+                assert!(result.success, "{result:?}");
+            })
+            .await;
+
+        let request = provider.request();
+        assert_eq!(request.thinking_budget, Some(10_000));
+        assert_eq!(request.temperature, Some(0.2));
     }
 
     #[tokio::test]
@@ -7812,58 +8616,717 @@ command = "echo hi"
         );
     }
 
-    #[tokio::test]
-    async fn delegate_builds_target_provider_with_its_declared_wire_api() {
+    fn fallback_delegate_config(
+        primary_uri: String,
+        backup_uri: String,
+        agentic: bool,
+    ) -> (Arc<Config>, TempDir) {
+        fallback_delegate_config_with_native_tools(primary_uri, backup_uri, agentic, None, None)
+    }
+
+    fn fallback_delegate_config_with_native_tools(
+        primary_uri: String,
+        backup_uri: String,
+        agentic: bool,
+        primary_native_tools: Option<bool>,
+        backup_native_tools: Option<bool>,
+    ) -> (Arc<Config>, TempDir) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
         use zeroclaw_config::schema::{
-            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig, WireApi,
+            AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+            RiskProfileConfig, RuntimeProfileConfig,
         };
-        let mut config = Config::default();
+
+        let temp_dir = TempDir::new().expect("temporary delegate fixture directory");
+        let mut config = Config {
+            data_dir: temp_dir.path().join("data"),
+            config_path: temp_dir.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.provider_backoff_ms = 1;
         config.providers.models.custom.insert(
-            "vllm".to_string(),
+            "primary".to_string(),
             CustomModelProviderConfig {
                 base: ModelProviderConfig {
-                    uri: Some("http://10.0.0.15:8000/v1".to_string()),
-                    model: Some("Qwen3.6-27B".to_string()),
-                    wire_api: Some(WireApi::Responses),
+                    uri: Some(primary_uri),
+                    model: Some("primary-model".to_string()),
+                    native_tools: primary_native_tools,
+                    fallback: vec![zeroclaw_config::providers::ModelProviderRef::new(
+                        "custom.backup",
+                    )],
                     ..ModelProviderConfig::default()
                 },
             },
         );
-        config.agents.insert(
-            "target".to_string(),
-            AliasedAgentConfig {
-                model_provider: "custom.vllm".into(),
-                ..AliasedAgentConfig::default()
+        config.providers.models.custom.insert(
+            "backup".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(backup_uri),
+                    // This deliberately matches the primary model. The two aliases
+                    // still represent distinct configured candidates.
+                    model: Some("primary-model".to_string()),
+                    native_tools: backup_native_tools,
+                    ..ModelProviderConfig::default()
+                },
             },
         );
-        let config = Arc::new(config);
+        config.risk_profiles.insert(
+            "delegating".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.runtime_profiles.insert(
+            "review".to_string(),
+            RuntimeProfileConfig {
+                agentic,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        for agent in ["caller", "target"] {
+            config.agents.insert(
+                agent.to_string(),
+                AliasedAgentConfig {
+                    model_provider: "custom.primary".into(),
+                    risk_profile: "delegating".into(),
+                    runtime_profile: "review".into(),
+                    ..AliasedAgentConfig::default()
+                },
+            );
+        }
 
-        let tool = DelegateTool::new(sample_agents(), None, test_security())
-            .with_root_config(Arc::clone(&config));
+        (Arc::new(config), temp_dir)
+    }
 
-        // Drives the exact build path `run` takes. With root_config + a
-        // dotted model_provider, the alias-aware factory must read the
-        // target's `custom.vllm` entry and honor wire_api = responses.
-        let provider = tool
-            .build_target_provider("custom.vllm", "custom", None)
-            .expect("target provider builds offline");
+    fn fallback_delegate_tool(config: Arc<Config>, workspace_dir: Option<PathBuf>) -> DelegateTool {
+        let caller_policy =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let tool = DelegateTool::new(config.agents.clone(), None, caller_policy)
+            .with_root_config(config.clone())
+            .with_caller_alias("caller")
+            .with_risk_profiles(config.risk_profiles.clone())
+            .with_runtime_profiles(config.runtime_profiles.clone());
+
+        match workspace_dir {
+            Some(workspace_dir) => tool.with_workspace_dir(workspace_dir),
+            None => tool,
+        }
+    }
+
+    fn assert_generic_fallback_warning(output: &str, primary_uri: &str) {
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
         assert_eq!(
-            provider.default_wire_api(),
-            "responses",
-            "delegate must build the target with its declared responses wire API"
+            output.matches(&warning).count(),
+            1,
+            "recovered delegate result must include exactly one generic warning: {output:?}"
+        );
+        assert!(
+            !output.contains(primary_uri),
+            "recovered output must not expose the primary endpoint: {output:?}"
+        );
+        assert!(
+            !output.contains("synthetic primary failure"),
+            "recovered output must not expose provider error details: {output:?}"
+        );
+    }
+
+    fn assert_explicit_fallback_attribution(output: &str, agentic: bool) {
+        let header_key = if agentic {
+            "delegate-provider-fallback-header-agentic"
+        } else {
+            "delegate-provider-fallback-header"
+        };
+        let header = crate::i18n::get_required_cli_string_with_args(
+            header_key,
+            &[
+                ("agent", "target"),
+                ("requested_provider", "custom.primary"),
+                ("requested_model", "primary-model"),
+                ("actual_provider", "custom.backup"),
+                // The same model proves this is exact candidate attribution, not a model switch.
+                ("actual_model", "primary-model"),
+            ],
+        );
+        assert_eq!(
+            output.matches(&header).count(),
+            1,
+            "recovered output must identify the requested and served candidates exactly once: \
+             {output:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_fallback_warning_is_local_to_synchronous_call() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["fallback reply"]).await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "fallback should recover: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(result.output.contains("fallback reply"), "{result:?}");
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), true);
+        assert!(
+            outer_fallback.is_none(),
+            "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn agentic_delegate_attributes_final_primary_response_after_earlier_fallback() {
+        let (primary, primary_requests) = start_primary_failure_then_final_chat_server().await;
+        let (backup, backup_requests) = start_tool_call_chat_server().await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("agentic delegate completes");
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the primary must be retried on the post-tool model request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the backup must serve only the tool-call response"
+        );
+        assert!(result.output.contains("final primary reply"), "{result:?}");
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !result.output.contains(&warning),
+            "a final primary response must not carry stale fallback attribution: {result:?}"
+        );
+        assert!(
+            !result.output.contains("custom.backup"),
+            "the final primary response must not be labeled as backup-served: {result:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn agentic_delegate_uses_text_tools_when_only_its_fallback_supports_them() {
+        // The primary advertises native tools but fails. The text-only fallback
+        // must receive the XML protocol and execute its tool, rather than a
+        // native request that it cannot reliably interpret.
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let (backup, backup_requests, backup_bodies) =
+            start_text_tool_then_final_chat_server().await;
+        let (config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            primary.uri.clone(),
+            backup.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let tool = fallback_delegate_tool(config, None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("agentic delegate completes");
+
+        assert!(result.success, "agentic delegate failed: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must receive the initial failing request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the fallback must receive the tool request and the final response request"
+        );
+        assert!(result.output.contains("fallback final reply"), "{result:?}");
+
+        let bodies = backup_bodies.lock().unwrap();
+        let first_request = http_request_json(bodies.first().expect("first fallback request"));
+        assert!(
+            first_request.get("tools").is_none(),
+            "the text-only fallback must not receive native tool specifications: {first_request}"
+        );
+        let system_prompt = first_request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("fallback request contains a text system prompt");
+        for required in ["## Tool Use Protocol", "<tool_call>", "echo_tool", "value"] {
+            assert!(
+                system_prompt.contains(required),
+                "fallback prompt must contain {required:?}: {system_prompt}"
+            );
+        }
+        assert!(
+            bodies
+                .get(1)
+                .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
+            "the second fallback request must contain the executed tool result: {bodies:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn routed_agentic_delegate_uses_selected_models_text_tool_protocol() {
+        let (default, default_requests) = start_failing_chat_server(503).await;
+        let (routed, routed_requests, routed_bodies) =
+            start_text_tool_then_final_chat_server().await;
+        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            default.uri.clone(),
+            routed.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let mut config = (*fixture_config).clone();
+        let primary = &mut config
+            .providers
+            .models
+            .custom
+            .get_mut("primary")
+            .expect("primary provider")
+            .base;
+        primary.model = Some("hint:text".to_string());
+        primary.fallback.clear();
+        config
+            .providers
+            .models
+            .custom
+            .get_mut("backup")
+            .expect("routed provider")
+            .base
+            .model = Some("routed-model".to_string());
+        config.model_routes.push(ModelRouteConfig {
+            hint: "text".to_string(),
+            model_provider: "custom.backup".to_string(),
+            model: "routed-model".to_string(),
+            api_key: None,
+        });
+        let tool = fallback_delegate_tool(Arc::new(config), None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool, then answer"}))
+            .await
+            .expect("routed agentic delegate completes");
+
+        assert!(result.success, "routed delegate failed: {result:?}");
+        assert_eq!(
+            default_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the Router default must not receive a hinted request"
+        );
+        assert_eq!(
+            routed_requests.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the selected route must receive both tool-loop requests"
+        );
+        assert!(result.output.contains("fallback final reply"), "{result:?}");
+
+        let bodies = routed_bodies.lock().unwrap();
+        let first_request = http_request_json(bodies.first().expect("first routed request"));
+        assert_eq!(first_request["model"], "routed-model");
+        assert!(
+            first_request.get("tools").is_none(),
+            "the text-only selected route must not receive native tools: {first_request}"
+        );
+        let system_prompt = first_request["messages"]
+            .as_array()
+            .and_then(|messages| messages.iter().find(|message| message["role"] == "system"))
+            .and_then(|message| message["content"].as_str())
+            .expect("routed request contains a text system prompt");
+        for required in ["## Tool Use Protocol", "<tool_call>", "echo_tool", "value"] {
+            assert!(
+                system_prompt.contains(required),
+                "routed prompt must contain {required:?}: {system_prompt}"
+            );
+        }
+        assert!(
+            bodies
+                .get(1)
+                .is_some_and(|body| body.windows(13).any(|part| part == b"echo:fallback")),
+            "the second routed request must contain the tool result: {bodies:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn strict_mixed_agentic_delegate_fails_before_provider_dispatch() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let (backup, backup_requests) = start_failing_chat_server(503).await;
+        let (fixture_config, _fixture_dir) = fallback_delegate_config_with_native_tools(
+            primary.uri.clone(),
+            backup.uri.clone(),
+            true,
+            Some(true),
+            Some(false),
+        );
+        let mut config = (*fixture_config).clone();
+        config
+            .runtime_profiles
+            .get_mut("review")
+            .expect("review runtime profile")
+            .strict_tool_parsing = true;
+        let tool = fallback_delegate_tool(Arc::new(config), None)
+            .with_parent_tools(Arc::new(RwLock::new(vec![Arc::new(EchoTool)])));
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "use the echo tool"}))
+            .await
+            .expect("delegate returns a terminal tool result");
+
+        assert!(!result.success, "strict mixed chain must fail: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "terminal failure has no output: {result:?}"
+        );
+        let expected =
+            crate::i18n::get_required_cli_string("turn-tool-protocol-strict-mixed-error");
+        let error = result.error.expect("strict mixed chain returns an error");
+        assert!(error.contains(&expected), "unexpected error: {error}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "strict mixed validation must precede the primary request"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "strict mixed validation must precede fallback dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_agentic_delegate_preserves_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["non-agentic fallback reply"]).await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "fallback should recover: {result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(
+            result.output.contains("non-agentic fallback reply"),
+            "{result:?}"
+        );
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), false);
+        assert!(
+            outer_fallback.is_none(),
+            "delegate fallback must not leak into the parent channel scope: {outer_fallback:?}"
+        );
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn background_delegate_persists_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["background fallback reply"]).await;
+        let workspace = TempDir::new().expect("temporary workspace");
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
+
+        let (start, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let start = tool
+                    .execute(json!({
+                        "agent": "target",
+                        "prompt": "respond",
+                        "background": true,
+                    }))
+                    .await
+                    .expect("background delegate starts");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (start, outer_fallback)
+            })
+            .await;
+
+        assert!(start.success, "background start failed: {start:?}");
+        assert!(
+            outer_fallback.is_none(),
+            "background delegate fallback must not leak into its parent scope: {outer_fallback:?}"
+        );
+        let task_id = start
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        let result = wait_for_terminal_background_result(workspace.path(), task_id).await;
+
+        assert_eq!(result.status, BackgroundTaskStatus::Completed, "{result:?}");
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        let output = result.output.as_deref().expect("completed output");
+        assert!(output.contains("background fallback reply"), "{result:?}");
+        assert_generic_fallback_warning(output, &primary.uri);
+        assert_explicit_fallback_attribution(output, true);
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn parallel_delegate_preserves_generic_fallback_warning() {
+        let (primary, primary_requests) = start_failing_chat_server(503).await;
+        let backup = start_final_chat_server(vec!["parallel fallback reply"]).await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"parallel": ["target"], "prompt": "respond"}))
+                    .await
+                    .expect("parallel delegate completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(result.success, "parallel delegate failed: {result:?}");
+        assert!(
+            outer_fallback.is_none(),
+            "parallel delegate fallback must not leak into the parent scope: {outer_fallback:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert!(
+            result.output.contains("parallel fallback reply"),
+            "{result:?}"
+        );
+        assert_generic_fallback_warning(result.output.as_str(), &primary.uri);
+        assert_explicit_fallback_attribution(result.output.as_str(), true);
+        assert!(result.error.is_none(), "{result:?}");
+    }
+
+    #[tokio::test]
+    async fn delegate_returns_safe_ordered_summary_when_fallbacks_exhaust() {
+        let (primary, primary_requests) =
+            start_failing_chat_server_with_error(503, "primary failure marker").await;
+        let (backup, backup_requests) =
+            start_failing_chat_server_with_error(503, "backup failure marker").await;
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, None);
+
+        let (result, outer_fallback) =
+            zeroclaw_providers::reliable::scope_provider_fallback(async {
+                let result = tool
+                    .execute(json!({"agent": "target", "prompt": "respond"}))
+                    .await
+                    .expect("delegate call completes");
+                let outer_fallback = zeroclaw_providers::reliable::take_last_provider_fallback();
+                (result, outer_fallback)
+            })
+            .await;
+
+        assert!(!result.success, "exhaustion must be terminal: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "terminal error must not carry output: {result:?}"
+        );
+        assert!(
+            outer_fallback.is_none(),
+            "failed delegation must not leave recovery metadata in the parent scope: {outer_fallback:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured fallback must be attempted exactly once"
+        );
+        let error = result.error.expect("terminal delegate error");
+        assert!(
+            error.contains("All model providers/models failed after 2 failure event(s)"),
+            "terminal error summarizes every failure event: {error}"
+        );
+        assert!(
+            error.contains("event 1 (retry 1/1): retryable")
+                && error.contains("event 2 (retry 1/1): retryable"),
+            "summary preserves event order: {error}"
+        );
+        assert!(
+            !error.contains("primary failure marker") && !error.contains("backup failure marker"),
+            "provider-controlled response bodies must not reach the caller: {error}"
+        );
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !error.contains(&warning),
+            "terminal errors must remain errors rather than recovery warnings: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_timeout_stays_distinct_from_provider_exhaustion() {
+        let (primary, _primary_requests) = start_slow_chat_server(Duration::from_secs(2)).await;
+        let (backup, backup_requests) = start_failing_chat_server(503).await;
+        let (fixture_config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), false);
+        let mut config = (*fixture_config).clone();
+        config
+            .runtime_profiles
+            .get_mut("review")
+            .expect("review runtime profile")
+            .delegation_timeout_secs = Some(1);
+        let tool = fallback_delegate_tool(Arc::new(config), None);
+
+        let result = tool
+            .execute(json!({"agent": "target", "prompt": "respond"}))
+            .await
+            .expect("delegate call completes");
+
+        assert!(!result.success, "timeout must remain terminal: {result:?}");
+        assert!(
+            result.output.is_empty(),
+            "timeout must not carry output: {result:?}"
+        );
+        let error = result.error.expect("timeout error");
+        assert_eq!(error, "Agent 'target' timed out after 1s");
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "outer timeout must not be converted into fallback exhaustion"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_delegate_persists_safe_summary_when_fallbacks_exhaust() {
+        let (primary, primary_requests) =
+            start_failing_chat_server_with_error(503, "background primary failure marker").await;
+        let (backup, backup_requests) =
+            start_failing_chat_server_with_error(503, "background backup failure marker").await;
+        let workspace = TempDir::new().expect("temporary workspace");
+        let (config, _fixture_dir) =
+            fallback_delegate_config(primary.uri.clone(), backup.uri.clone(), true);
+        let tool = fallback_delegate_tool(config, Some(workspace.path().to_path_buf()));
+
+        let start = tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "respond",
+                "background": true,
+            }))
+            .await
+            .expect("background delegate starts");
+        let task_id = start
+            .output
+            .lines()
+            .find_map(|line| line.strip_prefix("task_id: "))
+            .expect("background start includes task id");
+        let persisted = wait_for_terminal_background_result(workspace.path(), task_id).await;
+
+        assert_eq!(
+            persisted.status,
+            BackgroundTaskStatus::Failed,
+            "{persisted:?}"
+        );
+        assert_eq!(
+            primary_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the controlled primary must be attempted exactly once"
+        );
+        assert_eq!(
+            backup_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the configured fallback must be attempted exactly once"
+        );
+        let persisted_error = persisted
+            .error
+            .as_deref()
+            .expect("persisted failure detail");
+        assert!(
+            persisted_error.contains("All model providers/models failed after 2 failure event(s)")
+                && persisted_error.contains("event 1 (retry 1/1): retryable")
+                && persisted_error.contains("event 2 (retry 1/1): retryable"),
+            "persisted error must contain the safe ordered summary: {persisted_error}"
+        );
+        assert!(
+            !persisted_error.contains("background primary failure marker")
+                && !persisted_error.contains("background backup failure marker"),
+            "provider-controlled response bodies must not persist: {persisted_error}"
         );
 
-        let stale = zeroclaw_providers::create_model_provider_with_options(
-            "custom",
-            None,
-            &tool.provider_runtime_options,
-        );
-        let stale_is_responses = stale
-            .map(|p| p.default_wire_api() == "responses")
-            .unwrap_or(false);
+        let result = tool
+            .execute(json!({"action": "check_result", "task_id": task_id}))
+            .await
+            .expect("check_result completes");
         assert!(
-            !stale_is_responses,
-            "bare factory must NOT yield a responses provider — proves the alias path is load-bearing"
+            !result.success,
+            "terminal background failure is not success: {result:?}"
+        );
+        let error = result
+            .error
+            .expect("caller receives background failure detail");
+        assert!(
+            error.contains("All model providers/models failed after 2 failure event(s)")
+                && error.contains("event 1 (retry 1/1): retryable")
+                && error.contains("event 2 (retry 1/1): retryable"),
+            "check_result returns the same safe summary: {error}"
+        );
+        assert!(
+            !error.contains("background primary failure marker")
+                && !error.contains("background backup failure marker"),
+            "provider-controlled response bodies must not reach check_result: {error}"
+        );
+        let warning = crate::i18n::get_required_cli_string("delegate-provider-fallback-warning");
+        assert!(
+            !error.contains(&warning),
+            "terminal background errors must not become recovery warnings: {error}"
         );
     }
 

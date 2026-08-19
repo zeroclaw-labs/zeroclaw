@@ -29,6 +29,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 chrono-tz = "0.10"
 console = "0.16"
 cron = "0.15"
+# Raw-mode terminal secret input (cli_input::SecretInput). Blocking
+# `event::read()` only — no EventStream, so default features suffice.
+crossterm = "0.29"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
@@ -38,7 +41,7 @@ hmac = "0.12"
 hostname = "0.4.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 indicatif = "0.18"
-lru = "0.16"
+lru = "0.18.2"
 mime_guess = "2"
 nanohtml2text = "0.2"
 parking_lot = "0.12"

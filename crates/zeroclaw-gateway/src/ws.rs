@@ -200,6 +200,29 @@ pub async fn handle_ws_chat(
 /// Gateway session key prefix to avoid collisions with channel sessions.
 const GW_SESSION_PREFIX: &str = "gw_";
 
+fn websocket_ping_interval(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<tokio::time::Interval> {
+    let seconds = config.gateway.websocket_ping_interval_secs;
+    if seconds == 0 {
+        return None;
+    }
+
+    let period = Duration::from_secs(seconds);
+    let start = tokio::time::Instant::now().checked_add(period)?;
+    let mut interval = tokio::time::interval_at(start, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    Some(interval)
+}
+
+async fn tick_websocket_ping(interval: &mut Option<tokio::time::Interval>) {
+    if let Some(interval) = interval.as_mut() {
+        interval.tick().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
 async fn resolve_ws_memory_handle(
     config: &zeroclaw_config::schema::Config,
     agent_alias: &str,
@@ -393,10 +416,21 @@ async fn handle_socket(
 
     let mut first_msg_fallback: Option<String> = None;
     let mut requested_cwd = session_cwd;
+    let mut ping_interval = websocket_ping_interval(&config);
 
-    if let Some(first) = receiver.next().await {
+    loop {
+        let first = tokio::select! {
+            first = receiver.next() => first,
+            _ = tick_websocket_ping(&mut ping_interval) => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+        };
+
         match first {
-            Ok(Message::Text(text)) => {
+            Some(Ok(Message::Text(text))) => {
                 if let Ok(cp) = serde_json::from_str::<ConnectParams>(&text) {
                     if cp.msg_type == "connect" {
                         ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"session_id": cp.session_id, "device_name": cp.device_name, "capabilities": cp.capabilities, "cwd": cp.cwd})), "WebSocket connect params received");
@@ -429,9 +463,16 @@ async fn handle_socket(
                     // Not parseable as ConnectParams — fall through
                     first_msg_fallback = Some(text.to_string());
                 }
+                break;
             }
-            Ok(Message::Close(_)) | Err(_) => return,
-            _ => {}
+            Some(Ok(Message::Ping(payload))) => {
+                if sender.send(Message::Pong(payload)).await.is_err() {
+                    return;
+                }
+            }
+            Some(Ok(Message::Pong(_))) => {}
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+            Some(Ok(_)) => {}
         }
     }
 
@@ -556,8 +597,7 @@ async fn handle_socket(
     if let Some(ref text) = first_msg_fallback {
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
-                if !content.is_empty() {
+                if let Some(content) = first_chat_message_content(text) {
                     let _session_guard = match state.session_queue.acquire(&session_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -577,6 +617,7 @@ async fn handle_socket(
                         &mut receiver,
                         &mut approval_event_rx,
                         &pending_approvals,
+                        &mut ping_interval,
                         &ws_memory,
                         &content,
                         &session_key,
@@ -610,11 +651,23 @@ async fn handle_socket(
 
     loop {
         tokio::select! {
+            // ── Keepalive ─────────────────────────────────────────────
+            _ = tick_websocket_ping(&mut ping_interval) => {
+                if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+
             // ── Client message ────────────────────────────────────────
             client_msg = receiver.next() => {
                 let Some(msg) = client_msg else { break };
                 let msg = match msg {
                     Ok(Message::Text(text)) => text,
+                    Ok(Message::Ping(payload)) => {
+                        if sender.send(Message::Pong(payload)).await.is_err() { break; }
+                        continue;
+                    }
+                    Ok(Message::Pong(_)) => continue,
                     Ok(Message::Close(_)) | Err(_) => break,
                     _ => continue,
                 };
@@ -736,6 +789,7 @@ async fn handle_socket(
                     &mut receiver,
                     &mut approval_event_rx,
                     &pending_approvals,
+                    &mut ping_interval,
                     &ws_memory,
                     &content,
                     &session_key,
@@ -903,6 +957,13 @@ fn needs_onboarding_ws_error(
     }))
 }
 
+fn first_chat_message_content(text: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    (parsed["type"].as_str() == Some("message"))
+        .then(|| parsed["content"].as_str().unwrap_or("").to_string())
+        .filter(|content| !content.is_empty())
+}
+
 fn event_matches_session(event: &serde_json::Value, session_id: &str) -> bool {
     match event.get("session_id").and_then(|value| value.as_str()) {
         Some(event_session_id) => event_session_id == session_id,
@@ -932,6 +993,7 @@ async fn process_chat_message(
     receiver: &mut futures_util::stream::SplitStream<WebSocket>,
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     pending_approvals: &PendingApprovals,
+    ping_interval: &mut Option<tokio::time::Interval>,
     ws_memory: &Option<Arc<dyn zeroclaw_memory::Memory>>,
     content: &str,
     session_key: &str,
@@ -1047,7 +1109,6 @@ async fn process_chat_message(
     // (replaces on each TurnEvent::Usage; not accumulated).
     // Used for accurate context-bar rendering on the client.
     let mut last_input_tokens: Option<u64> = None;
-
     let forward_fut = async {
         let mut cancel_drained = false;
         loop {
@@ -1065,6 +1126,14 @@ async fn process_chat_message(
                 client_msg = receiver.next() => {
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Ping(payload))) => {
+                            if sender.send(Message::Pong(payload)).await.is_err() {
+                                cancel_token.cancel();
+                                break;
+                            }
+                            continue;
+                        }
+                        Some(Ok(Message::Pong(_))) => continue,
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
                             cancel_token.cancel();
                             break;
@@ -1163,6 +1232,12 @@ async fn process_chat_message(
                             "timeout_secs": timeout_secs,
                         });
                         let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                    }
+                }
+                _ = tick_websocket_ping(ping_interval) => {
+                    if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
+                        cancel_token.cancel();
+                        break;
                     }
                 }
                     event_opt = event_rx.recv() => {
@@ -1456,31 +1531,15 @@ async fn process_chat_message(
                     .with_attrs(::serde_json::json!({"error": format!("{}", e.error)})),
                 "Agent turn failed"
             );
-            let sanitized = zeroclaw_providers::sanitize_api_error(&e.error.to_string());
-            let error_code = if sanitized.to_lowercase().contains("api key")
-                || sanitized.to_lowercase().contains("authentication")
-                || sanitized.to_lowercase().contains("unauthorized")
-            {
-                "AUTH_ERROR"
-            } else if sanitized.to_lowercase().contains("model_provider")
-                || sanitized.to_lowercase().contains("model")
-            {
-                "PROVIDER_ERROR"
-            } else {
-                "AGENT_ERROR"
-            };
-            let err = serde_json::json!({
-                "type": "error",
-                "message": sanitized,
-                "code": error_code,
-            });
-            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            let user_message =
+                zeroclaw_runtime::agent::terminal_completion_error_message(&e.error, None);
+            let err = send_ws_turn_failure(sender, &e.error, user_message.as_deref()).await;
 
             // Broadcast error event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "error",
                 "component": "ws_chat",
-                "message": sanitized,
+                "message": err["message"],
             }));
 
             // Trace the failed turn so the doctor / replay tool sees the
@@ -1494,8 +1553,8 @@ async fn process_chat_message(
                         "model_provider": provider_label,
                         "model": turn_model,
                         "session_key": session_key,
-                        "error": sanitized,
-                        "error_code": error_code,
+                        "error": zeroclaw_providers::sanitize_api_error(&e.error.to_string()),
+                        "error_code": err["code"],
                         "trace_id": turn_id,
                     })),
                 "gateway_ws_turn"
@@ -1504,10 +1563,380 @@ async fn process_chat_message(
     }
 }
 
+/// Serialize a failed turn for the WebSocket boundary without letting a
+/// localized user message alter the stable diagnostic used for classification.
+fn ws_turn_failure_frame(
+    diagnostic: &str,
+    user_message: Option<&str>,
+    is_terminal_provider_failure: bool,
+) -> serde_json::Value {
+    let sanitized = zeroclaw_providers::sanitize_api_error(diagnostic);
+    let error_code = if is_terminal_provider_failure {
+        "PROVIDER_ERROR"
+    } else if sanitized.to_lowercase().contains("api key")
+        || sanitized.to_lowercase().contains("authentication")
+        || sanitized.to_lowercase().contains("unauthorized")
+    {
+        "AUTH_ERROR"
+    } else if sanitized.to_lowercase().contains("model_provider")
+        || sanitized.to_lowercase().contains("model")
+    {
+        "PROVIDER_ERROR"
+    } else {
+        "AGENT_ERROR"
+    };
+    serde_json::json!({
+        "type": "error",
+        "message": user_message.unwrap_or(&sanitized),
+        "code": error_code,
+    })
+}
+
+async fn send_ws_turn_failure<S>(
+    sender: &mut S,
+    error: &anyhow::Error,
+    user_message: Option<&str>,
+) -> serde_json::Value
+where
+    S: futures_util::Sink<Message> + Unpin,
+{
+    let frame = ws_turn_failure_frame(&error.to_string(), user_message, user_message.is_some());
+    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderMap;
+    use axum::{
+        Json, Router,
+        http::{HeaderMap, header},
+        routing::{get, post},
+    };
+    use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+    #[test]
+    fn ws_terminal_failure_uses_localized_message_without_reclassifying_diagnostic() {
+        let diagnostic = "provider completed without final text or tool calls";
+        let localized = "Réponse terminale invalide.";
+
+        let frame = ws_turn_failure_frame(diagnostic, Some(localized), true);
+
+        assert_eq!(frame["type"], "error");
+        assert_eq!(frame["message"], "Réponse terminale invalide.");
+        assert_eq!(frame["code"], "PROVIDER_ERROR");
+        assert!(
+            !frame["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(diagnostic),
+            "WebSocket delivery must not fall back to the diagnostic when Fluent supplies text"
+        );
+    }
+
+    #[test]
+    fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error() {
+        // This production-shaped fixture exceeds the Linux test harness's
+        // default stack; isolate only this test instead of weakening CI-wide
+        // stack limits or dropping the real WebSocket boundary coverage.
+        std::thread::Builder::new()
+            .name("ws-empty-terminal-regression".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner());
+            })
+            .expect("spawn WebSocket regression thread")
+            .join()
+            .expect("WebSocket regression thread must not panic");
+    }
+
+    async fn websocket_handler_projects_anthropic_empty_terminal_stream_as_user_error_inner() {
+        // This is a real WebSocket upgrade and a real agent built from live
+        // config. The local Anthropic-shaped server completes an empty SSE
+        // response, then returns an empty non-stream fallback, exercising the
+        // production path through `process_chat_message` to the client.
+        let mock_app = Router::new().route(
+            "/v1/messages",
+            post(|Json(request): Json<serde_json::Value>| async move {
+                if request["stream"].as_bool() == Some(true) {
+                    (
+                        [(header::CONTENT_TYPE, "text/event-stream")],
+                        "event: message_start\n\
+data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_test\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-test\",\"usage\":{\"input_tokens\":1}}}\n\n\
+event: message_delta\n\
+data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n\
+event: message_stop\n\
+data: {\"type\":\"message_stop\"}\n\n",
+                    )
+                        .into_response()
+                } else {
+                    Json(serde_json::json!({
+                        "id": "msg_test",
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-test",
+                        "content": [],
+                        "stop_reason": "end_turn",
+                        "usage": {"input_tokens": 1, "output_tokens": 1}
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local Anthropic fixture");
+        let mock_addr = mock_listener.local_addr().expect("fixture address");
+        let mock_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(mock_listener, mock_app)
+                .await
+                .expect("local Anthropic fixture serves");
+        });
+
+        let tmp = tempfile::tempdir().expect("temporary gateway workspace");
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).expect("gateway workspace");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace.clone(),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.reliability.provider_retries = 0;
+        config.providers.models.anthropic.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    api_key: Some("test-key".to_string()),
+                    uri: Some(format!("http://{mock_addr}")),
+                    model: Some("claude-test".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.risk_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig::default(),
+        );
+        config.runtime_profiles.insert(
+            "fixture".to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            "web".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: "anthropic.fixture".into(),
+                risk_profile: "fixture".into(),
+                runtime_profile: "fixture".into(),
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(workspace),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let state = crate::api::tests::test_state(config);
+        let gateway_app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(state);
+        let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind local WebSocket gateway");
+        let gateway_addr = gateway_listener.local_addr().expect("gateway address");
+        let gateway_server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(gateway_listener, gateway_app)
+                .await
+                .expect("local WebSocket gateway serves");
+        });
+
+        let (mut client, _) = connect_async(format!("ws://{gateway_addr}/ws/chat?agent=web"))
+            .await
+            .expect("WebSocket upgrade");
+        let first = client
+            .next()
+            .await
+            .expect("session_start frame")
+            .expect("session_start");
+        assert!(
+            first
+                .into_text()
+                .expect("text session_start")
+                .contains("session_start")
+        );
+        client
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("connect frame");
+        let connected = client
+            .next()
+            .await
+            .expect("connected frame")
+            .expect("connected");
+        assert!(
+            connected
+                .into_text()
+                .expect("text connected")
+                .contains("connected")
+        );
+        client
+            .send(ClientMessage::Text(
+                r#"{"type":"message","content":"test"}"#.into(),
+            ))
+            .await
+            .expect("chat message");
+
+        let mut terminal_error = None;
+        for _ in 0..8 {
+            let frame = tokio::time::timeout(Duration::from_secs(3), client.next())
+                .await
+                .expect("gateway response deadline")
+                .expect("gateway stays connected")
+                .expect("gateway frame");
+            let text = frame.into_text().expect("text gateway frame");
+            let json: serde_json::Value = serde_json::from_str(&text).expect("JSON gateway frame");
+            if json["type"] == "error" {
+                terminal_error = Some(json);
+                break;
+            }
+        }
+
+        let error = terminal_error.expect("empty terminal response reaches WebSocket client");
+        assert_eq!(error["code"], "PROVIDER_ERROR");
+        assert_eq!(
+            error["message"],
+            zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None),
+        );
+        assert_ne!(
+            error["message"], "provider completed without final text or tool calls",
+            "stable diagnostic must not leak into the user-facing WebSocket frame"
+        );
+
+        gateway_server.abort();
+        mock_server.abort();
+    }
+
+    #[tokio::test]
+    async fn websocket_ping_interval_skips_missed_ticks() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.websocket_ping_interval_secs = 1;
+
+        let interval = websocket_ping_interval(&config).expect("enabled ping interval");
+
+        assert_eq!(
+            interval.missed_tick_behavior(),
+            tokio::time::MissedTickBehavior::Skip
+        );
+    }
+
+    #[test]
+    fn websocket_ping_interval_handles_unvalidated_overflow_without_panicking() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.websocket_ping_interval_secs = u64::MAX;
+
+        assert!(websocket_ping_interval(&config).is_none());
+    }
+
+    #[tokio::test]
+    async fn idle_chat_route_pings_before_and_preserves_the_first_client_message() {
+        use axum::{Router, routing::get};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+        use zeroclaw_config::{
+            multi_agent::MemoryBackendKind,
+            schema::{AliasedAgentConfig, Config},
+        };
+
+        let tmp = tempfile::TempDir::new().expect("temporary config root");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).expect("test data directory");
+        config.gateway.websocket_ping_interval_secs = 1;
+        let mut agent = AliasedAgentConfig::default();
+        agent.memory.backend = MemoryBackendKind::None;
+        config.agents.insert("web".to_string(), agent);
+
+        let app = Router::new()
+            .route("/ws/chat", get(handle_ws_chat))
+            .with_state(crate::api::test_state(config));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test gateway server");
+        });
+
+        let (mut socket, _) = connect_async(format!(
+            // This URL connects only to the test's loopback listener.
+            "ws://{address}/ws/chat?agent=web&session_id=idle-test" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        ))
+        .await
+        .expect("chat WebSocket upgrade");
+
+        let session_start = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .expect("session_start timeout")
+            .expect("session_start frame")
+            .expect("session_start transport");
+        assert!(matches!(session_start, ClientMessage::Text(_)));
+
+        let ping = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("idle ping timeout")
+            .expect("idle ping frame")
+            .expect("idle ping transport");
+        assert!(matches!(ping, ClientMessage::Ping(_)));
+
+        socket
+            .send(ClientMessage::Text(
+                serde_json::json!({"type": "message", "content": "hello"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("first chat message after idle ping");
+
+        let response = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let frame = socket
+                    .next()
+                    .await
+                    .expect("response frame")
+                    .expect("response transport");
+                if let ClientMessage::Text(text) = frame {
+                    break serde_json::from_str::<serde_json::Value>(&text)
+                        .expect("JSON response frame");
+                }
+            }
+        })
+        .await
+        .expect("first chat response timeout");
+
+        assert_eq!(response["code"], "NEEDS_ONBOARDING");
+        server.abort();
+    }
+
+    #[test]
+    fn first_chat_message_content_preserves_the_message_for_dispatch() {
+        let text = serde_json::json!({
+            "type": "message",
+            "content": "hello after an idle keepalive"
+        })
+        .to_string();
+
+        assert_eq!(
+            first_chat_message_content(&text).as_deref(),
+            Some("hello after an idle keepalive")
+        );
+    }
 
     #[test]
     fn ws_turn_has_a_single_channel_identity() {
