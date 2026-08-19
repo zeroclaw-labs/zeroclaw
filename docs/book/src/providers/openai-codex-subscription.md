@@ -202,6 +202,31 @@ zeroclaw auth login --model-provider openai-codex --import ~/.codex/auth.json
 zeroclaw auth status   # openai-codex:default kind=OAuth account=... expires=...
 ```
 
+### Switching between subscription profiles
+
+ZeroClaw can store more than one OpenAI Codex profile, but the selected profile
+is global: every provider entry with `requires_openai_auth = true` uses the same
+active profile. Name each login explicitly, then use the helper script to switch
+without editing provider or agent configuration:
+
+```bash
+zeroclaw auth login --model-provider openai-codex --profile primary
+zeroclaw auth login --model-provider openai-codex --profile backup
+
+CODEX_PRIMARY_PROFILE=primary CODEX_ALT_PROFILE=backup \
+  ./scripts/codex-subscription.sh status
+CODEX_PRIMARY_PROFILE=primary CODEX_ALT_PROFILE=backup \
+  ./scripts/codex-subscription.sh toggle
+```
+
+The helper refuses a missing or expired target, verifies the active profile
+after switching, and never restarts ZeroClaw. Use `use primary`, `use alt`, or
+`use <profile>` when an explicit destination is clearer than `toggle`.
+
+Switching profiles does not change the configured model. All affected agents
+continue using the model named in their provider entry, but authenticate through
+the newly active subscription.
+
 (Interactive alternatives: `zeroclaw auth login` without `--import`, or
 `--device-code`.)
 
