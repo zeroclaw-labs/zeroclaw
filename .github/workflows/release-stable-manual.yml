@@ -777,7 +777,12 @@ jobs:
             "zeroclaw-arm-unknown-linux-gnueabihf.tar.gz"
             "zeroclaw-aarch64-apple-darwin.tar.gz"
             "zeroclaw-x86_64-apple-darwin.tar.gz"
-            "zeroclaw-aarch64-linux-android.tar.gz"
+            # aarch64-linux-android is experimental (continue-on-error): it is
+            # attached to the release when it builds (matched by the zeroclaw-*
+            # artifact download above) but must not block publish when the
+            # allowed-to-fail leg fails. Treated like the desktop-linux/windows
+            # bundles. Promote it back into required_assets only when the
+            # Android build leg drops `experimental: true`.
             "zeroclaw-x86_64-pc-windows-msvc.zip"
             "ZeroClaw.dmg"
             "zeroclaw-${TAG}-sbom.spdx.json"
