@@ -31,6 +31,14 @@
 //! Only the assertion crosses this boundary. It is a one-time signature over
 //! the server's challenge and carries no private key, so a stale or captured
 //! file cannot be replayed against a different challenge.
+//!
+//! The request is published atomically (temp file plus rename) and, on Unix,
+//! created owner-only. Both matter because the reader is a poller rather than
+//! a process that knows when the write finished: without the rename it could
+//! read a truncated document, and without the mode the challenge would sit at
+//! the prevailing umask. The assertion is written by whoever runs the ceremony,
+//! so its permissions are theirs to set; this module consumes and deletes it as
+//! soon as it is read.
 
 #![cfg(feature = "whatsapp-web")]
 
@@ -63,6 +71,48 @@ pub fn request_path(session_path: &str) -> String {
 #[must_use]
 pub fn assertion_path(session_path: &str) -> String {
     format!("{session_path}.passkey-assertion.json")
+}
+
+/// Publish `contents` at `path` atomically, and owner-only where the platform
+/// supports it.
+///
+/// Both properties matter because the file is picked up by a poller — the
+/// operator, or the gateway hook in the follow-up — rather than read once by a
+/// process that knows when the write finished:
+///
+/// * **Atomic.** A plain write leaves a window where a reader sees a truncated
+///   JSON document. Writing to a sibling temp file and renaming is atomic
+///   within a directory on POSIX, so a reader observes either the previous
+///   contents or the complete new ones, never a partial document.
+/// * **Owner-only.** The mode is applied at creation rather than after the
+///   write, so the file is never briefly readable at the prevailing umask. The
+///   temp file is created with `create_new`, so a pre-existing path (a stale
+///   temp, or something planted) is an error rather than something to clobber
+///   or follow.
+async fn publish_private(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt as _;
+
+    let tmp = format!("{path}.tmp");
+    // A previous run that died between create and rename would otherwise make
+    // `create_new` fail forever.
+    let _ = tokio::fs::remove_file(&tmp).await;
+
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // tokio's OpenOptions exposes `mode` inherently on Unix, so no extension
+    // trait is needed. Set at creation, not after: a later `set_permissions`
+    // would leave a window where the challenge is readable at the umask.
+    #[cfg(unix)]
+    options.mode(0o600);
+
+    let mut file = options.open(&tmp).await?;
+    file.write_all(contents).await?;
+    // Flush before the rename so the published name never points at a file
+    // whose contents have not reached disk.
+    file.sync_all().await?;
+    drop(file);
+
+    tokio::fs::rename(&tmp, path).await
 }
 
 /// A [`PasskeyAuthenticator`] that brokers the ceremony through two files
@@ -158,7 +208,7 @@ impl PasskeyAuthenticator for FilePasskeyAuthenticator {
         // server would reject it and burn this attempt for no reason.
         let _ = tokio::fs::remove_file(&assertion_file).await;
 
-        tokio::fs::write(&request_file, request.raw_options_json.as_bytes())
+        publish_private(&request_file, request.raw_options_json.as_bytes())
             .await
             .map_err(|e| PasskeyError::Backend(format!("could not write {request_file}: {e}")))?;
 
@@ -329,6 +379,65 @@ mod tests {
             !tokio::fs::try_exists(&expected_request).await.unwrap(),
             "the request file must be cleaned up once answered"
         );
+    }
+
+    #[tokio::test]
+    async fn a_published_request_is_owner_only_and_leaves_no_temp_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir
+            .path()
+            .join("session.db.passkey-request.json")
+            .to_string_lossy()
+            .into_owned();
+
+        publish_private(&target, br#"{"challenge":"AQID"}"#)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            tokio::fs::read(&target).await.unwrap(),
+            br#"{"challenge":"AQID"}"#.to_vec(),
+            "the published file must carry the exact bytes"
+        );
+        assert!(
+            !tokio::fs::try_exists(format!("{target}.tmp"))
+                .await
+                .unwrap(),
+            "the rename must consume the temp file, not leave it beside the real one"
+        );
+
+        // The request is published for a poller to read, so it must never be
+        // observable at the prevailing umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = tokio::fs::metadata(&target)
+                .await
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "request file must be owner-only");
+        }
+    }
+
+    #[tokio::test]
+    async fn publishing_over_a_stale_temp_file_still_succeeds() {
+        // A run that died between create and rename leaves a temp behind.
+        // Without clearing it, `create_new` would fail on every later attempt
+        // and the channel could never publish another challenge.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir
+            .path()
+            .join("session.db.passkey-request.json")
+            .to_string_lossy()
+            .into_owned();
+        tokio::fs::write(format!("{target}.tmp"), b"leftover")
+            .await
+            .unwrap();
+
+        publish_private(&target, b"fresh").await.unwrap();
+
+        assert_eq!(tokio::fs::read(&target).await.unwrap(), b"fresh".to_vec());
     }
 
     #[tokio::test]
