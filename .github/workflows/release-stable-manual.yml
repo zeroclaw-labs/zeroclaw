@@ -272,8 +272,11 @@ jobs:
         with:
           toolchain: 1.96.1
           targets: ${{ matrix.target }}
+      # Cache every target, including Windows. CI's Windows Clippy job caches the
+      # same x86_64-pc-windows-msvc target with this exact action, so there is no
+      # Windows-specific reason to recompile the release build from scratch each
+      # time. The per-(os, target) prefix keeps each leg's cache isolated.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        if: runner.os != 'Windows'
         with:
           prefix-key: ${{ matrix.os }}-${{ matrix.target }}
 
@@ -777,7 +780,12 @@ jobs:
             "zeroclaw-arm-unknown-linux-gnueabihf.tar.gz"
             "zeroclaw-aarch64-apple-darwin.tar.gz"
             "zeroclaw-x86_64-apple-darwin.tar.gz"
-            "zeroclaw-aarch64-linux-android.tar.gz"
+            # aarch64-linux-android is experimental (continue-on-error): it is
+            # attached to the release when it builds (matched by the zeroclaw-*
+            # artifact download above) but must not block publish when the
+            # allowed-to-fail leg fails. Treated like the desktop-linux/windows
+            # bundles. Promote it back into required_assets only when the
+            # Android build leg drops `experimental: true`.
             "zeroclaw-x86_64-pc-windows-msvc.zip"
             "ZeroClaw.dmg"
             "zeroclaw-${TAG}-sbom.spdx.json"

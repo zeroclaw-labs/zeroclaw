@@ -25,8 +25,9 @@ env:
   CARGO_INCREMENTAL: 0
 
 # ── Runner selection: closed Blacksmith toggle (compile-heavy jobs) ─────────
-# The seven Rust-compiling jobs below (lint, build, check, check-plugin-backends,
-# check-32bit, bench, test) and the Linux `build` matrix entry pick their runner
+# The ten Rust-compiling jobs below (lint, build, check, check-plugin-backends,
+# check-32bit, bench, test, msrv, parallel-runtime-test, installer-drift) and the
+# Linux `build` matrix entry pick their runner
 # from a single boolean Actions variable, mapped here to two pinned choices only:
 #   • CI_USE_BLACKSMITH == 'true'        → blacksmith-8vcpu-ubuntu-2404 (pinned in-workflow)
 #   • any other value / unset (default)  → GitHub-hosted ubuntu-latest (today's behavior)
@@ -416,7 +417,7 @@ jobs:
   msrv:
     name: MSRV (declared floor)
     needs: [fmt, installer-drift]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -437,8 +438,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -620,16 +622,17 @@ jobs:
     name: Parallel Runtime Test
     needs: [parallel-runtime-test-changes]
     if: needs.parallel-runtime-test-changes.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           shared-key: test
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -722,9 +725,70 @@ jobs:
       - name: Run cargo audit (RustSec advisory database)
         run: cargo audit
 
+  # Detect which non-Rust job families a PR actually touches, so a pure-Rust
+  # PR does not spin runners it cannot affect. Cheap and always-on; forces every
+  # family true on push / merge_group so master cache-warming and the required
+  # gate keep exercising the full set. A path-skipped job leaves `CI Required
+  # Gate` green (it only trips on failure/cancelled), and this detector is never
+  # skipped, so a job that should run never is.
+  path-changes:
+    name: Detect changed paths
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+      nix: ${{ steps.filter.outputs.nix }}
+      nix_hash: ${{ steps.filter.outputs.nix_hash }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Non-PR events (push to master, merge_group) always run every gated
+          # job: warms caches and keeps the required gate exercising the full set.
+          case "${{ github.event_name }}" in
+            pull_request) ;;
+            *)
+              {
+                echo "docs=true"
+                echo "nix=true"
+                echo "nix_hash=true"
+                echo "web=true"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          changed="$(mktemp)"
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed"
+
+          emit() {
+            local name="$1" pattern="$2"
+            if grep -Eq "$pattern" "$changed"; then
+              echo "${name}=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "${name}=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          # Any change to this workflow re-runs all gated families.
+          wf='^\.github/workflows/ci\.yml$'
+          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/docs_(quality_gate|links_gate)\.sh$|${wf}"
+          emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
+          emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
+          emit web      "^web/|^\.nvmrc$|${wf}"
+
   nix-eval:
     name: Nix Module Eval
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.nix == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -738,7 +802,8 @@ jobs:
 
   nix-hash-drift:
     name: Nix Hash Drift
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.nix_hash == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -779,7 +844,8 @@ jobs:
 
   docs-style:
     name: Docs Style
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -827,7 +893,7 @@ jobs:
   installer-drift:
     name: Installer Drift
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     outputs:
       all_features: ${{ steps.all_features.outputs.value }}
@@ -838,9 +904,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
@@ -858,7 +925,8 @@ jobs:
 
   web-permission-tests:
     name: Web Permission Tests
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -885,7 +953,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, repo-structure, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

@@ -16359,6 +16359,18 @@ pub struct SecurityConfig {
     /// for those that use only the well-known `64:ff9b::/96` prefix, which is
     /// classified without configuration.
     ///
+    /// RFC 8215 also standardizes `64:ff9b:1::/48` as the local-use NAT64
+    /// block, and it still needs declaring. The public-address validator
+    /// already denies the whole block as non-global, so the default is safe on
+    /// its own. But that non-global check is precisely what the private-host
+    /// opt-in relaxes, and the metadata gate that remains unconditional
+    /// underneath it decodes only the well-known `/96`, not this block. A
+    /// deployment that translates from `64:ff9b:1::/48` must therefore declare
+    /// the specific prefix it uses here; otherwise, once a host is allowed
+    /// through `allowed_private_hosts`, an address in that block reaches the
+    /// translator's embedded IPv4 destination without that destination being
+    /// classified.
+    ///
     /// Declared prefixes may overlap, and an address inside several of them
     /// decodes to a *different* IPv4 destination under each. Validation is
     /// conservative: an address is accepted only when every declared
