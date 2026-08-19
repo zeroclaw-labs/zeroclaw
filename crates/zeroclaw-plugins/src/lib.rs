@@ -5,7 +5,12 @@
 #[cfg(feature = "plugins-wasmtime")]
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
+mod component_config;
+#[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_secrets;
+pub mod config;
 pub mod egress;
 pub mod endpoint;
 pub mod error;
@@ -14,6 +19,8 @@ pub mod instance;
 pub mod registry;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod services;
 pub mod signature;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
@@ -41,11 +48,23 @@ pub struct PluginManifest {
     /// for skill-only plugins, which carry no WASM payload.
     #[serde(default)]
     pub wasm_path: Option<String>,
+    /// Lowercase or uppercase hexadecimal SHA-256 of the exact WASM payload.
+    /// Required for executable plugins when signature policy is strict.
+    #[serde(default)]
+    pub wasm_sha256: Option<String>,
     /// Capabilities this plugin provides
     pub capabilities: Vec<PluginCapability>,
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Draft 2020-12 JSON Schema for this plugin's private config object.
+    /// Required exactly when `config_read` is requested.
+    /// Direct top-level string properties marked `x-secret: true` are withheld
+    /// from public config and served through the scoped secrets import during
+    /// tool execution or channel service calls. Channel calls obtain the
+    /// remaining typed public object through the scoped config import.
+    #[serde(default)]
+    pub config_schema: Option<serde_json::Value>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
