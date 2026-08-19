@@ -28,6 +28,11 @@ pub mod nodes;
 pub mod observability;
 pub mod peers;
 pub mod platform;
+#[cfg(feature = "plugins-wasm")]
+pub(crate) mod plugin_state;
+/// Teardown hook for `plugin remove`; the store itself stays crate-private.
+#[cfg(feature = "plugins-wasm")]
+pub use plugin_state::purge_plugin_state;
 pub mod process_stats;
 pub mod quickstart;
 pub mod rag;
