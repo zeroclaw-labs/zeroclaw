@@ -1902,6 +1902,9 @@ impl Agent {
         fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
         event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> String {
+        if zeroclaw_providers::peek_last_safeguard_fallback().is_some() {
+            return response;
+        }
         let Some(fallback) = fallback else {
             return response;
         };
@@ -3445,6 +3448,31 @@ mod tests {
         let out = Agent::append_model_fallback_notice("hello".to_string(), None, &tx).await;
         assert_eq!(out, "hello");
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn safeguard_notice_suppresses_generic_fallback_text_and_chunk() {
+        zeroclaw_providers::scope_safeguard_fallback(async {
+            zeroclaw_providers::commit_safeguard_fallback(Some(
+                zeroclaw_providers::SafeguardFallbackNotice {
+                    kind: zeroclaw_providers::SafeguardFallbackKind::ClientAndServer,
+                    requested_model: "model-a".to_string(),
+                    served_model: "model-c".to_string(),
+                    category: Some("private-category".to_string()),
+                },
+            ));
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            let info = fallback_info("anthropic", "model-a", "anthropic", "model-b");
+            let out =
+                Agent::append_model_fallback_notice("hello".to_string(), Some(&info), &tx).await;
+
+            assert_eq!(out, "hello", "generic notice duplicated safeguard event");
+            assert!(
+                rx.try_recv().is_err(),
+                "generic fallback chunk duplicated safeguard event"
+            );
+        })
+        .await;
     }
 
     #[derive(Clone, Copy)]

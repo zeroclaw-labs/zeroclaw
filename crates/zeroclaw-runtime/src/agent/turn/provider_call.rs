@@ -217,6 +217,11 @@ pub(crate) async fn call_provider(
                 Err(stream_err)
             }
             Err(stream_err) => {
+                let streamed_refusal = stream_err.chain().find_map(|cause| {
+                    cause
+                        .downcast_ref::<zeroclaw_api::model_provider::ModelRefusalError>()
+                        .cloned()
+                });
                 let discarded_usage = stream_err
                     .downcast_ref::<StreamSemanticEmptyCompletion>()
                     .and_then(|error| error.usage.as_ref());
@@ -238,18 +243,33 @@ pub(crate) async fn call_provider(
                 );
                 {
                     let dispatcher = ProviderDispatch::from_ref(active_model_provider);
-                    let chat_future = dispatcher.chat_accounted(
-                        ChatRequest {
-                            messages: prepared_messages,
-                            tools: request_tools,
-                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
-                                .try_with(Clone::clone)
-                                .ok()
-                                .flatten(),
-                        },
-                        active_model,
-                        ctx.temperature,
-                    );
+                    let request = ChatRequest {
+                        messages: prepared_messages,
+                        tools: request_tools,
+                        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                            .try_with(Clone::clone)
+                            .ok()
+                            .flatten(),
+                    };
+                    let chat_future = async {
+                        match streamed_refusal {
+                            Some(refusal) => {
+                                dispatcher
+                                    .chat_accounted_after_stream_refusal(
+                                        request,
+                                        active_model,
+                                        ctx.temperature,
+                                        refusal,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                dispatcher
+                                    .chat_accounted(request, active_model, ctx.temperature)
+                                    .await
+                            }
+                        }
+                    };
                     if let Some(token) = ctx.cancellation_token {
                         tokio::select! {
                             () = token.cancelled() => Err(ToolLoopCancelled.into()),

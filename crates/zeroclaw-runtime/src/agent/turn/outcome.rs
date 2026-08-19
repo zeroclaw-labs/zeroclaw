@@ -44,6 +44,7 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
     pub(crate) message: String,
+    pub(crate) source: zeroclaw_api::model_provider::StreamError,
 }
 
 impl std::fmt::Display for StreamInterruptedAfterOutput {
@@ -52,7 +53,11 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
     }
 }
 
-impl std::error::Error for StreamInterruptedAfterOutput {}
+impl std::error::Error for StreamInterruptedAfterOutput {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
 
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those

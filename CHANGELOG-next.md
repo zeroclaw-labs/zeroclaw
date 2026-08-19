@@ -43,6 +43,8 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 
 ### Providers and Runtime
 
+- Native Anthropic requests now detect Fable safety-classifier refusals and fall back client- or server-side with a user-visible notice (#9262, #9263, #9265, #9266, #9268).
+- The web dashboard agent chat now surfaces that safeguard-fallback switch as an inline notice before the answer, matching the messaging-channel footer (#9272).
 - Default newly created persisted OpenAI model slots to the Responses API with native tool calling, without changing existing persisted entries or bare provider references (#9021).
 - Propagate OpenAI Responses usage and carry model context-window metadata from the models.dev catalog (#9360, #9347).
 - Add configurable model vision capabilities and improve provider timeouts, streamed retries, tool-call argument handling, multimodal fallback, and Gemini thought-signature preservation (#9099, #8947, #9113, #9372, #8931, #9102, #8935).

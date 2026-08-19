@@ -4,9 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
-use zeroclaw_providers::{
-    ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage, multimodal,
-};
+use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -95,11 +93,7 @@ impl ResolvedModelAccess<'_> {
                 // typed Reliable error chain. Keep the original error intact so
                 // terminal-cause classification remains the provider's source
                 // of truth.
-                if let Some(usage) = error.chain().find_map(|cause| {
-                    cause
-                        .downcast_ref::<ReliableRejectedCompletionUsage>()
-                        .map(|rejected| &rejected.usage)
-                }) {
+                if let Some(usage) = zeroclaw_providers::rejected_attempt_usage_from_error(&error) {
                     crate::agent::cost::record_rejected_tool_loop_cost_usage(
                         self.provider_name,
                         self.model,

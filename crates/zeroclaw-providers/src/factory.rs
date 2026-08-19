@@ -1081,6 +1081,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
     ) -> Result<Box<dyn ModelProvider>> {
         let mut b = crate::anthropic::AnthropicModelProvider::builder(alias)
             .credential(key)
+            .server_fallback_models(self.server_fallback_models.clone())
             .base_url(api_url.unwrap_or(fixed_family_endpoint::<Self>()));
         if let Some(mt) = opts.provider_max_tokens {
             b = b.max_tokens(mt);

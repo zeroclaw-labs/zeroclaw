@@ -151,10 +151,11 @@ pub(crate) async fn consume_provider_streaming_response(
                     return Err(StreamInterruptedAfterOutput {
                         partial_text: forwarded_text,
                         message,
+                        source: err,
                     }
                     .into());
                 }
-                return Err(anyhow::Error::msg(message));
+                return Err(anyhow::Error::new(err).context(message));
             }
         };
         match event {

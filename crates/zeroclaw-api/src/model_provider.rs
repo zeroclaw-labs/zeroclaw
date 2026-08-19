@@ -376,6 +376,35 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// A provider safety refusal that completed at the transport layer but cannot
+/// be accepted as an assistant response.
+///
+/// The optional usage belongs to the refusing attempt. It is carried on the
+/// typed cause so reliability and turn accounting can bill that work without
+/// treating it as accepted-response context usage. `category` is diagnostic
+/// metadata only and must not be rendered to users.
+#[derive(Debug, Clone, thiserror::Error)]
+#[error("anthropic refusal: model declined this request (safety classifiers)")]
+pub struct ModelRefusalError {
+    /// Model requested on the refusing attempt.
+    pub requested_model: String,
+    /// Refusal category token, when the provider supplied one.
+    pub category: Option<String>,
+    /// Normalized usage billed by the refusing attempt.
+    pub usage: Option<Box<TokenUsage>>,
+    /// Exact reliability candidate that emitted a streamed refusal.
+    ///
+    /// Leaf providers leave this unset. Composite providers fill it while
+    /// forwarding a stream so a non-streaming recovery can skip exactly the
+    /// already-billed candidate.
+    pub attempted_candidate: Option<String>,
+    /// Position of that candidate in the active reliability domain.
+    ///
+    /// This disambiguates same-profile fallback models, which intentionally
+    /// share one configured candidate/cooldown identity.
+    pub attempted_candidate_index: Option<usize>,
+}
+
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -390,6 +419,9 @@ pub enum StreamError {
 
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
+
+    #[error(transparent)]
+    ModelRefusal(#[from] Box<ModelRefusalError>),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

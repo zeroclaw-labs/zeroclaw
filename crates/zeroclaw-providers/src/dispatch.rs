@@ -85,6 +85,22 @@ impl ProviderDispatch {
         })
     }
 
+    /// Recover a pre-output streamed refusal without replaying the candidate
+    /// that already refused and reported usage.
+    pub async fn chat_accounted_after_stream_refusal(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        refusal: crate::AnthropicRefusalError,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        crate::reliable::scope_stream_refusal_recovery(
+            refusal,
+            self.chat_accounted(request, model, temperature),
+        )
+        .await
+    }
+
     pub fn stream_chat(
         &self,
         request: ChatRequest<'_>,
@@ -276,6 +292,22 @@ impl<'a> ProviderDispatchRef<'a> {
             response,
             rejected_attempt_usage,
         })
+    }
+
+    /// Recover a pre-output streamed refusal without replaying the candidate
+    /// that already refused and reported usage.
+    pub async fn chat_accounted_after_stream_refusal(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        refusal: crate::AnthropicRefusalError,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        crate::reliable::scope_stream_refusal_recovery(
+            refusal,
+            self.chat_accounted(request, model, temperature),
+        )
+        .await
     }
 
     pub fn stream_chat(
