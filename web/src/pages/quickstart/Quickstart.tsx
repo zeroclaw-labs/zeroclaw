@@ -1059,7 +1059,7 @@ function ChannelAddForm({
   const [fields, setFields] = useState<Record<string, string>>({});
 
   useEffect(() => {
-    if (mode !== "fresh" || !type) {
+    if (!type) {
       setDescriptors([]);
       return;
     }
@@ -1069,7 +1069,7 @@ function ChannelAddForm({
         const f = await quickstartFields({ section: "channel", type_key: type });
         if (!cancelled) {
           setDescriptors(f.fields);
-          setFields(initialChannelFieldValues(f.fields));
+          setFields((current) => initialChannelFieldValues(f.fields, current));
         }
       } catch {
         if (!cancelled) setDescriptors([]);
@@ -1078,7 +1078,7 @@ function ChannelAddForm({
     return () => {
       cancelled = true;
     };
-  }, [mode, type]);
+  }, [type]);
 
   const freshRef = type && alias.trim() ? `${type}.${alias.trim()}` : "";
   const conflict =

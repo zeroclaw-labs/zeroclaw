@@ -32,3 +32,16 @@ test("initializes channel fields from descriptor defaults", () => {
 test("does not invent values for descriptors without defaults", () => {
   assert.deepEqual(initialChannelFieldValues([descriptor("secret", null)]), {});
 });
+
+test("preserves edited values across a fresh-existing-fresh transition", () => {
+  const fields = [descriptor("port", "8090"), descriptor("secret", null)];
+  const edited = initialChannelFieldValues(fields);
+  edited.port = "9123";
+  edited.secret = "user-entered-secret";
+
+  // The existing-mode view hides, but does not discard, fresh-mode state.
+  assert.deepEqual(initialChannelFieldValues(fields, edited), {
+    port: "9123",
+    secret: "user-entered-secret",
+  });
+});
