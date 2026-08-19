@@ -17,6 +17,7 @@ use zeroclaw_providers::{ChatMessage, ChatResponse, ToolCall};
 use zeroclaw_tool_call_parser::{
     ParsedToolCall, build_native_assistant_history_from_parsed_calls,
     looks_like_tool_protocol_example, parse_tool_calls, strip_think_tags,
+    strip_trailing_terminal_markers,
 };
 
 /// Build assistant history entry in JSON format for native tool-call APIs.
@@ -120,6 +121,7 @@ pub(crate) struct InterpretedResponse {
 /// holds no borrows of `ctx` past the call (RUN_SHEET `turn.parse_response`).
 pub(crate) async fn interpret_chat_response(
     ctx: &TurnCtx<'_>,
+    model: &str,
     resp: ChatResponse,
     history: &[ChatMessage],
     specs: &IterationToolSpecs,
@@ -136,7 +138,7 @@ pub(crate) async fn interpret_chat_response(
 
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
         model_provider: ctx.provider_name.to_string(),
-        model: ctx.model.to_string(),
+        model: model.to_string(),
         duration: llm_started_at.elapsed(),
         success: true,
         error_message: None,
@@ -154,7 +156,7 @@ pub(crate) async fn interpret_chat_response(
     let call_cost_usd = resp
         .usage
         .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, ctx.model, usage))
+        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, model, usage))
         .map(|(_total_tokens, cost_usd)| cost_usd);
 
     // Per-LLM-call usage event, right after the observer success event
@@ -173,6 +175,9 @@ pub(crate) async fn interpret_chat_response(
     }
 
     let response_text = strip_think_tags(resp.text_or_empty());
+    // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
+    // Handles stacked markers with arbitrary whitespace between them.
+    let response_text = strip_trailing_terminal_markers(&response_text);
     // First try native structured tool calls (OpenAI-format).
     // Fall back to text-based parsing (XML tags, markdown blocks,
     // GLM format) only if the model_provider returned no native calls —
@@ -245,7 +250,7 @@ pub(crate) async fn interpret_chat_response(
                 .with_category(::zeroclaw_log::EventCategory::Tool)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
-                    "model": ctx.model,
+                    "model": model,
                     "iteration": iteration + 1,
                     "issue": issue.as_str(),
                     "response": scrub_credentials(&response_text),
@@ -262,7 +267,7 @@ pub(crate) async fn interpret_chat_response(
             .with_outcome(::zeroclaw_log::EventOutcome::Success)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
-                "model": ctx.model,
+                "model": model,
                 "iteration": iteration + 1,
                 "input_tokens": resp_input_tokens,
                 "output_tokens": resp_output_tokens,
@@ -509,7 +514,7 @@ mod cost_usd_regression_tests {
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(cost_ctx), async {
-                interpret_chat_response(&ctx, resp, &[], &specs, false, now, 0, false).await;
+                interpret_chat_response(&ctx, model, resp, &[], &specs, false, now, 0, false).await;
             })
             .await;
 

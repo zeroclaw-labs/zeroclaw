@@ -23,8 +23,6 @@ use serde::{Deserialize, Serialize};
 /// - `memory_config_knob_inert`: a `[memory]` knob is set to a non-default
 ///   value but has no runtime consumer yet, so it currently has no effect
 ///   (see `validate_memory_semantics` in `schema.rs` for the current list).
-/// - `skills_prompt_injection_mode_full_deprecated`: explicit global full skill
-///   injection remains supported but is deprecated before Schema V4.
 /// - `peer_group_channel_dangling`: a `peer_groups.<name>.channel` dotted
 ///   alias (`<type>.<alias>`) does not resolve to any configured
 ///   `[channels.<type>.<alias>]` block — typically a typo that silently
@@ -38,6 +36,9 @@ use serde::{Deserialize, Serialize};
 ///   has no runtime consumer — the context compressor was removed —
 ///   so it currently has no effect. One warning per non-default field (see
 ///   `collect_context_compression_ignored_warnings` in `schema.rs`).
+/// - `proxy_conflicts_with_dns_pinned_tools`: the configured proxy scope
+///   selects `http_request` and/or `web_fetch`, whose validated DNS answers
+///   require direct transport and therefore make the selected tool fail.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

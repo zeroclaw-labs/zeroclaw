@@ -382,7 +382,8 @@ Applied manually: the auto-response automation that used to handle these was rem
 |---|---|
 | `r:needs-repro` | Incomplete bug report; request a deterministic repro |
 | `r:support` | Usage / help item better handled outside the bug backlog |
-| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. This is not a stale warning by itself. |
+| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. For RFCs, apply it after a `REVISE` outcome while the author prepares the revision; remove it and restore `needs-maintainer-review` when a revised stable proposal is ready for Core action. This is not a stale warning by itself. |
+| `needs-maintainer-review` | A maintainer decision, review, or vote action is pending. On RFCs, use this while substantive Core discussion or ratification action is needed; remove it when the decision is recorded or the next action moves to the author or implementation. This label does not imply acceptance, ownership, or stale protection. |
 | `stale-candidate` | Dormant PR that is a candidate for closing. Follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). Issue stale passes use `status:stale` instead. |
 
 ## Workflow labels

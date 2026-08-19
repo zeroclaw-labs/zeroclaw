@@ -721,6 +721,88 @@ mod tests {
         assert!(schema["properties"]["approved"].is_object());
     }
 
+    #[cfg(all(any(unix, windows), not(target_os = "android")))]
+    #[tokio::test]
+    async fn rebuilt_shell_tool_adopts_reloaded_runtime_shell_dialect() {
+        use crate::platform::{ShellDialect, create_runtime};
+        use zeroclaw_config::schema::Config;
+
+        let mut config = Config::default();
+        #[cfg(target_os = "windows")]
+        {
+            config.runtime.shell = Some("cmd".into());
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            config.runtime.shell = Some("sh".into());
+        }
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let build_shell_tool = |config: &Config| {
+            let runtime: Arc<dyn RuntimeAdapter> =
+                Arc::from(create_runtime(&config.runtime).expect("runtime should rebuild"));
+            ShellTool::new(security.clone(), runtime)
+        };
+
+        let before_reload = build_shell_tool(&config);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            before_reload.runtime.shell_dialect(),
+            ShellDialect::WindowsCmd
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(before_reload.runtime.shell_dialect(), ShellDialect::Posix);
+        let before_result = before_reload
+            .execute(json!({"command": "echo Env:NAME"}))
+            .await
+            .expect("pre-reload shell should return a tool result");
+        assert!(
+            before_result.success,
+            "the pre-reload non-PowerShell policy should accept the probe: {before_result:?}"
+        );
+
+        // A daemon reload re-reads Config and rebuilds the subsystem graph.
+        // Use an executable shim named `pwsh` on Unix so the real runtime
+        // factory validates the reloaded value without requiring PowerShell to
+        // be installed; policy rejection occurs before the shim can spawn.
+        #[cfg(unix)]
+        let powershell_dir = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let powershell = powershell_dir.path().join("pwsh");
+            std::fs::write(&powershell, "#!/bin/sh\nexit 99\n").unwrap();
+            std::fs::set_permissions(&powershell, std::fs::Permissions::from_mode(0o755)).unwrap();
+            config.runtime.shell = Some(powershell.to_string_lossy().into_owned());
+        }
+        #[cfg(target_os = "windows")]
+        {
+            config.runtime.shell = Some("powershell".into());
+        }
+
+        let after_reload = build_shell_tool(&config);
+        assert_eq!(
+            after_reload.runtime.shell_dialect(),
+            ShellDialect::PowerShell
+        );
+        let after_result = after_reload
+            .execute(json!({"command": "echo Env:NAME", "approved": true}))
+            .await
+            .expect("reloaded shell should return a policy result");
+        assert!(!after_result.success);
+        assert!(
+            after_result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed")),
+            "the rebuilt PowerShell path must apply provider-aware validation: {after_result:?}"
+        );
+    }
+
     #[tokio::test]
     async fn shell_stdin_is_eof_not_the_terminal() {
         let security = Arc::new(SecurityPolicy {
@@ -856,6 +938,196 @@ mod tests {
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
         assert!(error.contains("not allowed") || error.contains("high-risk"));
+    }
+
+    #[tokio::test]
+    async fn shell_policy_blocks_powershell_native_high_risk_command() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let result = tool
+            .execute(json!({"command": "Remove-Item important.txt"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "PowerShell-native operation must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_shell_blocks_windows_relative_path_for_powershell() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
+
+        let result = tool
+            .execute(json!({"command": "cat ..\\secret.txt"}))
+            .await
+            .expect("path rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("forbidden path argument")),
+            "Windows-relative path must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_shell_blocks_powershell_stop_parsing_native_mutation() {
+        // `git --% push` would reach native Git as `push` on PowerShell while
+        // policy sees only `--%` as the first argument. The dialect-aware
+        // validator must reject it before the process is ever built, so the
+        // guard holds on this Unix host too.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["git".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
+
+        let result = tool
+            .execute(json!({"command": "git --% push origin main"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "stop-parsing native mutation must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapped_shell_blocks_powershell_mixed_quoted_provider_path() {
+        // `cat E'nv:'PATH` binds as the `Env:PATH` provider read on PowerShell,
+        // but the interior quote hides the `Env:` prefix from policy's raw-token
+        // provider check. The bounded grammar rejects the mixed quoted/unquoted
+        // token so it is blocked before the process is ever built.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["cat".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = RateLimitedTool::new(ShellTool::new(security.clone(), runtime), security);
+
+        let result = tool
+            .execute(json!({"command": "cat E'nv:'PATH"}))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed by security policy")),
+            "mixed-quoted provider path must be blocked before spawn: {:?}",
+            result.error
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn powershell_agent_shell_executes_safe_pipeline_and_rejects_dangerous_alias() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: workspace.path().to_path_buf(),
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        });
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(NativeRuntime::with_shell("powershell".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let safe = tool
+            .execute(json!({
+                    "command": "Write-Output \"quoted safe value\" | Select-Object -First 1"
+            }))
+            .await
+            .expect("safe PowerShell pipeline should return a tool result");
+        assert!(safe.success, "{:?}", safe.error);
+        assert!(safe.output.contains("quoted safe value"), "{}", safe.output);
+
+        let dangerous = tool
+            .execute(json!({"command": "ac .\\blocked.txt value", "approved": true}))
+            .await
+            .expect("dangerous PowerShell alias should return a policy result");
+        assert!(!dangerous.success);
+        assert!(
+            dangerous
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "{:?}",
+            dangerous.error
+        );
+        assert!(!workspace.path().join("blocked.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn shell_uses_runtime_dialect_to_reject_powershell_expression_bypass() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["echo".into()],
+            ..SecurityPolicy::default()
+        });
+        // Policy rejection happens before spawn, so this test does not require
+        // pwsh to be installed on the host.
+        let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::with_shell("pwsh".into()));
+        let tool = ShellTool::new(security, runtime);
+
+        let result = tool
+            .execute(json!({
+                "command": "echo ([System.IO.File]::Delete('important.txt'))"
+            }))
+            .await
+            .expect("policy rejection should be returned as a tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("not allowed")),
+            "PowerShell expression must be rejected before spawn: {:?}",
+            result.error
+        );
     }
 
     #[tokio::test]

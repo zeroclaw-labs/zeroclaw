@@ -9,6 +9,17 @@ use zeroclaw_api::model_provider::{
     StreamResult,
 };
 
+/// A successful response plus billed usage from Reliable attempts that were
+/// rejected before that response was accepted.
+///
+/// `response.usage` always describes the accepted attempt. The sidecar is for
+/// cost accounting only; it must not be used as context-window usage or
+/// successful-response telemetry.
+pub struct AccountedChatResponse {
+    pub response: ChatResponse,
+    pub rejected_attempt_usage: Option<crate::traits::TokenUsage>,
+}
+
 /// Wraps a model provider so every call opens the correct
 /// `attribution_span!` automatically. See the module docs for the
 /// rationale and the CI gate that enforces routing through this type.
@@ -55,6 +66,23 @@ impl ProviderDispatch {
         }
         .instrument(span)
         .await
+    }
+
+    /// Like [`Self::chat`], while retaining rejected Reliable-attempt usage in
+    /// a separate accounting sidecar.
+    pub async fn chat_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) =
+            crate::reliable::scope_reliable_rejected_usage(self.chat(request, model, temperature))
+                .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
     }
 
     pub fn stream_chat(
@@ -166,6 +194,25 @@ impl ProviderDispatch {
         .await
     }
 
+    /// Like [`Self::chat_with_tools`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_with_tools_accounted(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) = crate::reliable::scope_reliable_rejected_usage(
+            self.chat_with_tools(messages, tools, model, temperature),
+        )
+        .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
+    }
+
     pub async fn list_models(&self) -> anyhow::Result<Vec<String>> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(&*self.inner);
@@ -212,6 +259,23 @@ impl<'a> ProviderDispatchRef<'a> {
         }
         .instrument(span)
         .await
+    }
+
+    /// Like [`Self::chat`], while retaining rejected Reliable-attempt usage in
+    /// a separate accounting sidecar.
+    pub async fn chat_accounted(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) =
+            crate::reliable::scope_reliable_rejected_usage(self.chat(request, model, temperature))
+                .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
     }
 
     pub fn stream_chat(
@@ -321,6 +385,25 @@ impl<'a> ProviderDispatchRef<'a> {
         }
         .instrument(span)
         .await
+    }
+
+    /// Like [`Self::chat_with_tools`], while retaining rejected
+    /// Reliable-attempt usage in a separate accounting sidecar.
+    pub async fn chat_with_tools_accounted(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[serde_json::Value],
+        model: &str,
+        temperature: Option<f64>,
+    ) -> anyhow::Result<AccountedChatResponse> {
+        let (response, rejected_attempt_usage) = crate::reliable::scope_reliable_rejected_usage(
+            self.chat_with_tools(messages, tools, model, temperature),
+        )
+        .await;
+        response.map(|response| AccountedChatResponse {
+            response,
+            rejected_attempt_usage,
+        })
     }
 
     /// Wrap the inner provider's `list_models`. No `model` parameter,

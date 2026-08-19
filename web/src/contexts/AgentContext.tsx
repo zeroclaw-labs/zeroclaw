@@ -3,8 +3,9 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { getProp, putProp, resolveAliasSource, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
+import { resolveAvailableModels } from './modelPicker.logic';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
 import { resolveToolResultIndex } from '@/lib/toolCardMatch';
 import {
@@ -601,16 +602,24 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         setCurrentModel(activeRef ?? activeModel);
 
         // Available switch targets = every configured provider ref
-        // (`providers.models.<family>.<alias>`), discovered via config/list.
+        // (`providers.models.<family>.<alias>`), resolved and sorted by the
+        // config layer's canonical alias-source resolver.
+        //
+        // The `/api/config/resolve-alias-source` endpoint only exists on
+        // daemons that declare the `PropKind::AliasRef` contract. Embedded-web
+        // builds ship the bundle inside the daemon binary, so skew is
+        // impossible there — but `gateway.web_dist_dir` filesystem serving can
+        // pair a newer bundle with an older daemon. `resolveAvailableModels`
+        // falls back to the pre-resolver `listProps` scan (sorted through the
+        // same `family.alias` key) when the endpoint is unavailable, so the
+        // picker never silently collapses to a single ref on those deployments.
         try {
-          const list = await listProps('providers.models');
+          const refs = await resolveAvailableModels({
+            resolveAliasSource: () => resolveAliasSource('model_providers'),
+            listProps: () => listProps('providers.models'),
+          });
           if (cancelled) return;
-          const refs = (list.entries ?? [])
-            .map((e) => e.path)
-            .filter((p) => /^providers\.models\.[^.]+\.[^.]+\.model$/.test(p))
-            .map((p) => p.replace(/^providers\.models\./, '').replace(/\.model$/, ''));
-          const unique = Array.from(new Set(refs));
-          setAvailableModels(unique.length > 0 ? unique : activeRef ? [activeRef] : []);
+          setAvailableModels(refs.length > 0 ? refs : activeRef ? [activeRef] : []);
         } catch {
           setAvailableModels(activeRef ? [activeRef] : []);
         }
