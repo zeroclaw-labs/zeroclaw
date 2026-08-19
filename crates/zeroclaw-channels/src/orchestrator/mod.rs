@@ -23703,6 +23703,7 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(route.model, "claude-sonnet-4-5");
     }
 
+    #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     async fn telegram_model_picker_username_change_updates_only_current_sender_session() {
         use wiremock::matchers::{body_partial_json, method, path_regex};
