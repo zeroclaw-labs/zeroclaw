@@ -412,7 +412,11 @@ enum PasskeyNotice<'a> {
     /// produce one without a registered authenticator, so the link stalls here.
     Required,
     /// A verification code the operator must confirm on the primary phone.
-    Confirm { code: &'a str },
+    /// A re-link carries a continuity proof and upstream confirms it itself.
+    Confirm {
+        code: &'a str,
+        skip_handoff_ux: bool,
+    },
     /// Upstream reported the passkey link attempt failed. `continuation`
     /// distinguishes a retryable continuation from a terminal failure.
     Failed { error: &'a str, continuation: bool },
@@ -1187,6 +1191,7 @@ impl WhatsAppWebChannel {
             Event::PairPasskeyRequest(_) => Some(PasskeyNotice::Required),
             Event::PairPasskeyConfirmation(confirmation) => Some(PasskeyNotice::Confirm {
                 code: confirmation.code.as_str(),
+                skip_handoff_ux: confirmation.skip_handoff_ux,
             }),
             Event::PairPasskeyError(err) => Some(PasskeyNotice::Failed {
                 error: err.error.as_str(),
@@ -2746,6 +2751,7 @@ impl Channel for WhatsAppWebChannel {
             let bot_phone_clone = self.bot_phone.clone();
             let bot_lid_clone = self.bot_lid.clone();
             let persist_clone = self.persist.clone();
+            let passkey_session_path = expanded_session_path.clone();
             let inbound_context = WhatsAppInboundContext {
                 tx: tx.clone(),
                 alias: Arc::clone(&alias),
@@ -2788,6 +2794,7 @@ impl Channel for WhatsAppWebChannel {
                     let bot_lid_inner = bot_lid_clone.clone();
                     let persist_inner = persist_clone.clone();
                     let inbound_context = inbound_context.clone();
+                    let passkey_session_path = passkey_session_path.clone();
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
                         // per so we match against `&*event` to get a
@@ -2885,17 +2892,6 @@ impl Channel for WhatsAppWebChannel {
                                         // authenticator is now waiting for the
                                         // operator to drop an assertion file,
                                         // and it logs the exact paths itself.
-                                        crate::login_events::LoginEvent::Qr {
-                                            payload: "",
-                                            image_url: None,
-                                            attempt: None,
-                                            max_attempts: None,
-                                        }
-                                        .emit(
-                                            "whatsapp",
-                                            alias.as_ref(),
-                                            "WhatsApp requires a passkey assertion to link this device — awaiting the operator's WebAuthn ceremony",
-                                        );
                                         ::zeroclaw_log::record!(
                                             WARN,
                                             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2903,15 +2899,87 @@ impl Channel for WhatsAppWebChannel {
                                             "WhatsApp Web linking requires a passkey (SHORTCAKE); the file broker is waiting for a signed assertion"
                                         );
                                     }
-                                    Some(PasskeyNotice::Confirm { code }) => {
-                                        ::zeroclaw_log::record!(
-                                            INFO,
-                                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                                            "WhatsApp Web passkey verification code received"
-                                        );
-                                        eprintln!();
-                                        eprintln!("WhatsApp passkey verification code: {code}");
-                                        eprintln!();
+                                    Some(PasskeyNotice::Confirm {
+                                        code,
+                                        skip_handoff_ux,
+                                    }) => {
+                                        if skip_handoff_ux {
+                                            // Upstream already proved continuity
+                                            // from the prior ADV secret and will
+                                            // auto-confirm after this event returns.
+                                            ::zeroclaw_log::record!(
+                                                INFO,
+                                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                                                "WhatsApp Web passkey re-link continuity verified; upstream will auto-confirm"
+                                            );
+                                        } else {
+                                            ::zeroclaw_log::record!(
+                                                INFO,
+                                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                                                "WhatsApp Web passkey verification code received"
+                                            );
+                                            eprintln!();
+                                            eprintln!("WhatsApp passkey verification code: {code}");
+                                            eprintln!();
+
+                                            let confirmation = crate::whatsapp_passkey::FilePasskeyConfirmation::new(passkey_session_path);
+                                            let confirmation_code = code.to_string();
+                                            let confirmation_client = Arc::clone(&client);
+                                            let confirmation_alias = Arc::clone(&alias);
+                                            zeroclaw_spawn::spawn!(async move {
+                                                match confirmation
+                                                    .wait_for_acknowledgement(&confirmation_code)
+                                                    .await
+                                                {
+                                                    Ok(()) => {
+                                                        match confirmation_client
+                                                            .send_passkey_confirmation()
+                                                            .await
+                                                        {
+                                                            Ok(()) => ::zeroclaw_log::record!(
+                                                                INFO,
+                                                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                                                                "WhatsApp Web passkey verification code confirmed; finishing device linking"
+                                                            ),
+                                                            Err(error) => {
+                                                                let reason = error.to_string();
+                                                                crate::login_events::LoginEvent::Failed {
+                                                                    reason: &reason,
+                                                                }
+                                                                .emit(
+                                                                    "whatsapp",
+                                                                    confirmation_alias.as_ref(),
+                                                                    "WhatsApp Web passkey confirmation failed",
+                                                                );
+                                                                ::zeroclaw_log::record!(
+                                                                    ERROR,
+                                                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                                                                    &format!("failed to confirm WhatsApp Web passkey code: {error}")
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(error) => {
+                                                        let reason = error.to_string();
+                                                        crate::login_events::LoginEvent::Failed {
+                                                            reason: &reason,
+                                                        }
+                                                        .emit(
+                                                            "whatsapp",
+                                                            confirmation_alias.as_ref(),
+                                                            "WhatsApp Web passkey confirmation was not acknowledged",
+                                                        );
+                                                        ::zeroclaw_log::record!(
+                                                            WARN,
+                                                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                                            &format!("WhatsApp Web passkey confirmation ended without acknowledgement: {error}")
+                                                        );
+                                                    }
+                                                }
+                                            });
+                                        }
                                     }
                                     Some(PasskeyNotice::Failed { error, continuation }) => {
                                         crate::login_events::LoginEvent::Failed { reason: error }
@@ -4238,8 +4306,24 @@ mod tests {
         });
         assert_eq!(
             WhatsAppWebChannel::passkey_notice(&confirmation),
-            Some(PasskeyNotice::Confirm { code: "1234-5678" }),
+            Some(PasskeyNotice::Confirm {
+                code: "1234-5678",
+                skip_handoff_ux: false,
+            }),
             "the verification code must be surfaced verbatim to be typed on the phone"
+        );
+
+        let relink = Event::PairPasskeyConfirmation(PairPasskeyConfirmation {
+            code: "ABCD-EFGH".to_string(),
+            skip_handoff_ux: true,
+        });
+        assert_eq!(
+            WhatsAppWebChannel::passkey_notice(&relink),
+            Some(PasskeyNotice::Confirm {
+                code: "ABCD-EFGH",
+                skip_handoff_ux: true,
+            }),
+            "the classifier must preserve upstream's re-link auto-confirm signal"
         );
 
         let failure = Event::PairPasskeyError(PairPasskeyError {
