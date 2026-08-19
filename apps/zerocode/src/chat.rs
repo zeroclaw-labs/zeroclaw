@@ -2561,9 +2561,6 @@ impl Chat {
         let ChatPhase::Active(state) = &mut self.phase else {
             return;
         };
-        if state.turn_in_flight {
-            return;
-        }
         let action = state.input_bar.handle_paste(text);
         if let InputBarAction::StatusMessage(msg) = action {
             state.set_info_notice(msg);
@@ -11969,6 +11966,35 @@ mod tests {
             unreachable!();
         };
         active
+    }
+
+    #[tokio::test]
+    async fn active_turn_paste_populates_composer_and_queues_on_submit() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.input_bar.clear_input();
+        state.turn_in_flight = true;
+
+        chat.handle_paste("pasted while active");
+
+        let state = active_state(&mut chat);
+        assert_eq!(state.input_bar.input(), "pasted while active");
+        assert!(state.turn_in_flight);
+
+        let InputBarAction::Submit { text, attachments } =
+            state.input_bar.submit_current_input_for_test()
+        else {
+            panic!("pasted input must submit normally");
+        };
+        state
+            .enqueue_message(text.unwrap_or_default(), attachments)
+            .expect("pasted input queues during an active turn");
+
+        assert_eq!(state.queue_len(), 1);
+        assert!(
+            state.take_next_dispatchable().is_none(),
+            "an active turn must not dispatch the queued pasted input"
+        );
     }
 
     #[tokio::test]
