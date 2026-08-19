@@ -75,6 +75,14 @@ OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
 on their terminal response event, and Anthropic streams finish on
 `message_stop`. Servers may keep the HTTP connection open after those events.
 
+An OpenAI-compatible chat-completions stream whose explicit
+`finish_reason` is `length` is not a completed answer: the provider reached
+its output-token limit. ZeroClaw preserves text already delivered to the
+caller, reports the terminal result as incomplete, and does not replay that
+request. It may advance to the next configured fallback candidate only before
+any output or tool activity was exposed. The same classification applies to
+non-streaming compatible responses.
+
 Streaming clients use byte-idle timeouts: 300 seconds for OpenAI Responses and
 OpenAI-compatible providers, and 90 seconds for Anthropic. Each received body
 read resets the relevant timeout, so active generations are not constrained by

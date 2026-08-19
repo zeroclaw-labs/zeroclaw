@@ -6,6 +6,9 @@ use crate::auth::AuthService;
 use crate::multimodal;
 use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
 use crate::stream_guard::AbortOnDrop;
+use crate::terminal::{
+    capture_terminal_policy_slot, default_terminal_policy, publish_terminal_policy,
+};
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
     ModelProvider, StreamChunk, StreamError, StreamEvent, StreamOptions, StreamResult,
@@ -1095,7 +1098,7 @@ impl ApiChatResponseEnvelope {
     }
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct UsageInfo {
     #[serde(default)]
     prompt_tokens: Option<u64>,
@@ -1107,7 +1110,7 @@ struct UsageInfo {
     prompt_cache_hit_tokens: Option<u64>,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Debug, Deserialize)]
 struct PromptTokensDetails {
     #[serde(default, deserialize_with = "deserialize_optional_token_count")]
     cached_tokens: Option<u64>,
@@ -1180,6 +1183,43 @@ fn normalize_token_count_float(value: f64) -> Option<u64> {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+fn output_limit_failure(
+    finish_reason: Option<&str>,
+    usage: Option<&zeroclaw_api::model_provider::TokenUsage>,
+) -> Option<zeroclaw_api::model_provider::TerminalCompletionFailure> {
+    (finish_reason == Some("length")).then(|| compatible_output_limit_failure(usage.cloned()))
+}
+
+fn compatible_output_limit_failure(
+    usage: Option<zeroclaw_api::model_provider::TokenUsage>,
+) -> zeroclaw_api::model_provider::TerminalCompletionFailure {
+    zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+        zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+        usage,
+    )
+}
+
+fn output_limit_error(
+    finish_reason: Option<&str>,
+    usage: Option<&zeroclaw_api::model_provider::TokenUsage>,
+) -> Option<anyhow::Error> {
+    output_limit_failure(finish_reason, usage).map(anyhow::Error::new)
+}
+
+fn preserve_output_limit_cause(
+    fallback: StreamError,
+    observed: bool,
+    usage: Option<zeroclaw_api::model_provider::TokenUsage>,
+) -> StreamError {
+    if observed {
+        StreamError::TerminalCompletion(compatible_output_limit_failure(usage))
+    } else {
+        fallback
+    }
 }
 
 /// OpenAI Chat Completions may return assistant `message.content` as a string,
@@ -1738,26 +1778,31 @@ fn reserve_tool_call_id_for_contract(
     }
 }
 
+#[cfg(test)]
 fn parse_sse_line(line: &str) -> StreamResult<Option<StreamChunk>> {
     let chunk = match parse_sse_chunk(line)? {
         Some(c) => c,
         None => return Ok(None),
     };
 
+    Ok(stream_chunk_from_sse_response(&chunk))
+}
+
+fn stream_chunk_from_sse_response(chunk: &StreamChunkResponse) -> Option<StreamChunk> {
     if let Some(choice) = chunk.choices.first() {
         if let Some(content) = &choice.delta.content
             && !content.is_empty()
         {
-            return Ok(Some(StreamChunk::delta(content.clone())));
+            return Some(StreamChunk::delta(content.clone()));
         }
         if let Some(reasoning) = &choice.delta.reasoning_content
             && !reasoning.is_empty()
         {
-            return Ok(Some(StreamChunk::reasoning(reasoning.clone())));
+            return Some(StreamChunk::reasoning(reasoning.clone()));
         }
     }
 
-    Ok(None)
+    None
 }
 
 /// Convert SSE byte stream to text chunks.
@@ -1769,6 +1814,8 @@ fn sse_bytes_to_chunks(
 
     let handle = ::zeroclaw_spawn::spawn!(async move {
         let mut buffer = String::new();
+        let mut output_limit = false;
+        let mut output_limit_usage = None;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
@@ -1821,34 +1868,63 @@ fn sse_bytes_to_chunks(
                             break 'stream;
                         }
 
-                        match parse_sse_line(&line) {
-                            Ok(Some(chunk)) => {
-                                let chunk = if count_tokens {
-                                    chunk.with_token_estimate()
-                                } else {
-                                    chunk
-                                };
-                                if tx.send(Ok(chunk)).await.is_err() {
-                                    return; // Receiver dropped
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                let _ = tx.send(Err(e)).await;
+                        let mut parsed = match parse_sse_chunk(&line) {
+                            Ok(Some(chunk)) => chunk,
+                            Ok(None) => continue,
+                            Err(error) => {
+                                let _ = tx
+                                    .send(Err(preserve_output_limit_cause(
+                                        error,
+                                        output_limit,
+                                        output_limit_usage.clone(),
+                                    )))
+                                    .await;
                                 return;
+                            }
+                        };
+                        if let Some(usage) = parsed.usage.take() {
+                            output_limit_usage = Some(usage.into_provider_usage());
+                        }
+                        if parsed
+                            .choices
+                            .iter()
+                            .any(|choice| choice.finish_reason.as_deref() == Some("length"))
+                        {
+                            output_limit = true;
+                        }
+                        if let Some(chunk) = stream_chunk_from_sse_response(&parsed) {
+                            let chunk = if count_tokens {
+                                chunk.with_token_estimate()
+                            } else {
+                                chunk
+                            };
+                            if tx.send(Ok(chunk)).await.is_err() {
+                                return; // Receiver dropped
                             }
                         }
                     }
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(preserve_output_limit_cause(
+                            StreamError::Http(super::format_error_chain(&e)),
+                            output_limit,
+                            output_limit_usage.clone(),
+                        )))
                         .await;
                     return;
                 }
             }
         }
 
+        if output_limit {
+            let _ = tx
+                .send(Err(StreamError::TerminalCompletion(
+                    compatible_output_limit_failure(output_limit_usage),
+                )))
+                .await;
+            return;
+        }
         let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
     });
 
@@ -1864,13 +1940,19 @@ pub(crate) fn sse_bytes_to_events(
     response: reqwest::Response,
     count_tokens: bool,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-    sse_bytes_to_events_for_contract(response, count_tokens, false)
+    sse_bytes_to_events_for_contract(
+        response,
+        count_tokens,
+        false,
+        capture_terminal_policy_slot(),
+    )
 }
 
 fn sse_bytes_to_events_for_contract(
     response: reqwest::Response,
     count_tokens: bool,
     targets_mistral_tool_call_contract: bool,
+    terminal_policy_slot: Option<std::sync::Arc<crate::terminal::TerminalPolicySlot>>,
 ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -1880,12 +1962,18 @@ fn sse_bytes_to_events_for_contract(
         let mut used_tool_call_ids = std::collections::HashSet::new();
         let mut emitted_tool_calls = false;
         let mut saw_completion = false;
+        let mut output_limit_observed = false;
+        let mut output_limit_usage = None;
 
         match response.error_for_status_ref() {
             Ok(_) => {}
             Err(e) => {
                 let _ = tx
-                    .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                    .send(Err(preserve_output_limit_cause(
+                        StreamError::Http(super::format_error_chain(&e)),
+                        output_limit_observed,
+                        output_limit_usage.clone(),
+                    )))
                     .await;
                 return;
             }
@@ -1946,13 +2034,29 @@ fn sse_bytes_to_events_for_contract(
                                 continue;
                             }
                             Err(e) => {
-                                let _ = tx.send(Err(e)).await;
+                                let _ = tx
+                                    .send(Err(preserve_output_limit_cause(
+                                        e,
+                                        output_limit_observed,
+                                        output_limit_usage.clone(),
+                                    )))
+                                    .await;
                                 return;
                             }
                         };
 
                         let mut should_emit_tool_calls = false;
                         for choice in &chunk.choices {
+                            if choice.finish_reason.as_deref() == Some("length") {
+                                output_limit_observed = true;
+                                publish_terminal_policy(
+                                    &terminal_policy_slot,
+                                    zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                                    default_terminal_policy(
+                                        zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                                    ),
+                                );
+                            }
                             if choice.finish_reason.is_some() {
                                 saw_completion = true;
                             }
@@ -1997,14 +2101,17 @@ fn sse_bytes_to_events_for_contract(
                             }
                         }
 
-                        if let Some(usage) = chunk.usage.clone() {
+                        if let Some(usage) = chunk.usage {
                             let token_usage = usage.into_provider_usage();
+                            if output_limit_observed {
+                                output_limit_usage = Some(token_usage.clone());
+                            }
                             if tx.send(Ok(StreamEvent::Usage(token_usage))).await.is_err() {
                                 return;
                             }
                         }
 
-                        if should_emit_tool_calls && !emitted_tool_calls {
+                        if should_emit_tool_calls && !output_limit_observed && !emitted_tool_calls {
                             emitted_tool_calls = true;
                             for tool_call in tool_calls.drain(..).filter_map(|tool_call| {
                                 tool_call.into_provider_tool_call(
@@ -2021,14 +2128,18 @@ fn sse_bytes_to_events_for_contract(
                 }
                 Err(e) => {
                     let _ = tx
-                        .send(Err(StreamError::Http(super::format_error_chain(&e))))
+                        .send(Err(preserve_output_limit_cause(
+                            StreamError::Http(super::format_error_chain(&e)),
+                            output_limit_observed,
+                            output_limit_usage.clone(),
+                        )))
                         .await;
                     return;
                 }
             }
         }
 
-        if !emitted_tool_calls {
+        if !output_limit_observed && !emitted_tool_calls {
             for tool_call in tool_calls.drain(..).filter_map(|tool_call| {
                 tool_call.into_provider_tool_call(
                     targets_mistral_tool_call_contract,
@@ -2041,8 +2152,16 @@ fn sse_bytes_to_events_for_contract(
             }
         }
 
-        crate::stream_guard::finish_sse_stream(&tx, saw_completion, "[DONE] or finish_reason")
-            .await;
+        if output_limit_observed {
+            let _ = tx
+                .send(Err(StreamError::TerminalCompletion(
+                    compatible_output_limit_failure(output_limit_usage),
+                )))
+                .await;
+        } else {
+            crate::stream_guard::finish_sse_stream(&tx, saw_completion, "[DONE] or finish_reason")
+                .await;
+        }
     });
 
     let guard = AbortOnDrop::new(handle.abort_handle());
@@ -2877,34 +2996,33 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+        let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
 
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| {
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|t: &Vec<_>| !t.is_empty())
-                {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.effective_content())
-                } else {
-                    c.message.effective_content()
-                }
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                    "compatible: empty choices in response"
-                );
-                anyhow::Error::msg(format!("No response from {}", self.name))
-            })
+        let choice = chat_response.choices.into_iter().next().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                "compatible: empty choices in response"
+            );
+            anyhow::Error::msg(format!("No response from {}", self.name))
+        })?;
+        if let Some(error) = output_limit_error(choice.finish_reason.as_deref(), usage.as_ref()) {
+            return Err(error);
+        }
+        if choice.message.tool_calls.is_some()
+            && choice
+                .message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tools: &Vec<_>| !tools.is_empty())
+        {
+            Ok(serde_json::to_string(&choice.message)
+                .unwrap_or_else(|_| choice.message.effective_content()))
+        } else {
+            Ok(choice.message.effective_content())
+        }
     }
 
     async fn chat_with_history(
@@ -2961,34 +3079,33 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
 
         let body = response.text().await?;
         let chat_response = parse_chat_response_body(&self.name, &body)?;
+        let usage = chat_response.usage.map(UsageInfo::into_provider_usage);
 
-        chat_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| {
-                if c.message.tool_calls.is_some()
-                    && c.message
-                        .tool_calls
-                        .as_ref()
-                        .is_some_and(|t: &Vec<_>| !t.is_empty())
-                {
-                    serde_json::to_string(&c.message)
-                        .unwrap_or_else(|_| c.message.effective_content())
-                } else {
-                    c.message.effective_content()
-                }
-            })
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                    "compatible: empty choices in response"
-                );
-                anyhow::Error::msg(format!("No response from {}", self.name))
-            })
+        let choice = chat_response.choices.into_iter().next().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                "compatible: empty choices in response"
+            );
+            anyhow::Error::msg(format!("No response from {}", self.name))
+        })?;
+        if let Some(error) = output_limit_error(choice.finish_reason.as_deref(), usage.as_ref()) {
+            return Err(error);
+        }
+        if choice.message.tool_calls.is_some()
+            && choice
+                .message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tools: &Vec<_>| !tools.is_empty())
+        {
+            Ok(serde_json::to_string(&choice.message)
+                .unwrap_or_else(|_| choice.message.effective_content()))
+        } else {
+            Ok(choice.message.effective_content())
+        }
     }
 
     async fn chat_with_tools(
@@ -3098,6 +3215,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             );
             anyhow::Error::msg(format!("No response from {}", self.name))
         })?;
+
+        if let Some(error) = output_limit_error(choice.finish_reason.as_deref(), usage.as_ref()) {
+            return Err(error);
+        }
 
         let mut result = self.parse_native_response(choice.message);
         result.usage = usage;
@@ -3224,23 +3345,22 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let body = response.text().await?;
         let native_response = parse_chat_response_body(&self.name, &body)?;
         let usage = native_response.usage.map(UsageInfo::into_provider_usage);
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message)
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"model_provider": &self.name})),
-                    "compatible: empty choices in response"
-                );
-                anyhow::Error::msg(format!("No response from {}", self.name))
-            })?;
+        let message = native_response.choices.into_iter().next().ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"model_provider": &self.name})),
+                "compatible: empty choices in response"
+            );
+            anyhow::Error::msg(format!("No response from {}", self.name))
+        })?;
 
-        let mut result = self.parse_native_response(message);
+        if let Some(error) = output_limit_error(message.finish_reason.as_deref(), usage.as_ref()) {
+            return Err(error);
+        }
+
+        let mut result = self.parse_native_response(message.message);
         result.usage = usage;
         Ok(result)
     }
@@ -3276,6 +3396,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let model = model.to_string();
         let count_tokens = options.count_tokens;
         let options_enabled = options.enabled;
+        let terminal_policy_slot = capture_terminal_policy_slot();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
@@ -3439,6 +3560,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 response,
                 count_tokens,
                 targets_mistral_tool_call_contract,
+                terminal_policy_slot,
             );
             while let Some(event) = event_stream.next().await {
                 if tx.send(event).await.is_err() {
@@ -3829,6 +3951,39 @@ mod tests {
         let provider = make_model_provider("custom", &format!("http://{addr}"), Some("test-key"));
 
         (provider, captured, server)
+    }
+
+    async fn mock_streaming_response(
+        body: &'static str,
+    ) -> (OpenAiCompatibleModelProvider, tokio::task::JoinHandle<()>) {
+        use axum::{Router, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || async move {
+                (
+                    [("content-type", "text/event-stream")],
+                    axum::body::Body::from(body),
+                )
+                    .into_response()
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind compatible streaming mock");
+        let addr = listener
+            .local_addr()
+            .expect("compatible streaming mock address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve compatible streaming mock");
+        });
+        (
+            make_model_provider("compatible-primary", &format!("http://{addr}"), Some("key")),
+            server,
+        )
     }
 
     fn non_streaming_response_cases() -> Vec<(&'static str, serde_json::Value, Option<&'static str>)>
@@ -4949,6 +5104,43 @@ mod tests {
         (response, server)
     }
 
+    async fn open_errored_sse_response(
+        body: &'static str,
+    ) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind failing SSE test server");
+        let addr = listener
+            .local_addr()
+            .expect("failing SSE test server address");
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept failing SSE request");
+            let declared_length = body.len() + 1;
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("write failing SSE headers");
+            socket
+                .write_all(format!("{declared_length:X}\r\n{body}").as_bytes())
+                .await
+                .expect("write truncated SSE chunk");
+            socket.flush().await.expect("flush truncated SSE chunk");
+            // Close before the declared chunk is complete: reqwest has already
+            // received the length terminal event, then reports a body-read error.
+            socket.shutdown().await.expect("close truncated SSE socket");
+        });
+        let response = reqwest::Client::new()
+            .get(format!("http://{addr}/stream"))
+            .send()
+            .await
+            .expect("request failing SSE test stream");
+        (response, server)
+    }
+
     #[tokio::test]
     async fn done_sentinel_finishes_chunk_stream_without_eof() {
         let (response, server) = open_sse_response(
@@ -5018,6 +5210,367 @@ mod tests {
             matches!(events.last(), Some(Ok(StreamEvent::Final))),
             "got: {events:?}"
         );
+    }
+
+    fn assert_output_limit_failure(error: &anyhow::Error, expected_usage: Option<(u64, u64)>) {
+        let failure = zeroclaw_api::model_provider::terminal_completion_failure(error)
+            .expect("length must retain a typed terminal failure");
+        assert_eq!(
+            failure.reason,
+            zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+        );
+        assert_eq!(
+            failure
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.input_tokens)
+                .zip(failure.usage.as_ref().and_then(|usage| usage.output_tokens),),
+            expected_usage,
+        );
+    }
+
+    fn assert_chunk_output_limit_failure(
+        chunks: &[StreamResult<StreamChunk>],
+        expected_usage: Option<(u64, u64)>,
+    ) {
+        let failure = match chunks.last() {
+            Some(Err(StreamError::TerminalCompletion(failure))) => failure,
+            other => panic!("expected output-limit terminal failure, got: {other:?}"),
+        };
+        assert_eq!(
+            failure.reason,
+            zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+        );
+        assert_eq!(
+            failure
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.input_tokens)
+                .zip(failure.usage.as_ref().and_then(|usage| usage.output_tokens)),
+            expected_usage,
+        );
+    }
+
+    #[test]
+    fn only_length_classifies_as_an_output_limit() {
+        for finish_reason in [
+            Some("stop"),
+            Some("tool_calls"),
+            Some("content_filter"),
+            Some("vendor_extension"),
+            None,
+        ] {
+            assert!(output_limit_error(finish_reason, None).is_none());
+        }
+        let error = output_limit_error(Some("length"), None)
+            .expect("length must classify as an output limit");
+        assert_output_limit_failure(&error, None);
+    }
+
+    #[tokio::test]
+    async fn compatible_length_stream_preserves_partial_text_and_never_finishes() {
+        let events = collect_stream_events(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        assert!(matches!(
+            events.first(),
+            Some(Ok(StreamEvent::TextDelta(chunk))) if chunk.delta == "partial"
+        ));
+        assert!(matches!(
+            events.get(1),
+            Some(Ok(StreamEvent::Usage(usage)))
+                if usage.input_tokens == Some(10) && usage.output_tokens == Some(20)
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Final))),
+            "length must not emit Final: {events:?}"
+        );
+        match events.last() {
+            Some(Err(StreamError::TerminalCompletion(failure))) => {
+                assert_eq!(
+                    failure.reason,
+                    zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+                );
+                assert_eq!(
+                    failure.usage.as_ref().and_then(|usage| usage.output_tokens),
+                    Some(20)
+                );
+            }
+            other => panic!("expected output-limit failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_length_stream_preserves_terminal_cause_after_malformed_sse() {
+        let events = collect_stream_events(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+             data: {not-json}\n\n",
+        )
+        .await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Final))),
+            "length must not emit Final: {events:?}"
+        );
+        match events.last() {
+            Some(Err(StreamError::TerminalCompletion(failure))) => assert_eq!(
+                failure.reason,
+                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+            ),
+            other => panic!("captured output-limit cause must win, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_length_stream_publishes_the_existing_output_limit_policy() {
+        let (slot, _scope) = crate::terminal::enter_terminal_policy_scope();
+        let events = collect_stream_events(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let stream_error = match events.into_iter().last() {
+            Some(Err(error)) => error,
+            other => panic!("expected output-limit failure, got {other:?}"),
+        };
+        let error = crate::terminal::contextualize_terminal_stream_error(&slot, stream_error);
+        let context = crate::terminal::terminal_completion_context(&error)
+            .expect("compatible output limit must retain its delivery policy");
+        assert_eq!(
+            context.policy().recovery(),
+            crate::terminal::TerminalRecoveryDisposition::NextCandidate
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_length_stream_uses_the_real_reliable_candidate_for_fallback() {
+        use std::sync::Arc;
+
+        let (primary, primary_server) = mock_streaming_response(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n\
+             data: [DONE]\n\n",
+        )
+        .await;
+        let (fallback, fallback_requests, fallback_server) =
+            mock_non_streaming_response(serde_json::json!({
+                "choices": [{"message": {"content": "recovered"}, "finish_reason": "stop"}]
+            }))
+            .await;
+        let reliable = Arc::new(crate::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "compatible-primary".to_string(),
+                    Box::new(primary) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "compatible-fallback".to_string(),
+                    Box::new(fallback) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        ));
+        let dispatch = crate::dispatch::ProviderDispatch::new(reliable as Arc<dyn ModelProvider>);
+        let messages = vec![ChatMessage::user("hello")];
+        let request = crate::traits::ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+
+        let scope = crate::dispatch::AccountedChatScope::new();
+        let response = scope
+            .scope(async {
+                let mut stream = dispatch.stream_chat_terminal_aware(
+                    request,
+                    "test-model",
+                    Some(0.0),
+                    StreamOptions::new(true),
+                );
+                let error = loop {
+                    let event = stream
+                        .next()
+                        .await
+                        .expect("length stream must yield usage followed by a terminal error");
+                    match event {
+                        Ok(StreamEvent::Usage(usage)) => {
+                            assert_eq!(usage.output_tokens, Some(20));
+                        }
+                        Err(error) => break error,
+                        Ok(other) => {
+                            panic!("length stream must not complete successfully: {other:?}")
+                        }
+                    }
+                };
+                let terminal = crate::terminal::terminal_completion_context(&error)
+                    .expect("dispatch must retain the compatible terminal policy");
+                assert_eq!(
+                    terminal.failure().reason,
+                    zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+                );
+                assert_eq!(
+                    terminal
+                        .failure()
+                        .usage
+                        .as_ref()
+                        .and_then(|usage| usage.output_tokens),
+                    Some(20)
+                );
+                drop(stream);
+
+                dispatch
+                    .chat(
+                        crate::traits::ChatRequest {
+                            messages: &messages,
+                            tools: None,
+                            thinking: None,
+                        },
+                        "test-model",
+                        Some(0.0),
+                    )
+                    .await
+            })
+            .await
+            .expect("a no-output compatible length failure may use the next candidate");
+
+        primary_server.abort();
+        fallback_server.abort();
+        assert_eq!(response.text.as_deref(), Some("recovered"));
+        assert_eq!(
+            fallback_requests
+                .lock()
+                .expect("fallback requests lock")
+                .len(),
+            1,
+            "only the configured next candidate may receive the fallback request"
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_length_chunk_stream_never_emits_final() {
+        let mut stream = sse_bytes_to_chunks(
+            sse_response(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n\
+                 data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                 data: [DONE]\n\n",
+            ),
+            false,
+        );
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+        assert!(matches!(chunks.first(), Some(Ok(chunk)) if chunk.delta == "partial"));
+        assert!(
+            !chunks
+                .iter()
+                .any(|chunk| matches!(chunk, Ok(chunk) if chunk.is_final))
+        );
+        assert!(matches!(
+            chunks.last(),
+            Some(Err(StreamError::TerminalCompletion(failure)))
+                if failure.reason == zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+        ));
+    }
+
+    #[tokio::test]
+    async fn compatible_length_chunk_stream_retains_usage_after_terminal_reason() {
+        let mut stream = sse_bytes_to_chunks(
+            sse_response(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n\
+                 data: [DONE]\n\n",
+            ),
+            false,
+        );
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+
+        assert_chunk_output_limit_failure(&chunks, Some((10, 20)));
+    }
+
+    #[tokio::test]
+    async fn compatible_length_chunk_stream_retains_usage_reported_after_terminal_reason() {
+        let mut stream = sse_bytes_to_chunks(
+            sse_response(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                 data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n\
+                 data: [DONE]\n\n",
+            ),
+            false,
+        );
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+
+        assert_chunk_output_limit_failure(&chunks, Some((10, 20)));
+    }
+
+    #[tokio::test]
+    async fn compatible_length_chunk_stream_retains_usage_after_later_parse_error() {
+        let mut stream = sse_bytes_to_chunks(
+            sse_response(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20}}\n\n\
+                 data: {not-json}\n\n",
+            ),
+            false,
+        );
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+
+        assert_chunk_output_limit_failure(&chunks, Some((10, 20)));
+    }
+
+    #[tokio::test]
+    async fn compatible_length_chunk_stream_preserves_terminal_cause_after_malformed_sse() {
+        let mut stream = sse_bytes_to_chunks(
+            sse_response(
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n\
+                 data: {not-json}\n\n",
+            ),
+            false,
+        );
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+
+        assert!(matches!(
+            chunks.last(),
+            Some(Err(StreamError::TerminalCompletion(failure)))
+                if failure.reason == zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+        ));
+    }
+
+    #[tokio::test]
+    async fn compatible_length_chunk_stream_preserves_terminal_cause_after_body_failure() {
+        let (response, server) = open_errored_sse_response(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+        )
+        .await;
+        let mut stream = sse_bytes_to_chunks(response, false);
+        let mut chunks = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            chunks.push(chunk);
+        }
+        server.abort();
+
+        assert!(matches!(
+            chunks.last(),
+            Some(Err(StreamError::TerminalCompletion(failure)))
+                if failure.reason == zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit
+        ));
     }
 
     #[tokio::test]
@@ -5311,6 +5864,76 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn non_streaming_length_is_rejected_before_text_or_tool_conversion() {
+        let response = serde_json::json!({
+            "data": {
+                "choices": [{
+                    "message": {
+                        "content": "partial",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "echo", "arguments": "{}"}
+                        }]
+                    },
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20}
+            }
+        });
+        let (provider, captured, server) = mock_non_streaming_response(response).await;
+        let messages = vec![ChatMessage::user("hello")];
+
+        let system = provider
+            .chat_with_system(None, "hello", "test-model", None)
+            .await
+            .expect_err("length must not return text success");
+        assert_output_limit_failure(&system, Some((10, 20)));
+
+        let history = provider
+            .chat_with_history(&messages, "test-model", None)
+            .await
+            .expect_err("length must not return history text success");
+        assert_output_limit_failure(&history, Some((10, 20)));
+
+        let raw_tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "echo", "parameters": {"type": "object"}}
+        })];
+        let with_tools = provider
+            .chat_with_tools(&messages, &raw_tools, "test-model", None)
+            .await
+            .expect_err("length must not return executable tool calls");
+        assert_output_limit_failure(&with_tools, Some((10, 20)));
+
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "echo",
+            "Echo a value",
+            serde_json::json!({"type": "object"}),
+        )];
+        let native = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "test-model",
+                None,
+            )
+            .await
+            .expect_err("length must not return a native response");
+        assert_output_limit_failure(&native, Some((10, 20)));
+
+        server.abort();
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            4,
+            "every path must issue one request"
+        );
     }
 
     #[tokio::test]
