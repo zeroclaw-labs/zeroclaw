@@ -96,7 +96,7 @@ const MODEL_SWITCH_TIMEOUT_MS = 10_000;
 function friendlyAgentError(message?: string): string {
   const raw = message?.trim() || t('agent.unknown_error');
   const localConnectFailure = raw.match(
-    /model_provider=(\w+)\s+model=([^\s]+).*?url \((https?:\/\/[^)]+)\).*?(?:Connection refused|tcp connect error)/i,
+    /model_provider=([\w.]+)\s+model=([^\s]+).*?url \((https?:\/\/[^)]+)\).*?(?:Connection refused|tcp connect error)/i,
   );
   if (localConnectFailure) {
     const provider = localConnectFailure[1] ?? '';
@@ -602,8 +602,9 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         setCurrentModel(activeRef ?? activeModel);
 
         // Available switch targets = every configured provider ref
-        // (`providers.models.<family>.<alias>`), resolved and sorted by the
-        // config layer's canonical alias-source resolver.
+        // (`providers.models.<family>.<alias>`, plus a three-segment
+        // `<family>.<alias>.<model_alias>` per nested model entry), resolved
+        // and sorted by the config layer's canonical alias-source resolver.
         //
         // The `/api/config/resolve-alias-source` endpoint only exists on
         // daemons that declare the `PropKind::AliasRef` contract. Embedded-web
@@ -611,8 +612,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
         // impossible there — but `gateway.web_dist_dir` filesystem serving can
         // pair a newer bundle with an older daemon. `resolveAvailableModels`
         // falls back to the pre-resolver `listProps` scan (sorted through the
-        // same `family.alias` key) when the endpoint is unavailable, so the
-        // picker never silently collapses to a single ref on those deployments.
+        // same key) when the endpoint is unavailable, so the picker never
+        // silently collapses to a single ref on those deployments.
         try {
           const refs = await resolveAvailableModels({
             resolveAliasSource: () => resolveAliasSource('model_providers'),

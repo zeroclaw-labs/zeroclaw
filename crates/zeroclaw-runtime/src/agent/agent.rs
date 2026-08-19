@@ -28,9 +28,18 @@ pub fn build_session_model_provider(
     model_provider_ref: &str,
     model_override: Option<&str>,
 ) -> Result<(Box<dyn ModelProvider>, String, String)> {
+    // A ref must be at least `<type>.<alias>`; a third segment selects a model
+    // entry under the profile's `models` map. The entry itself may be absent
+    // (e.g. auth via env) — resolution stays lenient so an override can still
+    // build a provider, mirroring the pre-multi-model behavior.
     let (model_provider_name, model_provider_alias) = model_provider_ref
         .split_once('.')
-        .map(|(t, a)| (t.to_string(), a.to_string()))
+        .map(|(t, a)| {
+            (
+                t.to_string(),
+                a.split_once('.').map_or(a, |(al, _)| al).to_string(),
+            )
+        })
         .ok_or_else(|| {
             anyhow::Error::msg(format!(
                 "model_provider reference `{model_provider_ref}` must be `<type>.<alias>`"
@@ -41,10 +50,16 @@ pub fn build_session_model_provider(
         .providers
         .models
         .find(&model_provider_name, &model_provider_alias);
+    // Rich resolution: picks the model entry (three-segment or `models.default`
+    // / sole-entry fallback) and the model id. `None` when the entry is absent.
+    let selection = config.resolve_model_selection(model_provider_ref);
+    let model_entry = selection.as_ref().and_then(|s| s.model_entry);
+
     let model_name = model_override
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .map(str::to_string)
+        .or_else(|| selection.as_ref().and_then(|s| s.model_id.clone()))
         .or_else(|| {
             entry
                 .and_then(|e| e.model.as_deref())
@@ -59,15 +74,17 @@ pub fn build_session_model_provider(
             ))
         })?;
 
-    let model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+    let provider_ref = format!("{model_provider_name}.{model_provider_alias}");
+    let mut model_provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
         config,
         &model_provider_name,
         &model_provider_alias,
     );
+    zeroclaw_providers::apply_model_entry_options(&mut model_provider_runtime_options, model_entry);
 
     let model_provider = zeroclaw_providers::create_routed_model_provider_with_options(
         config,
-        model_provider_ref,
+        &provider_ref,
         entry.and_then(|e| e.api_key.as_deref()),
         entry.and_then(|e| e.uri.as_deref()),
         &config.reliability,
@@ -1644,24 +1661,39 @@ impl Agent {
         } = assembled;
         let tools = registry.into_inner();
 
-        let model_name = match agent_model_provider
-            .and_then(|e| e.model.as_deref())
+        // Resolve the (possibly three-segment) model_provider ref into the
+        // selected model entry, so a single provider profile can host multiple
+        // models. Two-segment refs fall back to the legacy single-model path.
+        let selection = config.resolve_model_selection(agent_cfg.model_provider.as_str());
+        let model_selection_temperature =
+            selection.as_ref().and_then(|s| s.model_entry?.temperature);
+        let model_entry_owned = selection.as_ref().and_then(|s| s.model_entry.cloned());
+
+        let model_name = match selection
+            .as_ref()
+            .and_then(|s| s.model_id.clone())
+            .as_deref()
             .map(str::trim)
             .filter(|m| !m.is_empty())
+            .map(str::to_string)
         {
-            Some(m) => m.to_string(),
+            Some(m) => m,
             None => anyhow::bail!(
                 "agents.{agent_alias}.model_provider resolves to a model_provider entry \
-                 with no `model` set. Configure [providers.models.{provider_name}.<alias>] \
-                 model = \"...\".",
+                 with no model id. Set [providers.models.{provider_name}.<alias>] model = \"...\" \
+                 or a [providers.models.{provider_name}.<alias>.models.<name>] id = \"...\".",
             ),
         };
 
         let provider_ref = format!("{provider_name}.{provider_alias}");
-        let provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
+        let mut provider_runtime_options = zeroclaw_providers::provider_runtime_options_for_alias(
             config,
             provider_name,
             provider_alias,
+        );
+        zeroclaw_providers::apply_model_entry_options(
+            &mut provider_runtime_options,
+            model_entry_owned.as_ref(),
         );
 
         let model_provider: Box<dyn ModelProvider> =
@@ -1742,7 +1774,10 @@ impl Agent {
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
             .model_provider_name(provider_name.to_string())
-            .temperature(agent_model_provider.and_then(|e| e.temperature))
+            .temperature(
+                model_selection_temperature
+                    .or_else(|| agent_model_provider.and_then(|e| e.temperature)),
+            )
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
             .classification_config(config.query_classification.clone())
@@ -2073,16 +2108,48 @@ impl Agent {
                     .and_then(|r| r.api_key.as_deref());
                 let api_key = route_api_key.or(default_api_key);
 
-                let runtime_options = new_model_provider
-                    .split_once('.')
-                    .map(|(family, alias)| {
-                        zeroclaw_providers::provider_runtime_options_for_alias(
-                            full_config.as_ref(),
-                            family,
-                            alias,
-                        )
-                    })
-                    .unwrap_or_default();
+                // Resolve runtime options via the full model-selection chain so a
+                // three-segment `<family>.<alias>.<model_alias>` ref picks up
+                // model-entry-level overrides (max_tokens, native_tools,
+                // provider_extra, replay_assistant_reasoning, think, vision,
+                // chat_template_kwargs); a two-segment ref falls back to
+                // profile-level options only.
+                let mut runtime_options =
+                    zeroclaw_config::schema::provider_profile_ref(&new_model_provider)
+                        .map(|(family, alias)| {
+                            zeroclaw_providers::provider_runtime_options_for_alias(
+                                full_config.as_ref(),
+                                family,
+                                alias,
+                            )
+                        })
+                        .unwrap_or_default();
+                if let Some(sel) = full_config.resolve_model_selection(&new_model_provider)
+                    && let Some(entry) = sel.model_entry
+                {
+                    if entry.max_tokens.is_some() {
+                        runtime_options.provider_max_tokens = entry.max_tokens;
+                    }
+                    if entry.native_tools.is_some() {
+                        runtime_options.native_tools = entry.native_tools;
+                    }
+                    if entry.provider_extra.is_some() {
+                        runtime_options.provider_extra = entry.provider_extra.clone();
+                    }
+                    if entry.replay_assistant_reasoning.is_some() {
+                        runtime_options.replay_assistant_reasoning =
+                            entry.replay_assistant_reasoning;
+                    }
+                    if entry.think.is_some() {
+                        runtime_options.think = entry.think;
+                    }
+                    if entry.vision.is_some() {
+                        runtime_options.vision = entry.vision;
+                    }
+                    if entry.chat_template_kwargs.is_some() {
+                        runtime_options.chat_template_kwargs = entry.chat_template_kwargs.clone();
+                    }
+                }
 
                 zeroclaw_providers::create_routed_model_provider_with_options(
                     full_config.as_ref(),
@@ -3202,19 +3269,23 @@ pub async fn run(
     let mut effective_config = config;
     if let Some(ref p) = provider_override {
         // When a model_provider override is specified, ensure that model_provider type exists
-        // in models and update the agent's model_provider to reference it.
-        let (type_key, alias_key) = p.split_once('.').unwrap_or((p.as_str(), agent_alias));
+        // in models and update the agent's model_provider to reference it. The
+        // override may be three-segment (`<type>.<alias>.<model>`); key the
+        // profile off the first two segments and preserve the whole ref.
+        let (type_key, alias_key) =
+            zeroclaw_config::schema::provider_profile_ref(p).unwrap_or((p.as_str(), agent_alias));
         effective_config
             .providers
             .models
             .ensure(type_key, alias_key);
         if let Some(agent_cfg) = effective_config.agents.get_mut(agent_alias) {
-            agent_cfg.model_provider = format!("{type_key}.{alias_key}").into();
+            agent_cfg.model_provider = p.as_str().into();
         }
     }
     // Apply model/temperature overrides to the agent's resolved provider entry.
     if let Some(agent_cfg) = effective_config.agents.get(agent_alias)
-        && let Some((fam, ali)) = agent_cfg.model_provider.split_once('.')
+        && let Some((fam, ali)) =
+            zeroclaw_config::schema::provider_profile_ref(agent_cfg.model_provider.as_str())
         && let Some(entry) = effective_config.providers.models.ensure(fam, ali)
     {
         if let Some(m) = model_override {

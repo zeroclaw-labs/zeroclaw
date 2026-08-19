@@ -65,6 +65,10 @@ fn section_path(kind: &AliasKind) -> String {
             };
             format!("providers.{cat}.{family}")
         }
+        AliasKind::ModelAlias {
+            family,
+            profile_alias,
+        } => format!("providers.models.{family}.{profile_alias}.models"),
         AliasKind::Channel { channel_type } => format!("channels.{channel_type}"),
     }
 }

@@ -6,7 +6,12 @@ use crate::schema::v1::V1Config;
 use crate::schema::v2::V2Config;
 
 /// The schema version this binary writes and expects on disk.
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+///
+/// V4 is reserved for the breaking schema cut covering channel/tool removals
+/// (the companion PR that removes deprecated channels and SaaS integrations).
+/// This branch's multi-model provider feature occupies V5 so the two cuts can
+/// land independently and in either order.
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 pub(crate) struct ConfigLoadAttribution;
 
@@ -786,6 +791,67 @@ pub(crate) fn fold_string_into_array(
     }
 }
 
+/// V4 → V5: regularize each `[providers.<family>.<alias>]` entry's flat
+/// `model` into a `models.default` subtable so one provider profile can host
+/// several named model entries. Entry-level fields are preserved for downgrade
+/// compatibility; this step only mints `models.default.id` from the legacy
+/// entry-level `model` field.
+///
+/// V4 is reserved for the breaking channel/tool-removal cut that removes
+/// deprecated channels and SaaS integrations.
+/// This step sits at V4→V5 so the two cuts can land independently and in
+/// either order without competing for the same version slot.
+fn migrate_v4_to_v5(value: toml::Value) -> Result<toml::Value> {
+    let mut root = match value {
+        toml::Value::Table(t) => t,
+        other => return Ok(other),
+    };
+
+    // Every step stamps its own target version (run_chain does not).
+    root.insert("schema_version".to_string(), toml::Value::Integer(5));
+
+    let Some(toml::Value::Table(providers)) = root.get_mut("providers") else {
+        return Ok(toml::Value::Table(root));
+    };
+    let Some(toml::Value::Table(families)) = providers.get_mut("models") else {
+        return Ok(toml::Value::Table(root));
+    };
+
+    let mut minted = 0usize;
+    for (_family, family_val) in families.iter_mut() {
+        let toml::Value::Table(aliases) = family_val else {
+            continue;
+        };
+        for (_alias, entry_val) in aliases.iter_mut() {
+            let toml::Value::Table(entry) = entry_val else {
+                continue;
+            };
+            // Skip entries that already carry a `models` subtable.
+            if matches!(entry.get("models"), Some(toml::Value::Table(_))) {
+                continue;
+            }
+            let Some(model_id) = entry.get("model").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let mut default_entry = toml::value::Table::new();
+            default_entry.insert("id".to_string(), toml::Value::String(model_id.to_string()));
+            let mut models = toml::value::Table::new();
+            models.insert("default".to_string(), toml::Value::Table(default_entry));
+            entry.insert("models".to_string(), toml::Value::Table(models));
+            minted += 1;
+        }
+    }
+
+    if minted > 0 {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "[providers] entry-level model → models.default (V4→V5)"
+        );
+    }
+    Ok(toml::Value::Table(root))
+}
+
 /// One typed migration step: `V_n` TOML → `V_{n+1}` TOML.
 type MigrationStep = fn(toml::Value) -> Result<toml::Value>;
 
@@ -807,6 +873,19 @@ const MIGRATION_STEPS: &[MigrationStep] = &[
             .context("failed to deserialize as V2 schema")?;
         v2.migrate().context("failed to migrate V2 → V3")
     },
+    // V3 → V4: reserved for the breaking channel/tool-removal cut that removes
+    // deprecated channels and SaaS integrations. This slot is a passthrough
+    // until that PR lands and fills it in.
+    |value| {
+        let mut root = match value {
+            toml::Value::Table(t) => t,
+            other => return Ok(other),
+        };
+        root.insert("schema_version".to_string(), toml::Value::Integer(4));
+        Ok(toml::Value::Table(root))
+    },
+    // V4 → V5: multi-model provider profiles (this branch).
+    |value| migrate_v4_to_v5(value).context("failed to migrate V4 → V5"),
 ];
 
 const _: () = assert!(
@@ -1441,6 +1520,91 @@ enabled = "not-a-bool"
             !backup.exists(),
             "no `.backup` should be created on the no-op path; got {}",
             backup.display()
+        );
+    }
+
+    #[test]
+    fn v4_to_v5_mints_models_default_from_entry_model() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "gpt-4o"
+fallback_models = ["gpt-4o-mini"]
+temperature = 0.5
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migration succeeds")
+            .expect("v4 input migrates to v5");
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        let entry = value["providers"]["models"]["custom"]["rag_bot"]
+            .as_table()
+            .unwrap();
+        // Entry-level fields preserved for downgrade compatibility. Profile-level
+        // `fallback_models` stays at the entry level and is NOT copied into the
+        // minted model entry — fallback is a profile-level concept.
+        assert_eq!(entry["model"].as_str(), Some("gpt-4o"));
+        assert!(entry.get("fallback_models").is_some());
+        // models.default minted from the entry-level model id only.
+        let default = entry["models"]["default"].as_table().unwrap();
+        assert_eq!(default["id"].as_str(), Some("gpt-4o"));
+        assert!(default.get("fallback_models").is_none());
+        // Result deserializes as a current Config.
+        let _cfg = migrate_to_current(raw).expect("migrates into a valid Config");
+    }
+
+    #[test]
+    fn v3_to_v5_mints_models_default_via_full_chain() {
+        // A V3 config should pass through the passthrough V3→V4 step and then
+        // have models.default minted by the V4→V5 step.
+        let raw = r#"
+schema_version = 3
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "gpt-4o"
+fallback_models = ["gpt-4o-mini"]
+temperature = 0.5
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migration succeeds")
+            .expect("v3 input migrates to v5");
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        assert_eq!(value["schema_version"].as_integer(), Some(5));
+        let entry = value["providers"]["models"]["custom"]["rag_bot"]
+            .as_table()
+            .unwrap();
+        assert_eq!(entry["model"].as_str(), Some("gpt-4o"));
+        let default = entry["models"]["default"].as_table().unwrap();
+        assert_eq!(default["id"].as_str(), Some("gpt-4o"));
+        let _cfg = migrate_to_current(raw).expect("migrates into a valid Config");
+    }
+
+    #[test]
+    fn v4_to_v5_leaves_existing_models_subtable_untouched() {
+        let raw = r#"
+schema_version = 4
+
+[providers.models.custom.rag_bot]
+uri = "http://localhost:8000/v1"
+model = "legacy-id"
+
+[providers.models.custom.rag_bot.models.fast]
+id = "gpt-4o-mini"
+"#;
+        let migrated = migrate_file(raw)
+            .expect("migration succeeds")
+            .expect("v4 input migrates to v5");
+        let value: toml::Value = toml::from_str(&migrated).unwrap();
+        let models = value["providers"]["models"]["custom"]["rag_bot"]["models"]
+            .as_table()
+            .unwrap();
+        // Pre-existing subtable is preserved; no `default` is synthesized over it.
+        assert!(models.contains_key("fast"));
+        assert!(
+            !models.contains_key("default"),
+            "must not mint default when a models subtable already exists"
         );
     }
 }

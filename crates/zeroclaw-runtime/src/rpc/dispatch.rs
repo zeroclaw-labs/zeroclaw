@@ -413,6 +413,16 @@ fn agent_scoped_refresh_selects(
     session_agent == edited_agent && overrides.model_provider.is_none()
 }
 
+/// Reduce a possibly three-segment `<type>.<alias>.<model>` model_provider
+/// reference to its two-segment `<type>.<alias>` provider-profile form, so it
+/// can be matched against a profile-scoped edit target. Falls back to the
+/// trimmed input when the ref has no dot separator.
+fn profile_ref_of(model_provider_ref: &str) -> String {
+    zeroclaw_config::schema::provider_profile_ref(model_provider_ref)
+        .map(|(family, alias)| format!("{family}.{alias}"))
+        .unwrap_or_else(|| model_provider_ref.trim().to_string())
+}
+
 /// Session-selection predicate for a provider-scoped refresh
 /// (`providers.models.*` edit). A session is eligible when its own
 /// `model_provider` override matches the edited provider, or when it has no
@@ -422,7 +432,9 @@ fn provider_scoped_refresh_selects(target_ref: &str, overrides: &SessionOverride
     overrides
         .model_provider
         .as_deref()
-        .map(|r| r == target_ref)
+        // A three-segment override still refreshes when its provider profile
+        // (first two segments) matches the edited `<type>.<alias>` target.
+        .map(|r| profile_ref_of(r) == target_ref)
         .unwrap_or(true)
 }
 
@@ -434,11 +446,13 @@ fn memory_embeddings_use_provider(
     config: &zeroclaw_config::schema::Config,
     model_provider_ref: &str,
 ) -> bool {
-    config.memory.embedding_provider.trim() == model_provider_ref
+    // Compare on the provider-profile portion so a three-segment
+    // `<type>.<alias>.<model>` embedding ref still matches the edited profile.
+    profile_ref_of(&config.memory.embedding_provider) == model_provider_ref
         || config
             .embedding_routes
             .iter()
-            .any(|route| route.model_provider.trim() == model_provider_ref)
+            .any(|route| profile_ref_of(&route.model_provider) == model_provider_ref)
 }
 
 fn rename_error_to_rpc(
@@ -2970,7 +2984,10 @@ impl RpcDispatcher {
                     .agent(session_agent)
                     .map(|agent| agent.model_provider.as_str())
             });
-            (effective_ref == Some(target_ref.as_str())).then(|| target_ref.clone())
+            // Compare on the provider-profile portion so a three-segment
+            // `<type>.<alias>.<model>` ref still matches the edited profile.
+            (effective_ref.map(profile_ref_of) == Some(target_ref.clone()))
+                .then(|| target_ref.clone())
         })
         .await;
     }
@@ -2999,15 +3016,16 @@ impl RpcDispatcher {
                 else {
                     continue;
                 };
-                let provider_temperature = model_provider_ref.split_once('.').and_then(
-                    |(provider_type, provider_alias)| {
-                        config
-                            .providers
-                            .models
-                            .find(provider_type, provider_alias)
-                            .and_then(|entry| entry.temperature)
-                    },
-                );
+                // Use resolve_model_selection so temperature respects the
+                // model-entry level when a three-segment ref selects one;
+                // a two-segment ref falls back to profile-level temperature.
+                let provider_temperature = config
+                    .resolve_model_selection(&model_provider_ref)
+                    .and_then(|sel| {
+                        sel.model_entry
+                            .and_then(|e| e.temperature)
+                            .or(sel.entry.temperature)
+                    });
                 let Some(agent_cfg) = config
                     .resolved_agent_config(&agent_alias)
                     .or_else(|| config.agent(&agent_alias).cloned())
@@ -5021,6 +5039,26 @@ mod tests {
         assert!(!provider_scoped_refresh_selects(
             "anthropic.default",
             &other_override
+        ));
+
+        // A three-segment override refreshes when its profile (first two
+        // segments) matches the edited `<type>.<alias>` target.
+        let three_seg_match = SessionOverrides {
+            model_provider: Some("anthropic.default.fast".to_string()),
+            ..Default::default()
+        };
+        assert!(provider_scoped_refresh_selects(
+            "anthropic.default",
+            &three_seg_match
+        ));
+        // ...but not when the profile portion names a different alias.
+        let three_seg_other = SessionOverrides {
+            model_provider: Some("anthropic.work.fast".to_string()),
+            ..Default::default()
+        };
+        assert!(!provider_scoped_refresh_selects(
+            "anthropic.default",
+            &three_seg_other
         ));
     }
 

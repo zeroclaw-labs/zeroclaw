@@ -803,12 +803,26 @@ impl DelegateTool {
         })
     }
 
-    /// Resolve `model_provider` ("type.alias") → (provider_type, credential, model, temperature).
+    /// Resolve `model_provider` (`type.alias` or `type.alias.model`) →
+    /// (provider_type, credential, model, temperature).
     fn resolve_brain(&self, model_provider: &str) -> (String, Option<String>, String, Option<f64>) {
-        if let Some((type_key, alias_key)) = model_provider.split_once('.')
+        let mut parts = model_provider.splitn(3, '.');
+        let type_key = parts.next().unwrap_or(model_provider);
+        let alias_key = parts.next();
+        let model_alias = parts.next();
+
+        if let Some(alias_key) = alias_key
             && let Some(alias_map) = self.providers_models.get(type_key)
             && let Some(cfg) = alias_map.get(alias_key)
         {
+            // A three-segment ref selects a model entry; its `id` (with its own
+            // temperature) overrides the profile's `model`/`temperature`.
+            let model_entry = model_alias.and_then(|m| cfg.models.get(m));
+            let model = model_entry
+                .and_then(|e| e.id.clone())
+                .or_else(|| cfg.model.clone())
+                .unwrap_or_default();
+            let temperature = model_entry.and_then(|e| e.temperature).or(cfg.temperature);
             return (
                 type_key.to_string(),
                 if cfg.requires_openai_auth {
@@ -818,13 +832,10 @@ impl DelegateTool {
                         .clone()
                         .or_else(|| self.global_credential.clone())
                 },
-                cfg.model.clone().unwrap_or_default(),
-                cfg.temperature,
+                model,
+                temperature,
             );
         }
-        let type_key = model_provider
-            .split_once('.')
-            .map_or(model_provider, |(t, _)| t);
         (
             type_key.to_string(),
             self.global_credential.clone(),

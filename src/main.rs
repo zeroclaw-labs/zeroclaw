@@ -8215,7 +8215,10 @@ async fn handle_models_set(config: &mut Config, model: &str) -> Result<()> {
             .providers
             .models
             .iter_entries()
-            .find(|(_, _, entry)| entry.model.as_ref().map_or(false, |m| !m.trim().is_empty()))
+            .find(|(_, _, entry)| {
+                entry.model.as_ref().is_some_and(|m| !m.trim().is_empty())
+                    || !entry.models.is_empty()
+            })
             .ok_or_else(|| {
                 anyhow::Error::msg(
                     "No model provider configured. Run `zeroclaw config init` first.",

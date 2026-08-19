@@ -1,7 +1,9 @@
 export interface StatusResponse {
   version?: string;
-  /** Dotted `<type>.<alias>` of the first configured model provider, or null
-   *  when none is configured. "provider" alone is reserved — always qualify. */
+  /** Dotted model-provider reference of the active/first configured provider,
+   *  or null when none is configured. Two-segment `<type>.<alias>`, or
+   *  three-segment `<type>.<alias>.<model>` when a multi-model subtable entry
+   *  is selected. "provider" alone is reserved — always qualify. */
   model_provider: string | null;
   model: string;
   temperature: number;
