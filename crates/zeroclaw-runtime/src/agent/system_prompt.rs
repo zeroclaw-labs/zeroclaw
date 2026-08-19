@@ -11,6 +11,20 @@ pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
 
+/// Model-facing `always_ask` exception under Full autonomy.
+fn full_autonomy_always_ask_prompt_lines(always_ask: &[String]) -> String {
+    if always_ask.iter().any(|tool| tool == "*") {
+        "- `always_ask` is set to `*`, so every tool still requires operator approval, or fails closed when no approver is present.\n".to_string()
+    } else if always_ask.is_empty() {
+        "- No tools are listed in `always_ask`.\n".to_string()
+    } else {
+        format!(
+            "- Tools listed in `always_ask` still require operator approval, or fail closed when no approver is present: {}.\n",
+            always_ask.join(", ")
+        )
+    }
+}
+
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
     workspace_dir: &std::path::Path,
@@ -217,9 +231,10 @@ pub fn build_system_prompt_with_mode_and_autonomy(
 
     // ── 1d. Tool Authorization (Full autonomy) ──────────────────────
     // At Full autonomy the user has explicitly opted into letting the model
-    // act without per-call approval. The generic Safety block alone isn't
-    // enough to overcome model safety-priors that produce simulated
-    // refusal text without ever dispatching a tool call.
+    // act without per-call approval for tools that are not listed in
+    // `always_ask`. The generic Safety block alone isn't enough to overcome
+    // model safety-priors that produce simulated refusal text without ever
+    // dispatching a tool call.
     // Name the power tools the autonomy policy authorizes and tell the model
     // it is authorized to *call/attempt* them (not that they are exempt from
     // policy): command policy, forbidden_commands, forbidden_paths, and OS
@@ -233,13 +248,18 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         if !power_tools.is_empty() {
             prompt.push_str(
                 "## Tool Authorization\n\n\
-                 The runtime autonomy policy is set to `full`. The user has granted the agent permission to act without per-call approval, so the following tools are registered and authorized to call (to attempt) under Full autonomy: ",
+                 The runtime autonomy policy is set to `full`. Uncovered tools are authorized to call (to attempt) without per-call approval. The following tools are registered under Full autonomy: ",
             );
             prompt.push_str(&power_tools.join(", "));
+            prompt.push_str(".\n");
+            prompt.push_str(&full_autonomy_always_ask_prompt_lines(
+                autonomy_config
+                    .map(|cfg| cfg.always_ask.as_slice())
+                    .unwrap_or(&[]),
+            ));
             prompt.push_str(
-                ".\n\
-                 When the user asks you to run a shell command, write or edit a file, or otherwise act through these tools, CALL the tool directly — do NOT self-refuse with simulated text such as \"blocked by security policy\" or \"restricted in this environment\" merely because the request uses shell or file-write tooling.\n\
-                 Full autonomy removes the approval prompt, not the runtime safeguards: command policy, `forbidden_commands`, `forbidden_paths`, and OS sandboxing still apply, and a call can still return a real tool error. If such an error occurs, it is reported as a tool error in the conversation; only then should you explain what was blocked. Never invent a block that did not happen.\n\n",
+                "When the user asks you to run a shell command, write or edit a file, or otherwise act through these tools, CALL the tool directly unless it is listed in `always_ask` — do NOT self-refuse with simulated text such as \"blocked by security policy\" or \"restricted in this environment\" merely because the request uses shell or file-write tooling.\n\
+                 Full autonomy auto-approves uncovered tools; it does not remove runtime safeguards: command policy, `forbidden_commands`, `forbidden_paths`, and OS sandboxing still apply, and a call can still return a real tool error. If such an error occurs, it is reported as a tool error in the conversation; only then should you explain what was blocked. Never invent a block that did not happen.\n\n",
             );
         }
     }
@@ -286,21 +306,34 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         );
     }
     prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
-    prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
+    match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
-            "- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
-             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
+            prompt.push_str(
+                "- Respect the runtime autonomy policy: Full auto-approves tools that are not listed in `always_ask`. Execute those directly instead of asking the user for extra approval.\n",
+            );
+            prompt.push_str(&full_autonomy_always_ask_prompt_lines(
+                autonomy_config
+                    .map(|cfg| cfg.always_ask.as_slice())
+                    .unwrap_or(&[]),
+            ));
+            prompt.push_str(
+                "- If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n",
+            );
         }
         Some(crate::security::AutonomyLevel::ReadOnly) => {
-            "- Respect the runtime autonomy policy: this runtime is read-only for side effects unless a tool explicitly reports otherwise.\n\
-             - If a requested action is blocked by policy, explain the restriction directly instead of simulating an approval dialog.\n"
+            prompt.push_str(
+                "- Respect the runtime autonomy policy: this runtime is read-only for side effects unless a tool explicitly reports otherwise.\n\
+                 - If a requested action is blocked by policy, explain the restriction directly instead of simulating an approval dialog.\n",
+            );
         }
         _ => {
-            "- When in doubt, ask before acting externally.\n\
-             - Respect the runtime autonomy policy: ask for approval only when the current runtime policy actually requires it.\n\
-             - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n"
+            prompt.push_str(
+                "- When in doubt, ask before acting externally.\n\
+                 - Respect the runtime autonomy policy: ask for approval only when the current runtime policy actually requires it.\n\
+                 - If a tool or action is blocked by policy or unavailable, explain that concrete restriction instead of simulating an approval dialog.\n",
+            );
         }
-    });
+    }
     prompt.push('\n');
 
     // ── 3. Skills (full or compact, based on config) ─────────────
@@ -489,9 +522,18 @@ mod tests {
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
 
     fn build_with_autonomy(tools: &[(&str, &str)], level: AutonomyLevel) -> String {
+        build_with_profile(tools, level, &[])
+    }
+
+    fn build_with_profile(
+        tools: &[(&str, &str)],
+        level: AutonomyLevel,
+        always_ask: &[&str],
+    ) -> String {
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let autonomy = zeroclaw_config::schema::RiskProfileConfig {
             level,
+            always_ask: always_ask.iter().map(|tool| (*tool).to_string()).collect(),
             ..Default::default()
         };
         build_system_prompt_with_mode_and_autonomy(
@@ -531,8 +573,10 @@ mod tests {
     fn full_autonomy_authorization_is_attempt_scoped_not_unconditional() {
         // Regression guard: the Full-autonomy block must authorize the model to
         // *attempt* the registered tools without self-refusing, but must NOT
-        // claim the tools are exempt from security policy. Full autonomy removes
-        // the approval prompt, not forbidden_commands/forbidden_paths/sandbox.
+        // claim the tools are exempt from security policy. Full autonomy
+        // auto-approves uncovered tools; it does not remove
+        // forbidden_commands/forbidden_paths/sandbox, and `always_ask` still
+        // prompts.
         let tools = [
             ("shell", "Run a shell command"),
             ("file_write", "Write a file"),
@@ -567,6 +611,10 @@ mod tests {
             !auth.contains("NOT blocked by any security policy")
                 && !auth.contains("not blocked by any security policy"),
             "block must not claim the tools are exempt from all security policy"
+        );
+        assert!(
+            !auth.contains("Full autonomy removes the approval prompt"),
+            "block must not claim Full unconditionally removes approval prompts"
         );
     }
 
@@ -609,6 +657,42 @@ mod tests {
         assert!(
             !prompt.contains("## Tool Authorization"),
             "Tool Authorization should be skipped when no power tools (shell/file_write/file_edit) are registered"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_prompt_names_exact_always_ask_exception() {
+        let tools = [("shell", "Run a shell command")];
+        let prompt = build_with_profile(&tools, AutonomyLevel::Full, &["shell"]);
+        assert!(
+            prompt.contains("always_ask"),
+            "Full prompt must mention the always_ask exception"
+        );
+        assert!(
+            prompt.contains("shell"),
+            "exact always_ask entry must be named"
+        );
+        assert!(
+            !prompt.contains("Full autonomy removes the approval prompt"),
+            "must not claim Full unconditionally removes prompts"
+        );
+        assert!(
+            prompt.contains("fail closed") || prompt.contains("fails closed"),
+            "must describe fail-closed behavior when no approver is present"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_prompt_names_wildcard_always_ask_exception() {
+        let tools = [("shell", "Run a shell command")];
+        let prompt = build_with_profile(&tools, AutonomyLevel::Full, &["*"]);
+        assert!(
+            prompt.contains("`always_ask` is set to `*`"),
+            "wildcard always_ask must be described as covering every tool"
+        );
+        assert!(
+            !prompt.contains("Full autonomy removes the approval prompt"),
+            "must not claim Full unconditionally removes prompts"
         );
     }
 }

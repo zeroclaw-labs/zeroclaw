@@ -78,9 +78,9 @@ Per-server fields (`[[mcp.servers]]`), generated from the schema:
 
 MCP tool calls go through the same approval gate as every other tool, governed by the agent's risk profile (`risk_profiles.<alias>`). The `tool_search` discovery step is auto-approved so deferred MCP loading can work in non-interactive sessions, but tools discovered from MCP servers still follow the normal approval policy:
 
-- At autonomy `level = full`, no tool call prompts (MCP tools included).
+- At autonomy `level = full`, uncovered tool calls do not prompt (MCP tools included). A name (or `"*"`) in `always_ask` still prompts, including under Full.
 - Otherwise, an MCP tool call prompts for approval unless its **prefixed** name (`<server>__<tool>`) is in the profile's `auto_approve` list. `auto_approve = ["*"]` approves everything; an exact entry like `auto_approve = ["filesystem__read_file"]` approves just that tool.
-- `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve`.
+- `always_ask` is the inverse: a name (or `"*"`) there always prompts, overriding `auto_approve` and Full autonomy.
 
 ### Authorization: `allowed_tools` / `excluded_tools`
 

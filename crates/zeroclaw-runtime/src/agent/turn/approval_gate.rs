@@ -112,10 +112,11 @@ pub(crate) async fn gate_tool_approval(
             // This string is fed back to the MODEL, so it states the outcome and
             // stops there. It deliberately does not name the settings that would
             // permit the call: `auto_approve` bypasses operator approval for that
-            // tool and `level = "full"` removes approval gates for every tool and
-            // drops workspace-only confinement. Putting that remedy in front of the
-            // model invites it to argue for expanding its own privileges, which is a
-            // disproportionate response to an approval channel being unavailable.
+            // tool and `level = "full"` auto-approves uncovered tools (tools in
+            // `always_ask` still prompt or fail closed). Putting that remedy in
+            // front of the model invites it to argue for expanding its own
+            // privileges, which is a disproportionate response to an approval
+            // channel being unavailable.
             // Operators get the actionable advice through the WARN record below and
             // the UI, where changing policy is actually their decision to make.
             let denied = if unanswerable {
@@ -216,5 +217,178 @@ pub(crate) async fn gate_tool_approval(
 
     ApprovalGateOutcome::Proceed {
         approved: approval_requirement == ApprovalRequirement::Approved,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::context::TurnCtx;
+    use super::{ApprovalGateOutcome, gate_tool_approval};
+    use crate::approval::ApprovalManager;
+    use crate::observability::NoopObserver;
+    use crate::security::AutonomyLevel;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zeroclaw_api::attribution::{Attributable, ChannelKind, Role};
+    use zeroclaw_api::channel::{
+        Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    };
+    use zeroclaw_config::schema::{PacingConfig, RiskProfileConfig};
+
+    fn full_always_ask_profile() -> RiskProfileConfig {
+        RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        }
+    }
+
+    fn test_ctx<'a>(
+        observer: &'a NoopObserver,
+        pacing: &'a PacingConfig,
+        approval: Option<&'a ApprovalManager>,
+        channel: Option<&'a dyn Channel>,
+    ) -> TurnCtx<'a> {
+        TurnCtx {
+            parent_agent_alias: None,
+            observer,
+            provider_name: "stub",
+            model: "stub-model",
+            temperature: None,
+            approval,
+            channel_name: "test",
+            channel_reply_target: Some("operator"),
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing,
+            strict_tool_parsing: false,
+            channel,
+            agent_alias: None,
+            turn_id: "trace-approval-gate",
+        }
+    }
+
+    struct ApprovingChannel {
+        approval_requests: Arc<AtomicUsize>,
+    }
+
+    impl Attributable for ApprovingChannel {
+        fn role(&self) -> Role {
+            Role::Channel(ChannelKind::AcpChannel)
+        }
+        fn alias(&self) -> &str {
+            "approving-test"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ApprovingChannel {
+        fn name(&self) -> &str {
+            "approving-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn request_approval(
+            &self,
+            _recipient: &str,
+            _request: &ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+            self.approval_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(ChannelApprovalResponse::Approve))
+        }
+    }
+
+    #[tokio::test]
+    async fn full_always_ask_fail_closed_without_channel_does_not_execute() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let profile = full_always_ask_profile();
+        let approval = ApprovalManager::for_non_interactive(&profile);
+        let ctx = test_ctx(&observer, &pacing, Some(&approval), None);
+
+        match gate_tool_approval(&ctx, "shell", &serde_json::json!({"command": "ls"}), 0).await {
+            ApprovalGateOutcome::Deny(outcome) => {
+                assert!(!outcome.success);
+                assert!(
+                    outcome.output.contains("requires approval"),
+                    "plain non-interactive Full+always_ask must fail closed, got {}",
+                    outcome.output
+                );
+            }
+            ApprovalGateOutcome::Proceed { approved } => {
+                panic!("listed Full tool must not silently execute (approved={approved})")
+            }
+            ApprovalGateOutcome::Replace(_) => panic!("listed Full tool must not be replaced"),
+        }
+
+        match gate_tool_approval(&ctx, "file_write", &serde_json::json!({"path": "x"}), 0).await {
+            ApprovalGateOutcome::Proceed { approved: true } => {}
+            ApprovalGateOutcome::Proceed { approved: false } => {
+                panic!("uncovered Full tool must still auto-approve")
+            }
+            ApprovalGateOutcome::Deny(_) | ApprovalGateOutcome::Replace(_) => {
+                panic!("uncovered Full tool must still auto-approve")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_always_ask_backchannel_requests_approval_and_uncovered_still_executes() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let profile = full_always_ask_profile();
+        let approval = ApprovalManager::for_non_interactive_backchannel(&profile);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let channel = ApprovingChannel {
+            approval_requests: Arc::clone(&requests),
+        };
+        let ctx = test_ctx(&observer, &pacing, Some(&approval), Some(&channel));
+
+        match gate_tool_approval(&ctx, "shell", &serde_json::json!({"command": "ls"}), 0).await {
+            ApprovalGateOutcome::Proceed { approved: true } => {}
+            ApprovalGateOutcome::Proceed { approved: false } => {
+                panic!("back-channel approval must mark the listed tool approved")
+            }
+            ApprovalGateOutcome::Deny(outcome) => {
+                panic!(
+                    "back-channel approval must permit the listed tool, got {}",
+                    outcome.output
+                )
+            }
+            ApprovalGateOutcome::Replace(_) => panic!("unexpected replace"),
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "listed Full tool must go through the real back-channel request path"
+        );
+
+        match gate_tool_approval(&ctx, "file_write", &serde_json::json!({"path": "x"}), 0).await {
+            ApprovalGateOutcome::Proceed { approved: true } => {}
+            ApprovalGateOutcome::Proceed { approved: false }
+            | ApprovalGateOutcome::Deny(_)
+            | ApprovalGateOutcome::Replace(_) => {
+                panic!("uncovered Full tool must still auto-approve")
+            }
+        }
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "uncovered Full tool must not prompt the back-channel"
+        );
     }
 }

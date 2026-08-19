@@ -363,6 +363,10 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// Tools that still require approval even under Full autonomy.
+    /// Snapshotted from the risk profile at construction, matching
+    /// `autonomy_level`.
+    always_ask: Vec<String>,
     /// Cross-channel HITL: resolved from the active risk profile's
     /// `approval_route`. When set, the per-turn approval bridge asks the named
     /// approver channel (bounded + fail-closed) instead of the originating
@@ -515,6 +519,7 @@ pub struct AgentBuilder {
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    always_ask: Option<Vec<String>>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     mcp_pinned_section: Option<String>,
@@ -565,6 +570,7 @@ impl AgentBuilder {
             response_cache: None,
             security_summary: None,
             autonomy_level: None,
+            always_ask: None,
             approval_route: None,
             activated_tools: None,
             mcp_pinned_section: None,
@@ -741,6 +747,11 @@ impl AgentBuilder {
 
     pub fn autonomy_level(mut self, level: crate::security::AutonomyLevel) -> Self {
         self.autonomy_level = Some(level);
+        self
+    }
+
+    pub fn always_ask(mut self, tools: Vec<String>) -> Self {
+        self.always_ask = Some(tools);
         self
     }
 
@@ -929,6 +940,7 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            always_ask: self.always_ask.unwrap_or_default(),
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
@@ -1755,6 +1767,7 @@ impl Agent {
             .exclude_memory(exclude_memory)
             .security_summary(Some(security.prompt_summary()))
             .autonomy_level(risk_profile.level)
+            .always_ask(risk_profile.always_ask.clone())
             .approval_route(risk_profile.approval_route.clone())
             .activated_tools(activated_handle)
             .mcp_deferred_section(Some(deferred_section))
@@ -1971,6 +1984,7 @@ impl Agent {
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            always_ask: &self.always_ask,
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
         let receipts = &self.config.resolved.tool_receipts;

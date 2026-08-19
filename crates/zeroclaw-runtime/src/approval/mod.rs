@@ -173,19 +173,20 @@ impl ApprovalManager {
     }
 
     pub fn approval_requirement(&self, tool_name: &str) -> ApprovalRequirement {
-        // Full autonomy never prompts.
-        if self.autonomy_level == AutonomyLevel::Full {
-            return ApprovalRequirement::Approved;
-        }
-
         // ReadOnly blocks everything — handled elsewhere; no prompt needed.
         if self.autonomy_level == AutonomyLevel::ReadOnly {
             return ApprovalRequirement::NotRequired;
         }
 
-        // always_ask overrides everything.
+        // always_ask overrides everything, including Full autonomy — an operator
+        // who explicitly lists a tool here wants a prompt regardless of level.
         if self.always_ask.contains("*") || self.always_ask.contains(tool_name) {
             return ApprovalRequirement::Prompt;
+        }
+
+        // Full autonomy auto-approves only tools that are not always_ask.
+        if self.autonomy_level == AutonomyLevel::Full {
+            return ApprovalRequirement::Approved;
         }
 
         if self.non_interactive
@@ -554,6 +555,67 @@ mod tests {
     }
 
     #[test]
+    fn full_autonomy_prompts_for_always_ask_tool() {
+        // always_ask must survive Full autonomy: an operator who explicitly
+        // lists a tool wants a prompt regardless of autonomy level.
+        let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        });
+        assert!(
+            mgr.needs_approval("shell"),
+            "always_ask tool must prompt even under Full autonomy"
+        );
+        // an uncovered tool is still auto-approved
+        assert!(
+            !mgr.needs_approval("file_write"),
+            "uncovered tool should be auto-approved under Full autonomy"
+        );
+    }
+
+    #[test]
+    fn full_autonomy_wildcard_always_ask_prompts_for_everything() {
+        let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            always_ask: vec!["*".into()],
+            ..RiskProfileConfig::default()
+        });
+        assert!(mgr.needs_approval("shell"));
+        assert!(mgr.needs_approval("file_write"));
+        assert!(mgr.needs_approval("anything"));
+    }
+
+    #[test]
+    fn full_autonomy_always_ask_wins_over_auto_approve() {
+        // If a tool is in both auto_approve and always_ask, always_ask wins.
+        let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            auto_approve: vec!["shell".into()],
+            always_ask: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        });
+        assert!(
+            mgr.needs_approval("shell"),
+            "always_ask must win over auto_approve even under Full autonomy"
+        );
+    }
+
+    #[test]
+    fn read_only_still_not_required_even_with_always_ask() {
+        // ReadOnly blocks execution elsewhere; always_ask does not change that.
+        let mgr = ApprovalManager::from_risk_profile(&RiskProfileConfig {
+            level: AutonomyLevel::ReadOnly,
+            always_ask: vec!["shell".into()],
+            ..RiskProfileConfig::default()
+        });
+        assert_eq!(
+            mgr.approval_requirement("shell"),
+            ApprovalRequirement::NotRequired
+        );
+    }
+
+    #[test]
     fn readonly_never_prompts() {
         let config = RiskProfileConfig {
             level: AutonomyLevel::ReadOnly,
@@ -755,10 +817,68 @@ mod tests {
     #[test]
     fn non_interactive_full_autonomy_never_needs_approval() {
         let mgr = ApprovalManager::for_non_interactive(&full_config());
-        // Full autonomy means no approval needed, even in non-interactive mode.
+        // Full autonomy with empty always_ask means no approval needed,
+        // even in non-interactive mode.
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("file_write"));
         assert!(!mgr.needs_approval("anything"));
+    }
+
+    fn full_always_ask_config(always_ask: &[&str], auto_approve: &[&str]) -> RiskProfileConfig {
+        RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            always_ask: always_ask.iter().map(|tool| (*tool).to_string()).collect(),
+            auto_approve: auto_approve
+                .iter()
+                .map(|tool| (*tool).to_string())
+                .collect(),
+            ..RiskProfileConfig::default()
+        }
+    }
+
+    #[test]
+    fn non_interactive_full_autonomy_honors_exact_always_ask() {
+        let profile = full_always_ask_config(&["shell"], &[]);
+        for mgr in [
+            ApprovalManager::for_non_interactive(&profile),
+            ApprovalManager::for_non_interactive_backchannel(&profile),
+        ] {
+            assert!(
+                mgr.needs_approval("shell"),
+                "exact always_ask must prompt under Full, including non-interactive"
+            );
+            assert!(
+                !mgr.needs_approval("file_write"),
+                "uncovered Full tool must still auto-approve"
+            );
+        }
+    }
+
+    #[test]
+    fn non_interactive_full_autonomy_honors_wildcard_always_ask() {
+        let profile = full_always_ask_config(&["*"], &[]);
+        for mgr in [
+            ApprovalManager::for_non_interactive(&profile),
+            ApprovalManager::for_non_interactive_backchannel(&profile),
+        ] {
+            assert!(mgr.needs_approval("shell"));
+            assert!(mgr.needs_approval("file_write"));
+            assert!(mgr.needs_approval("anything"));
+        }
+    }
+
+    #[test]
+    fn non_interactive_full_autonomy_always_ask_wins_over_auto_approve() {
+        let profile = full_always_ask_config(&["shell"], &["shell"]);
+        for mgr in [
+            ApprovalManager::for_non_interactive(&profile),
+            ApprovalManager::for_non_interactive_backchannel(&profile),
+        ] {
+            assert!(
+                mgr.needs_approval("shell"),
+                "always_ask must win over auto_approve under Full non-interactive"
+            );
+        }
     }
 
     #[test]

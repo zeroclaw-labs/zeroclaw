@@ -22444,7 +22444,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         assert!(
-            prompt.contains("execute it directly instead of asking the user for extra approval"),
+            prompt.contains("Execute those directly instead of asking the user for extra approval"),
             "full autonomy should instruct direct execution for allowed tools"
         );
         assert!(

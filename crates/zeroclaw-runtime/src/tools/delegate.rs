@@ -2467,6 +2467,7 @@ impl DelegateTool {
 
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            always_ask: &[],
         };
 
         let builder = SystemPromptBuilder::default()
