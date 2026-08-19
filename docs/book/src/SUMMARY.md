@@ -160,6 +160,7 @@
     - [Writing a channel plugin](./plugins/writing-a-channel-plugin.md)
     - [Writing a memory plugin](./plugins/writing-a-memory-plugin.md)
     - [Distributing plugins](./plugins/distributing-plugins.md)
+    - [Migrating to typed config](./plugins/migrating-to-typed-config.md)
   - [Building the docs locally](./developing/building-docs.md)
   - [Building the web dashboard](./developing/web.md)
 - [Foundations (RFCs)](./foundations/README.md)
