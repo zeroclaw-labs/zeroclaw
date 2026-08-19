@@ -7,11 +7,87 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
+use zeroclaw_api::tool::ConfirmationRequirement;
+
+const DENIED_BY_USER: &str = "Denied by user.";
 
 pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
     Deny(ToolExecutionOutcome),
     Replace(ToolExecutionOutcome),
+}
+
+async fn deny_tool_call(
+    ctx: &TurnCtx<'_>,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    iteration: usize,
+    unanswerable: bool,
+) -> ApprovalGateOutcome {
+    // This string is fed back to the MODEL, so it states the outcome and
+    // stops there. It deliberately does not name the settings that would
+    // permit the call: `auto_approve` bypasses operator approval for that
+    // tool and `level = "full"` removes approval gates for every tool and
+    // drops workspace-only confinement. Putting that remedy in front of the
+    // model invites it to argue for expanding its own privileges, which is a
+    // disproportionate response to an approval channel being unavailable.
+    // Operators get the actionable advice through the WARN record below and
+    // the UI, where changing policy is actually their decision to make.
+    let denied = if unanswerable {
+        format!(
+            "Tool call not executed: '{tool_name}' requires approval and no operator \
+             decision was available, so the runtime denied it by policy. This was not \
+             a user's decision."
+        )
+    } else {
+        DENIED_BY_USER.to_string()
+    };
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_category(::zeroclaw_log::EventCategory::Tool)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "model": ctx.model,
+                "iteration": iteration + 1,
+                "tool": tool_name,
+                "arguments": scrub_credentials(&tool_args.to_string()),
+                "result": denied,
+                "trace_id": ctx.turn_id,
+                // Operator-facing only. The remedy lives here rather than
+                // in `result`, which is shown to the model: deciding to
+                // relax an approval policy is the operator's call, and
+                // putting the option in front of the model would invite it
+                // to lobby for its own privilege expansion.
+                "denied_by_runtime": unanswerable,
+                "operator_hint": if unanswerable {
+                    Some("No operator could be asked. Check that an approval-capable \
+                          channel is connected and that the agent's approval route names \
+                          a registered, reachable approver. If this tool should run \
+                          unattended, review the agent's risk profile deliberately.")
+                } else {
+                    None
+                },
+            })),
+        "tool_call_result"
+    );
+    if let Some(tx) = ctx.on_delta {
+        let _ = tx
+            .send(StreamDelta::Status(format!(
+                "\u{274c} {}: {}\n",
+                tool_name, denied
+            )))
+            .await;
+    }
+    ApprovalGateOutcome::Deny(ToolExecutionOutcome {
+        output: denied.clone(),
+        audit_output: None,
+        success: false,
+        error_reason: Some(denied),
+        duration: Duration::ZERO,
+        receipt: None,
+        output_data: None,
+    })
 }
 
 /// Run the approval flow for one tool call (upstream loop body, approval
@@ -22,15 +98,22 @@ pub(crate) async fn gate_tool_approval(
     ctx: &TurnCtx<'_>,
     tool_name: &str,
     tool_args: &serde_json::Value,
+    confirmation_requirement: ConfirmationRequirement,
     iteration: usize,
 ) -> ApprovalGateOutcome {
-    let mut approval_requirement = ctx
-        .approval
-        .map(|mgr| mgr.approval_requirement(tool_name))
-        .unwrap_or(ApprovalRequirement::NotRequired);
-    if let Some(mgr) = ctx.approval
-        && approval_requirement == ApprovalRequirement::Prompt
-    {
+    let mut approval_requirement = match confirmation_requirement {
+        ConfirmationRequirement::Policy => ctx
+            .approval
+            .map(|mgr| mgr.approval_requirement(tool_name))
+            .unwrap_or(ApprovalRequirement::NotRequired),
+        ConfirmationRequirement::Fresh => ApprovalRequirement::Prompt,
+    };
+    if approval_requirement == ApprovalRequirement::Prompt {
+        let Some(mgr) = ctx.approval else {
+            // No approval manager at all: there is no operator to ask, so this
+            // is a runtime fail-closed denial rather than a user's decision.
+            return deny_tool_call(ctx, tool_name, tool_args, iteration, true).await;
+        };
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
@@ -44,7 +127,10 @@ pub(crate) async fn gate_tool_approval(
             let attributed = if let Some(ch) = ctx.channel {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
-                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    arguments_summary: crate::approval::summarize_args_for_confirmation(
+                        &request.arguments,
+                        confirmation_requirement,
+                    ),
                     raw_arguments: Some(request.arguments.clone()),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
@@ -102,76 +188,24 @@ pub(crate) async fn gate_tool_approval(
             };
             (decision, decided_by, unanswerable)
         } else {
-            (mgr.prompt_cli(&request), None, false)
+            (
+                mgr.prompt_cli_with_confirmation(&request, confirmation_requirement),
+                None,
+                false,
+            )
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
-        mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+        mgr.record_decision_with_confirmation(
+            tool_name,
+            tool_args,
+            &decision,
+            &decision_channel,
+            confirmation_requirement,
+        );
 
         if decision == ApprovalResponse::No {
-            // This string is fed back to the MODEL, so it states the outcome and
-            // stops there. It deliberately does not name the settings that would
-            // permit the call: `auto_approve` bypasses operator approval for that
-            // tool and `level = "full"` removes approval gates for every tool and
-            // drops workspace-only confinement. Putting that remedy in front of the
-            // model invites it to argue for expanding its own privileges, which is a
-            // disproportionate response to an approval channel being unavailable.
-            // Operators get the actionable advice through the WARN record below and
-            // the UI, where changing policy is actually their decision to make.
-            let denied = if unanswerable {
-                format!(
-                    "Tool call not executed: '{tool_name}' requires approval and no operator \
-                     decision was available, so the runtime denied it by policy. This was not \
-                     a user's decision."
-                )
-            } else {
-                "Denied by user.".to_string()
-            };
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "model": ctx.model,
-                        "iteration": iteration + 1,
-                        "tool": tool_name,
-                        "arguments": scrub_credentials(&tool_args.to_string()),
-                        "result": denied,
-                        "trace_id": ctx.turn_id,
-                        // Operator-facing only. The remedy lives here rather than
-                        // in `result`, which is shown to the model: deciding to
-                        // relax an approval policy is the operator's call, and
-                        // putting the option in front of the model would invite it
-                        // to lobby for its own privilege expansion.
-                        "denied_by_runtime": unanswerable,
-                        "operator_hint": if unanswerable {
-                            Some("No operator could be asked. Check that an approval-capable \
-                                  channel is connected and that the agent's approval route names \
-                                  a registered, reachable approver. If this tool should run \
-                                  unattended, review the agent's risk profile deliberately.")
-                        } else {
-                            None
-                        },
-                    })),
-                "tool_call_result"
-            );
-            if let Some(tx) = ctx.on_delta {
-                let _ = tx
-                    .send(StreamDelta::Status(format!(
-                        "\u{274c} {}: {}\n",
-                        tool_name, denied
-                    )))
-                    .await;
-            }
-            return ApprovalGateOutcome::Deny(ToolExecutionOutcome {
-                output: denied.clone(),
-                success: false,
-                error_reason: Some(denied),
-                duration: Duration::ZERO,
-                receipt: None,
-                output_data: None,
-            });
+            return deny_tool_call(ctx, tool_name, tool_args, iteration, unanswerable).await;
         }
 
         if let ApprovalResponse::ReplaceWith(replacement) = &decision {
@@ -201,6 +235,7 @@ pub(crate) async fn gate_tool_approval(
             );
             return ApprovalGateOutcome::Replace(ToolExecutionOutcome {
                 output: crate::approval::sanitize_tool_replacement(replacement),
+                audit_output: None,
                 success: true,
                 error_reason: None,
                 duration: Duration::ZERO,

@@ -3,7 +3,9 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{
+    ConfirmationRequirement, Tool, ToolOutput, ToolOutputSensitivity, ToolResult,
+};
 use zeroclaw_config::schema::PipelineConfig;
 
 use crate::tool_search::ToolAccessPolicy;
@@ -17,6 +19,8 @@ pub enum PipelineError {
     TooManySteps(usize),
     #[error("Invalid template reference: {0}")]
     InvalidTemplate(String),
+    #[error("Tool '{0}' requires fresh confirmation and cannot run inside a pipeline")]
+    FreshConfirmationRequired(String),
     #[error("Step {index} ({tool}) failed: {message}")]
     StepFailed {
         index: usize,
@@ -135,6 +139,11 @@ impl PipelineTool {
             if !globally_allowed || !caller_allowed || !child_exists {
                 return Err(PipelineError::UnknownTool(step.tool.clone()));
             }
+            if self.find_tool(&step.tool).is_some_and(|tool| {
+                tool.confirmation_requirement(&step.args) == ConfirmationRequirement::Fresh
+            }) {
+                return Err(PipelineError::FreshConfirmationRequired(step.tool.clone()));
+            }
         }
 
         Ok(())
@@ -154,6 +163,13 @@ impl PipelineTool {
 
             // Interpolate previous step results into args.
             let interpolated_args = interpolate_args(&step.args, &results);
+
+            // A prior result may change an action-sensitive requirement after
+            // initial validation. Pipelines have no trusted per-step approval
+            // channel, so fail closed before directly invoking the inner tool.
+            if tool.confirmation_requirement(&interpolated_args) == ConfirmationRequirement::Fresh {
+                return Err(PipelineError::FreshConfirmationRequired(step.tool.clone()));
+            }
 
             let tool_result =
                 tool.execute(interpolated_args)
@@ -202,6 +218,10 @@ impl PipelineTool {
             // Clone what we need for the spawned task.
             let tool_name = step.tool.clone();
             let args = step.args.clone();
+
+            if tool.confirmation_requirement(&args) == ConfirmationRequirement::Fresh {
+                return Err(PipelineError::FreshConfirmationRequired(step.tool.clone()));
+            }
 
             // We need a reference that lives long enough — use Arc.
             let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
@@ -304,6 +324,22 @@ impl Tool for PipelineTool {
             },
             "required": ["steps"]
         })
+    }
+
+    fn output_sensitivity(&self, args: &serde_json::Value) -> ToolOutputSensitivity {
+        let Ok(request) = serde_json::from_value::<PipelineRequest>(args.clone()) else {
+            return ToolOutputSensitivity::Sensitive;
+        };
+        if request.steps.iter().any(|step| {
+            step.args.to_string().contains("{{")
+                || self.find_tool(&step.tool).is_some_and(|tool| {
+                    tool.output_sensitivity(&step.args) == ToolOutputSensitivity::Sensitive
+                })
+        }) {
+            ToolOutputSensitivity::Sensitive
+        } else {
+            ToolOutputSensitivity::Ordinary
+        }
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<ToolResult> {
@@ -862,6 +898,37 @@ mod tests {
         }
     }
 
+    struct ActionSensitiveTool;
+
+    zeroclaw_api::mock_tool_attribution!(ActionSensitiveTool);
+
+    #[async_trait::async_trait]
+    impl Tool for ActionSensitiveTool {
+        fn name(&self) -> &str {
+            "computer_use"
+        }
+
+        fn description(&self) -> &str {
+            "action-sensitive test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn confirmation_requirement(&self, args: &serde_json::Value) -> ConfirmationRequirement {
+            if args.get("action").and_then(serde_json::Value::as_str) == Some("mouse_click") {
+                ConfirmationRequirement::Fresh
+            } else {
+                ConfirmationRequirement::Policy
+            }
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            panic!("fresh-confirmation tool must never execute inside a pipeline")
+        }
+    }
+
     fn echo_pipeline() -> PipelineTool {
         let config = PipelineConfig {
             enabled: true,
@@ -908,5 +975,69 @@ mod tests {
         assert!(res.success);
         assert!(res.output.contains("FIRST_BIG_BLOB"));
         assert!(res.output.contains("final answer"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_rejects_nested_fresh_confirmation_even_with_approved_arg() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["computer_use".to_string()],
+        };
+        let tool = PipelineTool::new(config, vec![Arc::new(ActionSensitiveTool)]);
+        let result = tool
+            .execute(serde_json::json!({
+                "steps": [{
+                    "tool": "computer_use",
+                    "args": {"action": "mouse_click", "approved": true}
+                }]
+            }))
+            .await
+            .expect("pipeline returns a denied tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("requires fresh confirmation"))
+        );
+    }
+
+    #[tokio::test]
+    async fn pipeline_rechecks_fresh_confirmation_after_interpolation() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["action_name".to_string(), "computer_use".to_string()],
+        };
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(EchoTool {
+                name: "action_name".into(),
+                output: "mouse_click".into(),
+            }),
+            Arc::new(ActionSensitiveTool),
+        ];
+        let tool = PipelineTool::new(config, tools);
+        let result = tool
+            .execute(serde_json::json!({
+                "steps": [
+                    {"tool": "action_name", "args": {}},
+                    {
+                        "tool": "computer_use",
+                        "args": {"action": "{{step[0].result}}", "approved": true}
+                    }
+                ]
+            }))
+            .await
+            .expect("pipeline returns a denied tool result");
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("requires fresh confirmation"))
+        );
     }
 }

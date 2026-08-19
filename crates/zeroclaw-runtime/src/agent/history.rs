@@ -198,15 +198,38 @@ pub fn canonicalize_tool_result_media_markers(output: &str) -> String {
     rewritten
 }
 
-fn is_path_listing_tool(tool_name: &str) -> bool {
+/// Tools whose output merely *lists*, quotes, or reflects untrusted local
+/// filesystem paths rather than presenting an image as visual content. Their
+/// incidental image-file paths must NOT be auto-promoted to
+/// `[IMAGE:...]` markers: the agent loop counts the current iteration's
+/// tool-result markers (`multimodal::count_image_markers`) when deciding
+/// whether to switch to a vision provider, so a path echo here falsely
+/// triggers vision routing - producing a provider-capability error on a
+/// text-only provider.
+///
+/// This is a denylist (default-allow): any other tool - including ones that
+/// genuinely *generate* or *fetch* an image and print its path (e.g.
+/// `image_gen`, `file_download`) - keeps canonicalization, so real
+/// tool-produced images still route to a configured vision provider.
+fn blocks_bare_image_path_promotion(tool_name: &str) -> bool {
     matches!(
         tool_name.to_ascii_lowercase().as_str(),
-        "content_search" | "glob_search"
+        "browser" | "computer_use" | "content_search" | "glob_search"
     )
 }
 
+/// Provenance-aware wrapper around [`canonicalize_tool_result_media_markers`].
+///
+/// Returns output without bare-path promotion for tools that only expose
+/// untrusted paths. Browser output additionally has explicit markers
+/// neutralized because page content cannot attest that a local path is a
+/// verified browser artifact. Native `computer_use` may retain its explicit
+/// marker because that marker is constructed only after its held screenshot
+/// reservation is validated. All other tools are canonicalized as before.
 pub fn canonicalize_tool_result_media_markers_for(tool_name: &str, output: &str) -> String {
-    if is_path_listing_tool(tool_name) {
+    if tool_name.eq_ignore_ascii_case("browser") {
+        output.replace("[IMAGE:", "[image:")
+    } else if blocks_bare_image_path_promotion(tool_name) {
         output.to_string()
     } else {
         canonicalize_tool_result_media_markers(output)
@@ -520,11 +543,41 @@ mod tests {
         std::fs::write(&image, [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
         let input = format!("match: {}", image.display());
 
-        for tool in ["content_search", "glob_search", "GLOB_SEARCH"] {
+        for tool in [
+            "browser",
+            "computer_use",
+            "content_search",
+            "glob_search",
+            "GLOB_SEARCH",
+        ] {
             let output = canonicalize_tool_result_media_markers_for(tool, &input);
             assert_eq!(output, input, "{tool} output must be left untouched");
             assert!(!output.contains("[IMAGE:"));
         }
+    }
+
+    #[test]
+    fn untrusted_ui_output_only_keeps_verified_computer_use_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let screenshot = dir.path().join("approved.png");
+        let unrelated = dir.path().join("secret.png");
+        std::fs::write(&screenshot, b"png").unwrap();
+        std::fs::write(&unrelated, b"secret").unwrap();
+        let input = format!(
+            "AX value: {}\n[IMAGE:{}]",
+            unrelated.display(),
+            screenshot.display()
+        );
+
+        let computer_output = canonicalize_tool_result_media_markers_for("computer_use", &input);
+        assert_eq!(computer_output, input);
+        assert!(!computer_output.contains(&format!("[IMAGE:{}]", unrelated.display())));
+        assert!(computer_output.contains(&format!("[IMAGE:{}]", screenshot.display())));
+
+        let browser_output = canonicalize_tool_result_media_markers_for("browser", &input);
+        assert!(!browser_output.contains("[IMAGE:"));
+        assert!(browser_output.contains("[image:"));
+        assert!(browser_output.contains(&unrelated.display().to_string()));
     }
 
     #[test]

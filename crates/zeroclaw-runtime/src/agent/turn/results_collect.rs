@@ -223,6 +223,7 @@ mod tests {
     fn outcome(output: &str, success: bool) -> ToolExecutionOutcome {
         ToolExecutionOutcome {
             output: output.to_string(),
+            audit_output: None,
             success,
             error_reason: if success {
                 None

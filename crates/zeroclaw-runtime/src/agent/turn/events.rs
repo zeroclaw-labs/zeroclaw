@@ -163,6 +163,7 @@ mod tests {
     fn ok_outcome() -> ToolExecutionOutcome {
         ToolExecutionOutcome {
             output: "out".into(),
+            audit_output: None,
             success: true,
             error_reason: None,
             duration: Duration::ZERO,
@@ -243,6 +244,7 @@ mod tests {
     async fn tool_result_event_is_scrubbed_for_rendering() {
         let outcome = ToolExecutionOutcome {
             output: "api_key = \"sk-live-abcd1234efgh5678\"".into(),
+            audit_output: None,
             success: true,
             error_reason: None,
             duration: Duration::ZERO,

@@ -22,6 +22,8 @@ pub mod cloud_patterns;
 pub mod codex_cli;
 pub mod coding_cli;
 pub mod composio;
+#[cfg(feature = "computer-use")]
+pub mod computer_use;
 pub mod content_search;
 pub mod data_management;
 pub mod discord_search;
