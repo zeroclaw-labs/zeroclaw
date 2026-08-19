@@ -66,6 +66,10 @@ impl ModelProvider for VisionOverrideProvider {
         capabilities
     }
 
+    async fn warm_capabilities_metadata(&self) {
+        self.inner.warm_capabilities_metadata().await
+    }
+
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
         self.inner.has_mixed_native_tool_support_for_model(model)
     }
@@ -294,6 +298,55 @@ mod tests {
         assert!(
             models[0].pricing.is_some(),
             "vision override must delegate list_models_with_pricing and keep pricing"
+        );
+    }
+
+    struct WarmRecordingMock {
+        warm_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WarmRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.warm_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl Attributable for WarmRecordingMock {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Anthropic))
+        }
+        fn alias(&self) -> &str {
+            "warm_recording_mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_capabilities_metadata_delegates_to_inner() {
+        let warm_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapped = VisionOverrideProvider::new(
+            Box::new(WarmRecordingMock {
+                warm_calls: std::sync::Arc::clone(&warm_calls),
+            }),
+            true,
+        );
+
+        wrapped.warm_capabilities_metadata().await;
+
+        assert_eq!(
+            warm_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "warm_capabilities_metadata must delegate to the inner provider"
         );
     }
 

@@ -878,6 +878,8 @@ channel-runtime-thinking-invalid = Niveau de thinking inconnu `{ $raw }`. Utilis
 channel-runtime-provider-turn-init-failed =
     ⚠️ Échec de l'initialisation de model_provider `{ $provider }`. Exécutez `/models` pour choisir un autre model_provider.
     Détails : { $error }
+channel-runtime-media-catalog-unavailable =
+    ⚠️ Impossible de vérifier si `{ $provider }` accepte les images car son catalogue de modèles est temporairement indisponible ({ $error }). L'image n'a pas été transmise et aucune requête n'a été envoyée. Réessayez dans un instant.
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` indisponible — réponse de **{ $actual }** (`{ $model }`)
     Changer de modèle : /models

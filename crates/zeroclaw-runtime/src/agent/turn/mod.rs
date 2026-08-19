@@ -723,6 +723,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
+        // Per-model capability warm (e.g. the models.dev catalog) is owned by
+        // `resolve_vision_provider`, which warms lazily only when the turn
+        // actually carries image markers — a text-only turn never waits on a
+        // catalog-backed request (fnd-001 zero-overhead constraint). No warm
+        // here: an unconditional warm would fetch capability metadata for
+        // every turn regardless of whether any image decision is needed.
         let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
             config,
             model_provider,
@@ -730,7 +736,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             multimodal_config,
             provider_name,
             model,
-        )?;
+        )
+        .await?;
 
         let (active_model_provider, active_model_provider_name, active_model): (
             &dyn ModelProvider,

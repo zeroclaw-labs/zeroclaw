@@ -101,9 +101,14 @@ impl RouterModelProvider {
         let mut candidates: Vec<(usize, String, f64)> = Vec::new();
 
         for (idx, route_model) in self.routes.values() {
-            // Capability filtering
+            // Capability filtering. Vision is judged per model via
+            // `capabilities_for_model` — not the provider-family
+            // `supports_vision()` default — so a catalog-only image model
+            // (whose vision support becomes known only after the models.dev
+            // catalog loads) is not wrongly skipped from a cost-optimized
+            // vision route.
             if let Some((_, model_provider)) = self.model_providers.get(*idx) {
-                if required_vision && !model_provider.supports_vision() {
+                if required_vision && !model_provider.capabilities_for_model(route_model).vision {
                     continue;
                 }
                 if required_tools && !model_provider.supports_native_tools() {
@@ -356,6 +361,30 @@ impl ModelProvider for RouterModelProvider {
             .get(provider_idx)
             .map(|(_, provider)| provider.capabilities_for_model(&resolved_model))
             .unwrap_or_default()
+    }
+
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<crate::traits::ProviderCapabilities> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        match self.model_providers.get(provider_idx) {
+            Some((_, provider)) => {
+                provider
+                    .resolve_capabilities_for_model(&resolved_model)
+                    .await
+            }
+            None => Ok(Default::default()),
+        }
+    }
+
+    async fn warm_capabilities_metadata(&self) {
+        // Warm every routed provider: route selection happens inside the
+        // synchronous capability gate, so each candidate (e.g. a credentialed
+        // compatible provider) must preload its catalog beforehand.
+        for (_, provider) in &self.model_providers {
+            provider.warm_capabilities_metadata().await;
+        }
     }
 
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
@@ -896,6 +925,7 @@ mod tests {
         response: &'static str,
         vision: bool,
         tools: bool,
+        vision_models: Vec<&'static str>,
     }
 
     impl CapableMockModelProvider {
@@ -904,7 +934,17 @@ mod tests {
                 response,
                 vision,
                 tools,
+                vision_models: Vec::new(),
             }
+        }
+
+        /// Mark specific models as vision-capable via the per-model path only.
+        /// The family-level `capabilities()`/`supports_vision()` stay as-is, so
+        /// tests can distinguish a family default from a catalog-derived
+        /// per-model capability (the exact `capabilities_for_model` contract).
+        fn with_vision_model(mut self, model: &'static str) -> Self {
+            self.vision_models.push(model);
+            self
         }
     }
 
@@ -917,6 +957,14 @@ mod tests {
                 prompt_caching: false,
                 extended_thinking: false,
             }
+        }
+
+        fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+            let mut caps = self.capabilities();
+            if self.vision_models.contains(&model) {
+                caps.vision = true;
+            }
+            caps
         }
 
         async fn chat_with_system(
@@ -1035,6 +1083,40 @@ mod tests {
         // With vision required, the cheap model (no vision) is filtered out
         let (_, model) = router.resolve_cost_optimized("hint:cheapest", &prices, true, false);
         assert_eq!(model, "vision-model");
+    }
+
+    #[test]
+    fn cost_optimized_vision_filter_uses_per_model_capabilities() {
+        // A provider whose family default claims no vision, but which the
+        // models.dev catalog marks vision-capable for a specific model — the
+        // per-model capability this PR threads through `capabilities_for_model`.
+        // The cost-optimized vision filter must consult the per-model value,
+        // not the family `supports_vision()` default, or the catalog-only
+        // image model would be wrongly skipped from a vision route. Reverting
+        // to `supports_vision()` (family default false) fails this test.
+        let model_providers: Vec<(String, Box<dyn ModelProvider>)> = vec![(
+            "catalog-image".into(),
+            Box::new(
+                CapableMockModelProvider::new("img", false, false).with_vision_model("image-model"),
+            ),
+        )];
+        let routes = vec![(
+            "cost".to_string(),
+            Route {
+                provider_name: "catalog-image".into(),
+                model: "image-model".into(),
+            },
+        )];
+        let router =
+            RouterModelProvider::new("test", model_providers, routes, "default-model".into());
+        let prices = make_pricing(vec![("catalog-image", "image-model", 1.0, 2.0)]);
+
+        let (_, model) = router.resolve_cost_optimized("hint:cost-optimized", &prices, true, false);
+        assert_eq!(
+            model, "image-model",
+            "a catalog-only image model must be selectable for a cost-optimized vision route \
+             via its per-model capability"
+        );
     }
 
     #[test]
@@ -1573,5 +1655,77 @@ mod tests {
             "outer capabilities().vision must match the delegated supports_vision()"
         );
         assert_eq!(router.capabilities().vision, router.supports_vision());
+    }
+
+    /// Child that records `warm_capabilities_metadata` invocations.
+    struct WarmRecordingMock {
+        warm_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WarmRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.warm_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for WarmRecordingMock {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "WarmRecordingMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_capabilities_metadata_delegates_to_all_routes() {
+        let warm_calls = Arc::new(AtomicUsize::new(0));
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(WarmRecordingMock {
+                        warm_calls: Arc::clone(&warm_calls),
+                    }),
+                ),
+                (
+                    "secondary".into(),
+                    Box::new(WarmRecordingMock {
+                        warm_calls: Arc::clone(&warm_calls),
+                    }),
+                ),
+            ],
+            vec![(
+                "hint".into(),
+                Route {
+                    provider_name: "secondary".into(),
+                    model: "other-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        router.warm_capabilities_metadata().await;
+
+        assert_eq!(
+            warm_calls.load(Ordering::SeqCst),
+            2,
+            "warm_capabilities_metadata must delegate to every routed provider"
+        );
     }
 }
