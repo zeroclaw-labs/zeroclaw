@@ -797,6 +797,13 @@ cli-config-schema-current = Config already at current schema version.
 cli-config-applied-ops = Applied {$count} operation(s):
 cli-plugins-none = No plugins installed.
 cli-plugins-installed = Installed plugins:
+cli-plugin-catalog-heading = Plugins:
+cli-plugin-catalog-empty = No installed or cached-registry plugins.
+cli-plugin-catalog-installed = {"  "}● {$name} v{$version} — installed — {$description}
+cli-plugin-catalog-installed-listed = {"  "}● {$name} v{$version} — installed, listed — {$description}
+cli-plugin-catalog-installed-other-version = {"  "}● {$name} v{$installed_version} — installed; registry v{$available_version} — {$description}
+cli-plugin-catalog-available = {"  "}○ {$name} v{$version} — available in cached registry — {$description}
+cli-plugin-catalog-cache-failed = warning: could not read cached plugin registry: {$error}
 cli-plugin-search-none = No plugins matching '{$query}'.
 cli-plugin-search-results = Plugins matching '{$query}' ({$count}):
 cli-plugin-search-result =   {$name} v{$version} — {$description}
@@ -805,8 +812,8 @@ cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
 cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Config entry key ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-seed-unaddressable = warning: skipped seeding the config entry for '{$name}': plugin names containing '.' cannot be addressed by dotted config paths (`config set` splits on '.'). Add a [[plugins.entries]] block with `name = "{$name}"` to the config file by hand.
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
 cli-plugin-removed = Plugin '{$name}' removed.
