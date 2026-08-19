@@ -90,6 +90,91 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+/// Complete system-prompt variants for the two tool transports supported by a
+/// turn. The caller owns construction; the loop only selects the variant after
+/// a before-LLM hook has finalized the model that will receive the request.
+#[derive(Clone)]
+pub(crate) struct ToolProtocolPrompts {
+    text_tools_section: String,
+}
+
+impl ToolProtocolPrompts {
+    pub(crate) fn new(_native: String, text: String) -> Self {
+        let text_tools_section = tool_section_bounds(&text)
+            .map(|bounds| text[bounds].to_string())
+            .unwrap_or_default();
+        Self { text_tools_section }
+    }
+}
+
+tokio::task_local! {
+    static TOOL_PROTOCOL_PROMPTS: Arc<ToolProtocolPrompts>;
+}
+
+/// Scope complete prompt variants around an Agent turn. This remains transient
+/// request state: durable history keeps the caller-owned canonical prompt.
+pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
+    prompts: Arc<ToolProtocolPrompts>,
+    future: F,
+) -> F::Output {
+    TOOL_PROTOCOL_PROMPTS.scope(prompts, future).await
+}
+
+fn refresh_scoped_tool_protocol_prompt(
+    history: &mut [ChatMessage],
+    request_messages: &mut [ChatMessage],
+    use_native_tools: bool,
+) {
+    let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+        if let Some(system) = history.iter_mut().find(|message| message.role == "system") {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+        if let Some(system) = request_messages
+            .iter_mut()
+            .find(|message| message.role == "system")
+        {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+    });
+}
+
+fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
+    let start = prompt.find("## Tools\n")?;
+    let following = &prompt[start..];
+    let end = following
+        .find("\n\n## Safety")
+        .map_or(prompt.len(), |offset| start + offset);
+    Some(start..end)
+}
+
+fn replace_tool_protocol_section(
+    prompt: &mut String,
+    text_tools_section: &str,
+    use_native_tools: bool,
+) {
+    if let Some(bounds) = tool_section_bounds(prompt) {
+        if use_native_tools {
+            prompt.replace_range(bounds, "");
+        } else {
+            prompt.replace_range(bounds, text_tools_section);
+        }
+        return;
+    }
+
+    if !use_native_tools && !text_tools_section.is_empty() {
+        let insertion = prompt.find("## Safety").unwrap_or(prompt.len());
+        prompt.insert_str(insertion, &format!("{text_tools_section}\n\n"));
+    }
+}
+
 fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool {
     budget
         .fetch_update(
@@ -632,6 +717,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
+            model,
             tools_registry,
             excluded_tools,
             activated_tools,
@@ -659,15 +745,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
-        iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
-        let IterationToolSpecs {
-            ref tool_specs,
-            use_native_tools,
-            ..
-        } = iteration_tool_specs;
-
-        refresh_prompt_anchor(turn_state.history, use_native_tools);
-
         let prepared_messages = prepare_messages_for_iteration(
             turn_state.history,
             multimodal_config,
@@ -693,6 +770,34 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        // Only direct Agent turns scope the complete prompt variants. Preserve
+        // the channel loop's existing hook/protocol behavior rather than
+        // silently widening this delegation-focused repair into channel prompt
+        // reconciliation.
+        let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
+        let protocol_model = if uses_scoped_tool_protocol {
+            provider_request_model
+        } else {
+            active_model
+        };
+        iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
+        let IterationToolSpecs {
+            ref tool_specs,
+            use_native_tools,
+            ..
+        } = iteration_tool_specs;
+
+        // For scoped direct Agent turns, the hook can choose a different routed
+        // model. Every protocol-bearing surface follows that dispatched model.
+        // Unscoped channel turns intentionally retain their pre-existing
+        // protocol behavior; channel prompt reconciliation is separate work.
+        refresh_prompt_anchor(turn_state.history, use_native_tools);
+        refresh_prompt_anchor(&mut provider_request_messages, use_native_tools);
+        refresh_scoped_tool_protocol_prompt(
+            turn_state.history,
+            &mut provider_request_messages,
+            use_native_tools,
+        );
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
@@ -700,6 +805,20 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // first would claim the agent is waiting on a model that is never
         // called.
         enforce_tool_loop_budget()?;
+
+        if strict_tool_parsing
+            && !tool_specs.is_empty()
+            && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
+        {
+            return Err(zeroclaw_providers::ProviderCapabilityError {
+                model_provider: active_model_provider_name.to_string(),
+                capability: "tool_protocol".to_string(),
+                message: crate::i18n::get_required_cli_string(
+                    "turn-tool-protocol-strict-mixed-error",
+                ),
+            }
+            .into());
+        }
 
         let llm_started_at = announce_llm_request(
             &ctx,
@@ -719,8 +838,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             None
         };
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
-        let base_provider_supports_native_tools = model_provider.supports_native_tools();
-        let active_provider_supports_native_tools = active_model_provider.supports_native_tools();
+        let base_provider_supports_native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling;
+        let active_provider_supports_native_tools = active_model_provider
+            .capabilities_for_model(provider_request_model)
+            .native_tool_calling;
         let active_provider_supports_streaming = active_model_provider.supports_streaming();
         let active_provider_supports_streaming_tool_events =
             active_model_provider.supports_streaming_tool_events();

@@ -358,6 +358,15 @@ impl ModelProvider for RouterModelProvider {
             .unwrap_or_default()
     }
 
+    fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .is_some_and(|(_, provider)| {
+                provider.has_mixed_native_tool_support_for_model(&resolved_model)
+            })
+    }
+
     fn supports_vision(&self) -> bool {
         self.model_providers
             .get(self.default_index)
@@ -1461,6 +1470,79 @@ mod tests {
         assert_eq!(default.call_count(), 0);
         assert_eq!(text_route.call_count(), 1);
         assert_eq!(text_route.last_model(), "text-model");
+    }
+
+    #[test]
+    fn mixed_tool_capability_matches_the_selected_route_and_model() {
+        struct ModelScopedMixedProvider {
+            mixed_model: &'static str,
+        }
+
+        impl ::zeroclaw_api::attribution::Attributable for ModelScopedMixedProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "ModelScopedMixedProvider"
+            }
+        }
+
+        #[async_trait]
+        impl ModelProvider for ModelScopedMixedProvider {
+            fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+                model == self.mixed_model
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+
+        let router = RouterModelProvider::new(
+            "test",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(ModelScopedMixedProvider {
+                        mixed_model: "not-the-default-model",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "mixed".into(),
+                    Box::new(ModelScopedMixedProvider {
+                        mixed_model: "routed-model",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "mixed".into(),
+                Route {
+                    provider_name: "mixed".into(),
+                    model: "routed-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        assert!(
+            !router.has_mixed_native_tool_support_for_model("default-model"),
+            "the unhinted request must inspect only the default route"
+        );
+        assert!(
+            router.has_mixed_native_tool_support_for_model("hint:mixed"),
+            "the hinted request must forward mixed-chain detection to the selected provider using the resolved model"
+        );
     }
 
     #[test]

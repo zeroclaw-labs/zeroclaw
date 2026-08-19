@@ -413,6 +413,7 @@ zc-chat-approval-action-edit = 編集
 zc-chat-clipboard-you = あなた: { $text }
 zc-chat-clipboard-agent = エージェント: { $text }
 zc-chat-copied-clipboard = クリップボードにコピーしました
+zc-chat-context-menu-copy = コピー
 zc-config-breadcrumb-root = 設定
 zc-config-section-detail-hint = { $open } または { $into } でこのセクションを開く
 zc-config-breadcrumb-new = 新規

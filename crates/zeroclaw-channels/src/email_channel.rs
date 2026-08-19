@@ -911,23 +911,7 @@ impl EmailChannel {
         if !references.is_empty() {
             builder = builder.references(references.join(" "));
         }
-        let mut att_parts: Vec<(String, Vec<u8>, ContentType)> = Vec::new();
-        for att in &message.attachments {
-            let content_type = att
-                .mime_type
-                .as_deref()
-                .and_then(|m| ContentType::parse(m).ok())
-                .unwrap_or_else(|| {
-                    ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
-                });
-            let att_data = resolve_attachment_data(&att.file_name, &att.data)?;
-            let att_name = std::path::Path::new(&att.file_name)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(&att.file_name)
-                .to_string();
-            att_parts.push((att_name, att_data, content_type));
-        }
+        let att_parts = build_attachment_parts(&message.attachments);
 
         let email = if self.config.html_body {
             let alt = MultiPart::alternative()
@@ -937,8 +921,8 @@ impl EmailChannel {
                 builder.multipart(alt)?
             } else {
                 let mut mixed = MultiPart::mixed().multipart(alt);
-                for (name, data, ct) in att_parts {
-                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
+                for part in att_parts {
+                    mixed = mixed.singlepart(part);
                 }
                 builder.multipart(mixed)?
             }
@@ -948,8 +932,8 @@ impl EmailChannel {
                 builder.singlepart(plain)?
             } else {
                 let mut mixed = MultiPart::mixed().singlepart(plain);
-                for (name, data, ct) in att_parts {
-                    mixed = mixed.singlepart(Attachment::new(name).body(data, ct));
+                for part in att_parts {
+                    mixed = mixed.singlepart(part);
                 }
                 builder.multipart(mixed)?
             }
@@ -1091,14 +1075,25 @@ impl Channel for EmailChannel {
     }
 }
 
-fn resolve_attachment_data(file_name: &str, data: &[u8]) -> anyhow::Result<Vec<u8>> {
-    if data.is_empty() && std::path::Path::new(file_name).exists() {
-        std::fs::read(file_name).map_err(|e| {
-            anyhow::Error::msg(format!("failed to read attachment '{}': {}", file_name, e))
+fn build_attachment_parts(attachments: &[zeroclaw_api::media::MediaAttachment]) -> Vec<SinglePart> {
+    attachments
+        .iter()
+        .map(|attachment| {
+            let content_type = attachment
+                .mime_type
+                .as_deref()
+                .and_then(|mime| ContentType::parse(mime).ok())
+                .unwrap_or_else(|| {
+                    ContentType::parse("application/octet-stream").expect("hardcoded MIME type")
+                });
+            let name = std::path::Path::new(&attachment.file_name)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&attachment.file_name)
+                .to_string();
+            Attachment::new(name).body(attachment.data.clone(), content_type)
         })
-    } else {
-        Ok(data.to_vec())
-    }
+        .collect()
 }
 
 /// Build the SASL XOAUTH2 initial client response for IMAP `AUTHENTICATE`.
@@ -1170,64 +1165,74 @@ mod tests {
     }
     use super::*;
 
-    // -- resolve_attachment_data tests --
+    // -- build_attachment_parts tests --
+
+    fn outbound_attachment(
+        file_name: impl Into<String>,
+        data: Vec<u8>,
+    ) -> zeroclaw_api::media::MediaAttachment {
+        zeroclaw_api::media::MediaAttachment {
+            file_name: file_name.into(),
+            data,
+            mime_type: None,
+        }
+    }
+
+    fn rendered_attachment(attachment: zeroclaw_api::media::MediaAttachment) -> Vec<u8> {
+        let mut parts = build_attachment_parts(&[attachment]);
+        let email = Message::builder()
+            .from("sender@example.invalid".parse().unwrap())
+            .to("recipient@example.invalid".parse().unwrap())
+            .subject("attachment boundary")
+            .multipart(MultiPart::mixed().singlepart(parts.remove(0)))
+            .unwrap();
+        let formatted = email.formatted();
+        let parsed = MessageParser::default()
+            .parse(formatted.as_slice())
+            .unwrap();
+        parsed.attachments().next().unwrap().contents().to_vec()
+    }
 
     #[test]
-    fn resolve_attachment_data_returns_provided_bytes_when_non_empty() {
+    fn build_attachment_parts_serializes_provided_bytes() {
         let data = b"hello attachment".to_vec();
-        let result = resolve_attachment_data("ignored.bin", &data).unwrap();
+        let result = rendered_attachment(outbound_attachment("ignored.bin", data.clone()));
         assert_eq!(result, data);
     }
 
     #[test]
-    fn resolve_attachment_data_falls_back_to_file_when_data_empty_and_file_exists() {
+    fn build_attachment_parts_does_not_read_existing_file_when_data_empty() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("att.txt");
         std::fs::write(&path, b"file contents").unwrap();
-        let result = resolve_attachment_data(path.to_str().unwrap(), &[]).unwrap();
-        assert_eq!(result, b"file contents");
+        let result = rendered_attachment(outbound_attachment(path.display().to_string(), vec![]));
+        assert!(result.is_empty());
     }
 
     #[test]
-    fn resolve_attachment_data_returns_empty_when_data_empty_and_file_absent() {
+    fn build_attachment_parts_keeps_empty_data_for_absent_file_name() {
         // file_name does not exist on disk — should return empty vec, not error.
         // Use a temp dir to guarantee the path does not exist, rather than a
         // hard-coded /tmp path, for portability.
         let dir = tempfile::tempdir().unwrap();
         let absent = dir.path().join("does-not-exist.bin");
-        let result = resolve_attachment_data(absent.to_str().unwrap(), &[]).unwrap();
+        let result = rendered_attachment(outbound_attachment(absent.display().to_string(), vec![]));
         assert!(result.is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn resolve_attachment_data_propagates_read_error_on_unreadable_file() {
-        // Create a file, then make it unreadable (Unix only).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("locked.bin");
-            std::fs::write(&path, b"secret").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            #[cfg(target_os = "linux")]
-            let is_root = std::fs::read_to_string("/proc/self/status")
-                .ok()
-                .and_then(|s| {
-                    s.lines()
-                        .find(|l| l.starts_with("Uid:"))
-                        .and_then(|l| l.split_whitespace().nth(1))
-                        .and_then(|uid| uid.parse::<u32>().ok())
-                })
-                .map(|uid| uid == 0)
-                .unwrap_or(false);
-            #[cfg(not(target_os = "linux"))]
-            let is_root = std::env::var("USER").map(|u| u == "root").unwrap_or(false);
-            if is_root {
-                return;
-            }
-            let result = resolve_attachment_data(path.to_str().unwrap(), &[]);
-            assert!(result.is_err());
-        }
+    fn build_attachment_parts_does_not_follow_symlink_when_data_empty() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("secret.txt");
+        let link = dir.path().join("attachment.txt");
+        std::fs::write(&target, b"secret contents").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let result = rendered_attachment(outbound_attachment(link.display().to_string(), vec![]));
+        assert!(result.is_empty());
     }
 
     #[test]
@@ -1404,6 +1409,138 @@ mod tests {
 
     fn parse_test_email(raw: &'static [u8]) -> mail_parser::Message<'static> {
         MessageParser::default().parse(raw).unwrap()
+    }
+
+    // -- extract_attachments tests --
+
+    fn attachment_config(max_attachment_bytes: usize) -> EmailConfig {
+        EmailConfig {
+            max_attachment_bytes,
+            ..mailbox_identity_config()
+        }
+    }
+
+    #[test]
+    fn extract_attachments_returns_binary_parts_with_name_and_mime() {
+        let channel = EmailChannel::new(
+            attachment_config(default_max_attachment_bytes()),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        let parsed = parse_test_email(
+            b"From: sender@example.invalid\r\n\
+              To: recipient@example.invalid\r\n\
+              Subject: Test with attachments\r\n\
+              MIME-Version: 1.0\r\n\
+              Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+              \r\n\
+              --BOUNDARY\r\n\
+              Content-Type: text/plain\r\n\
+              \r\n\
+              Email body text\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: application/pdf\r\n\
+              Content-Disposition: attachment; filename=\"document.pdf\"\r\n\
+              \r\n\
+              PDF_BINARY_DATA\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: image/png\r\n\
+              Content-Disposition: attachment; filename=\"photo.png\"\r\n\
+              \r\n\
+              PNG_BINARY_DATA\r\n\
+              --BOUNDARY--\r\n",
+        );
+
+        let attachments = channel.extract_attachments(&parsed);
+
+        // The text/plain body part is not an attachment; the PDF and PNG are.
+        assert_eq!(attachments.len(), 2);
+
+        let pdf = attachments
+            .iter()
+            .find(|a| a.file_name == "document.pdf")
+            .expect("pdf attachment");
+        assert_eq!(pdf.mime_type.as_deref(), Some("application/pdf"));
+        assert_eq!(pdf.data, b"PDF_BINARY_DATA");
+
+        let png = attachments
+            .iter()
+            .find(|a| a.file_name == "photo.png")
+            .expect("png attachment");
+        assert_eq!(png.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(png.data, b"PNG_BINARY_DATA");
+    }
+
+    #[test]
+    fn extract_attachments_skips_text_parts() {
+        let channel = EmailChannel::new(
+            attachment_config(default_max_attachment_bytes()),
+            "email_test_alias",
+            empty_resolver(),
+        );
+        // `notes.txt` carries Content-Disposition: attachment, so mail_parser
+        // yields it from `attachments()` — this is what reaches the `text/`
+        // guard. A bare text/plain body part never gets that far.
+        let parsed = parse_test_email(
+            b"From: sender@example.invalid\r\n\
+              To: recipient@example.invalid\r\n\
+              Subject: Text attachment\r\n\
+              MIME-Version: 1.0\r\n\
+              Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+              \r\n\
+              --BOUNDARY\r\n\
+              Content-Type: text/plain\r\n\
+              \r\n\
+              Plain text body\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: text/plain\r\n\
+              Content-Disposition: attachment; filename=\"notes.txt\"\r\n\
+              \r\n\
+              attached text file\r\n\
+              --BOUNDARY\r\n\
+              Content-Type: application/pdf\r\n\
+              Content-Disposition: attachment; filename=\"document.pdf\"\r\n\
+              \r\n\
+              PDF_BINARY_DATA\r\n\
+              --BOUNDARY--\r\n",
+        );
+
+        let attachments = channel.extract_attachments(&parsed);
+
+        // Only the PDF survives; every text/* part is left to extract_text.
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].file_name, "document.pdf");
+        assert!(!attachments.iter().any(|a| a.file_name == "notes.txt"));
+    }
+
+    #[test]
+    fn extract_attachments_drops_parts_past_configured_size_limit() {
+        let mut raw = String::from(
+            "From: sender@example.invalid\r\n\
+             To: recipient@example.invalid\r\n\
+             Subject: Large attachment\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"BOUNDARY\"\r\n\
+             \r\n\
+             --BOUNDARY\r\n\
+             Content-Type: text/plain\r\n\
+             \r\n\
+             Body\r\n\
+             --BOUNDARY\r\n\
+             Content-Type: application/octet-stream\r\n\
+             Content-Disposition: attachment; filename=\"large.bin\"\r\n\
+             \r\n",
+        );
+        raw.push_str(&"X".repeat(150));
+        raw.push_str("\r\n--BOUNDARY--\r\n");
+        let parsed = MessageParser::default().parse(raw.as_bytes()).unwrap();
+
+        // The limit is read from EmailConfig, the same field production uses.
+        let under = EmailChannel::new(attachment_config(100), "email_test_alias", empty_resolver());
+        assert!(under.extract_attachments(&parsed).is_empty());
+
+        let over = EmailChannel::new(attachment_config(200), "email_test_alias", empty_resolver());
+        assert_eq!(over.extract_attachments(&parsed).len(), 1);
     }
 
     #[test]

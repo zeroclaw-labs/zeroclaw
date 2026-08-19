@@ -29,6 +29,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 chrono-tz = "0.10"
 console = "0.16"
 cron = "0.15"
+# Raw-mode terminal secret input (cli_input::SecretInput). Blocking
+# `event::read()` only — no EventStream, so default features suffice.
+crossterm = "0.29"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }

@@ -1242,10 +1242,11 @@ impl SopEngine {
         }
     }
 
-    /// Load/reload SOPs from the configured directory.
-    pub fn reload(&mut self, workspace_dir: &Path) {
+    /// Load/reload SOPs from the configured directory, resolved against
+    /// `install_root` (the install root, `config_path`'s parent).
+    pub fn reload(&mut self, install_root: &Path) {
         self.sops = load_sops(
-            workspace_dir,
+            install_root,
             self.config.sops_dir.as_deref(),
             super::parse_execution_mode(&self.config.default_execution_mode),
         );

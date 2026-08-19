@@ -16,18 +16,34 @@ use std::time::{Duration, Instant};
 /// Info about a model_provider fallback that occurred during a request.
 #[derive(Debug, Clone)]
 pub struct ProviderFallbackInfo {
-    /// ModelProvider that was originally requested.
+    /// ModelProvider family that was originally requested.
     pub requested_provider: String,
     /// Model that was originally requested.
     pub requested_model: String,
-    /// ModelProvider that actually served the request.
+    /// ModelProvider family that actually served the request.
     pub actual_provider: String,
     /// Model that actually served the request.
     pub actual_model: String,
 }
 
+/// Fallback metadata for a caller that needs exact configured-candidate
+/// provenance in addition to the stable provider-family display fields.
+#[derive(Debug, Clone)]
+pub struct ProviderFallbackAttribution {
+    /// Stable provider/model record for channel and direct-agent notices.
+    pub fallback: ProviderFallbackInfo,
+    /// Exact configured candidate that was requested before fallback.
+    pub requested_candidate: String,
+    /// Exact configured candidate that served the recovered request.
+    pub actual_candidate: String,
+}
+
 tokio::task_local! {
-    static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackInfo>>;
+    static PROVIDER_FALLBACK: RefCell<Option<ProviderFallbackAttribution>>;
+}
+
+tokio::task_local! {
+    static PROVIDER_CONTEXT_TRUNCATED: RefCell<bool>;
 }
 
 tokio::task_local! {
@@ -64,6 +80,45 @@ pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
         .try_with(|cell| cell.borrow_mut().take())
         .ok()
         .flatten()
+        .map(|attribution| attribution.fallback)
+}
+
+/// Take fallback metadata including the exact configured candidates.
+pub fn take_last_provider_fallback_attribution() -> Option<ProviderFallbackAttribution> {
+    PROVIDER_FALLBACK
+        .try_with(|cell| cell.borrow_mut().take())
+        .ok()
+        .flatten()
+}
+
+/// Take whether Reliable shortened the provider-visible transcript while
+/// recovering the current request from a context-window error.
+///
+/// This is intentionally distinct from fallback attribution: retrying the
+/// same candidate must not render a fallback notice, but the caller must not
+/// cache that response under the untrimmed request transcript.
+pub fn take_last_provider_context_truncation() -> bool {
+    PROVIDER_CONTEXT_TRUNCATED
+        .try_with(|cell| std::mem::take(&mut *cell.borrow_mut()))
+        .unwrap_or(false)
+}
+
+fn record_provider_context_truncation() {
+    let _ = PROVIDER_CONTEXT_TRUNCATED.try_with(|cell| *cell.borrow_mut() = true);
+}
+
+/// Record the fallback that served the current successful provider request, or
+/// clear stale attribution when the primary served it.
+///
+/// A fallback scope can span an agentic tool loop, which issues several model
+/// requests. The caller-visible result must describe the request that produced
+/// the final response, not an earlier request that only produced a tool call.
+fn record_successful_provider_fallback(record: Option<&ProviderFallbackRecord>) {
+    if let Some(record) = record {
+        record.record();
+    } else {
+        let _ = PROVIDER_FALLBACK.try_with(|cell| *cell.borrow_mut() = None);
+    }
 }
 
 /// Run the given future within a provider-fallback scope.
@@ -71,7 +126,12 @@ pub fn take_last_provider_fallback() -> Option<ProviderFallbackInfo> {
 /// `take_last_provider_fallback` (post-loop channel code) must execute
 /// within this scope for the data to be visible.
 pub async fn scope_provider_fallback<F: std::future::Future>(future: F) -> F::Output {
-    PROVIDER_FALLBACK.scope(RefCell::new(None), future).await
+    PROVIDER_FALLBACK
+        .scope(
+            RefCell::new(None),
+            PROVIDER_CONTEXT_TRUNCATED.scope(RefCell::new(false), future),
+        )
+        .await
 }
 
 /// Record a model_provider fallback event.
@@ -80,13 +140,19 @@ fn record_provider_fallback(
     requested_model: &str,
     actual_provider: &str,
     actual_model: &str,
+    requested_candidate: &str,
+    actual_candidate: &str,
 ) {
     let _ = PROVIDER_FALLBACK.try_with(|cell| {
-        *cell.borrow_mut() = Some(ProviderFallbackInfo {
-            requested_provider: requested_provider.to_string(),
-            requested_model: requested_model.to_string(),
-            actual_provider: actual_provider.to_string(),
-            actual_model: actual_model.to_string(),
+        *cell.borrow_mut() = Some(ProviderFallbackAttribution {
+            fallback: ProviderFallbackInfo {
+                requested_provider: requested_provider.to_string(),
+                requested_model: requested_model.to_string(),
+                actual_provider: actual_provider.to_string(),
+                actual_model: actual_model.to_string(),
+            },
+            requested_candidate: requested_candidate.to_string(),
+            actual_candidate: actual_candidate.to_string(),
         });
     });
 }
@@ -96,16 +162,21 @@ struct ProviderFallbackRecord {
     requested_model: String,
     actual_provider: String,
     actual_model: String,
+    requested_candidate: String,
+    actual_candidate: String,
 }
 
 impl ProviderFallbackRecord {
-    fn new_if_recovered(
+    fn new_if_true_fallback(
         requested_provider: &str,
         requested_model: &str,
         actual_provider: &str,
         actual_model: &str,
+        used_later_candidate: bool,
+        requested_candidate: &str,
+        actual_candidate: &str,
     ) -> Option<Self> {
-        if requested_provider == actual_provider && requested_model == actual_model {
+        if !used_later_candidate && requested_model == actual_model {
             return None;
         }
 
@@ -114,6 +185,8 @@ impl ProviderFallbackRecord {
             requested_model: requested_model.to_string(),
             actual_provider: actual_provider.to_string(),
             actual_model: actual_model.to_string(),
+            requested_candidate: requested_candidate.to_string(),
+            actual_candidate: actual_candidate.to_string(),
         })
     }
 
@@ -123,6 +196,8 @@ impl ProviderFallbackRecord {
             &self.requested_model,
             &self.actual_provider,
             &self.actual_model,
+            &self.requested_candidate,
+            &self.actual_candidate,
         );
     }
 }
@@ -146,9 +221,7 @@ where
                     let mut recorded = recorded;
                     match &event {
                         Ok(value) if !saw_error && !recorded && is_final(value) => {
-                            if let Some(record) = &fallback_record {
-                                record.record();
-                            }
+                            record_successful_provider_fallback(fallback_record.as_ref());
                             recorded = true;
                         }
                         Err(_) => {
@@ -162,11 +235,8 @@ where
                     ))
                 }
                 None => {
-                    if !saw_error
-                        && !recorded
-                        && let Some(record) = &fallback_record
-                    {
-                        record.record();
+                    if !saw_error && !recorded {
+                        record_successful_provider_fallback(fallback_record.as_ref());
                     }
                     None
                 }
@@ -714,29 +784,115 @@ fn truncate_for_context(messages: &mut Vec<ChatMessage>) -> usize {
     first_kept_position
 }
 
+const MAX_RETAINED_FAILURE_EVENTS: usize = 8;
+const MAX_FAILURE_AGGREGATE_BYTES: usize = 2_048;
+
+#[derive(Clone, Debug, Default)]
+struct FailureEvents {
+    total: usize,
+    retained: Vec<String>,
+}
+
+impl FailureEvents {
+    fn push(&mut self, event: String) {
+        self.total += 1;
+        if self.retained.len() < MAX_RETAINED_FAILURE_EVENTS {
+            self.retained.push(event);
+        }
+    }
+
+    fn next_index(&self) -> usize {
+        self.total + 1
+    }
+}
+
 fn push_failure(
-    failures: &mut Vec<String>,
-    provider_name: &str,
-    model: &str,
+    failures: &mut FailureEvents,
     attempt: u32,
     max_attempts: u32,
-    reason: &str,
-    error_detail: &str,
+    reason: &'static str,
     diagnostic: Option<&ProviderErrorDiagnostic>,
 ) {
+    // This aggregate can cross into model-visible tool results and durable
+    // background results. Keep it to fields controlled by ZeroClaw; the
+    // provider response detail is retained in the structured attempt logs.
     let mut failure = format!(
-        "model_provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
+        "event {} (retry {attempt}/{max_attempts}): {reason}",
+        failures.next_index()
     );
     if let Some(diagnostic) = diagnostic {
         failure.push_str(&format!(
             "; kind={}; phase={}; hint={}",
             diagnostic.kind, diagnostic.phase, diagnostic.hint
         ));
-        if let Some(endpoint) = diagnostic.endpoint.as_deref() {
-            failure.push_str(&format!("; endpoint={endpoint}"));
-        }
     }
     failures.push(failure);
+}
+
+fn omitted_failure_marker(count: usize) -> String {
+    format!("[{count} additional failure event(s) omitted]")
+}
+
+fn format_failure_aggregate(header: String, failures: &FailureEvents) -> String {
+    let all_omitted_marker = omitted_failure_marker(failures.total);
+    let minimum_suffix_len = if failures.total > 0 {
+        1 + all_omitted_marker.len()
+    } else {
+        0
+    };
+    let mut output = if header.len() + minimum_suffix_len <= MAX_FAILURE_AGGREGATE_BYTES {
+        header
+    } else {
+        format!(
+            "Model provider failure after {} failure event(s). Events:",
+            failures.total
+        )
+    };
+    let mut retained_count = 0;
+
+    for failure in &failures.retained {
+        let candidate_retained_count = retained_count + 1;
+        let omitted_after = failures.total - candidate_retained_count;
+        let reserved_marker_len = if omitted_after > 0 {
+            1 + omitted_failure_marker(omitted_after).len()
+        } else {
+            0
+        };
+        if output.len() + 1 + failure.len() + reserved_marker_len > MAX_FAILURE_AGGREGATE_BYTES {
+            break;
+        }
+        output.push('\n');
+        output.push_str(failure);
+        retained_count = candidate_retained_count;
+    }
+
+    let omitted = failures.total - retained_count;
+    if omitted > 0 {
+        output.push('\n');
+        output.push_str(&omitted_failure_marker(omitted));
+    }
+    debug_assert!(output.len() <= MAX_FAILURE_AGGREGATE_BYTES);
+    output
+}
+
+fn failure_aggregate(failures: &FailureEvents) -> String {
+    format_failure_aggregate(
+        format!(
+            "All model providers/models failed after {} failure event(s). Events:",
+            failures.total
+        ),
+        failures,
+    )
+}
+
+fn context_failure_aggregate(message: &str, failures: &FailureEvents) -> String {
+    format_failure_aggregate(
+        format!(
+            "{message} Failed after {} failure event(s). Events:",
+            failures.total
+        ),
+        failures,
+    )
 }
 
 fn is_empty_completion(resp: &ChatResponse) -> bool {
@@ -760,16 +916,12 @@ fn is_semantic_empty_completion_error(error: &anyhow::Error) -> bool {
 #[derive(Debug)]
 pub struct ReliableRejectedCompletionUsage {
     pub usage: TokenUsage,
-    failures: Vec<String>,
+    failures: FailureEvents,
 }
 
 impl std::fmt::Display for ReliableRejectedCompletionUsage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "All model_providers/models failed. Attempts:\n{}",
-            self.failures.join("\n")
-        )
+        write!(f, "{}", failure_aggregate(&self.failures))
     }
 }
 
@@ -781,17 +933,13 @@ impl std::error::Error for ReliableRejectedCompletionUsage {}
 /// classify the actual terminal failure without guessing from accounting data.
 #[derive(Debug)]
 pub struct ReliableSemanticEmptyCompletion {
-    failures: Vec<String>,
+    failures: FailureEvents,
     rejected_usage: Option<ReliableRejectedCompletionUsage>,
 }
 
 impl std::fmt::Display for ReliableSemanticEmptyCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "All model_providers/models failed. Attempts:\n{}",
-            self.failures.join("\n")
-        )
+        write!(f, "{}", failure_aggregate(&self.failures))
     }
 }
 
@@ -804,7 +952,7 @@ impl std::error::Error for ReliableSemanticEmptyCompletion {
 }
 
 fn reliable_terminal_error(
-    failures: Vec<String>,
+    failures: FailureEvents,
     rejected_attempt_usage: Option<TokenUsage>,
     final_cause_is_semantic_empty: bool,
 ) -> anyhow::Error {
@@ -818,10 +966,20 @@ fn reliable_terminal_error(
 
     match rejected_attempt_usage {
         Some(usage) => anyhow::Error::new(ReliableRejectedCompletionUsage { usage, failures }),
-        None => anyhow::Error::msg(format!(
-            "All model_providers/models failed. Attempts:\n{}",
-            failures.join("\n")
-        )),
+        None => anyhow::Error::msg(failure_aggregate(&failures)),
+    }
+}
+
+fn reliable_context_terminal_error(
+    message: String,
+    failures: FailureEvents,
+    rejected_attempt_usage: Option<TokenUsage>,
+) -> anyhow::Error {
+    let context_error = context_failure_aggregate(&message, &failures);
+    match rejected_attempt_usage {
+        Some(usage) => anyhow::Error::new(ReliableRejectedCompletionUsage { usage, failures })
+            .context(context_error),
+        None => anyhow::Error::msg(context_error),
     }
 }
 
@@ -876,6 +1034,11 @@ impl ReliableModelProviderEntryProvider {
 
 pub(crate) struct ReliableModelProviderEntry {
     display_name: String,
+    /// Exact configured candidate identity used for fallback attribution.
+    ///
+    /// This deliberately differs from `display_name`: two aliases can share a
+    /// provider family and model while still being distinct fallback candidates.
+    candidate_name: String,
     cooldown_key: String,
     provider: ReliableModelProviderEntryProvider,
 }
@@ -886,8 +1049,24 @@ impl ReliableModelProviderEntry {
         cooldown_key: impl Into<String>,
         provider: Box<dyn ModelProvider>,
     ) -> Self {
+        let display_name = display_name.into();
+        Self {
+            candidate_name: display_name.clone(),
+            display_name,
+            cooldown_key: cooldown_key.into(),
+            provider: ReliableModelProviderEntryProvider::Direct(provider),
+        }
+    }
+
+    pub(crate) fn new_with_candidate(
+        display_name: impl Into<String>,
+        cooldown_key: impl Into<String>,
+        candidate_name: impl Into<String>,
+        provider: Box<dyn ModelProvider>,
+    ) -> Self {
         Self {
             display_name: display_name.into(),
+            candidate_name: candidate_name.into(),
             cooldown_key: cooldown_key.into(),
             provider: ReliableModelProviderEntryProvider::Direct(provider),
         }
@@ -904,9 +1083,11 @@ impl ReliableModelProviderEntry {
         pinned_model: &str,
         inner: Box<dyn ModelProvider>,
     ) -> Self {
+        let cooldown_key = cooldown_key.into();
         Self {
             display_name: display_name.into(),
-            cooldown_key: cooldown_key.into(),
+            candidate_name: cooldown_key.clone(),
+            cooldown_key,
             provider: ReliableModelProviderEntryProvider::Pinned(
                 crate::model_pin::ModelPinnedProvider::builder(alias)
                     .pinned_model(pinned_model)
@@ -920,6 +1101,10 @@ impl ReliableModelProviderEntry {
     /// the entry is model-pinned, otherwise the requested model unchanged.
     fn served_model<'a>(&'a self, requested_model: &'a str) -> &'a str {
         self.provider.served_model(requested_model)
+    }
+
+    fn candidate_name(&self) -> &str {
+        &self.candidate_name
     }
 
     fn provider(&self) -> &dyn ModelProvider {
@@ -1047,10 +1232,20 @@ impl ReliableModelProvider {
         self.model_providers.len() > 1 && self.provider_cooldown_active(&entry.cooldown_key)
     }
 
-    fn record_cooldown_skip_failure(failures: &mut Vec<String>, provider_name: &str, model: &str) {
-        failures.push(format!(
-            "model_provider={provider_name} model={model}: skipped; reason=rate_limit_cooldown"
-        ));
+    fn record_cooldown_skip_failure(failures: &mut FailureEvents, max_attempts: u32) {
+        let diagnostic = ProviderErrorDiagnostic {
+            kind: "rate_limited",
+            phase: "cooldown",
+            hint: "wait for provider cooldown or switch provider",
+            endpoint: None,
+        };
+        push_failure(
+            failures,
+            0,
+            max_attempts,
+            "rate_limit_cooldown",
+            Some(&diagnostic),
+        );
     }
 
     fn log_cooldown_skip(&self, provider_name: &str) {
@@ -1102,7 +1297,7 @@ impl ReliableModelProvider {
     /// or records its final failed attempt. See [`is_empty_completion`].
     async fn backoff_after_empty_completion(
         &self,
-        failures: &mut Vec<String>,
+        failures: &mut FailureEvents,
         provider_name: &str,
         model: &str,
         attempt: u32,
@@ -1118,7 +1313,7 @@ impl ReliableModelProvider {
     /// fallback instead of returning a successful blank turn.
     fn record_empty_completion_failure(
         &self,
-        failures: &mut Vec<String>,
+        failures: &mut FailureEvents,
         provider_name: &str,
         model: &str,
         attempt: u32,
@@ -1126,12 +1321,9 @@ impl ReliableModelProvider {
     ) {
         push_failure(
             failures,
-            provider_name,
-            model,
             attempt + 1,
             self.max_retries + 1,
             "empty_response",
-            "model_provider returned an empty completion",
             None,
         );
         ::zeroclaw_log::record!(
@@ -1204,19 +1396,19 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = false;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
         // immediately. On non-retryable error, break to next model_provider. On
         // retryable error, sleep with exponential backoff and retry.
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (provider_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1255,6 +1447,8 @@ impl ModelProvider for ReliableModelProvider {
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_index != 0
+                                || provider_index != 0
                                 || self
                                     .model_providers
                                     .first()
@@ -1265,14 +1459,25 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
+                                    model_index != 0 || provider_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                            } else {
+                                record_successful_provider_fallback(None);
                             }
                             return Ok(resp);
                         }
@@ -1303,21 +1508,18 @@ impl ModelProvider for ReliableModelProvider {
                             // Context window exceeded: no history to truncate
                             // in chat_with_system, bail immediately.
                             if is_context_window_exceeded(&e) {
-                                let error_detail = compact_error_detail(&e);
+                                let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
-                                    provider_name,
-                                    current_model,
                                     attempt + 1,
                                     self.max_retries + 1,
-                                    "non_retryable",
-                                    &error_detail,
-                                    None,
+                                    "context_window",
+                                    Some(&diagnostic),
                                 );
-                                anyhow::bail!(
-                                    "Request exceeds model context window. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
+                                anyhow::bail!(context_failure_aggregate(
+                                    "Request exceeds model context window.",
+                                    &failures,
+                                ));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -1331,12 +1533,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1439,17 +1638,17 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = false;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (provider_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1488,6 +1687,8 @@ impl ModelProvider for ReliableModelProvider {
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_index != 0
+                                || provider_index != 0
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1499,14 +1700,25 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
+                                    model_index != 0 || provider_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                            } else {
+                                record_successful_provider_fallback(None);
                             }
                             return Ok(resp);
                         }
@@ -1536,33 +1748,34 @@ impl ModelProvider for ReliableModelProvider {
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
+                                    record_provider_context_truncation();
                                     context_truncated = true;
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let error_detail = compact_error_detail(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
-                                push_failure(
-                                    &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "non_retryable",
-                                    &error_detail,
+                                return Err(reliable_context_terminal_error(
+                                    format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). \
+                                         Try using a model with a larger context window, reducing the number \
+                                         of tools/skills, or enabling compact_context in config."
+                                    ),
+                                    failures,
                                     None,
-                                );
-                                anyhow::bail!(
-                                    "Request exceeds model context window and cannot be reduced without \
-                                     breaking message/tool pairing ({truncation_limit}). \
-                                     Try using a model with a larger context window, reducing the number \
-                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
+                                ));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -1576,12 +1789,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1686,6 +1896,11 @@ impl ModelProvider for ReliableModelProvider {
                 .model_providers
                 .iter()
                 .all(|entry| entry.provider().supports_vision());
+        capabilities.native_tool_calling = !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider().supports_native_tools());
         capabilities
     }
 
@@ -1700,14 +1915,47 @@ impl ModelProvider for ReliableModelProvider {
                 .model_providers
                 .iter()
                 .all(|entry| entry.provider().capabilities_for_model(model).vision);
+        capabilities.native_tool_calling = !self.model_providers.is_empty()
+            && self.model_providers.iter().all(|entry| {
+                entry
+                    .provider()
+                    .capabilities_for_model(model)
+                    .native_tool_calling
+            });
         capabilities
     }
 
+    fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+        let mut has_native = false;
+        let mut has_text_only = false;
+
+        for entry in &self.model_providers {
+            let provider = entry.provider();
+            if provider.has_mixed_native_tool_support_for_model(model) {
+                return true;
+            }
+            if provider.capabilities_for_model(model).native_tool_calling {
+                has_native = true;
+            } else {
+                has_text_only = true;
+            }
+            if has_native && has_text_only {
+                return true;
+            }
+        }
+
+        false
+    }
+
     fn supports_native_tools(&self) -> bool {
-        self.model_providers
-            .first()
-            .map(|entry| entry.provider().supports_native_tools())
-            .unwrap_or(false)
+        // The turn loop selects one tool protocol before Reliable chooses a
+        // candidate. A native request is therefore safe only when every
+        // candidate the request may reach accepts native tool specifications.
+        !self.model_providers.is_empty()
+            && self
+                .model_providers
+                .iter()
+                .all(|entry| entry.provider().supports_native_tools())
     }
 
     fn supports_vision(&self) -> bool {
@@ -1722,18 +1970,18 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = false;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
 
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (provider_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -1778,6 +2026,8 @@ impl ModelProvider for ReliableModelProvider {
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_index != 0
+                                || provider_index != 0
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -1789,14 +2039,25 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
+                                    model_index != 0 || provider_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                            } else {
+                                record_successful_provider_fallback(None);
                             }
                             return Ok(resp);
                         }
@@ -1826,40 +2087,34 @@ impl ModelProvider for ReliableModelProvider {
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
+                                    record_provider_context_truncation();
                                     context_truncated = true;
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let error_detail = compact_error_detail(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
-                                push_failure(
-                                    &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "non_retryable",
-                                    &error_detail,
-                                    None,
-                                );
-                                let context_error = format!(
-                                    "Request exceeds model context window and cannot be reduced without \
-                                     breaking message/tool pairing ({truncation_limit}). \
-                                     Try using a model with a larger context window, reducing the number \
-                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
-                                if let Some(usage) = rejected_attempt_usage {
-                                    return Err(anyhow::Error::new(
-                                        ReliableRejectedCompletionUsage { usage, failures },
-                                    )
-                                    .context(context_error));
-                                }
-                                anyhow::bail!("{context_error}");
+                                return Err(reliable_context_terminal_error(
+                                    format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). \
+                                         Try using a model with a larger context window, reducing the number \
+                                         of tools/skills, or enabling compact_context in config."
+                                    ),
+                                    failures,
+                                    rejected_attempt_usage,
+                                ));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -1873,12 +2128,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -1975,18 +2227,18 @@ impl ModelProvider for ReliableModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let models = self.model_chain(model);
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = false;
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
 
-        for current_model in &models {
-            for entry in &self.model_providers {
+        for (model_index, current_model) in models.iter().enumerate() {
+            for (provider_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
                 if self.provider_should_skip_for_cooldown(entry) {
                     self.log_cooldown_skip(provider_name);
-                    Self::record_cooldown_skip_failure(&mut failures, provider_name, current_model);
+                    Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
 
@@ -2036,6 +2288,8 @@ impl ModelProvider for ReliableModelProvider {
                             let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
+                                || model_index != 0
+                                || provider_index != 0
                                 || context_truncated
                                 || self
                                     .model_providers
@@ -2047,14 +2301,25 @@ impl ModelProvider for ReliableModelProvider {
                                 let primary = self
                                     .model_providers
                                     .first()
+                                    .map(|entry| entry.candidate_name())
+                                    .unwrap_or("");
+                                let primary_provider = self
+                                    .model_providers
+                                    .first()
                                     .map(|entry| entry.display_name.as_str())
                                     .unwrap_or("");
-                                record_provider_fallback(
-                                    primary,
+                                let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
+                                    primary_provider,
                                     model,
                                     provider_name,
                                     served_model,
+                                    model_index != 0 || provider_index != 0,
+                                    primary,
+                                    entry.candidate_name(),
                                 );
+                                record_successful_provider_fallback(fallback_record.as_ref());
+                            } else {
+                                record_successful_provider_fallback(None);
                             }
                             return Ok(resp);
                         }
@@ -2084,40 +2349,34 @@ impl ModelProvider for ReliableModelProvider {
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
                             if is_context_window_exceeded(&e) && !context_truncated {
+                                let diagnostic = provider_error_diagnostic(&e);
+                                push_failure(
+                                    &mut failures,
+                                    attempt + 1,
+                                    self.max_retries + 1,
+                                    "context_window",
+                                    Some(&diagnostic),
+                                );
                                 let dropped = truncate_for_context(&mut effective_messages);
                                 if dropped > 0 {
+                                    record_provider_context_truncation();
                                     context_truncated = true;
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
-                                let error_detail = compact_error_detail(&e);
                                 let truncation_limit =
                                     context_truncation_limit(&effective_messages);
-                                push_failure(
-                                    &mut failures,
-                                    provider_name,
-                                    current_model,
-                                    attempt + 1,
-                                    self.max_retries + 1,
-                                    "non_retryable",
-                                    &error_detail,
-                                    None,
-                                );
-                                let context_error = format!(
-                                    "Request exceeds model context window and cannot be reduced without \
-                                     breaking message/tool pairing ({truncation_limit}). \
-                                     Try using a model with a larger context window, reducing the number \
-                                     of tools/skills, or enabling compact_context in config. Attempts:\n{}",
-                                    failures.join("\n")
-                                );
-                                if let Some(usage) = rejected_attempt_usage {
-                                    return Err(anyhow::Error::new(
-                                        ReliableRejectedCompletionUsage { usage, failures },
-                                    )
-                                    .context(context_error));
-                                }
-                                anyhow::bail!("{context_error}");
+                                return Err(reliable_context_terminal_error(
+                                    format!(
+                                        "Request exceeds model context window and cannot be reduced without \
+                                         breaking message/tool pairing ({truncation_limit}). \
+                                         Try using a model with a larger context window, reducing the number \
+                                         of tools/skills, or enabling compact_context in config."
+                                    ),
+                                    failures,
+                                    rejected_attempt_usage,
+                                ));
                             }
 
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -2131,12 +2390,9 @@ impl ModelProvider for ReliableModelProvider {
 
                             push_failure(
                                 &mut failures,
-                                provider_name,
-                                current_model,
                                 attempt + 1,
                                 self.max_retries + 1,
                                 failure_reason,
-                                &error_detail,
                                 Some(&diagnostic),
                             );
 
@@ -2251,7 +2507,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
         let needs_tool_events = request.tools.is_some_and(|tools| !tools.is_empty());
 
-        for entry in &self.model_providers {
+        for (provider_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -2276,7 +2532,7 @@ impl ModelProvider for ReliableModelProvider {
                 .unwrap_or(model)
                 .to_string();
             let served_model = entry.served_model(&current_model).to_string();
-            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+            let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                 self.model_providers
                     .first()
                     .map(|entry| entry.display_name.as_str())
@@ -2284,6 +2540,12 @@ impl ModelProvider for ReliableModelProvider {
                 model,
                 provider_name,
                 &served_model,
+                provider_index != 0,
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.candidate_name())
+                    .unwrap_or(""),
+                entry.candidate_name(),
             );
 
             let req = ChatRequest {
@@ -2335,7 +2597,7 @@ impl ModelProvider for ReliableModelProvider {
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
         // Try each model_provider/model combination for streaming
         // For streaming, we use the first model_provider that supports it and has streaming enabled
-        for entry in &self.model_providers {
+        for (provider_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -2356,7 +2618,7 @@ impl ModelProvider for ReliableModelProvider {
                 None => model.to_string(),
             };
             let served_model = entry.served_model(&current_model).to_string();
-            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+            let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                 self.model_providers
                     .first()
                     .map(|entry| entry.display_name.as_str())
@@ -2364,6 +2626,12 @@ impl ModelProvider for ReliableModelProvider {
                 model,
                 provider_name,
                 &served_model,
+                provider_index != 0,
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.candidate_name())
+                    .unwrap_or(""),
+                entry.candidate_name(),
             );
 
             // For streaming, we attempt once and propagate errors
@@ -2417,7 +2685,7 @@ impl ModelProvider for ReliableModelProvider {
         // Try each model_provider/model combination for streaming with history.
         // Mirrors stream_chat_with_system but delegates to the underlying
         // model_provider's stream_chat_with_history, preserving the full conversation.
-        for entry in &self.model_providers {
+        for (provider_index, entry) in self.model_providers.iter().enumerate() {
             let provider_name = entry.display_name.as_str();
             let model_provider = entry.provider();
             if !model_provider.supports_streaming() || !options.enabled {
@@ -2436,7 +2704,7 @@ impl ModelProvider for ReliableModelProvider {
                 None => model.to_string(),
             };
             let served_model = entry.served_model(&current_model).to_string();
-            let fallback_record = ProviderFallbackRecord::new_if_recovered(
+            let fallback_record = ProviderFallbackRecord::new_if_true_fallback(
                 self.model_providers
                     .first()
                     .map(|entry| entry.display_name.as_str())
@@ -2444,6 +2712,12 @@ impl ModelProvider for ReliableModelProvider {
                 model,
                 provider_name,
                 &served_model,
+                provider_index != 0,
+                self.model_providers
+                    .first()
+                    .map(|entry| entry.candidate_name())
+                    .unwrap_or(""),
+                entry.candidate_name(),
             );
 
             let stream = model_provider.stream_chat_with_history(
@@ -3676,7 +3950,7 @@ mod tests {
             .expect_err("an exhausted empty completion must not be returned as success");
         assert!(
             err.to_string()
-                .contains("All model_providers/models failed")
+                .contains("All model providers/models failed")
         );
         assert!(err.to_string().contains("empty_response"));
         // Initial attempt + max_retries (2) re-rolls = 3 calls.
@@ -3790,8 +4064,14 @@ mod tests {
         assert!(
             error
                 .to_string()
+                .contains("event 2 (retry 1/1): retryable; kind=provider_error"),
+            "the final provider failure classification must be retained: {error:#}"
+        );
+        assert!(
+            !error
+                .to_string()
                 .contains("upstream terminal provider failure"),
-            "the final provider failure must be retained: {error:#}"
+            "provider-controlled failure text must not reach the terminal summary: {error:#}"
         );
         assert!(
             !error
@@ -3989,12 +4269,54 @@ mod tests {
             .await
             .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All model_providers/models failed"));
-        assert!(msg.contains("model_provider=p1 model=test"));
-        assert!(msg.contains("model_provider=p2 model=test"));
-        assert!(msg.contains("error=p1 error"));
-        assert!(msg.contains("error=p2 error"));
+        assert!(msg.contains("All model providers/models failed after 2 failure event(s)"));
+        assert!(msg.contains("event 1 (retry 1/1): retryable"));
+        assert!(msg.contains("event 2 (retry 1/1): retryable"));
+        assert!(!msg.contains("p1 error"));
+        assert!(!msg.contains("p2 error"));
         assert!(msg.contains("retryable"));
+    }
+
+    #[tokio::test]
+    async fn excessive_failure_events_are_bounded_without_provider_details() {
+        const PROVIDER_COUNT: usize = 64;
+        let providers: Vec<(String, Box<dyn ModelProvider>)> = (0..PROVIDER_COUNT)
+            .map(|index| {
+                (
+                    format!("sensitive-provider-identity-{index}"),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "sensitive provider response body: secret-token",
+                    }) as Box<dyn ModelProvider>,
+                )
+            })
+            .collect();
+        let model_provider = ReliableModelProvider::new("test", providers, 0, 1);
+
+        let err = model_provider
+            .simple_chat("hello", "sensitive-model-identity", Some(0.0))
+            .await
+            .expect_err("all model providers should fail");
+        let msg = err.to_string();
+
+        assert!(
+            msg.len() <= MAX_FAILURE_AGGREGATE_BYTES,
+            "aggregate was {} bytes",
+            msg.len()
+        );
+        assert!(msg.contains("after 64 failure event(s)"));
+        assert!(msg.contains("event 8 (retry 1/1): retryable"));
+        assert!(!msg.contains("event 9 (retry 1/1): retryable"));
+        assert!(msg.contains(&format!(
+            "[{} additional failure event(s) omitted]",
+            PROVIDER_COUNT - MAX_RETAINED_FAILURE_EVENTS
+        )));
+        assert!(!msg.contains("sensitive-provider-identity"));
+        assert!(!msg.contains("sensitive-model-identity"));
+        assert!(!msg.contains("sensitive provider response body"));
+        assert!(!msg.contains("secret-token"));
     }
 
     #[test]
@@ -4167,31 +4489,37 @@ mod tests {
     }
 
     #[test]
-    fn failure_summary_includes_provider_diagnostic_fields() {
+    fn failure_summary_contains_only_safe_diagnostic_fields() {
         let diagnostic = ProviderErrorDiagnostic {
             kind: "connect_timeout",
             phase: "tls_or_connect",
             hint: "check network, VPN, or firewall",
             endpoint: Some("https://api.deepseek.com/chat/completions".to_string()),
         };
-        let mut failures = Vec::new();
+        let mut failures = FailureEvents::default();
 
-        push_failure(
-            &mut failures,
-            "deepseek",
-            "deepseek-reasoner",
-            1,
-            3,
-            "retryable",
-            "operation timed out",
-            Some(&diagnostic),
-        );
+        push_failure(&mut failures, 1, 3, "retryable", Some(&diagnostic));
 
-        let summary = failures.join("\n");
+        let summary = failure_aggregate(&failures);
+        assert!(summary.contains("event 1 (retry 1/3): retryable"));
         assert!(summary.contains("kind=connect_timeout"));
         assert!(summary.contains("phase=tls_or_connect"));
-        assert!(summary.contains("endpoint=https://api.deepseek.com/chat/completions"));
         assert!(summary.contains("hint=check network, VPN, or firewall"));
+        assert!(!summary.contains("https://api.deepseek.com/chat/completions"));
+        assert!(!summary.contains("operation timed out"));
+    }
+
+    #[test]
+    fn failure_aggregate_enforces_byte_limit_when_an_event_does_not_fit() {
+        let mut failures = FailureEvents::default();
+        failures.push("provider-controlled-body".repeat(MAX_FAILURE_AGGREGATE_BYTES));
+
+        let summary = failure_aggregate(&failures);
+
+        assert!(summary.len() <= MAX_FAILURE_AGGREGATE_BYTES);
+        assert!(summary.contains("after 1 failure event(s)"));
+        assert!(summary.contains("[1 additional failure event(s) omitted]"));
+        assert!(!summary.contains("provider-controlled-body"));
     }
 
     #[tokio::test]
@@ -4229,7 +4557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregated_error_marks_non_retryable_model_mismatch_with_details() {
+    async fn aggregated_error_marks_non_retryable_model_mismatch_without_provider_text() {
         let calls = Arc::new(AtomicUsize::new(0));
         let model_provider = ReliableModelProvider::new(
             "test",
@@ -4252,8 +4580,10 @@ mod tests {
             .expect_err("model_provider should fail");
         let msg = err.to_string();
 
+        assert!(msg.contains("All model providers/models failed after 1 failure event(s)"));
         assert!(msg.contains("non_retryable"));
-        assert!(msg.contains("error=unsupported model: glm-4.7"));
+        assert!(msg.contains("kind=model_not_found"));
+        assert!(!msg.contains("unsupported model: glm-4.7"));
         // Non-retryable errors should not consume retry budget.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
@@ -4438,7 +4768,7 @@ mod tests {
             .expect_err("all models should fail");
         assert!(
             err.to_string()
-                .contains("All model_providers/models failed")
+                .contains("All model providers/models failed after 3 failure event(s)")
         );
 
         let seen = mock.models_seen.lock();
@@ -4832,6 +5162,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cooldown_skip_uses_safe_terminal_summary() {
+        let skipped_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "test",
+            vec![
+                ReliableModelProviderEntry::new(
+                    "provider-alias-should-not-escape",
+                    "primary-cooldown-key",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&skipped_calls),
+                        fail_until_attempt: 0,
+                        response: "should be skipped",
+                        error: "unreachable",
+                    }),
+                ),
+                ReliableModelProviderEntry::new(
+                    "fallback-alias-should-not-escape",
+                    "fallback-cooldown-key",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "unreachable",
+                        error: "fallback provider response marker",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        let cooldown_error = anyhow::Error::msg("429 Too Many Requests, Retry-After: 30");
+        model_provider.set_rate_limit_cooldown("primary-cooldown-key", &cooldown_error);
+
+        let error = model_provider
+            .simple_chat("hello", "model-id-should-not-escape", Some(0.0))
+            .await
+            .expect_err("the non-cooled fallback should fail");
+        let message = error.to_string();
+
+        assert_eq!(skipped_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert!(message.contains("event 1 (retry 0/1): rate_limit_cooldown"));
+        assert!(message.contains("kind=rate_limited"));
+        assert!(message.contains("phase=cooldown"));
+        assert!(message.contains("event 2 (retry 1/1): retryable"));
+        assert!(!message.contains("provider-alias-should-not-escape"));
+        assert!(!message.contains("fallback-alias-should-not-escape"));
+        assert!(!message.contains("model-id-should-not-escape"));
+        assert!(!message.contains("fallback provider response marker"));
+    }
+
+    #[tokio::test]
     async fn retryable_rate_limit_cools_down_shared_provider_identity() {
         let primary_calls = Arc::new(AtomicUsize::new(0));
         let shared_model_fallback_calls = Arc::new(AtomicUsize::new(0));
@@ -5100,7 +5482,123 @@ mod tests {
         );
     }
 
+    #[test]
+    fn mixed_chain_disables_native_tools_before_dispatch() {
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "native-primary".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "unused",
+                        tool_calls: vec![],
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text-fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "unused",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(
+            !provider.supports_native_tools(),
+            "a text-only fallback must select prompt-guided tools before dispatch"
+        );
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "Reliable capabilities must not advertise native tools that a fallback cannot accept"
+        );
+        assert!(
+            !provider
+                .capabilities_for_model("any-model")
+                .native_tool_calling,
+            "model-specific Reliable capabilities must not advertise native tools that a fallback cannot accept"
+        );
+        assert!(
+            provider.has_mixed_native_tool_support_for_model("any-model"),
+            "the strict-mode preflight must distinguish a mixed chain from a homogeneous text-only chain"
+        );
+    }
+
     // ── Gap 2-4: Parity tests for chat() ────────────────────────
+
+    #[test]
+    fn homogeneous_chains_do_not_report_mixed_native_tool_support() {
+        let native_provider = ReliableModelProvider::new(
+            "native",
+            vec![
+                (
+                    "native-primary".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "unused",
+                        tool_calls: vec![],
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "native-fallback".into(),
+                    Box::new(NativeToolMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response_text: "unused",
+                        tool_calls: vec![],
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+        let text_provider = ReliableModelProvider::new(
+            "text",
+            vec![
+                (
+                    "text-primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "unused",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text-fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "unused",
+                        error: "unused",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(native_provider.supports_native_tools());
+        assert!(
+            !native_provider.has_mixed_native_tool_support_for_model("any-model"),
+            "an all-native chain is homogeneous"
+        );
+        assert!(!text_provider.supports_native_tools());
+        assert!(
+            !text_provider.has_mixed_native_tool_support_for_model("any-model"),
+            "an all-text chain is homogeneous and remains valid in strict mode"
+        );
+    }
 
     #[tokio::test]
     async fn chat_returns_aggregated_error_when_all_providers_fail() {
@@ -5143,11 +5641,11 @@ mod tests {
             .await
             .expect_err("all model_providers should fail");
         let msg = err.to_string();
-        assert!(msg.contains("All model_providers/models failed"));
-        assert!(msg.contains("model_provider=p1 model=test"));
-        assert!(msg.contains("model_provider=p2 model=test"));
-        assert!(msg.contains("error=p1 chat error"));
-        assert!(msg.contains("error=p2 chat error"));
+        assert!(msg.contains("All model providers/models failed after 2 failure event(s)"));
+        assert!(msg.contains("event 1 (retry 1/1): retryable"));
+        assert!(msg.contains("event 2 (retry 1/1): retryable"));
+        assert!(!msg.contains("p1 chat error"));
+        assert!(!msg.contains("p2 chat error"));
         assert!(msg.contains("retryable"));
     }
 
@@ -5583,7 +6081,24 @@ mod tests {
     struct ContextOverflowMock {
         calls: Arc<AtomicUsize>,
         fail_until_attempt: usize,
+        post_context_error: Option<&'static str>,
         message_counts: parking_lot::Mutex<Vec<usize>>,
+    }
+
+    impl ContextOverflowMock {
+        fn record_attempt(&self, message_count: usize) -> anyhow::Result<()> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            self.message_counts.lock().push(message_count);
+            if attempt <= self.fail_until_attempt {
+                anyhow::bail!(
+                    "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
+                );
+            }
+            if let Some(error) = self.post_context_error {
+                anyhow::bail!(error);
+            }
+            Ok(())
+        }
     }
 
     #[async_trait]
@@ -5595,7 +6110,8 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            Ok("ok".to_string())
+            self.record_attempt(0)?;
+            Ok("recovered after truncation".to_string())
         }
 
         async fn chat_with_history(
@@ -5604,14 +6120,39 @@ mod tests {
             _model: &str,
             _temperature: Option<f64>,
         ) -> anyhow::Result<String> {
-            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
-            self.message_counts.lock().push(messages.len());
-            if attempt <= self.fail_until_attempt {
-                anyhow::bail!(
-                    "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
-                );
-            }
+            self.record_attempt(messages.len())?;
             Ok("recovered after truncation".to_string())
+        }
+
+        async fn chat_with_tools(
+            &self,
+            messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.record_attempt(messages.len())?;
+            Ok(ChatResponse {
+                text: Some("recovered after truncation".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.record_attempt(request.messages.len())?;
+            Ok(ChatResponse {
+                text: Some("recovered after truncation".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
         }
     }
     impl ::zeroclaw_api::attribution::Attributable for ContextOverflowMock {
@@ -5627,12 +6168,39 @@ mod tests {
         }
     }
 
+    fn all_non_stream_context_overflow_provider(calls: Arc<AtomicUsize>) -> ReliableModelProvider {
+        ReliableModelProvider::new(
+            "test",
+            vec![(
+                "local".into(),
+                Box::new(ContextOverflowMock {
+                    calls,
+                    fail_until_attempt: usize::MAX,
+                    post_context_error: None,
+                    message_counts: parking_lot::Mutex::new(Vec::new()),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        )
+    }
+
+    fn assert_single_safe_context_failure(err: anyhow::Error, calls: &AtomicUsize) {
+        let msg = err.to_string();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(msg.contains("after 1 failure event(s)"), "{msg}");
+        assert!(msg.contains("event 1 (retry 1/1): context_window"), "{msg}");
+        assert!(!msg.contains("8968 tokens"));
+        assert!(!msg.contains("8448 tokens"));
+    }
+
     #[tokio::test]
     async fn chat_with_history_truncates_on_context_overflow() {
         let calls = Arc::new(AtomicUsize::new(0));
         let mock = ContextOverflowMock {
             calls: Arc::clone(&calls),
             fail_until_attempt: 1, // fail first call, succeed after truncation
+            post_context_error: None,
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 
@@ -5652,13 +6220,116 @@ mod tests {
             ChatMessage::user("current question"),
         ];
 
-        let result = model_provider
-            .chat_with_history(&messages, "local-model", Some(0.0))
-            .await
-            .unwrap();
+        let (result, fallback, context_truncated) = scope_provider_fallback(async {
+            let result = model_provider
+                .chat_with_history(&messages, "local-model", Some(0.0))
+                .await
+                .unwrap();
+            (
+                result,
+                take_last_provider_fallback(),
+                take_last_provider_context_truncation(),
+            )
+        })
+        .await;
         assert_eq!(result, "recovered after truncation");
         // Should have been called twice: once with full messages, once with truncated
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(
+            fallback.is_none(),
+            "same-candidate context recovery is not user-visible fallback attribution"
+        );
+        assert!(
+            context_truncated,
+            "the internal provenance signal must remain available for cache safety"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_non_stream_context_overflows_with_zero_retries_report_one_attempt() {
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old message"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("current question"),
+        ];
+
+        let system_calls = Arc::new(AtomicUsize::new(0));
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&system_calls))
+            .chat_with_system(None, "hello", "local-model", Some(0.0))
+            .await
+            .expect_err("the only system-chat call should overflow");
+        assert_single_safe_context_failure(err, &system_calls);
+
+        let history_calls = Arc::new(AtomicUsize::new(0));
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&history_calls))
+            .chat_with_history(&messages, "local-model", Some(0.0))
+            .await
+            .expect_err("the only history-chat call should overflow");
+        assert_single_safe_context_failure(err, &history_calls);
+
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&tool_calls))
+            .chat_with_tools(&messages, &[], "local-model", Some(0.0))
+            .await
+            .expect_err("the only tool-chat call should overflow");
+        assert_single_safe_context_failure(err, &tool_calls);
+
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let err = all_non_stream_context_overflow_provider(Arc::clone(&chat_calls))
+            .chat(request, "local-model", Some(0.0))
+            .await
+            .expect_err("the only structured-chat call should overflow");
+        assert_single_safe_context_failure(err, &chat_calls);
+    }
+
+    #[tokio::test]
+    async fn context_truncation_then_failure_reports_both_events_in_order() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mock = ContextOverflowMock {
+            calls: Arc::clone(&calls),
+            fail_until_attempt: 1,
+            post_context_error: Some("sensitive final provider response body: secret-token"),
+            message_counts: parking_lot::Mutex::new(Vec::new()),
+        };
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![("local".into(), Box::new(mock) as Box<dyn ModelProvider>)],
+            1,
+            1,
+        );
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old message"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("current question"),
+        ];
+
+        let err = model_provider
+            .chat_with_history(&messages, "local-model", Some(0.0))
+            .await
+            .expect_err("both provider calls should overflow");
+        let msg = err.to_string();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(msg.contains("after 2 failure event(s)"), "{msg}");
+        let first = msg
+            .find("event 1 (retry 1/2): context_window")
+            .expect("first overflow event should be retained");
+        let second = msg
+            .find("event 2 (retry 2/2): retryable")
+            .expect("post-truncation failure should be retained");
+        assert!(first < second, "events were reordered: {msg}");
+        assert!(msg.contains("kind=provider_error"));
+        assert!(!msg.contains("8968 tokens"));
+        assert!(!msg.contains("8448 tokens"));
+        assert!(!msg.contains("sensitive final provider response body"));
+        assert!(!msg.contains("secret-token"));
     }
 
     #[tokio::test]
@@ -5667,6 +6338,7 @@ mod tests {
         let mock = ContextOverflowMock {
             calls: Arc::clone(&calls),
             fail_until_attempt: 999, // always fail
+            post_context_error: None,
             message_counts: parking_lot::Mutex::new(Vec::new()),
         };
 
@@ -6485,6 +7157,140 @@ mod tests {
 
             // Second take should be None.
             assert!(take_last_provider_fallback().is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn later_primary_success_clears_stale_fallback_attribution() {
+        scope_provider_fallback(async {
+            let primary_calls = Arc::new(AtomicUsize::new(0));
+            let backup_calls = Arc::new(AtomicUsize::new(0));
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "primary".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::clone(&primary_calls),
+                            fail_until_attempt: 1,
+                            response: "final primary response",
+                            error: "503 Service Unavailable",
+                        }),
+                    ),
+                    (
+                        "backup".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::clone(&backup_calls),
+                            fail_until_attempt: 0,
+                            response: "tool-call response",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                0,
+                1,
+            );
+
+            assert_eq!(
+                model_provider
+                    .simple_chat("first", "test-model", Some(0.0))
+                    .await
+                    .expect("fallback recovers the first request"),
+                "tool-call response"
+            );
+            assert_eq!(
+                model_provider
+                    .simple_chat("second", "test-model", Some(0.0))
+                    .await
+                    .expect("primary recovers for the second request"),
+                "final primary response"
+            );
+            assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+            assert_eq!(backup_calls.load(Ordering::SeqCst), 1);
+            assert!(
+                take_last_provider_fallback().is_none(),
+                "the final primary request must clear fallback attribution"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retry_on_same_candidate_does_not_record_fallback_info() {
+        scope_provider_fallback(async {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![(
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&calls),
+                        fail_until_attempt: 1,
+                        response: "recovered on retry",
+                        error: "503 Service Unavailable",
+                    }),
+                )],
+                1,
+                1,
+            );
+
+            let response = model_provider
+                .simple_chat("hi", "test-model", Some(0.0))
+                .await
+                .expect("same candidate retry recovers");
+
+            assert_eq!(response, "recovered on retry");
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert!(
+                take_last_provider_fallback().is_none(),
+                "retrying the exact candidate must not be reported as fallback"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn later_duplicate_candidate_records_fallback_info() {
+        scope_provider_fallback(async {
+            let model_provider = ReliableModelProvider::new(
+                "test",
+                vec![
+                    (
+                        "duplicate".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: usize::MAX,
+                            response: "unused",
+                            error: "503 Service Unavailable",
+                        }),
+                    ),
+                    (
+                        "duplicate".into(),
+                        Box::new(MockModelProvider {
+                            calls: Arc::new(AtomicUsize::new(0)),
+                            fail_until_attempt: 0,
+                            response: "recovered on later duplicate",
+                            error: "unused",
+                        }),
+                    ),
+                ],
+                0,
+                1,
+            );
+
+            let response = model_provider
+                .simple_chat("hi", "test-model", Some(0.0))
+                .await
+                .expect("later duplicate candidate recovers");
+
+            assert_eq!(response, "recovered on later duplicate");
+            let fallback = take_last_provider_fallback()
+                .expect("later configured candidate must be reported as fallback");
+            assert_eq!(fallback.requested_provider, "duplicate");
+            assert_eq!(fallback.actual_provider, "duplicate");
+            assert_eq!(fallback.requested_model, "test-model");
+            assert_eq!(fallback.actual_model, "test-model");
         })
         .await;
     }

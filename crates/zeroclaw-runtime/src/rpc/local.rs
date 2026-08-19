@@ -957,9 +957,50 @@ mod tests {
         drop(guard);
     }
 
+    /// Set on the re-executed child so `endpoint_lock_is_held_through_guard_cleanup`
+    /// runs its real assertions instead of relaunching itself again.
+    #[cfg(unix)]
+    const ENDPOINT_LOCK_TEST_CHILD_ENV: &str = "ZEROCLAW_ENDPOINT_LOCK_TEST_CHILD";
+
     #[cfg(unix)]
     #[tokio::test]
     async fn endpoint_lock_is_held_through_guard_cleanup() {
+        // This test drops a real EndpointLock and then requires that a
+        // fresh acquire of the same path immediately succeeds. `flock()`,
+        // which EndpointLock uses, is scoped to the *open file
+        // description*, and `fork()` duplicates a process's whole
+        // descriptor table into any child it creates. If some unrelated
+        // test elsewhere in this binary forks a subprocess (the shell
+        // tool, a sandbox backend, ...) at the exact instant our lock's
+        // descriptor happens to be open, that child inherits a reference
+        // that keeps the lock alive past our own `drop()`, and the
+        // reacquire below spuriously observes it as still owned. This is
+        // not about path uniqueness — this test's `tempfile::tempdir()`
+        // path is already unique — it is about the whole test binary
+        // process's descriptor table being shared with every other
+        // concurrently running test.
+        //
+        // The only way to make the reacquire deterministic is to guarantee
+        // nothing else can fork while it happens, so the real body below
+        // runs in a freshly exec'd child process dedicated to this one
+        // test, whose descriptor table nothing else can share.
+        if std::env::var_os(ENDPOINT_LOCK_TEST_CHILD_ENV).is_none() {
+            let exe = std::env::current_exe().expect("resolve current test binary");
+            let status = tokio::process::Command::new(exe)
+                .arg("rpc::local::tests::endpoint_lock_is_held_through_guard_cleanup")
+                .arg("--exact")
+                .arg("--test-threads=1")
+                .env(ENDPOINT_LOCK_TEST_CHILD_ENV, "1")
+                .status()
+                .await
+                .expect("relaunch endpoint_lock_is_held_through_guard_cleanup in isolation");
+            assert!(
+                status.success(),
+                "isolated endpoint_lock_is_held_through_guard_cleanup failed: {status}"
+            );
+            return;
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         let sock_path = tmp.path().join("daemon.sock");
         let (listener, guard) = platform::bind(&sock_path).await.unwrap();

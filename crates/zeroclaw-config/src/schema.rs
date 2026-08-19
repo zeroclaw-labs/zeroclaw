@@ -21117,9 +21117,12 @@ impl Config {
                     "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
                 );
             }
+            // Unlike service IDs, resource/sub_resource/method names are camelCase
+            // in the Google APIs (calendarList, quickAdd, batchUpdate), so
+            // uppercase must be accepted here and in the runtime tool check.
             if !resource
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 anyhow::bail!(
                     "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
@@ -21135,7 +21138,7 @@ impl Config {
                 }
                 if !sub
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 {
                     anyhow::bail!(
                         "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
@@ -21161,7 +21164,7 @@ impl Config {
                 }
                 if !normalized
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 {
                     anyhow::bail!(
                         "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
@@ -23210,9 +23213,15 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// Optional override. When omitted, the runtime and CLI both resolve the
-    /// default `<workspace>/sops`; SOPs load from there whenever it exists.
-    #[serde(default)]
+    /// A relative value resolves against the install root (matching the
+    /// `skill-bundles` convention), so the documented `shared/sops` loads from
+    /// `<install>/shared/sops` — the same directory the web/RPC SOP author writes
+    /// to. An absolute or `~`-prefixed value is used as-is. Unset by default;
+    /// SOP runtime behavior activates only when this is set to a non-empty
+    /// value, so leaving it unset (or an explicit empty value) keeps SOP
+    /// loading disabled (unset/empty still falls back to `<install>/shared/sops`
+    /// for offline CLI inspection).
+    #[serde(default = "default_sop_sops_dir")]
     pub sops_dir: Option<String>,
 
     /// Default execution mode for SOPs that omit `execution_mode`.
@@ -23336,6 +23345,26 @@ pub struct SopConfig {
     /// Experimental.
     #[serde(default)]
     pub procedural_memory_enabled: bool,
+}
+
+impl SopConfig {
+    /// Whether the SOP runtime (engine, tools, maintenance tick, run store) is
+    /// active for this config. SOP loading is gated on a concrete definitions
+    /// directory: a non-empty `sops_dir` enables it; an unset or explicit empty
+    /// string keeps it disabled (the default is unset, so SOP runtime is off
+    /// until an operator opts in). This is the single source of truth for
+    /// activation, so callers must not re-derive it from `sops_dir.is_some()` —
+    /// that treats an empty string as enabled and would break the disable path.
+    #[must_use]
+    pub fn runtime_enabled(&self) -> bool {
+        self.sops_dir
+            .as_deref()
+            .is_some_and(|dir| !dir.trim().is_empty())
+    }
+}
+
+fn default_sop_sops_dir() -> Option<String> {
+    None
 }
 
 fn default_sop_execution_mode() -> String {
@@ -23525,7 +23554,7 @@ fn default_sop_maintenance_interval_secs() -> u64 {
 impl Default for SopConfig {
     fn default() -> Self {
         Self {
-            sops_dir: None,
+            sops_dir: default_sop_sops_dir(),
             default_execution_mode: default_sop_execution_mode(),
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),
@@ -24339,6 +24368,87 @@ max_height = 8
         assert_eq!(config.untrusted_guard_sensitivity, 0.7);
         assert!(config.untrusted_frame_warning);
         assert!(config.untrusted_outbound_redact);
+    }
+
+    #[test]
+    async fn sop_sops_dir_defaults_to_unset_and_disables_runtime() {
+        // A fresh install (no [sop] sops_dir) leaves the field unset, which keeps
+        // the SOP runtime off. Operators opt in by setting a directory; the daemon
+        // and CLI gate on this via `runtime_enabled()`.
+        let config: SopConfig = toml::from_str("").expect("empty SOP config should deserialize");
+
+        assert_eq!(config.sops_dir, None);
+        assert!(!config.runtime_enabled());
+
+        // SopConfig::default() must agree with the deserialized default.
+        assert_eq!(SopConfig::default().sops_dir, None);
+        assert!(!SopConfig::default().runtime_enabled());
+    }
+
+    #[test]
+    async fn sop_empty_sops_dir_disables_runtime() {
+        // An explicit empty string keeps the SOP runtime off, same as unset.
+        // Whitespace-only is treated the same so a stray space cannot silently
+        // enable it.
+        let disabled: SopConfig =
+            toml::from_str(r#"sops_dir = """#).expect("empty sops_dir should deserialize");
+        assert_eq!(disabled.sops_dir.as_deref(), Some(""));
+        assert!(!disabled.runtime_enabled());
+
+        let whitespace: SopConfig =
+            toml::from_str(r#"sops_dir = "   ""#).expect("whitespace sops_dir should deserialize");
+        assert!(!whitespace.runtime_enabled());
+
+        // A non-empty explicit path enables the runtime.
+        let custom: SopConfig =
+            toml::from_str(r#"sops_dir = "my-sops""#).expect("custom sops_dir should deserialize");
+        assert!(custom.runtime_enabled());
+    }
+
+    // Regression: disabling the SOP runtime by setting an empty `sops_dir`
+    // through the config API must survive save_dirty + reload. Because the
+    // default is now unset (runtime off), even if the incremental writer drops
+    // the empty field, a reload deserializes back to the disabled default —
+    // the operator's opt-out cannot silently flip back on.
+    #[test]
+    async fn sop_empty_sops_dir_disable_survives_persist_and_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file with the SOP runtime explicitly enabled so the
+        // incremental save path runs against an existing [sop] section.
+        let seed = format!(
+            "schema_version = {}\n\n[sop]\nsops_dir = \"sops\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.sop.sops_dir = Some("sops".to_string());
+        assert!(config.sop.runtime_enabled(), "seed must start enabled");
+
+        // Operator opts out via the same call site the dashboard/TUI use.
+        config
+            .set_prop_persistent("sop.sops_dir", "")
+            .expect("set_prop_persistent must accept an empty sops_dir");
+        assert!(
+            !config.sop.runtime_enabled(),
+            "empty sops_dir must disable the runtime in memory"
+        );
+
+        config.save_dirty().await.unwrap();
+
+        // Reload from disk and confirm the disable stuck.
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written).expect("persisted config should reload");
+        assert!(
+            !reloaded.sop.runtime_enabled(),
+            "empty/unset sops_dir must keep the SOP runtime off after reload; \
+             on-disk file reads:\n{written}"
+        );
     }
 
     #[test]
@@ -30953,6 +31063,35 @@ api_token = "tok"
                 resource: "files".into(),
                 sub_resource: None,
                 methods: vec!["list".into(), "get".into()],
+            },
+        ];
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn google_workspace_allowed_operations_accept_camelcase_entries() {
+        // Google API resource/method identifiers are camelCase; the shipped
+        // examples (calendarList, quickAdd, batchUpdate) must validate.
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "calendar".into(),
+                resource: "calendarList".into(),
+                sub_resource: None,
+                methods: vec!["list".into(), "get".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "calendar".into(),
+                resource: "events".into(),
+                sub_resource: None,
+                methods: vec!["quickAdd".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("sendAs".into()),
+                methods: vec!["list".into()],
             },
         ];
 

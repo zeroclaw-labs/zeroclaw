@@ -516,10 +516,21 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
     fn capabilities_for_model(&self, _model: &str) -> ProviderCapabilities {
         let mut capabilities = self.capabilities();
         // Preserve compatibility with providers that historically overrode the
-        // convenience accessor instead of capabilities(). Composite overrides
+        // convenience accessors instead of capabilities(). Composite overrides
         // should still make the model-aware value authoritative.
+        capabilities.native_tool_calling = self.supports_native_tools();
         capabilities.vision = self.supports_vision();
         capabilities
+    }
+
+    /// Whether the selected request can reach both native-tool and text-only
+    /// candidates.
+    ///
+    /// Ordinary providers are homogeneous and inherit `false`. Composite
+    /// providers override this so callers that must select one tool protocol
+    /// before dispatch can reject an incompatible strict configuration.
+    fn has_mixed_native_tool_support_for_model(&self, _model: &str) -> bool {
+        false
     }
 
     /// Family-preferred temperature default. Override per family. Documented
@@ -796,6 +807,10 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
         self.as_ref().capabilities_for_model(model)
     }
 
+    fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+        self.as_ref().has_mixed_native_tool_support_for_model(model)
+    }
+
     fn default_max_tokens(&self) -> u32 {
         self.as_ref().default_max_tokens()
     }
@@ -946,6 +961,58 @@ pub fn build_tool_instructions_text(tools: &[ToolSpec]) -> String {
     }
 
     instructions
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::ModelProvider;
+    use crate::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use async_trait::async_trait;
+
+    struct NativeAccessorOnlyProvider;
+
+    impl Attributable for NativeAccessorOnlyProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "native_accessor_only"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for NativeAccessorOnlyProvider {
+        fn supports_native_tools(&self) -> bool {
+            true
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn model_capabilities_preserve_native_accessor_overrides() {
+        let provider = NativeAccessorOnlyProvider;
+
+        assert!(
+            !provider.capabilities().native_tool_calling,
+            "the fixture must exercise the legacy accessor-only override"
+        );
+        assert!(
+            provider
+                .capabilities_for_model("requested-model")
+                .native_tool_calling,
+            "model-aware capability lookup must preserve legacy supports_native_tools overrides"
+        );
+    }
 }
 
 #[cfg(test)]

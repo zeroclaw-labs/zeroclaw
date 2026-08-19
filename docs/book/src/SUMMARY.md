@@ -50,6 +50,7 @@
     - [ADR-010: Memory authority boundaries](./architecture/decisions/ADR-010-memory-authority-boundaries.md)
     - [ADR-011: Multi-agent runtime boundaries](./architecture/decisions/ADR-011-multi-agent-runtime-boundaries.md)
     - [ADR-012: Generation-scoped live config apply](./architecture/decisions/ADR-012-generation-scoped-live-config-apply.md)
+    - [ADR-013: Key-source authority](./architecture/decisions/ADR-013-key-source-authority.md)
   - [Logging](./architecture/logging.md)
   - [Runtime state and persistence](./architecture/runtime-state-and-persistence.md)
   - [Memory and payload lifecycle](./architecture/memory-payload-lifecycle.md)
