@@ -633,8 +633,10 @@ mod tests {
             description: None,
             author: None,
             wasm_path: None,
+            wasm_sha256: None,
             capabilities: vec![PluginCapability::Channel],
             permissions,
+            config_schema: None,
             signature: None,
             publisher_key: None,
         };
