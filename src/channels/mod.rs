@@ -85,6 +85,12 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
         crate::ChannelCommands::BindTelegram { identity, alias } => {
             Box::pin(bind_telegram_identity(config, &identity, &alias)).await
         }
+        crate::ChannelCommands::BindWechat { identity, alias } => {
+            Box::pin(bind_channel_identity(config, "wechat", &alias, &identity)).await
+        }
+        crate::ChannelCommands::BindLine { identity, alias } => {
+            Box::pin(bind_channel_identity(config, "line", &alias, &identity)).await
+        }
         crate::ChannelCommands::Send {
             message,
             channel_id,
