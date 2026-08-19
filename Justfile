@@ -17,6 +17,10 @@ fmt-check:
 lint:
     cargo clippy --all-targets -- -D warnings
 
+# Reject newly introduced low-evidence Rust patterns relative to a git base.
+anti-slop BASE="origin/master":
+    cargo run --locked -p zeroclaw-anti-slop -- --changed-since {{BASE}}
+
 # Run all tests
 test:
     cargo test --locked
