@@ -1653,6 +1653,12 @@ impl DelegateTool {
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        // The delegating turn's capability ceiling lives in a task-local that a
+        // spawned background task does not inherit. Capture it here, in the
+        // parent task where it is still in scope, and re-establish it around the
+        // child execution below so a background child cannot regain a tool the
+        // image turn removed.
+        let parent_tool_ceiling = crate::agent::tool_ceiling::current_tool_ceiling();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
@@ -1689,11 +1695,14 @@ impl DelegateTool {
                     () = child_token.cancelled() => {
                         Err("Cancelled by parent session".to_string())
                     }
-                    result = Box::pin(inner.execute_sync_with_admission(
-                        &agent_name_owned,
-                        &full_prompt,
-                        &args_inner,
-                        DelegateAdmission::Prevalidated,
+                    result = Box::pin(crate::agent::tool_ceiling::with_tool_ceiling(
+                        &parent_tool_ceiling,
+                        inner.execute_sync_with_admission(
+                            &agent_name_owned,
+                            &full_prompt,
+                            &args_inner,
+                            DelegateAdmission::Prevalidated,
+                        ),
                     )) => {
                         match result {
                             Ok(tool_result) => {
@@ -1872,6 +1881,11 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        // Snapshot the delegating turn's capability ceiling once, in the parent
+        // task, so each spawned parallel child can re-establish it (task-locals
+        // do not cross `spawn`). Without this a parallel child rebuilds policy
+        // from static configuration and regains a tool the image turn removed.
+        let parent_tool_ceiling = crate::agent::tool_ceiling::current_tool_ceiling();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1898,6 +1912,7 @@ impl DelegateTool {
             let runtime_profiles = Arc::clone(&self.runtime_profiles);
             let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
+            let tool_ceiling = parent_tool_ceiling.clone();
             let root_config = self.root_config.clone();
             // Carried, not dropped: each fan-out task rebuilds a DelegateTool
             // that will construct its own nested registries.
@@ -1934,8 +1949,11 @@ impl DelegateTool {
                     let result = scope_delegate_session_key(session_key, async move {
                         crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
                             .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
-                                    .await
+                                crate::agent::tool_ceiling::with_tool_ceiling(
+                                    &tool_ceiling,
+                                    Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)),
+                                )
+                                .await
                             })
                             .await
                     })
@@ -9805,6 +9823,246 @@ command = "echo hi"
             !result.output.contains("forbidden_tool_seen"),
             "the turn ceiling should have kept shell out of the delegated child, but got: {}",
             result.output
+        );
+    }
+
+    /// A tool that counts its own executions, so a regression can prove a
+    /// forbidden tool is never actually *run* by a child — not merely absent
+    /// from a tool list.
+    struct CeilingProbeTool {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    zeroclaw_api::tool_attribution!(
+        CeilingProbeTool,
+        ::zeroclaw_api::attribution::ToolKind::Plugin
+    );
+    #[async_trait]
+    impl Tool for CeilingProbeTool {
+        fn name(&self) -> &str {
+            "ceiling_probe"
+        }
+        fn description(&self) -> &str {
+            "ceiling_probe"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "probe ran".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// A scripted OpenAI-compatible endpoint whose child model asks for
+    /// `ceiling_probe` on its first turn and then finishes. Serving the final
+    /// response for every later request keeps the child from hanging whether or
+    /// not the tool was available to it.
+    async fn start_probe_tool_chat_server() -> LocalChatServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+
+        let task = zeroclaw_spawn::spawn!(async move {
+            let mut first = true;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let _request = read_http_request(&mut socket).await;
+                let response = if first {
+                    first = false;
+                    chat_completion_tool_call("ceiling_probe", "call_probe", serde_json::json!({}))
+                } else {
+                    serde_json::json!({
+                        "choices": [{ "message": { "content": "probe workflow done" } }]
+                    })
+                };
+                write_json_response(&mut socket, response).await;
+            }
+        });
+
+        LocalChatServer { uri, _task: task }
+    }
+
+    /// A real `DelegateTool` wired to `server_uri`, whose `target` agent runs an
+    /// agentic loop with `ceiling_probe` in its policy and registry. The only
+    /// thing that can keep the probe out of a child is a propagated turn
+    /// ceiling, so a zero execution count isolates exactly that.
+    fn probe_delegate_tool(
+        server_uri: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (DelegateTool, TempDir, PathBuf) {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        let model_provider_config = ModelProviderConfig {
+            uri: Some(server_uri),
+            model: Some("probe-model".to_string()),
+            api_key: Some("probe-key".to_string()),
+            timeout_secs: Some(2),
+            ..ModelProviderConfig::default()
+        };
+        let mut root_config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        root_config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: model_provider_config.clone(),
+            },
+        );
+        root_config.risk_profiles.insert(
+            "agentic_test".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec!["ceiling_probe".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        root_config.runtime_profiles.insert(
+            "agentic_test".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 5,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        let agent_config = AliasedAgentConfig {
+            model_provider: "custom.local".into(),
+            risk_profile: "agentic_test".into(),
+            runtime_profile: "agentic_test".into(),
+            ..AliasedAgentConfig::default()
+        };
+        root_config
+            .agents
+            .insert("caller".to_string(), agent_config.clone());
+        root_config
+            .agents
+            .insert("target".to_string(), agent_config);
+        let root_config = Arc::new(root_config);
+        let caller_security =
+            Arc::new(SecurityPolicy::for_agent(&root_config, "caller").expect("caller policy"));
+        let mut providers_models: HashMap<String, HashMap<String, ModelProviderConfig>> =
+            HashMap::new();
+        providers_models
+            .entry("custom".to_string())
+            .or_default()
+            .insert("local".to_string(), model_provider_config);
+
+        let parent_tools: Vec<Arc<dyn Tool>> = vec![Arc::new(CeilingProbeTool { calls })];
+        let tool = DelegateTool::new(
+            root_config.agents.clone(),
+            None,
+            Arc::clone(&caller_security),
+        )
+        .with_root_config(Arc::clone(&root_config))
+        .with_workspace_dir(workspace_dir.clone())
+        .with_parent_tools(Arc::new(RwLock::new(parent_tools)))
+        .with_providers_models(providers_models)
+        .with_risk_profiles(root_config.risk_profiles.clone())
+        .with_runtime_profiles(root_config.runtime_profiles.clone())
+        .with_caller_alias("caller");
+
+        (tool, tmp, workspace_dir)
+    }
+
+    /// Run a background delegation under `ceiling` and return how many times the
+    /// child actually executed `ceiling_probe`.
+    async fn background_probe_calls(ceiling: &[String]) -> usize {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = start_probe_tool_chat_server().await;
+        let (tool, _tmp, workspace_dir) =
+            probe_delegate_tool(server.uri.clone(), Arc::clone(&calls));
+
+        let result = crate::agent::tool_ceiling::with_tool_ceiling(
+            ceiling,
+            Box::pin(tool.execute(json!({
+                "agent": "target",
+                "prompt": "call the probe",
+                "background": true
+            }))),
+        )
+        .await
+        .unwrap();
+
+        let task_id = result
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background execute returns a task id")
+            .trim_start_matches("task_id: ")
+            .trim();
+        let _ = wait_for_terminal_background_result(&workspace_dir, task_id).await;
+        drop(server);
+        calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Run a parallel delegation under `ceiling` and return how many times the
+    /// child actually executed `ceiling_probe`.
+    async fn parallel_probe_calls(ceiling: &[String]) -> usize {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server = start_probe_tool_chat_server().await;
+        let (tool, _tmp, _workspace_dir) =
+            probe_delegate_tool(server.uri.clone(), Arc::clone(&calls));
+
+        let _ = crate::agent::tool_ceiling::with_tool_ceiling(
+            ceiling,
+            Box::pin(tool.execute(json!({
+                "parallel": ["target"],
+                "prompt": "call the probe"
+            }))),
+        )
+        .await
+        .unwrap();
+
+        drop(server);
+        calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// `delegate` with `background: true` starts the child in a fresh tokio
+    /// task, which does not inherit the turn's `TURN_TOOL_CEILING` task-local.
+    /// The background path must capture the ceiling before spawning and
+    /// re-establish it in the child, or a model can regain a blocked tool by
+    /// asking a background sub-agent to run it.
+    #[tokio::test]
+    async fn background_delegate_child_cannot_call_a_tool_the_turn_removed() {
+        // Control: with no ceiling the scripted child really does execute the
+        // probe, so the restricted assertion below cannot pass vacuously.
+        assert_eq!(
+            background_probe_calls(&[]).await,
+            1,
+            "unrestricted background child must actually execute the probe"
+        );
+        // The turn removed `ceiling_probe`, the shape a skill's
+        // `blocked_tools_with_image` produces on an image turn.
+        assert_eq!(
+            background_probe_calls(&["ceiling_probe".to_string()]).await,
+            0,
+            "a background child must not regain a tool the image turn removed"
+        );
+    }
+
+    /// The same escape through `delegate`'s `parallel` fan-out, which likewise
+    /// spawns each child in its own task.
+    #[tokio::test]
+    async fn parallel_delegate_child_cannot_call_a_tool_the_turn_removed() {
+        assert_eq!(
+            parallel_probe_calls(&[]).await,
+            1,
+            "unrestricted parallel child must actually execute the probe"
+        );
+        assert_eq!(
+            parallel_probe_calls(&["ceiling_probe".to_string()]).await,
+            0,
+            "a parallel child must not regain a tool the image turn removed"
         );
     }
 
