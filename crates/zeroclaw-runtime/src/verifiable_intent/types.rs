@@ -1,11 +1,12 @@
 //! Core data models for the Verifiable Intent credential chain.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 
 // ── JWK / Key material ───────────────────────────────────────────────
 
 /// A JSON Web Key (EC P-256) used for signing and key confirmation.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Jwk {
     pub kty: String,
     pub crv: String,
@@ -14,8 +15,21 @@ pub struct Jwk {
     /// Base64url-encoded y coordinate.
     pub y: String,
     /// Base64url-encoded private key (only present for signing keys, never serialized to verifiers).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing)]
     pub d: Option<String>,
+}
+
+impl fmt::Debug for Jwk {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let private_scalar = self.d.as_ref().map(|_| "[REDACTED]");
+        f.debug_struct("Jwk")
+            .field("kty", &self.kty)
+            .field("crv", &self.crv)
+            .field("x", &self.x)
+            .field("y", &self.y)
+            .field("d", &private_scalar)
+            .finish()
+    }
 }
 
 /// Confirmation claim (`cnf`) binding a credential to a public key.
@@ -285,6 +299,29 @@ pub struct CredentialChain {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jwk_private_scalar_is_not_serialized_or_debugged() {
+        let secret = "private-scalar-sentinel";
+        let jwk: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC",
+            "crv": "P-256",
+            "x": "x-coordinate",
+            "y": "y-coordinate",
+            "d": secret,
+        }))
+        .unwrap();
+
+        assert_eq!(jwk.d.as_deref(), Some(secret));
+
+        let serialized = serde_json::to_string(&jwk).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(!serialized.contains("\"d\""));
+
+        let debug = format!("{jwk:?}");
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("[REDACTED]"));
+    }
 
     #[test]
     fn entity_matches_by_id() {

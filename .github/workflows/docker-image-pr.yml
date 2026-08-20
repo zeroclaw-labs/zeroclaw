@@ -16,6 +16,7 @@ on:
       - .github/workflows/docker-image-pr.yml
       - .github/workflows/release-stable-manual.yml
       - scripts/ci/prepare_docker_context.sh
+      - scripts/ci/smoke_docker_compose.sh
 
 concurrency:
   group: docker-image-pr-${{ github.event.pull_request.number }}
@@ -49,16 +50,16 @@ jobs:
           if [ -n "$changed_files" ] && \
              ! printf '%s\n' "$changed_files" | grep -Eqv '^(docker-compose\.yml|docker-compose\.alpine\.yml)$'; then
             prebuilt_images=false
-            source_matrix='{"include":[{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64"}]}'
+            source_matrix='{"include":[{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64","gateway_smoke":true}]}'
           elif [ -n "$changed_files" ] && \
                ! printf '%s\n' "$changed_files" | grep -Eqv '^Containerfile$'; then
             prebuilt_images=false
-            source_matrix='{"include":[{"dockerfile":"Containerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-all-features:build","cache-scope":"containerfile-source-all-features-amd64"}]}'
+            source_matrix='{"include":[{"dockerfile":"Containerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-all-features:build","cache-scope":"containerfile-source-all-features-amd64","gateway_smoke":false}]}'
           else
             prebuilt_images=true
-            source_matrix='{"include":[{"dockerfile":"Dockerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-amd64"},{"dockerfile":"Dockerfile","platform":"linux/arm64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-arm64"},{"dockerfile":"Dockerfile.debian","platform":"linux/amd64","tag":"zeroclaw-pr-source-debian:build","cache-scope":"docker-source-debian"},{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64"},{"dockerfile":"Dockerfile.alpine","platform":"linux/arm64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-arm64"}]}'
+            source_matrix='{"include":[{"dockerfile":"Dockerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-amd64","gateway_smoke":true},{"dockerfile":"Dockerfile","platform":"linux/arm64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-arm64","gateway_smoke":false},{"dockerfile":"Dockerfile.debian","platform":"linux/amd64","tag":"zeroclaw-pr-source-debian:build","cache-scope":"docker-source-debian","gateway_smoke":false},{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64","gateway_smoke":false},{"dockerfile":"Dockerfile.alpine","platform":"linux/arm64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-arm64","gateway_smoke":false}]}'
             if [ "$containerfile_required" = true ]; then
-              source_matrix=$(jq -c '.include += [{"dockerfile":"Containerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-all-features:build","cache-scope":"containerfile-source-all-features-amd64"}]' <<< "$source_matrix")
+              source_matrix=$(jq -c '.include += [{"dockerfile":"Containerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-all-features:build","cache-scope":"containerfile-source-all-features-amd64","gateway_smoke":false}]' <<< "$source_matrix")
             fi
           fi
           echo "prebuilt_images=$prebuilt_images" >> "$GITHUB_OUTPUT"
@@ -147,11 +148,17 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
-          load: ${{ matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' }}
+          load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64') }}
           platforms: ${{ matrix.platform }}
           tags: ${{ matrix.tag }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max,ignore-error=true
+
+      - name: Smoke test Compose published gateway port
+        if: matrix.gateway_smoke
+        env:
+          ZEROCLAW_COMPOSE_SMOKE_IMAGE: ${{ matrix.tag }}
+        run: bash scripts/ci/smoke_docker_compose.sh
 
       - name: Smoke Alpine binaries
         if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64'

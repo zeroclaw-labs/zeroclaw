@@ -42,10 +42,15 @@ pub use outcome::{
     is_tool_loop_cancelled,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
+pub use outcome::{
+    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
+    terminal_completion_error_message,
+};
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
-    interpret_chat_response, resolve_display_text, unforwarded_narration,
+    interpret_chat_response, record_accepted_chat_response, resolve_display_text,
+    unforwarded_narration,
 };
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
@@ -86,6 +91,91 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+/// Complete system-prompt variants for the two tool transports supported by a
+/// turn. The caller owns construction; the loop only selects the variant after
+/// a before-LLM hook has finalized the model that will receive the request.
+#[derive(Clone)]
+pub(crate) struct ToolProtocolPrompts {
+    text_tools_section: String,
+}
+
+impl ToolProtocolPrompts {
+    pub(crate) fn new(_native: String, text: String) -> Self {
+        let text_tools_section = tool_section_bounds(&text)
+            .map(|bounds| text[bounds].to_string())
+            .unwrap_or_default();
+        Self { text_tools_section }
+    }
+}
+
+tokio::task_local! {
+    static TOOL_PROTOCOL_PROMPTS: Arc<ToolProtocolPrompts>;
+}
+
+/// Scope complete prompt variants around an Agent turn. This remains transient
+/// request state: durable history keeps the caller-owned canonical prompt.
+pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
+    prompts: Arc<ToolProtocolPrompts>,
+    future: F,
+) -> F::Output {
+    TOOL_PROTOCOL_PROMPTS.scope(prompts, future).await
+}
+
+fn refresh_scoped_tool_protocol_prompt(
+    history: &mut [ChatMessage],
+    request_messages: &mut [ChatMessage],
+    use_native_tools: bool,
+) {
+    let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+        if let Some(system) = history.iter_mut().find(|message| message.role == "system") {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+        if let Some(system) = request_messages
+            .iter_mut()
+            .find(|message| message.role == "system")
+        {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+    });
+}
+
+fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
+    let start = prompt.find("## Tools\n")?;
+    let following = &prompt[start..];
+    let end = following
+        .find("\n\n## Safety")
+        .map_or(prompt.len(), |offset| start + offset);
+    Some(start..end)
+}
+
+fn replace_tool_protocol_section(
+    prompt: &mut String,
+    text_tools_section: &str,
+    use_native_tools: bool,
+) {
+    if let Some(bounds) = tool_section_bounds(prompt) {
+        if use_native_tools {
+            prompt.replace_range(bounds, "");
+        } else {
+            prompt.replace_range(bounds, text_tools_section);
+        }
+        return;
+    }
+
+    if !use_native_tools && !text_tools_section.is_empty() {
+        let insertion = prompt.find("## Safety").unwrap_or(prompt.len());
+        prompt.insert_str(insertion, &format!("{text_tools_section}\n\n"));
+    }
+}
+
 fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool {
     budget
         .fetch_update(
@@ -103,13 +193,18 @@ pub struct ToolLoop<'a> {
     /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
     pub exec: ResolvedAgentExecution<'a>,
     pub history: &'a mut Vec<ChatMessage>,
-    /// Persisted trim-breadcrumb provenance for this agent's live history. A
-    /// later turn seeds `has_leading_breadcrumb` from this so it treats a
-    /// synthetic breadcrumb already leading the history as such — not as the
-    /// oldest real turn — and the loop writes provenance back through this handle
-    /// when it inserts one. `None` on paths with no persisted agent flag (tests
-    /// and nested/one-shot sub-turns); those behave as "no leading breadcrumb".
-    pub history_has_trim_breadcrumb: Option<&'a mut bool>,
+    /// Whether `history` already begins with a synthetic trim breadcrumb, so
+    /// this turn treats it as such rather than as the oldest real turn.
+    ///
+    /// This is a seed describing the vector passed in `history`, and nothing is
+    /// written back. The caller's own flag describes the caller's own history:
+    /// `Agent::turn` hands the loop a *copy* of provider-facing history and
+    /// replays only the new messages afterwards, so a breadcrumb the loop
+    /// inserts never reaches canonical `Agent::history`. Writing provenance back
+    /// would leave the agent claiming a breadcrumb its history does not have,
+    /// and the next turn would then skip a real user turn as though it were
+    /// synthetic. Paths whose history cannot carry one pass `false`.
+    pub history_has_trim_breadcrumb: bool,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -306,7 +401,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
         exec,
         history: raw_history,
-        history_has_trim_breadcrumb: mut persisted_breadcrumb,
+        history_has_trim_breadcrumb: seeded_breadcrumb,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -495,8 +590,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // turn (already leading this turn's restored history) is recognised at
     // iteration zero instead of being miscounted as the oldest real turn, trimmed,
     // and reinserted with no progress. Any change made below is written back
-    // through `persisted_breadcrumb` so the next turn seeds correctly.
-    let mut has_leading_breadcrumb = persisted_breadcrumb.as_deref().copied().unwrap_or(false);
+    // provenance stays attached to `turn_state.history` for the life of this
+    // turn and is never written back to the caller's flag.
+    let mut has_leading_breadcrumb = seeded_breadcrumb;
 
     for iteration in 0..max_iterations {
         for steering_message in drain_steering_messages(&mut steering) {
@@ -579,9 +675,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 // inserting because a real user message already matched the
                 // breadcrumb text must not mark that message as synthetic.
                 has_leading_breadcrumb |= inserted_breadcrumb;
-                if let Some(flag) = persisted_breadcrumb.as_deref_mut() {
-                    *flag = has_leading_breadcrumb;
-                }
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                         target: "zeroclaw_log_internal_scope",
@@ -663,6 +756,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
+            model,
             tools_registry,
             excluded_tools,
             activated_tools,
@@ -690,15 +784,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
-        iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
-        let IterationToolSpecs {
-            ref tool_specs,
-            use_native_tools,
-            ..
-        } = iteration_tool_specs;
-
-        refresh_prompt_anchor(turn_state.history, use_native_tools);
-
         // Enforce the context budget against the EFFECTIVE prepared payload on
         // every dispatch, not just the first iteration. `[IMAGE:...]` markers
         // expand to un-downscaled base64 only during preparation, so a tool
@@ -770,9 +855,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     // mark that message as synthetic.
                     has_leading_breadcrumb |=
                         crate::agent::history_trim::insert_breadcrumb_deduped(turn_state.history);
-                    if let Some(flag) = persisted_breadcrumb.as_deref_mut() {
-                        *flag = has_leading_breadcrumb;
-                    }
                     if let Some(tx) = event_tx.as_ref() {
                         let _ = tx
                             .send(TurnEvent::HistoryTrimmed {
@@ -824,6 +906,52 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
             prepared
         };
+        let mut provider_request_messages = prepared_messages.messages;
+        let mut hook_selected_model = None;
+
+        if let Some(hooks) = ctx.hooks.filter(|hooks| !hooks.is_empty()) {
+            let mut candidate_model = active_model.to_string();
+            match hooks
+                .run_before_llm_call(&mut provider_request_messages, &mut candidate_model)
+                .await
+            {
+                crate::hooks::HookResult::Continue(()) => {
+                    hook_selected_model = Some(candidate_model);
+                }
+                crate::hooks::HookResult::Cancel(reason) => {
+                    anyhow::bail!("LLM call cancelled by hook: {reason}");
+                }
+            }
+        }
+        let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        // Only direct Agent turns scope the complete prompt variants. Preserve
+        // the channel loop's existing hook/protocol behavior rather than
+        // silently widening this delegation-focused repair into channel prompt
+        // reconciliation.
+        let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
+        let protocol_model = if uses_scoped_tool_protocol {
+            provider_request_model
+        } else {
+            active_model
+        };
+        iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
+        let IterationToolSpecs {
+            ref tool_specs,
+            use_native_tools,
+            ..
+        } = iteration_tool_specs;
+
+        // For scoped direct Agent turns, the hook can choose a different routed
+        // model. Every protocol-bearing surface follows that dispatched model.
+        // Unscoped channel turns intentionally retain their pre-existing
+        // protocol behavior; channel prompt reconciliation is separate work.
+        refresh_prompt_anchor(turn_state.history, use_native_tools);
+        refresh_prompt_anchor(&mut provider_request_messages, use_native_tools);
+        refresh_scoped_tool_protocol_prompt(
+            turn_state.history,
+            &mut provider_request_messages,
+            use_native_tools,
+        );
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
@@ -832,12 +960,26 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // called.
         enforce_tool_loop_budget()?;
 
+        if strict_tool_parsing
+            && !tool_specs.is_empty()
+            && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
+        {
+            return Err(zeroclaw_providers::ProviderCapabilityError {
+                model_provider: active_model_provider_name.to_string(),
+                capability: "tool_protocol".to_string(),
+                message: crate::i18n::get_required_cli_string(
+                    "turn-tool-protocol-strict-mixed-error",
+                ),
+            }
+            .into());
+        }
+
         let llm_started_at = announce_llm_request(
             &ctx,
-            turn_state.history,
+            &provider_request_messages,
             active_model_provider,
             active_model_provider_name,
-            active_model,
+            provider_request_model,
             iteration,
         )
         .await;
@@ -850,8 +992,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             None
         };
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
-        let base_provider_supports_native_tools = model_provider.supports_native_tools();
-        let active_provider_supports_native_tools = active_model_provider.supports_native_tools();
+        let base_provider_supports_native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling;
+        let active_provider_supports_native_tools = active_model_provider
+            .capabilities_for_model(provider_request_model)
+            .native_tool_calling;
         let active_provider_supports_streaming = active_model_provider.supports_streaming();
         let active_provider_supports_streaming_tool_events =
             active_model_provider.supports_streaming_tool_events();
@@ -881,19 +1027,63 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let ProviderCallOutcome {
             chat_result,
+            mut rejected_attempts,
+            mut provisional_stream_attempt,
+            accepted_route,
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
         } = call_provider(
             &ctx,
             active_model_provider,
-            active_model,
-            &prepared_messages.messages,
+            provider_request_model,
+            &provider_request_messages,
             request_tools,
             should_consume_provider_stream,
             iteration,
         )
         .await?;
+
+        let has_accounted_rejections = !rejected_attempts.is_empty();
+        for rejected in &rejected_attempts {
+            crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                rejected.provider_ref(),
+                rejected.model(),
+                rejected.usage(),
+            );
+        }
+
+        // Reliable reports its actually served candidate; direct providers
+        // intentionally retain the requested route as the accounting fallback.
+        let (served_provider, served_model) = accepted_route
+            .as_ref()
+            .map(|route| (route.provider_ref(), route.model()))
+            .unwrap_or((ctx.provider_name, provider_request_model));
+
+        // Reliable providers classify this before retries and fallback. Keep
+        // the turn-level guard for direct/unwrapped providers: a transport
+        // success with no final text and no tool calls cannot complete a turn.
+        // This runs before response-success telemetry and history mutation.
+        let chat_result = chat_result.and_then(|response| {
+            if response.is_semantically_empty_terminal() {
+                if let Some(rejected_stream) = provisional_stream_attempt.take()
+                    && let Some(usage) = response.usage.clone()
+                {
+                    rejected_attempts.push(rejected_stream.with_usage(usage));
+                }
+                if let Some(usage) = response.usage.as_ref() {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        served_provider,
+                        served_model,
+                        usage,
+                    );
+                }
+                return Err(anyhow::Error::new(
+                    zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+                ));
+            }
+            Ok(response)
+        });
 
         let (
             response_text,
@@ -905,15 +1095,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             protocol_suppressed,
             response_streamed_live,
             reported_input_tokens,
+            response_usage,
         ) = match chat_result {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
                     &ctx,
+                    served_provider,
+                    served_model,
                     resp,
-                    &prepared_messages.messages,
+                    &provider_request_messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
-                    llm_started_at,
                     iteration,
                     knobs.detect_protocol_without_tools,
                 )
@@ -928,10 +1120,22 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
                     interpreted.input_tokens,
+                    interpreted.usage,
                 )
             }
             Err(e) => {
-                record_llm_failure(&ctx, llm_started_at, iteration, &e);
+                if !has_accounted_rejections
+                    && let Some(rejected) = e.chain().find_map(|cause| {
+                        cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
+                    })
+                {
+                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                        ctx.provider_name,
+                        ctx.model,
+                        &rejected.usage,
+                    );
+                }
+                record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
                     &e,
@@ -982,9 +1186,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             !native_tool_calls.is_empty(),
         );
 
-        // Native provider tool_calls are converted into parsed `tool_calls`
-        // above; if this branch is reached there is no valid native call to run.
-        if tool_calls.is_empty() && parse_issue_detected {
+        // Any parser or stream-protocol guard finding rejects the transport
+        // candidate, including a response that also carries native tool calls.
+        if parse_issue_detected {
+            if let Some(rejected_stream) = provisional_stream_attempt.take()
+                && let Some(usage) = response_usage.clone()
+            {
+                rejected_attempts.push(rejected_stream.with_usage(usage));
+            }
+            if let Some(usage) = response_usage.as_ref() {
+                crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                    served_provider,
+                    served_model,
+                    usage,
+                );
+            }
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1041,6 +1257,25 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Ok(accumulated_display_text);
         }
 
+        record_accepted_chat_response(
+            &ctx,
+            served_provider,
+            served_model,
+            &response_text,
+            &native_tool_calls,
+            tool_calls.len(),
+            response_usage.as_ref(),
+            &provider_request_messages,
+            llm_started_at,
+            iteration,
+        )
+        .await;
+
+        // A provider transport success is only a candidate. Commit (or clear)
+        // presentation state after parsing has accepted the response, so a
+        // malformed fallback completion cannot leak a stale recovery notice.
+        zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
+
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
             let llm_secs = llm_started_at.elapsed().as_secs();
@@ -1090,7 +1325,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let msg = ChatMessage::assistant(response_text.clone());
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
-                let inserted = enforce_reported_budget(
+                // The turn ends here, so nothing reads the provenance again;
+                // the trim itself still has to run so `turn_state.history` is
+                // left within budget for whatever reuses it.
+                enforce_reported_budget(
                     turn_state.history,
                     reported as usize,
                     context_token_budget,
@@ -1098,12 +1336,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     observer,
                 )
                 .await;
-                if inserted {
-                    has_leading_breadcrumb = true;
-                    if let Some(flag) = persisted_breadcrumb.as_deref_mut() {
-                        *flag = true;
-                    }
-                }
             }
             return Ok(accumulated_display_text);
         }
@@ -1376,9 +1608,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .await;
             if inserted {
                 has_leading_breadcrumb = true;
-                if let Some(flag) = persisted_breadcrumb.as_deref_mut() {
-                    *flag = true;
-                }
             }
         }
     }
@@ -1556,6 +1785,10 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's deferred+pinned MCP prompt section (single-block
     /// shape, same as `run` / `process_message`).
     mcp_prompt_section: String,
+    /// The shell this step's runtime adapter will spawn, carried so the step's
+    /// system prompt reports the same dialect the step will execute under.
+    /// `None` for a shell-less runtime.
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -1640,6 +1873,8 @@ pub(crate) async fn assemble_owned_execution(
         None,
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
+    // Capture before `runtime` is moved into `ScopedAssembly` below.
+    let shell_profile = runtime.shell_profile();
     // The same gated seam run(), process_message, and independent delegation use:
     // step 2 filters with THIS agent's SecurityPolicy, `connect_mcp` grants only
     // this agent's MCP bundles, and its skills register as tools. Peripherals stay
@@ -1713,6 +1948,9 @@ pub(crate) async fn assemble_owned_execution(
         skills,
         mcp_tool_names,
         mcp_prompt_section,
+        // Captured from the same adapter this step's tools were built with, so
+        // the prompt names the shell the step will actually run under.
+        shell_profile,
     })
 }
 
@@ -1759,6 +1997,7 @@ fn build_owned_step_system_prompt(
         true,
         config.channels.show_tool_calls,
         None,
+        owned.shell_profile.as_ref(),
     )
 }
 
@@ -2062,7 +2301,7 @@ async fn drive_live_sop_actions(
                             let step_result = crate::sop::executor::scope_step_call_sink(
                                 step_call_sink.clone(),
                                 Box::pin(run_tool_call_loop(ToolLoop {
-                                    history_has_trim_breadcrumb: None,
+                                    history_has_trim_breadcrumb: false,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,
@@ -2464,6 +2703,23 @@ mod reported_budget_tests {
         enforce_reported_budget(&mut history, estimated, estimated * 4, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "within-budget history is untouched");
+    }
+
+    #[tokio::test]
+    async fn recovered_rejected_usage_does_not_trigger_context_trim() {
+        let mut history = big_history();
+        let before: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+
+        // The rejected attempt's 80 input tokens remain billed separately; the
+        // accepted response reports 80 input tokens, which is within this
+        // model's 100-token context budget and must not trim history.
+        enforce_reported_budget(&mut history, 80, 100, None, &NoopObserver).await;
+
+        let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
+        assert_eq!(
+            after, before,
+            "accepted context usage must not include rejected usage"
+        );
     }
 
     #[tokio::test]
@@ -3048,6 +3304,7 @@ mod sop_step_reassembly_tests {
             skills: Vec::new(),
             mcp_tool_names,
             mcp_prompt_section: String::new(),
+            shell_profile: None,
         }
     }
 
@@ -3781,6 +4038,7 @@ mod sop_step_reassembly_tests {
                 skills: Vec::new(),
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),
+                shell_profile: None,
             },
         );
 

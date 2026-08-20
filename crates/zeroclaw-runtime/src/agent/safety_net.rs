@@ -460,7 +460,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let (dtx, mut drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-        history_has_trim_breadcrumb: None,
+        history_has_trim_breadcrumb: false,
         parent_agent_alias: None,
         sop_reassembly: None,
         exec: crate::agent::loop_::ResolvedAgentExecution {
@@ -852,7 +852,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         Some("thread-1".into()),
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
-                history_has_trim_breadcrumb: None,
+                history_has_trim_breadcrumb: false,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution {
@@ -1669,9 +1669,17 @@ async fn safety_net_failed_graceful_summary_does_not_persist_prompt() {
         .await
         .expect_err("the summary call is scripted to fail");
     assert!(
-        err.error.to_string().contains("maximum tool iterations"),
+        err.error
+            .to_string()
+            .contains("Agent exceeded maximum tool iterations (2)"),
         "unexpected error: {}",
         err.error
+    );
+    assert!(
+        err.error
+            .chain()
+            .any(|cause| cause.to_string() == "provider 500: scripted mid-turn failure"),
+        "the original summary failure must remain available for diagnostics"
     );
     assert!(
         !err.new_messages.iter().any(|m| matches!(

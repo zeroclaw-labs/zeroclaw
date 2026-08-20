@@ -2,9 +2,8 @@
 // It speaks JSON-RPC to whatever ZeroClaw daemon is at the configured
 // address; the daemon owns attribution, the TUI owns its session id.
 // Bare `tokio::spawn` is the right primitive here — the workspace-wide
-// `zeroclaw_spawn::spawn!` rule is daemon-path only (see
-// `clippy.toml`'s commentary; this matches the `robot-kit/src/safety.rs`
-// exemption pattern).
+// `zeroclaw_spawn::spawn!` rule is daemon-path only (see `clippy.toml`'s
+// commentary, which records this crate as the sole exemption).
 #![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
@@ -750,6 +749,7 @@ fn reconcile_spawned_daemon_identity(
     Ok(false)
 }
 
+#[cfg(unix)]
 fn cleanup_spawned_daemon_after_signal(daemon: &mut SpawnedDaemon) -> anyhow::Result<()> {
     daemon
         .terminate_and_wait()
@@ -1018,6 +1018,7 @@ mod connection_tests {
         assert!(daemon.try_wait().expect("poll helper").is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawned_daemon_startup_signal_cleanup_terminates_and_reaps_child() {
         let mut daemon =

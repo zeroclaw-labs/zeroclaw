@@ -34,7 +34,7 @@ impl XmlToolDispatcher {
     fn parse_xml_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         // Strip `<think>...</think>` blocks before parsing tool calls.
         // Qwen and other reasoning models may embed chain-of-thought inline.
-        let cleaned = Self::strip_think_tags(response);
+        let cleaned = zeroclaw_tool_call_parser::strip_think_tags(response);
         let mut text_parts = Vec::new();
         let mut calls = Vec::new();
         let mut remaining = cleaned.as_str();
@@ -93,26 +93,6 @@ impl XmlToolDispatcher {
         }
 
         (text_parts.join("\n"), calls)
-    }
-
-    /// Remove `<think>...</think>` blocks from model output.
-    fn strip_think_tags(s: &str) -> String {
-        let mut result = String::with_capacity(s.len());
-        let mut rest = s;
-        loop {
-            if let Some(start) = rest.find("<think>") {
-                result.push_str(&rest[..start]);
-                if let Some(end) = rest[start..].find("</think>") {
-                    rest = &rest[start + end + "</think>".len()..];
-                } else {
-                    break;
-                }
-            } else {
-                result.push_str(rest);
-                break;
-            }
-        }
-        result
     }
 
     pub fn tool_specs(tools: &[Box<dyn Tool>]) -> Vec<ToolSpec> {

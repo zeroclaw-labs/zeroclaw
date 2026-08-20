@@ -34,6 +34,7 @@ pub struct OpenAiCompatibleModelProvider {
     pub alias: String,
     pub name: String,
     pub base_url: String,
+    canonical_base_url: Option<&'static str>,
     pub credential: Option<String>,
     auth_service: Option<AuthService>,
     auth_model_provider: Option<String>,
@@ -172,6 +173,9 @@ fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
     let (id, secret) = credential
         .split_once('.')
         .ok_or_else(|| "Zhipu API key must be in 'id.secret' format".to_string())?;
+    if id.is_empty() || secret.is_empty() {
+        return Err("Zhipu API key must contain non-empty id and secret components".to_string());
+    }
 
     #[allow(clippy::cast_possible_truncation)] // millis won't exceed u64 until year 584 million
     let now_ms = std::time::SystemTime::now()
@@ -182,7 +186,12 @@ fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
 
     // Header: {"alg":"HS256","typ":"JWT","sign_type":"SIGN"}
     let header_b64 = base64url_no_pad(br#"{"alg":"HS256","typ":"JWT","sign_type":"SIGN"}"#);
-    let payload = format!(r#"{{"api_key":"{id}","exp":{exp_ms},"timestamp":{now_ms}}}"#);
+    let payload = serde_json::json!({
+        "api_key": id,
+        "exp": exp_ms,
+        "timestamp": now_ms,
+    })
+    .to_string();
     let payload_b64 = base64url_no_pad(payload.as_bytes());
 
     let signing_input = format!("{header_b64}.{payload_b64}");
@@ -216,9 +225,26 @@ fn apply_auth_to_request(
         AuthStyle::Custom(header) => req.header(header, credential),
         AuthStyle::ZhipuJwt => match zhipu_jwt_bearer(credential) {
             Ok(val) => req.header("Authorization", val),
-            Err(_) => req.header("Authorization", format!("Bearer {credential}")),
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "zhipu_jwt_generation_failed",
+                            "reason": error,
+                        })),
+                    "Zhipu JWT generation failed; omitting authorization header"
+                );
+                req
+            }
         },
     }
+}
+
+fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
+    let sanitized = super::sanitize_api_error(body);
+    StreamError::ModelProvider(format!("{status}: {sanitized}"))
 }
 
 #[derive(Deserialize)]
@@ -300,6 +326,7 @@ pub struct OpenAiCompatibleBuilder {
     alias: String,
     name: Option<String>,
     base_url: Option<String>,
+    canonical_base_url: Option<&'static str>,
     credential: Option<String>,
     auth_style: Option<AuthStyle>,
     supports_vision: bool,
@@ -348,6 +375,11 @@ impl OpenAiCompatibleBuilder {
     /// supplied them. Required.
     pub fn base_url(mut self, base_url: &str) -> Self {
         self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    pub(crate) fn canonical_base_url(mut self, base_url: &'static str) -> Self {
+        self.canonical_base_url = Some(base_url);
         self
     }
 
@@ -561,6 +593,7 @@ impl OpenAiCompatibleBuilder {
             alias: self.alias,
             name,
             base_url,
+            canonical_base_url: self.canonical_base_url,
             credential: self.credential,
             auth_service: self.auth_service,
             auth_model_provider: self.auth_model_provider,
@@ -600,6 +633,7 @@ impl OpenAiCompatibleModelProvider {
             alias: alias.to_string(),
             name: None,
             base_url: None,
+            canonical_base_url: None,
             credential: None,
             auth_style: None,
             supports_vision: false,
@@ -2517,22 +2551,7 @@ impl OpenAiCompatibleModelProvider {
             .filter_map(|tc| {
                 let name = tc.function_name()?;
                 let arguments = tc.function_arguments().unwrap_or_else(|| "{}".to_string());
-                let normalized_arguments = if serde_json::from_str::<serde_json::Value>(&arguments)
-                    .is_ok()
-                {
-                    arguments
-                } else {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"function": name, "arguments": arguments})
-                            ),
-                        "Invalid JSON in native tool-call arguments, using empty object"
-                    );
-                    "{}".to_string()
-                };
+                let normalized_arguments = sanitize_tool_arguments(&name, &arguments);
                 Some(ProviderToolCall {
                     id: self.reserve_tool_call_id(tc.id, &mut used_tool_call_ids),
                     name,
@@ -2576,6 +2595,10 @@ impl OpenAiCompatibleModelProvider {
 
 #[async_trait]
 impl ModelProvider for OpenAiCompatibleModelProvider {
+    fn default_base_url(&self) -> Option<&str> {
+        self.canonical_base_url
+    }
+
     fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
         zeroclaw_api::model_provider::ProviderCapabilities {
             native_tool_calling: self.native_tool_calling,
@@ -3005,33 +3028,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             anyhow::Error::msg(format!("No response from {}", self.name))
         })?;
 
-        let text = choice.message.effective_content_optional();
-        let reasoning_content = choice.message.reasoning_content;
-        let mut used_tool_call_ids = std::collections::HashSet::new();
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|tc| {
-                let function = tc.function?;
-                let name = function.name?;
-                let arguments = function.arguments.unwrap_or_else(|| "{}".to_string());
-                Some(ProviderToolCall {
-                    id: self.reserve_tool_call_id(tc.id, &mut used_tool_call_ids),
-                    name,
-                    arguments,
-                    extra_content: tc.extra_content,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        Ok(ProviderChatResponse {
-            text,
-            tool_calls,
-            usage,
-            reasoning_content,
-        })
+        let mut result = self.parse_native_response(choice.message);
+        result.usage = usage;
+        Ok(result)
     }
 
     async fn chat(
@@ -3287,12 +3286,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(text) => text,
                     Err(_) => format!("HTTP error: {}", status),
                 };
-                let _ = tx
-                    .send(Err(StreamError::ModelProvider(format!(
-                        "{}: {}",
-                        status, error
-                    ))))
-                    .await;
+                let _ = tx.send(Err(streaming_api_error(status, &error))).await;
                 return;
             }
 
@@ -3436,12 +3430,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(e) => e,
                     Err(_) => format!("HTTP error: {}", status),
                 };
-                let _ = tx
-                    .send(Err(StreamError::ModelProvider(format!(
-                        "{}: {}",
-                        status, error
-                    ))))
-                    .await;
+                let _ = tx.send(Err(streaming_api_error(status, &error))).await;
                 return;
             }
 
@@ -3548,12 +3537,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                     Ok(e) => e,
                     Err(_) => format!("HTTP error: {}", status),
                 };
-                let _ = tx
-                    .send(Err(StreamError::ModelProvider(format!(
-                        "{}: {}",
-                        status, error
-                    ))))
-                    .await;
+                let _ = tx.send(Err(streaming_api_error(status, &error))).await;
                 return;
             }
 
@@ -3641,6 +3625,18 @@ mod tests {
         assert_eq!(sanitize_tool_arguments("f", r#"{"x":1}garbage"#), "{}");
         // Truncated (the observed failure case from the field)
         assert_eq!(sanitize_tool_arguments("f", ""), "{}");
+    }
+
+    #[test]
+    fn streaming_api_error_sanitizes_and_bounds_upstream_body() {
+        let secret = "sk-test-streaming-secret";
+        let body = format!(r#"{{"error":"{secret} {}"}}"#, "x".repeat(4_000));
+        let error = streaming_api_error(reqwest::StatusCode::UNAUTHORIZED, &body).to_string();
+
+        assert!(error.contains("401 Unauthorized"));
+        assert!(error.contains("[REDACTED]"));
+        assert!(!error.contains(secret));
+        assert!(error.chars().count() <= 550);
     }
 
     fn make_model_provider(
@@ -4626,6 +4622,8 @@ mod tests {
     fn zhipu_jwt_rejects_invalid_key_format() {
         assert!(zhipu_jwt_bearer("no-dot-here").is_err());
         assert!(zhipu_jwt_bearer("").is_err());
+        assert!(zhipu_jwt_bearer(".secret").is_err());
+        assert!(zhipu_jwt_bearer("id.").is_err());
     }
 
     #[test]
@@ -4637,6 +4635,24 @@ mod tests {
             .auth_style(AuthStyle::ZhipuJwt)
             .build();
         assert!(matches!(p.auth_header, AuthStyle::ZhipuJwt));
+    }
+
+    #[test]
+    fn invalid_zhipu_credential_is_not_sent_as_raw_bearer_token() {
+        let request = apply_auth_to_request(
+            reqwest::Client::new().get("https://example.com"),
+            &AuthStyle::ZhipuJwt,
+            Some("raw-secret-without-required-separator"),
+        )
+        .build()
+        .unwrap();
+
+        assert!(
+            request
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -4871,6 +4887,94 @@ mod tests {
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");
+    }
+
+    #[test]
+    fn parse_native_response_rejects_non_object_tool_arguments() {
+        let provider = make_model_provider("test", "https://example.com", None);
+        let message = ResponseMessage {
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: Some("call_123".to_string()),
+                kind: Some("function".to_string()),
+                function: Some(Function {
+                    name: Some("shell".to_string()),
+                    arguments: Some(r#"["not", "an", "object"]"#.to_string()),
+                }),
+                name: None,
+                arguments: None,
+                parameters: None,
+                extra_content: None,
+            }]),
+            reasoning_content: None,
+        };
+
+        let parsed = provider.parse_native_response(message);
+
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].arguments, "{}");
+    }
+
+    #[tokio::test]
+    async fn streaming_entry_points_sanitize_upstream_error_bodies() {
+        use axum::{Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+
+        let secret = "sk-streaming-boundary-secret";
+        let body = format!(r#"{{"error":"{secret} {}"}}"#, "x".repeat(4_000));
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let body = body.clone();
+                async move { (StatusCode::UNAUTHORIZED, body).into_response() }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let provider = make_model_provider("test", &format!("http://{addr}"), Some("key"));
+        let options = StreamOptions {
+            enabled: true,
+            count_tokens: false,
+        };
+
+        let mut event_stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &[ChatMessage::user("hi")],
+                tools: None,
+                thinking: None,
+            },
+            "test-model",
+            None,
+            options,
+        );
+        assert_sanitized_streaming_error(event_stream.next().await.unwrap().unwrap_err(), secret);
+
+        let mut system_stream =
+            provider.stream_chat_with_system(None, "hi", "test-model", None, options);
+        assert_sanitized_streaming_error(system_stream.next().await.unwrap().unwrap_err(), secret);
+
+        let mut history_stream = provider.stream_chat_with_history(
+            &[ChatMessage::user("hi")],
+            "test-model",
+            None,
+            options,
+        );
+        assert_sanitized_streaming_error(history_stream.next().await.unwrap().unwrap_err(), secret);
+
+        server.abort();
+    }
+
+    fn assert_sanitized_streaming_error(error: StreamError, secret: &str) {
+        let StreamError::ModelProvider(message) = error else {
+            panic!("expected model-provider error, got {error}");
+        };
+        assert!(message.contains("401 Unauthorized"));
+        assert!(message.contains("[REDACTED]"));
+        assert!(!message.contains(secret));
+        assert!(message.chars().count() <= 525);
     }
 
     #[test]
