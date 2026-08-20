@@ -167,9 +167,14 @@ explicitly address it.
 
 ### Reload behavior
 
-`allowed_groups` is resolved live from the shared config on each message.
-Changes take effect immediately without restart: there is no construction-time
-snapshot.
+`allowed_groups` is resolved live from the shared config on each message. The
+file-reload path runs on every poll cycle: if `config.toml` has changed on
+disk, the reloaded `Config` is written into the shared in-memory handle that
+the resolver closures read, so `allowed_groups` edits take effect on the next
+message without restart. The one exception is a `bind_telegram` CLI invocation
+from a separate terminal — that process changed the file, not the running
+daemon's memory; the daemon picks it up on its next poll, but a manual restart
+is always safe.
 
 ### Naming convention
 
@@ -276,7 +281,7 @@ running channel would read. For a valid alias it creates or updates
 | Successful `/bind <code>` in Telegram | Immediately; the channel updates the shared in-process config and saves it. |
 | `zeroclaw channel bind-telegram ...` with a detected running systemd, OpenRC, or launchd service | The CLI saves the config and restarts the managed service automatically. |
 | `bind-telegram` while `zeroclaw daemon` or `zeroclaw channel start` is running in another terminal | After you stop and restart that foreground process. The CLI process changed the file, not the other process's in-memory config. |
-| Direct `config.toml` edit or standalone `zeroclaw config set` change | After a daemon reload or process restart. Saving alone does not rebuild long-running listeners. |
+| Direct `config.toml` edit or standalone `zeroclaw config set` change | On the next poll cycle. The reload path detects the file change and writes the new config into the shared in-memory handle that resolver closures read, so `allowed_groups` and `peer_groups` take effect without restart. |
 | Restart with no matching peers | A new one-time pairing code is generated. |
 | Restart after a peer was saved | The peer remains authorized and startup pairing is not activated. |
 
