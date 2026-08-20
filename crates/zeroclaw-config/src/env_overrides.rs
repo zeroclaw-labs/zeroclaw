@@ -8,6 +8,15 @@ use std::sync::LazyLock;
 const PREFIX: &str = "ZEROCLAW_";
 const SEP: &str = "__";
 
+/// Legacy env var naming the Hindsight shared/family tier bank. Bridged into
+/// the typed `memory.hindsight.shared_bank` field at load so it is subject to
+/// the same complete-set cross-agent collision validation and save-masking as a
+/// TOML value. See [`apply_hindsight_tier_bank_env_bridge`].
+const HINDSIGHT_SHARED_BANK_ENV: &str = "ZC_HINDSIGHT_SHARED_BANK";
+/// Legacy env var naming the Hindsight system tier bank. Bridged like
+/// [`HINDSIGHT_SHARED_BANK_ENV`].
+const HINDSIGHT_SYSTEM_BANK_ENV: &str = "ZC_HINDSIGHT_SYSTEM_BANK";
+
 static NON_OVERRIDABLE_PATHS: LazyLock<HashSet<&'static str>> =
     LazyLock::new(|| HashSet::from(["schema_version"]));
 
@@ -83,6 +92,68 @@ pub fn apply_env_overrides(config: &mut Config) -> Result<AppliedOverrides> {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_attrs(::serde_json::json!({"count": paths.len()})),
             "Applied env-var config overrides"
+        );
+    }
+    Ok(AppliedOverrides { paths, snapshots })
+}
+
+/// Bridge the legacy `ZC_HINDSIGHT_SHARED_BANK` / `ZC_HINDSIGHT_SYSTEM_BANK`
+/// env vars into the typed `memory.hindsight.shared_bank` / `system_bank`
+/// fields, recording each as an applied override (with a pre-override snapshot)
+/// so save-masking resets it to the on-disk value.
+///
+/// Why here and not only at backend construction: the backend previously read
+/// these env vars itself and compared the resolved tier bank ONLY against the
+/// constructing agent's own private bank, so an env-provided tier bank that
+/// aliased ANOTHER agent's private bank slipped past validation and leaked that
+/// agent's private data across the whole install. Folding the env values into
+/// typed config at load time subjects them to `Config::validate`'s existing
+/// complete-set cross-agent collision check - the same check the TOML values
+/// already get - which closes the hole.
+///
+/// Precedence: this runs BEFORE [`apply_env_overrides`], so a generic
+/// `ZEROCLAW_memory__hindsight__shared_bank` (or `__system_bank`) override
+/// applied afterward wins, matching the "generic form takes precedence" rule.
+/// A non-empty TOML value already present in the field is left untouched (the
+/// legacy env var is only a fallback for an unset field).
+pub fn apply_hindsight_tier_bank_env_bridge(config: &mut Config) -> Result<AppliedOverrides> {
+    let mut paths: HashSet<String> = HashSet::new();
+    let mut snapshots: HashMap<String, String> = HashMap::new();
+    for (env_var, path, current_is_empty) in [
+        (
+            HINDSIGHT_SHARED_BANK_ENV,
+            "memory.hindsight.shared_bank",
+            config.memory.hindsight.shared_bank.trim().is_empty(),
+        ),
+        (
+            HINDSIGHT_SYSTEM_BANK_ENV,
+            "memory.hindsight.system_bank",
+            config.memory.hindsight.system_bank.trim().is_empty(),
+        ),
+    ] {
+        // Only bridge when the typed field is unset: a TOML value always wins
+        // over the legacy env fallback (parity with the old resolution order).
+        if !current_is_empty {
+            continue;
+        }
+        let Some(value) = std::env::var(env_var)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let snapshot = raw_value_for_path(config, path).unwrap_or_default();
+        config
+            .set_prop(path, &value)
+            .with_context(|| format!("{env_var} -> {path}"))?;
+        snapshots.insert(path.to_string(), snapshot);
+        paths.insert(path.to_string());
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"path": path, "env_var": env_var})),
+            "Legacy Hindsight tier-bank env bridged into typed config"
         );
     }
     Ok(AppliedOverrides { paths, snapshots })
