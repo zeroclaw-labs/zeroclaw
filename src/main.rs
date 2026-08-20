@@ -2804,15 +2804,47 @@ fn plugin_host_with_configured_security(
     )
 }
 
+/// The `[[plugins.entries]]` instance keys a manifest's admitted bindings own.
+///
+/// One row per instance. The key is
+/// [`PluginInstanceScope::config_entry_key`][k] — `zpi1_` + Base64URL of the
+/// canonical `(package, capability, binding)` tuple — and it is the *only* key
+/// for that instance's host-owned state: the private `config` map and the
+/// ADR-013 `egress_hosts` grant live in the same row, resolved by the same key.
+/// Deriving it here rather than at each call site is what keeps that true.
+///
+/// A row is owed when the instance has host-owned state to hold: a private
+/// config object (`config_schema`), a declared egress destination, or a network
+/// permission whose reach the operator must grant. A manifest with none of
+/// those owns no state and gets no row.
+///
+/// The network-permission arm widens master's config-only predicate on purpose.
+/// ADR-013's second grant path is the plugin whose destination *is* deployment
+/// configuration — a self-hosted Gitea, a LAN Nextcloud — which its author
+/// cannot declare, so it ships `http_client` with no `[egress]` table and often
+/// no `config_schema`. Without a row there is nowhere to author that grant:
+/// `config set plugins.entries.<key>.egress_hosts` only resolves keys already
+/// present in live config, and `plugin info` would not even print the opaque
+/// key to address. Pinned by
+/// `a_network_permission_alone_earns_a_row_so_the_operator_can_grant_reach`.
+///
+/// [k]: zeroclaw::plugins::instance::PluginInstanceScope::config_entry_key
 #[cfg(feature = "plugins-wasm")]
-fn installed_plugin_config_entries(
-    host: &zeroclaw::plugins::host::PluginHost,
-    plugin_name: &str,
+fn manifest_config_entries(
+    manifest: &zeroclaw::plugins::PluginManifest,
 ) -> Result<Vec<(zeroclaw::plugins::PluginCapability, String)>> {
-    let manifest = host
-        .manifest(plugin_name)
-        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
-    if manifest.config_schema.is_none()
+    use zeroclaw::plugins::PluginPermission;
+    let declares_network = manifest.permissions.iter().any(|p| {
+        matches!(
+            p,
+            PluginPermission::HttpClient
+                | PluginPermission::WebSocketClient
+                | PluginPermission::SocketClient
+        )
+    });
+    let owns_state =
+        manifest.config_schema.is_some() || !manifest.egress.hosts.is_empty() || declares_network;
+    if !owns_state
         || !manifest
             .capabilities
             .contains(&zeroclaw::plugins::PluginCapability::Tool)
@@ -2823,6 +2855,8 @@ fn installed_plugin_config_entries(
     // Tool registration currently owns the only package-name runtime binding.
     // Alias-owned channel bindings must seed their actual instance key when
     // their production construction path lands; install must not invent one.
+    // A channel-only package therefore yields no entry at all — the grant
+    // ceremony stays silent for it rather than seeding a key nothing reads.
     let scope = zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
         manifest,
         zeroclaw::plugins::PluginCapability::Tool,
@@ -2834,15 +2868,222 @@ fn installed_plugin_config_entries(
     )])
 }
 
-/// Seed empty `[[plugins.entries]]` blocks for a freshly installed plugin's
-/// canonical default instance keys. `config set
+#[cfg(feature = "plugins-wasm")]
+fn installed_plugin_config_entries(
+    host: &zeroclaw::plugins::host::PluginHost,
+    plugin_name: &str,
+) -> Result<Vec<(zeroclaw::plugins::PluginCapability, String)>> {
+    let manifest = host
+        .manifest(plugin_name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    manifest_config_entries(manifest)
+}
+
+/// The destinations `plugin_name`'s manifest **declares** (ADR-013's `[egress]`
+/// table), resolved from the admitted manifest at use time.
+///
+/// This is the declaration, never a grant: nothing here confers network reach.
+/// An unknown plugin and a plugin that declares nothing give the same answer —
+/// an empty list — because "declares nothing" is the same state as "no
+/// `[egress]` table".
+#[cfg(feature = "plugins-wasm")]
+fn declared_egress_hosts(
+    host: &zeroclaw::plugins::host::PluginHost,
+    plugin_name: &str,
+) -> Vec<String> {
+    host.manifest(plugin_name)
+        .map(|m| m.egress.hosts.clone())
+        .unwrap_or_default()
+}
+
+/// Print the destinations a freshly seeded instance row was granted, one line
+/// each, plus the exact command that edits the grant later.
+///
+/// ADR-013's grant ceremony: installation is an explicit operator act, and the
+/// printed, persisted allowlist is its record. `package` is what the operator
+/// recognizes; `instance_key` is the opaque `zpi1_` row the grant actually
+/// lives on, and it reaches the operator inside the printed command rather than
+/// as a bare token they would have to transcribe. A manifest that declares
+/// nothing prints nothing.
+#[cfg(feature = "plugins-wasm")]
+fn print_egress_grant_ceremony(package: &str, instance_key: &str, granted: &[String]) {
+    use crate::plugins::egress_ceremony::egress_set_command;
+    if granted.is_empty() {
+        return;
+    }
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-egress-seeded",
+            &[("name", package), ("count", &granted.len().to_string())],
+            "Granted egress from the manifest declaration."
+        )
+    );
+    for host in granted {
+        // The literal carries indentation only; the prose is the Fluent value.
+        println!(
+            "  {}",
+            ta(
+                "cli-plugin-egress-destination",
+                &[("host", host)],
+                "-> host"
+            )
+        );
+    }
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-egress-edit-command",
+            &[("command", &egress_set_command(instance_key, granted))],
+            "Edit this grant later with the printed command."
+        )
+    );
+}
+
+/// Print the declaration-versus-grant difference for an instance row that
+/// already exists, and change nothing.
+///
+/// This is the security invariant of the ceremony: a package upgrade whose
+/// declaration grew must not extend an existing grant. The operator applies the
+/// difference deliberately, with the exact command printed here. The comparison
+/// reads the same `zpi1_` row `entry_config` resolves against, so "granted"
+/// means the one allowlist the runtime enforces.
+#[cfg(feature = "plugins-wasm")]
+fn report_existing_egress_grant(
+    config: &crate::config::schema::Config,
+    package: &str,
+    instance_key: &str,
+    declared_egress: &[String],
+) {
+    use crate::plugins::egress_ceremony::{
+        diff_declaration, egress_set_command, should_report_diff,
+    };
+    let (granted, _private) = config.plugins.entry_egress(instance_key);
+    let diff = diff_declaration(declared_egress, &granted);
+    if !should_report_diff(&diff) {
+        return;
+    }
+    if !diff.declared_not_granted.is_empty() {
+        println!(
+            "{}",
+            ta(
+                "cli-plugin-egress-declared-not-granted",
+                &[
+                    ("name", package),
+                    ("count", &diff.declared_not_granted.len().to_string()),
+                ],
+                "This plugin declares destinations its config entry does not grant."
+            )
+        );
+        for host in &diff.declared_not_granted {
+            println!(
+                "  {}",
+                ta("cli-plugin-egress-added", &[("host", host)], "+ host")
+            );
+        }
+        println!(
+            "{}",
+            ta(
+                "cli-plugin-egress-apply-command",
+                &[("command", &egress_set_command(instance_key, &diff.union()))],
+                "Grant them with the printed command."
+            )
+        );
+    }
+    if !diff.granted_not_declared.is_empty() {
+        println!(
+            "{}",
+            ta(
+                "cli-plugin-egress-granted-not-declared",
+                &[
+                    ("name", package),
+                    ("count", &diff.granted_not_declared.len().to_string()),
+                ],
+                "This entry grants destinations the manifest no longer declares."
+            )
+        );
+        for host in &diff.granted_not_declared {
+            println!(
+                "  {}",
+                ta("cli-plugin-egress-removed", &[("host", host)], "- host")
+            );
+        }
+    }
+    println!(
+        "{}",
+        ta(
+            "cli-plugin-egress-never-extended",
+            &[("name", package)],
+            "Installing a package never extends an existing egress grant."
+        )
+    );
+}
+
+/// ADR-013 gate G4's migration diagnostic, on the surface an operator already
+/// runs: for every installed `http_client` plugin, one terse line naming the
+/// destinations it declares that its instance row does not grant — denials
+/// waiting to happen — and the exact command that closes the gap.
+///
+/// Only declared-but-not-granted is flagged. The reverse (granted but not
+/// declared) is the operator's own authored grant, which is a first-class
+/// ADR-013 path, not a finding.
+///
+/// A package whose bindings own no derivable instance key (a channel-only
+/// package, until its alias-aware key path lands) yields no entries and is
+/// skipped in silence: there is no row to compare against, and inventing one
+/// would report a gap against a key nothing reads.
+#[cfg(feature = "plugins-wasm")]
+fn print_egress_grant_gaps(
+    config: &crate::config::schema::Config,
+    host: &zeroclaw::plugins::host::PluginHost,
+    plugins: &[zeroclaw::plugins::PluginInfo],
+) -> Result<()> {
+    use crate::plugins::egress_ceremony::{diff_declaration, egress_set_command};
+    use zeroclaw::plugins::PluginPermission;
+    for p in plugins {
+        if !p.permissions.contains(&PluginPermission::HttpClient) {
+            continue;
+        }
+        let Some(manifest) = host.manifest(&p.name) else {
+            continue;
+        };
+        let declared = manifest.egress.hosts.clone();
+        for (_, instance_key) in manifest_config_entries(manifest)? {
+            let (granted, _private) = config.plugins.entry_egress(&instance_key);
+            let diff = diff_declaration(&declared, &granted);
+            if diff.declared_not_granted.is_empty() {
+                continue;
+            }
+            println!(
+                "  {}",
+                ta(
+                    "cli-plugin-egress-gap",
+                    &[
+                        ("name", &p.name),
+                        ("hosts", &diff.declared_not_granted.join(", ")),
+                        ("command", &egress_set_command(&instance_key, &diff.union())),
+                    ],
+                    "This plugin declares destinations its entry does not grant."
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Seed `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
+/// default instance keys, carrying the manifest's declared egress destinations
+/// into each row this call creates. `config set
 /// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
 /// resolution, which only matches entries already present in live config.
-/// Idempotent: existing entries and operator values remain untouched.
+/// Idempotent: existing entries and operator values remain untouched — an
+/// existing row's `egress_hosts` is reported against, never rewritten.
 #[cfg(feature = "plugins-wasm")]
 async fn seed_plugin_config_entries(
     config: &mut crate::config::schema::Config,
+    package: &str,
     entries: &[(zeroclaw::plugins::PluginCapability, String)],
+    declared_egress: &[String],
 ) -> Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -2870,6 +3111,7 @@ async fn seed_plugin_config_entries(
     }
 
     let mut created = Vec::new();
+    let mut existing = Vec::new();
     for (_, instance_key) in entries {
         if config
             .create_map_key("plugins.entries", instance_key)
@@ -2877,22 +3119,52 @@ async fn seed_plugin_config_entries(
         {
             config.mark_dirty(&format!("plugins.entries.{instance_key}"));
             created.push(instance_key);
+        } else {
+            existing.push(instance_key);
         }
     }
-    if created.is_empty() {
-        return Ok(());
+
+    // Seed the declaration into the rows just created, before the save, so the
+    // grant lands through the same dirty-path persistence the entry itself
+    // uses — one row per instance carrying both `config` and `egress_hosts`.
+    // `egress_hosts` is a plaintext sibling of the `#[secret]` `config` map, so
+    // `encrypt_secrets` leaves it readable in the file the operator audits
+    // (asserted by `seeded_egress_is_written_plaintext_beside_encrypted_config`).
+    let granted = crate::plugins::egress_ceremony::canonical_hosts(declared_egress);
+    if !granted.is_empty() {
+        for instance_key in &created {
+            config
+                .set_prop(
+                    &crate::plugins::egress_ceremony::egress_hosts_path(instance_key),
+                    &granted.join(","),
+                )
+                .with_context(|| {
+                    format!("failed to seed the declared egress allowlist for '{package}'")
+                })?;
+        }
     }
-    Box::pin(config.save_dirty()).await?;
-    for instance_key in created {
-        println!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seeded",
-                &[("name", instance_key)],
-                "Seeded config entry. Set plugin config values with \
-                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
-            )
-        );
+
+    if !created.is_empty() {
+        Box::pin(config.save_dirty()).await?;
+        for instance_key in &created {
+            println!(
+                "{}",
+                ta(
+                    "cli-plugin-config-entry-seeded",
+                    &[("name", instance_key)],
+                    "Seeded config entry. Set plugin config values with \
+                     `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+                )
+            );
+            print_egress_grant_ceremony(package, instance_key, &granted);
+        }
+    }
+
+    // Rows that already existed — an upgrade, a reinstall, or an
+    // operator-authored row. ADR-013: never auto-extend. Report the difference
+    // and leave `egress_hosts` exactly as the operator left it.
+    for instance_key in existing {
+        report_existing_egress_grant(config, package, instance_key, declared_egress);
     }
     Ok(())
 }
@@ -6259,6 +6531,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             p.description.as_deref().unwrap_or("(no description)")
                         );
                     }
+                    print_egress_grant_gaps(&config, &host, &plugins)?;
                 }
                 let target = config.plugins.resolved_plugins_dir().display().to_string();
                 for legacy in crate::config::schema::legacy_plugin_dirs_with_entries(&config) {
@@ -6336,6 +6609,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 if plugin_registry::is_local_plugin_source(&source) {
                     let name = host.install(&source)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
+                    let declared = declared_egress_hosts(&host, &name);
                     println!(
                         "{}",
                         ta(
@@ -6344,7 +6618,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
+                    Box::pin(seed_plugin_config_entries(
+                        &mut config,
+                        &name,
+                        &config_entries,
+                        &declared,
+                    ))
+                    .await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -6364,6 +6644,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     let name = host.install(&plugin_dir)?;
                     let config_entries = installed_plugin_config_entries(&host, &name)?;
+                    let declared = declared_egress_hosts(&host, &name);
                     println!(
                         "{}",
                         ta(
@@ -6375,7 +6656,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
+                    Box::pin(seed_plugin_config_entries(
+                        &mut config,
+                        &name,
+                        &config_entries,
+                        &declared,
+                    ))
+                    .await?;
                 }
                 Ok(())
             }
@@ -9986,5 +10273,514 @@ mod tests {
             msg.contains("No model provider configured"),
             "error must mention missing provider; got: {msg}"
         );
+    }
+
+    /// A config rooted in `dir` with secret encryption on and an existing
+    /// `config.toml`, so `save_dirty` takes its incremental path and
+    /// `encrypt_secrets` has a key directory to work in.
+    #[cfg(feature = "plugins-wasm")]
+    fn config_in_dir(dir: &std::path::Path) -> crate::config::schema::Config {
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "schema_version = 0\n").expect("seed config file");
+        let mut config = crate::config::schema::Config::default();
+        config.config_path = path;
+        config.secrets.encrypt = true;
+        config
+    }
+
+    /// Build an admitted-shape manifest from TOML, the way a real plugin ships
+    /// one, so the instance key derives from the same fields production reads.
+    #[cfg(feature = "plugins-wasm")]
+    fn manifest_from_toml(src: &str) -> zeroclaw::plugins::PluginManifest {
+        toml::from_str(src).expect("test manifest must parse")
+    }
+
+    /// A tool manifest declaring `hosts` and requesting `permissions`, with a
+    /// config schema unless `with_config_schema` is false.
+    #[cfg(feature = "plugins-wasm")]
+    fn tool_manifest_with(
+        name: &str,
+        hosts: &[&str],
+        permissions: &[&str],
+        with_config_schema: bool,
+    ) -> zeroclaw::plugins::PluginManifest {
+        let quote = |xs: &[&str]| -> String {
+            xs.iter()
+                .map(|x| format!("\"{x}\""))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let schema = if with_config_schema {
+            "config_schema = { type = \"object\" }\n"
+        } else {
+            ""
+        };
+        manifest_from_toml(&format!(
+            "name = \"{name}\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\"]\n\
+             permissions = [{}]\n\
+             {schema}\
+             [egress]\n\
+             hosts = [{}]\n",
+            quote(permissions),
+            quote(hosts)
+        ))
+    }
+
+    /// The common case: a tool plugin that requests `http_client`.
+    #[cfg(feature = "plugins-wasm")]
+    fn tool_manifest(
+        name: &str,
+        hosts: &[&str],
+        with_config_schema: bool,
+    ) -> zeroclaw::plugins::PluginManifest {
+        tool_manifest_with(name, hosts, &["http_client"], with_config_schema)
+    }
+
+    /// The `zpi1_` key production derives for a package's default tool binding.
+    #[cfg(feature = "plugins-wasm")]
+    fn expected_instance_key(manifest: &zeroclaw::plugins::PluginManifest) -> String {
+        zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
+            manifest,
+            zeroclaw::plugins::PluginCapability::Tool,
+            std::iter::empty(),
+        )
+        .expect("scope must derive")
+        .id()
+        .config_entry_key()
+        .expect("instance key must derive")
+    }
+
+    /// Read the `[[plugins.entries]]` table named `name` back off disk.
+    #[cfg(feature = "plugins-wasm")]
+    fn entry_on_disk(path: &std::path::Path, name: &str) -> toml::Table {
+        let raw = std::fs::read_to_string(path).expect("config file must exist after save");
+        let doc: toml::Table = toml::from_str(&raw).expect("saved config must be valid TOML");
+        doc.get("plugins")
+            .and_then(toml::Value::as_table)
+            .and_then(|p| p.get("entries"))
+            .and_then(toml::Value::as_array)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|e| e.get("name").and_then(toml::Value::as_str) == Some(name))
+            })
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_else(|| panic!("no [[plugins.entries]] row named '{name}' on disk"))
+    }
+
+    /// THE unification invariant (typed instance config plus ADR-013): `plugin
+    /// install` seeds the egress grant onto the SAME `zpi1_` instance-key row
+    /// that carries the instance's private config — one row per instance,
+    /// never one row for config and a second keyed by the package name.
+    ///
+    /// Pinned as observable state: the row's `name` on disk is the derived
+    /// instance key, that row carries the grant, and no package-name-keyed row
+    /// exists at all.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn install_seeds_egress_onto_the_instance_key_row_not_a_package_name_row() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let path = config.config_path.clone();
+
+        let manifest = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&manifest);
+        assert!(
+            instance_key.starts_with("zpi1_"),
+            "the entry key must be the opaque instance key; got {instance_key}"
+        );
+        assert_ne!(
+            instance_key, "weather-tool",
+            "the instance key must not collapse to the package name"
+        );
+
+        let entries = manifest_config_entries(&manifest).expect("entries must derive");
+        seed_plugin_config_entries(
+            &mut config,
+            "weather-tool",
+            &entries,
+            &manifest.egress.hosts,
+        )
+        .await
+        .expect("seeding a fresh entry must succeed");
+
+        // Exactly one row, keyed by the instance key, carrying the grant.
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "one row per instance: {:?}",
+            config
+                .plugins
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>()
+        );
+        let entry = &config.plugins.entries[0];
+        assert_eq!(
+            entry.name, instance_key,
+            "the seeded row must be keyed by the instance key"
+        );
+        assert_eq!(entry.egress_hosts, vec!["api.example.com".to_string()]);
+
+        // The same row is the one `entry_egress` resolves — the read `plugin
+        // list` and the runtime policy both perform.
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(
+            granted,
+            vec!["api.example.com".to_string()],
+            "entry_egress must resolve the grant by instance key"
+        );
+        assert!(
+            config.plugins.entry_egress("weather-tool").0.is_empty(),
+            "no package-name-keyed row may carry the grant"
+        );
+
+        // And it is the instance key that persists to disk.
+        let on_disk = entry_on_disk(&path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("egress_hosts must be persisted")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(hosts, vec!["api.example.com"]);
+        let raw = std::fs::read_to_string(&path).expect("read back");
+        assert!(
+            !raw.contains("name = \"weather-tool\""),
+            "install must not write a package-name-keyed entry:\n{raw}"
+        );
+    }
+
+    /// ADR-013 grant ceremony, install half: the declaration seeds the row it
+    /// just created, and it lands as a PLAINTEXT sibling of the encrypted
+    /// `config` map — the allowlist is what the operator audits, so it has to
+    /// be readable in the file they audit.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn seeded_egress_is_written_plaintext_beside_encrypted_config() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let path = config.config_path.clone();
+
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "*.cdn.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        let entries = manifest_config_entries(&manifest).expect("entries must derive");
+        seed_plugin_config_entries(
+            &mut config,
+            "weather-tool",
+            &entries,
+            &manifest.egress.hosts,
+        )
+        .await
+        .expect("seeding a fresh entry must succeed");
+
+        // In memory: the grant is on the plaintext field, canonicalized, and
+        // nothing leaked into the secret map.
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("install must seed an entry");
+        assert_eq!(
+            entry.egress_hosts,
+            vec![
+                "*.cdn.example.com".to_string(),
+                "api.example.com".to_string()
+            ],
+            "the declaration must seed egress_hosts, sorted and canonical"
+        );
+        assert!(
+            entry.config.is_empty(),
+            "egress must never be written into the #[secret] config map: {:?}",
+            entry.config
+        );
+
+        // Now add a genuine secret through the same call the CLI's `zeroclaw
+        // config set` makes, so the file carries both kinds of value and the
+        // save path can be shown to treat them differently.
+        config
+            .set_prop_persistent(
+                &format!("plugins.entries.{instance_key}.config.api_key"),
+                "sk-not-real",
+            )
+            .expect("plugin config values must be settable");
+        Box::pin(config.save_dirty())
+            .await
+            .expect("save must succeed");
+
+        let on_disk = entry_on_disk(&path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("egress_hosts must be persisted")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["*.cdn.example.com", "api.example.com"],
+            "the granted allowlist must be readable plaintext on disk"
+        );
+        for host in &hosts {
+            assert!(
+                !host.starts_with("enc2:"),
+                "egress destinations must not be encrypted: {host}"
+            );
+        }
+        let api_key = on_disk
+            .get("config")
+            .and_then(toml::Value::as_table)
+            .and_then(|c| c.get("api_key"))
+            .and_then(toml::Value::as_str)
+            .expect("the secret config value must be persisted");
+        assert!(
+            api_key.starts_with("enc2:"),
+            "secret config values must still encrypt at rest; got {api_key}"
+        );
+    }
+
+    /// ADR-013 grant ceremony, upgrade half and the security invariant of this
+    /// stage: an install that finds an EXISTING instance row never extends its
+    /// allowlist, however much the new manifest declares. The operator applies
+    /// the difference deliberately.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn install_never_auto_extends_an_existing_egress_grant() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let path = config.config_path.clone();
+
+        // v1: one declared destination, seeded at first install.
+        let v1 = tool_manifest("weather-tool", &["api.example.com"], true);
+        let instance_key = expected_instance_key(&v1);
+        let entries = manifest_config_entries(&v1).expect("entries must derive");
+        seed_plugin_config_entries(&mut config, "weather-tool", &entries, &v1.egress.hosts)
+            .await
+            .expect("first install must seed");
+
+        // v2 of the same package declares an extra destination. Its instance
+        // key is unchanged (identity is package/capability/binding, not
+        // version), so installing it meets the existing row — and must leave
+        // it exactly as the operator left it.
+        let v2 = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        assert_eq!(
+            expected_instance_key(&v2),
+            instance_key,
+            "a version bump must not move the instance key"
+        );
+        let entries_v2 = manifest_config_entries(&v2).expect("entries must derive");
+        seed_plugin_config_entries(&mut config, "weather-tool", &entries_v2, &v2.egress.hosts)
+            .await
+            .expect("re-seeding an existing entry must not fail");
+
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("the entry must still exist");
+        assert_eq!(
+            entry.egress_hosts,
+            vec!["api.example.com".to_string()],
+            "a package upgrade must NEVER extend an existing egress grant"
+        );
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "re-seeding must not duplicate the entry"
+        );
+
+        let on_disk = entry_on_disk(&path, &instance_key);
+        let hosts: Vec<&str> = on_disk
+            .get("egress_hosts")
+            .and_then(toml::Value::as_array)
+            .expect("egress_hosts must be persisted")
+            .iter()
+            .filter_map(toml::Value::as_str)
+            .collect();
+        assert_eq!(
+            hosts,
+            vec!["api.example.com"],
+            "the on-disk grant must be untouched by the upgrade"
+        );
+    }
+
+    /// A manifest that declares nothing grants nothing: `http_client` alone
+    /// still confers no reach, and the seeded row stays deny-everything.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_manifest_without_a_declaration_seeds_no_egress() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+
+        // A config schema still earns a row; the egress grant on it is empty.
+        let manifest = tool_manifest("silent-tool", &[], true);
+        let instance_key = expected_instance_key(&manifest);
+        let entries = manifest_config_entries(&manifest).expect("entries must derive");
+        seed_plugin_config_entries(&mut config, "silent-tool", &entries, &manifest.egress.hosts)
+            .await
+            .expect("seeding must succeed");
+
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("the entry is still seeded");
+        assert!(
+            entry.egress_hosts.is_empty(),
+            "no declaration means no grant: {:?}",
+            entry.egress_hosts
+        );
+    }
+
+    /// The scoping constraint inherited from the typed-instance-config work:
+    /// `installed_plugin_config_entries` derives keys for tool/default bindings
+    /// only, because channel bindings are alias-owned and their key derivation
+    /// is deferred to the alias-aware host path. The ceremony must inherit that
+    /// scope rather than invent a package-level key — so a channel-only package
+    /// yields no entries and seeds nothing at all, even when its manifest
+    /// declares destinations.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_channel_only_package_seeds_nothing_rather_than_inventing_a_key() {
+        let manifest = manifest_from_toml(
+            "name = \"chat-bridge\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"channel\"]\n\
+             permissions = [\"http_client\"]\n\
+             config_schema = { type = \"object\" }\n\
+             [egress]\n\
+             hosts = [\"api.example.com\"]\n",
+        );
+        let entries = manifest_config_entries(&manifest).expect("derivation must not error");
+        assert!(
+            entries.is_empty(),
+            "a channel-only package has no derivable instance key yet: {entries:?}"
+        );
+
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        seed_plugin_config_entries(&mut config, "chat-bridge", &entries, &manifest.egress.hosts)
+            .await
+            .expect("seeding nothing must succeed");
+        assert!(
+            config.plugins.entries.is_empty(),
+            "no row may be invented for a channel-only package: {:?}",
+            config
+                .plugins
+                .entries
+                .iter()
+                .map(|e| e.name.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A tool package that declares egress but ships no config schema still
+    /// owns host state — its grant — so it earns an instance row. Master's
+    /// config-schema-only predicate returned nothing for it, which would have
+    /// left the declaration with nowhere to land.
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn an_egress_declaration_alone_earns_an_instance_row() {
+        let declaring = tool_manifest("beacon-tool", &["api.example.com"], false);
+        assert_eq!(
+            manifest_config_entries(&declaring)
+                .expect("derivation must not error")
+                .len(),
+            1,
+            "a declared destination needs a row to be granted on"
+        );
+
+        // No schema, no declaration, no network permission: no host-owned
+        // state, no row.
+        let inert = tool_manifest_with("inert-tool", &[], &["memory_read"], false);
+        assert!(
+            manifest_config_entries(&inert)
+                .expect("derivation must not error")
+                .is_empty(),
+            "a package owning no host state must not get a row"
+        );
+    }
+
+    /// ADR-013's SECOND grant path: the plugin whose destination is deployment
+    /// configuration (self-hosted Gitea, LAN Nextcloud). Its author cannot
+    /// declare the host, so it ships a network permission with no `[egress]`
+    /// table and no `config_schema`. It must still get an instance row —
+    /// otherwise the operator has nowhere to author the grant.
+    ///
+    /// The second half pins *why* the row is required: without one, the dotted
+    /// path does not resolve, so `zeroclaw config set
+    /// plugins.entries.<key>.egress_hosts` cannot create the grant either.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_network_permission_alone_earns_a_row_so_the_operator_can_grant_reach() {
+        for permission in ["http_client", "websocket_client", "socket_client"] {
+            let manifest = tool_manifest_with("gitea-tool", &[], &[permission], false);
+            let entries = manifest_config_entries(&manifest).expect("derivation must not error");
+            assert_eq!(
+                entries.len(),
+                1,
+                "{permission} alone must earn a row the operator can grant on"
+            );
+        }
+
+        let manifest = tool_manifest_with("gitea-tool", &[], &["http_client"], false);
+        let instance_key = expected_instance_key(&manifest);
+        let entries = manifest_config_entries(&manifest).expect("derivation must not error");
+
+        // Before the row exists the grant is unaddressable — this is the
+        // dead-end the widened predicate exists to prevent.
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut bare = config_in_dir(tmp.path());
+        assert!(
+            bare.set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                "gitea.internal.example.com",
+            )
+            .is_err(),
+            "without a seeded row the egress path must not resolve"
+        );
+
+        // After install seeds it, the operator's own grant lands on the row.
+        let mut config = config_in_dir(tmp.path());
+        seed_plugin_config_entries(&mut config, "gitea-tool", &entries, &manifest.egress.hosts)
+            .await
+            .expect("seeding must succeed");
+        let entry = config
+            .plugins
+            .entries
+            .iter()
+            .find(|e| e.name == instance_key)
+            .expect("a network-permitted tool must get a row");
+        assert!(
+            entry.egress_hosts.is_empty(),
+            "the row starts deny-everything: {:?}",
+            entry.egress_hosts
+        );
+        config
+            .set_prop(
+                &crate::plugins::egress_ceremony::egress_hosts_path(&instance_key),
+                "gitea.internal.example.com",
+            )
+            .expect("the operator must be able to author the grant on the seeded row");
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        assert_eq!(granted, vec!["gitea.internal.example.com".to_string()]);
     }
 }
