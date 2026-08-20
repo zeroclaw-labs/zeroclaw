@@ -16,9 +16,10 @@ pub use schedule::{
 pub use store::{
     add_agent_job, all_overdue_jobs, claim_job, clear_stale_locks, due_jobs, get_job,
     get_job_for_agent, list_jobs, list_jobs_by_agent, list_runs, record_last_run,
-    record_last_run_with_status, record_run, release_job, remove_job, remove_jobs_by_agent,
-    rename_jobs_by_agent, reschedule_after_run, reschedule_after_run_with_status,
-    resolve_job_id_or_name, skip_missed_run, sync_declarative_jobs, update_job,
+    record_last_run_with_status, record_run, release_job, remove_job, remove_job_for_agent,
+    remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
+    reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
+    sync_declarative_jobs, update_job, update_job_for_agent,
 };
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
@@ -167,7 +168,10 @@ pub fn update_shell_job_with_approval(
     if let Some(command) = patch.command.as_deref() {
         validate_shell_command(config, agent_alias, command, approved)?;
     }
-    update_job(config, job_id, patch)
+    // Scoped: this is an agent-facing path, so the ownership test travels with
+    // the write rather than being a separate read the operator's rename cascade
+    // can slip between.
+    update_job_for_agent(config, job_id, agent_alias, patch)
 }
 
 /// Create a one-shot validated shell job from a delay string (e.g. "30m").
@@ -258,6 +262,33 @@ pub fn resume_job(config: &Config, id: &str) -> Result<CronJob> {
     update_job(
         config,
         id,
+        CronJobPatch {
+            enabled: Some(true),
+            ..CronJobPatch::default()
+        },
+    )
+}
+
+/// Pause a job the calling agent owns. The ownership test travels with the
+/// write; see `store::remove_job_for_agent`.
+pub fn pause_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<CronJob> {
+    update_job_for_agent(
+        config,
+        id,
+        agent_alias,
+        CronJobPatch {
+            enabled: Some(false),
+            ..CronJobPatch::default()
+        },
+    )
+}
+
+/// Resume a job the calling agent owns.
+pub fn resume_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<CronJob> {
+    update_job_for_agent(
+        config,
+        id,
+        agent_alias,
         CronJobPatch {
             enabled: Some(true),
             ..CronJobPatch::default()

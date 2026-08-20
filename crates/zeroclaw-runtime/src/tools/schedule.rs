@@ -509,15 +509,7 @@ impl ScheduleTool {
     }
 
     fn handle_cancel(&self, id: &str) -> ToolResult {
-        if let Err(error) = cron::get_job_for_agent(&self.config, id, &self.agent_alias) {
-            return ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(error.to_string()),
-            };
-        }
-
-        match cron::remove_job(&self.config, id) {
+        match cron::remove_job_for_agent(&self.config, id, &self.agent_alias) {
             Ok(()) => ToolResult {
                 success: true,
                 output: format!("Cancelled job {id}").into(),
@@ -532,21 +524,13 @@ impl ScheduleTool {
     }
 
     fn handle_pause_resume(&self, id: &str, pause: bool) -> ToolResult {
-        // Authorize before touching the job. Without this an agent that receives
-        // or guesses another agent's id can disable or re-enable it, and the
-        // success reply confirms that the foreign id exists.
-        if let Err(error) = cron::get_job_for_agent(&self.config, id, &self.agent_alias) {
-            return ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(error.to_string()),
-            };
-        }
-
+        // Authorization travels with the write: an agent that receives or guesses
+        // another agent's id must not disable or re-enable it, and a success
+        // reply must not confirm that the foreign id exists.
         let operation = if pause {
-            cron::pause_job(&self.config, id)
+            cron::pause_job_for_agent(&self.config, id, &self.agent_alias)
         } else {
-            cron::resume_job(&self.config, id)
+            cron::resume_job_for_agent(&self.config, id, &self.agent_alias)
         };
 
         match operation {
