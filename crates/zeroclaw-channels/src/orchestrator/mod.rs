@@ -11733,17 +11733,19 @@ temperature = 0.3
         std::fs::write(
             &config_path,
             r#"
+schema_version = 3
+
 [channels.telegram.home]
 enabled = true
 mention_only = false
 allowed_groups = ["-100111"]
 
-[model_providers.openrouter.default]
+[providers.models.openrouter.default]
 name = "openrouter"
+model = "test/model"
 
 [agents.demo]
-provider = "openrouter.default"
-model = "test/model"
+model_provider = "openrouter.default"
 "#,
         )
         .unwrap();
@@ -11777,17 +11779,19 @@ model = "test/model"
         std::fs::write(
             &config_path,
             r#"
+schema_version = 3
+
 [channels.telegram.home]
 enabled = true
 mention_only = false
 allowed_groups = ["-100222"]
 
-[model_providers.openrouter.default]
+[providers.models.openrouter.default]
 name = "openrouter"
+model = "test/model"
 
 [agents.demo]
-provider = "openrouter.default"
-model = "test/model"
+model_provider = "openrouter.default"
 "#,
         )
         .unwrap();
