@@ -88,7 +88,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: '.nvmrc'
@@ -272,8 +272,11 @@ jobs:
         with:
           toolchain: 1.96.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        if: runner.os != 'Windows'
+      # Cache every target, including Windows. CI's Windows Clippy job caches the
+      # same x86_64-pc-windows-msvc target with this exact action, so there is no
+      # Windows-specific reason to recompile the release build from scratch each
+      # time. The per-(os, target) prefix keeps each leg's cache isolated.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: ${{ matrix.os }}-${{ matrix.target }}
 
@@ -290,7 +293,7 @@ jobs:
 
       - name: Install cross (MUSL targets)
         if: matrix.use_cross
-        run: cargo install cross --version 0.2.5 --locked
+        run: bash scripts/ci/install_release_tool.sh cross
 
       - name: Setup Android NDK
         if: matrix.ndk
@@ -395,7 +398,7 @@ jobs:
           toolchain: 1.96.1
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: macos-tauri
 
@@ -404,7 +407,7 @@ jobs:
           node-version-file: '.nvmrc'
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked
+        run: bash scripts/ci/install_release_tool.sh tauri-cli
 
       - name: Sync Tauri version with Cargo.toml
         shell: bash
@@ -596,12 +599,12 @@ jobs:
         with:
           toolchain: 1.96.1
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: linux-tauri
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked
+        run: bash scripts/ci/install_release_tool.sh tauri-cli
 
       - name: Sync Tauri version with Cargo.toml
         shell: bash
@@ -645,12 +648,13 @@ jobs:
         with:
           toolchain: 1.96.1
 
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           prefix-key: windows-tauri
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked
+        shell: bash
+        run: bash scripts/ci/install_release_tool.sh tauri-cli
 
       - name: Sync Tauri version with Cargo.toml
         shell: bash
@@ -777,7 +781,12 @@ jobs:
             "zeroclaw-arm-unknown-linux-gnueabihf.tar.gz"
             "zeroclaw-aarch64-apple-darwin.tar.gz"
             "zeroclaw-x86_64-apple-darwin.tar.gz"
-            "zeroclaw-aarch64-linux-android.tar.gz"
+            # aarch64-linux-android is experimental (continue-on-error): it is
+            # attached to the release when it builds (matched by the zeroclaw-*
+            # artifact download above) but must not block publish when the
+            # allowed-to-fail leg fails. Treated like the desktop-linux/windows
+            # bundles. Promote it back into required_assets only when the
+            # Android build leg drops `experimental: true`.
             "zeroclaw-x86_64-pc-windows-msvc.zip"
             "ZeroClaw.dmg"
             "zeroclaw-${TAG}-sbom.spdx.json"

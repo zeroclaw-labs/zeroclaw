@@ -6,27 +6,44 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronUpdateTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — risk profile gate for command updates.
     agent_alias: String,
 }
 
 impl CronUpdateTool {
+    pub fn new_with_runtime(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            runtime,
+            agent_alias: agent_alias.into(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn new(
         config: Arc<Config>,
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
     ) -> Self {
-        Self {
-            config,
-            security,
-            agent_alias: agent_alias.into(),
-        }
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        Self::new_with_runtime(config, security, agent_alias, runtime)
     }
 
     fn enforce_mutation_allowed(&self, action: &str) -> Option<ToolResult> {
@@ -261,9 +278,10 @@ impl Tool for CronUpdateTool {
             return Ok(blocked);
         }
 
-        match cron::update_shell_job_with_approval(
+        match cron::update_shell_job_with_runtime(
             &self.config,
-            &self.agent_alias,
+            self.runtime.as_ref(),
+            &self.security,
             job_id,
             patch,
             approved,
@@ -413,6 +431,47 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn command_update_uses_injected_runtime_dialect() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Full;
+        risk_profile.allowed_commands = vec!["*".into()];
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        let runtime: Arc<dyn RuntimeAdapter> =
+            Arc::new(crate::platform::NativeRuntime::with_shell("pwsh".into()));
+        let tool =
+            CronUpdateTool::new_with_runtime(cfg.clone(), test_security(&cfg), TEST_AGENT, runtime);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "command": "ac blocked.txt value" },
+                "approved": true
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("high-risk")),
+            "{:?}",
+            result.error
+        );
+        assert_eq!(cron::get_job(&cfg, &job.id).unwrap().command, "echo ok");
     }
 
     #[tokio::test]

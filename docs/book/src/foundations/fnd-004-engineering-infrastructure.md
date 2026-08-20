@@ -1,9 +1,9 @@
 # FND-004: Engineering Infrastructure: CI/CD Pipeline and Release Automation
 
-> Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 1
+> Supporting v0.7.0 → v1.0.0 · Type: Architecture · Rev. 8
 >
-> **Canonical reference** · Ratified by the team · Rev. 1
-> Discussion thread and full revision history: [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)
+> **Canonical reference** · Ratified by the team · Rev. 8
+> Original RFC discussion: [#5579](https://github.com/zeroclaw-labs/zeroclaw/issues/5579)
 
 ---
 
@@ -31,6 +31,13 @@
 | Rev | Date | Summary |
 |---|---|---|
 | 1 | 2026-04-09 | Initial draft |
+| 2 | 2026-06-04 | Replaced format-and-lint serial gating with format-only gating followed by parallel required Rust jobs ([#7111](https://github.com/zeroclaw-labs/zeroclaw/pull/7111)) |
+| 3 | 2026-06-10 | Required trusted `master` runs to seed caches consumed by pull requests ([#7355](https://github.com/zeroclaw-labs/zeroclaw/pull/7355)) |
+| 4 | 2026-06-21 | Changed the plugin build and release target from `wasm32-wasip1` to `wasm32-wasip2` ([#8061](https://github.com/zeroclaw-labs/zeroclaw/pull/8061)) |
+| 5 | 2026-06-30 | Removed the desktop artifact and its release-pipeline obligations ([#8544](https://github.com/zeroclaw-labs/zeroclaw/pull/8544)) |
+| 6 | 2026-07-04 | Restored the desktop artifact and its release-pipeline obligations ([#8565](https://github.com/zeroclaw-labs/zeroclaw/pull/8565)) |
+| 7 | 2026-08-07 | Replaced `actions/attest-build-provenance` guidance with direct `actions/attest` artifact attestation ([#9717](https://github.com/zeroclaw-labs/zeroclaw/pull/9717)) |
+| 8 | 2026-08-20 | Removed the retired hardware-library class from independent-release guidance after `aardvark-sys` and `zeroclaw-robot-kit` left the workspace ([#10152](https://github.com/zeroclaw-labs/zeroclaw/pull/10152)) |
 
 ---
 
@@ -294,7 +301,7 @@ The architecture RFC §4.4.1 specifies `release-plz` as the release automation t
 
 - On push to `master`, `release-plz` opens a "Release PR" that bumps the workspace version, updates changelogs from conventional commit history, and lists all crates that have changed since the last release
 - When the Release PR is merged, the release pipeline triggers automatically
-- Crates with `version.workspace = true` are bumped together; independently-versioned crates (`zeroclaw-api`, hardware library crates) are handled separately per the versioning policy
+- Crates with `version.workspace = true` are bumped together; the independently versioned `zeroclaw-api` crate is handled separately per the versioning policy
 
 The Release PR serves as a review checkpoint: the team sees exactly what version will be published and what the changelog says before anything goes out. This replaces manual version bumps and the `version-sync.yml` workflow.
 
@@ -474,7 +481,7 @@ Extract the build, test, and security jobs into reusable workflow files under `.
 
 ##### D1: Introduce `release-plz` and remove `version-sync.yml`
 
-Configure `release-plz` for the workspace. Workspace application crates use `version.workspace = true`. `zeroclaw-api` and hardware library crates are configured with independent release settings. The `version-sync.yml` workflow is retired.
+Configure `release-plz` for the workspace. Workspace application crates use `version.workspace = true`. The independently versioned `zeroclaw-api` crate uses its own release settings. The `version-sync.yml` workflow is retired.
 
 ##### D2: Build the structured release pipeline in `release.yml`
 

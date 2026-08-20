@@ -29,6 +29,7 @@ pub struct OpenAiModelProvider {
     /// `[providers.models.openai.<alias>]` config-key alias.
     alias: String,
     base_url: String,
+    canonical_base_url: &'static str,
     credential: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: u64,
@@ -64,18 +65,24 @@ struct Choice {
 struct ResponseMessage {
     #[serde(default)]
     content: Option<String>,
-    /// Reasoning/thinking models may return output in `reasoning_content`.
-    #[serde(default)]
-    reasoning_content: Option<String>,
 }
 
 impl ResponseMessage {
     fn effective_content(&self) -> String {
-        match &self.content {
-            Some(c) if !c.is_empty() => c.clone(),
-            _ => self.reasoning_content.clone().unwrap_or_default(),
-        }
+        self.content.clone().unwrap_or_default()
     }
+}
+
+/// String-only completions have no native tool-call escape hatch. An empty or
+/// reasoning-only result is therefore a typed terminal failure, not a valid
+/// string result for direct callers that do not use the structured chat API.
+fn require_terminal_text(content: String) -> anyhow::Result<String> {
+    if zeroclaw_api::model_provider::strip_think_tags(&content).is_empty() {
+        return Err(anyhow::Error::new(
+            zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+        ));
+    }
+    Ok(content)
 }
 
 #[derive(Debug, Serialize)]
@@ -215,10 +222,10 @@ struct NativeResponseMessage {
 
 impl NativeResponseMessage {
     fn effective_content(&self) -> Option<String> {
-        match &self.content {
-            Some(c) if !c.is_empty() => Some(c.clone()),
-            _ => self.reasoning_content.clone(),
-        }
+        self.content
+            .as_ref()
+            .filter(|content| !content.is_empty())
+            .cloned()
     }
 }
 
@@ -232,6 +239,7 @@ pub struct OpenAiBuilder {
     alias: String,
     credential: Option<String>,
     base_url: Option<String>,
+    canonical_base_url: Option<&'static str>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
 }
@@ -250,6 +258,11 @@ impl OpenAiBuilder {
     /// Override the API endpoint. Trailing slashes are stripped.
     pub fn base_url(mut self, base_url: &str) -> Self {
         self.base_url = Some(base_url.trim_end_matches('/').to_string());
+        self
+    }
+
+    pub(crate) fn canonical_base_url(mut self, base_url: &'static str) -> Self {
+        self.canonical_base_url = Some(base_url);
         self
     }
 
@@ -273,6 +286,7 @@ impl OpenAiBuilder {
         OpenAiModelProvider {
             alias: self.alias,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
+            canonical_base_url: self.canonical_base_url.unwrap_or(BASE_URL),
             credential: self.credential,
             max_tokens: self.max_tokens,
             timeout_secs: self.timeout_secs.unwrap_or(120),
@@ -288,6 +302,7 @@ impl OpenAiModelProvider {
             alias: alias.to_string(),
             credential: None,
             base_url: None,
+            canonical_base_url: None,
             max_tokens: None,
             timeout_secs: None,
         }
@@ -453,7 +468,7 @@ impl OpenAiModelProvider {
 impl ModelProvider for OpenAiModelProvider {
     // ── ModelProvider-family defaults ──
     fn default_base_url(&self) -> Option<&str> {
-        Some(BASE_URL)
+        Some(self.canonical_base_url)
     }
 
     async fn chat_with_system(
@@ -516,7 +531,8 @@ impl ModelProvider for OpenAiModelProvider {
             .choices
             .into_iter()
             .next()
-            .map(|c| c.message.effective_content())
+            .map(|c| require_terminal_text(c.message.effective_content()))
+            .transpose()?
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -1818,6 +1834,25 @@ mod tests {
     }
 
     #[test]
+    fn string_completion_rejects_empty_and_think_only_text() {
+        for text in ["", "  \n", "<think>internal reasoning</think>"] {
+            let error = require_terminal_text(text.to_string())
+                .expect_err("a string-only semantic-empty completion must fail");
+            assert!(error.chain().any(|cause| {
+                cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+            }));
+        }
+    }
+
+    #[test]
+    fn string_completion_keeps_visible_text() {
+        assert_eq!(
+            require_terminal_text("final answer".to_string()).unwrap(),
+            "final answer"
+        );
+    }
+
+    #[test]
     fn request_serializes_with_system_message() {
         let req = ChatRequest {
             model: "gpt-4o".to_string(),
@@ -1914,18 +1949,18 @@ mod tests {
     // ----------------------------------------------------------
 
     #[test]
-    fn reasoning_content_fallback_empty_content() {
+    fn reasoning_content_does_not_become_empty_final_content() {
         let json = r#"{"choices":[{"message":{"content":"","reasoning_content":"Thinking..."}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+        assert_eq!(resp.choices[0].message.effective_content(), "");
     }
 
     #[test]
-    fn reasoning_content_fallback_null_content() {
+    fn reasoning_content_does_not_become_missing_final_content() {
         let json =
             r#"{"choices":[{"message":{"content":null,"reasoning_content":"Thinking..."}}]}"#;
         let resp: ChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.effective_content(), "Thinking...");
+        assert_eq!(resp.choices[0].message.effective_content(), "");
     }
 
     #[test]
@@ -1936,12 +1971,12 @@ mod tests {
     }
 
     #[test]
-    fn native_response_reasoning_content_fallback() {
+    fn native_response_reasoning_content_does_not_become_final_text() {
         let json =
             r#"{"choices":[{"message":{"content":"","reasoning_content":"Native thinking"}}]}"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let msg = &resp.choices[0].message;
-        assert_eq!(msg.effective_content(), Some("Native thinking".to_string()));
+        assert_eq!(msg.effective_content(), None);
     }
 
     #[test]
@@ -2067,7 +2102,19 @@ mod tests {
         let message = resp.choices.into_iter().next().unwrap().message;
         let parsed = OpenAiModelProvider::parse_native_response(message);
         assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert_eq!(parsed.text.as_deref(), Some("answer"));
         assert_eq!(parsed.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn parse_native_response_rejects_reasoning_only_terminal_text() {
+        let json =
+            r#"{"choices":[{"message":{"content":"","reasoning_content":"thinking step"}}]}"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let message = resp.choices.into_iter().next().unwrap().message;
+        let parsed = OpenAiModelProvider::parse_native_response(message);
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("thinking step"));
+        assert!(parsed.is_semantically_empty_terminal());
     }
 
     #[test]

@@ -3,6 +3,7 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
@@ -11,19 +12,35 @@ pub struct CronRunTool {
     security: Arc<SecurityPolicy>,
     /// Owning agent — another agent's job cannot be triggered from here.
     agent_alias: String,
+    runtime: Arc<dyn RuntimeAdapter>,
 }
 
 impl CronRunTool {
-    pub fn new(
+    pub fn new_with_runtime(
         config: Arc<Config>,
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
+        runtime: Arc<dyn RuntimeAdapter>,
     ) -> Self {
         Self {
             config,
             security,
             agent_alias: agent_alias.into(),
+            runtime,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
+    ) -> Self {
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        Self::new_with_runtime(config, security, agent_alias, runtime)
     }
 }
 
@@ -104,14 +121,17 @@ impl Tool for CronRunTool {
         };
 
         if matches!(job.job_type, JobType::Shell)
-            && let Err(reason) = self
-                .security
-                .validate_command_execution(&job.command, approved)
+            && let Err(reason) = cron::validate_shell_command_with_security(
+                self.runtime.as_ref(),
+                &self.security,
+                &job.command,
+                approved,
+            )
         {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(reason),
+                error: Some(reason.to_string()),
             });
         }
 
@@ -123,11 +143,13 @@ impl Tool for CronRunTool {
             });
         }
 
-        let result = cron::scheduler::run_manual_job(
+        let result = cron::scheduler::run_manual_job_with_runtime(
             &self.config,
             &job,
             cron::scheduler::CronDeliveryContext::ToolManual,
             &None,
+            self.runtime.as_ref(),
+            approved,
         )
         .await;
 

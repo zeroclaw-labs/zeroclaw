@@ -32,15 +32,11 @@ pub fn setup_uno_q_bridge(host: Option<&str>) -> Result<()> {
 }
 
 fn deploy_remote(host: &str, bridge_dir: &std::path::Path) -> Result<()> {
-    let ssh_target = if host.contains('@') {
-        host.to_string()
-    } else {
-        format!("arduino@{}", host)
-    };
+    let ssh_target = validated_ssh_target(host)?;
 
     println!("Copying Bridge app to {}...", host);
     let status = Command::new("ssh")
-        .args([&ssh_target, "mkdir", "-p", "~/ArduinoApps"])
+        .args(["--", &ssh_target, "mkdir", "-p", "~/ArduinoApps"])
         .status()
         .context("ssh mkdir failed")?;
     if !status.success() {
@@ -50,6 +46,7 @@ fn deploy_remote(host: &str, bridge_dir: &std::path::Path) -> Result<()> {
     let status = Command::new("scp")
         .args([
             "-r",
+            "--",
             bridge_dir.to_str().unwrap(),
             &format!("{}:~/ArduinoApps/", ssh_target),
         ])
@@ -62,6 +59,7 @@ fn deploy_remote(host: &str, bridge_dir: &std::path::Path) -> Result<()> {
     println!("Starting Bridge app on Uno Q...");
     let status = Command::new("ssh")
         .args([
+            "--",
             &ssh_target,
             "arduino-app-cli",
             "app",
@@ -79,6 +77,59 @@ fn deploy_remote(host: &str, bridge_dir: &std::path::Path) -> Result<()> {
     println!("  board = \"arduino-uno-q\"");
     println!("  transport = \"bridge\"");
     Ok(())
+}
+
+fn validated_ssh_target(value: &str) -> Result<String> {
+    let mut parts = value.split('@');
+    let first = parts.next().unwrap_or_default();
+    let second = parts.next();
+    if parts.next().is_some() {
+        anyhow::bail!("Uno Q host must contain at most one '@'");
+    }
+
+    let (user, host) = match second {
+        Some(host) => (first, host),
+        None => ("arduino", first),
+    };
+
+    if !valid_ssh_user(user) {
+        anyhow::bail!(
+            "Invalid Uno Q SSH user: use only ASCII letters, digits, '.', '_', or '-' and do not begin with '-'"
+        );
+    }
+    if !valid_ssh_host(host) {
+        anyhow::bail!(
+            "Invalid Uno Q host: use a DNS hostname or IPv4 address without SSH/SCP syntax characters"
+        );
+    }
+
+    Ok(format!("{user}@{host}"))
+}
+
+fn valid_ssh_user(user: &str) -> bool {
+    !user.is_empty()
+        && !user.starts_with('-')
+        && user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn valid_ssh_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
 }
 
 fn deploy_local(bridge_dir: Option<&std::path::Path>) -> Result<()> {
@@ -164,6 +215,49 @@ mod tests {
     #[test]
     fn bridge_app_name_is_correct() {
         assert_eq!(BRIDGE_APP_NAME, "uno-q-bridge");
+    }
+
+    #[test]
+    fn ssh_target_accepts_hostname_ipv4_and_explicit_user() {
+        assert_eq!(
+            validated_ssh_target("uno-q.local").unwrap(),
+            "arduino@uno-q.local"
+        );
+        assert_eq!(
+            validated_ssh_target("192.168.0.48").unwrap(),
+            "arduino@192.168.0.48"
+        );
+        assert_eq!(
+            validated_ssh_target("operator_1@lab-node.example").unwrap(),
+            "operator_1@lab-node.example"
+        );
+    }
+
+    #[test]
+    fn ssh_target_rejects_ambiguous_or_option_like_syntax() {
+        for invalid in [
+            "",
+            "-oProxyCommand=bad",
+            "-user@host",
+            "user@-host",
+            "user@@host",
+            "user@",
+            "@host",
+            "user name@host",
+            "user@host name",
+            "user@host:path",
+            "user@[::1]",
+            "user@host/../../tmp",
+            "user@host%zone",
+            "user@host..example",
+            "user@-host.example",
+            "user@host-.example",
+        ] {
+            assert!(
+                validated_ssh_target(invalid).is_err(),
+                "{invalid:?} should be rejected"
+            );
+        }
     }
 
     #[test]

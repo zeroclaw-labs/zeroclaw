@@ -10,8 +10,10 @@ pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
+pub mod runtime_locales;
 pub mod setup_bat;
 pub mod spec;
+pub mod tools_ftl;
 
 use container::ContainerSurface;
 use spec::Selection as Sel;
@@ -46,6 +48,16 @@ fn registry() -> Vec<Surface> {
             name: "install-docs",
             file: "docs/book/src/_snippets/install.md",
             render: docs::render_file,
+        },
+        Surface {
+            name: "runtime-locales",
+            file: "crates/zeroclaw-runtime/src/generated_locales.rs",
+            render: runtime_locales::render_file,
+        },
+        Surface {
+            name: "tools-en-ftl",
+            file: "crates/zeroclaw-tools/locales/en/tools.ftl",
+            render: tools_ftl::render_file,
         },
         Surface {
             name: "readme-unix-fast",

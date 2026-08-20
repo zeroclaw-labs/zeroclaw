@@ -4,7 +4,7 @@
 
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_config::schema::PacingConfig;
@@ -161,7 +161,9 @@ pub(crate) async fn finish_after_max_iterations(
                 "final summary LLM call failed after iteration exhaustion; bailing"
             );
             history.pop();
-            anyhow::bail!("Agent exceeded maximum tool iterations ({max_iterations})")
+            return Err(e).context(format!(
+                "Agent exceeded maximum tool iterations ({max_iterations})"
+            ));
         }
         SummaryCall::Done(Ok(resp)) => resp,
     };
@@ -198,7 +200,9 @@ mod graceful_summary_metering_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_api::model_provider::{ChatRequest, ChatResponse};
+    use zeroclaw_api::model_provider::{
+        ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion,
+    };
     use zeroclaw_config::schema::{CostConfig, PacingConfig};
     use zeroclaw_providers::traits::TokenUsage;
     use zeroclaw_providers::{ChatMessage, ModelProvider};
@@ -249,7 +253,7 @@ mod graceful_summary_metering_tests {
         }
     }
 
-    async fn run_summary(provider: &CountingUsageProvider) -> anyhow::Result<String> {
+    async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig::default();
         let knobs = LoopKnobs::default(); // GracefulSummary
@@ -332,6 +336,80 @@ mod graceful_summary_metering_tests {
             0,
             "budget gate must fire before the provider call"
         );
+    }
+
+    struct SemanticEmptySummaryProvider;
+
+    #[async_trait]
+    impl ModelProvider for SemanticEmptySummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("<think>internal reasoning</think>".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(TokenUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(20),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: Some("internal reasoning".to_string()),
+            })
+        }
+    }
+
+    impl Attributable for SemanticEmptySummaryProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "semantic-empty-summary-provider"
+        }
+    }
+
+    #[tokio::test]
+    async fn graceful_summary_rejects_think_only_text_with_rejected_usage_and_typed_cause() {
+        let provider = SemanticEmptySummaryProvider;
+        let ctx = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::clone(&ctx.turn_usage);
+
+        let error = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(ctx), async {
+                run_summary(&provider)
+                    .await
+                    .expect_err("think-only summary cannot be a successful terminal answer")
+            })
+            .await;
+
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.is::<SemanticEmptyTerminalCompletion>())
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("Agent exceeded maximum tool iterations (2)"),
+            "the iteration cap remains the caller-visible summary failure: {error}"
+        );
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 100);
+        assert_eq!(recorded.output_tokens, 20);
+        assert_eq!(recorded.last_input_tokens, 0);
     }
 
     /// Provider stub that records the exact messages it was dispatched, so a
