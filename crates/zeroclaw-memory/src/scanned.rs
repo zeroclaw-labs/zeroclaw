@@ -30,6 +30,7 @@ use crate::threat::{self, Scope};
 use crate::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
 };
+use anyhow::Context as _;
 use async_trait::async_trait;
 use zeroclaw_config::schema::MemoryPolicyConfig;
 
@@ -304,6 +305,22 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.inner.name()
     }
 
+    fn as_shared_writable(&self) -> Option<&dyn crate::traits::SharedWritable> {
+        // Own the shared/system write capability whenever the wrapped backend
+        // supports it. Returning `Some(self)` (not the inner accessor) routes
+        // shared/system writes through this decorator's `SharedWritable` impl,
+        // which runs the SAME fail-closed content scan / redaction / policy the
+        // private write path runs before delegating inward. A bare forward
+        // would let a shared/system write reach the remote bank unscanned.
+        // When the backend has no shared tier, expose none so the tools stay
+        // unconstructed for it.
+        if self.inner.as_shared_writable().is_some() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
     fn refresh_embedder(
         &self,
         model_provider: &str,
@@ -561,6 +578,63 @@ impl<M: Memory> Memory for ScannedMemory<M> {
 
     async fn ensure_agent_uuid(&self, agent_alias: &str) -> anyhow::Result<String> {
         self.inner.ensure_agent_uuid(agent_alias).await
+    }
+}
+
+/// Shared/system tier writes run through the SAME write-boundary pipeline as
+/// private writes before reaching the backend.
+///
+/// The composed handle owns this capability (`ScannedMemory::as_shared_writable`
+/// returns `Some(self)`), so `shared_memory_store` / `system_memory_store` land
+/// here first: each write is redacted and content-scanned by
+/// [`ScannedMemory::process_content`] and its namespace/category is policy-gated
+/// by [`ScannedMemory::enforce_policy`] - exactly the two steps `store` performs
+/// - and only the processed content is forwarded to the inner backend's tier
+/// write. A flagged shared/system write is rejected before it reaches the remote
+/// bank (fail-closed) and a redactable one arrives redacted, so the tiers can no
+/// longer be reached unprocessed by bypassing the composed chain.
+#[async_trait]
+impl<M: Memory> crate::traits::SharedWritable for ScannedMemory<M> {
+    fn shared_bank(&self) -> Option<&str> {
+        self.inner
+            .as_shared_writable()
+            .and_then(|w| w.shared_bank())
+    }
+
+    fn system_bank(&self) -> Option<&str> {
+        self.inner
+            .as_shared_writable()
+            .and_then(|w| w.system_bank())
+    }
+
+    async fn store_to_shared(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> anyhow::Result<()> {
+        let inner = self
+            .inner
+            .as_shared_writable()
+            .context("backend does not support shared-tier writes")?;
+        let content = self.process_content(key, content, None)?;
+        self.enforce_policy(key, None, &category).await?;
+        inner.store_to_shared(key, &content, category).await
+    }
+
+    async fn store_to_system(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+    ) -> anyhow::Result<()> {
+        let inner = self
+            .inner
+            .as_shared_writable()
+            .context("backend does not support system-tier writes")?;
+        let content = self.process_content(key, content, None)?;
+        self.enforce_policy(key, None, &category).await?;
+        inner.store_to_system(key, &content, category).await
     }
 }
 
