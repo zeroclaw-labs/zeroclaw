@@ -16045,7 +16045,7 @@ BTC is currently around $65,000 based on latest tool output."#
             reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
             provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
-            config_arc: Arc::new(RwLock::new(prompt_config.clone())),
+            config_arc: Arc::new(RwLock::new((*prompt_config).clone())),
             prompt_config,
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: InterruptOnNewMessageConfig {
