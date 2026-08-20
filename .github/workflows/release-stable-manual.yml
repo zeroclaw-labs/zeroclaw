@@ -1202,6 +1202,15 @@ jobs:
             "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
 
   # ── Post-publish: package manager auto-sync ─────────────────────────
+  crates:
+    name: Publish crates.io Workspace
+    needs: [validate, publish]
+    if: ${{ !cancelled() && needs.publish.result == 'success' }}
+    uses: ./.github/workflows/pub-crates.yml
+    with:
+      release_tag: ${{ needs.validate.outputs.tag }}
+      release_sha: ${{ github.sha }}
+      dry_run: false
   scoop:
     name: Update Scoop Manifest
     needs: [validate, publish]

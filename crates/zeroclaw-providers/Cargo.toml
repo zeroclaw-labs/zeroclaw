@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "LLM provider implementations, auth services, and multimodal processing."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-log.workspace = true

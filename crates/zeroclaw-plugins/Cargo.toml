@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "WASM plugin system for ZeroClaw — host, manifests, signatures, execution bridge."
-publish = false
+repository.workspace = true
+publish = true
 
 [features]
 default = ["plugins-wit-v0"]

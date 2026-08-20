@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Interactive TUI config manager for ZeroClaw."
-publish = false
+repository.workspace = true
+publish = true
 
 [features]
 # Reserved for future SOP-authoring exposure work. The SOP pane is currently

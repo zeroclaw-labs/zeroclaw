@@ -161,10 +161,8 @@ mod tests {
     use super::*;
     use crate::PluginCapability;
 
-    const LOGGING_WIT: &str = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../wit/v0/logging.wit"
-    ));
+    const LOGGING_WIT: &str =
+        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/wit/v0/logging.wit"));
 
     #[test]
     fn wit_plugin_actions_cover_log_action_taxonomy() {

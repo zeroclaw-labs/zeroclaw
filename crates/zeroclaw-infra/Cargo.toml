@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Channel infrastructure: session backends, debouncing, stall watchdog."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-log.workspace = true

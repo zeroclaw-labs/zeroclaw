@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Shared built-in slash command catalogue for ZeroClaw surfaces."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 serde = { version = "1.0", default-features = false, features = ["derive"] }
