@@ -2426,8 +2426,6 @@ impl DelegateTool {
             }
         };
 
-        // Determine shell policy instructions when the `shell` tool is in the
-        // effective tool list.
         let empty_tools: &[Box<dyn Tool>] = &[];
         let expose_text_tools =
             sends_native_tool_specs || !agent_config.resolved.strict_tool_parsing;
@@ -2436,17 +2434,8 @@ impl DelegateTool {
         } else {
             empty_tools
         };
-        let has_shell = prompt_tools.iter().any(|t| t.name() == "shell");
-        let shell_policy = if has_shell {
-            "## Shell Policy\n\n\
-             - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
-             - Do not run commands that exfiltrate data or modify system-critical paths.\n\
-             - Avoid interactive commands that block on stdin.\n\
-             - Quote paths that may contain spaces."
-                .to_string()
-        } else {
-            String::new()
-        };
+
+        let shell_profile = self.runtime.as_ref().and_then(|r| r.shell_profile());
 
         // Build structured operational context using SystemPromptBuilder sections.
         let dispatcher_instructions = if sends_native_tool_specs || prompt_tools.is_empty() {
@@ -2464,24 +2453,21 @@ impl DelegateTool {
             identity_config: None,
             dispatcher_instructions: &dispatcher_instructions,
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
-
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            shell_profile,
         };
 
         let builder = SystemPromptBuilder::default()
             .add_section(Box::new(crate::agent::prompt::ToolsSection))
             .add_section(Box::new(crate::agent::prompt::SafetySection))
+            .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
             .add_section(Box::new(crate::agent::prompt::DateTimeSection));
 
         let mut enriched = builder.build(&ctx).unwrap_or_default();
-
-        if !shell_policy.is_empty() {
-            enriched.push_str(&shell_policy);
-            enriched.push_str("\n\n");
-        }
 
         if let Some(target_workspace) = self.agent_workspace(agent_alias) {
             let identity_files = [
@@ -6405,11 +6391,40 @@ mod tests {
             }
         }
 
+        struct PosixRuntime;
+        impl crate::platform::RuntimeAdapter for PosixRuntime {
+            fn name(&self) -> &str {
+                "posix-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::Posix
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("/bin/sh");
+                cmd.args(["-c", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
         let workspace = std::env::temp_dir();
 
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_workspace_dir(workspace.to_path_buf());
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PosixRuntime));
 
         let prompt = tool
             .build_enriched_system_prompt(
@@ -6424,8 +6439,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            prompt.contains("## Shell Policy"),
-            "should contain shell policy when shell tool is present"
+            prompt.contains("## Shell"),
+            "should contain shell section when shell tool is present"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 
@@ -6484,6 +6503,112 @@ mod tests {
         assert!(
             !prompt.contains("## Shell Policy"),
             "should not contain shell policy when shell tool is absent"
+        );
+    }
+
+    #[test]
+    fn enriched_prompt_reports_powershell_dialect_for_delegate_with_shell_tool() {
+        let config = AliasedAgentConfig::default();
+
+        struct MockShellTool;
+        impl ::zeroclaw_api::attribution::Attributable for MockShellTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Shell,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
+        #[async_trait]
+        impl Tool for MockShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Execute shell commands"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::default(),
+                    error: None,
+                })
+            }
+        }
+
+        struct PsRuntime;
+        impl crate::platform::RuntimeAdapter for PsRuntime {
+            fn name(&self) -> &str {
+                "ps-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::PowerShell
+            }
+            fn shell_profile(&self) -> Option<zeroclaw_api::runtime_traits::ShellProfile> {
+                Some(zeroclaw_api::runtime_traits::ShellProfile {
+                    name: "powershell".to_string(),
+                    dialect: crate::platform::ShellDialect::PowerShell,
+                })
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("powershell");
+                cmd.args(["-Command", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
+        let workspace = std::env::temp_dir();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PsRuntime));
+
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            prompt.contains("Shell: powershell") || prompt.contains("powershell"),
+            "prompt must identify powershell dialect; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("trash"),
+            "POSIX deletion advice must not appear in a PowerShell delegate prompt"
+        );
+        assert!(
+            prompt.contains("Get-ChildItem") || prompt.contains("Remove-Item"),
+            "PowerShell deletion guidance must appear; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 

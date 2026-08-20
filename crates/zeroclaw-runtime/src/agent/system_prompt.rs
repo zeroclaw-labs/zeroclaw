@@ -5,6 +5,7 @@
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
+use zeroclaw_api::runtime_traits::{POSIX_DELETION_GUIDANCE, ShellProfile};
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
@@ -41,6 +42,11 @@ fn load_openclaw_bootstrap_files(
     }
 }
 
+/// Build the default system prompt.
+///
+/// Reports no shell: callers that know their runtime adapter should use
+/// [`build_system_prompt_with_mode_and_autonomy`] and pass its
+/// `shell_profile` so the model is told which dialect to write.
 pub fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -87,6 +93,7 @@ pub fn build_system_prompt_with_tool_calls(
         0,
         true,
         show_tool_calls,
+        None,
     )
 }
 
@@ -119,6 +126,7 @@ pub fn build_system_prompt_with_mode(
         0,
         true,
         false,
+        None,
     )
 }
 
@@ -142,6 +150,11 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // response. When `false` (default), the system prompt instructs
     // the model to treat tool calls as invisible infrastructure.
     show_tool_calls: bool,
+    // The shell the runtime adapter will actually spawn, or `None` for a
+    // shell-less runtime (which omits the `Shell:` field and the dialect
+    // guidance entirely). Resolved from `RuntimeAdapter::shell_profile` so the
+    // reported shell cannot drift from the executed one.
+    shell_profile: Option<&ShellProfile>,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -285,7 +298,14 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              - Do not bypass oversight or approval mechanisms.\n",
         );
     }
-    prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
+    // Deletion advice follows the dialect: `trash` exists only on POSIX, so
+    // recommending it to a PowerShell or `cmd.exe` session would name a
+    // command that is not there. Shell-less runtimes keep the POSIX default,
+    // which is what they rendered before this was dialect-aware.
+    prompt.push_str(shell_profile.map_or(
+        POSIX_DELETION_GUIDANCE,
+        ShellProfile::safe_deletion_guidance,
+    ));
     prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
             "- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
@@ -302,6 +322,21 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     });
     prompt.push('\n');
+
+    // ── 2b. Shell dialect ───────────────────────────────────────
+    // Only when a registered tool takes a model-authored command: the syntax
+    // list is dead weight otherwise. Skipped in compact_context for the same
+    // reason the tool catalog is trimmed there. The `## Runtime` line still
+    // names the shell in both cases.
+    if !compact_context
+        && zeroclaw_api::runtime_traits::needs_shell_dialect_guidance(
+            tools.iter().map(|(name, _)| *name),
+        )
+        && let Some(profile) = shell_profile
+    {
+        prompt.push_str(&profile.prompt_section());
+        prompt.push('\n');
+    }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -383,11 +418,27 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // ── 7. Runtime ──────────────────────────────────────────────
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-    let _ = writeln!(
-        prompt,
-        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
-        std::env::consts::OS,
-    );
+    // The shell is reported next to the OS because the OS alone does not
+    // determine it: on Windows `cmd.exe` and PowerShell are both reachable.
+    // Omitted entirely for shell-less runtimes, which read no worse than
+    // before. See `RuntimeAdapter::shell_profile`.
+    match shell_profile {
+        Some(profile) => {
+            let _ = writeln!(
+                prompt,
+                "## Runtime\n\nHost: {host} | OS: {} | Shell: {} | Model: {model_name}\n",
+                std::env::consts::OS,
+                profile.name,
+            );
+        }
+        None => {
+            let _ = writeln!(
+                prompt,
+                "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
+                std::env::consts::OS,
+            );
+        }
+    }
 
     // ── 8. Channel Capabilities (skipped in compact_context mode) ──
     if !compact_context {
@@ -488,6 +539,276 @@ mod tests {
     use super::*;
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
 
+    /// Helper: build the prompt with a given shell profile and one registered
+    /// tool, named by `tool_name` so a caller can pick which command-taking
+    /// tool the surface holds.
+    fn build_with_shell(
+        shell_profile: Option<&zeroclaw_api::runtime_traits::ShellProfile>,
+        tool_name: &str,
+    ) -> String {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            &[(tool_name, "a registered tool")],
+            &[],
+            None,
+            Some(512),
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            shell_profile,
+        )
+    }
+
+    // ── Acceptance criteria from issue 9788 ────────────────────────────
+    //
+    // AC-1: ## Runtime includes `Shell: <name>` derived from shell_profile,
+    //       and omits the field cleanly for None.
+    // AC-2: POSIX runtimes report the configured shell name (`bash`, `zsh`…).
+    // AC-3: Windows reports `cmd` or `powershell`/`pwsh`.
+    // AC-4: Tests cover each dialect variant including the omitted case.
+
+    #[test]
+    fn ac1_runtime_line_includes_shell_field_when_profile_is_present() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "bash".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        let runtime_line = prompt
+            .lines()
+            .find(|l| l.starts_with("Host:"))
+            .expect("Runtime line present");
+        assert!(
+            runtime_line.contains("Shell: bash"),
+            "expected Shell field: {runtime_line}"
+        );
+    }
+
+    #[test]
+    fn ac1_runtime_line_omits_shell_field_when_profile_is_none() {
+        let prompt = build_with_shell(None, "shell");
+        let runtime_line = prompt
+            .lines()
+            .find(|l| l.starts_with("Host:"))
+            .expect("Runtime line present");
+        assert!(
+            !runtime_line.contains("Shell:"),
+            "unexpected Shell field in shell-less prompt: {runtime_line}"
+        );
+    }
+
+    #[test]
+    fn ac2_posix_reports_configured_shell_name() {
+        for (configured, expected) in [("bash", "bash"), ("zsh", "zsh"), ("sh", "sh")] {
+            let profile = zeroclaw_api::runtime_traits::ShellProfile {
+                name: configured.to_string(),
+                dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+            };
+            let prompt = build_with_shell(Some(&profile), "shell");
+            let runtime_line = prompt
+                .lines()
+                .find(|l| l.starts_with("Host:"))
+                .expect("Runtime line present");
+            assert!(
+                runtime_line.contains(&format!("Shell: {expected}")),
+                "configured {configured}: {runtime_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn ac3_windows_reports_cmd_or_powershell_variant() {
+        for (name, dialect) in [
+            (
+                "cmd",
+                zeroclaw_api::runtime_traits::ShellDialect::WindowsCmd,
+            ),
+            (
+                "powershell",
+                zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            ),
+            (
+                "pwsh",
+                zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            ),
+        ] {
+            let profile = zeroclaw_api::runtime_traits::ShellProfile {
+                name: name.to_string(),
+                dialect,
+            };
+            let prompt = build_with_shell(Some(&profile), "shell");
+            let runtime_line = prompt
+                .lines()
+                .find(|l| l.starts_with("Host:"))
+                .expect("Runtime line present");
+            assert!(
+                runtime_line.contains(&format!("Shell: {name}")),
+                "configured {name}: {runtime_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_section_present_for_a_cron_only_tool_surface() {
+        // `cron_add`/`cron_update`/`schedule` take a model-authored `command`
+        // that runs through the same interpreter as `shell`, so an agent
+        // holding only those is exactly as exposed to a dialect mismatch.
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "pwsh".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        for tool in ["cron_add", "cron_update", "schedule"] {
+            let prompt = build_with_shell(Some(&profile), tool);
+            assert!(
+                prompt.contains("## Shell"),
+                "{tool} writes commands and needs the dialect: {prompt}"
+            );
+            assert!(prompt.contains("Get-ChildItem"), "{tool}: {prompt}");
+        }
+    }
+
+    #[test]
+    fn shell_section_absent_without_shell_tool() {
+        // The dialect guidance is dead weight when no registered tool takes a
+        // model-authored command.
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "powershell".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            &[("file_read", "read a file")],
+            &[],
+            None,
+            Some(512),
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            Some(&profile),
+        );
+        assert!(
+            !prompt.contains("## Shell"),
+            "Shell section must be absent when shell tool is not registered"
+        );
+        // Runtime line still reports the shell name.
+        let runtime_line = prompt.lines().find(|l| l.starts_with("Host:")).unwrap();
+        assert!(runtime_line.contains("Shell: powershell"), "{runtime_line}");
+    }
+
+    #[test]
+    fn shell_section_present_and_correct_for_powershell() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "powershell".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        assert!(prompt.contains("## Shell"), "Shell section missing");
+        assert!(
+            prompt.contains("Get-ChildItem"),
+            "PowerShell syntax table missing"
+        );
+        // POSIX tool names must be ruled out as a class.
+        assert!(
+            prompt.contains("POSIX tools"),
+            "POSIX steer missing: {prompt}"
+        );
+    }
+
+    #[test]
+    fn shell_section_present_and_correct_for_pwsh() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "pwsh".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        assert!(
+            prompt.contains("PowerShell 7+"),
+            "pwsh must note PS 7+: {prompt}"
+        );
+    }
+
+    #[test]
+    fn shell_section_present_and_correct_for_cmd() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile::from_dialect(
+            zeroclaw_api::runtime_traits::ShellDialect::WindowsCmd,
+        )
+        .unwrap();
+        let prompt = build_with_shell(Some(&profile), "shell");
+        assert!(prompt.contains("## Shell"), "Shell section missing");
+        assert!(
+            prompt.contains("dir /a"),
+            "cmd syntax table missing: {prompt}"
+        );
+        assert!(prompt.contains("findstr"), "{prompt}");
+    }
+
+    #[test]
+    fn posix_shell_section_has_no_syntax_table() {
+        // POSIX tool names don't need correction; emitting a table wastes tokens.
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "bash".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        // The ## Shell section heading is still emitted (name is useful).
+        assert!(prompt.contains("## Shell"), "{prompt}");
+        assert!(
+            !prompt.contains("Get-ChildItem"),
+            "no PS table in POSIX prompt"
+        );
+        assert!(!prompt.contains("dir /a"), "no cmd table in POSIX prompt");
+    }
+
+    #[test]
+    fn deletion_guidance_follows_dialect_not_hardcoded() {
+        // `trash` is only POSIX. PowerShell and cmd must get their own advice.
+        let posix_prompt = build_with_shell(
+            Some(&zeroclaw_api::runtime_traits::ShellProfile {
+                name: "bash".to_string(),
+                dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+            }),
+            "shell",
+        );
+        assert!(posix_prompt.contains("trash"), "POSIX must mention trash");
+
+        let ps_prompt = build_with_shell(
+            Some(&zeroclaw_api::runtime_traits::ShellProfile {
+                name: "powershell".to_string(),
+                dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            }),
+            "shell",
+        );
+        assert!(!ps_prompt.contains("trash"), "PS must not mention trash");
+        assert!(ps_prompt.contains("-WhatIf"), "PS must mention -WhatIf");
+
+        let cmd_prompt = build_with_shell(
+            Some(
+                &zeroclaw_api::runtime_traits::ShellProfile::from_dialect(
+                    zeroclaw_api::runtime_traits::ShellDialect::WindowsCmd,
+                )
+                .unwrap(),
+            ),
+            "shell",
+        );
+        assert!(!cmd_prompt.contains("trash"), "cmd must not mention trash");
+        assert!(
+            cmd_prompt.contains("rmdir /s"),
+            "cmd must name the destructive tool"
+        );
+    }
+
     fn build_with_autonomy(tools: &[(&str, &str)], level: AutonomyLevel) -> String {
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let autonomy = zeroclaw_config::schema::RiskProfileConfig {
@@ -508,6 +829,7 @@ mod tests {
             0,
             true,
             false,
+            None,
         )
     }
 

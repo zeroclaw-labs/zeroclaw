@@ -2,8 +2,9 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamInterruptedAfterOutput,
-    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
+    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
+    StreamSemanticEmptyCompletion,
 };
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -117,9 +118,13 @@ pub(crate) async fn consume_provider_streaming_response(
                     // exactly like the pre-consolidation engine's
                     // committed-partial-on-cancel.
                     if forwarded_text.is_empty() {
-                        return Err(ToolLoopCancelled.into());
+                        return Err(StreamCancelledWithUsage::new(outcome.usage).into());
                     }
-                    return Err(StreamCancelledAfterOutput::new(forwarded_text).into());
+                    return Err(StreamCancelledAfterOutput::with_usage(
+                        forwarded_text,
+                        outcome.usage,
+                    )
+                    .into());
                 }
                 chunk = provider_stream.next() => chunk,
             }
@@ -151,10 +156,15 @@ pub(crate) async fn consume_provider_streaming_response(
                     return Err(StreamInterruptedAfterOutput {
                         partial_text: forwarded_text,
                         message,
+                        usage: outcome.usage,
                     }
                     .into());
                 }
-                return Err(anyhow::Error::msg(message));
+                return Err(StreamErrorWithUsage {
+                    message,
+                    usage: outcome.usage,
+                }
+                .into());
             }
         };
         match event {
@@ -315,12 +325,17 @@ mod tests {
     use zeroclaw_api::model_provider::StreamChunk;
     use zeroclaw_providers::ToolCall;
     use zeroclaw_providers::traits::{
-        ChatResponse, ProviderCapabilities, StreamOptions, StreamResult,
+        ChatResponse, ProviderCapabilities, StreamOptions, StreamResult, TokenUsage,
     };
 
     struct ToolThenTextProvider;
 
     struct EmptyStreamProvider;
+
+    struct CancelAfterUsageProvider {
+        cancellation: CancellationToken,
+        cancel_after_visible_output: bool,
+    }
 
     impl ::zeroclaw_api::attribution::Attributable for ToolThenTextProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -345,6 +360,19 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "EmptyStreamProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CancelAfterUsageProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CancelAfterUsageProvider"
         }
     }
 
@@ -446,6 +474,74 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for CancelAfterUsageProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let cancellation = self.cancellation.clone();
+            let cancel_after_visible_output = self.cancel_after_visible_output;
+            Box::pin(futures_util::stream::unfold(0_u8, move |state| {
+                let cancellation = cancellation.clone();
+                async move {
+                    match state {
+                        0 => Some((
+                            Ok(StreamEvent::Usage(TokenUsage {
+                                input_tokens: Some(10),
+                                output_tokens: Some(5),
+                                cached_input_tokens: None,
+                            })),
+                            1,
+                        )),
+                        1 => {
+                            if cancel_after_visible_output {
+                                return Some((
+                                    Ok(StreamEvent::TextDelta(StreamChunk::delta("visible"))),
+                                    2,
+                                ));
+                            }
+                            cancellation.cancel();
+                            std::future::pending::<()>().await;
+                            None
+                        }
+                        2 => {
+                            std::future::pending::<()>().await;
+                            None
+                        }
+                        _ => None,
+                    }
+                }
+            }))
+        }
+    }
+
     #[tokio::test]
     async fn forwards_text_deltas_emitted_after_a_native_tool_call() {
         let provider = ToolThenTextProvider;
@@ -500,6 +596,84 @@ mod tests {
             err.to_string(),
             "provider stream completed without final text or tool calls"
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_reported_usage_preserves_rejected_usage() {
+        let cancellation = CancellationToken::new();
+        let provider = CancelAfterUsageProvider {
+            cancellation: cancellation.clone(),
+            cancel_after_visible_output: false,
+        };
+
+        let error = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            Some(&cancellation),
+            None,
+            None,
+            false,
+        )
+        .await
+        .expect_err("cancellation must interrupt the stream");
+
+        let cancelled = error
+            .downcast_ref::<StreamCancelledWithUsage>()
+            .expect("pre-output cancellation retains its typed outcome");
+        let usage = cancelled
+            .usage
+            .as_ref()
+            .expect("reported usage must survive cancellation");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_visible_output_preserves_usage_and_partial_text() {
+        let cancellation = CancellationToken::new();
+        let provider = CancelAfterUsageProvider {
+            cancellation: cancellation.clone(),
+            cancel_after_visible_output: true,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
+        let cancel_after_chunk = cancellation.clone();
+        let observed_chunk = zeroclaw_spawn::spawn!(async move {
+            let event = event_rx.recv().await;
+            cancel_after_chunk.cancel();
+            event
+        });
+
+        let error = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            Some(&cancellation),
+            None,
+            Some(&event_tx),
+            false,
+        )
+        .await
+        .expect_err("cancellation must interrupt the stream");
+
+        let cancelled = error
+            .downcast_ref::<StreamCancelledAfterOutput>()
+            .expect("visible cancellation keeps its typed partial outcome");
+        assert_eq!(cancelled.partial_text, "visible");
+        let usage = cancelled
+            .usage
+            .as_ref()
+            .expect("reported usage must survive visible cancellation");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        match observed_chunk.await.expect("chunk observer task must join") {
+            Some(TurnEvent::Chunk { delta }) => assert_eq!(delta, "visible"),
+            other => panic!("expected one visible text chunk, got {other:?}"),
+        }
     }
 
     struct MarkerTestProvider {

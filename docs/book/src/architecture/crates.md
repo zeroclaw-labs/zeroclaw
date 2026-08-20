@@ -146,10 +146,6 @@ Derive macros for config schema, tool registration, and channel registration. Sa
 
 Terminal UI, built as a separate app under `apps/zerocode/`. It is its own workspace member with no `zeroclaw-*` crate dependency (see [Docs & Translations → zerocode strings](../maintainers/docs-and-translations.md) for its independent i18n catalogue).
 
-### `aardvark-sys`, `robot-kit`
-
-Specialised hardware support used by the `hardware` submodule. Out-of-scope unless you're bringing up specific peripherals.
-
 ## Feature flags
 
 The microkernel roadmap (RFC #5574) defines a feature-flag taxonomy. The practical upshot for a user:

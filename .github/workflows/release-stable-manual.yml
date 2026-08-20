@@ -293,7 +293,7 @@ jobs:
 
       - name: Install cross (MUSL targets)
         if: matrix.use_cross
-        run: cargo install cross --version 0.2.5 --locked
+        run: bash scripts/ci/install_release_tool.sh cross
 
       - name: Setup Android NDK
         if: matrix.ndk
@@ -407,7 +407,7 @@ jobs:
           node-version-file: '.nvmrc'
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked
+        run: bash scripts/ci/install_release_tool.sh tauri-cli
 
       - name: Sync Tauri version with Cargo.toml
         shell: bash
@@ -604,7 +604,7 @@ jobs:
           prefix-key: linux-tauri
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked
+        run: bash scripts/ci/install_release_tool.sh tauri-cli
 
       - name: Sync Tauri version with Cargo.toml
         shell: bash
@@ -653,7 +653,8 @@ jobs:
           prefix-key: windows-tauri
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --locked
+        shell: bash
+        run: bash scripts/ci/install_release_tool.sh tauri-cli
 
       - name: Sync Tauri version with Cargo.toml
         shell: bash

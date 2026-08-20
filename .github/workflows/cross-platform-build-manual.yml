@@ -120,7 +120,7 @@ jobs:
 
       - name: Install cross (MUSL targets)
         if: matrix.use_cross
-        run: cargo install cross --version 0.2.5 --locked
+        run: bash scripts/ci/install_release_tool.sh cross
 
       - name: Setup Android NDK
         if: matrix.ndk

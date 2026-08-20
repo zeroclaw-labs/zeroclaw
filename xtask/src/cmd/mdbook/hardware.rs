@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::fmt::Write as _;
 use std::path::Path;
 
-use zeroclaw_hardware::catalog::{AARDVARK_TOOLS, BASE_TOOLS};
+use zeroclaw_hardware::catalog::BASE_TOOLS;
 use zeroclaw_hardware::registry::known_boards;
 use zeroclaw_hardware::transport::TransportKind;
 
@@ -28,10 +28,6 @@ pub fn run(root: &Path) -> Result<()> {
     std::fs::write(
         dir.join("hardware-tools-base.md"),
         render_tool_list(BASE_TOOLS),
-    )?;
-    std::fs::write(
-        dir.join("hardware-tools-aardvark.md"),
-        render_tool_list(AARDVARK_TOOLS),
     )?;
     std::fs::write(
         dir.join("hardware-release-targets.md"),
@@ -71,10 +67,6 @@ fn render_transports() -> String {
         (
             TransportKind::Native,
             "Direct Linux GPIO/I2C/SPI (rppal, sysfs)",
-        ),
-        (
-            TransportKind::Aardvark,
-            "Total Phase Aardvark USB adapter (I2C/SPI/GPIO)",
         ),
     ] {
         let _ = writeln!(out, "| `{kind}` | {desc} |");

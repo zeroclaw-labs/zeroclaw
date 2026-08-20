@@ -5018,44 +5018,31 @@ mod tests {
     /// reconnect branch from the production helper will fail this
     /// test (not silently let the dead child leak across ticks).
     ///
-    /// Unix-only: the fixture writes a Bash script, chmods it via
-    /// `PermissionsExt`, and invokes `kill`. The test is gated under
-    /// `#[cfg(unix)]` so the repository's Windows `cargo test
-    /// --no-run` target for `zeroclaw-runtime` stays green.
+    /// Unix-only: the fixture symlinks to a checked-in stdio MCP server
+    /// script and invokes `kill`. The test is gated under `#[cfg(unix)]`
+    /// so the repository's Windows `cargo test --no-run` target for
+    /// `zeroclaw-runtime` stays green.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn heartbeat_worker_reconnects_after_stdio_child_exits() {
-        use std::os::unix::fs::PermissionsExt;
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
 
         let _test_hook_guard = heartbeat_mcp_registry_without_test_hook();
         let tmp = TempDir::new().unwrap();
 
-        // ── 1. Build a tiny stdio MCP server script ──────────────────────
+        // ── 1. Point at a tiny stdio MCP server script ───────────────────
+        //    Symlink to a checked-in fixture instead of writing a fresh
+        //    executable inside this already-multithreaded test process:
+        //    a concurrently forked child can inherit the write
+        //    descriptor and make the subsequent exec fail with
+        //    ETXTBSY. Creating a symlink does not open an executable
+        //    for writing, so it removes that race.
         let pid_path = tmp.path().join("pid");
         let server_path = tmp.path().join("mcp-server.sh");
-        std::fs::write(
-        &server_path,
-        format!(
-            r#"#!/usr/bin/env bash
-echo $$ > "{}"
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"reconnect-test","version":"0.1.0"}}}}}}'
-      ;;
-    *'"method":"tools/list"'*)
-      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}'
-      ;;
-  esac
-done
-"#,
-            pid_path.display(),
-        ),
-    )
-    .expect("write server script");
-        std::fs::set_permissions(&server_path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod +x");
+        let fixture_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-server.sh");
+        std::os::unix::fs::symlink(&fixture_path, &server_path)
+            .expect("symlink mcp server fixture");
 
         // ── 2. Build a config that grants this stdio server ─────────────
         let mut config = test_config(&tmp);
