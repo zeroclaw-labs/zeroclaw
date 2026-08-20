@@ -130,19 +130,28 @@ rand = "0.10"
 webpki-roots = "1.0.6"
 tokio-socks = "0.5"
 
-# WhatsApp Web (optional). Pinned to oxidezap/whatsapp-rust @ cbcdd2a
-# until upstream ships 0.6.1 to crates.io.
-whatsapp-rust = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false, features = [
+# WhatsApp Web (optional). Registry releases from oxidezap/whatsapp-rust.
+#
+# These were a git pin (b5daf757) until this change. The ceiling on that pin was
+# a6fb1174 "migrate from prost to buffa for protobuf codegen", which rewrites
+# every generated waproto field from Option<Box<T>> to MessageField<T>. 0.7.0
+# sits above that migration, so moving here was a port of whatsapp_web.rs and
+# whatsapp_storage.rs rather than a version bump.
+#
+# Taking the registry releases is what lets zeroclaw-channels be published to
+# crates.io at all: the registry rejects git dependencies regardless of whether
+# they are optional.
+whatsapp-rust = { version = "0.7.0", optional = true, default-features = false, features = [
   "tokio-runtime",
 ] }
-wacore = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
-wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
-waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
+wacore = { version = "0.7.0", optional = true, default-features = false }
+wacore-binary = { version = "0.7.0", optional = true, default-features = false }
+waproto = { version = "0.7.0", optional = true, default-features = false }
 serde-big-array = { version = "0.5", optional = true }
 
 cpal = { version = "0.18.1", optional = true }
-whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true }
-whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
+whatsapp-rust-ureq-http-client = { version = "0.7.0", optional = true }
+whatsapp-rust-tokio-transport = { version = "0.7.0", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
 # `bytes` is required for the `Bytes` return types in wacore 0.6 storage
 # traits (SignalStore::get_session / load_prekey). Feature-gated to
