@@ -280,6 +280,25 @@ impl Memory for AgentScopedMemory {
             .collect())
     }
 
+    async fn list_own_daily_history(&self) -> Result<Vec<MemoryEntry>> {
+        // Own-history query for the per-turn Daily dedup gate. The trait
+        // default lists `Daily`, but `AgentScopedMemory::list` intentionally
+        // keeps EVERY row whose `agent_id` is in `allowed_agent_ids` - the
+        // bound agent PLUS every `read_memory_from` sibling - so on this
+        // wrapper the default is a cross-agent read, not an own-history read.
+        // With `daily_dedup = true` that would let a sibling's Daily row
+        // suppress THIS agent's private Daily write, silently erasing the turn
+        // from the bound agent's own history even though the agent never
+        // persisted the fact. Filter STRICTLY to the bound `agent_id` (never
+        // the allowlist) so dedup only ever compares the agent against its own
+        // prior Daily rows.
+        let entries = self.inner.list(Some(&MemoryCategory::Daily), None).await?;
+        Ok(entries
+            .into_iter()
+            .filter(|e| e.agent_id.as_deref() == Some(self.agent_id.as_str()))
+            .collect())
+    }
+
     async fn forget(&self, key: &str) -> Result<bool> {
         if self.inner.forget_for_agent(key, &self.agent_id).await? {
             return Ok(true);
@@ -346,7 +365,9 @@ impl Memory for AgentScopedMemory {
 
     async fn count(&self) -> Result<usize> {
         // Scope to the bound + allowlisted agents so a wrapper-using
-        // caller does not see the install-wide row total.
+        // caller does not see the install-wide row total. This is
+        // VISIBILITY-scoped (includes allowlisted peers) for the recall/list
+        // use case; own-footprint callers must use `count_own` instead.
         let entries = self.inner.list(None, None).await?;
         Ok(entries
             .into_iter()
@@ -356,6 +377,12 @@ impl Memory for AgentScopedMemory {
                     .is_some_and(|aid| self.allowed_agent_ids.contains(aid))
             })
             .count())
+    }
+
+    async fn count_own(&self) -> Result<u64> {
+        // Narrower than `count()`: only the bound agent's own rows, via the
+        // backend's native uncapped count, never allowlisted peers.
+        self.inner.count_by_agent_id(&self.agent_id).await
     }
 
     async fn purge_namespace(&self, namespace: &str) -> Result<usize> {
@@ -1089,6 +1116,188 @@ mod tests {
         assert!(
             !hits.iter().any(|e| e.key == "rogue-key"),
             "caller allowlist must be intersected, not unioned"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_own_daily_history_excludes_allowlisted_sibling_and_cannot_suppress_own_write() {
+        // B1 regression: `list_own_daily_history` must scope STRICTLY to the
+        // bound agent, never the `read_memory_from` allowlist. Otherwise, with
+        // `daily_dedup = true`, a matching SIBLING Daily row could suppress
+        // THIS agent's private Daily write, silently erasing the turn from the
+        // bound agent's own history even though it never persisted the fact.
+        use crate::consolidation::consolidate_daily_history_for_test;
+        use zeroclaw_config::schema::MemoryConfig;
+
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        // Seed an identical Daily summary attributed to the ALLOWLISTED
+        // sibling (beta). The bound agent (alpha) has NO Daily row of its own.
+        let summary = "User asked what time it is";
+        inner
+            .store_with_agent(
+                "beta-daily",
+                summary,
+                MemoryCategory::Daily,
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+
+        // Wrapper is bound to alpha and allowlists beta for recall.
+        let wrapper =
+            AgentScopedMemory::new(as_dyn(inner.clone()), alpha_uuid, vec![beta_uuid.clone()]);
+
+        // `list` (allowlist-scoped) DOES see the sibling row...
+        let listed = wrapper
+            .list(Some(&MemoryCategory::Daily), None)
+            .await
+            .unwrap();
+        assert!(
+            listed.iter().any(|e| e.key == "beta-daily"),
+            "sanity: allowlist-scoped list includes the sibling's Daily row"
+        );
+
+        // ...but the own-history query must NOT: it is strictly the bound agent.
+        let own = wrapper.list_own_daily_history().await.unwrap();
+        assert!(
+            own.is_empty(),
+            "own-Daily history must exclude allowlisted sibling rows; got {own:?}"
+        );
+
+        // End-to-end: with daily_dedup on, the bound agent's write must land
+        // even though a byte-identical sibling row already exists.
+        let cfg = MemoryConfig {
+            daily_dedup: true,
+            ..MemoryConfig::default()
+        };
+        consolidate_daily_history_for_test(&wrapper, &cfg, summary)
+            .await
+            .unwrap();
+
+        let alpha_daily = inner
+            .list(Some(&MemoryCategory::Daily), None)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.agent_id.as_deref() == Some(alpha_uuid.as_str()))
+            .count();
+        assert_eq!(
+            alpha_daily, 1,
+            "the bound agent's private Daily write must not be suppressed by an allowlisted sibling's duplicate row"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_own_excludes_allowlisted_peer_rows() {
+        // `count_own` is the bound agent's own footprint, NOT the
+        // visibility-scoped `count()` (which includes allowlisted peers).
+        // Alpha allowlists beta for READ access, but beta's rows must not be
+        // counted as part of alpha's own footprint.
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        inner
+            .store_with_agent(
+                "alpha-row",
+                "v",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(alpha_uuid),
+            )
+            .await
+            .unwrap();
+        for i in 0..3 {
+            inner
+                .store_with_agent(
+                    &format!("beta-row-{i}"),
+                    "v",
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    Some(beta_uuid),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, vec![beta_uuid.clone()]);
+
+        // Sanity: visibility-scoped `count()` includes the allowlisted peer.
+        assert_eq!(
+            wrapper.count().await.unwrap(),
+            4,
+            "count() is visibility-scoped and includes the allowlisted peer's rows"
+        );
+        // `count_own` must exclude them.
+        assert_eq!(
+            wrapper.count_own().await.unwrap(),
+            1,
+            "count_own must report only the bound agent's own row, never allowlisted peers"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_own_is_correct_above_the_list_row_cap() {
+        // SQLite's `list()` caps at 1,000 rows before agent filtering, so the
+        // trait's default `count_by_agent_id` (list + filter) would undercount
+        // an agent with more rows than that, or one whose rows sort outside
+        // the capped slice. `count_own` must use the native uncapped COUNT
+        // query instead.
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "noise"]).await;
+        let alpha_uuid = &uuids[0];
+        let noise_uuid = &uuids[1];
+
+        // Seed 1,005 "noise" rows attributed to a different agent so they sort
+        // ahead of alpha's rows in `list()`'s `ORDER BY updated_at DESC`
+        // (inserted first => older `updated_at` => NOT ahead; insert noise
+        // AFTER alpha's rows so noise is newer and pushes alpha's single row
+        // past the 1,000-row cap).
+        inner
+            .store_with_agent(
+                "alpha-only-row",
+                "v",
+                MemoryCategory::Core,
+                None,
+                None,
+                None,
+                Some(alpha_uuid),
+            )
+            .await
+            .unwrap();
+        for i in 0..1005 {
+            inner
+                .store_with_agent(
+                    &format!("noise-{i}"),
+                    "v",
+                    MemoryCategory::Core,
+                    None,
+                    None,
+                    None,
+                    Some(noise_uuid),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new(as_dyn(inner), alpha_uuid, Vec::<String>::new());
+
+        assert_eq!(
+            wrapper.count_own().await.unwrap(),
+            1,
+            "count_own must find the agent's row via a native COUNT, not a capped list+filter"
         );
     }
 }

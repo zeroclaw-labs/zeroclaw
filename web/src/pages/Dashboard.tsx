@@ -2831,7 +2831,11 @@ function DashboardMetrics({ agents }: { agents: AgentSummary[] }) {
   const total = agents.length;
   const enabled = agents.filter((a) => a.enabled).length;
   const totalSessions = agents.reduce((sum, a) => sum + a.sessionCount, 0);
-  const totalMemories = agents.reduce((sum, a) => sum + a.memoryCount, 0);
+  // Best-effort aggregate total: an unavailable agent contributes 0 to the
+  // SUM (there is no per-agent card to show its own "unavailable" state at
+  // this granularity), but per-agent cards below render "unavailable"
+  // distinctly rather than a misleading 0.
+  const totalMemories = agents.reduce((sum, a) => sum + (a.memoryCount ?? 0), 0);
   // monthCostUsd is null when per-agent cost tracking is disabled; only sum the
   // agents that actually report a figure, and surface whether any did.
   const trackedSpend = agents.filter((a) => a.monthCostUsd !== null);

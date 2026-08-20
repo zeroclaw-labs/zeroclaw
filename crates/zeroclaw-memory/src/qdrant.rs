@@ -910,6 +910,44 @@ impl Memory for QdrantMemory {
         Ok(count)
     }
 
+    async fn count_by_agent_id(&self, agent_id: &str) -> Result<u64> {
+        self.ensure_initialized().await?;
+
+        // Native `/points/count` with an exact `agent_id` filter, not the
+        // capped `list_for_agents` (1,000-row scroll limit) the trait
+        // default composes. Qdrant keys points by alias in the `agent_id`
+        // payload field, so `agent_id` here is the alias, same as
+        // `count_agent`/`rename_agent`.
+        let body = serde_json::json!({
+            "filter": Self::must_filter(&[("agent_id", agent_id)]),
+            "exact": true,
+        });
+
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/collections/{}/points/count", self.collection),
+            )
+            .json(&body)
+            .send()
+            .await
+            .context("failed to count Qdrant points for agent")?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant points count failed ({status}): {text}");
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+        let count = json
+            .get("result")
+            .and_then(|r| r.get("count"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        Ok(count)
+    }
+
     async fn health_check(&self) -> bool {
         let resp = self.request(reqwest::Method::GET, "/").send().await;
 
@@ -1202,5 +1240,46 @@ mod tests {
         let json = serde_json::to_string(&payload).unwrap();
         assert!(!json.contains("session_id"));
         assert!(!json.contains("agent_id"));
+    }
+
+    #[tokio::test]
+    async fn count_by_agent_id_uses_native_points_count_not_capped_scroll() {
+        // `count_by_agent_id` must hit `/points/count` with an exact agent_id
+        // filter, not `list_for_agents`'s capped 1,000-row scroll. A server
+        // that reports a count above the scroll cap proves the native path is
+        // being used: a list+filter fallback could never exceed 1,000.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/collections/mem"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "result": { "points_count": 0 }
+                })),
+            )
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/collections/mem/points/count"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "result": { "count": 1234 }
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let mem = QdrantMemory::new_lazy(
+            "test",
+            &server.uri(),
+            "mem",
+            None,
+            Arc::new(super::super::embeddings::NoopEmbedding),
+        );
+
+        let count = mem.count_by_agent_id("alpha").await.unwrap();
+        assert_eq!(
+            count, 1234,
+            "count_by_agent_id must report the native /points/count result, above the 1,000-row scroll cap"
+        );
     }
 }

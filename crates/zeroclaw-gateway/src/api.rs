@@ -230,11 +230,33 @@ pub struct SessionMessagePostBody {
 /// Query parameters for `GET /api/status`. Pass `?agent=<alias>` to
 /// have `model_provider`, `model`, `temperature`, and `memory_backend`
 /// reflect that specific agent's resolved config; omit it for the
-/// install-wide summary.
+/// install-wide summary. An `agent` value naming no `[agents.<alias>]`
+/// entry is rejected (404 Not Found) rather than silently falling back to
+/// the install-wide view — see [`handle_api_status`].
 #[derive(Debug, Deserialize)]
 pub struct StatusQuery {
     #[serde(default)]
     pub agent: Option<String>,
+}
+
+/// Short, status-specific deadline for the per-agent memory count: far below
+/// the (configurable, default 30s) Hindsight per-request timeout, so a
+/// stalled remote backend cannot hold the core `/api/status` response — or,
+/// via `loadAgentSummaries()`'s one-request-per-agent fanout, the whole
+/// Agents page — hostage for anywhere near that long. A slow/unreachable
+/// backend surfaces as `memory_status: "unavailable"` well within normal
+/// dashboard polling cadence rather than hanging the request.
+const STATUS_MEMORY_COUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Resolve a memory handle's own-footprint count under the short status
+/// deadline. `None` covers every failure mode uniformly (count error OR
+/// timeout) — the caller renders that as `memory_status: "unavailable"`,
+/// distinct from a genuine `Some(0)` empty store.
+async fn memory_count_own_with_deadline(handle: &dyn zeroclaw_memory::Memory) -> Option<u64> {
+    match tokio::time::timeout(STATUS_MEMORY_COUNT_TIMEOUT, handle.count_own()).await {
+        Ok(Ok(n)) => Some(n),
+        Ok(Err(_)) | Err(_) => None,
+    }
 }
 
 /// GET /api/status — system status overview
@@ -265,12 +287,26 @@ pub async fn handle_api_status(
         .map(String::from)
         .unwrap_or_else(zeroclaw_runtime::i18n::detect_locale);
 
-    // Per-agent resolution when `?agent=<alias>` is supplied. Falls back
-    // to the install-wide first-of-each view when the alias is unknown
-    // (so the dashboard's old shape still renders during onboarding,
-    // before any agent exists).
     let agent_alias = query.agent.as_deref().filter(|s| !s.trim().is_empty());
-    let (model_provider, model, temperature, memory_backend) =
+
+    // An `?agent=<alias>` naming no `[agents.<alias>]` entry is rejected
+    // outright: silently falling back to the install-wide view while still
+    // echoing the unknown alias in `agent_alias` (the prior behavior) makes
+    // global data look like it belongs to a non-existent agent. Validated
+    // here, once, before any per-agent resolution below.
+    if let Some(alias) = agent_alias
+        && config.agent(alias).is_none()
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": format!(
+                "Unknown agent {alias:?} (no [agents.{alias}] entry configured)"
+            )})),
+        )
+            .into_response();
+    }
+
+    let (model_provider, model, temperature) =
         match agent_alias.and_then(|alias| config.agent(alias).map(|a| (alias, a))) {
             Some((alias, agent)) => {
                 let provider_ref = if agent.model_provider.is_empty() {
@@ -285,12 +321,7 @@ pub async fn handle_api_status(
                     .unwrap_or_default();
                 let temperature: Option<f64> =
                     resolved.as_ref().and_then(|(_, _, cfg)| cfg.temperature);
-                let backend_kind = agent.memory.backend;
-                let backend = serde_json::to_value(backend_kind)
-                    .ok()
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| format!("{backend_kind:?}").to_lowercase());
-                (provider_ref, model, temperature, backend)
+                (provider_ref, model, temperature)
             }
             None => (
                 config
@@ -301,7 +332,6 @@ pub async fn handle_api_status(
                     .map(|(ty, alias, _)| format!("{ty}.{alias}")),
                 state.model.clone(),
                 state.temperature,
-                state.mem.name().to_string(),
             ),
         };
 
@@ -310,6 +340,62 @@ pub async fn handle_api_status(
     // Upgrade affordance: whether the dashboard should poll for updates / offer
     // the upgrade button, and which restart command to show afterwards.
     let restart = crate::version::detect_restart();
+
+    // Memory backend label + count for the active backend, derived from ONE
+    // resolved handle so they can never disagree. Previously the label came
+    // from the per-agent config ENUM (`agent.memory.backend`) while the count
+    // came from the resolved handle; under the install-wide Hindsight
+    // fallback (`[memory] backend = "hindsight"` with a default/unset
+    // per-agent enum) the factory builds a Hindsight handle while the enum
+    // stays `sqlite`, so the old code showed a `sqlite` label next to a
+    // Hindsight count. `Memory::name()` on the SAME handle that produced the
+    // count is the single source of truth for both.
+    //
+    // `memory_status` distinguishes a genuinely empty store (`"ok"` +
+    // `memory_count: 0`) from one that couldn't be queried (`"unavailable"` +
+    // `memory_count: null`) — handle-construction failure, a count error, and
+    // a count that blew the short status deadline all collapse to the same
+    // `"unavailable"` state instead of the misleading `0` the API used to
+    // return for all three.
+    //
+    // A KNOWN agent whose handle fails to build stays `"unavailable"` rather
+    // than borrowing the install-wide `state.mem` count, which would
+    // misreport another scope's total; its label falls back to the
+    // configured enum since no live handle exists to ask. Only a genuinely
+    // unscoped request (no `?agent=`) uses the install-wide handle.
+    let (memory_backend, memory_count, memory_status) = match agent_alias {
+        Some(alias) => match resolve_memory_handle(&state, Some(alias)).await {
+            Ok(handle) => {
+                let backend = handle.name().to_string();
+                match memory_count_own_with_deadline(handle.as_ref()).await {
+                    Some(n) => (backend, Some(n), "ok"),
+                    None => (backend, None, "unavailable"),
+                }
+            }
+            Err(_) => {
+                // Handle-construction failed (backend unreachable/misconfigured).
+                // No live handle exists, so fall back to the configured enum for
+                // the label; the count is unavailable, not a borrowed
+                // install-wide total.
+                let backend_kind = config
+                    .agent(alias)
+                    .map(|a| a.memory.backend)
+                    .unwrap_or_default();
+                let backend = serde_json::to_value(backend_kind)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| format!("{backend_kind:?}").to_lowercase());
+                (backend, None, "unavailable")
+            }
+        },
+        None => {
+            let backend = state.mem.name().to_string();
+            match memory_count_own_with_deadline(state.mem.as_ref()).await {
+                Some(n) => (backend, Some(n), "ok"),
+                None => (backend, None, "unavailable"),
+            }
+        }
+    };
 
     let body = serde_json::json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -321,6 +407,8 @@ pub async fn handle_api_status(
         "gateway_port": config.gateway.port,
         "locale": locale,
         "memory_backend": memory_backend,
+        "memory_count": memory_count,
+        "memory_status": memory_status,
         "paired": state.pairing.is_paired(),
         "channels": channels,
         "nodes": {
@@ -2494,6 +2582,305 @@ pub(crate) mod tests {
         assert_eq!(json["entries"][0]["key"], "huge-memory");
         assert_eq!(json["entries"][0]["category"], "conversation");
         assert_ne!(content, huge);
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_reports_memory_count_from_active_backend() {
+        // Regression for the dashboard "0 memories" bug: the status endpoint
+        // must surface a live entry count from the resolved backend so the UI
+        // no longer bucketed install-wide entries by `agent_alias` (which read 0
+        // for hindsight). Here the install-wide `state.mem` holds three rows;
+        // the unscoped status count must be 3.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let entries = vec![
+            memory_entry_with_content("one".into()),
+            memory_entry_with_content("two".into()),
+            memory_entry_with_content("three".into()),
+        ];
+        let state = test_state_with_memory(config, entries);
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["memory_count"], 3);
+        assert_eq!(json["memory_status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_memory_count_zero_when_backend_empty() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let state = test_state_with_memory(config, Vec::new());
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery { agent: None }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        // A genuinely empty store is `memory_status: "ok"` + `memory_count: 0`,
+        // distinct from `"unavailable"` + `null` (see the handle-failure and
+        // never-responding-backend regressions below).
+        assert_eq!(json["memory_count"], 0);
+        assert_eq!(json["memory_status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_reports_scoped_hindsight_count() {
+        // A KNOWN agent whose handle builds and reaches its backend must report
+        // the REAL per-agent count from that handle, not the install-wide
+        // `state.mem`. Agent `user_a` selects hindsight install-wide; its private
+        // bank is `zeroclaw-user_a`. The install-wide handle holds a single entry,
+        // so a count equal to the bank total (7) proves the scoped handle - not
+        // `state.mem` - produced the number.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v1/default/banks/zeroclaw-user_a/memories/list",
+            ))
+            .and(wiremock::matchers::header(
+                "authorization",
+                "Bearer test-token",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "items": [{ "id": "1", "text": "a" }],
+                    "total": 7
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "hindsight".to_string();
+        config.memory.hindsight.base_url = server.uri();
+        config.memory.hindsight.token = Some("test-token".to_string());
+        config.agents.insert(
+            "user_a".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        // Install-wide handle deliberately holds a single row so a count of 7
+        // can only come from the scoped hindsight bank, never `state.mem`.
+        let state = test_state_with_memory(config, vec![memory_entry_with_content("one".into())]);
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery {
+                agent: Some("user_a".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["memory_count"], 7);
+        // The label must come from the SAME resolved handle that produced the
+        // count, not the per-agent config enum (which stays unset/`sqlite`
+        // under install-wide Hindsight selection) - see blocker 1 regression
+        // below for the case where the two previously disagreed.
+        assert_eq!(json["memory_backend"], "hindsight");
+        assert_eq!(json["memory_status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_install_wide_hindsight_label_matches_count_source() {
+        // Regression: install-wide Hindsight selection (`[memory] backend =
+        // "hindsight"`) with the per-agent enum left at its default (`sqlite`)
+        // must show a `hindsight` label next to the hindsight count, not a
+        // `sqlite` label next to a hindsight count. Before the fix, the label
+        // came from `agent.memory.backend` (the enum) while the count came
+        // from the resolved handle, so the two disagreed under exactly this
+        // fallback.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v1/default/banks/zeroclaw-mismatch/memories/list",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "items": [{ "id": "1", "text": "a" }],
+                    "total": 4
+                })),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "hindsight".to_string();
+        config.memory.hindsight.base_url = server.uri();
+        config.memory.hindsight.token = Some("test-token".to_string());
+        // Per-agent enum left at its default (Sqlite) - the install-wide
+        // string is what actually selects Hindsight in `create_memory_for_agent`.
+        config.agents.insert(
+            "mismatch".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let state = test_state_with_memory(config, Vec::new());
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery {
+                agent: Some("mismatch".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(
+            json["memory_backend"], "hindsight",
+            "label must reflect the resolved handle, not the unset per-agent enum"
+        );
+        assert_eq!(json["memory_count"], 4);
+        assert_eq!(json["memory_status"], "ok");
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_known_agent_handle_failure_is_unavailable_not_zero() {
+        // A KNOWN agent whose per-agent handle FAILS to build (backend
+        // unreachable/misconfigured) must report a distinct "unavailable"
+        // state - NOT `0`, which is indistinguishable from a genuinely empty
+        // store. Here agent `user_a` selects hindsight but no token resolves (a
+        // missing env var name and no inline token), so
+        // `create_memory_for_agent` errors and the handle is None.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "hindsight".to_string();
+        config.memory.hindsight.token = None;
+        config.memory.hindsight.token_env = "ZC_HINDSIGHT_TOKEN_ABSENT_FOR_STATUS_TEST".to_string();
+        config.agents.insert(
+            "user_a".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let entries = vec![
+            memory_entry_with_content("one".into()),
+            memory_entry_with_content("two".into()),
+            memory_entry_with_content("three".into()),
+        ];
+        let state = test_state_with_memory(config, entries);
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery {
+                agent: Some("user_a".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        let json = response_json(response).await;
+        assert_eq!(json["memory_status"], "unavailable");
+        assert!(
+            json["memory_count"].is_null(),
+            "a failed handle must report null, not a misleading 0: {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_never_responding_backend_does_not_hang_status() {
+        // A stalled remote backend must not hold the status response hostage:
+        // the short `STATUS_MEMORY_COUNT_TIMEOUT` (well below the hindsight
+        // client's own configurable request timeout) bounds the wait, and the
+        // count degrades to "unavailable" rather than the request hanging
+        // for the full backend timeout. Delay is set well past the status
+        // deadline but under the hindsight client's own 30s timeout, so it's
+        // unambiguously OUR deadline that fires, not reqwest's.
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(
+                "/v1/default/banks/zeroclaw-stalled/memories/list",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "items": [], "total": 0 }))
+                    .set_delay(std::time::Duration::from_secs(10)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        config.memory.backend = "hindsight".to_string();
+        config.memory.hindsight.base_url = server.uri();
+        config.memory.hindsight.token = Some("test-token".to_string());
+        config.agents.insert(
+            "stalled".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let state = test_state_with_memory(config, Vec::new());
+
+        let started = std::time::Instant::now();
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery {
+                agent: Some("stalled".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(8),
+            "status must return well before the 10s backend delay; took {elapsed:?}"
+        );
+        let json = response_json(response).await;
+        assert_eq!(json["memory_status"], "unavailable");
+        assert!(json["memory_count"].is_null());
+        // The label is still derived from the successfully-built handle even
+        // though its count timed out - handle construction and the count are
+        // independent failure points.
+        assert_eq!(json["memory_backend"], "hindsight");
+    }
+
+    #[tokio::test]
+    async fn handle_api_status_unknown_agent_is_rejected_not_silently_unscoped() {
+        // An UNKNOWN alias (no `[agents.<alias>]` entry) must be rejected
+        // rather than silently falling back to the install-wide view while
+        // still echoing the unknown alias - that would make global data look
+        // like it belongs to a non-existent agent.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.gateway.require_pairing = false;
+        let entries = vec![
+            memory_entry_with_content("one".into()),
+            memory_entry_with_content("two".into()),
+        ];
+        let state = test_state_with_memory(config, entries);
+
+        let response = handle_api_status(
+            State(state),
+            HeaderMap::new(),
+            Query(StatusQuery {
+                agent: Some("nonexistent".to_string()),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|s| s.contains("Unknown agent")),
+            "expected an unknown-agent error, got: {json}"
+        );
     }
 
     #[tokio::test]
