@@ -1465,6 +1465,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         accumulated_display_text,
         turn_id,
         knobs,
+        event_tx.as_ref(),
         turn_state.canonical.as_deref_mut(),
     )
     .await
