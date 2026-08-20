@@ -2868,6 +2868,10 @@ impl Tool for ToolArcRef {
         self.inner.param_domains()
     }
 
+    fn host_owns_approved_arg(&self) -> bool {
+        self.inner.host_owns_approved_arg()
+    }
+
     // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
     // schemas; the trait default would rebuild the spec from
     // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
@@ -8472,7 +8476,7 @@ version = "0.1.0"
 name = "run"
 description = "run pdfify"
 kind = "shell"
-command = "echo hi"
+command = "mkdir delegated-medium-risk"
 "#,
         )
         .unwrap();
@@ -8496,6 +8500,8 @@ command = "echo hi"
             "target".to_string(),
             RiskProfileConfig {
                 allowed_tools: vec!["shell".to_string()],
+                allowed_commands: vec!["mkdir".to_string()],
+                require_approval_for_medium_risk: true,
                 ..RiskProfileConfig::default()
             },
         );
@@ -8578,6 +8584,34 @@ command = "echo hi"
         assert_eq!(
             independent.workspace_dir, target_ws,
             "target workspace must resolve to the configured target-workspace path"
+        );
+
+        let skill_tool = independent
+            .tools
+            .iter()
+            .find(|tool| tool.name() == "pdfify__run")
+            .expect("target skill tool exists");
+        let result = skill_tool
+            .execute(serde_json::json!({}))
+            .await
+            .expect("policy refusal is a tool result, not a transport error");
+
+        assert!(
+            !result.success,
+            "an unapproved delegated skill must not run"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("requires explicit approval"),
+            "the delegated skill should fail at the approval boundary: {:?}",
+            result.error
+        );
+        assert!(
+            !target_ws.join("delegated-medium-risk").exists(),
+            "the refused delegated skill must not create its directory"
         );
     }
 

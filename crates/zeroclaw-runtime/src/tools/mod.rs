@@ -203,6 +203,10 @@ impl Tool for ArcToolRef {
         self.0.param_domains()
     }
 
+    fn host_owns_approved_arg(&self) -> bool {
+        self.0.host_owns_approved_arg()
+    }
+
     // Forward `spec()` so inner overrides keep their `Arc`-shared parameter
     // schemas; the trait default would rebuild the spec from
     // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
@@ -262,6 +266,10 @@ impl Tool for ArcDelegatingTool {
 
     fn param_domains(&self) -> Vec<(&'static str, ::zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn host_owns_approved_arg(&self) -> bool {
+        self.inner.host_owns_approved_arg()
     }
 
     // Forward `spec()` so inner overrides keep their `Arc`-shared parameter

@@ -46,6 +46,31 @@ pub(crate) struct ToolDispatchContext<'a> {
     pub model_switch_callback: Option<&'a ModelSwitchCallback>,
 }
 
+/// Whether the runtime, not the model, decides this call's `approved` argument.
+///
+/// A union, never a replacement: the built-in names stay host-owned whatever is
+/// registered under them, and explicit tool metadata adds tools named at
+/// runtime — a skill shell tool is `skill__tool`, unknowable at compile time.
+/// JSON Schema is deliberately not authority metadata: an unrelated tool may
+/// use a boolean named `approved` as ordinary business data.
+pub(crate) fn host_owns_approved_arg(dispatch: ToolDispatchContext<'_>, name: &str) -> bool {
+    if crate::agent::is_runtime_approved_arg_tool(name) {
+        return true;
+    }
+    if let Some(tool) = find_tool(dispatch.tools_registry, name) {
+        return tool.host_owns_approved_arg();
+    }
+    if let Some(activated) = dispatch.activated_tools {
+        let tools = activated
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(tool) = tools.get_resolved(name) {
+            return tool.host_owns_approved_arg();
+        }
+    }
+    false
+}
+
 fn is_excluded_tool(name: &str, excluded_tools: &[String]) -> bool {
     let name = name.trim();
     excluded_tools
@@ -608,6 +633,47 @@ mod tests {
         }
     }
 
+    /// Plugin-shaped control: `approved` is ordinary business data, not the
+    /// runtime's authorization verdict.
+    struct BusinessApprovalTool;
+
+    impl zeroclaw_api::attribution::Attributable for BusinessApprovalTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+        fn alias(&self) -> &str {
+            "test-business-approval-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for BusinessApprovalTool {
+        fn name(&self) -> &str {
+            "business_approval"
+        }
+
+        fn description(&self) -> &str {
+            "Records an unrelated approval state"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "approved": { "type": "boolean" }
+                },
+                "required": ["approved"]
+            })
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult::ok("ok"))
+        }
+    }
+
     #[tokio::test]
     async fn execute_one_tool_recovers_poisoned_activated_tool_lock() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -890,6 +956,138 @@ mod tests {
         assert!(
             should_execute_tools_in_parallel(&batch, None),
             "no approval manager + non-tool_search batch must run in parallel"
+        );
+    }
+
+    fn approval_dispatch_registry() -> Vec<Box<dyn Tool>> {
+        let security = Arc::new(crate::security::SecurityPolicy::default());
+        let runtime = Arc::new(crate::platform::NativeRuntime::new());
+        let skill = crate::skills::SkillTool {
+            name: "make_dir".to_string(),
+            description: "Create a directory".to_string(),
+            kind: "shell".to_string(),
+            command: "mkdir {{dir}}".to_string(),
+            args: std::collections::HashMap::new(),
+            target: None,
+            locked_args: std::collections::HashMap::new(),
+            timeout_secs: None,
+        };
+        vec![
+            Box::new(crate::tools::ShellTool::new(
+                security.clone(),
+                runtime.clone(),
+            )),
+            Box::new(zeroclaw_tools::wrappers::RateLimitedTool::new(
+                crate::skills::skill_tool::SkillShellTool::new("s", &skill, security.clone()),
+                security,
+            )),
+            Box::new(CountingTool::new(
+                "counting_no_approved",
+                Arc::new(AtomicUsize::new(0)),
+            )),
+            Box::new(BusinessApprovalTool),
+        ]
+    }
+
+    #[test]
+    fn host_owns_the_approved_arg_of_a_dynamically_named_skill_tool() {
+        let registry = approval_dispatch_registry();
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+
+        assert!(
+            super::host_owns_approved_arg(dispatch, "shell"),
+            "the built-in shell tool declares `approved`"
+        );
+        assert!(
+            super::host_owns_approved_arg(dispatch, "s__make_dir"),
+            "a wrapped skill shell tool is unknowable by name, so explicit metadata must answer"
+        );
+        assert!(
+            !super::host_owns_approved_arg(dispatch, "counting_no_approved"),
+            "a tool that declares no `approved` must not have one injected"
+        );
+        assert!(
+            !super::host_owns_approved_arg(dispatch, "business_approval"),
+            "an unrelated boolean named `approved` is business data, not authority metadata"
+        );
+    }
+
+    #[test]
+    fn unrelated_approved_business_data_is_not_overwritten() {
+        let registry = approval_dispatch_registry();
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+        let mut args = serde_json::json!({"approved": false});
+        let host_owned = super::host_owns_approved_arg(dispatch, "business_approval");
+
+        crate::agent::set_approved_arg(host_owned, &mut args, true);
+
+        assert_eq!(args["approved"], false);
+    }
+
+    #[test]
+    fn activated_plugin_approved_business_data_is_not_host_owned() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        activated.lock().unwrap().activate(
+            "business_approval".to_string(),
+            Arc::new(BusinessApprovalTool),
+        );
+        let registry: Vec<Box<dyn Tool>> = Vec::new();
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: Some(&activated),
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+
+        assert!(
+            !super::host_owns_approved_arg(dispatch, "business_approval"),
+            "activated plugin schemas cannot opt into host authority by field name"
+        );
+    }
+
+    #[test]
+    fn built_in_names_stay_host_owned_whatever_is_registered_under_them() {
+        // Empty registry: nothing resolves, so only the name list can answer.
+        // A tool registered under one of these names that declares no
+        // `approved` must not be able to opt out of host ownership either.
+        let registry: Vec<Box<dyn Tool>> = Vec::new();
+        let dispatch = ToolDispatchContext {
+            tools_registry: &registry,
+            activated_tools: None,
+            excluded_tools: &[],
+            model_switch_callback: None,
+        };
+
+        for name in ["shell", "schedule", "cron_add", "cron_update", "cron_run"] {
+            assert!(
+                super::host_owns_approved_arg(dispatch, name),
+                "{name} must stay host-owned when it cannot be resolved"
+            );
+        }
+        assert!(!super::host_owns_approved_arg(dispatch, "file_read"));
+    }
+
+    #[test]
+    fn every_built_in_on_the_fallback_list_actually_declares_the_arg() {
+        // The fallback list and the concrete tool schema must not drift apart: a name on
+        // the list whose tool stopped declaring `approved` would get the key
+        // injected only on the fallback path.
+        let registry = approval_dispatch_registry();
+        let shell = super::find_tool(&registry, "shell").expect("shell tool in registry");
+        assert!(crate::agent::is_runtime_approved_arg_tool("shell"));
+        assert_eq!(
+            shell.parameters_schema()["properties"]["approved"]["type"],
+            "boolean"
         );
     }
 

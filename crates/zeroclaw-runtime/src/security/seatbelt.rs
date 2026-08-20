@@ -100,6 +100,7 @@ impl Sandbox for SeatbeltSandbox {
             sandbox_cmd.current_dir(current_dir);
         }
 
+        crate::security::traits::adopt_command_context(cmd, &mut sandbox_cmd);
         *cmd = sandbox_cmd;
         Ok(())
     }
@@ -240,6 +241,29 @@ mod tests {
         };
         assert!(sandbox.description().contains("macOS"));
         assert!(sandbox.description().contains("Seatbelt"));
+    }
+
+    #[test]
+    fn seatbelt_wrap_command_keeps_the_working_directory() {
+        let sandbox = SeatbeltSandbox {
+            policy_dir: PathBuf::from("/tmp/test-seatbelt"),
+            policy_path: PathBuf::from("/tmp/test-seatbelt/test.sb"),
+        };
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c").arg("pwd").current_dir("/workspace");
+
+        sandbox.wrap_command(&mut cmd).unwrap();
+
+        assert_eq!(
+            cmd.get_program().to_string_lossy(),
+            SANDBOX_EXEC_PATH,
+            "the command should be replaced by the wrapper's absolute binary"
+        );
+        assert_eq!(
+            cmd.get_current_dir(),
+            Some(Path::new("/workspace")),
+            "wrapping must not silently move the child to the daemon's cwd"
+        );
     }
 
     #[test]

@@ -342,6 +342,17 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
         Vec::new()
     }
 
+    /// Whether the runtime owns this tool's top-level `approved` argument.
+    ///
+    /// Opting in means the model-provided value is discarded before approval
+    /// and replaced with the host's verdict afterward. This is explicit
+    /// authority metadata, not something inferred from JSON Schema: unrelated
+    /// tools may legitimately use a boolean named `approved` as business data.
+    /// Delegating wrappers must forward this method to their inner tool.
+    fn host_owns_approved_arg(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 

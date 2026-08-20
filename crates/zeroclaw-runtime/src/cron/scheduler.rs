@@ -1226,16 +1226,25 @@ async fn run_job_command_with_runtime_and_timeout(
     // override an imperative job's stored format.
     let output_format = &job.shell_output_format;
 
-    let mut command = match runtime.build_shell_command(&job.command, &config.data_dir) {
+    // Same OS confinement the shell tool gets, from the same resolved policy.
+    // The cwd is the workspace, not `data_dir`: the checks above resolve the
+    // command's relative path arguments against `security.workspace_dir`, so
+    // spawning anywhere else would validate one directory and read another.
+    let sandbox = crate::security::create_sandbox(
+        &security.sandbox_config(),
+        config.runtime.kind.as_wire(),
+        Some(&security.workspace_dir),
+    );
+
+    let mut command = match build_cron_shell_command(
+        runtime,
+        &job.command,
+        &security.workspace_dir,
+        sandbox.as_ref(),
+    ) {
         Ok(command) => command,
         Err(error) => return (false, format!("shell setup error: {error}")),
     };
-
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => return (false, format!("spawn error: {error}")),
@@ -1268,6 +1277,29 @@ async fn run_job_command_with_runtime_and_timeout(
             format!("job timed out after {}s", timeout.as_secs_f64()),
         ),
     }
+}
+
+fn build_cron_shell_command(
+    runtime: &dyn RuntimeAdapter,
+    command: &str,
+    workspace_dir: &std::path::Path,
+    sandbox: &dyn crate::security::Sandbox,
+) -> anyhow::Result<tokio::process::Command> {
+    let mut cmd = runtime.build_shell_command(command, workspace_dir)?;
+
+    // Backends that isolate by replacing the command carry the cwd over but
+    // cannot carry stdio, which `Command` exposes no getter for. Wrap first,
+    // then pipe, or the scheduler captures nothing.
+    sandbox
+        .wrap_command(cmd.as_std_mut())
+        .map_err(|e| anyhow::Error::msg(format!("sandbox error: {e}")))?;
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    Ok(cmd)
 }
 
 #[cfg(test)]
@@ -2120,8 +2152,10 @@ mod tests {
             .allowed_commands = vec!["sh".into()];
         let security = test_security(&config);
 
+        // The workspace, not `data_dir`: that is where the policy resolves a
+        // relative path argument, and now where the job actually runs.
         tokio::fs::write(
-            config.data_dir.join("retry-once.sh"),
+            security.workspace_dir.join("retry-once.sh"),
             "#!/bin/sh\nif [ -f retry-ok.flag ]; then\n  echo recovered\n  exit 0\nfi\ntouch retry-ok.flag\nexit 1\n",
         )
         .await
@@ -2851,6 +2885,79 @@ mod tests {
         assert!(output.status.success());
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(stdout.contains("cron-ok"));
+    }
+
+    #[test]
+    fn build_cron_shell_command_wraps_the_command_with_the_sandbox() {
+        #[derive(Default)]
+        struct RecordingSandbox {
+            wraps: std::sync::atomic::AtomicUsize,
+        }
+
+        impl crate::security::Sandbox for RecordingSandbox {
+            fn wrap_command(&self, _cmd: &mut std::process::Command) -> std::io::Result<()> {
+                self.wraps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+
+            fn is_available(&self) -> bool {
+                true
+            }
+
+            fn name(&self) -> &str {
+                "recording"
+            }
+
+            fn description(&self) -> &str {
+                "test double that records wrap_command calls"
+            }
+        }
+
+        let sandbox = RecordingSandbox::default();
+        let workspace = std::env::temp_dir();
+
+        build_cron_shell_command(
+            &crate::platform::NativeRuntime::new(),
+            "echo cron-wrapped",
+            &workspace,
+            &sandbox,
+        )
+        .unwrap();
+
+        assert_eq!(
+            sandbox.wraps.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a scheduled shell job must get the same OS confinement as the shell tool"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn run_job_command_spawns_in_the_agent_workspace_not_the_data_dir() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        {
+            let profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+            profile.allowed_commands = vec!["pwd".into()];
+            // The cwd is what is under test; keep OS confinement out of it.
+            profile.sandbox_enabled = Some(false);
+        }
+        let job = test_job("pwd");
+        let security = test_security(&config);
+        let workspace = std::fs::canonicalize(&security.workspace_dir).unwrap();
+
+        let (success, output) = run_job_command(&config, &security, &job).await;
+
+        assert!(success, "pwd should run: {output}");
+        assert!(
+            output.contains(&workspace.display().to_string()),
+            "job must run where its path arguments were validated ({}), got: {output}",
+            workspace.display()
+        );
+        assert!(
+            !output.contains(&config.data_dir.display().to_string()),
+            "job must not run in data_dir: {output}"
+        );
     }
 
     #[tokio::test]

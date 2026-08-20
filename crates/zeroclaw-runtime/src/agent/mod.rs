@@ -29,6 +29,13 @@ pub use turn::{
     terminal_completion_error_message,
 };
 
+/// The built-in tools whose `approved` argument the runtime owns.
+///
+/// Only a fallback for when a call cannot be resolved to a tool in this turn's
+/// registry. Resolved tools opt in explicitly through
+/// [`zeroclaw_api::tool::Tool::host_owns_approved_arg`], which covers tools
+/// whose names are not known at compile time without inferring authority from
+/// their JSON Schema.
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
@@ -36,14 +43,13 @@ pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     )
 }
 
-pub(crate) fn set_runtime_approved_arg(
-    tool_name: &str,
-    args: &mut serde_json::Value,
-    approved: bool,
-) {
-    if is_runtime_approved_arg_tool(tool_name)
-        && let Some(args) = args.as_object_mut()
-    {
+/// Overwrite the model's `approved` argument with the host's decision.
+///
+/// `host_owned` comes from [`crate::agent::tool_execution::host_owns_approved_arg`].
+/// Unconditionally inserting would put an `approved` key into tools that never
+/// declared one, which strict-schema surfaces (MCP) reject.
+pub(crate) fn set_approved_arg(host_owned: bool, args: &mut serde_json::Value, approved: bool) {
+    if host_owned && let Some(args) = args.as_object_mut() {
         args.insert("approved".to_string(), serde_json::Value::Bool(approved));
     }
 }

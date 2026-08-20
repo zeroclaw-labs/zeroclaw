@@ -7,7 +7,9 @@ use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{ProgressEvent, StreamDelta, emit_tool_call_pair, send_progress};
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::tool_execution::{
+    ToolDispatchContext, ToolExecutionOutcome, host_owns_approved_arg,
+};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use std::collections::HashSet;
@@ -72,6 +74,9 @@ async fn record_duplicate_tool_call(
 /// loop body, per-call prep loop).
 pub(crate) async fn prepare_tool_calls(
     ctx: &TurnCtx<'_>,
+    // Only for resolving a call to its tool, which is how a tool named at
+    // runtime is recognised as one whose `approved` argument the host owns.
+    dispatch: ToolDispatchContext<'_>,
     tool_calls: &[ParsedToolCall],
     seen_tool_signatures: &mut HashSet<(String, String)>,
     prompt_approval_tool_signatures: &mut HashSet<(String, String)>,
@@ -152,7 +157,9 @@ pub(crate) async fn prepare_tool_calls(
             ctx.channel_reply_target,
         );
 
-        crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, false);
+        // Resolved after the hook, which may have renamed the call.
+        let host_owns_approval = host_owns_approved_arg(dispatch, &tool_name);
+        crate::agent::set_approved_arg(host_owns_approval, &mut tool_args, false);
 
         let requires_prompt = ctx
             .approval
@@ -214,7 +221,7 @@ pub(crate) async fn prepare_tool_calls(
                 continue;
             }
         };
-        crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
+        crate::agent::set_approved_arg(host_owns_approval, &mut tool_args, approved);
 
         let signature = tool_call_signature(&tool_name, &tool_args);
         let dedup_exempt =

@@ -12292,7 +12292,7 @@ impl RiskProfileConfig {
     }
 }
 
-fn parse_sandbox_backend(name: &str) -> SandboxBackend {
+pub(crate) fn parse_sandbox_backend(name: &str) -> SandboxBackend {
     match name.to_ascii_lowercase().as_str() {
         "auto" => SandboxBackend::Auto,
         "landlock" => SandboxBackend::Landlock,
