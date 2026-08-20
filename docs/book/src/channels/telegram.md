@@ -172,7 +172,7 @@ file-reload path runs on every poll cycle: if `config.toml` has changed on
 disk, the reloaded `Config` is written into the shared in-memory handle that
 the resolver closures read, so `allowed_groups` edits take effect on the next
 message without restart. The one exception is a `bind_telegram` CLI invocation
-from a separate terminal — that process changed the file, not the running
+from a separate terminal, that process changed the file, not the running
 daemon's memory; the daemon picks it up on its next poll, but a manual restart
 is always safe.
 
