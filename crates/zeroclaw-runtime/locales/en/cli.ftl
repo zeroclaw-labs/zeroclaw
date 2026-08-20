@@ -420,6 +420,7 @@ channel-discord-component-expired = This button or menu has expired or was alrea
 channel-discord-approval-recorded = Your decision has been recorded.
 channel-discord-delivery-failure-note-one = (note: I couldn't deliver {$count} file.)
 channel-discord-delivery-failure-note-many = (note: I couldn't deliver {$count} files.)
+channel-msteams-draft-cancelled = (this response was superseded by a newer message)
 channel-whatsapp-web-delivery-failure-note-one = (note: I could not deliver {$count} WhatsApp media attachment.)
 channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$count} WhatsApp media attachments.)
 channel-line-bind-success = ✅ Paired! You can now chat.

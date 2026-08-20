@@ -80,6 +80,8 @@ pub enum ChannelKind {
     Mattermost,
     #[strum(serialize = "mochat")]
     MoChat,
+    #[strum(serialize = "msteams")]
+    MsTeams,
     NextcloudTalk,
     Nostr,
     Notion,
