@@ -1,0 +1,50 @@
+name: Rust cache (provider-aware)
+description: >
+  Restore/save the Rust build cache using Blacksmith's sticky-disk cache when
+  the job runs on a Blacksmith runner, otherwise Swatinem/rust-cache on a
+  GitHub-hosted runner. This preserves the CI_USE_BLACKSMITH fail-safe: any
+  non-'true' value (including unset) selects Swatinem, so GitHub-hosted jobs
+  stay fully cached and the toggle can be flipped off with no loss of caching.
+
+inputs:
+  use-blacksmith:
+    description: >
+      Pass 'true' only when this job is running on a Blacksmith runner
+      (useblacksmith/rust-cache needs the local sticky disk). Any other value
+      falls back to Swatinem/rust-cache.
+    required: true
+  cache-on-failure:
+    description: Save the cache even when the job fails.
+    required: false
+    default: "false"
+  save-if:
+    description: Only write the cache when this evaluates truthy (e.g. default branch only).
+    required: false
+    default: "true"
+  shared-key:
+    description: Shared cache key to reuse a cache across jobs (Swatinem/useblacksmith shared-key). Empty = per-job cache.
+    required: false
+    default: ""
+
+outputs:
+  cache-hit:
+    description: Whether an exact cache match was restored, from whichever provider ran.
+    value: ${{ steps.bs.outputs.cache-hit || steps.gh.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - id: bs
+      if: ${{ inputs.use-blacksmith == 'true' }}
+      uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3.0.1
+      with:
+        cache-on-failure: ${{ inputs.cache-on-failure }}
+        save-if: ${{ inputs.save-if }}
+        shared-key: ${{ inputs.shared-key }}
+    - id: gh
+      if: ${{ inputs.use-blacksmith != 'true' }}
+      uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      with:
+        cache-on-failure: ${{ inputs.cache-on-failure }}
+        save-if: ${{ inputs.save-if }}
+        shared-key: ${{ inputs.shared-key }}

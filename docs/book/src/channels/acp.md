@@ -201,7 +201,10 @@ When a tool requires user approval (via `always_ask` in the autonomy config, or 
   }}
 ```
 
-The server-issued id (`"zc-out-N"`) is always a string prefixed `zc-out-`, disjoint from any integer or string ids the client uses for its own requests.
+The server-issued id (`"zc-out-N"`) is always a string prefixed `zc-out-`.
+Correlation is directional: each peer matches responses only against its own
+pending-request map, so the same textual id may be in flight independently in
+both directions.
 
 Response shape:
 - `{"outcome": {"outcome": "selected", "optionId": "<id>"}}`, user picked an option

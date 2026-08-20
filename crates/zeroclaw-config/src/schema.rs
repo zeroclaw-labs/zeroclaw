@@ -6031,13 +6031,12 @@ impl Default for PacingConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsPromptInjectionMode {
-    /// Inline full skill instructions. This legacy behavior remains supported
-    /// when explicitly configured during the deprecation window.
+    /// Default behavior for the v0.8.x line: inline full skill instructions.
+    #[default]
     Full,
-    /// Default behavior: inline compact skill metadata
+    /// Inline compact skill metadata
     /// (name/description/location + callable tool specs) and load instructions
     /// on demand via `read_skill`.
-    #[default]
     Compact,
 }
 
@@ -6158,9 +6157,9 @@ pub struct SkillsConfig {
     /// is cloned to its own `extra-registry-<name>/` workspace directory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_registries: Vec<ExternalRegistry>,
-    /// Controls how skills are injected into the system prompt. Omission now
-    /// defaults to `compact`; explicit `full` remains supported during the
-    /// deprecation window and emits a validation warning before Schema V4.
+    /// Controls how skills are injected into the system prompt. Omission
+    /// defaults to `full` throughout the v0.8.x release line; `compact`
+    /// remains available as an explicit global or runtime-profile setting.
     #[serde(default)]
     pub prompt_injection_mode: SkillsPromptInjectionMode,
     /// Autonomous skill creation from successful multi-step task executions.
@@ -6850,6 +6849,12 @@ impl Default for PeripheralBoardConfig {
 
 // ── Gateway security ─────────────────────────────────────────────
 
+/// Longest supported dashboard WebSocket keepalive interval.
+///
+/// Longer periods do not protect typical intermediary idle deadlines, while
+/// this bound keeps timer construction portable across supported targets.
+pub const GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS: u64 = 86_400;
+
 /// Gateway server configuration (`[gateway]` section).
 ///
 /// Controls the HTTP gateway for webhook and pairing endpoints.
@@ -6928,6 +6933,15 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub session_ttl_hours: u32,
 
+    /// Send WebSocket ping frames every N seconds to keep dashboard chat
+    /// connections alive. Range:
+    /// `0..=GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS`. 0 = disabled. Default: 30.
+    /// The value is read when each WebSocket connection opens; changing it
+    /// requires reconnecting clients (or restarting the gateway) to affect
+    /// existing connections.
+    #[serde(default = "default_gateway_websocket_ping_interval_secs")]
+    pub websocket_ping_interval_secs: u64,
+
     /// Pairing dashboard configuration
     #[serde(default)]
     #[nested]
@@ -6981,6 +6995,10 @@ fn default_gateway_request_timeout_secs() -> u64 {
 
 fn default_gateway_long_running_request_timeout_secs() -> u64 {
     600
+}
+
+fn default_gateway_websocket_ping_interval_secs() -> u64 {
+    30
 }
 
 fn default_gateway_host() -> String {
@@ -7041,6 +7059,7 @@ impl Default for GatewayConfig {
             idempotency_max_keys: default_gateway_idempotency_max_keys(),
             session_persistence: true,
             session_ttl_hours: 0,
+            websocket_ping_interval_secs: default_gateway_websocket_ping_interval_secs(),
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -7541,7 +7560,11 @@ impl Default for BrowserConfig {
 ///
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
 /// for all public hosts, which is the default). If `allowed_domains` is empty, all
-/// requests are rejected.
+/// requests are rejected. Requests use direct transport so locally validated DNS
+/// answers remain pinned: an enabled `environment` proxy scope or runtime proxy
+/// that applies to `tool.http_request` is rejected. A process environment proxy
+/// outside that managed scope is warned and ignored; connection failures name
+/// the ignored variable.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "http_request"]
@@ -7558,12 +7581,18 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
-    /// Allow requests to private/LAN hosts (RFC 1918, loopback, link-local, .local).
-    /// Default: false (deny private hosts for SSRF protection).
+    /// Allow requests to private/LAN hosts (RFC 1918, loopback, `.local`).
+    /// Default: false (deny private hosts for SSRF protection). Regardless of
+    /// this setting, all of `169.254.0.0/16`, Azure `168.63.129.16`, Alibaba
+    /// `100.100.100.200`, AWS `fd00:ec2::/64`, GCP `fd20:ce::254`, and their
+    /// recognized IPv4-embedded forms remain blocked.
     #[serde(default)]
     pub allow_private_hosts: bool,
-    /// Private/internal hosts explicitly allowed to bypass SSRF protection.
-    /// Exact and subdomain matches are supported; `*` permits all private/local hosts.
+    /// Private/internal hosts explicitly allowed to relax the public-address check.
+    /// Exact and subdomain matches are supported; `*` permits private/local hosts
+    /// except the unconditional metadata/platform exclusions: `169.254.0.0/16`,
+    /// `168.63.129.16`, `100.100.100.200`, `fd00:ec2::/64`, `fd20:ce::254`, and
+    /// their recognized IPv4-embedded forms.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Named authorization secrets for `auth_secret` requests.
@@ -7608,6 +7637,8 @@ fn default_allowed_domains_star() -> Vec<String> {
 /// Domain filtering: `allowed_domains` controls which hosts are reachable (use `["*"]`
 /// for all public hosts). `blocked_domains` takes priority over `allowed_domains`.
 /// If `allowed_domains` is empty, all requests are rejected (deny-by-default).
+/// Same-host redirects are followed; cross-host redirects are rejected so the
+/// validated DNS answers remain pinned to the request transport.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "web_fetch"]
@@ -7621,14 +7652,22 @@ pub struct WebFetchConfig {
     /// Blocked domains (exact or subdomain match; always takes priority over allowed_domains)
     #[serde(default)]
     pub blocked_domains: Vec<String>,
-    /// Private/internal hosts allowed to bypass SSRF protection (e.g. `["192.168.1.10", "internal.local"]`).
-    /// Exact and subdomain matches are supported. Listing a host skips the
-    /// resolved-IP SSRF check for it; a *literal* private/local host (IP literal,
-    /// localhost, .local) listed here also bypasses `allowed_domains`. The `*`
-    /// wildcard permits any literal private/local host and lets a name already in
-    /// `allowed_domains` resolve to a private IP, but it does NOT widen
+    /// Private/internal hosts allowed to relax the public-address SSRF check
+    /// (e.g. `["192.168.1.10", "internal.local"]`). Exact and subdomain matches
+    /// are supported. Every target still resolves locally, and known cloud
+    /// metadata/platform addresses remain blocked. A *literal* private/local host
+    /// (IP literal, localhost, .local) listed here also bypasses `allowed_domains`.
+    /// The `*` wildcard permits any literal private/local host and lets a name
+    /// already in `allowed_domains` resolve to a private IP, but it does NOT widen
     /// `allowed_domains` — a non-private host (matched explicitly or via `*`) still
     /// needs `allowed_domains`, so `*` cannot reach an arbitrary public host.
+    /// The standard `web_fetch` request requires direct transport for DNS pinning:
+    /// environment proxy discovery is disabled, and an enabled `environment` scope
+    /// or runtime proxy applying to the tool is rejected. A process environment proxy
+    /// outside that managed scope is warned and ignored for the standard request.
+    /// The optional Firecrawl API fallback uses normal environment proxy discovery
+    /// because that separate API request has no locally validated DNS pin. Use
+    /// `proxy.scope = "services"` without `tool.*` to proxy other traffic.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
     /// Maximum response size in bytes (default: 500KB, plain text is much smaller than raw HTML)
@@ -7787,11 +7826,17 @@ pub struct TextBrowserConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_text_browser_timeout_secs")]
     pub timeout_secs: u64,
-    /// Private/internal hosts allowed to bypass SSRF protection.
-    /// Exact and subdomain matches are supported; `["*"]` permits **all** private/local
-    /// hosts (RFC 1918, loopback, link-local, `.local`). Default: empty (deny).
-    /// Warning: `["*"]` also reaches link-local addresses, including the cloud metadata
-    /// endpoint (`169.254.169.254`) — list specific hosts unless you accept that exposure.
+    /// Private/internal hosts allowed to relax the public-address SSRF check.
+    /// Exact and subdomain matches are supported; `["*"]` permits private/local
+    /// hosts (RFC 1918, loopback, `.local`). Default: empty (deny). All of
+    /// `169.254.0.0/16`, Azure `168.63.129.16`, Alibaba `100.100.100.200`, AWS
+    /// `fd00:ec2::/64`, GCP `fd20:ce::254`, and their recognized IPv4-embedded
+    /// forms remain blocked after resolution regardless of this opt-in.
+    /// The external browser re-resolves DNS and follows redirects without
+    /// revalidation, so these checks are not a DNS-rebinding or redirect boundary.
+    /// Local preflight resolution still applies under this opt-in, which may reject
+    /// names available only through a browser or proxy. Prefer `web_fetch` when
+    /// URLs or DNS are attacker-controlled.
     #[serde(default)]
     pub allowed_private_hosts: Vec<String>,
 }
@@ -8361,8 +8406,14 @@ fn default_linkedin_api_version() -> String {
     "202602".to_string()
 }
 
-/// Per-plugin config section keyed by plugin alias; values are secret so they
-/// encrypt at rest under the same adjacent `.secret_key` as every other secret.
+/// More than one canonical config row exists for the same plugin instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("duplicate plugin config entries for one instance key")]
+pub struct DuplicatePluginConfigEntry;
+
+/// Per-instance plugin config keyed by the host-derived `PluginInstanceId`
+/// config-entry key; values are secret so they encrypt at rest under the same
+/// adjacent `.secret_key` as every other secret.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.entries"]
@@ -8373,6 +8424,32 @@ pub struct PluginEntryConfig {
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub config: HashMap<String, String>,
+    /// Destinations this plugin instance may reach. Default: empty,
+    /// which means **no network reach at all** — a transport permission such as
+    /// `http_client` grants the surface, this field grants the destinations.
+    ///
+    /// Entries are exact hosts (`api.example.com`, `10.0.0.5`) or explicit
+    /// suffix patterns (`*.example.com`, which matches subdomains but **not**
+    /// the apex — list the apex separately if it is needed). A bare domain
+    /// never implies its subdomains, and there is no `*` meaning "anywhere".
+    /// Ports are not part of an entry: granting a host grants every port on it.
+    ///
+    /// Deliberately a **plaintext sibling** of the `#[secret]` `config` map and
+    /// never inside it: the allowlist is the thing an operator audits, so it
+    /// has to stay readable in the file they are auditing.
+    #[serde(default)]
+    pub egress_hosts: Vec<String>,
+    /// Subset of `egress_hosts` additionally permitted to resolve to a private,
+    /// loopback, or link-local address (a self-hosted Gitea, a LAN Nextcloud).
+    /// Mirrors the `allowed_private_hosts` semantics the host tools already use.
+    ///
+    /// This relaxes the *address class* only. It never widens `egress_hosts` —
+    /// a host listed here but not there is still denied — and cloud metadata
+    /// addresses stay refused regardless of what is listed, including through a
+    /// configured `security.nat64_prefixes` translation. Unlike the tool-layer
+    /// field, `*` is not accepted here.
+    #[serde(default)]
+    pub egress_allow_private: Vec<String>,
 }
 
 /// Plugin system configuration.
@@ -8407,12 +8484,37 @@ pub struct PluginsConfig {
 }
 
 impl PluginsConfig {
+    pub fn entry_config(
+        &self,
+        instance_key: &str,
+    ) -> Result<Option<&HashMap<String, String>>, DuplicatePluginConfigEntry> {
+        let mut matches = self
+            .entries
+            .iter()
+            .filter(|entry| entry.name == instance_key);
+        let first = matches.next().map(|entry| &entry.config);
+        if matches.next().is_some() {
+            return Err(DuplicatePluginConfigEntry);
+        }
+        Ok(first)
+    }
+
+    /// The granted egress allowlist and private-address carveout for `alias`,
+    /// as `(egress_hosts, egress_allow_private)`.
+    ///
+    /// A missing entry returns two empty lists, which is deny-everything. This
+    /// is the read the plugin host performs **per request**, so an operator's
+    /// edit applies without re-instantiating the guest (resolved from live
+    /// config at use time
+    /// resolution). Both lists are returned as authored; they were validated by
+    /// [`Config::validate`] at load, and the matcher re-canonicalizes nothing.
     #[must_use]
-    pub fn entry_config(&self, alias: &str) -> Option<&HashMap<String, String>> {
+    pub fn entry_egress(&self, alias: &str) -> (Vec<String>, Vec<String>) {
         self.entries
             .iter()
             .find(|e| e.name == alias)
-            .map(|e| &e.config)
+            .map(|e| (e.egress_hosts.clone(), e.egress_allow_private.clone()))
+            .unwrap_or_default()
     }
 }
 
@@ -8482,6 +8584,13 @@ pub struct PluginLimitsConfig {
     /// Maximum component instances a plugin store may create.
     #[serde(default = "default_plugin_max_instances")]
     pub max_instances: usize,
+    /// Maximum live host-owned network connections per logical plugin instance,
+    /// shared across every transport and every store belonging to it.
+    ///
+    /// Unlike the ceilings above this one spans calls rather than bounding a
+    /// single call, because a connection outlives the call that opened it.
+    #[serde(default = "default_plugin_max_connections_per_instance")]
+    pub max_connections_per_instance: usize,
 }
 
 fn default_plugin_call_fuel() -> u64 {
@@ -8500,6 +8609,10 @@ fn default_plugin_max_instances() -> usize {
     64
 }
 
+fn default_plugin_max_connections_per_instance() -> usize {
+    16
+}
+
 impl Default for PluginLimitsConfig {
     fn default() -> Self {
         Self {
@@ -8507,6 +8620,7 @@ impl Default for PluginLimitsConfig {
             max_memory_mb: default_plugin_max_memory_mb(),
             max_table_elements: default_plugin_max_table_elements(),
             max_instances: default_plugin_max_instances(),
+            max_connections_per_instance: default_plugin_max_connections_per_instance(),
         }
     }
 }
@@ -9184,8 +9298,11 @@ pub struct CodexCliConfig {
     /// Extra CLI arguments appended to `codex exec` before the prompt.
     ///
     /// Values come from operator-controlled config (same trust level as
-    /// `env_passthrough`) and are not validated — the operator is responsible
-    /// for understanding the implications of flags passed here.
+    /// `env_passthrough`) and remain allowed without blocking. Config validation
+    /// warns when a recognized argument can disable Codex's sandbox, alter
+    /// approval or policy loading, expand workspace access, or register a
+    /// locally executable integration. This is a warning inventory, not an
+    /// allowlist; ordinary and unknown arguments remain allowed and silent.
     ///
     /// **Warning:** `--sandbox=danger-full-access` disables Codex's bubblewrap
     /// isolation; only use in environments where the container itself provides
@@ -9194,6 +9311,274 @@ pub struct CodexCliConfig {
     /// Example: `["--sandbox=danger-full-access", "--skip-git-repo-check"]`
     #[serde(default)]
     pub extra_args: Vec<String>,
+}
+
+impl CodexCliConfig {
+    /// Returns the configured arguments exactly as ZeroClaw forwards them to
+    /// `codex exec`, paired with their original config indices.
+    ///
+    /// Trimming and empty-entry removal live here so subprocess construction
+    /// and security-boundary diagnostics cannot interpret different argv
+    /// sequences. Original indices keep warning paths stable for operators.
+    pub fn effective_extra_args(&self) -> impl Iterator<Item = (usize, &str)> {
+        effective_codex_cli_extra_args(&self.extra_args)
+    }
+}
+
+fn effective_codex_cli_extra_args(extra_args: &[String]) -> impl Iterator<Item = (usize, &str)> {
+    extra_args
+        .iter()
+        .enumerate()
+        .filter_map(|(index, raw_arg)| {
+            let arg = raw_arg.trim();
+            (!arg.is_empty()).then_some((index, arg))
+        })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RiskyCodexCliArgValue {
+    Presence,
+    AnyValue,
+    ExactValue(&'static str),
+    SecurityConfigOverride,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RiskyCodexCliFlag {
+    spellings: &'static [&'static str],
+    display: &'static str,
+    value: RiskyCodexCliArgValue,
+    effect: &'static str,
+}
+
+/// Recognized Codex CLI arguments that can weaken the warning contract below.
+///
+/// The scope is deliberately finite: direct sandbox, approval, policy-source,
+/// and workspace selectors, plus config families that register local commands,
+/// hooks, plugins, apps, or MCP tools. This is not an allowlist or an exhaustive
+/// classification of every behavioral Codex setting. Unknown arguments remain
+/// allowed and silent for forward compatibility.
+const RISKY_CODEX_CLI_FLAGS: &[RiskyCodexCliFlag] = &[
+    // `danger-full-access` removes the command sandbox; read-only and
+    // workspace-write remain ordinary supported operator choices.
+    RiskyCodexCliFlag {
+        spellings: &["--sandbox", "-s"],
+        display: "--sandbox danger-full-access / -s danger-full-access",
+        value: RiskyCodexCliArgValue::ExactValue("danger-full-access"),
+        effect: "disable Codex command sandboxing",
+    },
+    // The long flag and its `--yolo` alias disable both independent gates.
+    RiskyCodexCliFlag {
+        spellings: &["--dangerously-bypass-approvals-and-sandbox", "--yolo"],
+        display: "--dangerously-bypass-approvals-and-sandbox / --yolo",
+        value: RiskyCodexCliArgValue::Presence,
+        effect: "disable Codex approval prompts and sandbox enforcement",
+    },
+    // Automatic review changes who decides approval requests even though the
+    // command sandbox remains enabled.
+    RiskyCodexCliFlag {
+        spellings: &["--approve-for-me", "--not-so-yolo"],
+        display: "--approve-for-me / --not-so-yolo",
+        value: RiskyCodexCliArgValue::Presence,
+        effect: "route Codex approval requests through automatic review",
+    },
+    // Hooks may execute outside the command sandbox, so bypassing their trust
+    // review crosses a separate execution boundary.
+    RiskyCodexCliFlag {
+        spellings: &["--dangerously-bypass-hook-trust"],
+        display: "--dangerously-bypass-hook-trust",
+        value: RiskyCodexCliArgValue::Presence,
+        effect: "run enabled hooks without persisted hook trust",
+    },
+    // Execpolicy rules are an operator-authored command constraint layer.
+    RiskyCodexCliFlag {
+        spellings: &["--ignore-rules"],
+        display: "--ignore-rules",
+        value: RiskyCodexCliArgValue::Presence,
+        effect: "skip execpolicy .rules files that constrain command execution",
+    },
+    // Codex treats every added directory as writable alongside the workspace.
+    RiskyCodexCliFlag {
+        spellings: &["--add-dir"],
+        display: "--add-dir",
+        value: RiskyCodexCliArgValue::AnyValue,
+        effect: "add writable directories alongside the selected workspace",
+    },
+    // ZeroClaw validates the tool's working_directory before spawning Codex;
+    // this flag can replace that validated root inside the child process.
+    RiskyCodexCliFlag {
+        spellings: &["--cd", "-C"],
+        display: "--cd / -C",
+        value: RiskyCodexCliArgValue::AnyValue,
+        effect: "replace the ZeroClaw-validated Codex working root",
+    },
+    // A named profile is layered over the base user config and can replace its
+    // approval, sandbox, permission, and workspace boundary settings.
+    RiskyCodexCliFlag {
+        spellings: &["--profile", "-p"],
+        display: "--profile / -p",
+        value: RiskyCodexCliArgValue::AnyValue,
+        effect: "load a Codex configuration profile that can override approval, sandbox, or workspace policy",
+    },
+    // Omitting the base user config can remove stricter policy selected there.
+    RiskyCodexCliFlag {
+        spellings: &["--ignore-user-config"],
+        display: "--ignore-user-config",
+        value: RiskyCodexCliArgValue::Presence,
+        effect: "skip Codex user configuration that may define stricter approval, sandbox, or workspace policy",
+    },
+    // Codex folds these global selectors into `features.<name>` config
+    // overrides for every subcommand. Feature gates include permission,
+    // network, sandbox, hooks, apps, plugins, and other external capabilities,
+    // so classify the selector without copying Codex's fast-moving registry.
+    RiskyCodexCliFlag {
+        spellings: &["--enable", "--disable"],
+        display: "--enable / --disable feature toggle",
+        value: RiskyCodexCliArgValue::AnyValue,
+        effect: "change Codex feature gates that can alter security or external capability boundaries",
+    },
+    // `-c` is global in Codex and can override approval policy, legacy sandbox
+    // mode, feature gates, or the newer named permission-profile configuration.
+    RiskyCodexCliFlag {
+        spellings: &["--config", "-c"],
+        display: "--config / -c security or executable-integration override",
+        value: RiskyCodexCliArgValue::SecurityConfigOverride,
+        effect: "override a recognized Codex security or executable-integration setting",
+    },
+];
+
+/// Current Codex config namespaces within this warning's finite contract.
+/// Match each namespace as a family so new descendants inherit the warning
+/// without turning unrelated keys or near matches into false positives.
+const RISKY_CODEX_CLI_CONFIG_KEY_FAMILIES: &[&str] = &[
+    // Approval, sandbox, workspace, and environment policy.
+    "approval_policy",
+    "approvals_reviewer",
+    "auto_review",
+    "sandbox_mode",
+    "sandbox_permissions",
+    "sandbox_workspace_write",
+    "default_permissions",
+    "permissions",
+    "shell_environment_policy",
+    "allow_login_shell",
+    "features",
+    "use_legacy_landlock",
+    // Project trust and platform sandbox policy.
+    "projects",
+    "windows",
+    // Locally executable or tool-providing integrations.
+    "mcp_servers",
+    "hooks",
+    "plugins",
+    "apps",
+    "notify",
+];
+
+const CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING: &str =
+    "codex_cli_extra_args_security_boundary";
+
+#[derive(Debug, Clone, Copy)]
+struct RiskyCodexCliArgMatch {
+    index: usize,
+    flag: &'static RiskyCodexCliFlag,
+}
+
+fn risky_codex_cli_arg_matches(extra_args: &[String]) -> Vec<RiskyCodexCliArgMatch> {
+    let mut matches = Vec::new();
+    let effective_args = effective_codex_cli_extra_args(extra_args).collect::<Vec<_>>();
+
+    for (effective_index, (original_index, arg)) in effective_args.iter().copied().enumerate() {
+        if arg == "--" {
+            break;
+        }
+
+        for flag in RISKY_CODEX_CLI_FLAGS {
+            if flag.spellings.iter().any(|spelling| {
+                codex_cli_flag_matches(&effective_args, effective_index, arg, spelling, flag.value)
+            }) {
+                matches.push(RiskyCodexCliArgMatch {
+                    index: original_index,
+                    flag,
+                });
+                break;
+            }
+        }
+    }
+
+    matches
+}
+
+fn codex_cli_flag_matches(
+    effective_args: &[(usize, &str)],
+    index: usize,
+    arg: &str,
+    spelling: &str,
+    value_rule: RiskyCodexCliArgValue,
+) -> bool {
+    if arg == spelling {
+        return match value_rule {
+            RiskyCodexCliArgValue::Presence => true,
+            _ => effective_args
+                .get(index + 1)
+                .map(|(_, value)| *value)
+                .filter(|value| !value.starts_with('-'))
+                .is_some_and(|value| codex_cli_value_matches(value, value_rule)),
+        };
+    }
+
+    !matches!(value_rule, RiskyCodexCliArgValue::Presence)
+        && codex_cli_attached_value(arg, spelling)
+            .is_some_and(|value| codex_cli_value_matches(value, value_rule))
+}
+
+fn codex_cli_attached_value<'a>(arg: &'a str, spelling: &str) -> Option<&'a str> {
+    let remainder = arg.strip_prefix(spelling)?;
+    if spelling.starts_with("--") {
+        remainder.strip_prefix('=')
+    } else if spelling.len() == 2 && !remainder.is_empty() {
+        Some(remainder.strip_prefix('=').unwrap_or(remainder))
+    } else {
+        None
+    }
+}
+
+fn codex_cli_value_matches(value: &str, rule: RiskyCodexCliArgValue) -> bool {
+    let value = value.trim();
+    match rule {
+        // Presence-only clap flags do not accept attached values. Their exact
+        // spelling is handled before this value matcher is called.
+        RiskyCodexCliArgValue::Presence => false,
+        RiskyCodexCliArgValue::AnyValue => !value.is_empty(),
+        RiskyCodexCliArgValue::ExactValue(expected) => {
+            codex_cli_unquote(value).eq_ignore_ascii_case(expected)
+        }
+        RiskyCodexCliArgValue::SecurityConfigOverride => codex_cli_security_config_override(value),
+    }
+}
+
+fn codex_cli_security_config_override(value: &str) -> bool {
+    let Some((key, raw_value)) = value.split_once('=') else {
+        return false;
+    };
+    let key = key.trim();
+    let value = codex_cli_unquote(raw_value.trim());
+
+    !value.is_empty()
+        && RISKY_CODEX_CLI_CONFIG_KEY_FAMILIES
+            .iter()
+            .any(|family| codex_cli_config_key_is_in_family(key, family))
+}
+
+fn codex_cli_config_key_is_in_family(key: &str, family: &str) -> bool {
+    key == family
+        || key
+            .strip_prefix(family)
+            .is_some_and(|remainder| remainder.starts_with('.'))
+}
+
+fn codex_cli_unquote(value: &str) -> &str {
+    value.trim_matches(|character| character == '\'' || character == '"')
 }
 
 fn default_codex_cli_timeout_secs() -> u64 {
@@ -9325,6 +9710,13 @@ pub enum ProxyScope {
 }
 
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
+/// The standard `web_fetch` request and every `http_request` request are direct
+/// so their locally validated DNS answers can be pinned: they bypass environment
+/// proxies and reject a runtime proxy scope that applies to `tool.web_fetch` or
+/// `tool.http_request`, including an enabled `environment` scope. Unmanaged process
+/// proxy variables are warned when ignored. The optional Firecrawl API fallback uses
+/// normal environment proxy discovery. To proxy other traffic, use `services` scope
+/// without those selectors or `tool.*`.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "proxy"]
@@ -9591,6 +9983,25 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
 
 const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 
+fn validate_plugin_entries(config: &PluginsConfig) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (index, entry) in config.entries.iter().enumerate() {
+        let instance_key = entry.name.trim();
+        if instance_key.is_empty() {
+            anyhow::bail!("plugins.entries[{index}].name must not be empty");
+        }
+        if instance_key != entry.name {
+            anyhow::bail!(
+                "plugins.entries[{index}].name must not have leading or trailing whitespace"
+            );
+        }
+        if !seen.insert(instance_key) {
+            anyhow::bail!("plugins.entries contains a duplicate instance key");
+        }
+    }
+    Ok(())
+}
+
 fn validate_mcp_config(config: &McpConfig) -> Result<()> {
     let mut seen_names = std::collections::HashSet::new();
     for (i, server) in config.servers.iter().enumerate() {
@@ -9807,6 +10218,112 @@ fn clear_proxy_env_pair(key: &str) {
     unsafe {
         std::env::remove_var(key);
         std::env::remove_var(key.to_ascii_lowercase());
+    }
+}
+
+/// Return the process proxy variable that reqwest would use for `raw_url`,
+/// excluding destinations covered by `NO_PROXY`/`no_proxy`.
+///
+/// DNS-pinned callers use this to surface an intentional environment-proxy
+/// bypass instead of silently changing the operator's egress path.
+pub fn environment_proxy_for_url(raw_url: &str) -> Option<&'static str> {
+    environment_proxy_for_url_with(raw_url, |key| std::env::var(key).ok())
+}
+
+fn environment_proxy_for_url_with(
+    raw_url: &str,
+    mut read_env: impl FnMut(&str) -> Option<String>,
+) -> Option<&'static str> {
+    fn first_nonempty(
+        read_env: &mut impl FnMut(&str) -> Option<String>,
+        keys: &[&'static str],
+    ) -> Option<&'static str> {
+        keys.iter().copied().find(|key| {
+            read_env(key)
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+    }
+
+    let parsed = reqwest::Url::parse(raw_url).ok()?;
+    let scheme_keys: &[&str] = match parsed.scheme() {
+        "http" => &["HTTP_PROXY", "http_proxy"],
+        "https" => &["HTTPS_PROXY", "https_proxy"],
+        _ => return None,
+    };
+    let proxy_var = first_nonempty(&mut read_env, scheme_keys)
+        .or_else(|| first_nonempty(&mut read_env, &["ALL_PROXY", "all_proxy"]))?;
+    let host = parsed.host_str()?;
+    let no_proxy = read_env("NO_PROXY")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| read_env("no_proxy").filter(|value| !value.trim().is_empty()));
+
+    if no_proxy
+        .as_deref()
+        .is_some_and(|entries| no_proxy_matches_host(entries, host))
+    {
+        None
+    } else {
+        Some(proxy_var)
+    }
+}
+
+fn no_proxy_matches_host(entries: &str, host: &str) -> bool {
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let host_ip = host.parse::<std::net::IpAddr>().ok();
+
+    entries.split(',').map(str::trim).any(|entry| {
+        if entry == "*" {
+            return true;
+        }
+        let entry = entry.trim_end_matches('.');
+        if entry.is_empty() {
+            return false;
+        }
+
+        if let Some(host_ip) = host_ip
+            && let Some((network, prefix)) = entry.split_once('/')
+            && let (Ok(network), Ok(prefix)) =
+                (network.parse::<std::net::IpAddr>(), prefix.parse::<u32>())
+        {
+            return ip_in_prefix(host_ip, network, prefix);
+        }
+
+        if let Ok(entry_ip) = entry.parse::<std::net::IpAddr>() {
+            return host_ip == Some(entry_ip);
+        }
+
+        let domain = entry.trim_start_matches('.').to_ascii_lowercase();
+        host == domain
+            || host
+                .strip_suffix(&domain)
+                .is_some_and(|prefix| prefix.ends_with('.'))
+    })
+}
+
+fn ip_in_prefix(host: std::net::IpAddr, network: std::net::IpAddr, prefix: u32) -> bool {
+    match (host, network) {
+        (std::net::IpAddr::V4(host), std::net::IpAddr::V4(network)) if prefix <= 32 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            u32::from(host) & mask == u32::from(network) & mask
+        }
+        (std::net::IpAddr::V6(host), std::net::IpAddr::V6(network)) if prefix <= 128 => {
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(host) & mask == u128::from(network) & mask
+        }
+        _ => false,
     }
 }
 
@@ -12179,13 +12696,17 @@ pub struct RuntimeConfig {
     /// Shell binary the native runtime uses for command execution.
     ///
     /// Applies only to `runtime.kind = "native"`; other runtimes ignore it.
-    /// When unset or `null`, the system default `sh` is used. The shell is
-    /// invoked as `<shell> -c "<command>"`, so it must be a POSIX-compatible
-    /// shell binary.
+    /// When unset or `null`, the system default `sh` is used.
     ///
-    /// Accepted forms (Unix):
+    /// **Unix:** POSIX-compatible shells are invoked as
+    /// `<shell> -c "<command>"`. Accepted forms:
     /// - a bare command name resolved via `PATH` (e.g. `"bash"`), or
     /// - an absolute path (e.g. `"/bin/bash"`, `"/usr/bin/zsh"`).
+    ///
+    /// `powershell` and `pwsh` select the PowerShell policy dialect and run as
+    /// `<interpreter> -NoProfile -NonInteractive -Command <command>` on every
+    /// supported desktop host; other Unix interpreters are treated as
+    /// POSIX-compatible shells.
     ///
     /// The value is validated when the native runtime is constructed, so a bad
     /// value is reported up front rather than failing on the first shell
@@ -12194,15 +12715,33 @@ pub struct RuntimeConfig {
     /// instead); a bare name not found on `PATH`; and a path that does not
     /// exist or is not executable.
     ///
-    /// **Ignored on Windows and Android** (and not validated there): Windows
-    /// always uses `cmd.exe`, and Android always uses `/system/bin/sh`
-    /// (its shell is not on `PATH` for spawned processes).
+    /// **Windows:** the value selects the interpreter *family* by its file stem
+    /// (case-insensitive), which fixes the invocation convention:
+    /// - `"powershell"` (Windows PowerShell 5.x) or `"pwsh"` (PowerShell 7+),
+    ///   as a bare name resolved via `PATH` or an absolute path (e.g.
+    ///   `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`), run the command as
+    ///   `<interpreter> -NoProfile -NonInteractive -Command <command>`;
+    /// - any other value (including the default `sh` and an explicit `"cmd"`)
+    ///   runs `cmd.exe /C "<command>"`, preserving the historical behaviour.
+    ///
+    /// Only an empty/whitespace value is rejected on Windows; the interpreter is
+    /// located at spawn time.
+    ///
+    /// Command policy uses the selected interpreter's dialect. PowerShell
+    /// accepts a bounded grammar of simple command invocations, arguments,
+    /// variable reads, and pipelines; expression and invocation constructs
+    /// that cannot be safely classified are rejected before execution.
+    ///
+    /// **Ignored on Android** (always `/system/bin/sh`, whose shell is not on
+    /// `PATH` for spawned processes).
     ///
     /// **Examples:**
     /// ```toml
     /// [runtime]
-    /// shell = "bash" # resolves via PATH
-    /// shell = "/bin/zsh" # absolute path
+    /// shell = "bash" # Unix: resolves via PATH
+    /// shell = "/bin/zsh" # Unix: absolute path
+    /// shell = "pwsh" # PowerShell 7+ (Windows, Linux, or macOS)
+    /// shell = "powershell" # Windows: Windows PowerShell 5.x
     /// ```
     #[serde(default)]
     pub shell: Option<String>,
@@ -14828,7 +15367,13 @@ pub enum WhatsAppChatPolicy {
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.whatsapp"]
 pub struct WhatsAppConfig {
@@ -14980,6 +15525,24 @@ pub struct WhatsAppConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+}
+
+impl Default for WhatsAppConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree.
+    ///
+    /// A hand-written field list was the other option and was rejected: this
+    /// struct carries two dozen fields, so such a list silently goes stale the
+    /// first time one is added, which is the same class of defect this exists
+    /// to remove. Every field here either declares a serde default or is an
+    /// `Option`, which is what makes the empty object total. The unwrap is
+    /// covered by `whatsapp_rust_default_matches_serde_default` below, so a
+    /// field added without a default fails that test rather than reaching a
+    /// caller.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every WhatsAppConfig field declares a serde default or is Option")
+    }
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -16065,7 +16628,8 @@ impl ChannelConfig for LineConfig {
 
 // ── Security Config ─────────────────────────────────────────────────
 
-/// Security configuration for audit logging, OTP, e-stop, IAM/SSO, and WebAuthn.
+/// Security configuration for audit logging, OTP, e-stop, IAM/SSO, WebAuthn,
+/// and the host's NAT64 egress boundary.
 ///
 /// Sandbox backend and resource limits live on per-agent risk profiles
 /// (see `RiskProfileConfig::sandbox_*` and `RiskProfileConfig::max_*`); the
@@ -16074,6 +16638,53 @@ impl ChannelConfig for LineConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "security"]
 pub struct SecurityConfig {
+    /// Network-specific RFC 6052 NAT64 prefixes deployed on this host's
+    /// network, for example
+    /// `[security] nat64_prefixes = ["2001:db8:122:344::/96"]`. Default: `[]`.
+    ///
+    /// A NAT64 translator delivers any IPv6 destination inside one of these
+    /// prefixes to the IPv4 address embedded in it. The prefix is an
+    /// organization's own choice and nothing in the address reveals it, so
+    /// without this list an attacker-controlled hostname can resolve to an
+    /// apparently-global IPv6 address that the local translator maps to
+    /// `10.0.0.1` or `169.254.169.254`, and the outbound SSRF checks accept
+    /// it. Declaring the prefixes in use makes the address they translate to
+    /// part of the validation boundary for `http_request`, `web_fetch`, and
+    /// `text_browser`.
+    ///
+    /// Each entry is `<ipv6>/<length>` with one of RFC 6052 §2.2's lengths —
+    /// 32, 40, 48, 56, 64, or 96 — and no bits set beyond that length. A
+    /// malformed entry fails construction of the tools that read this list
+    /// rather than being skipped, so a typo cannot silently narrow the
+    /// boundary.
+    ///
+    /// The default is correct for deployments that run no NAT64 translator and
+    /// for those that use only the well-known `64:ff9b::/96` prefix, which is
+    /// classified without configuration.
+    ///
+    /// RFC 8215 also standardizes `64:ff9b:1::/48` as the local-use NAT64
+    /// block, and it still needs declaring. The public-address validator
+    /// already denies the whole block as non-global, so the default is safe on
+    /// its own. But that non-global check is precisely what the private-host
+    /// opt-in relaxes, and the metadata gate that remains unconditional
+    /// underneath it decodes only the well-known `/96`, not this block. A
+    /// deployment that translates from `64:ff9b:1::/48` must therefore declare
+    /// the specific prefix it uses here; otherwise, once a host is allowed
+    /// through `allowed_private_hosts`, an address in that block reaches the
+    /// translator's embedded IPv4 destination without that destination being
+    /// classified.
+    ///
+    /// Declared prefixes may overlap, and an address inside several of them
+    /// decodes to a *different* IPv4 destination under each. Validation is
+    /// conservative: an address is accepted only when every declared
+    /// translation it matches lands somewhere acceptable, so a nested prefix
+    /// that decodes an address to a private or metadata destination denies it
+    /// even when a broader prefix decodes the same address globally. If that
+    /// refuses destinations you consider legitimate, narrow the declared
+    /// prefixes to the translations actually deployed.
+    #[serde(default)]
+    pub nat64_prefixes: Vec<String>,
+
     /// Audit logging configuration
     #[serde(default)]
     #[nested]
@@ -19117,6 +19728,10 @@ impl Config {
                      can fix them via /config or `zeroclaw config set`"
                 );
             }
+            // Publish the effective post-decryption, post-env-override proxy
+            // configuration before any runtime client or tool is constructed.
+            // Interactive proxy_config updates use the same live state.
+            set_runtime_proxy_config(config.proxy.clone());
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         } else {
@@ -19154,6 +19769,7 @@ impl Config {
                      booting anyway so you can fix them via /config"
                 );
             }
+            set_runtime_proxy_config(config.proxy.clone());
             ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config.config_path.display().to_string(), "workspace": config.data_dir.display().to_string(), "source": resolution_source.as_str(), "initialized": true})), "Config loaded");
             Ok(config)
         }
@@ -19173,35 +19789,12 @@ impl Config {
     /// and document the code in `validation_warnings.rs`.
     pub fn collect_warnings(&self) -> Vec<crate::validation_warnings::ValidationWarning> {
         let mut warnings = Vec::new();
-        if matches!(
-            self.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Full
-        ) {
-            warnings.push(crate::validation_warnings::ValidationWarning::new(
-                "skills_prompt_injection_mode_full_deprecated",
-                "skills.prompt_injection_mode = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode.",
-                "skills.prompt_injection_mode",
-            ));
-        }
-        for (profile_alias, profile) in &self.runtime_profiles {
-            if matches!(
-                profile.prompt_injection_mode,
-                Some(SkillsPromptInjectionMode::Full)
-            ) {
-                let path = format!("runtime_profiles.{profile_alias}.prompt_injection_mode");
-                warnings.push(crate::validation_warnings::ValidationWarning::new(
-                    "skills_prompt_injection_mode_full_deprecated",
-                    format!(
-                        "{path} = \"full\" is deprecated. Explicit full mode remains supported during the deprecation window, but compact is now the default; migrate before Schema V4 removes full mode."
-                    ),
-                    path,
-                ));
-            }
-        }
+        self.collect_codex_cli_extra_arg_warnings(&mut warnings);
         self.collect_fallback_warnings(&mut warnings);
         self.collect_cross_provider_summary_model_warnings(&mut warnings);
         self.collect_a2a_exposed_skills_warnings(&mut warnings);
         self.collect_memory_semantic_search_warnings(&mut warnings);
+        self.collect_dns_pinned_proxy_warnings(&mut warnings);
         self.collect_peer_groups_warnings(&mut warnings);
         // Must run after `collect_cross_provider_summary_model_warnings`: it
         // scans `warnings` to suppress its generic inert `summary_model`
@@ -19231,6 +19824,68 @@ impl Config {
             }
         }
         warnings
+    }
+
+    fn collect_dns_pinned_proxy_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        if !self.proxy.enabled {
+            return;
+        }
+        if self.proxy.scope != ProxyScope::Environment && !self.proxy.has_any_proxy_url() {
+            return;
+        }
+
+        let (http_request_blocked, web_fetch_blocked) = match self.proxy.scope {
+            ProxyScope::Environment | ProxyScope::Zeroclaw => (true, true),
+            ProxyScope::Services => (
+                self.proxy.should_apply_to_service("tool.http_request"),
+                self.proxy.should_apply_to_service("tool.web_fetch"),
+            ),
+        };
+        if !http_request_blocked && !web_fetch_blocked {
+            return;
+        }
+
+        let affected = match (http_request_blocked, web_fetch_blocked) {
+            (true, true) => "http_request and web_fetch",
+            (true, false) => "http_request",
+            (false, true) => "web_fetch",
+            (false, false) => unreachable!(),
+        };
+        warnings.push(crate::validation_warnings::ValidationWarning::new(
+            "proxy_conflicts_with_dns_pinned_tools",
+            format!(
+                "The configured proxy scope applies to DNS-pinned tool calls ({affected}), so \
+                 those calls will fail instead of using an unpinned proxy connection. Use \
+                 proxy.scope = \"services\" and omit tool.http_request and tool.* from \
+                 proxy.services; tool.* also selects web_fetch."
+            ),
+            if self.proxy.scope == ProxyScope::Services {
+                "proxy.services"
+            } else {
+                "proxy.scope"
+            },
+        ));
+    }
+
+    fn collect_codex_cli_extra_arg_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for risky_match in risky_codex_cli_arg_matches(&self.codex_cli.extra_args) {
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING,
+                format!(
+                    "Codex CLI argument `{}` can {}. ZeroClaw allows this operator-controlled \
+                     argument without blocking; verify that the resulting trust boundary is \
+                     intentional.",
+                    risky_match.flag.display, risky_match.flag.effect
+                ),
+                format!("codex_cli.extra_args[{}]", risky_match.index),
+            ));
+        }
     }
 
     /// Surface sqlite semantic/hybrid search with no effective embedder. The
@@ -19838,6 +20493,16 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+
+        let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
+        if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
+            let path = "gateway.websocket_ping_interval_secs";
+            validation_bail!(
+                InvalidNumericRange,
+                path,
+                "{path} = {websocket_ping_interval_secs} is out of range; must be 0..={GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS}"
+            );
+        }
 
         // Tunnel — OpenVPN
         if self.tunnel.tunnel_provider.trim() == "openvpn" {
@@ -20690,6 +21355,8 @@ impl Config {
             }
         }
 
+        validate_plugin_entries(&self.plugins)?;
+
         // MCP
         if self.mcp.enabled {
             validate_mcp_config(&self.mcp)?;
@@ -20786,9 +21453,12 @@ impl Config {
                     "google_workspace.allowed_operations[{i}].service contains invalid characters: {service}"
                 );
             }
+            // Unlike service IDs, resource/sub_resource/method names are camelCase
+            // in the Google APIs (calendarList, quickAdd, batchUpdate), so
+            // uppercase must be accepted here and in the runtime tool check.
             if !resource
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 anyhow::bail!(
                     "google_workspace.allowed_operations[{i}].resource contains invalid characters: {resource}"
@@ -20804,7 +21474,7 @@ impl Config {
                 }
                 if !sub
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 {
                     anyhow::bail!(
                         "google_workspace.allowed_operations[{i}].sub_resource contains invalid characters: {sub}"
@@ -20830,7 +21500,7 @@ impl Config {
                 }
                 if !normalized
                     .chars()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
                 {
                     anyhow::bail!(
                         "google_workspace.allowed_operations[{i}].methods[{j}] contains invalid characters: {normalized}"
@@ -21483,6 +22153,49 @@ impl Config {
                 "plugins.limits.max_instances",
                 "plugins.limits.max_instances must be greater than 0; a zero ceiling rejects every plugin at instantiation"
             );
+        }
+        if self.plugins.limits.max_connections_per_instance == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.max_connections_per_instance",
+                "plugins.limits.max_connections_per_instance must be greater than 0; a zero ceiling rejects every plugin network connection"
+            );
+        }
+
+        // The granted egress allowlist is a security control, so a
+        // malformed entry is a hard config error rather than a silently
+        // dropped line. Both lists validate against the one shared strict
+        // grammar in `zeroclaw_infra::net_guard`.
+        for entry in &self.plugins.entries {
+            for (field, patterns) in [
+                ("egress_hosts", &entry.egress_hosts),
+                ("egress_allow_private", &entry.egress_allow_private),
+            ] {
+                let path = format!("plugins.entries.{}.{field}", entry.name);
+                if let Err(e) =
+                    zeroclaw_infra::net_guard::normalize_egress_patterns(patterns, &path)
+                {
+                    validation_bail!(InvalidFormat, path.clone(), "{}", e);
+                }
+            }
+
+            // A carveout for a host that was never granted is almost always a
+            // typo, and silently ignoring it leaves an operator believing they
+            // opened a path they did not.
+            for private in &entry.egress_allow_private {
+                if !zeroclaw_infra::net_guard::egress_host_matches(
+                    private.trim_start_matches("*."),
+                    &entry.egress_hosts,
+                ) && !entry.egress_hosts.iter().any(|h| h == private)
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("plugins.entries.{}.egress_allow_private", entry.name),
+                        "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one",
+                        entry.name
+                    );
+                }
+            }
         }
 
         Ok(())
@@ -22836,9 +23549,15 @@ async fn sync_directory(path: &Path) -> Result<()> {
 #[prefix = "sop"]
 pub struct SopConfig {
     /// Directory containing SOP definitions (subdirs with SOP.toml + SOP.md).
-    /// Optional override. When omitted, the runtime and CLI both resolve the
-    /// default `<workspace>/sops`; SOPs load from there whenever it exists.
-    #[serde(default)]
+    /// A relative value resolves against the install root (matching the
+    /// `skill-bundles` convention), so the documented `shared/sops` loads from
+    /// `<install>/shared/sops` — the same directory the web/RPC SOP author writes
+    /// to. An absolute or `~`-prefixed value is used as-is. Unset by default;
+    /// SOP runtime behavior activates only when this is set to a non-empty
+    /// value, so leaving it unset (or an explicit empty value) keeps SOP
+    /// loading disabled (unset/empty still falls back to `<install>/shared/sops`
+    /// for offline CLI inspection).
+    #[serde(default = "default_sop_sops_dir")]
     pub sops_dir: Option<String>,
 
     /// Default execution mode for SOPs that omit `execution_mode`.
@@ -22962,6 +23681,26 @@ pub struct SopConfig {
     /// Experimental.
     #[serde(default)]
     pub procedural_memory_enabled: bool,
+}
+
+impl SopConfig {
+    /// Whether the SOP runtime (engine, tools, maintenance tick, run store) is
+    /// active for this config. SOP loading is gated on a concrete definitions
+    /// directory: a non-empty `sops_dir` enables it; an unset or explicit empty
+    /// string keeps it disabled (the default is unset, so SOP runtime is off
+    /// until an operator opts in). This is the single source of truth for
+    /// activation, so callers must not re-derive it from `sops_dir.is_some()` —
+    /// that treats an empty string as enabled and would break the disable path.
+    #[must_use]
+    pub fn runtime_enabled(&self) -> bool {
+        self.sops_dir
+            .as_deref()
+            .is_some_and(|dir| !dir.trim().is_empty())
+    }
+}
+
+fn default_sop_sops_dir() -> Option<String> {
+    None
 }
 
 fn default_sop_execution_mode() -> String {
@@ -23151,7 +23890,7 @@ fn default_sop_maintenance_interval_secs() -> u64 {
 impl Default for SopConfig {
     fn default() -> Self {
         Self {
-            sops_dir: None,
+            sops_dir: default_sop_sops_dir(),
             default_execution_mode: default_sop_execution_mode(),
             max_concurrent_total: default_sop_max_concurrent_total(),
             approval_timeout_secs: default_sop_approval_timeout_secs(),
@@ -23527,21 +24266,56 @@ max_height = 8
         plugins.entries.push(super::PluginEntryConfig {
             name: "image_gen_fal".into(),
             config: std::collections::HashMap::from([("api_key".into(), "secret-a".into())]),
+            ..Default::default()
         });
         plugins.entries.push(super::PluginEntryConfig {
             name: "sd_webui".into(),
             config: std::collections::HashMap::from([("base_url".into(), "http://host".into())]),
+            ..Default::default()
         });
 
-        let fal = plugins.entry_config("image_gen_fal").unwrap();
+        let fal = plugins.entry_config("image_gen_fal").unwrap().unwrap();
         assert_eq!(fal.get("api_key").map(String::as_str), Some("secret-a"));
         assert!(fal.get("base_url").is_none());
 
-        let sd = plugins.entry_config("sd_webui").unwrap();
+        let sd = plugins.entry_config("sd_webui").unwrap().unwrap();
         assert_eq!(sd.get("base_url").map(String::as_str), Some("http://host"));
         assert!(sd.get("api_key").is_none());
 
-        assert!(plugins.entry_config("unknown").is_none());
+        assert!(plugins.entry_config("unknown").unwrap().is_none());
+
+        plugins.entries.push(super::PluginEntryConfig {
+            name: "image_gen_fal".into(),
+            config: std::collections::HashMap::new(),
+            ..Default::default()
+        });
+        assert_eq!(
+            plugins.entry_config("image_gen_fal"),
+            Err(super::DuplicatePluginConfigEntry),
+            "duplicate canonical rows must fail closed"
+        );
+    }
+
+    #[test]
+    async fn config_validation_rejects_duplicate_plugin_instance_keys() {
+        let mut config = Config::default();
+        config.plugins.entries = vec![
+            super::PluginEntryConfig {
+                name: "zpi1_same".into(),
+                config: std::collections::HashMap::new(),
+                ..Default::default()
+            },
+            super::PluginEntryConfig {
+                name: "zpi1_same".into(),
+                config: std::collections::HashMap::new(),
+                ..Default::default()
+            },
+        ];
+
+        let error = config
+            .validate()
+            .expect_err("duplicate plugin instance keys must invalidate config");
+        assert!(error.to_string().contains("duplicate instance key"));
     }
 
     #[test]
@@ -23966,6 +24740,87 @@ max_height = 8
     }
 
     #[test]
+    async fn sop_sops_dir_defaults_to_unset_and_disables_runtime() {
+        // A fresh install (no [sop] sops_dir) leaves the field unset, which keeps
+        // the SOP runtime off. Operators opt in by setting a directory; the daemon
+        // and CLI gate on this via `runtime_enabled()`.
+        let config: SopConfig = toml::from_str("").expect("empty SOP config should deserialize");
+
+        assert_eq!(config.sops_dir, None);
+        assert!(!config.runtime_enabled());
+
+        // SopConfig::default() must agree with the deserialized default.
+        assert_eq!(SopConfig::default().sops_dir, None);
+        assert!(!SopConfig::default().runtime_enabled());
+    }
+
+    #[test]
+    async fn sop_empty_sops_dir_disables_runtime() {
+        // An explicit empty string keeps the SOP runtime off, same as unset.
+        // Whitespace-only is treated the same so a stray space cannot silently
+        // enable it.
+        let disabled: SopConfig =
+            toml::from_str(r#"sops_dir = """#).expect("empty sops_dir should deserialize");
+        assert_eq!(disabled.sops_dir.as_deref(), Some(""));
+        assert!(!disabled.runtime_enabled());
+
+        let whitespace: SopConfig =
+            toml::from_str(r#"sops_dir = "   ""#).expect("whitespace sops_dir should deserialize");
+        assert!(!whitespace.runtime_enabled());
+
+        // A non-empty explicit path enables the runtime.
+        let custom: SopConfig =
+            toml::from_str(r#"sops_dir = "my-sops""#).expect("custom sops_dir should deserialize");
+        assert!(custom.runtime_enabled());
+    }
+
+    // Regression: disabling the SOP runtime by setting an empty `sops_dir`
+    // through the config API must survive save_dirty + reload. Because the
+    // default is now unset (runtime off), even if the incremental writer drops
+    // the empty field, a reload deserializes back to the disabled default —
+    // the operator's opt-out cannot silently flip back on.
+    #[test]
+    async fn sop_empty_sops_dir_disable_survives_persist_and_reload() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Seed an on-disk file with the SOP runtime explicitly enabled so the
+        // incremental save path runs against an existing [sop] section.
+        let seed = format!(
+            "schema_version = {}\n\n[sop]\nsops_dir = \"sops\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.sop.sops_dir = Some("sops".to_string());
+        assert!(config.sop.runtime_enabled(), "seed must start enabled");
+
+        // Operator opts out via the same call site the dashboard/TUI use.
+        config
+            .set_prop_persistent("sop.sops_dir", "")
+            .expect("set_prop_persistent must accept an empty sops_dir");
+        assert!(
+            !config.sop.runtime_enabled(),
+            "empty sops_dir must disable the runtime in memory"
+        );
+
+        config.save_dirty().await.unwrap();
+
+        // Reload from disk and confirm the disable stuck.
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written).expect("persisted config should reload");
+        assert!(
+            !reloaded.sop.runtime_enabled(),
+            "empty/unset sops_dir must keep the SOP runtime off after reload; \
+             on-disk file reads:\n{written}"
+        );
+    }
+
+    #[test]
     async fn sop_untrusted_payload_config_overrides_deserialize() {
         let config: SopConfig = toml::from_str(
             r#"
@@ -24278,17 +25133,39 @@ api_token = "Bearer test-token"
         assert!(!c.skills.allow_scripts);
         assert!(!c.skills.install_suggestions.enabled);
         assert_eq!(
+            SkillsPromptInjectionMode::default(),
+            SkillsPromptInjectionMode::Full
+        );
+        assert_eq!(
             c.skills.prompt_injection_mode,
-            SkillsPromptInjectionMode::Compact
+            SkillsPromptInjectionMode::Full
+        );
+        assert_eq!(
+            c.effective_skills_prompt_mode("missing"),
+            SkillsPromptInjectionMode::Full
         );
         assert!(c.data_dir.to_string_lossy().contains("data"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
 
     #[test]
+    async fn skills_table_without_prompt_mode_keeps_full_default() {
+        let config = parse_test_config(
+            r#"
+[skills]
+open_skills_enabled = false
+"#,
+        );
+
+        assert_eq!(
+            config.skills.prompt_injection_mode,
+            SkillsPromptInjectionMode::Full
+        );
+    }
+
+    #[test]
     async fn runtime_profile_prompt_injection_mode_overrides_global() {
         let mut config = Config::default();
-        config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
         // A runtime profile that pins compact, and an agent pointing at it.
         config.runtime_profiles.insert(
             "compact_profile".to_string(),
@@ -24320,13 +25197,13 @@ api_token = "Bearer test-token"
             .agents
             .insert("inherit".to_string(), AliasedAgentConfig::default());
 
-        // Profile override to Compact beats the (deprecated) global value.
+        // Profile override to Compact beats the global value.
         assert_eq!(
             config.effective_skills_prompt_mode("override"),
             SkillsPromptInjectionMode::Compact
         );
         // An unset profile, an agent with no profile, and an unknown alias all
-        // inherit the explicit global Full value during the deprecation window.
+        // inherit the global Full value.
         assert_eq!(
             config.effective_skills_prompt_mode("unset"),
             SkillsPromptInjectionMode::Full
@@ -24439,8 +25316,7 @@ runtime_profile = "fast"
             SkillsPromptInjectionMode::Compact
         );
 
-        // Profile-less agent: explicit global `full` remains effective during
-        // the deprecation window.
+        // Profile-less agent: explicit global `full` remains effective.
         let plain = parsed
             .resolved_agent_config("plain")
             .expect("agent plain resolves");
@@ -24455,43 +25331,23 @@ runtime_profile = "fast"
     }
 
     #[test]
-    async fn explicit_global_full_emits_structured_deprecation_warning() {
+    async fn full_modes_do_not_emit_deprecation_warning_before_v09() {
         let mut config = Config::default();
         config.skills.prompt_injection_mode = SkillsPromptInjectionMode::Full;
-
-        let warning = config
-            .collect_warnings()
-            .into_iter()
-            .find(|warning| warning.code == "skills_prompt_injection_mode_full_deprecated")
-            .expect("explicit global full should emit a deprecation warning");
-
-        assert_eq!(warning.path, "skills.prompt_injection_mode");
-        assert!(warning.message.contains("remains supported"));
-        assert!(!warning.message.contains("ignored"));
-    }
-
-    #[test]
-    async fn runtime_profile_full_emits_structured_deprecation_warning() {
-        let mut config = Config::default();
         config.runtime_profiles.insert(
-            "legacy".to_string(),
+            "full".to_string(),
             RuntimeProfileConfig {
                 prompt_injection_mode: Some(SkillsPromptInjectionMode::Full),
                 ..RuntimeProfileConfig::default()
             },
         );
 
-        let warning = config
-            .collect_warnings()
-            .into_iter()
-            .find(|warning| {
-                warning.code == "skills_prompt_injection_mode_full_deprecated"
-                    && warning.path == "runtime_profiles.legacy.prompt_injection_mode"
-            })
-            .expect("runtime-profile full should emit a deprecation warning");
-
-        assert!(warning.message.contains("remains supported"));
-        assert!(!warning.message.contains("ignored"));
+        assert!(
+            config
+                .collect_warnings()
+                .into_iter()
+                .all(|warning| warning.code != "skills_prompt_injection_mode_full_deprecated")
+        );
     }
 
     #[test]
@@ -24618,6 +25474,180 @@ enabled = true
         assert!(
             msg.contains("channels.telegram.default.reply_min_interval_secs"),
             "error must name the offending path; got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_websocket_ping_interval_above_upper_bound() {
+        let mut config = Config::default();
+        config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS + 1;
+
+        let err = config
+            .validate()
+            .expect_err("over-bound WebSocket ping interval must be rejected");
+
+        assert!(
+            err.to_string()
+                .contains("gateway.websocket_ping_interval_secs"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_accepts_websocket_ping_interval_upper_bound() {
+        let mut config = Config::default();
+        config.gateway.websocket_ping_interval_secs = GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS;
+
+        config
+            .validate()
+            .expect("WebSocket ping interval upper bound must validate");
+    }
+
+    fn plugin_entry_with_egress(hosts: &[&str], private: &[&str]) -> super::PluginEntryConfig {
+        super::PluginEntryConfig {
+            name: "gitea".to_string(),
+            config: HashMap::new(),
+            egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            egress_allow_private: private.iter().map(|h| (*h).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    async fn validate_accepts_a_well_formed_egress_grant() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["git.internal.example.com", "*.cdn.example.com", "10.0.0.5"],
+            &["git.internal.example.com", "10.0.0.5"],
+        ));
+        config.validate().expect("a canonical grant must validate");
+    }
+
+    #[test]
+    async fn validate_rejects_an_allow_all_egress_entry() {
+        let mut config = Config::default();
+        config
+            .plugins
+            .entries
+            .push(plugin_entry_with_egress(&["*"], &[]));
+        let err = config
+            .validate()
+            .expect_err("a bare '*' egress grant must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("plugins.entries.gitea.egress_hosts"),
+            "error must name the offending path; got: {text}"
+        );
+        assert!(text.contains("allow-all"), "got: {text}");
+    }
+
+    #[test]
+    async fn validate_rejects_malformed_egress_entries() {
+        for bad in [
+            "https://api.example.com",
+            "api.example.com:8443",
+            "*.com",
+            "",
+        ] {
+            let mut config = Config::default();
+            config
+                .plugins
+                .entries
+                .push(plugin_entry_with_egress(&[bad], &[]));
+            assert!(
+                config.validate().is_err(),
+                "egress_hosts entry {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    async fn validate_rejects_a_carveout_for_an_ungranted_destination() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["api.example.com"],
+            &["127.0.0.1"],
+        ));
+        let err = config
+            .validate()
+            .expect_err("a carveout must not stand in for a grant");
+        let text = err.to_string();
+        assert!(
+            text.contains("egress_allow_private"),
+            "error must name the offending path; got: {text}"
+        );
+        assert!(text.contains("not granted by egress_hosts"), "got: {text}");
+    }
+
+    /// The allowlist must stay in the plaintext half of the entry: an operator
+    /// audits the file, and an encrypted allowlist is not auditable.
+    #[test]
+    async fn egress_allowlist_is_not_part_of_the_secret_config_map() {
+        let entry = plugin_entry_with_egress(&["api.example.com"], &[]);
+        let rendered = ::toml::to_string(&entry).expect("entry serializes");
+        assert!(
+            rendered.contains("egress_hosts"),
+            "allowlist must serialize as a plaintext field; got:\n{rendered}"
+        );
+        assert!(
+            entry.config.is_empty(),
+            "the allowlist must not have landed inside the secret config map"
+        );
+    }
+
+    /// An entry authored before this field parses unchanged, and grants nothing.
+    #[test]
+    async fn entry_without_egress_fields_grants_nothing() {
+        let entry: super::PluginEntryConfig =
+            ::toml::from_str("name = \"legacy\"\n").expect("legacy entry parses");
+        assert!(entry.egress_hosts.is_empty());
+        assert!(entry.egress_allow_private.is_empty());
+
+        let mut config = Config::default();
+        config.plugins.entries.push(entry);
+        config.validate().expect("a legacy entry stays valid");
+        assert_eq!(
+            config.plugins.entry_egress("legacy"),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    #[test]
+    async fn entry_egress_returns_deny_all_for_an_unknown_alias() {
+        let config = Config::default();
+        assert_eq!(
+            config.plugins.entry_egress("never-configured"),
+            (Vec::new(), Vec::new()),
+            "an unconfigured instance must resolve to no reach"
+        );
+    }
+
+    #[test]
+    async fn entry_egress_returns_the_authored_grant_for_a_configured_alias() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["git.internal.example.com"],
+            &["git.internal.example.com"],
+        ));
+        assert_eq!(
+            config.plugins.entry_egress("gitea"),
+            (
+                vec!["git.internal.example.com".to_string()],
+                vec!["git.internal.example.com".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_max_connections_per_instance() {
+        let mut config = Config::default();
+        config.plugins.limits.max_connections_per_instance = 0;
+        let err = config
+            .validate()
+            .expect_err("zero max_connections_per_instance must be rejected");
+        assert!(
+            err.to_string()
+                .contains("plugins.limits.max_connections_per_instance"),
+            "error must name the offending path; got: {err}"
         );
     }
 
@@ -28379,6 +29409,7 @@ allowed_numbers = ["+1", "+2"]
             idempotency_max_keys: 4096,
             session_persistence: true,
             session_ttl_hours: 0,
+            websocket_ping_interval_secs: 30,
             pairing_dashboard: PairingDashboardConfig::default(),
             web_dist_dir: None,
             tls: None,
@@ -29323,6 +30354,38 @@ wire_api = "ws"
     }
 
     #[test]
+    async fn load_or_init_seeds_runtime_proxy_from_config_file() {
+        let _env_guard = env_override_lock().await;
+        let config_dir = TempDir::new().unwrap();
+        let _config_dir_guard = EnvValueGuard::set("ZEROCLAW_CONFIG_DIR", config_dir.path());
+        fs::write(
+            config_dir.path().join("config.toml"),
+            r#"
+schema_version = 3
+
+[proxy]
+enabled = true
+http_proxy = "http://boot-proxy.example:3128"
+scope = "zeroclaw"
+"#,
+        )
+        .await
+        .unwrap();
+
+        let loaded = Box::pin(Config::load_or_init()).await.unwrap();
+        let runtime = runtime_proxy_config();
+
+        assert_eq!(loaded.proxy.http_proxy, runtime.http_proxy);
+        assert!(runtime.enabled);
+        assert_eq!(
+            runtime.http_proxy.as_deref(),
+            Some("http://boot-proxy.example:3128")
+        );
+
+        set_runtime_proxy_config(ProxyConfig::default());
+    }
+
+    #[test]
     async fn load_or_init_workspace_override_uses_workspace_root_for_config() {
         let _env_guard = env_override_lock().await;
         let temp_home =
@@ -30213,6 +31276,73 @@ api_token = "tok"
     }
 
     #[test]
+    async fn collect_warnings_surfaces_dns_pinned_proxy_conflicts() {
+        let proxy_url = Some("http://proxy.example:3128".to_string());
+
+        for (scope, http_proxy) in [
+            (ProxyScope::Environment, None),
+            (ProxyScope::Environment, proxy_url.clone()),
+            (ProxyScope::Zeroclaw, proxy_url.clone()),
+        ] {
+            let config = Config {
+                proxy: ProxyConfig {
+                    enabled: true,
+                    http_proxy,
+                    scope,
+                    ..ProxyConfig::default()
+                },
+                ..Config::default()
+            };
+            let warning = config
+                .collect_warnings()
+                .into_iter()
+                .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+                .expect("broad proxy scopes must warn about DNS-pinned tools");
+            assert_eq!(warning.path, "proxy.scope");
+            assert!(warning.message.contains("http_request and web_fetch"));
+            assert!(warning.message.contains("proxy.scope = \"services\""));
+        }
+
+        let services_config = |services: Vec<&str>| Config {
+            proxy: ProxyConfig {
+                enabled: true,
+                http_proxy: proxy_url.clone(),
+                scope: ProxyScope::Services,
+                services: services.into_iter().map(ToOwned::to_owned).collect(),
+                ..ProxyConfig::default()
+            },
+            ..Config::default()
+        };
+
+        let http_warning = services_config(vec!["tool.http_request"])
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+            .expect("the explicit http_request selector must warn");
+        assert_eq!(http_warning.path, "proxy.services");
+        assert!(http_warning.message.contains("tool calls (http_request)"));
+        assert!(!http_warning.message.contains("tool calls (web_fetch)"));
+
+        let wildcard_warning = services_config(vec!["tool.*"])
+            .collect_warnings()
+            .into_iter()
+            .find(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+            .expect("the tool wildcard must warn");
+        assert!(
+            wildcard_warning
+                .message
+                .contains("http_request and web_fetch")
+        );
+
+        assert!(
+            services_config(vec!["model_provider.openai"])
+                .collect_warnings()
+                .iter()
+                .all(|warning| warning.code != "proxy_conflicts_with_dns_pinned_tools")
+        );
+    }
+
+    #[test]
     async fn google_workspace_allowed_operations_require_methods() {
         let mut config = Config::default();
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -30309,6 +31439,35 @@ api_token = "tok"
     }
 
     #[test]
+    async fn google_workspace_allowed_operations_accept_camelcase_entries() {
+        // Google API resource/method identifiers are camelCase; the shipped
+        // examples (calendarList, quickAdd, batchUpdate) must validate.
+        let mut config = Config::default();
+        config.google_workspace.allowed_operations = vec![
+            GoogleWorkspaceAllowedOperation {
+                service: "calendar".into(),
+                resource: "calendarList".into(),
+                sub_resource: None,
+                methods: vec!["list".into(), "get".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "calendar".into(),
+                resource: "events".into(),
+                sub_resource: None,
+                methods: vec!["quickAdd".into()],
+            },
+            GoogleWorkspaceAllowedOperation {
+                service: "gmail".into(),
+                resource: "users".into(),
+                sub_resource: Some("sendAs".into()),
+                methods: vec!["list".into()],
+            },
+        ];
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     async fn google_workspace_allowed_operations_reject_invalid_sub_resource_characters() {
         let mut config = Config::default();
         config.google_workspace.allowed_operations = vec![GoogleWorkspaceAllowedOperation {
@@ -30330,7 +31489,40 @@ api_token = "tok"
     }
 
     #[test]
+    async fn environment_proxy_detection_respects_scheme_and_no_proxy() {
+        let values = HashMap::from([
+            ("HTTP_PROXY", "http://http-proxy.example:3128"),
+            ("HTTPS_PROXY", "http://https-proxy.example:3128"),
+            ("ALL_PROXY", "socks5://all-proxy.example:1080"),
+            ("NO_PROXY", "example.com,10.0.0.0/8,2001:db8::/32,localhost"),
+        ]);
+        let read = |key: &str| values.get(key).map(ToString::to_string);
+
+        assert_eq!(
+            environment_proxy_for_url_with("https://public.invalid/", read),
+            Some("HTTPS_PROXY")
+        );
+        assert_eq!(
+            environment_proxy_for_url_with("http://public.invalid/", read),
+            Some("HTTP_PROXY")
+        );
+        for bypassed in [
+            "https://api.example.com/",
+            "http://10.2.3.4/",
+            "https://[2001:db8::1]/",
+            "http://localhost/",
+        ] {
+            assert_eq!(
+                environment_proxy_for_url_with(bypassed, read),
+                None,
+                "NO_PROXY should bypass {bypassed}"
+            );
+        }
+    }
+
+    #[test]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
+        let _env_guard = env_override_lock().await;
         let service_key = format!(
             "model_provider.cache_test.{}",
             std::time::SystemTime::now()
@@ -30352,6 +31544,7 @@ api_token = "tok"
 
     #[test]
     async fn proxy_reload_applies_new_config_through_rwlock() {
+        let _env_guard = env_override_lock().await;
         set_runtime_proxy_config(ProxyConfig {
             enabled: true,
             http_proxy: Some("http://boot.example:3128".to_string()),
@@ -30378,6 +31571,7 @@ api_token = "tok"
 
     #[test]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
+        let _env_guard = env_override_lock().await;
         let service_key = format!(
             "model_provider.cache_timeout_test.{}",
             std::time::SystemTime::now()
@@ -30406,6 +31600,7 @@ api_token = "tok"
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_max_keys, 10_000);
+        assert_eq!(g.websocket_ping_interval_secs, 30);
     }
 
     // ── Peripherals config ───────────────────────────────────────
@@ -34397,40 +35592,61 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     #[test]
     async fn create_map_key_seeds_plugin_entry_and_routes_config_set() {
         // The `zeroclaw plugin install` seeding path: a fresh
-        // `[[plugins.entries]]` entry named after the plugin must make
-        // `config set plugins.entries.<name>.config.<key>` routable;
+        // `[[plugins.entries]]` entry named with the canonical instance key
+        // must make `config set plugins.entries.<instance>.config.<key>` routable;
         // natural-key path routing only matches keys already present in
         // live config.
-        let mut config = Config::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Config::default()
+        };
+        let instance_key = "zpi1_WyJmaXh0dXJlLnBsdWdpbiIsInRvb2wiLCJtYWluLnh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh44KC-Il0";
         let created = config
-            .create_map_key("plugins.entries", "weather-tool")
+            .create_map_key("plugins.entries", instance_key)
             .expect("plugins.entries must accept new natural-key entries");
         assert!(created, "first add should report created=true");
         assert_eq!(config.plugins.entries.len(), 1);
-        assert_eq!(config.plugins.entries[0].name, "weather-tool");
+        assert_eq!(config.plugins.entries[0].name, instance_key);
+        config.mark_dirty(&format!("plugins.entries.{instance_key}"));
+        config.save_dirty().await.unwrap();
 
         config
-            .set_prop("plugins.entries.weather-tool.config.api_key", "sk-test")
+            .set_prop_persistent(
+                &format!("plugins.entries.{instance_key}.config.api_key"),
+                "sk-test",
+            )
             .expect("config set must route through the seeded entry");
+        config.save_dirty().await.unwrap();
         assert_eq!(
             config
                 .plugins
-                .entry_config("weather-tool")
+                .entry_config(instance_key)
+                .unwrap()
                 .and_then(|c| c.get("api_key"))
                 .map(String::as_str),
             Some("sk-test")
         );
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains(instance_key));
+        assert!(written.contains("api_key"));
+        assert!(
+            !written.contains("sk-test"),
+            "plugin config values must remain encrypted on disk"
+        );
 
         // Idempotent: reinstalling must not clobber operator values.
         let again = config
-            .create_map_key("plugins.entries", "weather-tool")
+            .create_map_key("plugins.entries", instance_key)
             .expect("second add still resolves the section");
         assert!(!again, "duplicate add should report created=false");
         assert_eq!(config.plugins.entries.len(), 1);
         assert_eq!(
             config
                 .plugins
-                .entry_config("weather-tool")
+                .entry_config(instance_key)
+                .unwrap()
                 .and_then(|c| c.get("api_key"))
                 .map(String::as_str),
             Some("sk-test"),
@@ -36275,6 +37491,121 @@ allowed_users = []
         assert_eq!(whatsapp.approval_timeout_secs, 300);
     }
 
+    /// The test above proves the SERDE path. It says nothing about the RUST
+    /// path, and the two used to disagree: a derived `Default` zeroed the
+    /// field while serde supplied 300.
+    ///
+    /// That gap is not cosmetic. An alias created through a surface that
+    /// constructs the struct in Rust, rather than parsing a file, got `0`,
+    /// and `Duration::from_secs(0)` is an already-elapsed deadline, so every
+    /// approval on that alias denied at once with nothing in the operator's
+    /// config looking wrong.
+    #[test]
+    async fn whatsapp_rust_default_waits_rather_than_denying() {
+        assert_eq!(
+            WhatsAppConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs(),
+            "a constructed alias must wait the documented timeout, not deny at once"
+        );
+    }
+
+    /// Pins the whole struct rather than the one field, so a field added later
+    /// with a serde default but no matching Rust default fails here instead of
+    /// reaching an operator. This is also what makes the `expect` in
+    /// `Default::default` safe: if any field stopped being defaultable, the
+    /// deserialize would fail and this test would panic first.
+    #[test]
+    async fn whatsapp_rust_default_matches_serde_default() {
+        let from_rust = serde_json::to_value(WhatsAppConfig::default()).unwrap();
+        let from_serde =
+            serde_json::to_value(serde_json::from_str::<WhatsAppConfig>("{}").unwrap()).unwrap();
+        assert_eq!(
+            from_rust, from_serde,
+            "Default::default() and the serde defaults disagree; every field must match"
+        );
+    }
+
+    /// A zero is still honoured when an operator writes it. The fix above
+    /// changes what an UNSET field means, and must not take away the ability
+    /// to refuse every gated tool deliberately.
+    #[test]
+    async fn whatsapp_explicit_zero_timeout_is_preserved() {
+        let whatsapp: WhatsAppConfig =
+            serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(whatsapp.approval_timeout_secs, 0);
+    }
+
+    /// The whole lifecycle that persisted the accidental zero: create an alias
+    /// through the supported map-key surface, save, reload.
+    ///
+    /// The two tests above compare `Default::default()` against the serde
+    /// defaults, which pins the TYPE. That is where the fix lives, and it is
+    /// not where the defect was felt. An operator never calls
+    /// `WhatsAppConfig::default()`; they add an alias, and the generated
+    /// `create_map_key` inserts `<T>::default()` on their behalf. The field
+    /// carries no `skip_serializing_if` and the struct sets no global skip, so
+    /// whatever that default held is written out EXPLICITLY, and a serde
+    /// default only fires on an ABSENT key. The zero therefore reached the file
+    /// and survived every reload after it, with nothing in the operator's
+    /// config looking wrong.
+    ///
+    /// So this drives the surface rather than the type, and asserts on the
+    /// bytes as well as the reparse: the on-disk assert names the mechanism
+    /// (an explicit `= 0` was persisted) while the reparse asserts what the
+    /// operator gets back. Nothing here sets `approval_timeout_secs`; it is
+    /// omitted throughout, which is the case that broke.
+    #[test]
+    async fn whatsapp_alias_created_through_the_map_key_surface_reloads_waiting() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "schema_version = {}\n",
+                crate::migration::CURRENT_SCHEMA_VERSION
+            ),
+        )
+        .unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+
+        // The same wire sequence the create dispatch runs: create_map_key,
+        // then mark the new alias dirty.
+        let created = config
+            .create_map_key("channels.whatsapp", "shop")
+            .expect("channels.whatsapp must be a map-keyed section");
+        assert!(
+            created,
+            "a fresh alias must be created, not silently reused"
+        );
+        config.mark_dirty("channels.whatsapp.shop");
+
+        config.save_dirty().await.unwrap();
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("approval_timeout_secs = 0"),
+            "creating an alias must not persist an already-elapsed approval deadline; \
+             got:\n{written}"
+        );
+
+        let reparsed: Config = toml::from_str(&written).unwrap();
+        let shop = reparsed
+            .channels
+            .whatsapp
+            .get("shop")
+            .expect("the created alias must survive save and reload");
+        assert_eq!(
+            shop.approval_timeout_secs,
+            default_channel_approval_timeout_secs(),
+            "an alias whose approval_timeout_secs was never set must reload waiting the \
+             documented timeout, not denying at once"
+        );
+    }
+
     #[test]
     async fn channel_approval_timeout_secs_explicit_override() {
         let discord: DiscordConfig =
@@ -37757,6 +39088,518 @@ group_policy = "ignore"
             .into_iter()
             .filter(|warning| warning.code == code)
             .collect()
+    }
+
+    fn owned_codex_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| (*arg).to_string()).collect()
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_accepts_attached_split_and_short_forms() {
+        let cases: &[&[&str]] = &[
+            &["--sandbox=danger-full-access"],
+            &["--sandbox", "danger-full-access"],
+            &["-s", "danger-full-access"],
+            &["-sdanger-full-access"],
+            &["-s=danger-full-access"],
+            &["--dangerously-bypass-approvals-and-sandbox"],
+            &["--yolo"],
+            &["--approve-for-me"],
+            &["--not-so-yolo"],
+            &["--dangerously-bypass-hook-trust"],
+            &["--ignore-rules"],
+            &["--add-dir=/srv/shared"],
+            &["--add-dir", "/srv/shared"],
+            &["--cd=/srv/project"],
+            &["--cd", "/srv/project"],
+            &["-C/srv/project"],
+            &["-C", "/srv/project"],
+            &["--config=approval_policy=never"],
+            &["--config", "approval_policy=on-failure"],
+            &["-capproval_policy=never"],
+            &["-c", "sandbox_mode='danger-full-access'"],
+            &["-c", "default_permissions=unrestricted"],
+            &["--config=sandbox_permissions=[\"disk-full-read-access\"]"],
+            &[
+                "--config",
+                "sandbox_permissions=[\"disk-full-read-access\"]",
+            ],
+            &["-csandbox_permissions=[\"disk-full-read-access\"]"],
+            &["-c", "sandbox_permissions=[\"disk-full-read-access\"]"],
+            &["-cpermissions.unrestricted.network.enabled=true"],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            assert_eq!(
+                risky_codex_cli_arg_matches(&args).len(),
+                1,
+                "expected one risky match for {case:?}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_warns_on_policy_config_source_selectors() {
+        let profile_cases: &[&[&str]] = &[
+            &["--profile=security-review"],
+            &["--profile", "security-review"],
+            &["-psecurity-review"],
+            &["-p=security-review"],
+            &["-p", "security-review"],
+        ];
+
+        for case in profile_cases {
+            let args = owned_codex_args(case);
+            let matches = risky_codex_cli_arg_matches(&args);
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected one profile boundary match for {case:?}"
+            );
+            assert_eq!(matches[0].flag.display, "--profile / -p");
+        }
+
+        let ignore_user_config = owned_codex_args(&["--ignore-user-config"]);
+        let matches = risky_codex_cli_arg_matches(&ignore_user_config);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].flag.display, "--ignore-user-config");
+
+        let missing_profile_value = owned_codex_args(&["--profile", "--ignore-user-config"]);
+        let matches = risky_codex_cli_arg_matches(&missing_profile_value);
+        assert_eq!(matches.len(), 1, "only --ignore-user-config should match");
+        assert_eq!(matches[0].index, 1);
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_effective_extra_args_match_execution_and_preserve_indices() {
+        let config = CodexCliConfig {
+            extra_args: owned_codex_args(&[
+                "   ",
+                " --sandbox ",
+                "\t",
+                " danger-full-access ",
+                " --skip-git-repo-check ",
+            ]),
+            ..CodexCliConfig::default()
+        };
+
+        assert_eq!(
+            config.effective_extra_args().collect::<Vec<_>>(),
+            vec![
+                (1, "--sandbox"),
+                (3, "danger-full-access"),
+                (4, "--skip-git-repo-check"),
+            ]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_classifies_effective_argv_after_empty_elision() {
+        let cases: &[&[&str]] = &[
+            &["--sandbox", "   ", "danger-full-access"],
+            &["-c", "", "mcp_servers.review={ command = 'server' }"],
+            &["--profile", "\t", "security-review"],
+            &["--cd", " ", "/srv/project"],
+            &["--add-dir", "", "/srv/shared"],
+            &["--enable", "  ", "request_permissions_tool"],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            let matches = risky_codex_cli_arg_matches(&args);
+            assert_eq!(
+                matches.len(),
+                1,
+                "expected one risky match after empty argv elision for {case:?}"
+            );
+            assert_eq!(matches[0].index, 0, "warning must retain original index");
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_warns_on_finite_config_families() {
+        let cases: &[&[&str]] = &[
+            &["--config=mcp_servers.review={ command = 'server' }"],
+            &["--config", "hooks.after_agent={ command = ['audit'] }"],
+            &["-cplugins.audit.enabled=true"],
+            &["-c", "apps.connector.enabled=true"],
+            &["--config=notify=['audit-helper']"],
+            &["-c", "projects.'C:\\repo'.trust_level='trusted'"],
+            &["--config=windows.sandbox='elevated'"],
+            &["-c", "shell_environment_policy.inherit='all'"],
+            &["--config=allow_login_shell=true"],
+            &["-cauto_review.policy='review everything'"],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            assert_eq!(
+                risky_codex_cli_arg_matches(&args).len(),
+                1,
+                "expected one finite-family match for {case:?}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_keeps_unrelated_config_families_silent() {
+        let cases: &[&[&str]] = &[
+            &["--config=mcp_server.review.command='server'"],
+            &["--config", "mcp_servers_extra.review.command='server'"],
+            &["-chook.after_agent.command='audit'"],
+            &["-c", "plugins_extra.audit.enabled=true"],
+            &["--config=applications.connector.enabled=true"],
+            &["-c", "notifications=['audit-helper']"],
+            &["--config=project.repo.trust_level='trusted'"],
+            &["-cwindows_extra.sandbox='elevated'"],
+            &["-c", "shell_environment_policy_extra.inherit='all'"],
+            &["--config=allow_login_shell_extra=true"],
+            &["-c", "model='gpt-5.6'"],
+            &["-c", "mcp_servers=''"],
+            &["-c", "hooks=\"\""],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            assert!(
+                risky_codex_cli_arg_matches(&args).is_empty(),
+                "unexpected finite-family match for {case:?}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_warns_on_feature_toggle_selectors() {
+        let cases: &[&[&str]] = &[
+            &["--enable", "request_permissions_tool"],
+            &["--enable=web_search_request"],
+            &["--disable", "plugins"],
+            &["--disable=apps"],
+            &["--config=features.request_permissions_tool=true"],
+            &["--config", "features.web_search_request=true"],
+            &["-cfeatures.use_legacy_landlock=true"],
+            &["-c", "features.plugins=false"],
+            &["--config=features={ request_permissions_tool = true }"],
+            &["-c", "use_legacy_landlock=true"],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            assert_eq!(
+                risky_codex_cli_arg_matches(&args).len(),
+                1,
+                "expected one feature boundary match for {case:?}"
+            );
+        }
+
+        let missing_value_before_flag = owned_codex_args(&["--enable", "--ignore-rules"]);
+        let matches = risky_codex_cli_arg_matches(&missing_value_before_flag);
+        assert_eq!(matches.len(), 1, "only --ignore-rules should match");
+        assert_eq!(matches[0].index, 1);
+
+        let after_terminator = owned_codex_args(&["--", "--enable", "request_permissions_tool"]);
+        assert!(risky_codex_cli_arg_matches(&after_terminator).is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_warns_on_approval_reviewer_overrides() {
+        let cases: &[&[&str]] = &[
+            &["--config=approvals_reviewer=\"auto_review\""],
+            &["--config", "approvals_reviewer='guardian_subagent'"],
+            &["-capprovals_reviewer=auto_review"],
+            &["-c", "approvals_reviewer=\"auto_review\" # comment"],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            assert_eq!(
+                risky_codex_cli_arg_matches(&args).len(),
+                1,
+                "expected one approval-reviewer boundary match for {case:?}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_warns_on_workspace_write_boundary_overrides() {
+        let cases: &[&[&str]] = &[
+            &["--config=sandbox_workspace_write.network_access=true"],
+            &["--config", "sandbox_workspace_write.network_access=false"],
+            &["-csandbox_workspace_write.network_access=true"],
+            &["-c", "sandbox_workspace_write.network_access=true"],
+            &["--config=sandbox_workspace_write.writable_roots=[\"/srv/shared\"]"],
+            &[
+                "--config",
+                "sandbox_workspace_write.writable_roots=[\"/srv/shared\"]",
+            ],
+            &["-csandbox_workspace_write.writable_roots=[\"/srv/shared\"]"],
+            &[
+                "-c",
+                "sandbox_workspace_write.writable_roots=[\"/srv/shared\"]",
+            ],
+            &["--config=sandbox_workspace_write={ network_access = true }"],
+            &[
+                "-c",
+                "sandbox_workspace_write={ writable_roots = [\"/srv/shared\"] }",
+            ],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            assert_eq!(
+                risky_codex_cli_arg_matches(&args).len(),
+                1,
+                "expected one workspace-write boundary match for {case:?}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_warns_on_temp_directory_boundary_overrides() {
+        let cases: &[&[&str]] = &[
+            &["--config=sandbox_workspace_write.exclude_tmpdir_env_var=false"],
+            &[
+                "--config",
+                "sandbox_workspace_write.exclude_tmpdir_env_var=false",
+            ],
+            &["-csandbox_workspace_write.exclude_tmpdir_env_var=false"],
+            &["-c", "sandbox_workspace_write.exclude_tmpdir_env_var=false"],
+            &["--config=sandbox_workspace_write.exclude_slash_tmp=false"],
+            &[
+                "--config",
+                "sandbox_workspace_write.exclude_slash_tmp=false",
+            ],
+            &["-csandbox_workspace_write.exclude_slash_tmp=false"],
+            &["-c", "sandbox_workspace_write.exclude_slash_tmp=false"],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            assert_eq!(
+                risky_codex_cli_arg_matches(&args).len(),
+                1,
+                "expected one temp-directory boundary match for {case:?}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_warns_on_all_nonempty_sandbox_mode_overrides() {
+        let cases: &[&[&str]] = &[
+            &["--config=sandbox_mode=workspace-write"],
+            &["--config", "sandbox_mode=read-only"],
+            &["-csandbox_mode=\"danger-full-access\" # comment"],
+            &["-c", "sandbox_mode=\"danger-full-access\" # comment"],
+            &["-c", "sandbox_mode=\"danger\\u002dfull\\u002daccess\""],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            assert_eq!(
+                risky_codex_cli_arg_matches(&args).len(),
+                1,
+                "expected one sandbox-mode boundary match for {case:?}"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_rejects_safe_near_matches_and_missing_values() {
+        let cases: &[&[&str]] = &[
+            &[],
+            &[""],
+            &["--sandbox=workspace-write"],
+            &["--sandbox", "read-only"],
+            &["--sandboxed=danger-full-access"],
+            &["--dangerously-bypass-approvals"],
+            &["--dangerously-bypass-approvals-and-sandbox=true"],
+            &["--approve-for-me=true"],
+            &["--not-so-yolo=true"],
+            &["--ignore-ruleset"],
+            &["--ignore-rules=true"],
+            &["--add-dir"],
+            &["--add-dir", "--ignore-rules"],
+            &["--cd"],
+            &["-C"],
+            &["--profile"],
+            &["-p"],
+            &["--profile="],
+            &["-p="],
+            &["--profiles=security-review"],
+            &["--enable"],
+            &["--disable"],
+            &["--enable="],
+            &["--disable="],
+            &["--enabled=request_permissions_tool"],
+            &["--disable-feature=plugins"],
+            &["--ignore-user-config=true"],
+            &["--ignore-user-configuration"],
+            &["--ignore-user-config-extra"],
+            &["--config"],
+            &["--config=model=gpt-5.6"],
+            &["-c", "model=gpt-5.6"],
+            &["-c", "approvals_reviewer="],
+            &["-c", "sandbox_permissions="],
+            &["-c", "sandbox_mode="],
+            &["-c", "sandbox_mode=''"],
+            &["-c", "sandbox_workspace_write="],
+            &["-c", "sandbox_workspace_write.network_access="],
+            &["-c", "sandbox_workspace_write.writable_roots="],
+            &["-c", "sandbox_workspace_write.exclude_tmpdir_env_var="],
+            &["-c", "sandbox_workspace_write.exclude_slash_tmp="],
+            &["-c", "features="],
+            &["-c", "features.plugins="],
+            &["-c", "feature.plugins=true"],
+            &["-c", "features_extra.plugins=true"],
+            &["-c", "sandbox_workspace_writer.network_access=true"],
+            &[
+                "-c",
+                "sandbox_workspace_write_extra.exclude_slash_tmp=false",
+            ],
+            &["--skip-git-repo-check"],
+            &["--", "--ignore-rules"],
+        ];
+
+        for case in cases {
+            let args = owned_codex_args(case);
+            let matches = risky_codex_cli_arg_matches(&args);
+            if *case == ["--add-dir", "--ignore-rules"] {
+                assert_eq!(matches.len(), 1, "only --ignore-rules should match");
+                assert_eq!(matches[0].index, 1);
+            } else {
+                assert!(matches.is_empty(), "unexpected match for {case:?}");
+            }
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_policy_config_source_warnings_are_non_blocking_and_redacted() {
+        let selected_profile = "sensitive-production-profile";
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.codex_cli.extra_args = vec![
+            format!("--profile={selected_profile}"),
+            "--ignore-user-config".to_string(),
+        ];
+
+        config
+            .validate()
+            .expect("policy config selectors must remain allowed");
+        let warnings = warnings_with_code(&config, CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING);
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].path, "codex_cli.extra_args[0]");
+        assert_eq!(warnings[1].path, "codex_cli.extra_args[1]");
+        assert!(warnings[0].message.contains("--profile / -p"));
+        assert!(warnings[1].message.contains("--ignore-user-config"));
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.message.contains(selected_profile)),
+            "warning messages must not disclose the selected profile name"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_feature_toggle_warnings_are_non_blocking_and_redacted() {
+        let selected_feature = "sensitive-future-capability";
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.codex_cli.extra_args = vec![
+            format!("--enable={selected_feature}"),
+            "-c".to_string(),
+            format!("features.{selected_feature}=true"),
+        ];
+
+        config
+            .validate()
+            .expect("feature toggle selectors must remain allowed");
+        let warnings = warnings_with_code(&config, CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING);
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].path, "codex_cli.extra_args[0]");
+        assert_eq!(warnings[1].path, "codex_cli.extra_args[1]");
+        assert!(warnings[0].message.contains("--enable / --disable"));
+        assert!(warnings[1].message.contains("--config / -c"));
+        assert!(
+            warnings
+                .iter()
+                .all(|warning| !warning.message.contains(selected_feature)),
+            "warning messages must not disclose feature names or values"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_executable_integration_warnings_are_non_blocking_and_redacted() {
+        let sensitive_server = "private-review-server";
+        let sensitive_command = "C:\\private\\review-server.exe";
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.codex_cli.extra_args = vec![
+            "-c".to_string(),
+            format!("mcp_servers.{sensitive_server}={{ command = '{sensitive_command}' }}"),
+        ];
+
+        config
+            .validate()
+            .expect("executable-integration overrides must remain allowed");
+        let warnings = warnings_with_code(&config, CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].path, "codex_cli.extra_args[0]");
+        assert!(warnings[0].message.contains("without blocking"));
+        assert!(warnings[0].message.contains("--config / -c"));
+        assert!(!warnings[0].message.contains(sensitive_server));
+        assert!(!warnings[0].message.contains(sensitive_command));
+    }
+
+    #[::core::prelude::v1::test]
+    fn risky_codex_cli_arg_matcher_trims_and_reports_each_argument_index() {
+        let args = owned_codex_args(&[
+            "  --sandbox  ",
+            " danger-full-access ",
+            "--ignore-rules",
+            "--config=sandbox_mode=\"danger-full-access\"",
+        ]);
+
+        let matches = risky_codex_cli_arg_matches(&args);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|risky_match| risky_match.index)
+                .collect::<Vec<_>>(),
+            vec![0, 2, 3]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_security_warnings_are_non_blocking_and_structured() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.codex_cli.extra_args =
+            owned_codex_args(&["--sandbox", "danger-full-access", "--skip-git-repo-check"]);
+
+        config
+            .validate()
+            .expect("risky operator-controlled Codex arguments must remain allowed");
+        let warnings = warnings_with_code(&config, CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].path, "codex_cli.extra_args[0]");
+        assert!(warnings[0].message.contains("without blocking"));
+        assert!(warnings[0].message.contains("--sandbox"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn codex_cli_unknown_extra_args_remain_silent_and_allowed() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.codex_cli.extra_args =
+            owned_codex_args(&["--skip-git-repo-check", "--future-codex-option=value"]);
+
+        config
+            .validate()
+            .expect("unknown operator-controlled Codex arguments must remain allowed");
+        assert!(
+            warnings_with_code(&config, CODEX_CLI_EXTRA_ARGS_SECURITY_BOUNDARY_WARNING,).is_empty()
+        );
     }
 
     fn suppress_semantic_memory_warning(config: &mut Config) {
