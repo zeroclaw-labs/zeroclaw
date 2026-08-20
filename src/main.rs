@@ -428,9 +428,10 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
-    HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands, SopGraphFormat,
+    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, CronDeliveryArgs,
+    GatewayCommands, HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands,
+    ProvidersCommands, ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands,
+    SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -802,9 +803,9 @@ Examples:
   zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
   zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
   zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-  zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+  zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+  zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
   zeroclaw cron pause TASK_ID
   zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London")]
     Cron {
@@ -2804,58 +2805,95 @@ fn plugin_host_with_configured_security(
 }
 
 #[cfg(feature = "plugins-wasm")]
-async fn seed_plugin_config_entry(
-    config: &mut crate::config::schema::Config,
+fn installed_plugin_config_entries(
+    host: &zeroclaw::plugins::host::PluginHost,
     plugin_name: &str,
+) -> Result<Vec<(zeroclaw::plugins::PluginCapability, String)>> {
+    let manifest = host
+        .manifest(plugin_name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    if manifest.config_schema.is_none()
+        || !manifest
+            .capabilities
+            .contains(&zeroclaw::plugins::PluginCapability::Tool)
+    {
+        return Ok(Vec::new());
+    }
+
+    // Tool registration currently owns the only package-name runtime binding.
+    // Alias-owned channel bindings must seed their actual instance key when
+    // their production construction path lands; install must not invent one.
+    let scope = zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
+        manifest,
+        zeroclaw::plugins::PluginCapability::Tool,
+        std::iter::empty(),
+    )?;
+    Ok(vec![(
+        zeroclaw::plugins::PluginCapability::Tool,
+        scope.id().config_entry_key()?,
+    )])
+}
+
+/// Seed empty `[[plugins.entries]]` blocks for a freshly installed plugin's
+/// canonical default instance keys. `config set
+/// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
+/// resolution, which only matches entries already present in live config.
+/// Idempotent: existing entries and operator values remain untouched.
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_config_entries(
+    config: &mut crate::config::schema::Config,
+    entries: &[(zeroclaw::plugins::PluginCapability, String)],
 ) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
     let whole_config_degraded = config
         .degraded_security
         .iter()
         .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
     if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seed-skipped",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the \
-                 [plugins] section on disk is malformed. Repair it, add \
-                 `[[plugins.entries]]` with the plugin name, then set values \
-                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
-            )
-        );
+        for (_, instance_key) in entries {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-plugin-config-entry-seed-skipped",
+                    &[("name", instance_key)],
+                    "warning: skipped seeding the plugin config entry: the \
+                     [plugins] section on disk is malformed. Repair it, add \
+                     `[[plugins.entries]]` with the instance key, then set values \
+                     with `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+                )
+            );
+        }
         return Ok(());
     }
-    if plugin_name.is_empty() || plugin_name.contains('.') {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seed-unaddressable",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the plugin \
-                 name cannot be addressed by a dotted config path. Add a \
-                 `[[plugins.entries]]` block to the config file by hand."
-            )
-        );
+
+    let mut created = Vec::new();
+    for (_, instance_key) in entries {
+        if config
+            .create_map_key("plugins.entries", instance_key)
+            .map_err(anyhow::Error::msg)?
+        {
+            config.mark_dirty(&format!("plugins.entries.{instance_key}"));
+            created.push(instance_key);
+        }
+    }
+    if created.is_empty() {
         return Ok(());
     }
-    let created = config
-        .create_map_key("plugins.entries", plugin_name)
-        .map_err(anyhow::Error::msg)?;
-    if !created {
-        return Ok(());
-    }
-    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
     Box::pin(config.save_dirty()).await?;
-    println!(
-        "{}",
-        ta(
-            "cli-plugin-config-entry-seeded",
-            &[("name", plugin_name)],
-            "Seeded config entry. Set plugin config values with \
-             `zeroclaw config set plugins.entries.<name>.config.<key>`."
-        )
-    );
+    for instance_key in created {
+        println!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seeded",
+                &[("name", instance_key)],
+                "Seeded config entry. Set plugin config values with \
+                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+            )
+        );
+    }
     Ok(())
 }
 
@@ -3545,6 +3583,29 @@ async fn async_main(command: clap::Command) -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunLaunchdDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("launchd runner requires --config-dir")?;
+        return service::run_launchd_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+        ..
+    } = &cli.command
+    {
+        return service::run_openrc_log_writer(matches!(stream, ServiceLogStream::Stderr));
+    }
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
     for section in config
@@ -3564,6 +3625,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
                  for this run. Values in that section are NOT in effect. Run \
                  `zeroclaw config migrate` to see the parse error, then repair \
                  the file."
+            )
+        );
+    }
+    for section in &config.retired_wati_config_sections {
+        let fallback = format!(
+            "warning: retired WATI channel config section '{section}' is ignored because WATI support was removed. Migrate to '[channels.whatsapp.<alias>]' using the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
+        );
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-section-retired-wati",
+                &[("section", section)],
+                &fallback,
             )
         );
     }
@@ -4169,10 +4243,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
             zeroclaw_runtime::restart::record_launch();
 
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
-            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
-            // (loop re-reads config from disk and re-runs). The PID stays
-            // the same across reloads — only the in-process subsystems
-            // tear down + re-instantiate.
+            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload after a
+            // `POST /admin/reload` request (loop re-reads config from disk and
+            // re-runs). The PID stays the same across reloads — only the
+            // in-process subsystems tear down + re-instantiate.
             let mut current_config = config;
             // Nag task for the degraded-security warning, scoped to the
             // current config. Re-evaluated each reload iteration so a repaired
@@ -4193,9 +4267,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
-                // SOP loading is gated on `[sop] sops_dir`: unset disables all
-                // SOP runtime behavior, matching the documented rollback path.
-                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
+                // (or empty) by default, so SOP runtime behavior is off until an
+                // operator opts in by setting a directory.
+                let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
@@ -4203,6 +4278,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
+                        &current_config.install_root_dir(),
                         mem,
                         sop_adapters,
                     );
@@ -4970,13 +5046,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+                let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
                     let sop_adapters = build_sop_adapters(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
                         &config.data_dir,
+                        &config.install_root_dir(),
                         mem,
                         sop_adapters,
                     );
@@ -6258,6 +6335,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
                     let name = host.install(&source)?;
+                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6266,7 +6344,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -6285,6 +6363,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     let name = host.install(&plugin_dir)?;
+                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6296,7 +6375,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
                 }
                 Ok(())
             }
@@ -6343,6 +6422,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 "Permissions"
                             )
                         );
+                        for (capability, key) in installed_plugin_config_entries(&host, &info.name)?
+                        {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-config-entry-key",
+                                    &[("capability", &format!("{capability:?}")), ("key", &key),],
+                                    "Config entry key"
+                                )
+                            );
+                        }
                         match &info.wasm_path {
                             Some(path) => println!(
                                 "{}",
@@ -7708,8 +7798,8 @@ fn gate_security_posture(
                 &format!(
                     "Running with DEGRADED security: sections ({sections}) were reset to \
                      defaults and `--allow-degraded-security` was set. The posture may be \
-                     weaker than intended — repair {config_path} and reload \
-                     (SIGUSR1 / `zeroclaw admin reload`) as soon as possible."
+                     weaker than intended — repair {config_path} and restart \
+                     the process as soon as possible."
                 )
             );
         }
@@ -8244,6 +8334,34 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn openrc_log_writer_cli_maps_only_known_streams() {
+        for (value, expected) in [
+            ("stdout", ServiceLogStream::Stdout),
+            ("stderr", ServiceLogStream::Stderr),
+        ] {
+            let cli = Cli::try_parse_from(["zeroclaw", "service", "run-openrc-log-writer", value])
+                .expect("internal OpenRC logger should parse");
+            assert!(matches!(
+                cli.command,
+                Commands::Service {
+                    service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+                    ..
+                } if stream == expected
+            ));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "service",
+                "run-openrc-log-writer",
+                "/tmp/arbitrary.log"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {

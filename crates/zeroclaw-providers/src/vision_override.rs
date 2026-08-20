@@ -7,24 +7,34 @@ use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use zeroclaw_api::model_provider::ModelInfo;
 
-/// Transparent decorator that overrides only a provider's vision (image input)
-/// capability, delegating everything else to the wrapped provider.
+/// Transparent decorator for factory-owned provider metadata.
 ///
-/// Applied once at the provider-construction choke point
-/// (`create_model_provider_inner`) when `[providers.models.<...>] vision` is
-/// set, so every consumer of the resulting provider instance — the
-/// vision-routing gate, the channel media pipeline, and the model router —
-/// reads one consistent capability regardless of provider family. This avoids
-/// having each family's factory (or each consumer) re-derive vision support.
+/// At the provider-construction choke point it both applies an optional vision
+/// override and marks the result as a known leaf with a stable dispatch
+/// identity. Other callers can retain the original vision-only behavior via
+/// [`VisionOverrideProvider::new`], which delegates identity stability.
 pub struct VisionOverrideProvider {
-    supports_vision: bool,
+    supports_vision: Option<bool>,
+    stable_request_identity: Option<bool>,
     inner: Box<dyn ModelProvider>,
 }
 
 impl VisionOverrideProvider {
     pub fn new(inner: Box<dyn ModelProvider>, supports_vision: bool) -> Self {
         Self {
+            supports_vision: Some(supports_vision),
+            stable_request_identity: None,
+            inner,
+        }
+    }
+
+    pub(crate) fn factory_leaf(
+        inner: Box<dyn ModelProvider>,
+        supports_vision: Option<bool>,
+    ) -> Self {
+        Self {
             supports_vision,
+            stable_request_identity: Some(true),
             inner,
         }
     }
@@ -32,19 +42,32 @@ impl VisionOverrideProvider {
 
 #[async_trait]
 impl ModelProvider for VisionOverrideProvider {
+    fn has_stable_request_identity(&self, model: &str) -> bool {
+        self.stable_request_identity
+            .unwrap_or_else(|| self.inner.has_stable_request_identity(model))
+    }
+
     fn capabilities(&self) -> super::traits::ProviderCapabilities {
         // Patch the canonical `vision` capability; the default
         // `supports_vision()` reads this, and so does anything that inspects
         // capabilities directly, keeping the two consistent.
         let mut capabilities = self.inner.capabilities();
-        capabilities.vision = self.supports_vision;
+        if let Some(supports_vision) = self.supports_vision {
+            capabilities.vision = supports_vision;
+        }
         capabilities
     }
 
     fn capabilities_for_model(&self, model: &str) -> super::traits::ProviderCapabilities {
         let mut capabilities = self.inner.capabilities_for_model(model);
-        capabilities.vision = self.supports_vision;
+        if let Some(supports_vision) = self.supports_vision {
+            capabilities.vision = supports_vision;
+        }
         capabilities
+    }
+
+    fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+        self.inner.has_mixed_native_tool_support_for_model(model)
     }
 
     fn default_temperature(&self) -> f64 {
@@ -77,6 +100,7 @@ impl ModelProvider for VisionOverrideProvider {
 
     fn supports_vision(&self) -> bool {
         self.supports_vision
+            .unwrap_or_else(|| self.inner.supports_vision())
     }
 
     fn supports_streaming(&self) -> bool {
@@ -208,6 +232,7 @@ impl zeroclaw_api::attribution::Attributable for VisionOverrideProvider {
 mod tests {
     use super::*;
     use crate::traits::ProviderCapabilities;
+    use std::sync::Arc;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::ModelPricing;
 
@@ -270,5 +295,83 @@ mod tests {
             models[0].pricing.is_some(),
             "vision override must delegate list_models_with_pricing and keep pricing"
         );
+    }
+
+    struct ModelAwareCapabilityFake;
+
+    impl Attributable for ModelAwareCapabilityFake {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "model_aware_capability_fake"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ModelAwareCapabilityFake {
+        fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: model == "routed-model",
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+            model == "routed-model"
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn vision_override_preserves_model_aware_tool_capabilities() {
+        let wrapped = VisionOverrideProvider::new(Box::new(ModelAwareCapabilityFake), false);
+
+        let capabilities = wrapped.capabilities_for_model("routed-model");
+        assert!(
+            capabilities.native_tool_calling,
+            "the vision decorator must preserve model-aware native-tool support"
+        );
+        assert!(
+            !capabilities.vision,
+            "the configured vision override remains authoritative"
+        );
+        assert!(
+            wrapped.has_mixed_native_tool_support_for_model("routed-model"),
+            "the vision decorator must transparently forward mixed-chain detection"
+        );
+    }
+
+    #[test]
+    fn request_identity_defaults_unstable_and_arc_delegates() {
+        let unknown = PricedVisionFake;
+        assert!(!unknown.has_stable_request_identity("model"));
+
+        let stable = Arc::new(VisionOverrideProvider::factory_leaf(
+            Box::new(PricedVisionFake),
+            None,
+        ));
+        assert!(stable.has_stable_request_identity("model"));
+    }
+
+    #[test]
+    fn ordinary_vision_override_preserves_inner_request_identity() {
+        let unstable = VisionOverrideProvider::new(Box::new(PricedVisionFake), false);
+        assert!(!unstable.has_stable_request_identity("model"));
+
+        let stable_inner = VisionOverrideProvider::factory_leaf(Box::new(PricedVisionFake), None);
+        let stable = VisionOverrideProvider::new(Box::new(stable_inner), false);
+        assert!(stable.has_stable_request_identity("model"));
     }
 }

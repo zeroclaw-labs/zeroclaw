@@ -45,7 +45,7 @@ Issues need contributor-visible routing evidence when a special state would othe
 
 Use these meanings consistently:
 
-| Signal | Means | Does not mean |
+| Routing signal | Means | Does not mean |
 |---|---|---|
 | Assignee | Someone is actively implementing, investigating, or shepherding the immediate work. | Permanent area ownership or passive responsibility for every related issue. |
 | Routing evidence | A visible issue comment, body section, public field, board field, or linked tracker records the reason for special handling and the next decision surface. | Automatic implementation ownership or permanent area ownership. |

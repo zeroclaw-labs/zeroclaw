@@ -3,7 +3,7 @@
 > Starting v0.7.0 · Type: Quality · Rev. 1
 >
 > **Canonical reference** · Ratified by the team · Rev. 1
-> Discussion thread and full revision history: [#5653](https://github.com/zeroclaw-labs/zeroclaw/issues/5653)
+> Original RFC discussion: [#5653](https://github.com/zeroclaw-labs/zeroclaw/issues/5653)
 
 --------
 

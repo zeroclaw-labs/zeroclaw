@@ -104,7 +104,13 @@ fn parse_frontmatter(src: &str) -> Result<SkillFrontmatter, DocumentParseError> 
             continue;
         }
         if let Some((ref key, ref mut parts)) = multiline {
-            if line.starts_with(' ') || line.starts_with('\t') {
+            // A blank/whitespace-only line is a paragraph break *inside* the
+            // block scalar, not a terminator — keep collecting. Only a
+            // non-indented, non-empty line (a real next key) ends the scalar.
+            // Mirrors `parse_simple_frontmatter` in skills/mod.rs so service
+            // read/write cannot truncate multi-paragraph descriptions the
+            // agent loader still sees.
+            if line.starts_with(' ') || line.starts_with('\t') || line.trim().is_empty() {
                 parts.push(line.trim().to_string());
                 continue;
             }
@@ -492,6 +498,41 @@ mod tests {
         let content = "---\nname: x\ndescription: >-\n  multi-line\n  description text\n---\n";
         let doc = SkillDocument::parse(content).unwrap();
         assert_eq!(doc.frontmatter.description, "multi-line description text");
+    }
+
+    #[test]
+    fn parses_block_scalar_description_keeps_blank_line_paragraph_break() {
+        // A blank line is a paragraph break *inside* a YAML block scalar, not a
+        // terminator. SkillDocument must match the runtime loader here so
+        // service edits cannot shrink multi-paragraph descriptions.
+        let content = "---\nname: x\ndescription: >-\n  para one\n\n  para two\n---\n# Body\n";
+        let doc = SkillDocument::parse(content).unwrap();
+        assert!(
+            doc.frontmatter.description.contains("para one"),
+            "first paragraph missing: {:?}",
+            doc.frontmatter.description
+        );
+        assert!(
+            doc.frontmatter.description.contains("para two"),
+            "second paragraph after blank line was truncated: {:?}",
+            doc.frontmatter.description
+        );
+        assert_eq!(doc.frontmatter.name, "x");
+        assert_eq!(doc.body.trim(), "# Body");
+    }
+
+    #[test]
+    fn block_scalar_description_round_trips_across_blank_paragraph() {
+        let content = "---\nname: x\ndescription: >-\n  para one\n\n  para two\n---\nbody\n";
+        let doc = SkillDocument::parse(content).unwrap();
+        let serialized = doc.serialize();
+        let again = SkillDocument::parse(&serialized).unwrap();
+        assert!(
+            again.frontmatter.description.contains("para one")
+                && again.frontmatter.description.contains("para two"),
+            "round-trip lost paragraph: {:?}",
+            again.frontmatter.description
+        );
     }
 
     #[test]

@@ -30,6 +30,11 @@ pub struct PromptContext<'a> {
     /// includes "ask before acting" instructions. Full autonomy omits them
     /// so the model executes tools directly without simulating approval.
     pub autonomy_level: AutonomyLevel,
+    /// The shell the runtime adapter will spawn, or `None` for a shell-less
+    /// runtime (which omits the `Shell:` field and the dialect guidance).
+    /// Resolved from `RuntimeAdapter::shell_profile` so the reported shell
+    /// cannot drift from the executed one.
+    pub shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
 }
 
 pub trait PromptSection: Send + Sync {
@@ -51,6 +56,7 @@ impl SystemPromptBuilder {
                 Box::new(ToolHonestySection),
                 Box::new(ToolsSection),
                 Box::new(SafetySection),
+                Box::new(ShellSection),
                 Box::new(SkillsSection),
                 Box::new(WorkspaceSection),
                 Box::new(RuntimeSection),
@@ -85,6 +91,7 @@ pub struct SafetySection;
 pub struct SkillsSection;
 pub struct WorkspaceSection;
 pub struct RuntimeSection;
+pub struct ShellSection;
 pub struct DateTimeSection;
 pub struct ChannelMediaSection;
 
@@ -191,7 +198,13 @@ impl PromptSection for SafetySection {
             );
         }
 
-        out.push_str("- Prefer `trash` over `rm`.\n");
+        // Deletion advice follows the dialect: `trash` is POSIX-only, so
+        // recommending it to a PowerShell or `cmd.exe` session would name a
+        // command that is not there.
+        out.push_str(ctx.shell_profile.as_ref().map_or(
+            zeroclaw_api::runtime_traits::POSIX_DELETION_GUIDANCE,
+            zeroclaw_api::runtime_traits::ShellProfile::safe_deletion_guidance,
+        ));
         out.push_str(match ctx.autonomy_level {
             AutonomyLevel::Full => {
                 "- Execute tools and actions directly — no extra approval needed.\n\
@@ -260,11 +273,44 @@ impl PromptSection for RuntimeSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let host =
             hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-        Ok(format!(
-            "## Runtime\n\nHost: {host} | OS: {} | Model: {}",
-            std::env::consts::OS,
-            ctx.model_name
-        ))
+        // The shell sits next to the OS because the OS alone does not
+        // determine it: on Windows `cmd.exe` and PowerShell are both
+        // reachable. Omitted for shell-less runtimes.
+        match &ctx.shell_profile {
+            Some(profile) => Ok(format!(
+                "## Runtime\n\nHost: {host} | OS: {} | Shell: {} | Model: {}",
+                std::env::consts::OS,
+                profile.name,
+                ctx.model_name
+            )),
+            None => Ok(format!(
+                "## Runtime\n\nHost: {host} | OS: {} | Model: {}",
+                std::env::consts::OS,
+                ctx.model_name
+            )),
+        }
+    }
+}
+
+impl PromptSection for ShellSection {
+    fn name(&self) -> &str {
+        "shell"
+    }
+
+    fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
+        // Only when a registered tool takes a model-authored command: the
+        // syntax list is dead weight otherwise. An empty string is dropped by
+        // the builder, so this section costs nothing when skipped.
+        if !zeroclaw_api::runtime_traits::needs_shell_dialect_guidance(
+            ctx.tools.iter().map(|tool| tool.name()),
+        ) {
+            return Ok(String::new());
+        }
+        Ok(ctx
+            .shell_profile
+            .as_ref()
+            .map(zeroclaw_api::runtime_traits::ShellProfile::prompt_section)
+            .unwrap_or_default())
     }
 }
 
@@ -312,9 +358,67 @@ mod tests {
 
     zeroclaw_api::mock_tool_attribution!(TestTool);
     zeroclaw_api::mock_tool_attribution!(ReadSkillTestTool);
+    zeroclaw_api::mock_tool_attribution!(ShellTestTool);
+    zeroclaw_api::mock_tool_attribution!(CronAddTestTool);
 
     struct TestTool;
     struct ReadSkillTestTool;
+    /// Stands in for the real `shell` tool: `ShellSection` keys on the name.
+    struct ShellTestTool;
+    /// Stands in for `cron_add`, which also takes a model-authored command.
+    struct CronAddTestTool;
+
+    #[async_trait]
+    impl Tool for ShellTestTool {
+        fn name(&self) -> &str {
+            "shell"
+        }
+
+        fn description(&self) -> &str {
+            "Execute a shell command in the workspace directory"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CronAddTestTool {
+        fn name(&self) -> &str {
+            "cron_add"
+        }
+
+        fn description(&self) -> &str {
+            "Schedule a recurring shell command"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
 
     #[async_trait]
     impl Tool for TestTool {
@@ -399,6 +503,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let section = IdentitySection;
@@ -432,6 +537,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(prompt.contains("## Tools"));
@@ -455,6 +561,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
         assert!(!prompt.contains("## Tools"));
@@ -478,6 +585,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -530,6 +638,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -580,6 +689,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -622,6 +732,7 @@ mod tests {
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -669,6 +780,7 @@ mod tests {
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let output = SkillsSection.build(&ctx).unwrap();
@@ -697,6 +809,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let rendered = DateTimeSection.build(&ctx).unwrap();
@@ -749,6 +862,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -785,6 +899,7 @@ mod tests {
 
             security_summary: Some(summary.clone()),
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -822,6 +937,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -851,6 +967,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
+            shell_profile: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -888,6 +1005,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            shell_profile: None,
         };
 
         let output = SafetySection.build(&ctx).unwrap();
@@ -899,5 +1017,152 @@ mod tests {
             output.contains("bypass oversight"),
             "supervised should include 'bypass oversight' instructions"
         );
+    }
+
+    /// Build a context for the shell-reporting sections. `tools` decides
+    /// whether `ShellSection` fires; `shell_profile` is what it reports.
+    fn shell_ctx<'a>(
+        tools: &'a [Box<dyn Tool>],
+        shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    ) -> PromptContext<'a> {
+        PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            agent_workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            shell_profile,
+        }
+    }
+
+    fn profile(
+        name: &str,
+        dialect: zeroclaw_api::runtime_traits::ShellDialect,
+    ) -> zeroclaw_api::runtime_traits::ShellProfile {
+        zeroclaw_api::runtime_traits::ShellProfile {
+            name: name.to_string(),
+            dialect,
+        }
+    }
+
+    #[test]
+    fn runtime_section_reports_the_configured_shell() {
+        use zeroclaw_api::runtime_traits::ShellDialect;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = shell_ctx(&tools, Some(profile("zsh", ShellDialect::Posix)));
+        let output = RuntimeSection.build(&ctx).unwrap();
+        assert!(output.contains("Shell: zsh"), "{output}");
+        // The field sits between OS and Model so the line stays scannable.
+        assert!(output.contains("| Shell: zsh | Model:"), "{output}");
+    }
+
+    #[test]
+    fn runtime_section_omits_the_shell_field_for_a_shell_less_runtime() {
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = shell_ctx(&tools, None);
+        let output = RuntimeSection.build(&ctx).unwrap();
+        assert!(!output.contains("Shell:"), "{output}");
+        // Everything else still renders, so a WASM runtime reads no worse
+        // than it did before the field existed.
+        assert!(
+            output.contains("Host:") && output.contains("Model:"),
+            "{output}"
+        );
+    }
+
+    #[test]
+    fn shell_section_is_silent_without_the_shell_tool() {
+        // No way to run a command means the syntax table is dead weight.
+        use zeroclaw_api::runtime_traits::ShellDialect;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = shell_ctx(&tools, Some(profile("pwsh", ShellDialect::PowerShell)));
+        assert!(ShellSection.build(&ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shell_section_fires_for_a_cron_only_tool_surface() {
+        // `cron_add` takes a model-authored `command` that runs through the
+        // same interpreter, so the dialect matters even without `shell`.
+        use zeroclaw_api::runtime_traits::ShellDialect;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(CronAddTestTool)];
+        let ctx = shell_ctx(&tools, Some(profile("pwsh", ShellDialect::PowerShell)));
+        let output = ShellSection.build(&ctx).unwrap();
+        assert!(output.contains("Get-ChildItem"), "{output}");
+    }
+
+    #[test]
+    fn shell_section_is_silent_for_a_shell_less_runtime() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ShellTestTool)];
+        let ctx = shell_ctx(&tools, None);
+        assert!(ShellSection.build(&ctx).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shell_section_corrects_dialect_when_the_shell_tool_is_registered() {
+        use zeroclaw_api::runtime_traits::ShellDialect;
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ShellTestTool)];
+
+        let ps = ShellSection
+            .build(&shell_ctx(
+                &tools,
+                Some(profile("pwsh", ShellDialect::PowerShell)),
+            ))
+            .unwrap();
+        assert!(ps.contains("Get-ChildItem -Force"), "{ps}");
+        assert!(ps.contains("`cmd` builtins"), "{ps}");
+
+        let cmd = ShellSection
+            .build(&shell_ctx(
+                &tools,
+                Some(profile("cmd", ShellDialect::WindowsCmd)),
+            ))
+            .unwrap();
+        assert!(cmd.contains("findstr"), "{cmd}");
+        assert!(cmd.contains("PowerShell cmdlets"), "{cmd}");
+
+        // POSIX names the shell but carries no correction table: `ls`/`grep`
+        // are already what the model reaches for.
+        let posix = ShellSection
+            .build(&shell_ctx(
+                &tools,
+                Some(profile("bash", ShellDialect::Posix)),
+            ))
+            .unwrap();
+        assert!(posix.contains("`bash`"), "{posix}");
+        assert!(!posix.contains("Get-ChildItem"), "{posix}");
+        assert!(!posix.contains("findstr"), "{posix}");
+    }
+
+    #[test]
+    fn safety_deletion_advice_names_a_command_the_dialect_has() {
+        use zeroclaw_api::runtime_traits::ShellDialect;
+        let tools: Vec<Box<dyn Tool>> = vec![];
+
+        let posix = SafetySection
+            .build(&shell_ctx(
+                &tools,
+                Some(profile("bash", ShellDialect::Posix)),
+            ))
+            .unwrap();
+        assert!(posix.contains("trash"), "{posix}");
+
+        let ps = SafetySection
+            .build(&shell_ctx(
+                &tools,
+                Some(profile("pwsh", ShellDialect::PowerShell)),
+            ))
+            .unwrap();
+        assert!(!ps.contains("trash"), "{ps}");
+        assert!(ps.contains("-WhatIf"), "{ps}");
+
+        // A shell-less runtime keeps the POSIX wording it rendered before.
+        let none = SafetySection.build(&shell_ctx(&tools, None)).unwrap();
+        assert!(none.contains("trash"), "{none}");
     }
 }

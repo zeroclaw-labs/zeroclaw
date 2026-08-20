@@ -27,11 +27,18 @@ fn chord_bypasses_text_input(chord: &Chord) -> bool {
     !modifiers.is_empty()
 }
 
-pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
-    GlobalAction::Help
+pub(crate) fn action_bypasses_text_input<A: RebindableActions>(
+    action: A,
+    event: &KeyEvent,
+) -> bool {
+    action
         .resolved()
         .iter()
         .any(|chord| chord_bypasses_text_input(chord) && chord.matches(event))
+}
+
+pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
+    action_bypasses_text_input(GlobalAction::Help, event)
 }
 
 pub fn input_bar_claims_pane_navigation(event: &KeyEvent) -> bool {
@@ -139,6 +146,26 @@ mod tests {
             assert!(chord.matches(&event));
             assert_eq!(chord_bypasses_text_input(&chord), expected, "{chord:?}");
         }
+    }
+
+    #[test]
+    fn action_bypass_distinguishes_text_from_command_chords() {
+        assert!(!action_bypasses_text_input(
+            ChatTabAction::CopySelection,
+            &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        ));
+        assert!(action_bypasses_text_input(
+            ChatTabAction::CopySelection,
+            &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+        ));
+        assert!(action_bypasses_text_input(
+            ChatTabAction::PageUp,
+            &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        ));
+        assert!(!action_bypasses_text_input(
+            ChatTabAction::CopySelection,
+            &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SHIFT),
+        ));
     }
 
     #[test]

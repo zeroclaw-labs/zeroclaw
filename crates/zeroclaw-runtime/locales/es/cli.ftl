@@ -200,9 +200,9 @@ cli-cron-long-about =
     zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
     zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
     zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-    zeroclaw cron add-every 60000 'Ping heartbeat'
-    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause TASK_ID
     zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =
@@ -429,7 +429,7 @@ cli-sop-ws-invalid-approval = sop approval_response requiere run_id y una decisi
 cli-sop-ws-resolve-failed = error al resolver SOP: {$error}
 cli-sop-ws-engine-lock-poisoned = bloqueo del motor SOP envenenado
 cli-sop-ws-subsystem-disabled = el subsistema SOP no está habilitado
-cli-sop-create-hint = {"  "}Cree uno: mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}Cree uno: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
 cli-sop-loaded-header = SOP cargados ({$count}):
 cli-sop-none-to-validate = No se encontraron SOP para validar.
@@ -479,7 +479,7 @@ cli-cron-added-oneshot = ✅ Tarea cron de una sola vez agregada {$id}
 cli-cron-added-interval-agent = ✅ Tarea cron de agente por intervalo agregada {$id}
 cli-cron-added-interval = ✅ Tarea cron de intervalo agregada {$id}
 cli-cron-updated = ✅ Tarea cron actualizada {$id}
-cli-cron-update-no-field = Se debe proporcionar al menos uno de --expression, --tz, --command, --name, --allowed-tool, o --uses-memory
+cli-cron-update-no-field = Se debe proporcionar al menos uno de --expression, --tz, --command, --name, --allowed-tool, --uses-memory, o una opción de entrega (--channel, --to, --thread, --best-effort, --no-best-effort)
 cli-cron-removed = ✅ Tarea cron eliminada {$id}
 cli-cron-paused = ⏸️  Tarea cron pausada {$id}
 cli-cron-resumed = ▶️  Tarea cron reanudada {$id}
@@ -495,6 +495,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}En    : {$v}
 cli-cron-at2 = {"  "}En  : {$v}
 cli-cron-every = {"  "}Cada(ms): {$v}
+cli-cron-delivery = {"  "}Entrega: {$v}
+cli-cron-delivery-disabled = desactivada (la salida no se envía a ninguna parte)
 cli-no-command = No se proporcionó ningún comando.
 cli-press-enter = Presiona Enter para salir...
 cli-quickstart-title = Quickstart — crea un agente funcional de principio a fin.
@@ -715,8 +717,8 @@ cli-plugin-install-resolving = Resolviendo '{$source}' desde el registro de comp
 cli-plugin-installed-from = Complemento instalado desde {$source}
 cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
 cli-plugin-config-entry-seeded = Se creó [[plugins.entries]] para '{$name}'. Establece los valores de configuración del plugin con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Clave de configuración ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = advertencia: se omitió crear la entrada de configuración para '{$name}': la sección [plugins] en disco está mal formada. Repárala, agrega un bloque [[plugins.entries]] con `name = "{$name}"`, y luego establece valores con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-seed-unaddressable = advertencia: se omitió crear la entrada de configuración para '{$name}': los nombres de plugin que contienen '.' no se pueden direccionar mediante rutas de configuración con puntos (`config set` divide por '.'). Agrega a mano un bloque [[plugins.entries]] con `name = "{$name}"` al archivo de configuración.
 cli-config-section-degraded = advertencia: la sección de configuración `{$section}` en {$path} está mal formada y se restableció a los valores predeterminados para esta ejecución. Los valores de esa sección NO están en efecto. Ejecuta `zeroclaw config migrate` para ver el error de análisis y luego repara el archivo.
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
@@ -946,11 +948,17 @@ cli-doctor-ctxwin-saved = Guardados {$updated} cambios en config.toml
 cli-doctor-ctxwin-dry-run = Simulación completa — sin cambios. Ejecute sin --dry-run para aplicar.
 cli-doctor-ctxwin-none = No se necesitan actualizaciones.
 cli-doctor-ctxwin-write-failed = {$provider_ref}: error al escribir context_window: {$error}
+cli-doctor-context-window-ok = {$provider_ref}: ventana de contexto: {$context_window} tokens
+cli-doctor-context-window-zero = {$provider_ref}: context_window es 0 (no válido; configúrelo con el límite de contexto real del modelo)
+cli-doctor-context-window-unset = {$provider_ref}: no se configuró context_window — usará el valor alternativo de {$fallback} tokens cuando se seleccione; probablemente sea muy inferior al límite real de este modelo; configure context_window en este perfil
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = La comprobación de modelos agotó el tiempo de espera. Es posible que algunos catálogos de proveedores no estén accesibles. Puede volver a ejecutar Doctor para actualizar.
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = Sección de configuración CRÍTICA PARA LA SEGURIDAD `{$path}` no es válida y se restableció a sus valores predeterminados para que el daemon pueda arrancar; la postura en ejecución puede ser MÁS DÉBIL de lo previsto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
 cli-doctor-degraded-section = La sección de configuración `{$path}` está mal formada y se restableció a sus valores predeterminados; los valores de esa sección NO están en efecto. Ejecute `zeroclaw config migrate` para ver el error de análisis y luego repare el archivo.
-cli-doctor-skills-prompt-injection-mode-full-deprecated = El modo de inyección de instrucciones de habilidades "full" está obsoleto. El modo full explícito seguirá siendo compatible durante el periodo de obsolescencia, pero compact es ahora el valor predeterminado; migre antes de que Schema V4 elimine el modo full.
 sop-approval-deferred-at-capacity = No se pudo reanudar la ejecución {$run_id}: los cupos de ejecución están llenos. La aprobación sigue en espera; inténtalo de nuevo cuando se libere un cupo.
 sop-approval-policy-unavailable = La aprobación falló porque el paso de SOP en espera no está disponible: {$reason}. La ejecución sigue en espera.
 sop-rpc-decision-invalid-state = La ejecución {$run_id} no se puede resolver en su estado actual.
@@ -976,6 +984,8 @@ channel-approval-btn-always = Siempre
 channel-approval-tap-instruction = Toca un botón a continuación:
 channel-approval-reply-instruction-yesno = Responde: "{ $yes_command }", "{ $no_command }" o "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Responde con `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-approval-group-visibility-warning =
+    Este es un chat de grupo, por lo que todos los presentes pueden ver este código y los argumentos de la herramienta mostrados arriba. Solo un par autorizado de este canal puede responder.
 channel-telegram-approval-ack-approved = Aprobado
 channel-telegram-approval-ack-always-approved = Siempre aprobado
 channel-telegram-approval-ack-denied = Denegado

@@ -70,10 +70,13 @@ COPY Cargo.toml Cargo.lock ./
 # no longer requires editing this file.  --parents preserves the
 # crates/<name>/Cargo.toml directory structure.
 COPY --parents crates/*/Cargo.toml ./
-# Nested workspace members (e.g. plugin test fixtures) are not matched by the
-# single-level crates/*/Cargo.toml glob above, so copy their manifests
-# explicitly to keep workspace manifest parsing intact during the pre-fetch.
-COPY --parents crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml ./
+# Nested workspace members (test fixture crates) are not matched by the
+# single-level crates/*/Cargo.toml glob above, so match them with their own
+# glob to keep workspace manifest parsing intact during the pre-fetch. A glob
+# rather than explicit paths means adding a fixture member does not require
+# editing this file — cargo fails the workspace load if any member manifest is
+# missing, and every such member lives at crates/*/tests/fixtures/*/.
+COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # apps/zerocode: TUI app not shipped in the server image; copy only its manifest
@@ -107,15 +110,14 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && mkdir -p crates/zeroclaw-hardware/examples \
     && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
     && for d in crates/*/; do mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
-    && mkdir -p crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src \
-    && printf '' > crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs
+    && for d in crates/*/tests/fixtures/*/; do [ -f "${d}Cargo.toml" ] || continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked -p zeroclaw -p zerocode; \
     fi
 RUN rm -rf src benches crates xtask tools/fill-translations
 
@@ -137,10 +139,9 @@ RUN touch src/main.rs src/lib.rs apps/zerocode/src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
-    rm -rf target/release/.fingerprint/zeroclawlabs-* \
-           target/release/deps/zeroclawlabs-* \
-           target/release/incremental/zeroclawlabs-* \
-           target/release/.fingerprint/zeroclaw-* \
+    rm -rf target/release/.fingerprint/zeroclaw-* \
+           target/release/deps/zeroclaw-* \
+           target/release/incremental/zeroclaw-* \
            target/release/deps/zeroclaw_* \
            target/release/incremental/zeroclaw_* \
            target/release/.fingerprint/xtask-* \
@@ -151,9 +152,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            target/release/deps/zerocode-* \
            target/release/incremental/zerocode-* && \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked -p zeroclaw -p zerocode; \
     fi && \
     cp target/release/zeroclaw /app/zeroclaw && \
     cp target/release/zerocode /app/zerocode && \

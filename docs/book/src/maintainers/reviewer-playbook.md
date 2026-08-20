@@ -43,6 +43,7 @@ For every new PR, before reading any code:
 3. Confirm `CI Required Gate` signal status.
 4. Confirm scope is one concern. Mixed-feature mega-PRs go back for a split unless the mix is explicitly justified.
 5. Confirm privacy / data-hygiene rules. See [Privacy](../contributing/privacy.md) for the full rulebook.
+6. If the PR changes visual presentation, confirm the author exercised the actual supported interface and supplied privacy-safe screenshots at representative dimensions. A statement that the smoke was not performed records the gap but does not satisfy it.
 
 If any intake check fails, leave one actionable checklist comment and stop. Don't deep-review a PR that hasn't passed intake: the back-and-forth is cheaper at this layer than after the diff has been reasoned about.
 
@@ -53,6 +54,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - PR-body provenance is true. Cited RFCs, audits, issues, PRs, paths, generated artifacts, or follow-up findings exist and support the claim.
 - Validation evidence names the checks being relied on and why they cover the changed behavior.
 - Directly user-observable claims identify the user boundary and provide the smallest credible evidence that reaches it; use [User-boundary proof](../contributing/user-boundary-proof.md) when unit, mocked, compile, or generic CI evidence stops short.
+- Visual presentation changes include actual-interface evidence from an identifiable revision plus screenshots with enough surrounding layout to assess the result. String assertions, component-only snapshots, and helper-level renderer tests cannot replace this proof. Interaction and transition claims also name the user action and observed result.
 - Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI, or unavailable CI.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
