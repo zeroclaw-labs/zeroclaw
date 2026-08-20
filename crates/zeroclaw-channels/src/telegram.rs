@@ -8554,8 +8554,7 @@ mod tests {
         // constructs (orchestrator/mod.rs 8458-8466): capture config_arc and
         // alias, read allowed_groups live at call-time.
         let alias = "home".to_string();
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
-            Arc::new(Vec::new);
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
         let ch = TelegramChannel::new("t".into(), "home", peer_resolver, false)
             .with_allowed_groups_resolver({
                 let cfg_arc = Arc::clone(&cfg_arc);
