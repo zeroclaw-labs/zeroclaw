@@ -790,9 +790,11 @@ fn render_env_var_name(path: &str) -> anyhow::Result<String> {
 fn render_model_provider_endpoint(name: &str, format_fixed: impl FnOnce(&str) -> String) -> String {
     use zeroclaw_providers::factory::ProviderEndpoint;
 
-    match zeroclaw_providers::factory::endpoint_for_family(name)
-        .unwrap_or_else(|| panic!("canonical provider {name:?} has no endpoint classification"))
-    {
+    let endpoint = zeroclaw_providers::factory::endpoint_for_family(name);
+    // INVARIANT: `name` comes from `list_model_providers`, whose canonical
+    // entries are required by provider-catalog tests to define an endpoint
+    // classification.
+    match endpoint.expect("canonical provider has no endpoint classification") {
         ProviderEndpoint::Fixed(url) => format_fixed(url),
         ProviderEndpoint::Dynamic => "dynamic / resolved at runtime".to_string(),
         ProviderEndpoint::OperatorRequired => "operator required".to_string(),

@@ -145,7 +145,12 @@ async fn serve_static(dir: std::path::PathBuf) -> anyhow::Result<()> {
     use axum::Router;
     use tower_http::services::ServeDir;
 
-    let shared_dir = dir.parent().unwrap().join("_shared");
+    let shared_dir = dir
+        .parent()
+        .ok_or_else(|| {
+            anyhow::Error::msg(format!("book directory has no parent: {}", dir.display()))
+        })?
+        .join("_shared");
     let app = Router::new()
         .nest_service("/_shared", ServeDir::new(&shared_dir))
         .fallback_service(ServeDir::new(&dir).append_index_html_on_directories(true));

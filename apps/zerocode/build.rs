@@ -7,20 +7,21 @@ use std::path::Path;
 
 use serde_json::Value;
 
-fn main() {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR");
+fn main() -> Result<(), String> {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .map_err(|error| format!("CARGO_MANIFEST_DIR is unavailable: {error}"))?;
     let registry = Path::new(&manifest).join("../../web/src/contexts/themes.json");
 
     println!("cargo:rerun-if-changed={}", registry.display());
     println!("cargo:rerun-if-changed=build.rs");
 
     let raw = std::fs::read_to_string(&registry)
-        .unwrap_or_else(|e| panic!("read theme registry {}: {e}", registry.display()));
-    let themes: Value =
-        serde_json::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", registry.display()));
+        .map_err(|error| format!("read theme registry {}: {error}", registry.display()))?;
+    let themes: Value = serde_json::from_str(&raw)
+        .map_err(|error| format!("parse {}: {error}", registry.display()))?;
     let arr = themes
         .as_array()
-        .expect("themes.json top level is not an array");
+        .ok_or_else(|| "themes.json top level is not an array".to_string())?;
 
     let mut out = String::from(
         "// GENERATED from web/src/contexts/themes.json by build.rs — DO NOT EDIT BY HAND.\n\n",
@@ -31,12 +32,12 @@ fn main() {
         let id = t
             .get("id")
             .and_then(Value::as_str)
-            .expect("theme missing id");
+            .ok_or_else(|| "theme missing id".to_string())?;
         let name = snake_case(id);
         let vars = t
             .get("vars")
             .and_then(Value::as_object)
-            .unwrap_or_else(|| panic!("theme {id} missing vars object"));
+            .ok_or_else(|| format!("theme {id} missing vars object"))?;
         let preview: Vec<&str> = t
             .get("preview")
             .and_then(Value::as_array)
@@ -44,29 +45,29 @@ fn main() {
             .unwrap_or_default();
         let tui = t.get("tui").and_then(Value::as_object);
 
-        let var = |key: &str| -> String {
+        let var = |key: &str| -> Result<String, String> {
             let v = vars
                 .get(key)
                 .and_then(Value::as_str)
-                .unwrap_or_else(|| panic!("theme {id} missing {key}"));
-            rgb_literal(v).unwrap_or_else(|| panic!("theme {id} {key} = {v:?} is not #rrggbb"))
+                .ok_or_else(|| format!("theme {id} missing {key}"))?;
+            rgb_literal(v).ok_or_else(|| format!("theme {id} {key} = {v:?} is not #rrggbb"))
         };
-        let swatch = |idx: usize, role: &str| -> String {
+        let swatch = |idx: usize, role: &str| -> Result<String, String> {
             let v = preview
                 .get(idx)
-                .unwrap_or_else(|| panic!("theme {id} preview missing index {idx} for {role}"));
+                .ok_or_else(|| format!("theme {id} preview missing index {idx} for {role}"))?;
             rgb_literal(v)
-                .unwrap_or_else(|| panic!("theme {id} preview[{idx}] = {v:?} is not #rrggbb"))
+                .ok_or_else(|| format!("theme {id} preview[{idx}] = {v:?} is not #rrggbb"))
         };
-        let title = role_literal(tui, id, "title", || var("--pc-accent"));
-        let heading = role_literal(tui, id, "heading", || var("--pc-accent-light"));
-        let body = role_literal(tui, id, "body", || var("--pc-text-primary"));
-        let dim = role_literal(tui, id, "dim", || var("--pc-text-muted"));
-        let accent = role_literal(tui, id, "accent", || var("--pc-accent"));
-        let warn = role_literal(tui, id, "warn", || swatch(3, "warn"));
-        let selection_bg = role_literal(tui, id, "selection_bg", || var("--pc-bg-elevated"));
-        let tool = role_literal(tui, id, "tool", || swatch(2, "tool"));
-        let background = role_literal(tui, id, "background", || var("--pc-bg-base"));
+        let title = role_literal(tui, id, "title", || var("--pc-accent"))?;
+        let heading = role_literal(tui, id, "heading", || var("--pc-accent-light"))?;
+        let body = role_literal(tui, id, "body", || var("--pc-text-primary"))?;
+        let dim = role_literal(tui, id, "dim", || var("--pc-text-muted"))?;
+        let accent = role_literal(tui, id, "accent", || var("--pc-accent"))?;
+        let warn = role_literal(tui, id, "warn", || swatch(3, "warn"))?;
+        let selection_bg = role_literal(tui, id, "selection_bg", || var("--pc-bg-elevated"))?;
+        let tool = role_literal(tui, id, "tool", || swatch(2, "tool"))?;
+        let background = role_literal(tui, id, "background", || var("--pc-bg-base"))?;
 
         out.push_str(&format!(
             "    (\"{name}\", Theme {{ title: {title}, heading: {heading}, body: {body}, \
@@ -77,8 +78,11 @@ fn main() {
 
     out.push_str("];\n");
 
-    let dest = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("theme_presets.rs");
-    std::fs::write(&dest, out).unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
+    let out_dir =
+        std::env::var("OUT_DIR").map_err(|error| format!("OUT_DIR is unavailable: {error}"))?;
+    let dest = Path::new(&out_dir).join("theme_presets.rs");
+    std::fs::write(&dest, out).map_err(|error| format!("write {}: {error}", dest.display()))?;
+    Ok(())
 }
 
 /// Translate a kebab-case registry id to the snake_case the TUI uses
@@ -92,14 +96,14 @@ fn role_literal<F>(
     id: &str,
     key: &str,
     fallback: F,
-) -> String
+) -> Result<String, String>
 where
-    F: FnOnce() -> String,
+    F: FnOnce() -> Result<String, String>,
 {
     let Some(v) = tui.and_then(|roles| roles.get(key)).and_then(Value::as_str) else {
         return fallback();
     };
-    rgb_literal(v).unwrap_or_else(|| panic!("theme {id} tui.{key} = {v:?} is not #rrggbb"))
+    rgb_literal(v).ok_or_else(|| format!("theme {id} tui.{key} = {v:?} is not #rrggbb"))
 }
 
 /// Convert a `#rrggbb` hex string to a `Color::Rgb(r, g, b)` literal. Returns

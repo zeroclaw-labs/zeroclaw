@@ -1,4 +1,5 @@
 use crate::util::*;
+use anyhow::Context as _;
 use std::path::{Path, PathBuf};
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_providers::ProviderDispatch;
@@ -43,7 +44,12 @@ pub fn run(
             std::fs::create_dir_all(&target_dir)?;
 
             for ftl_path in ftl_files_in(&en_dir)? {
-                let filename = ftl_path.file_name().unwrap();
+                let filename = ftl_path.file_name().with_context(|| {
+                    format!(
+                        "Fluent catalogue path has no file name: {}",
+                        ftl_path.display()
+                    )
+                })?;
                 let target_ftl = target_dir.join(filename);
 
                 fill_ftl_file(
