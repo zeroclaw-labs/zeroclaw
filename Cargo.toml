@@ -167,6 +167,12 @@ tower = { version = "0.5", default-features = false, features = ["util"], option
 
 # Uses whatsapp-rust for Bot and Client, wacore for storage traits, custom rusqlite backend avoids Diesel conflict.
 
+# Linux-only: `desktop --install` opens candidate `.desktop` entries with
+# O_NONBLOCK|O_NOFOLLOW so a FIFO or symlink planted in an XDG data dir cannot
+# block or redirect the read.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 # Installer/surface metadata: which `[features]` are internal aggregates or
 # meta toggles rather than user-selectable rows. This bit is NOT derivable from
 # the feature graph (e.g. `embedded-web` and `whatsapp-web` are structurally
