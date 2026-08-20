@@ -8,15 +8,12 @@
 use std::fs;
 use std::path::PathBuf;
 
-use tokio::sync::Mutex;
 use zeroclaw_config::schema::Config;
 use zeroclaw_plugins::component::PluginLimits;
 use zeroclaw_plugins::host::PluginHost;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
 use zeroclaw_plugins::{PluginCapability, PluginPermission};
-
-static ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
 fn fixture() -> Option<PathBuf> {
     let path =
@@ -64,22 +61,33 @@ fn seed_config_dir(dir: &std::path::Path) -> bool {
 
 #[tokio::test]
 async fn reference_plugin_end_to_end_from_throwaway_config() {
-    let _guard = ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir().unwrap();
     if !seed_config_dir(tmp.path()) {
         eprintln!("skipping: reference-plugin.wasm fixture not provisioned");
         return;
     }
 
-    // SAFETY: serialized by ENV_LOCK; restored before the lock is released.
-    let prev = std::env::var("ZEROCLAW_CONFIG_DIR").ok();
-    unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", tmp.path()) };
+    let status = tokio::process::Command::new(std::env::current_exe().expect("test executable"))
+        .args([
+            "--ignored",
+            "--exact",
+            "reference_plugin_from_config_subprocess",
+        ])
+        .env("ZEROCLAW_CONFIG_DIR", tmp.path())
+        .status()
+        .await
+        .expect("run isolated reference plugin test");
+    assert!(status.success(), "isolated reference plugin test failed");
+}
 
+#[tokio::test]
+#[ignore = "subprocess helper with an isolated ZEROCLAW_CONFIG_DIR"]
+async fn reference_plugin_from_config_subprocess() {
     let config = Config::load_or_init().await.expect("load throwaway config");
 
     assert!(config.plugins.enabled, "plugin system enabled from config");
     let plugins_dir = config.plugins.resolved_plugins_dir();
-    assert_eq!(plugins_dir, tmp.path().join("plugins"));
+    assert_eq!(plugins_dir, config.install_root_dir().join("plugins"));
 
     let host = PluginHost::from_plugins_dir(&plugins_dir).expect("scan throwaway plugins dir");
     let details = host.tool_plugin_details();
@@ -131,12 +139,6 @@ async fn reference_plugin_end_to_end_from_throwaway_config() {
     )
     .await
     .expect("execute discovered tool");
-
-    // SAFETY: serialized by ENV_LOCK.
-    match prev {
-        Some(v) => unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", v) },
-        None => unsafe { std::env::remove_var("ZEROCLAW_CONFIG_DIR") },
-    }
 
     assert!(result.success);
     assert!(!result.output.contains("bob@corp.com"), "email masked");

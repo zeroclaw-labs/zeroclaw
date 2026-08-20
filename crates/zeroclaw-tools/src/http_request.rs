@@ -279,11 +279,29 @@ impl HttpRequestTool {
     }
 
     fn resolve_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
-        Self::validate_secret_name(secret_name)?;
-        self.reload_auth_secret(secret_name)
+        self.resolve_auth_secret_with_env(secret_name, |name| std::env::var(name))
     }
 
-    fn reload_auth_secret(&self, secret_name: &str) -> anyhow::Result<String> {
+    fn resolve_auth_secret_with_env<F>(
+        &self,
+        secret_name: &str,
+        env_lookup: F,
+    ) -> anyhow::Result<String>
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
+        Self::validate_secret_name(secret_name)?;
+        self.reload_auth_secret_with_env(secret_name, &env_lookup)
+    }
+
+    fn reload_auth_secret_with_env<F>(
+        &self,
+        secret_name: &str,
+        env_lookup: &F,
+    ) -> anyhow::Result<String>
+    where
+        F: Fn(&str) -> Result<String, std::env::VarError>,
+    {
         let config_path = self.config_path.as_ref().ok_or_else(|| {
             anyhow::Error::msg("auth_secret requires runtime config reload support")
         })?;
@@ -324,7 +342,8 @@ impl HttpRequestTool {
             raw_secret.clone()
         };
 
-        if let Some(env_secret) = resolve_env_backed_auth_secret(secret_name, &secret)? {
+        if let Some(env_secret) = resolve_env_backed_auth_secret(secret_name, &secret, env_lookup)?
+        {
             Ok(env_secret)
         } else {
             Ok(secret)
@@ -418,15 +437,19 @@ impl HttpRequestTool {
     }
 }
 
-fn resolve_env_backed_auth_secret(
+fn resolve_env_backed_auth_secret<F>(
     secret_name: &str,
     raw_secret: &str,
-) -> anyhow::Result<Option<String>> {
+    env_lookup: &F,
+) -> anyhow::Result<Option<String>>
+where
+    F: Fn(&str) -> Result<String, std::env::VarError>,
+{
     let Some(env_name) = env_secret_reference(raw_secret)? else {
         return Ok(None);
     };
 
-    let value = std::env::var(env_name).map_err(|e| {
+    let value = env_lookup(env_name).map_err(|e| {
         anyhow::Error::msg(format!(
             "auth_secret '{secret_name}' references environment variable '{env_name}', but it could not be read: {e}"
         ))
@@ -1054,19 +1077,14 @@ api_token = "${ZEROCLAW_TEST_HTTP_REQUEST_SECRET}"
 "#,
         )
         .unwrap();
-        unsafe {
-            std::env::set_var("ZEROCLAW_TEST_HTTP_REQUEST_SECRET", "Bearer from-env");
-        }
-        scopeguard::defer! {
-            unsafe {
-                std::env::remove_var("ZEROCLAW_TEST_HTTP_REQUEST_SECRET");
-            }
-        }
-
         let tool = test_tool_with_auth_config(config_path, false);
 
         assert_eq!(
-            tool.resolve_auth_secret("api_token").unwrap(),
+            tool.resolve_auth_secret_with_env("api_token", |name| {
+                assert_eq!(name, "ZEROCLAW_TEST_HTTP_REQUEST_SECRET");
+                Ok("Bearer from-env".to_string())
+            })
+            .unwrap(),
             "Bearer from-env"
         );
     }
@@ -1083,13 +1101,12 @@ api_token = "${ZEROCLAW_TEST_HTTP_REQUEST_MISSING_SECRET}"
 "#,
         )
         .unwrap();
-        unsafe {
-            std::env::remove_var("ZEROCLAW_TEST_HTTP_REQUEST_MISSING_SECRET");
-        }
-
         let tool = test_tool_with_auth_config(config_path, false);
         let err = tool
-            .resolve_auth_secret("api_token")
+            .resolve_auth_secret_with_env("api_token", |name| {
+                assert_eq!(name, "ZEROCLAW_TEST_HTTP_REQUEST_MISSING_SECRET");
+                Err(std::env::VarError::NotPresent)
+            })
             .unwrap_err()
             .to_string();
 
@@ -1173,22 +1190,14 @@ api_token = "{encrypted}"
             ),
         )
         .unwrap();
-        unsafe {
-            std::env::set_var(
-                "ZEROCLAW_TEST_HTTP_REQUEST_ENCRYPTED_SECRET",
-                "Bearer encrypted-env",
-            );
-        }
-        scopeguard::defer! {
-            unsafe {
-                std::env::remove_var("ZEROCLAW_TEST_HTTP_REQUEST_ENCRYPTED_SECRET");
-            }
-        }
-
         let tool = test_tool_with_auth_config(config_path, true);
 
         assert_eq!(
-            tool.resolve_auth_secret("api_token").unwrap(),
+            tool.resolve_auth_secret_with_env("api_token", |name| {
+                assert_eq!(name, "ZEROCLAW_TEST_HTTP_REQUEST_ENCRYPTED_SECRET");
+                Ok("Bearer encrypted-env".to_string())
+            })
+            .unwrap(),
             "Bearer encrypted-env"
         );
     }

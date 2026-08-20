@@ -17,10 +17,18 @@ pub fn ref_dir(root: &Path) -> PathBuf {
 }
 
 pub fn target_dir(root: &Path) -> PathBuf {
-    let output = Command::new("cargo")
+    target_dir_with_override(root, None)
+}
+
+fn target_dir_with_override(root: &Path, cargo_target_dir: Option<&std::ffi::OsStr>) -> PathBuf {
+    let mut command = Command::new("cargo");
+    command
         .args(["metadata", "--no-deps", "--format-version", "1"])
-        .current_dir(root)
-        .output();
+        .current_dir(root);
+    if let Some(cargo_target_dir) = cargo_target_dir {
+        command.env("CARGO_TARGET_DIR", cargo_target_dir);
+    }
+    let output = command.output();
     if let Ok(out) = output
         && out.status.success()
         && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&out.stdout)
@@ -34,7 +42,11 @@ pub fn target_dir(root: &Path) -> PathBuf {
 /// The rustdoc output directory (`<target-dir>/doc`), resolved through
 /// [`target_dir`] so it tracks `cargo doc`'s actual output location.
 pub fn doc_dir(root: &Path) -> PathBuf {
-    target_dir(root).join("doc")
+    doc_dir_with_override(root, None)
+}
+
+fn doc_dir_with_override(root: &Path, cargo_target_dir: Option<&std::ffi::OsStr>) -> PathBuf {
+    target_dir_with_override(root, cargo_target_dir).join("doc")
 }
 
 pub fn po_dir(root: &Path) -> PathBuf {
@@ -404,20 +416,9 @@ mod tests {
         // <override>/doc so the assemble()/refs copy reads from where `cargo doc`
         // actually wrote. This is the exact failure the hardcoded `target/doc`
         // path had under a non-default CARGO_TARGET_DIR.
-        // SAFETY: single-threaded body; env is saved and restored.
-        let prev = std::env::var_os("CARGO_TARGET_DIR");
         let alt = std::env::temp_dir().join("zc-xtask-target-dir-test");
-        unsafe {
-            std::env::set_var("CARGO_TARGET_DIR", &alt);
-        }
-        let resolved_target = target_dir(&repo_root());
-        let resolved_doc = doc_dir(&repo_root());
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var("CARGO_TARGET_DIR", v),
-                None => std::env::remove_var("CARGO_TARGET_DIR"),
-            }
-        }
+        let resolved_target = target_dir_with_override(&repo_root(), Some(alt.as_os_str()));
+        let resolved_doc = doc_dir_with_override(&repo_root(), Some(alt.as_os_str()));
         assert_eq!(resolved_target, alt);
         assert_eq!(resolved_doc, alt.join("doc"));
     }
