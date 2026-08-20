@@ -320,15 +320,19 @@ async fn enforce_reported_budget(
     // differ slightly from the dispatched prompt near tight budget boundaries.
     next_use_native_tools: bool,
     // The `before_llm_call` hooks the NEXT iteration re-runs on its prepared
-    // messages before dispatch. A growing, filtering, or replacement hook
-    // changes the provider-facing population after a naive prepare-based
-    // projection, so the projection must account for the post-hook population
-    // to decide against the actual next request.
-    hooks: Option<&crate::hooks::HookRunner>,
-    // The model the next iteration starts its hook pass from (`active_model`
-    // at the real `run_before_llm_call` site). The projection only needs a
-    // starting value; a hook-selected model does not re-route the projection.
-    model: &str,
+    // messages before dispatch. Previously the projection executed the hook
+    // as an estimation step, which double-invoked stateful hooks. The
+    // decision now uses the durable population (no hook) and the actual
+    // next iteration will run the hook once before dispatch; if that hook
+    // grows the request beyond the budget, the next iteration's own
+    // enforcement will trim further. This keeps the projection
+    // side-effect-free.
+    _hooks: Option<&crate::hooks::HookRunner>,
+    // The model the next iteration starts its hook pass from. Kept for API
+    // compatibility; the durable projection does not re-route on hook-
+    // selected model. The next iteration's native-tool mode is already
+    // resolved via `next_use_native_tools` and `next_schema_tokens`.
+    _model: &str,
 ) {
     if context_token_budget == 0 {
         return;
@@ -347,8 +351,15 @@ async fn enforce_reported_budget(
     // growing `before_llm_call` hook adds to each dispatched request. The hook
     // result drives the budget DECISION below; the accounting stays anchored to
     // the durable context that is actually persisted and trimmed.
+    // Compute `tokens_before` after the next prompt-anchor swap so the event
+    // reflects the prompt that will actually be dispatched next. The real
+    // next iteration applies `refresh_prompt_anchor` before preparing its
+    // request; projecting before the swap would misstate the next prompt size
+    // when native-tool mode changes.
+    let mut taken_for_before = taken.clone();
+    refresh_prompt_anchor(&mut taken_for_before, next_use_native_tools);
     let projected_pre_trim = projected_provider_facing_tokens(
-        &taken,
+        &taken_for_before,
         multimodal_config,
         degrade_strip_images,
         image_cache.as_deref_mut(),
@@ -400,21 +411,22 @@ async fn enforce_reported_budget(
     // dropping the newest turn — an outcome that must be surfaced, not silently
     // kept as if the trim succeeded.
     let mut hit_floor = false;
-    // The decision seam is the ACTUAL next request: the real iteration re-runs
-    // `run_before_llm_call` on the prepared messages before dispatch, so a
-    // growing, filtering, or replacement hook changes the population that will
-    // actually be sent. The projection below therefore includes the hook result
-    // (`hooks`/`model`) when deciding whether the retained set must shrink. The
-    // emitted accounting (below) stays anchored to the durable pre-hook
-    // population, which is the context that is actually persisted and trimmed.
+    // The decision seam is the durable next request (prepared messages
+    // plus next schemas, without transient hook growth). Executing a
+    // modifying `before_llm_call` hook merely to estimate would double-
+    // invoke stateful hooks and is not side-effect-free. The actual next
+    // iteration will run the hook once before dispatch; if that hook
+    // grows the request beyond the budget, the next iteration's own
+    // enforcement will trim further. The emitted accounting stays anchored
+    // to the same durable population.
     loop {
         tokens_after = projected_provider_facing_tokens(
             &trimmed,
             multimodal_config,
             degrade_strip_images,
             image_cache.as_deref_mut(),
-            hooks,
-            model,
+            None,
+            "",
             tool_schema_tokens,
             ratio,
         )
@@ -442,8 +454,8 @@ async fn enforce_reported_budget(
                 multimodal_config,
                 degrade_strip_images,
                 image_cache.as_deref_mut(),
-                hooks,
-                model,
+                None,
+                "",
                 tool_schema_tokens,
                 ratio,
             )
@@ -1505,6 +1517,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let msg = ChatMessage::assistant(response_text.clone());
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
+                // Terminal response: no next request will be dispatched, so do
+                // not project the next hook's population as an estimation
+                // step. Passing `None` avoids executing a modifying
+                // `before_llm_call` hook merely to estimate a request that
+                // will never be sent, and prevents double-invocation of
+                // stateful hooks.
                 enforce_reported_budget(
                     turn_state.history,
                     reported as usize,
@@ -1517,8 +1535,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     degrade_strip_images,
                     image_cache.as_deref_mut(),
                     use_native_tools,
-                    hooks,
-                    active_model,
+                    None,
+                    "",
                 )
                 .await;
             }
@@ -1834,7 +1852,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 activated_tools,
             ) {
                 Ok(mut next_specs) => {
-                    next_specs.refresh_native_tool_mode(next_active_provider, protocol_model);
+                    // Use the hook-selected model for the next iteration's
+                    // native-tool capability projection, not the current
+                    // iteration's starting model. The next iteration will
+                    // derive `provider_request_model` from the hook result
+                    // and refresh native-tool mode from that model; the
+                    // projection must reserve the same schema population that
+                    // will actually be sent.
+                    let next_protocol_model = provider_request_model;
+                    next_specs.refresh_native_tool_mode(next_active_provider, next_protocol_model);
                     (
                         if next_specs.use_native_tools {
                             crate::agent::history::estimate_tool_schema_tokens(
