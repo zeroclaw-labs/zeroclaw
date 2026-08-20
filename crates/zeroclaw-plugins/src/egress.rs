@@ -418,6 +418,23 @@ impl EgressHostService {
         self.authorize_with_policy(request, addresses, &policy)
     }
 
+    /// Live connection count held for one instance.
+    ///
+    /// Test-only: the budget is observable in production solely through
+    /// [`EgressError::ConnectionLimitReached`], and adapters must not be able to
+    /// read or reset it. Tests that prove a failed dial returns its slot need to
+    /// see the count itself, not just that a later acquire happened to succeed.
+    #[cfg(test)]
+    pub(crate) fn live_connections(&self, instance: &PluginInstanceId) -> usize {
+        self.counts
+            .by_instance
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(instance)
+            .copied()
+            .unwrap_or_default()
+    }
+
     fn resolve_policy(&self, request: &EgressRequest) -> Result<EgressPolicy, EgressError> {
         let permission = request.transport.required_permission();
         if !request.scope.grants().allows(permission) {

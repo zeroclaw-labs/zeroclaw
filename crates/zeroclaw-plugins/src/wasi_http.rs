@@ -35,9 +35,11 @@
 //! Redirects are not followed. A guest that wants to chase one issues a second
 //! request, and that request is authorized on its own from scratch.
 
-use std::time::Duration;
+use std::net::SocketAddr;
 
 use hyper::header::HOST;
+use tokio::net::TcpStream;
+use tokio::time::{Instant, timeout, timeout_at};
 use wasmtime_wasi_http::p2::{
     WasiHttpHooks,
     bindings::http::types::ErrorCode,
@@ -170,11 +172,19 @@ impl WasiHttpHooks for PluginEgressHooks {
 /// The host-owned pinned send path.
 ///
 /// This mirrors the mechanics of `wasmtime_wasi_http::p2::default_send_request_handler`
-/// — same `Host` header fill-in, same connect/first-byte timeouts, same
-/// origin-form URI rewrite before `send_request`, same hyper http1 handshake and
-/// worker task — but replaces its single `TcpStream::connect(authority)` (which
-/// resolves and connects in one unobservable step) with **authorize, then
-/// connect to an address the boundary already validated**.
+/// — same `Host` header fill-in, same first-byte and between-bytes timeouts,
+/// same origin-form URI rewrite before `send_request`, same hyper http1
+/// handshake and worker task — with two deliberate differences.
+///
+/// The first is the point of the module: its single `TcpStream::connect(authority)`
+/// (which resolves and connects in one unobservable step) becomes **authorize,
+/// then connect to an address the boundary already validated**.
+///
+/// The second is the connect budget. The default handler applies
+/// `connect_timeout` per stage and leaves the TLS negotiation with no bound at
+/// all. Here one deadline covers authorization, the dial, TLS, and the HTTP
+/// handshake, because a host that leases a scarce connection slot to a guest
+/// cannot let the peer decide how long to hold it.
 async fn send(
     mut request: hyper::Request<HyperOutgoingBody>,
     config: OutgoingRequestConfig,
@@ -183,8 +193,6 @@ async fn send(
     id: PluginInstanceId,
 ) -> Result<IncomingResponse, ErrorCode> {
     use http_body_util::BodyExt;
-    use tokio::net::TcpStream;
-    use tokio::time::timeout;
 
     if !request.headers().contains_key(HOST)
         && let Some(authority) = request.uri().authority()
@@ -193,19 +201,37 @@ async fn send(
         request.headers_mut().insert(HOST, value);
     }
 
+    // ── one deadline for the whole connect ───────────────────────
+    // Authorization, the pinned dial, the TLS negotiation, and the HTTP
+    // handshake are stages of a single connect, so they are charged against a
+    // single budget, fixed here before any of them starts.
+    //
+    // Two failures follow from staging the budget per phase instead. A request
+    // that fails late spends the operator's `connect_timeout` once per stage,
+    // so the total is a multiple of what was configured. And any stage left
+    // unwrapped is unbounded: a peer that accepts TCP and then says nothing
+    // holds the guest's request open, and with it this instance's connection
+    // slot, for as long as it cares to.
+    //
+    // Expiry at any stage fails closed as `ConnectionTimeout`. The slot comes
+    // back on its own: the authorized token owns the lease and is a local of
+    // this future until the connection worker takes it, so returning early —
+    // or the guest dropping the request, which aborts this future — drops the
+    // token and releases the lease.
+    let deadline = Instant::now() + config.connect_timeout;
+
     // ── authorize ────────────────────────────────────────────────
     // The shared boundary checks the effective grant and the operator's
     // allowlist *before* it resolves anything, then performs the one resolution
-    // and pins what it validated. Bounding the whole call with the same
-    // `connect_timeout` the default path applies to its combined
-    // resolve-and-connect keeps a stalled resolver from hanging the guest.
+    // and pins what it validated. The deadline covers the call so a stalled
+    // resolver cannot hang the guest either.
     //
     // The requested host is scoped to this block on purpose: past it the only
     // host in hand is the pin's, so there is nothing left to resolve a second
     // time.
     let authorized = {
         let host = egress_request.host().to_string();
-        match timeout(config.connect_timeout, service.authorize(egress_request)).await {
+        match timeout_at(deadline, service.authorize(egress_request)).await {
             Ok(Ok(authorized)) => authorized,
             Ok(Err(error)) => {
                 record_denial(&id, &host, &error.to_string());
@@ -220,28 +246,20 @@ async fn send(
     };
 
     // ── connect (pinned) ─────────────────────────────────────────
-    // Connect by `SocketAddr`, never by name: these are the addresses the
-    // boundary validated, so no second resolution can substitute a different
-    // class. `ResolvedDestination` is never empty, so the fallback here is
-    // unreachable rather than a policy decision.
-    let address = *authorized
-        .destination()
-        .addresses()
-        .first()
-        .ok_or_else(dns_failure)?;
     // Canonical host from the pin, used for SNI and certificate verification —
     // never for a second resolution.
     let server_name = authorized.destination().host().to_string();
-
-    let tcp_stream = timeout(config.connect_timeout, TcpStream::connect(address))
-        .await
-        .map_err(|_| ErrorCode::ConnectionTimeout)?
-        .map_err(|_| ErrorCode::ConnectionRefused)?;
+    let tcp_stream = dial_pinned(authorized.destination().addresses(), deadline).await?;
 
     let (mut sender, worker) = if config.use_tls {
         use rustls::pki_types::ServerName;
         use wasmtime_wasi_http::io::TokioIo;
 
+        // Trust is the bundled webpki root program and nothing else: this path
+        // deliberately does not read the operating system's trust store, so an
+        // enterprise or private CA installed on the host does not silently
+        // become trusted for plugin egress. Native-root support is a separate,
+        // tracked decision rather than an omission.
         let root_cert_store = rustls::RootCertStore {
             roots: webpki_roots::TLS_SERVER_ROOTS.into(),
         };
@@ -250,14 +268,17 @@ async fn send(
             .with_no_client_auth();
         let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(tls_config));
         let domain = ServerName::try_from(server_name).map_err(|_| ErrorCode::TlsProtocolError)?;
-        let stream = connector
-            .connect(domain, tcp_stream)
+        // The stage that most needs the deadline: the TCP connect has already
+        // succeeded, so a peer that never sends a `ServerHello` is indistinguishable
+        // from a slow one and would otherwise stall here without limit.
+        let stream = timeout_at(deadline, connector.connect(domain, tcp_stream))
             .await
+            .map_err(|_| ErrorCode::ConnectionTimeout)?
             .map_err(|_| ErrorCode::TlsProtocolError)?;
-        handshake(TokioIo::new(stream), config.connect_timeout, authorized).await?
+        handshake(TokioIo::new(stream), deadline, authorized).await?
     } else {
         use wasmtime_wasi_http::io::TokioIo;
-        handshake(TokioIo::new(tcp_stream), config.connect_timeout, authorized).await?
+        handshake(TokioIo::new(tcp_stream), deadline, authorized).await?
     };
 
     // hyper's `SendRequest` does not strip scheme/authority, and an origin
@@ -289,6 +310,38 @@ async fn send(
     })
 }
 
+/// Dial the pinned addresses in order and return the first connection that
+/// comes up, under the shared connect deadline.
+///
+/// Connect by `SocketAddr`, never by name: every candidate comes out of the one
+/// [`crate::egress::AuthorizedEgress`] the boundary validated, so moving to the
+/// next address after a refusal is failover within an already-checked set, not a
+/// second resolution that could substitute a different address class.
+///
+/// The deadline belongs to the connect as a whole rather than to each attempt.
+/// A destination whose first address is a blackhole therefore spends the budget
+/// the later addresses would have used instead of extending it, which is what
+/// keeps a multi-address answer from multiplying the operator's timeout.
+async fn dial_pinned(addresses: &[SocketAddr], deadline: Instant) -> Result<TcpStream, ErrorCode> {
+    let mut attempted = false;
+    for address in addresses {
+        attempted = true;
+        match timeout_at(deadline, TcpStream::connect(*address)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            // Refused or unreachable: try the next validated address.
+            Ok(Err(_)) => {}
+            Err(_) => return Err(ErrorCode::ConnectionTimeout),
+        }
+    }
+    if attempted {
+        Err(ErrorCode::ConnectionRefused)
+    } else {
+        // `ResolvedDestination` is never empty, so an empty candidate set is an
+        // unreachable state rather than a policy decision.
+        Err(dns_failure())
+    }
+}
+
 /// Drive one hyper http1 handshake and spawn its connection worker.
 ///
 /// `authorized` travels into the worker rather than being dropped here: the
@@ -296,7 +349,7 @@ async fn send(
 /// as the connection it paid for, not as long as [`send`].
 async fn handshake<S>(
     stream: S,
-    connect_timeout: Duration,
+    deadline: Instant,
     authorized: AuthorizedEgress,
 ) -> Result<
     (
@@ -308,13 +361,10 @@ async fn handshake<S>(
 where
     S: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    let (sender, conn) = tokio::time::timeout(
-        connect_timeout,
-        hyper::client::conn::http1::handshake(stream),
-    )
-    .await
-    .map_err(|_| ErrorCode::ConnectionTimeout)?
-    .map_err(|_| ErrorCode::HttpProtocolError)?;
+    let (sender, conn) = timeout_at(deadline, hyper::client::conn::http1::handshake(stream))
+        .await
+        .map_err(|_| ErrorCode::ConnectionTimeout)?
+        .map_err(|_| ErrorCode::HttpProtocolError)?;
 
     let worker = wasmtime_wasi::runtime::spawn(async move {
         let outcome = conn.await;
@@ -335,6 +385,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use http_body_util::BodyExt;
 
     use super::*;
@@ -412,6 +464,175 @@ mod tests {
             denial(response),
             ErrorCode::InternalError(Some(message)) if message == DENIED_MESSAGE
         ));
+    }
+
+    /// A loopback grant with the private carveout and a one-connection ceiling.
+    /// The tight ceiling is the point: a slot that leaks on a failed dial makes
+    /// the next authorization fail, so the budget is observable.
+    fn loopback_service() -> EgressHostService {
+        EgressHostService::new(EgressPolicyResolver::new(|_| {
+            EgressPolicy::new(
+                &["127.0.0.1".to_string()],
+                &["127.0.0.1".to_string()],
+                &[],
+                1,
+            )
+        }))
+    }
+
+    /// A peer that completes the TCP handshake and then sends nothing.
+    ///
+    /// Deliberately raw `std::net` on its own thread: what this proves is what
+    /// an open, silent socket does to the connect path, and a server framework
+    /// would only add machinery that might answer.
+    fn stalled_peer() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback peer");
+        let port = listener.local_addr().expect("loopback port").port();
+        std::thread::spawn(move || {
+            let Ok((_stream, _)) = listener.accept() else {
+                return;
+            };
+            // Hold the accepted connection open and silent: a client waiting on
+            // a `ServerHello` here waits for as long as the host lets it.
+            std::thread::sleep(Duration::from_secs(60));
+        });
+        port
+    }
+
+    /// The whole connect path shares one deadline.
+    ///
+    /// A peer that accepts TCP and then stalls the TLS negotiation must not be
+    /// able to hang the guest's request, and must not keep the instance's
+    /// connection slot while it does. The TLS stage carried no timeout of its
+    /// own, so this request had no bound at all before the shared deadline.
+    #[tokio::test]
+    async fn a_stalled_tls_peer_times_out_within_one_connect_budget() {
+        let port = stalled_peer();
+        let service = loopback_service();
+        let mut hooks = hooks(Some(service.clone()));
+        let instance = hooks.scope.id().clone();
+        let budget = Duration::from_millis(250);
+        let config = OutgoingRequestConfig {
+            use_tls: true,
+            connect_timeout: budget,
+            first_byte_timeout: Duration::from_secs(1),
+            between_bytes_timeout: Duration::from_secs(1),
+        };
+
+        let started = std::time::Instant::now();
+        let response = hooks
+            .send_request(request(&format!("https://127.0.0.1:{port}/")), config)
+            .expect("a stalled peer is a guest-visible error, never a trap");
+        let HostFutureIncomingResponse::Pending(handle) = response else {
+            panic!("an authorized destination is dialed asynchronously");
+        };
+        let outcome = handle.await.expect("the send task must not trap");
+        let elapsed = started.elapsed();
+
+        assert!(
+            matches!(outcome, Err(ErrorCode::ConnectionTimeout)),
+            "a stalled TLS negotiation must fail closed as a connect timeout, got: {outcome:?}"
+        );
+        // Generous enough that a loaded runner cannot flake it, and far tighter
+        // than an unbounded stage, which never returns at all.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the connect path must not outlive its budget; took {elapsed:?}"
+        );
+        // Budget composition: authorization, the pinned dial, and the TLS
+        // negotiation are charged against one `connect_timeout`, so a failure
+        // that crosses several stages costs about one budget, not one each.
+        assert!(
+            elapsed < 4 * budget,
+            "staged budgets would compound; took {elapsed:?} against a {budget:?} budget"
+        );
+        assert_eq!(
+            service.live_connections(&instance),
+            0,
+            "a timed-out connect must return its slot to the shared budget"
+        );
+        // The returned slot must also be usable: the ceiling here is one.
+        let next = EgressRequest::new(
+            hooks.scope.clone(),
+            EgressTransport::Http { encrypted: true },
+            "127.0.0.1",
+            port,
+        )
+        .expect("a loopback destination is a valid request");
+        assert!(
+            service
+                .authorize_addresses(next, [SocketAddr::from(([127, 0, 0, 1], port))])
+                .is_ok(),
+            "the instance must be able to dial again after a timed-out connect"
+        );
+    }
+
+    /// A bound port nobody is listening on any more. Loopback refuses these
+    /// immediately, which is what makes the failover case deterministic rather
+    /// than dependent on a network that might blackhole instead.
+    fn refusing_address() -> SocketAddr {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback peer");
+        let address = listener.local_addr().expect("loopback address");
+        drop(listener);
+        address
+    }
+
+    /// The pin can carry several addresses, and one of them being dead is not a
+    /// reason to fail the request: the old unpinned path got that failover from
+    /// `TcpStream::connect(authority)` for free.
+    ///
+    /// Every candidate here comes from one validated destination, so this is
+    /// failover inside an already-checked set — the security property is that no
+    /// address outside the pin is ever dialed, not that only the first is.
+    #[tokio::test]
+    async fn the_pinned_dial_fails_over_to_the_next_validated_address() {
+        let refusing = refusing_address();
+        // Bound and never accepted from: the kernel completes the handshake out
+        // of the backlog, which is all a dial needs to succeed.
+        let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback peer");
+        let live_address = live.local_addr().expect("loopback address");
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let stream = dial_pinned(&[refusing, live_address], deadline)
+            .await
+            .expect("a dead first address must not fail the whole connect");
+        assert_eq!(
+            stream.peer_addr().expect("connected peer"),
+            live_address,
+            "failover must land on the next validated address"
+        );
+
+        assert!(
+            matches!(
+                dial_pinned(&[refusing], deadline).await,
+                Err(ErrorCode::ConnectionRefused)
+            ),
+            "an exhausted candidate list is a refused connect"
+        );
+        assert!(
+            matches!(
+                dial_pinned(&[], deadline).await,
+                Err(ErrorCode::DnsError(_))
+            ),
+            "an empty pin is reported as an unresolvable destination"
+        );
+    }
+
+    /// The dial is bounded by the shared deadline, not by a fresh timeout per
+    /// address: a pin full of stalled addresses cannot buy more time than one.
+    #[tokio::test]
+    async fn an_expired_deadline_stops_the_dial_before_it_tries_an_address() {
+        let live = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback peer");
+        let live_address = live.local_addr().expect("loopback address");
+        let expired = Instant::now() - Duration::from_millis(1);
+
+        assert!(
+            matches!(
+                dial_pinned(&[live_address], expired).await,
+                Err(ErrorCode::ConnectionTimeout)
+            ),
+            "a spent budget must not fund another attempt"
+        );
     }
 
     #[test]
