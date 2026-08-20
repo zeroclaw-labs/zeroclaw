@@ -86,9 +86,16 @@ pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// Redact a value sitting under a credential-named key. String values keep a
-/// short prefix for context; non-strings recurse so nested secret objects are
-/// still walked.
+/// Redact a value sitting under a credential-named key. A string keeps a short
+/// prefix for context; every other shape is replaced outright.
+///
+/// Recursing into containers instead would only redact descendants that
+/// themselves name a credential, and a secret under such a key is routinely
+/// carried by something that does not: `{"api_key": {"value": "..."}}`,
+/// `{"token": ["..."]}`, `{"password": 12345678}`. Tool arguments are arbitrary
+/// JSON, so the shape cannot be assumed — the key alone has to be enough.
+/// `null` is left as-is: it carries nothing, and preserving it keeps presence
+/// checks on the redacted document meaningful.
 fn redact_credential_leaf(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::String(s) => {
@@ -100,13 +107,47 @@ fn redact_credential_leaf(value: serde_json::Value) -> serde_json::Value {
                 .unwrap_or("");
             serde_json::Value::String(format!("{prefix}*[REDACTED]"))
         }
-        nested => scrub_credentials_value(nested),
+        serde_json::Value::Null => serde_json::Value::Null,
+        _ => serde_json::Value::String("*[REDACTED]".into()),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{scrub_credentials, scrub_credentials_value};
+
+    #[test]
+    fn a_credential_key_redacts_its_value_whatever_the_shape() {
+        // Each secret sits under a credential-named key but is carried by a
+        // descendant that names nothing sensitive, so a key-based walk that
+        // recursed would leave every one of them intact.
+        let value = serde_json::json!({
+            "api_key": {"value": "NESTEDSECRET"},
+            "token": ["ARRAYSECRET"],
+            "password": 12345678,
+            "secret": true,
+            "credential": null,
+        });
+
+        let scrubbed = scrub_credentials_value(value);
+        let wire = serde_json::to_string(&scrubbed).expect("serializable");
+
+        for secret in ["NESTEDSECRET", "ARRAYSECRET", "12345678"] {
+            assert!(
+                !wire.contains(secret),
+                "{secret} must not survive scrubbing"
+            );
+        }
+        assert_eq!(scrubbed["api_key"], "*[REDACTED]");
+        assert_eq!(scrubbed["token"], "*[REDACTED]");
+        assert_eq!(scrubbed["password"], "*[REDACTED]");
+        assert_eq!(scrubbed["secret"], "*[REDACTED]");
+        assert_eq!(
+            scrubbed["credential"],
+            serde_json::Value::Null,
+            "null carries nothing, so presence stays observable"
+        );
+    }
 
     #[test]
     fn scrub_credentials_value_redacts_nested_secret_and_keeps_key() {

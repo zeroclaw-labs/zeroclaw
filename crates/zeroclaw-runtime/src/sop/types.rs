@@ -861,6 +861,112 @@ impl SopRunSummary {
     }
 }
 
+/// Full detail for one run as exposed over RPC (`sops/run-detail`) — an
+/// explicit projection, not the persisted [`SopRun`].
+///
+/// Policy at this response boundary, applied independently of what any
+/// storage path did earlier:
+/// - free-text fields that can carry model or tool content (step output,
+///   tool arguments/output/error, the trigger topic) pass through the
+///   credential scrubber on the way out;
+/// - fields no consuming view reads are excluded rather than redacted — the
+///   raw trigger payload, the untrusted-framing marker, gate revision
+///   bookkeeping, structured tool output payloads, and savings counters are
+///   not on this struct, so a future serializer change cannot leak them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopRunDetail {
+    pub run_id: String,
+    pub sop_name: String,
+    pub status: SopRunStatus,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub waiting_since: Option<String>,
+    /// Where the run's trigger came from (manual, a channel, cron, ...).
+    pub trigger_source: String,
+    /// The trigger's routing topic, scrubbed; the raw payload is excluded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_topic: Option<String>,
+    /// True while the run is live rather than a retained terminal record.
+    pub active: bool,
+    pub steps: Vec<SopStepDetail>,
+}
+
+/// One executed step inside [`SopRunDetail`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopStepDetail {
+    pub step_number: u32,
+    pub status: SopStepStatus,
+    /// Scrubbed display output (or failure text) recorded for the step.
+    pub output: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<SopToolCallDetail>,
+}
+
+/// One tool invocation inside [`SopStepDetail`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SopToolCallDetail {
+    pub index: u32,
+    pub tool: String,
+    /// Scrubbed arguments the tool actually received.
+    pub args: serde_json::Value,
+    pub success: bool,
+    /// Scrubbed display output.
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub duration_ms: u64,
+}
+
+impl SopRunDetail {
+    pub fn from_run(run: &SopRun, active: bool) -> Self {
+        use crate::agent::turn::redact::{scrub_credentials, scrub_credentials_value};
+        Self {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            status: run.status,
+            current_step: run.current_step,
+            total_steps: run.total_steps,
+            started_at: run.started_at.clone(),
+            completed_at: run.completed_at.clone(),
+            waiting_since: run.waiting_since.clone(),
+            trigger_source: run.trigger_event.source.to_string(),
+            trigger_topic: run.trigger_event.topic.as_deref().map(scrub_credentials),
+            active,
+            steps: run
+                .step_results
+                .iter()
+                .map(|step| SopStepDetail {
+                    step_number: step.step_number,
+                    status: step.status,
+                    output: scrub_credentials(&step.output),
+                    started_at: step.started_at.clone(),
+                    completed_at: step.completed_at.clone(),
+                    effective_agent: step.effective_agent.clone(),
+                    tool_calls: step
+                        .tool_calls
+                        .iter()
+                        .map(|call| SopToolCallDetail {
+                            index: call.index,
+                            tool: call.tool.clone(),
+                            args: scrub_credentials_value(call.args.clone()),
+                            success: call.success,
+                            output: scrub_credentials(&call.output),
+                            error: call.error.as_deref().map(scrub_credentials),
+                            duration_ms: call.duration_ms,
+                        })
+                        .collect(),
+                })
+                .collect(),
+        }
+    }
+}
+
 // ── Deterministic workflow state (persistence + resume) ──────────
 
 /// Persisted state for a deterministic workflow run, enabling resume

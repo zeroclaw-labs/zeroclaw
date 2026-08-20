@@ -21,8 +21,8 @@ use zeroclaw_config::schema::Config;
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
     JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
-    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
-    SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
+    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunDetailRequest, SopRunOverlayRequest,
+    SopRunRequest, SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
@@ -176,6 +176,7 @@ pub enum Method {
     SopsGraph,
     SopsRun,
     SopsRuns,
+    SopsRunDetail,
     SopsRunOverlay,
     SopsValidate,
     SopsSave,
@@ -285,6 +286,7 @@ impl Method {
         (Method::SopsGraph, "sops/graph"),
         (Method::SopsRun, "sops/run"),
         (Method::SopsRuns, "sops/runs"),
+        (Method::SopsRunDetail, "sops/run-detail"),
         (Method::SopsRunOverlay, "sops/run-overlay"),
         (Method::SopsValidate, "sops/validate"),
         (Method::SopsSave, "sops/save"),
@@ -880,6 +882,7 @@ impl RpcDispatcher {
             Method::SopsGraph => self.handle_sops_graph(&req.params),
             Method::SopsRun => self.handle_sops_run(&req.params).await,
             Method::SopsRuns => self.handle_sops_runs(&req.params),
+            Method::SopsRunDetail => self.handle_sops_run_detail(&req.params),
             Method::SopsRunOverlay => self.handle_sops_run_overlay(&req.params),
             Method::SopsValidate => self.handle_sops_validate(&req.params),
             Method::SopsSave => self.handle_sops_save(&req.params),
@@ -4305,6 +4308,44 @@ impl RpcDispatcher {
         to_result(serde_json::json!({ "runs": runs }))
     }
 
+    /// Full detail for one run: step results with status, timings, failure
+    /// output, and captured tool calls. `sops/runs` intentionally returns
+    /// summaries; this is the drill-down a UI uses for a selected run.
+    fn handle_sops_run_detail(&self, params: &Value) -> RpcResult {
+        // Local transports only. This dispatcher serves both owner-scoped local
+        // IPC and remote WSS, and a fresh WSS caller can complete `initialize`
+        // without presenting a client credential and still be marked
+        // authenticated — so on that transport this method would hand step
+        // output, tool arguments and errors to anyone who can reach the socket.
+        // The accepted remote-authentication RFC has no implementation on this
+        // branch, so run detail stays off WSS rather than widening a hole it
+        // does not own. Lift this once that boundary lands.
+        if self.peer_label.starts_with("wss:") {
+            return Err(rpc_err(
+                AUTH_REQUIRED,
+                "sops/run-detail is not served over remote WSS: the transport has no \
+                 authenticated principal to authorize run contents against",
+            ));
+        }
+        let req: SopRunDetailRequest = parse_params(params)?;
+        let engine = self
+            .ctx
+            .sop_engine
+            .as_ref()
+            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "SOP subsystem not enabled"))?;
+        let (run, active) = crate::sop::run_detail_for(engine, &req.run_id).map_err(|e| {
+            let msg = e.to_string();
+            let code = if msg.contains("not found") {
+                INVALID_PARAMS
+            } else {
+                INTERNAL_ERROR
+            };
+            rpc_err(code, msg)
+        })?;
+        let detail = crate::sop::types::SopRunDetail::from_run(&run, active);
+        to_result(serde_json::json!({ "run": detail }))
+    }
+
     fn handle_sops_run_overlay(&self, params: &Value) -> RpcResult {
         let req: SopRunOverlayRequest = parse_params(params)?;
         let (dir, mode) = self.sops_dir_and_mode();
@@ -4904,6 +4945,236 @@ fn notification_for_turn_event(
 
 #[cfg(test)]
 mod tests {
+    /// `sops/run-detail` must serialize the explicit projection, never the
+    /// persisted run: seeded credentials in the step output, tool arguments,
+    /// tool output, and trigger topic are scrubbed at the response boundary;
+    /// the raw trigger payload, framing marker, revision bookkeeping, and
+    /// structured tool output are excluded outright; and exactly the
+    /// documented fields cross the wire.
+    #[tokio::test]
+    async fn sops_run_detail_serializes_a_scrubbed_projection_of_a_terminal_run() {
+        use std::collections::BTreeSet;
+        use std::sync::{Arc, Mutex};
+
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        use crate::sop::types::{
+            Sop, SopAdmissionPolicy, SopEvent, SopExecutionMode, SopPriority, SopRunAction,
+            SopStep, SopStepKind, SopStepResult, SopStepStatus, SopTriggerSource, StepToolCall,
+        };
+
+        let mut engine = crate::sop::SopEngine::new(zeroclaw_config::schema::SopConfig::default());
+        engine.set_sops_for_test(vec![Sop {
+            name: "detail-scrub".into(),
+            description: "wire projection regression".into(),
+            version: "0.1.0".into(),
+            execution_mode: SopExecutionMode::Auto,
+            priority: SopPriority::Normal,
+            triggers: vec![],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Step one".into(),
+                body: "Do step one".into(),
+                suggested_tools: vec![],
+                requires_confirmation: false,
+                kind: SopStepKind::default(),
+                schema: None,
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: false,
+            admission_policy: SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        }]);
+        let action = engine
+            .start_run(
+                "detail-scrub",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: Some("deploy token=TOPICSECRET66666".into()),
+                    payload: Some("PAYLOADSECRET55555".into()),
+                    timestamp: "2026-01-01T00:00:00Z".into(),
+                },
+            )
+            .expect("run starts");
+        let SopRunAction::ExecuteStep { run_id, .. } = action else {
+            panic!("an auto SOP with one step starts at ExecuteStep, got {action:?}");
+        };
+        engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: "posted with api_key=STEPSECRET99999".into(),
+                    started_at: "2026-01-01T00:00:01Z".into(),
+                    completed_at: Some("2026-01-01T00:00:02Z".into()),
+                    effective_agent: Some("reviewer".into()),
+                    tool_calls: vec![StepToolCall {
+                        index: 0,
+                        tool: "shell".into(),
+                        // Not just a direct string: a credential-named key
+                        // routinely carries its secret in a container or a bare
+                        // number, and those descendants name nothing sensitive.
+                        args: serde_json::json!({
+                            "token": "ARGSECRET888888",
+                            "api_key": {"value": "NESTEDSECRET33333"},
+                            "credential": ["ARRAYSECRET22222"],
+                            "password": 987654321,
+                        }),
+                        success: true,
+                        output: "done password=TOOLSECRET77777".into(),
+                        output_data: Some(serde_json::json!({"x": "DATASECRET44444"})),
+                        error: None,
+                        duration_ms: 5,
+                    }],
+                },
+            )
+            .expect("the single step completes the run in-process");
+        let engine = Arc::new(Mutex::new(engine));
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-rpc:pid=1".to_string());
+
+        let value = dispatcher
+            .handle_sops_run_detail(&serde_json::json!({ "run_id": run_id }))
+            .expect("a retained terminal run resolves over RPC");
+
+        let run = value
+            .get("run")
+            .and_then(|v| v.as_object())
+            .expect("run object");
+        let keys: BTreeSet<&str> = run.keys().map(String::as_str).collect();
+        let expected: BTreeSet<&str> = [
+            "run_id",
+            "sop_name",
+            "status",
+            "current_step",
+            "total_steps",
+            "started_at",
+            "completed_at",
+            "waiting_since",
+            "trigger_source",
+            "trigger_topic",
+            "active",
+            "steps",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected, "only the documented projection crosses");
+        assert_eq!(run["active"], serde_json::Value::Bool(false));
+
+        let step = run["steps"][0].as_object().expect("step object");
+        let step_keys: BTreeSet<&str> = step.keys().map(String::as_str).collect();
+        let expected_step: BTreeSet<&str> = [
+            "step_number",
+            "status",
+            "output",
+            "started_at",
+            "completed_at",
+            "effective_agent",
+            "tool_calls",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(step_keys, expected_step);
+
+        let call = run["steps"][0]["tool_calls"][0]
+            .as_object()
+            .expect("tool call object");
+        let call_keys: BTreeSet<&str> = call.keys().map(String::as_str).collect();
+        let expected_call: BTreeSet<&str> =
+            ["index", "tool", "args", "success", "output", "duration_ms"]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            call_keys, expected_call,
+            "a None error is omitted and structured tool output never crosses"
+        );
+
+        let wire = serde_json::to_string(&value).expect("serializable");
+        for secret in [
+            "PAYLOADSECRET55555",
+            "STEPSECRET99999",
+            "ARGSECRET888888",
+            "TOOLSECRET77777",
+            "DATASECRET44444",
+            "TOPICSECRET66666",
+            "NESTEDSECRET33333",
+            "ARRAYSECRET22222",
+            "987654321",
+        ] {
+            assert!(
+                !wire.contains(secret),
+                "{secret} must not cross the RPC boundary"
+            );
+        }
+        for excluded in [
+            "frame_marker_id",
+            "revision",
+            "llm_calls_saved",
+            "payload",
+            "output_data",
+        ] {
+            assert!(
+                !wire.contains(excluded),
+                "{excluded} must not be on the wire"
+            );
+        }
+    }
+
+    /// The dispatcher serves owner-scoped local IPC and remote WSS alike, and a
+    /// fresh WSS caller can finish `initialize` with no client credential and
+    /// still be treated as authenticated. Run detail carries step output, tool
+    /// arguments and errors, so on that transport it must refuse outright until
+    /// there is a principal to authorize against — a caller that can reach the
+    /// socket must not be able to read what a run did.
+    #[tokio::test]
+    async fn sops_run_detail_is_refused_over_remote_wss() {
+        use std::sync::{Arc, Mutex};
+
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let engine = Arc::new(Mutex::new(crate::sop::SopEngine::new(
+            zeroclaw_config::schema::SopConfig::default(),
+        )));
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal_with_sop_engine(
+            zeroclaw_config::schema::Config::default(),
+            sessions,
+            Arc::clone(&engine),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "wss:203.0.113.7:44321".to_string());
+
+        let err = dispatcher
+            .handle_sops_run_detail(&serde_json::json!({ "run_id": "run-anything" }))
+            .expect_err("run detail must not answer a remote WSS caller");
+
+        assert_eq!(
+            err.code, AUTH_REQUIRED,
+            "the refusal must read as missing authentication, not a lookup failure"
+        );
+        // Refused before the run id is even parsed: an unauthenticated caller
+        // must not be able to probe which run ids exist.
+        assert!(
+            !err.message.contains("not found"),
+            "the refusal must not double as a run-id oracle, got {}",
+            err.message
+        );
+    }
+
     use super::*;
     use async_trait::async_trait;
     use serde_json::json;
