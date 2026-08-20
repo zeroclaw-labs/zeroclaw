@@ -87,8 +87,8 @@ pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
 }
 
 /// Redact a value sitting under a credential-named key. String values keep a
-/// short prefix for context; non-strings recurse so nested secret objects are
-/// still walked.
+/// short prefix for context; containers retain the sensitive-key context so
+/// every descendant string is redacted.
 fn redact_credential_leaf(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::String(s) => {
@@ -100,7 +100,15 @@ fn redact_credential_leaf(value: serde_json::Value) -> serde_json::Value {
                 .unwrap_or("");
             serde_json::Value::String(format!("{prefix}*[REDACTED]"))
         }
-        nested => scrub_credentials_value(nested),
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(key, value)| (key, redact_credential_leaf(value)))
+                .collect(),
+        ),
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_credential_leaf).collect())
+        }
+        other => other,
     }
 }
 
@@ -143,6 +151,45 @@ mod tests {
         assert!(set_cookie.contains("[REDACTED]"));
         assert!(!set_cookie.contains("9f8e7d6c5b4a3210feed"));
         assert_eq!(out["body"]["status"], "ok");
+    }
+
+    #[test]
+    fn scrub_credentials_value_retains_sensitive_context_through_containers() {
+        let input = serde_json::json!({
+            "credentials": {
+                "primary": "SUPERSECRETVALUE123",
+                "fallbacks": [
+                    "ANOTHERSECRETVALUE456",
+                    {"nested": "THIRDSECRETVALUE789"}
+                ],
+                "attempts": 3
+            }
+        });
+
+        let out = scrub_credentials_value(input);
+
+        assert_eq!(out["credentials"]["attempts"], 3);
+        assert!(!out.to_string().contains("SUPERSECRETVALUE123"));
+        assert!(!out.to_string().contains("ANOTHERSECRETVALUE456"));
+        assert!(!out.to_string().contains("THIRDSECRETVALUE789"));
+        assert!(
+            out["credentials"]["primary"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
+        assert!(
+            out["credentials"]["fallbacks"][0]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
+        assert!(
+            out["credentials"]["fallbacks"][1]["nested"]
+                .as_str()
+                .unwrap()
+                .contains("[REDACTED]")
+        );
     }
 
     #[test]

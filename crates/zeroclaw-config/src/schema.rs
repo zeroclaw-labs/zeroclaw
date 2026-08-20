@@ -12204,7 +12204,10 @@ pub struct WebhookAuditConfig {
     pub tool_patterns: Vec<String>,
     /// Include tool call arguments in the audit payload. Default: `false`.
     ///
-    /// Be mindful of sensitive data — arguments may contain secrets or PII.
+    /// Arguments are scrubbed for common credentials and recognised inline
+    /// image markers before export, but may still contain unrecognised secrets
+    /// or personal data.
+    /// The destination controls retention of exported payloads.
     #[serde(default)]
     pub include_args: bool,
     /// Maximum size (in bytes) of serialised arguments included in a single

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use zeroclaw::hooks::{HookHandler, HookResult, HookRunner};
+use zeroclaw::hooks::{HookHandler, HookResult, HookRunner, ToolCallHookContext};
 use zeroclaw::tools::ToolResult;
 
 struct CounterHook {
@@ -28,6 +28,12 @@ impl HookHandler for CounterHook {
 
 struct ToolBlocker {
     blocked_tools: Vec<String>,
+}
+
+#[test]
+fn tool_call_hook_context_is_publicly_exported() {
+    let context = ToolCallHookContext::new("public-integration-test");
+    assert!(context.is_correlated());
 }
 
 #[async_trait]

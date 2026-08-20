@@ -89,8 +89,13 @@ pub(crate) async fn prepare_tool_calls(
         let mut tool_name = call.name.clone();
         let mut tool_args = call.arguments.clone();
         if let Some(hooks) = ctx.hooks {
+            let hook_context = crate::hooks::tool_call_hook_context(ctx.turn_id, iteration, idx);
             match hooks
-                .run_before_tool_call(tool_name.clone(), tool_args.clone())
+                .run_before_tool_call_with_context(
+                    &hook_context,
+                    tool_name.clone(),
+                    tool_args.clone(),
+                )
                 .await
             {
                 crate::hooks::HookResult::Cancel(reason) => {
