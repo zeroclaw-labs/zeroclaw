@@ -4438,6 +4438,7 @@ mod tests {
             cancellation_token: None,
             attachments: Vec::new(),
             in_reply_to: None,
+            references: Vec::new(),
             force_voice: false,
             suppress_voice: false,
         };

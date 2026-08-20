@@ -7,12 +7,14 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronAddTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — the alias of the agent whose tool loop registered
     /// this tool instance. Cron jobs created here are validated against
     /// this agent's risk profile and run as this agent.
@@ -20,16 +22,31 @@ pub struct CronAddTool {
 }
 
 impl CronAddTool {
+    pub fn new_with_runtime(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            runtime,
+            agent_alias: agent_alias.into(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn new(
         config: Arc<Config>,
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
     ) -> Self {
-        Self {
-            config,
-            security,
-            agent_alias: agent_alias.into(),
-        }
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        Self::new_with_runtime(config, security, agent_alias, runtime)
     }
 
     fn plain_string_schedule_error(raw: &str) -> Option<String> {
@@ -418,11 +435,16 @@ impl Tool for CronAddTool {
                     }
                 };
 
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
+                if let Err(reason) = cron::validate_shell_command_with_security(
+                    self.runtime.as_ref(),
+                    &self.security,
+                    command,
+                    approved,
+                ) {
                     return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
-                        error: Some(reason),
+                        error: Some(reason.to_string()),
                     });
                 }
 
@@ -435,8 +457,10 @@ impl Tool for CronAddTool {
                     Err(error) => return Ok(schedule_error_result(error)),
                 };
 
-                cron::add_shell_job_with_approval(
+                cron::add_shell_job_with_runtime(
                     &self.config,
+                    self.runtime.as_ref(),
+                    &self.security,
                     &self.agent_alias,
                     name,
                     schedule,

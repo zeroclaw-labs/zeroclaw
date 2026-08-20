@@ -1380,23 +1380,8 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     for warning in config.collect_warnings() {
         items.push(DiagItem::warn(
             cat,
-            format!(
-                "{} (at {})",
-                localized_validation_warning_message(&warning),
-                warning.path
-            ),
+            format!("{} (at {})", warning.message, warning.path),
         ));
-    }
-}
-
-fn localized_validation_warning_message(
-    warning: &zeroclaw_config::validation_warnings::ValidationWarning,
-) -> String {
-    match warning.code.as_str() {
-        "skills_prompt_injection_mode_full_deprecated" => crate::i18n::get_required_cli_string(
-            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
-        ),
-        _ => warning.message.clone(),
     }
 }
 
@@ -2104,6 +2089,26 @@ mod tests {
         let ch_item = items.iter().find(|i| i.message.contains("channel"));
         assert!(ch_item.is_some());
         assert_eq!(ch_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn diagnose_surfaces_codex_cli_security_boundary_warning() {
+        let mut config = Config::default();
+        config.codex_cli.extra_args =
+            vec!["--sandbox".to_string(), "danger-full-access".to_string()];
+
+        let results = diagnose(&config);
+        let warning = results.iter().find(|item| {
+            item.category == "config"
+                && item.severity == Severity::Warn
+                && item.message.contains("Codex CLI argument")
+                && item.message.contains("--sandbox")
+                && item.message.contains("codex_cli.extra_args[0]")
+        });
+        assert!(
+            warning.is_some(),
+            "doctor should surface the canonical Codex CLI warning: {results:?}"
+        );
     }
 
     #[test]
@@ -2941,25 +2946,6 @@ mod tests {
                 "expected per-agent SOUL.md diagnostic for {alias}; got {messages:?}"
             );
         }
-    }
-
-    #[test]
-    fn skills_prompt_deprecation_warning_uses_fluent() {
-        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
-            "skills_prompt_injection_mode_full_deprecated",
-            "unlocalized fallback",
-            "skills.prompt_injection_mode",
-        );
-
-        let expected = crate::i18n::get_required_cli_string(
-            "cli-doctor-skills-prompt-injection-mode-full-deprecated",
-        );
-        assert_eq!(localized_validation_warning_message(&warning), expected);
-        assert_ne!(expected, "unlocalized fallback");
-        assert_ne!(
-            expected,
-            "{cli-doctor-skills-prompt-injection-mode-full-deprecated}"
-        );
     }
 
     #[test]

@@ -303,6 +303,32 @@ fn channel_runtime_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> Str
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
 }
 
+fn append_provider_fallback_footer(
+    mut response: String,
+    fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+) -> String {
+    let Some(fallback) = fallback else {
+        return response;
+    };
+    let requested_family = fallback.requested_provider.split(':').next().unwrap_or("");
+    let actual_family = fallback.actual_provider.split(':').next().unwrap_or("");
+    let same_family = requested_family == actual_family
+        || requested_family.starts_with(actual_family)
+        || actual_family.starts_with(requested_family);
+    if !same_family {
+        response.push_str("\n\n---\n");
+        response.push_str(&channel_runtime_cli_string_with_args(
+            "channel-runtime-fallback-footer",
+            &[
+                ("requested", fallback.requested_provider.as_str()),
+                ("actual", fallback.actual_provider.as_str()),
+                ("model", fallback.actual_model.as_str()),
+            ],
+        ));
+    }
+    response
+}
+
 fn channel_runtime_scope_label(scope: OverrideScope) -> String {
     match scope {
         OverrideScope::User => channel_runtime_cli_string("channel-runtime-scope-user"),
@@ -643,6 +669,10 @@ fn is_stop_command(content: &str) -> bool {
     let cmd = trimmed.split_whitespace().next().unwrap_or("");
     let base = cmd.split('@').next().unwrap_or(cmd);
     base.eq_ignore_ascii_case("/stop")
+}
+
+fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
+    SendMessage::reply_to(msg, reply)
 }
 
 /// Every XML-ish element name that opens a tool-CALL envelope, longest first so
@@ -2346,6 +2376,16 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     zeroclaw_providers::reliable::is_non_retryable(error)
 }
 
+/// Select the user-facing channel failure after preserving the typed terminal
+/// cause. Substring-based transient hints remain a fallback only: an earlier
+/// transport failure in an aggregate must not mask the final terminal cause.
+fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String {
+    zeroclaw_runtime::agent::terminal_completion_error_message(error, None)
+        .map(|message| format!("⚠️ Error: {message}"))
+        .or_else(|| zeroclaw_providers::reliable::transient_error_hint(error).map(str::to_string))
+        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"))
+}
+
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
     let lower = err.to_string().to_lowercase();
     [
@@ -3121,23 +3161,7 @@ async fn handle_runtime_command_if_needed(
         ),
     };
 
-    if let Err(err) = channel
-        .send(&{
-            let mut sm = SendMessage::new(response, &msg.reply_target)
-                .in_thread(msg.thread_ts.clone())
-                .in_reply_to(Some(msg.id.clone()));
-            if let Some(ref subj) = msg.subject {
-                let reply_subject = if subj.to_lowercase().starts_with("re:") {
-                    subj.clone()
-                } else {
-                    format!("Re: {}", subj)
-                };
-                sm = sm.subject(reply_subject);
-            }
-            sm
-        })
-        .await
-    {
+    if let Err(err) = channel.send(&SendMessage::reply_to(msg, response)).await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -5482,6 +5506,7 @@ async fn process_channel_message_body(
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
+            route.model.as_str(),
             ctx.tools_registry.as_ref(),
             per_turn_excluded_tools,
             ctx.activated_tools.as_ref(),
@@ -6384,26 +6409,10 @@ async fn process_channel_message_body(
                 &msg.reply_target,
             );
 
-            // Append a footer when the response was served by a different model_provider family.
-            // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
-            if let Some(fb) = fallback_info.as_ref() {
-                let req_base = fb.requested_provider.split(':').next().unwrap_or("");
-                let act_base = fb.actual_provider.split(':').next().unwrap_or("");
-                let same_family = req_base == act_base
-                    || req_base.starts_with(act_base)
-                    || act_base.starts_with(req_base);
-                if !same_family {
-                    delivered_response.push_str("\n\n---\n");
-                    delivered_response.push_str(&channel_runtime_cli_string_with_args(
-                        "channel-runtime-fallback-footer",
-                        &[
-                            ("requested", fb.requested_provider.as_str()),
-                            ("actual", fb.actual_provider.as_str()),
-                            ("model", fb.actual_model.as_str()),
-                        ],
-                    ));
-                }
-            }
+            // The runtime commits this candidate only after semantic acceptance.
+            // This renderer must therefore receive only the final accepted route.
+            delivered_response =
+                append_provider_fallback_footer(delivered_response, fallback_info.as_ref());
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -6738,11 +6747,7 @@ async fn process_channel_message_body(
                         let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
                     let _ = channel
-                        .send(
-                            &SendMessage::new(error_text, &msg.reply_target)
-                                .suppress_voice()
-                                .in_thread(msg.thread_ts.clone()),
-                        )
+                        .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
                         .await;
                 }
             } else {
@@ -6804,9 +6809,7 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
+                    let user_msg = channel_user_error_message(&e, &safe_error);
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
@@ -6814,11 +6817,7 @@ async fn process_channel_message_body(
                         let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
                     let _ = channel
-                        .send(
-                            &SendMessage::new(user_msg, &msg.reply_target)
-                                .suppress_voice()
-                                .in_thread(msg.thread_ts.clone()),
-                        )
+                        .send(&SendMessage::reply_to(&msg, user_msg).suppress_voice())
                         .await;
                 }
             }
@@ -6866,11 +6865,7 @@ async fn process_channel_message_body(
                     let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                 }
                 let _ = channel
-                    .send(
-                        &SendMessage::new(error_text, &msg.reply_target)
-                            .suppress_voice()
-                            .in_thread(msg.thread_ts.clone()),
-                    )
+                    .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
                     .await;
             }
         }
@@ -7552,12 +7547,9 @@ async fn run_message_dispatch_loop(
             };
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
             if let Some(channel) = channel {
-                let reply_target = msg.reply_target.clone();
-                let thread_ts = msg.thread_ts.clone();
+                let send_msg = stop_reply_message(&msg, reply);
                 zeroclaw_spawn::spawn!(async move {
-                    let _ = channel
-                        .send(&SendMessage::new(reply, &reply_target).in_thread(thread_ts))
-                        .await;
+                    let _ = channel.send(&send_msg).await;
                 });
             } else {
                 ::zeroclaw_log::record!(
@@ -11376,6 +11368,7 @@ pub async fn start_channels(
             agent.resolved.max_system_prompt_chars,
             true,
             config.channels.show_tool_calls,
+            runtime.shell_profile().as_ref(),
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -12319,6 +12312,47 @@ mod tests {
     const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    #[test]
+    fn accepted_provider_fallback_footer_is_rendered_once_and_primary_has_none() {
+        let fallback = zeroclaw_providers::reliable::ProviderFallbackInfo {
+            requested_provider: "openai.primary".to_string(),
+            requested_model: "model-a".to_string(),
+            actual_provider: "anthropic.backup".to_string(),
+            actual_model: "model-b".to_string(),
+        };
+        let delivered =
+            append_provider_fallback_footer("final response".to_string(), Some(&fallback));
+        assert!(delivered.starts_with("final response\n\n---\n"));
+        assert!(delivered.contains("openai.primary"));
+        assert!(delivered.contains("anthropic.backup"));
+        assert_eq!(delivered.matches("---").count(), 1);
+        assert_eq!(
+            append_provider_fallback_footer("primary final".to_string(), None),
+            "primary final"
+        );
+    }
+
+    #[test]
+    fn channel_terminal_cause_precedes_transient_hint_from_earlier_attempt() {
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("earlier attempt returned HTTP 503 unavailable");
+
+        let delivered = channel_user_error_message(&error, "safe fallback");
+
+        assert_eq!(
+            delivered,
+            format!(
+                "⚠️ Error: {}",
+                zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
+            )
+        );
+        assert!(
+            !delivered.contains("temporarily unavailable"),
+            "an aggregate's earlier transient hint must not mask terminal completion failure"
+        );
+    }
 
     #[test]
     fn load_cached_model_preview_reads_from_data_dir_not_install_root() {
@@ -14430,6 +14464,44 @@ api_key = "anthropic-key"
         }
     }
 
+    struct TransientErrorModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for TransientErrorModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("503 service unavailable")
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("503 service unavailable")
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for TransientErrorModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TransientErrorModelProvider"
+        }
+    }
+
     const TEST_PROVIDER_QUERY_SECRET: &str = "abc,def'ghi(jkl)";
 
     struct QuerySecretErrorModelProvider;
@@ -14482,6 +14554,59 @@ api_key = "anthropic-key"
         reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
         reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
         finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[derive(Default)]
+    struct ThreadingRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<SendMessage>>,
+    }
+
+    #[cfg(feature = "channel-email")]
+    impl ::zeroclaw_api::attribution::Attributable for ThreadingRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Email,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[async_trait::async_trait]
+    impl Channel for ThreadingRecordingChannel {
+        fn name(&self) -> &str {
+            "email"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages.lock().await.push(message.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "channel-email")]
+    fn email_wire(message: &SendMessage) -> String {
+        let channel = EmailChannel::new(
+            crate::email_channel::EmailConfig {
+                from_address: "bot@example.invalid".to_string(),
+                ..crate::email_channel::EmailConfig::default()
+            },
+            "test",
+            Arc::new(Vec::new),
+        );
+        String::from_utf8_lossy(&channel.build_email_message(message).unwrap().formatted())
+            .into_owned()
     }
 
     enum PendingApprovalOutcome {
@@ -17173,9 +17298,6 @@ BTC is currently around $65,000 based on latest tool output."#
         fn name(&self) -> &str {
             "fingerprint-test-runtime"
         }
-        fn has_shell_access(&self) -> bool {
-            true
-        }
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -17184,6 +17306,9 @@ BTC is currently around $65,000 based on latest tool output."#
         }
         fn supports_long_running(&self) -> bool {
             false
+        }
+        fn shell_dialect(&self) -> platform::ShellDialect {
+            platform::ShellDialect::Posix
         }
         fn build_shell_command(
             &self,
@@ -21869,6 +21994,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
         if expose_text_protocol {
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
@@ -22078,7 +22204,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_preserve_instructions_without_compact_loader() {
+    fn prompt_helpers_default_mode_preserves_instructions_with_compact_loader() {
         let ws = make_workspace();
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
@@ -22103,7 +22229,24 @@ BTC is currently around $65,000 based on latest tool output."#
             location: None,
         }];
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
+        let prompt = build_system_prompt(
+            ws.path(),
+            "model",
+            &[("read_skill", "Load skill instructions by name")],
+            &skills,
+            None,
+            None,
+        );
+        let prompt_with_tool_calls =
+            zeroclaw_runtime::agent::system_prompt::build_system_prompt_with_tool_calls(
+                ws.path(),
+                "model",
+                &[("read_skill", "Load skill instructions by name")],
+                &skills,
+                None,
+                None,
+                true,
+            );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
@@ -22118,6 +22261,12 @@ BTC is currently around $65,000 based on latest tool output."#
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review__lint</name>"));
+        assert!(prompt_with_tool_calls.contains("<instructions>"));
+        assert!(
+            prompt_with_tool_calls.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
     }
 
     #[test]
@@ -22304,6 +22453,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -22337,6 +22487,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -23422,6 +23573,178 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[cfg(feature = "channel-email")]
+    fn threaded_email_message(content: &str) -> ChannelMessage {
+        ChannelMessage {
+            id: "current@example.invalid".to_string(),
+            sender: "sender@example.invalid".to_string(),
+            reply_target: "sender@example.invalid".to_string(),
+            channel: "email".to_string(),
+            channel_alias: Some("test".to_string()),
+            content: content.to_string(),
+            subject: Some("Thread subject".to_string()),
+            references: vec![
+                "root@example.invalid".to_string(),
+                "parent@example.invalid".to_string(),
+            ],
+            ..ChannelMessage::default()
+        }
+    }
+
+    #[cfg(feature = "channel-email")]
+    fn assert_full_email_reply_chain(message: &SendMessage) {
+        assert_eq!(
+            message.in_reply_to.as_deref(),
+            Some("current@example.invalid")
+        );
+        assert_eq!(
+            message.references,
+            [
+                "root@example.invalid",
+                "parent@example.invalid",
+                "current@example.invalid"
+            ]
+        );
+        let wire = email_wire(message);
+        let unfolded_wire = wire.replace("\r\n ", " ");
+        assert!(
+            wire.contains("In-Reply-To: <current@example.invalid>"),
+            "runtime response lost its immediate parent on the wire:\n{wire}"
+        );
+        assert!(
+            unfolded_wire.contains(
+                "References: <root@example.invalid> <parent@example.invalid> <current@example.invalid>"
+            ),
+            "runtime response lost its References ancestry on the wire:\n{wire}"
+        );
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[tokio::test]
+    async fn runtime_command_email_reply_preserves_full_references_chain() {
+        let channel_impl = Arc::new(ThreadingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &threaded_email_message("/new"),
+            Some(&(channel_impl.clone() as Arc<dyn Channel>)),
+        )
+        .await;
+
+        assert!(handled);
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_full_email_reply_chain(&sent[0]);
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[tokio::test]
+    async fn llm_error_email_reply_preserves_full_references_chain() {
+        let channel_impl = Arc::new(ThreadingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            ctx,
+            threaded_email_message("trigger format error"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_full_email_reply_chain(&sent[0]);
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[tokio::test]
+    async fn transient_error_email_reply_preserves_full_references_chain() {
+        let channel_impl = Arc::new(ThreadingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(TransientErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("test owns the only runtime context handle")
+            .reliability = Arc::new(zeroclaw_config::schema::ReliabilityConfig {
+            provider_retries: 0,
+            provider_backoff_ms: 0,
+            ..zeroclaw_config::schema::ReliabilityConfig::default()
+        });
+
+        process_channel_message(
+            ctx,
+            threaded_email_message("trigger transient error"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_full_email_reply_chain(&sent[0]);
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[tokio::test]
+    async fn timeout_email_reply_preserves_full_references_chain() {
+        let channel_impl = Arc::new(ThreadingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_secs(1),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("test owns the only runtime context handle")
+            .message_timeout_secs = 0;
+
+        process_channel_message(
+            ctx,
+            threaded_email_message("trigger timeout"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_full_email_reply_chain(&sent[0]);
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[test]
+    fn stop_email_reply_preserves_full_references_chain() {
+        let message = threaded_email_message("/stop");
+        let reply = stop_reply_message(&message, "stop requested");
+
+        assert_full_email_reply_chain(&reply);
+    }
+
     #[tokio::test]
     async fn dispatch_agent_scope_rejects_when_no_peer_groups_configured() {
         // Default config (no peer_groups) — every sender must be denied.
@@ -24132,6 +24455,8 @@ BTC is currently around $65,000 based on latest tool output."#
             ..Default::default()
         };
         config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
 
         let initial_skills =
             zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
@@ -25205,6 +25530,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 }],
                 subject: None,
                 internal_sop_event: None,
+                references: Vec::new(),
             },
             CancellationToken::new(),
         )
@@ -27051,6 +27377,7 @@ This is an example JSON object for profile settings."#;
                 }],
                 subject: None,
                 internal_sop_event: None,
+                references: Vec::new(),
             },
             CancellationToken::new(),
         )

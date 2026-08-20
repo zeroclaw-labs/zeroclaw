@@ -2,7 +2,7 @@ use crate::schema::DockerRuntimeConfig;
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
 /// Canonicalization failures that the runtime layer can present through
 /// localized tool diagnostics without parsing an English error chain.
@@ -157,10 +157,6 @@ impl RuntimeAdapter for DockerRuntime {
         "docker"
     }
 
-    fn has_shell_access(&self) -> bool {
-        true
-    }
-
     fn has_filesystem_access(&self) -> bool {
         self.config.mount_workspace
     }
@@ -181,6 +177,10 @@ impl RuntimeAdapter for DockerRuntime {
         self.config
             .memory_limit_mb
             .map_or(0, |mb| mb.saturating_mul(1024 * 1024))
+    }
+
+    fn shell_dialect(&self) -> ShellDialect {
+        ShellDialect::Posix
     }
 
     fn build_shell_command(
@@ -219,6 +219,12 @@ mod tests {
         };
         let runtime = DockerRuntime::new(cfg);
         assert_eq!(runtime.memory_budget(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn docker_reports_posix_shell_dialect() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
     }
 
     #[test]

@@ -124,7 +124,7 @@ pub fn capture_successful_run(
 
 pub fn apply_proposal(
     engine: &mut SopEngine,
-    workspace_dir: &Path,
+    install_root: &Path,
     proposal_id: &str,
     applied_by: Option<String>,
 ) -> Result<ApplyOutcome> {
@@ -137,7 +137,7 @@ pub fn apply_proposal(
         );
     }
 
-    let sops_root = super::resolve_sops_dir(workspace_dir, engine.config().sops_dir.as_deref());
+    let sops_root = super::resolve_sops_dir(install_root, engine.config().sops_dir.as_deref());
     // An Update must land on the currently-loaded SOP's actual directory, which
     // the loader sets from on-disk layout and need not match a slug of the name.
     // Create has no loaded SOP, so derive the new directory from the name.
@@ -201,7 +201,7 @@ pub fn apply_proposal(
     proposal.rollback_path = rollback.as_ref().map(|p| p.display().to_string());
     proposal.status_reason = None;
     engine.save_proposal(&proposal)?;
-    engine.reload(workspace_dir);
+    engine.reload(install_root);
 
     Ok(ApplyOutcome {
         proposal,

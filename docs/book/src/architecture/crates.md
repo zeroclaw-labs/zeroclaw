@@ -54,7 +54,7 @@ Structure:
 - `anthropic.rs`, `openai.rs`, `ollama.rs`, …: one file per native provider
 - `compatible.rs`: a single OpenAI-compatible implementation reused by 20+ providers (Groq, Mistral, xAI, Venice, etc.)
 - `router.rs`: hint-based per-call model route selection
-- `reliable.rs`: same-provider retry / backoff / API-key rotation wrapper
+- `reliable.rs`: retry / backoff / cooldown and ordered model-provider fallback wrapper
 - `streaming.rs`: SSE parsing, token estimation, tool-call deltas
 
 ### `zeroclaw-channels`
@@ -145,10 +145,6 @@ Derive macros for config schema, tool registration, and channel registration. Sa
 ### `zerocode`
 
 Terminal UI, built as a separate app under `apps/zerocode/`. It is its own workspace member with no `zeroclaw-*` crate dependency (see [Docs & Translations → zerocode strings](../maintainers/docs-and-translations.md) for its independent i18n catalogue).
-
-### `aardvark-sys`, `robot-kit`
-
-Specialised hardware support used by the `hardware` submodule. Out-of-scope unless you're bringing up specific peripherals.
 
 ## Feature flags
 
