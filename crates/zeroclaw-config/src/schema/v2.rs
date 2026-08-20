@@ -844,14 +844,104 @@ fn effective_source_identity_matches(
     let Some(toml::Value::Table(alias_table)) = family_table.get(alias) else {
         return false;
     };
-    if let Some(url) = expected_url
-        && alias_table.get("uri").and_then(toml::Value::as_str) != Some(url)
+    // URI is identity-bearing: compare both directions and allow the
+    // provider-facing composition of `api_path` onto a bare base URL. A
+    // selector `custom:https://vision.example.invalid` with global
+    // `api_path = "/v1"` materializes `https://vision.example.invalid/v1`;
+    // the bare base still names that same effective source.
+    match (
+        expected_url,
+        alias_table.get("uri").and_then(toml::Value::as_str),
+    ) {
+        (Some(expected), Some(actual)) => {
+            if actual == expected {
+                // exact match
+            } else {
+                let exp_trim = expected.trim_end_matches('/');
+                let act_trim = actual.trim_end_matches('/');
+                if act_trim == exp_trim {
+                    // slash-normalized exact
+                } else if act_trim.starts_with(exp_trim)
+                    && act_trim[exp_trim.len()..].starts_with('/')
+                {
+                    // actual is expected base plus an api_path suffix
+                } else {
+                    return false;
+                }
+            }
+        }
+        (Some(_), None) => return false,
+        (None, Some(actual_uri)) => {
+            // A bare reference (no URL) must not accept a variant URI.
+            // For families where URI is a variant selector (e.g. stepfun-intl),
+            // an alias with a variant URI should not be selected by a bare
+            // family reference. For generic families like `custom` or
+            // `llamacpp`, the URI is just connection info and a bare reference
+            // is allowed to select a single alias regardless of its URI
+            // (covered by the provenance single-producer check). Only reject
+            // when the alias's URI is a known variant endpoint.
+            let is_variant_uri = actual_uri == "https://api.stepfun.com/intl/v1"
+                || actual_uri == "https://api.stepfun.ai/v1"
+                || actual_uri.starts_with("https://api.stepfun.com/")
+                || actual_uri.starts_with("https://api.stepfun.ai/");
+            if is_variant_uri && family == "stepfun" {
+                return false;
+            }
+            // Otherwise, allow bare reference to match URI-bearing alias
+            // (e.g. custom:https://... or llamacpp with user-provided URI).
+        }
+        (None, None) => {}
+    }
+    // Expected extras must exactly match the alias's identity-bearing fields.
+    // A bare reference with no variant identity must not accept a variant
+    // source (e.g. `stepfun` must not match `stepfun-intl`'s intl endpoint,
+    // or `qwen` must not match `qwen-intl`'s endpoint).
+    // We include `uri` here as well because some variants (stepfun-intl)
+    // encode their identity via URI extras rather than expected_url.
+    let identity_fields = [
+        "endpoint",
+        "auth_mode",
+        "wire_api",
+        "requires_openai_auth",
+        "uri",
+    ];
+    // First check expected subset
+    if !expected_extras
+        .iter()
+        .all(|(field, expected)| alias_table.get(*field) == Some(expected))
     {
         return false;
     }
-    expected_extras
-        .iter()
-        .all(|(field, expected)| alias_table.get(*field) == Some(expected))
+    // Then reject extra identity fields present on the alias that the
+    // reference did not name. For `uri`, only reject when the alias's URI
+    // is a variant identity (see above) and the reference is bare; generic
+    // custom/llamacpp URIs are exempted to preserve existing
+    // `v2_colon_url_source_rewrites_bare_custom` behavior.
+    for field in identity_fields {
+        let expected_has = expected_extras.iter().any(|(f, _)| *f == field);
+        let alias_has = alias_table.contains_key(field);
+        if alias_has && !expected_has {
+            if field == "uri" {
+                // Apply same variant-uri allowance as above.
+                if let Some(uri) = alias_table.get("uri").and_then(toml::Value::as_str) {
+                    let is_variant = uri == "https://api.stepfun.com/intl/v1"
+                        || uri == "https://api.stepfun.ai/v1"
+                        || uri.starts_with("https://api.stepfun.com/")
+                        || uri.starts_with("https://api.stepfun.ai/");
+                    if is_variant && family == "stepfun" {
+                        return false;
+                    }
+                    // For other families/URIs, allow bare match.
+                    continue;
+                }
+            } else {
+                return false;
+            }
+        }
+    }
+    // `uri` already handled via expected_url; ensure no stray uri when
+    // expected_url is None is already covered above.
+    true
 }
 
 /// Rewrite a `[multimodal] vision_model_provider` reference to the dotted
@@ -945,7 +1035,15 @@ fn fold_providers_globals_into_models(
     let g_default_temperature = new_providers.remove("default_temperature");
     let g_provider_timeout_secs = new_providers.remove("provider_timeout_secs");
     let g_provider_max_tokens = new_providers.remove("provider_max_tokens");
-    let g_extra_headers = new_providers.remove("extra_headers");
+    let mut g_extra_headers = new_providers.remove("extra_headers");
+    // An empty `extra_headers = {}` table is a semantic no-op: it adds no
+    // headers and cannot establish alias ownership. Treat it as absent so a
+    // valid keyed vision alias remains reachable across multiple families.
+    if let Some(toml::Value::Table(ref t)) = g_extra_headers
+        && t.is_empty()
+    {
+        g_extra_headers = None;
+    }
 
     let any_value_globals = g_api_key.is_some()
         || g_api_url.is_some()
@@ -1081,6 +1179,16 @@ fn fold_providers_globals_into_models(
         None => return GlobalFold::None,
     };
 
+    // Preserve `api_path` for the selector-vs-alias equivalence check below;
+    // the `uri_source` match consumes `g_api_path`, but the selector's URL
+    // must be composed with the same path before comparing to the completed
+    // alias URI (otherwise `custom:https://vision.example.invalid` with
+    // `api_path = "/v1"` would materialize `…/v1` yet the selector would be
+    // compared as the bare base and the rewrite would stay incorrectly bare).
+    let g_api_path_for_composition = g_api_path
+        .as_ref()
+        .and_then(toml::Value::as_str)
+        .map(|s| s.to_string());
     let base_url_source = colon_url.map(toml::Value::String).or(g_api_url);
     let uri_source = match (base_url_source, g_api_path) {
         (Some(toml::Value::String(b)), Some(toml::Value::String(p))) => {
@@ -1158,13 +1266,29 @@ fn fold_providers_globals_into_models(
     if let Some(selector) = g_default_provider.as_ref().and_then(toml::Value::as_str) {
         let (raw_type, url) = split_colon_url_provider(selector);
         let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
+        // Compose the selector's URL with the same `api_path` the fold used
+        // for its URI, so the equivalence check compares the effective
+        // provider-facing identity (base + path) rather than the raw base.
+        let composed_url = match (url.as_deref(), g_api_path_for_composition.as_deref()) {
+            (Some(base), Some(path)) => {
+                let trimmed = base.trim_end_matches('/');
+                let suffix = if path.starts_with('/') {
+                    path.to_string()
+                } else {
+                    format!("/{path}")
+                };
+                Some(format!("{trimmed}{suffix}"))
+            }
+            (Some(base), None) => Some(base.to_string()),
+            (None, _) => None,
+        };
         if target_existed
             && effective_source_identity_matches(
                 aliased_models,
                 &canonical,
                 &alias,
                 &extras,
-                url.as_deref(),
+                composed_url.as_deref().or(url.as_deref()),
             )
         {
             source_key = None;
