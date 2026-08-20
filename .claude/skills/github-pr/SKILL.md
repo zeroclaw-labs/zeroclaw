@@ -1,3 +1,8 @@
+---
+name: github-pr
+description: "Open or update ZeroClaw GitHub pull requests with the current repository template, validation evidence, labels, authorship hygiene, and smart synchronization after new commits. Use whenever a user asks to open, create, submit, edit, update, label, comment on, or synchronize a PR, even when they only say to submit work for review."
+---
+
 # Skill: github-pr
 
 Open or update a GitHub Pull Request for ZeroClaw. Handles creating new PRs with a fully filled-out template body, and updating existing PRs (title, body sections, labels, comments). Use this skill whenever the user wants to open a PR, create a pull request, update a PR, edit PR description, add labels to a PR, or sync a PR after new commits — even if they don't say "PR" explicitly (e.g., "submit this for review", "push and open for merge").
@@ -31,13 +36,33 @@ Claude Code`.
 Before opening a PR, scan local commit messages and the drafted PR body:
 
 ```bash
-git log origin/master..HEAD --format=%B | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):.*(Claude|Codex|ChatGPT|Copilot|GitHub Copilot|Gemini|\[bot\]|dependabot|github-actions|web-flow|blacksmith|noreply@(anthropic|openai)\.com)|^[[:space:]]*(Created with Claude Code|Generated with Claude Code)[[:space:]]*$)'
+git log <base-ref>..HEAD --format=%B | rg -i '(^[[:space:]]*(Co-authored-by|Co-Authored-By):.*(Claude|Codex|ChatGPT|Copilot|GitHub Copilot|Gemini|\[bot\]|dependabot|github-actions|web-flow|blacksmith|noreply@(anthropic|openai)\.com)|^[[:space:]]*(Created with Claude Code|Generated with Claude Code)[[:space:]]*$)'
 ```
+
+`<base-ref>` always means the refreshed tracking ref for the PR base
+repository and branch: commonly `upstream/master` in a contributor fork or
+`origin/master` in a direct clone. Do not substitute a stale local `master` or
+the contributor fork's unrelated `origin/master`.
 
 Before showing or submitting PR text, remove bot/AI co-author trailers and
 generated tool footers. If local unpublished commits contain those footers, tell
 the user and ask before rewriting commit history. Do not rewrite a pushed branch
 or contributor branch solely for attribution cleanup without explicit approval.
+
+---
+
+## Shared: Rust Anti-Slop Gate
+
+When a PR changes Rust source or the anti-slop gate itself, load and follow
+[`anti-slop`](../anti-slop/SKILL.md) before drafting or applying PR updates.
+The anti-slop skill owns the command, result semantics, and remediation
+guidance; do not duplicate them here.
+
+Use the PR's actual base ref. Do not draft or update the PR after any nonzero
+status. The wrapper includes working-tree changes, but a dirty-tree pass is
+preparation evidence only: rerun after the intended changes are committed,
+then verify the pushed PR head before recording exact-head evidence in `How I
+tested`.
 
 ---
 
@@ -50,8 +75,9 @@ Collect information to pre-fill the PR body. Run these in parallel:
 ```bash
 # Branch and commit context
 git branch --show-current
-git log master..HEAD --oneline
-git diff master...HEAD --stat
+git status --short
+git log <base-ref>..HEAD --oneline
+git diff <base-ref>...HEAD --stat
 
 # Check if branch is pushed
 git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null
@@ -65,6 +91,9 @@ Also review the changed files and commit messages to understand the nature of th
 ### Step 1a: Gather Validation Evidence (required before drafting)
 
 Before drafting the PR body, identify the evidence that covers the changed surface. Fresh required CI is valid evidence when it ran on the current head and covers the same target, feature set, and behavior boundary. Do not require duplicate local Cargo merely to repeat that coverage. Add focused local checks or manual verification for a concrete gap, such as a platform that only received compile checks, a path outside the lint job, desktop coverage that did not trigger, a release target outside the PR matrix, or stale or unavailable CI.
+
+For Rust changes, run the shared Rust Anti-Slop Gate above before drafting.
+Treat any nonzero exit as a validation failure and stop until it is resolved.
 
 These are examples for Rust/code changes when the changed surface or a coverage gap calls for them:
 
@@ -198,16 +227,23 @@ When editing a specific section:
 
 When the user wants to sync the PR description after pushing new changes:
 
-1. Identify new commits:
+1. Inspect `git status --short`, then identify new commits:
    ```bash
    gh pr view <number> --json commits --jq '.commits[].messageHeadline'
-   git log <base>..<head> --oneline
-   git diff <base>...<head> --stat
+   git log <base-ref>..HEAD --oneline
+   git diff <base-ref>...HEAD --stat
    ```
+
+   If intended changes are uncommitted or untracked, do not describe them as
+   part of the PR head or apply a remote update yet. Finish the local workflow,
+   push, and verify that the remote PR head matches `git rev-parse HEAD` first.
 
 2. Re-read the PR template. Analyze which sections are now stale based on the new changes — use the template's section names and field descriptions to identify what needs updating rather than relying on hardcoded assumptions.
 
 3. Reassess the evidence under Step 1a against the new head before updating `How I tested`. Re-run only the local checks whose evidence became stale or whose coverage is not supplied by fresh required CI. Stale validation evidence is worse than no evidence because it misleads the reviewer.
+
+   If the new commits touch Rust or the anti-slop gate, rerun the shared Rust
+   Anti-Slop Gate before proposing the update.
 
 4. Apply the shared authorship-hygiene check before showing or submitting the
    update.

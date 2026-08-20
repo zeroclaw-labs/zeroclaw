@@ -1,56 +1,17 @@
-use std::collections::HashSet;
 use std::path::{Component, Path};
 
 use proc_macro2::Span;
 use syn::meta::ParseNestedMeta;
-use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{
-    Attribute, Expr, ExprCast, ExprMethodCall, ExprUnsafe, File, FnArg, GenericArgument, Ident,
-    ImplItemFn, ItemFn, ItemImpl, ItemType, Macro, PatType, ReturnType, TraitBound, TraitItemFn,
-    Type, TypeParamBound, UseTree,
+    Attribute, Expr, ExprMethodCall, ExprUnsafe, File, ForeignItem, ImplItem, ImplItemFn, Item,
+    ItemFn, ItemImpl, Local, Macro, StmtMacro, TraitItem, TraitItemFn,
 };
 
-use crate::{Diagnostic, PolicyProfile};
+use crate::Diagnostic;
 
 /// Stable rule identifiers and their intent.
 pub const RULES: &[(&str, &str)] = &[
-    (
-        "no-chained-casts",
-        "Reject nested `as` casts that manufacture evidence in stages.",
-    ),
-    (
-        "no-known-value-widening",
-        "Reject locals that widen a known initializer to Any or dynamic JSON.",
-    ),
-    (
-        "no-mock-macros",
-        "Reject mock-generating macros in favor of real dependency seams.",
-    ),
-    (
-        "no-shape-in-symbol-names",
-        "Reject `shape` in symbol names; use a domain name.",
-    ),
-    (
-        "no-erased-parameter-types",
-        "Reject Any or dynamic JSON in function inputs.",
-    ),
-    (
-        "no-erased-return-types",
-        "Reject Any or dynamic JSON in function outputs.",
-    ),
-    (
-        "no-erased-type-aliases",
-        "Reject aliases that conceal Any or dynamic JSON.",
-    ),
-    (
-        "no-unsafe-dictionary-types",
-        "Reject string-keyed maps whose values are Any or dynamic JSON.",
-    ),
-    (
-        "no-runtime-downcasting",
-        "Reject downcasting and type-id reflection in domain code.",
-    ),
     (
         "require-safety-comment-for-unsafe",
         "Require a nearby `SAFETY:` justification for unsafe code.",
@@ -61,42 +22,34 @@ pub const RULES: &[(&str, &str)] = &[
     ),
     (
         "no-dead-code-allow",
-        "Reject `allow(dead_code)` in production code.",
+        "Reject production dead-code suppression and unreasoned expectations.",
     ),
 ];
 
 pub(crate) struct Analyzer<'a> {
     path: &'a Path,
     lines: Vec<&'a str>,
+    comment_lines: Vec<String>,
     diagnostics: Vec<Diagnostic>,
-    json_value_names: HashSet<String>,
-    erased_alias_names: HashSet<String>,
-    profile: PolicyProfile,
     test_depth: usize,
 }
 
 impl<'a> Analyzer<'a> {
-    pub(crate) fn new(
-        path: &'a Path,
-        source: &'a str,
-        file: &File,
-        profile: PolicyProfile,
-    ) -> Self {
-        let mut json_value_names = HashSet::from(["JsonValue".to_string()]);
-        collect_json_imports(file, &mut json_value_names);
-        let erased_alias_names = collect_erased_aliases(file, &json_value_names, profile);
+    pub(crate) fn new(path: &'a Path, source: &'a str) -> Self {
         let file_is_test = path.components().any(|component| {
             matches!(component, Component::Normal(name) if name == "tests" || name == "benches")
         }) || path.file_name().is_some_and(|name| {
-            matches!(name.to_str(), Some("tests.rs" | "test.rs"))
+            name.to_str().is_some_and(|name| {
+                matches!(name, "tests.rs" | "test.rs")
+                    || name.ends_with("_test.rs")
+                    || name.ends_with("_tests.rs")
+            })
         });
         Self {
             path,
             lines: source.lines().collect(),
+            comment_lines: extract_comment_lines(source),
             diagnostics: Vec::new(),
-            json_value_names,
-            erased_alias_names,
-            profile,
             test_depth: usize::from(file_is_test),
         }
     }
@@ -120,63 +73,18 @@ impl<'a> Analyzer<'a> {
         self.test_depth > 0
     }
 
-    fn check_signature(
-        &mut self,
-        function_name: &Ident,
-        inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>,
-        output: &ReturnType,
-    ) {
-        for input in inputs {
-            let FnArg::Typed(argument) = input else {
-                continue;
-            };
-            if type_contains_erased(
-                &argument.ty,
-                &self.json_value_names,
-                &self.erased_alias_names,
-                self.profile,
-            ) {
-                self.report(
-                    argument.ty.span(),
-                    "no-erased-parameter-types",
-                    "parse erased input at its I/O boundary and accept a named domain type",
-                );
-            }
-        }
-        if let ReturnType::Type(_, ty) = output
-            && !(self.profile == PolicyProfile::ZeroClaw && function_name == "as_any")
-            && type_contains_erased(
-                ty,
-                &self.json_value_names,
-                &self.erased_alias_names,
-                self.profile,
-            )
-        {
-            self.report(
-                ty.span(),
-                "no-erased-return-types",
-                "parse erased output at its I/O boundary and return a named domain type",
-            );
-        }
-    }
-
-    fn check_ident(&mut self, ident: &Ident) {
-        if self.profile == PolicyProfile::Strict
-            && ident.to_string().to_ascii_lowercase().contains("shape")
-        {
-            self.report(
-                ident.span(),
-                "no-shape-in-symbol-names",
-                "replace `shape` with the domain concept this symbol owns",
-            );
-        }
-    }
-
     fn has_nearby_comment(&self, span: Span, tag: &str) -> bool {
         let start = span.start();
-        if let Some(line) = self.lines.get(start.line.saturating_sub(1)) {
-            let prefix = line.get(..start.column.min(line.len())).unwrap_or(line);
-            if contains_comment_tag(prefix, tag, self.profile) {
+        let line_index = start.line.saturating_sub(1);
+        if let Some(comments) = self.comment_lines.get(line_index) {
+            let byte_column = self
+                .lines
+                .get(line_index)
+                .map_or(0, |line| byte_offset_for_char_column(line, start.column));
+            let prefix = comments
+                .get(..byte_column.min(comments.len()))
+                .unwrap_or(comments);
+            if contains_tag(prefix, tag) {
                 return true;
             }
         }
@@ -185,16 +93,17 @@ impl<'a> Analyzer<'a> {
         while index > 0 && remaining > 0 {
             index -= 1;
             remaining -= 1;
-            let line = self.lines.get(index).copied().unwrap_or_default().trim();
-            if contains_comment_tag(line, tag, self.profile) {
+            let comments = self
+                .comment_lines
+                .get(index)
+                .map(String::as_str)
+                .unwrap_or_default();
+            if contains_tag(comments, tag) {
                 return true;
             }
-            if line.is_empty()
-                || line.starts_with("//")
-                || line.starts_with("/*")
-                || line.starts_with('*')
-                || line.starts_with("#[")
-            {
+            let line = self.lines.get(index).copied().unwrap_or_default();
+            let trimmed = line.trim();
+            if trimmed.is_empty() || !line_has_code(line, comments) || trimmed.starts_with("#[") {
                 continue;
             }
             break;
@@ -224,269 +133,402 @@ impl<'a> Analyzer<'a> {
 }
 
 impl<'ast> Visit<'ast> for Analyzer<'_> {
+    fn visit_file(&mut self, file: &'ast File) {
+        let is_test = attrs_require_test(&file.attrs);
+        self.test_depth += usize::from(is_test);
+        visit::visit_file(self, file);
+        self.test_depth -= usize::from(is_test);
+    }
+
+    fn visit_item(&mut self, item: &'ast Item) {
+        let is_test = attrs_require_test(item_attrs(item));
+        self.test_depth += usize::from(is_test);
+        visit::visit_item(self, item);
+        self.test_depth -= usize::from(is_test);
+    }
+
+    fn visit_impl_item(&mut self, item: &'ast ImplItem) {
+        let is_test = attrs_require_test(impl_item_attrs(item));
+        self.test_depth += usize::from(is_test);
+        visit::visit_impl_item(self, item);
+        self.test_depth -= usize::from(is_test);
+    }
+
+    fn visit_trait_item(&mut self, item: &'ast TraitItem) {
+        let is_test = attrs_require_test(trait_item_attrs(item));
+        self.test_depth += usize::from(is_test);
+        visit::visit_trait_item(self, item);
+        self.test_depth -= usize::from(is_test);
+    }
+
+    fn visit_foreign_item(&mut self, item: &'ast ForeignItem) {
+        let is_test = attrs_require_test(foreign_item_attrs(item));
+        self.test_depth += usize::from(is_test);
+        visit::visit_foreign_item(self, item);
+        self.test_depth -= usize::from(is_test);
+    }
+
+    fn visit_expr(&mut self, expression: &'ast Expr) {
+        let is_test = attrs_require_test(expr_attrs(expression));
+        self.test_depth += usize::from(is_test);
+        visit::visit_expr(self, expression);
+        self.test_depth -= usize::from(is_test);
+    }
+
+    fn visit_local(&mut self, local: &'ast Local) {
+        let is_test = attrs_require_test(&local.attrs);
+        self.test_depth += usize::from(is_test);
+        visit::visit_local(self, local);
+        self.test_depth -= usize::from(is_test);
+    }
+
+    fn visit_stmt_macro(&mut self, statement: &'ast StmtMacro) {
+        let is_test = attrs_require_test(&statement.attrs);
+        self.test_depth += usize::from(is_test);
+        visit::visit_stmt_macro(self, statement);
+        self.test_depth -= usize::from(is_test);
+    }
+
     fn visit_attribute(&mut self, attribute: &'ast Attribute) {
-        if !self.is_test() && attribute.path().is_ident("allow") {
-            let tokens = attribute
-                .meta
-                .require_list()
-                .ok()
-                .map(|list| list.tokens.to_string());
-            if tokens
-                .is_some_and(|tokens| tokens.split_whitespace().any(|token| token == "dead_code"))
-            {
-                self.report(
-                    attribute.span(),
-                    "no-dead-code-allow",
-                    "remove unused production code, connect it, or track the missing behavior",
-                );
-            }
+        if attribute.path().is_ident("unsafe") {
+            self.check_unsafe(attribute.pound_token.span);
         }
-        if attribute
-            .path()
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "automock")
-        {
+        if !self.is_test() && attribute_dead_code_suppression_is_invalid(attribute) {
             self.report(
-                attribute.span(),
-                "no-mock-macros",
-                "replace generated mocks with a faithful implementation of the real interface",
+                attribute.pound_token.span,
+                "no-dead-code-allow",
+                "remove unused production code, connect it, or use a reasoned expectation",
             );
         }
         visit::visit_attribute(self, attribute);
     }
 
     fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        self.check_ident(&item.ident);
-        let is_test = attrs_are_test(&item.attrs);
-        self.test_depth += usize::from(is_test);
         visit::visit_item_mod(self, item);
-        self.test_depth -= usize::from(is_test);
     }
 
     fn visit_item_fn(&mut self, item: &'ast ItemFn) {
-        self.check_ident(&item.sig.ident);
-        let is_test = attrs_are_test(&item.attrs);
-        self.test_depth += usize::from(is_test);
-        self.check_signature(&item.sig.ident, &item.sig.inputs, &item.sig.output);
-        if let Some(unsafety) = item.sig.unsafety {
-            self.check_unsafe(unsafety.span());
+        if let Some(unsafety) = &item.sig.unsafety {
+            self.check_unsafe(unsafety.span);
         }
         visit::visit_item_fn(self, item);
-        self.test_depth -= usize::from(is_test);
     }
 
     fn visit_impl_item_fn(&mut self, item: &'ast ImplItemFn) {
-        self.check_ident(&item.sig.ident);
-        let is_test = attrs_are_test(&item.attrs);
-        self.test_depth += usize::from(is_test);
-        self.check_signature(&item.sig.ident, &item.sig.inputs, &item.sig.output);
-        if let Some(unsafety) = item.sig.unsafety {
-            self.check_unsafe(unsafety.span());
+        if let Some(unsafety) = &item.sig.unsafety {
+            self.check_unsafe(unsafety.span);
         }
         visit::visit_impl_item_fn(self, item);
-        self.test_depth -= usize::from(is_test);
     }
 
     fn visit_trait_item_fn(&mut self, item: &'ast TraitItemFn) {
-        self.check_ident(&item.sig.ident);
-        self.check_signature(&item.sig.ident, &item.sig.inputs, &item.sig.output);
-        if let Some(unsafety) = item.sig.unsafety {
-            self.check_unsafe(unsafety.span());
+        if let Some(unsafety) = &item.sig.unsafety {
+            self.check_unsafe(unsafety.span);
         }
         visit::visit_trait_item_fn(self, item);
     }
 
     fn visit_item_impl(&mut self, item: &'ast ItemImpl) {
-        if let Some(unsafety) = item.unsafety {
-            self.check_unsafe(unsafety.span());
+        if let Some(unsafety) = &item.unsafety {
+            self.check_unsafe(unsafety.span);
         }
         visit::visit_item_impl(self, item);
     }
 
-    fn visit_item_type(&mut self, item: &'ast ItemType) {
-        self.check_ident(&item.ident);
-        if type_contains_erased(
-            &item.ty,
-            &self.json_value_names,
-            &self.erased_alias_names,
-            self.profile,
-        ) {
-            self.report(
-                item.ident.span(),
-                "no-erased-type-aliases",
-                "do not hide erased data behind an alias; parse it into an owner type",
-            );
-        }
-        visit::visit_item_type(self, item);
-    }
-
-    fn visit_type(&mut self, ty: &'ast Type) {
-        if is_unsafe_dictionary(
-            ty,
-            &self.json_value_names,
-            &self.erased_alias_names,
-            self.profile,
-        ) {
-            self.report(
-                ty.span(),
-                "no-unsafe-dictionary-types",
-                "use an owner/schema-derived value type and parse external values before insertion",
-            );
-        }
-        visit::visit_type(self, ty);
-    }
-
-    fn visit_local(&mut self, local: &'ast syn::Local) {
-        if let syn::Pat::Type(PatType { ty, .. }) = &local.pat
-            && local.init.is_some()
-            && type_contains_erased(
-                ty,
-                &self.json_value_names,
-                &self.erased_alias_names,
-                self.profile,
-            )
-        {
-            self.report(
-                ty.span(),
-                "no-known-value-widening",
-                "preserve the initializer's concrete type instead of erasing known evidence",
-            );
-        }
-        visit::visit_local(self, local);
-    }
-
-    fn visit_expr_cast(&mut self, expression: &'ast ExprCast) {
-        if matches!(strip_groups(&expression.expr), Expr::Cast(_)) {
-            self.report(
-                expression.as_token.span(),
-                "no-chained-casts",
-                "replace staged casts with a typed conversion that establishes the invariant once",
-            );
-        }
-        visit::visit_expr_cast(self, expression);
-    }
-
     fn visit_expr_method_call(&mut self, expression: &'ast ExprMethodCall) {
         let method = expression.method.to_string();
-        if matches!(
-            method.as_str(),
-            "downcast" | "downcast_ref" | "downcast_mut" | "type_id"
-        ) && self.profile == PolicyProfile::Strict
-        {
-            self.report(
-                expression.method.span(),
-                "no-runtime-downcasting",
-                "decode at the boundary and branch on a domain enum or trait method",
-            );
-        }
-        if method == "unwrap"
-            || (method == "expect"
-                && (self.profile == PolicyProfile::Strict
-                    || !has_static_expect_message(expression)))
-        {
+        if method == "unwrap" || (method == "expect" && !has_static_expect_message(expression)) {
             self.check_panic(expression.method.span());
         }
         visit::visit_expr_method_call(self, expression);
     }
 
     fn visit_expr_unsafe(&mut self, expression: &'ast ExprUnsafe) {
-        self.check_unsafe(expression.unsafe_token.span());
+        self.check_unsafe(expression.unsafe_token.span);
         visit::visit_expr_unsafe(self, expression);
     }
 
     fn visit_macro(&mut self, mac: &'ast Macro) {
-        if let Some(segment) = mac.path.segments.last() {
-            let name = segment.ident.to_string();
-            if name == "mock" {
-                self.report(
-                    segment.ident.span(),
-                    "no-mock-macros",
-                    "replace generated mocks with a faithful implementation of the real interface",
-                );
-            }
-            if matches!(
-                name.as_str(),
+        if let Some(segment) = mac.path.segments.last()
+            && matches!(
+                segment.ident.to_string().as_str(),
                 "panic" | "todo" | "unimplemented" | "unreachable"
-            ) {
-                self.check_panic(segment.ident.span());
-            }
+            )
+        {
+            self.check_panic(segment.ident.span());
         }
         visit::visit_macro(self, mac);
     }
 
-    fn visit_pat_ident(&mut self, pattern: &'ast syn::PatIdent) {
-        self.check_ident(&pattern.ident);
-        visit::visit_pat_ident(self, pattern);
-    }
-
-    fn visit_field(&mut self, field: &'ast syn::Field) {
-        if let Some(ident) = &field.ident {
-            self.check_ident(ident);
-        }
-        visit::visit_field(self, field);
-    }
-
-    fn visit_variant(&mut self, variant: &'ast syn::Variant) {
-        self.check_ident(&variant.ident);
-        visit::visit_variant(self, variant);
-    }
-
-    fn visit_item_struct(&mut self, item: &'ast syn::ItemStruct) {
-        self.check_ident(&item.ident);
-        visit::visit_item_struct(self, item);
-    }
-
-    fn visit_item_enum(&mut self, item: &'ast syn::ItemEnum) {
-        self.check_ident(&item.ident);
-        visit::visit_item_enum(self, item);
-    }
-
     fn visit_item_trait(&mut self, item: &'ast syn::ItemTrait) {
-        self.check_ident(&item.ident);
-        if let Some(unsafety) = item.unsafety {
-            self.check_unsafe(unsafety.span());
+        if let Some(unsafety) = &item.unsafety {
+            self.check_unsafe(unsafety.span);
         }
         visit::visit_item_trait(self, item);
     }
 
     fn visit_item_foreign_mod(&mut self, item: &'ast syn::ItemForeignMod) {
-        if let Some(unsafety) = item.unsafety {
-            self.check_unsafe(unsafety.span());
+        if let Some(unsafety) = &item.unsafety {
+            self.check_unsafe(unsafety.span);
         }
         visit::visit_item_foreign_mod(self, item);
     }
+}
 
-    fn visit_item_const(&mut self, item: &'ast syn::ItemConst) {
-        self.check_ident(&item.ident);
-        visit::visit_item_const(self, item);
-    }
-
-    fn visit_item_static(&mut self, item: &'ast syn::ItemStatic) {
-        self.check_ident(&item.ident);
-        visit::visit_item_static(self, item);
+fn expr_attrs(expression: &Expr) -> &[Attribute] {
+    match expression {
+        Expr::Array(expression) => &expression.attrs,
+        Expr::Assign(expression) => &expression.attrs,
+        Expr::Async(expression) => &expression.attrs,
+        Expr::Await(expression) => &expression.attrs,
+        Expr::Binary(expression) => &expression.attrs,
+        Expr::Block(expression) => &expression.attrs,
+        Expr::Break(expression) => &expression.attrs,
+        Expr::Call(expression) => &expression.attrs,
+        Expr::Cast(expression) => &expression.attrs,
+        Expr::Closure(expression) => &expression.attrs,
+        Expr::Const(expression) => &expression.attrs,
+        Expr::Continue(expression) => &expression.attrs,
+        Expr::Field(expression) => &expression.attrs,
+        Expr::ForLoop(expression) => &expression.attrs,
+        Expr::Group(expression) => &expression.attrs,
+        Expr::If(expression) => &expression.attrs,
+        Expr::Index(expression) => &expression.attrs,
+        Expr::Infer(expression) => &expression.attrs,
+        Expr::Let(expression) => &expression.attrs,
+        Expr::Lit(expression) => &expression.attrs,
+        Expr::Loop(expression) => &expression.attrs,
+        Expr::Macro(expression) => &expression.attrs,
+        Expr::Match(expression) => &expression.attrs,
+        Expr::MethodCall(expression) => &expression.attrs,
+        Expr::Paren(expression) => &expression.attrs,
+        Expr::Path(expression) => &expression.attrs,
+        Expr::Range(expression) => &expression.attrs,
+        Expr::RawAddr(expression) => &expression.attrs,
+        Expr::Reference(expression) => &expression.attrs,
+        Expr::Repeat(expression) => &expression.attrs,
+        Expr::Return(expression) => &expression.attrs,
+        Expr::Struct(expression) => &expression.attrs,
+        Expr::Try(expression) => &expression.attrs,
+        Expr::TryBlock(expression) => &expression.attrs,
+        Expr::Tuple(expression) => &expression.attrs,
+        Expr::Unary(expression) => &expression.attrs,
+        Expr::Unsafe(expression) => &expression.attrs,
+        Expr::While(expression) => &expression.attrs,
+        Expr::Yield(expression) => &expression.attrs,
+        Expr::Verbatim(_) => &[],
+        _ => &[],
     }
 }
 
-fn attrs_are_test(attributes: &[Attribute]) -> bool {
+fn item_attrs(item: &Item) -> &[Attribute] {
+    match item {
+        Item::Const(item) => &item.attrs,
+        Item::Enum(item) => &item.attrs,
+        Item::ExternCrate(item) => &item.attrs,
+        Item::Fn(item) => &item.attrs,
+        Item::ForeignMod(item) => &item.attrs,
+        Item::Impl(item) => &item.attrs,
+        Item::Macro(item) => &item.attrs,
+        Item::Mod(item) => &item.attrs,
+        Item::Static(item) => &item.attrs,
+        Item::Struct(item) => &item.attrs,
+        Item::Trait(item) => &item.attrs,
+        Item::TraitAlias(item) => &item.attrs,
+        Item::Type(item) => &item.attrs,
+        Item::Union(item) => &item.attrs,
+        Item::Use(item) => &item.attrs,
+        Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn impl_item_attrs(item: &ImplItem) -> &[Attribute] {
+    match item {
+        ImplItem::Const(item) => &item.attrs,
+        ImplItem::Fn(item) => &item.attrs,
+        ImplItem::Type(item) => &item.attrs,
+        ImplItem::Macro(item) => &item.attrs,
+        ImplItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn trait_item_attrs(item: &TraitItem) -> &[Attribute] {
+    match item {
+        TraitItem::Const(item) => &item.attrs,
+        TraitItem::Fn(item) => &item.attrs,
+        TraitItem::Type(item) => &item.attrs,
+        TraitItem::Macro(item) => &item.attrs,
+        TraitItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn foreign_item_attrs(item: &ForeignItem) -> &[Attribute] {
+    match item {
+        ForeignItem::Fn(item) => &item.attrs,
+        ForeignItem::Static(item) => &item.attrs,
+        ForeignItem::Type(item) => &item.attrs,
+        ForeignItem::Macro(item) => &item.attrs,
+        ForeignItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+#[derive(Default)]
+struct SuppressionDetails {
+    hides_dead_code: bool,
+    broad_group: bool,
+    has_reason: bool,
+}
+
+impl SuppressionDetails {
+    fn invalid(&self, is_allow: bool) -> bool {
+        self.hides_dead_code && (is_allow || self.broad_group || !self.has_reason)
+    }
+}
+
+fn attribute_dead_code_suppression_is_invalid(attribute: &Attribute) -> bool {
+    let is_allow = attribute.path().is_ident("allow");
+    let is_expect = attribute.path().is_ident("expect");
+    if is_allow || is_expect {
+        let mut details = SuppressionDetails::default();
+        let parsed = attribute.parse_nested_meta(|meta| suppression_arg(meta, &mut details));
+        return parsed.is_ok() && details.invalid(is_allow);
+    }
+    if !attribute.path().is_ident("cfg_attr") {
+        return false;
+    }
+
+    let mut index = 0;
+    let mut condition_requires_test = false;
+    let mut invalid_suppression = false;
+    let parsed = attribute.parse_nested_meta(|meta| {
+        inspect_cfg_attr_part(
+            meta,
+            &mut index,
+            &mut condition_requires_test,
+            &mut invalid_suppression,
+        )
+    });
+    parsed.is_ok() && !condition_requires_test && invalid_suppression
+}
+
+fn inspect_cfg_attr_meta(meta: ParseNestedMeta<'_>) -> syn::Result<(bool, bool)> {
+    let mut index = 0;
+    let mut condition_requires_test = false;
+    let mut invalid_suppression = false;
+    meta.parse_nested_meta(|nested| {
+        inspect_cfg_attr_part(
+            nested,
+            &mut index,
+            &mut condition_requires_test,
+            &mut invalid_suppression,
+        )
+    })?;
+    Ok((condition_requires_test, invalid_suppression))
+}
+
+fn inspect_cfg_attr_part(
+    meta: ParseNestedMeta<'_>,
+    index: &mut usize,
+    condition_requires_test: &mut bool,
+    invalid_suppression: &mut bool,
+) -> syn::Result<()> {
+    if *index == 0 {
+        *condition_requires_test = cfg_meta_requires_test(meta)?;
+    } else if meta.path.is_ident("allow") || meta.path.is_ident("expect") {
+        let is_allow = meta.path.is_ident("allow");
+        let mut details = SuppressionDetails::default();
+        meta.parse_nested_meta(|nested| suppression_arg(nested, &mut details))?;
+        *invalid_suppression |= details.invalid(is_allow);
+    } else if meta.path.is_ident("cfg_attr") {
+        let (nested_requires_test, nested_invalid) = inspect_cfg_attr_meta(meta)?;
+        *invalid_suppression |= !nested_requires_test && nested_invalid;
+    } else {
+        consume_meta(meta)?;
+    }
+    *index += 1;
+    Ok(())
+}
+
+fn suppression_arg(meta: ParseNestedMeta<'_>, details: &mut SuppressionDetails) -> syn::Result<()> {
+    if meta.path.is_ident("dead_code")
+        || meta.path.is_ident("unused")
+        || meta.path.is_ident("warnings")
+    {
+        details.hides_dead_code = true;
+        details.broad_group |= meta.path.is_ident("unused") || meta.path.is_ident("warnings");
+    }
+    if meta.path.is_ident("reason") && meta.input.peek(syn::Token![=]) {
+        let value = meta.value()?;
+        let reason: syn::Expr = value.parse()?;
+        details.has_reason = matches!(
+            reason,
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(message),
+                ..
+            }) if !message.value().trim().is_empty()
+        );
+        return Ok(());
+    }
+    consume_meta(meta)
+}
+
+fn attrs_require_test(attributes: &[Attribute]) -> bool {
     attributes.iter().any(|attribute| {
-        attribute.path().is_ident("test")
-            || (attribute.path().is_ident("cfg") && {
-                let mut found = false;
-                let parsed =
-                    attribute.parse_nested_meta(|meta| cfg_meta_contains_test(meta, &mut found));
-                parsed.is_ok() && found
-            })
+        if attribute
+            .path()
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "test")
+        {
+            return true;
+        }
+        if !attribute.path().is_ident("cfg") {
+            return false;
+        }
+        let mut requires_test = false;
+        let parsed = attribute.parse_nested_meta(|meta| {
+            requires_test = cfg_meta_requires_test(meta)?;
+            Ok(())
+        });
+        parsed.is_ok() && requires_test
     })
 }
 
-fn cfg_meta_contains_test(meta: ParseNestedMeta<'_>, found: &mut bool) -> syn::Result<()> {
+fn cfg_meta_requires_test(meta: ParseNestedMeta<'_>) -> syn::Result<bool> {
     if meta.path.is_ident("test") {
-        *found = true;
-        return Ok(());
+        let is_bare_test = !meta.input.peek(syn::token::Paren) && !meta.input.peek(syn::Token![=]);
+        consume_meta(meta)?;
+        return Ok(is_bare_test);
     }
+    if meta.path.is_ident("all") {
+        let mut any_child_requires_test = false;
+        meta.parse_nested_meta(|nested| {
+            any_child_requires_test |= cfg_meta_requires_test(nested)?;
+            Ok(())
+        })?;
+        return Ok(any_child_requires_test);
+    }
+    if meta.path.is_ident("any") {
+        let mut saw_child = false;
+        let mut every_child_requires_test = true;
+        meta.parse_nested_meta(|nested| {
+            saw_child = true;
+            every_child_requires_test &= cfg_meta_requires_test(nested)?;
+            Ok(())
+        })?;
+        return Ok(saw_child && every_child_requires_test);
+    }
+    consume_meta(meta)?;
+    Ok(false)
+}
+
+fn consume_meta(meta: ParseNestedMeta<'_>) -> syn::Result<()> {
     if meta.input.peek(syn::token::Paren) {
-        return meta.parse_nested_meta(|nested| cfg_meta_contains_test(nested, found));
+        return meta.parse_nested_meta(consume_meta);
     }
     if meta.input.peek(syn::Token![=]) {
         let value = meta.value()?;
@@ -495,240 +537,192 @@ fn cfg_meta_contains_test(meta: ParseNestedMeta<'_>, found: &mut bool) -> syn::R
     Ok(())
 }
 
-fn strip_groups(mut expression: &Expr) -> &Expr {
-    loop {
-        expression = match expression {
-            Expr::Group(group) => &group.expr,
-            Expr::Paren(paren) => &paren.expr,
-            _ => return expression,
-        };
+fn contains_tag(comments: &str, tag: &str) -> bool {
+    comments.to_ascii_uppercase().contains(tag)
+}
+
+fn line_has_code(line: &str, comments: &str) -> bool {
+    line.bytes()
+        .zip(comments.bytes())
+        .any(|(source, comment)| !source.is_ascii_whitespace() && comment == b' ')
+}
+
+fn byte_offset_for_char_column(line: &str, column: usize) -> usize {
+    line.char_indices()
+        .nth(column)
+        .map_or(line.len(), |(offset, _)| offset)
+}
+
+#[derive(Clone, Copy)]
+enum LexState {
+    Normal,
+    Quoted { quote: u8, escaped: bool },
+    Raw { hashes: usize },
+    LineComment,
+    BlockComment { depth: usize },
+}
+
+fn extract_comment_lines(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut lines = vec![Vec::new()];
+    let mut state = LexState::Normal;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'\n' {
+            lines.push(Vec::new());
+            state = match state {
+                LexState::LineComment => LexState::Normal,
+                LexState::Quoted { quote, .. } => LexState::Quoted {
+                    quote,
+                    escaped: false,
+                },
+                other => other,
+            };
+            index += 1;
+            continue;
+        }
+
+        match state {
+            LexState::Normal => {
+                if bytes.get(index..index + 2) == Some(b"//") {
+                    push_bytes(&mut lines, b"//", true);
+                    state = LexState::LineComment;
+                    index += 2;
+                } else if bytes.get(index..index + 2) == Some(b"/*") {
+                    push_bytes(&mut lines, b"/*", true);
+                    state = LexState::BlockComment { depth: 1 };
+                    index += 2;
+                } else if byte == b'r' {
+                    if let Some((hashes, length)) = raw_string_start(bytes, index) {
+                        push_bytes(&mut lines, &bytes[index..index + length], false);
+                        state = LexState::Raw { hashes };
+                        index += length;
+                    } else {
+                        push_bytes(&mut lines, &bytes[index..index + 1], false);
+                        index += 1;
+                    }
+                } else if byte == b'"' || (byte == b'\'' && !starts_lifetime(bytes, index)) {
+                    push_bytes(&mut lines, &bytes[index..index + 1], false);
+                    state = LexState::Quoted {
+                        quote: byte,
+                        escaped: false,
+                    };
+                    index += 1;
+                } else {
+                    push_bytes(&mut lines, &bytes[index..index + 1], false);
+                    index += 1;
+                }
+            }
+            LexState::Quoted { quote, escaped } => {
+                push_bytes(&mut lines, &bytes[index..index + 1], false);
+                state = if escaped {
+                    LexState::Quoted {
+                        quote,
+                        escaped: false,
+                    }
+                } else if byte == b'\\' {
+                    LexState::Quoted {
+                        quote,
+                        escaped: true,
+                    }
+                } else if byte == quote {
+                    LexState::Normal
+                } else {
+                    state
+                };
+                index += 1;
+            }
+            LexState::Raw { hashes } => {
+                let closes = byte == b'"'
+                    && bytes
+                        .get(index + 1..index + 1 + hashes)
+                        .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'));
+                let length = if closes { hashes + 1 } else { 1 };
+                push_bytes(&mut lines, &bytes[index..index + length], false);
+                if closes {
+                    state = LexState::Normal;
+                }
+                index += length;
+            }
+            LexState::LineComment => {
+                push_bytes(&mut lines, &bytes[index..index + 1], true);
+                index += 1;
+            }
+            LexState::BlockComment { mut depth } => {
+                if bytes.get(index..index + 2) == Some(b"/*") {
+                    push_bytes(&mut lines, b"/*", true);
+                    depth += 1;
+                    state = LexState::BlockComment { depth };
+                    index += 2;
+                } else if bytes.get(index..index + 2) == Some(b"*/") {
+                    push_bytes(&mut lines, b"*/", true);
+                    depth -= 1;
+                    state = if depth == 0 {
+                        LexState::Normal
+                    } else {
+                        LexState::BlockComment { depth }
+                    };
+                    index += 2;
+                } else {
+                    push_bytes(&mut lines, &bytes[index..index + 1], true);
+                    index += 1;
+                }
+            }
+        }
+    }
+    lines
+        .into_iter()
+        .map(|line| String::from_utf8(line).expect("comment mask preserves UTF-8"))
+        .collect()
+}
+
+fn push_bytes(lines: &mut [Vec<u8>], bytes: &[u8], comment: bool) {
+    let line = lines.last_mut().expect("at least one line exists");
+    if comment {
+        line.extend_from_slice(bytes);
+    } else {
+        line.extend(std::iter::repeat_n(b' ', bytes.len()));
     }
 }
 
-fn contains_comment_tag(line: &str, tag: &str, profile: PolicyProfile) -> bool {
-    match profile {
-        PolicyProfile::Strict => line.contains(tag),
-        PolicyProfile::ZeroClaw => line.to_ascii_uppercase().contains(tag),
+fn raw_string_start(bytes: &[u8], index: usize) -> Option<(usize, usize)> {
+    let mut cursor = index + 1;
+    while bytes.get(cursor) == Some(&b'#') {
+        cursor += 1;
     }
+    (bytes.get(cursor) == Some(&b'"')).then(|| (cursor - index - 1, cursor - index + 1))
+}
+
+fn starts_lifetime(bytes: &[u8], index: usize) -> bool {
+    let Some(next) = bytes.get(index + 1) else {
+        return false;
+    };
+    (next.is_ascii_alphabetic() || *next == b'_') && bytes.get(index + 2) != Some(&b'\'')
 }
 
 fn has_static_expect_message(expression: &ExprMethodCall) -> bool {
     expression.args.first().is_some_and(|argument| {
-        matches!(argument, Expr::Lit(literal) if matches!(&literal.lit, syn::Lit::Str(message) if !message.value().trim().is_empty()))
+        matches!(argument, syn::Expr::Lit(literal) if matches!(&literal.lit, syn::Lit::Str(message) if !message.value().trim().is_empty()))
     })
-}
-
-fn type_contains_erased(
-    ty: &Type,
-    json_names: &HashSet<String>,
-    erased_aliases: &HashSet<String>,
-    profile: PolicyProfile,
-) -> bool {
-    match ty {
-        Type::Array(ty) => type_contains_erased(&ty.elem, json_names, erased_aliases, profile),
-        Type::BareFn(function) => {
-            function.inputs.iter().any(|input| {
-                type_contains_erased(&input.ty, json_names, erased_aliases, profile)
-            }) || matches!(&function.output, ReturnType::Type(_, ty) if type_contains_erased(ty, json_names, erased_aliases, profile))
-        }
-        Type::Group(ty) => type_contains_erased(&ty.elem, json_names, erased_aliases, profile),
-        Type::ImplTrait(ty) => bounds_contain_any(&ty.bounds),
-        Type::Paren(ty) => type_contains_erased(&ty.elem, json_names, erased_aliases, profile),
-        Type::Path(ty) => {
-            path_is_erased(&ty.path, json_names, erased_aliases, profile)
-                || ty.path.segments.iter().any(|segment| match &segment.arguments {
-                    syn::PathArguments::AngleBracketed(arguments) => arguments.args.iter().any(|argument| {
-                        matches!(argument, GenericArgument::Type(ty) if type_contains_erased(ty, json_names, erased_aliases, profile))
-                    }),
-                    syn::PathArguments::Parenthesized(arguments) => {
-                        arguments.inputs.iter().any(|ty| type_contains_erased(ty, json_names, erased_aliases, profile))
-                            || matches!(&arguments.output, ReturnType::Type(_, ty) if type_contains_erased(ty, json_names, erased_aliases, profile))
-                    }
-                    syn::PathArguments::None => false,
-                })
-        }
-        Type::Ptr(ty) => type_contains_erased(&ty.elem, json_names, erased_aliases, profile),
-        Type::Reference(ty) => type_contains_erased(&ty.elem, json_names, erased_aliases, profile),
-        Type::Slice(ty) => type_contains_erased(&ty.elem, json_names, erased_aliases, profile),
-        Type::TraitObject(ty) => bounds_contain_any(&ty.bounds),
-        Type::Tuple(ty) => ty
-            .elems
-            .iter()
-            .any(|ty| type_contains_erased(ty, json_names, erased_aliases, profile)),
-        _ => false,
-    }
-}
-
-fn bounds_contain_any(
-    bounds: &syn::punctuated::Punctuated<TypeParamBound, syn::token::Plus>,
-) -> bool {
-    bounds.iter().any(|bound| {
-        matches!(bound, TypeParamBound::Trait(TraitBound { path, .. }) if path.segments.last().is_some_and(|segment| segment.ident == "Any"))
-    })
-}
-
-fn path_is_erased(
-    path: &syn::Path,
-    json_names: &HashSet<String>,
-    erased_aliases: &HashSet<String>,
-    profile: PolicyProfile,
-) -> bool {
-    let Some(last) = path.segments.last() else {
-        return false;
-    };
-    let name = last.ident.to_string();
-    if name == "Any" || erased_aliases.contains(&name) {
-        return true;
-    }
-    if profile == PolicyProfile::ZeroClaw {
-        return false;
-    }
-    if json_names.contains(&name) {
-        return true;
-    }
-    name == "Value"
-        && path
-            .segments
-            .iter()
-            .rev()
-            .nth(1)
-            .is_some_and(|segment| segment.ident == "serde_json")
-}
-
-fn is_unsafe_dictionary(
-    ty: &Type,
-    json_names: &HashSet<String>,
-    erased_aliases: &HashSet<String>,
-    profile: PolicyProfile,
-) -> bool {
-    let Type::Path(path) = ty else {
-        return false;
-    };
-    let Some(segment) = path.path.segments.last() else {
-        return false;
-    };
-    if !matches!(
-        segment.ident.to_string().as_str(),
-        "HashMap" | "BTreeMap" | "IndexMap" | "DashMap"
-    ) {
-        return false;
-    }
-    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-        return false;
-    };
-    let types: Vec<_> = arguments
-        .args
-        .iter()
-        .filter_map(|argument| match argument {
-            GenericArgument::Type(ty) => Some(ty),
-            _ => None,
-        })
-        .collect();
-    types.len() >= 2
-        && is_string_type(types[0])
-        && type_contains_erased(types[1], json_names, erased_aliases, profile)
-}
-
-fn is_string_type(ty: &Type) -> bool {
-    match ty {
-        Type::Path(path) => path
-            .path
-            .segments
-            .last()
-            .is_some_and(|segment| segment.ident == "String"),
-        Type::Reference(reference) => {
-            matches!(&*reference.elem, Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "str"))
-        }
-        _ => false,
-    }
-}
-
-fn collect_json_imports(file: &File, names: &mut HashSet<String>) {
-    struct Collector<'a>(&'a mut HashSet<String>);
-    impl<'ast> Visit<'ast> for Collector<'_> {
-        fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-            collect_use_tree(Vec::new(), &item.tree, self.0);
-            visit::visit_item_use(self, item);
-        }
-    }
-    Collector(names).visit_file(file);
-}
-
-fn collect_use_tree(prefix: Vec<String>, tree: &UseTree, names: &mut HashSet<String>) {
-    match tree {
-        UseTree::Path(path) => {
-            let mut prefix = prefix;
-            prefix.push(path.ident.to_string());
-            collect_use_tree(prefix, &path.tree, names);
-        }
-        UseTree::Name(name) => {
-            if prefix.last().is_some_and(|part| part == "serde_json") && name.ident == "Value" {
-                names.insert(name.ident.to_string());
-            }
-        }
-        UseTree::Rename(rename) => {
-            if prefix.last().is_some_and(|part| part == "serde_json") && rename.ident == "Value" {
-                names.insert(rename.rename.to_string());
-            }
-        }
-        UseTree::Group(group) => {
-            for item in &group.items {
-                collect_use_tree(prefix.clone(), item, names);
-            }
-        }
-        UseTree::Glob(_) => {}
-    }
-}
-
-fn collect_erased_aliases(
-    file: &File,
-    json_names: &HashSet<String>,
-    profile: PolicyProfile,
-) -> HashSet<String> {
-    #[derive(Default)]
-    struct Collector(Vec<(String, Type)>);
-    impl<'ast> Visit<'ast> for Collector {
-        fn visit_item_type(&mut self, item: &'ast ItemType) {
-            self.0.push((item.ident.to_string(), (*item.ty).clone()));
-            visit::visit_item_type(self, item);
-        }
-    }
-    let mut collector = Collector::default();
-    collector.visit_file(file);
-    let mut aliases = HashSet::new();
-    loop {
-        let before = aliases.len();
-        for (name, ty) in &collector.0 {
-            if type_contains_erased(ty, json_names, &aliases, profile) {
-                aliases.insert(name.clone());
-            }
-        }
-        if aliases.len() == before {
-            return aliases;
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use crate::{PolicyProfile, check_source, check_source_with_profile};
+    use crate::check_source;
 
-    fn rules(source: &str) -> Vec<&'static str> {
-        check_source(Path::new("src/example.rs"), source)
+    fn rules_at(path: &Path, source: &str) -> Vec<&'static str> {
+        check_source(path, source)
             .expect("fixture should parse")
             .into_iter()
             .map(|diagnostic| diagnostic.rule)
             .collect()
     }
 
-    fn zeroclaw_rules(source: &str) -> Vec<&'static str> {
-        check_source_with_profile(Path::new("src/example.rs"), source, PolicyProfile::ZeroClaw)
-            .expect("fixture should parse")
-            .into_iter()
-            .map(|diagnostic| diagnostic.rule)
-            .collect()
+    fn rules(source: &str) -> Vec<&'static str> {
+        rules_at(Path::new("src/example.rs"), source)
     }
 
     #[test]
@@ -737,36 +731,6 @@ mod tests {
             "struct User { id: String }\nfn load(user: User) -> Result<User, Error> { Ok(user) }",
         );
         assert!(diagnostics.is_empty());
-    }
-
-    #[test]
-    fn reports_erased_boundaries_aliases_and_dictionaries() {
-        let diagnostics = rules(
-            "use serde_json::Value as Json;\n\
-             use std::collections::HashMap;\n\
-             type Payload = Json;\n\
-             fn load(input: Box<dyn std::any::Any>) -> Payload { todo!() }\n\
-             fn metadata() -> HashMap<String, Json> { todo!() }",
-        );
-        assert!(diagnostics.contains(&"no-erased-parameter-types"));
-        assert!(diagnostics.contains(&"no-erased-return-types"));
-        assert!(diagnostics.contains(&"no-erased-type-aliases"));
-        assert!(diagnostics.contains(&"no-unsafe-dictionary-types"));
-    }
-
-    #[test]
-    fn reports_widening_downcasts_chained_casts_and_shape_names() {
-        let diagnostics = rules(
-            "fn decode(user_shape: User) {\n\
-                 let value: Box<dyn std::any::Any> = Box::new(user_shape);\n\
-                 let _ = value.downcast_ref::<User>();\n\
-                 let _ = 1_u8 as u16 as u32;\n\
-             }",
-        );
-        assert!(diagnostics.contains(&"no-known-value-widening"));
-        assert!(diagnostics.contains(&"no-runtime-downcasting"));
-        assert!(diagnostics.contains(&"no-chained-casts"));
-        assert!(diagnostics.contains(&"no-shape-in-symbol-names"));
     }
 
     #[test]
@@ -800,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn production_only_rules_ignore_test_modules() {
+    fn test_only_rules_are_exempt() {
         let diagnostics = rules(
             "#[cfg(all(test, unix))] mod tests {\n\
                  #[allow(dead_code)] fn helper(value: Option<u8>) { let _ = value.unwrap(); }\n\
@@ -811,13 +775,130 @@ mod tests {
     }
 
     #[test]
-    fn mock_generation_is_rejected_even_in_tests() {
-        let diagnostics = rules("#[cfg(test)] mod tests { mock! { Store {} } }");
-        assert!(diagnostics.contains(&"no-mock-macros"));
+    fn test_only_item_parents_are_exempt() {
+        let diagnostics = rules(
+            "#[cfg(test)]\n\
+             impl Fixture {\n\
+                 #[allow(dead_code)] fn helper(value: Option<u8>) { let _ = value.unwrap(); }\n\
+                 #[allow(dead_code)] const VALUE: u8 = None.unwrap();\n\
+             }\n\
+             #[cfg(test)]\n\
+             #[allow(dead_code)]\n\
+             static FIXTURE: u8 = None.unwrap();\n\
+             #[cfg(test)]\n\
+             trait FixtureTrait {\n\
+                 #[allow(dead_code)] fn helper(value: Option<u8>) { let _ = value.unwrap(); }\n\
+             }",
+        );
+        assert!(!diagnostics.contains(&"no-dead-code-allow"));
+        assert!(!diagnostics.contains(&"require-invariant-comment-for-panics"));
     }
 
     #[test]
-    fn dead_code_suppression_is_rejected_in_production() {
+    fn test_only_expressions_locals_and_statement_macros_are_exempt() {
+        let diagnostics = rules(
+            "fn fixture(value: Option<u8>) {\n\
+                 #[cfg(test)]\n\
+                 if true { let _ = value.unwrap(); }\n\
+                 #[cfg(test)]\n\
+                 let _local = value.unwrap();\n\
+                 #[cfg(test)]\n\
+                 panic!(\"fixture\");\n\
+             }",
+        );
+        assert!(!diagnostics.contains(&"require-invariant-comment-for-panics"));
+    }
+
+    #[test]
+    fn conventional_test_source_filenames_are_exempt() {
+        let diagnostics = rules_at(
+            Path::new("src/coding_agent_budget_tests.rs"),
+            "#[allow(dead_code)] fn helper(value: Option<u8>) { let _ = value.unwrap(); }",
+        );
+        assert!(!diagnostics.contains(&"no-dead-code-allow"));
+        assert!(!diagnostics.contains(&"require-invariant-comment-for-panics"));
+    }
+
+    #[test]
+    fn mixed_or_negated_test_cfg_does_not_bypass_production_rules() {
+        let diagnostics = rules(
+            "#[cfg(not(test))]\n\
+             #[allow(dead_code)]\n\
+             fn production_only() { unreachable!() }\n\
+             #[cfg(any(test, feature = \"fixture\"))]\n\
+             #[allow(dead_code)]\n\
+             fn mixed_surface() { todo!() }",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|rule| **rule == "no-dead-code-allow")
+                .count(),
+            2
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|rule| **rule == "require-invariant-comment-for-panics")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn custom_test_cfg_key_is_not_the_builtin_test_predicate() {
+        let diagnostics = rules(
+            "#[cfg(test = \"fixture\")]\n\
+             #[allow(dead_code)]\n\
+             fn custom_cfg() { unreachable!() }",
+        );
+        assert!(diagnostics.contains(&"no-dead-code-allow"));
+        assert!(diagnostics.contains(&"require-invariant-comment-for-panics"));
+    }
+
+    #[test]
+    fn dead_code_expectation_with_a_reason_is_allowed() {
+        let diagnostics =
+            rules("#[expect(dead_code, reason = \"compatibility surface\")] fn retained() {}");
+        assert!(!diagnostics.contains(&"no-dead-code-allow"));
+    }
+
+    #[test]
+    fn unreasoned_expectations_and_unused_allows_are_rejected() {
+        let diagnostics = rules(
+            "#[expect(dead_code)] fn unexplained() {}\n\
+             #[allow(unused)] fn broadly_suppressed() {}\n\
+             #[expect(unused, reason = \"too broad\")] fn broad_expectation() {}\n\
+             #[allow(warnings)] fn all_warnings_suppressed() {}",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|rule| **rule == "no-dead-code-allow")
+                .count(),
+            4
+        );
+    }
+
+    #[test]
+    fn production_capable_cfg_attr_cannot_hide_dead_code() {
+        let diagnostics = rules(
+            "#[cfg_attr(not(test), allow(dead_code))] fn production() {}\n\
+             #[cfg_attr(test, allow(dead_code))] fn test_configuration_only() {}\n\
+             #[cfg_attr(feature = \"fixture\", cfg_attr(not(test), allow(dead_code)))]\n\
+             fn nested_production_suppression() {}",
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|rule| **rule == "no-dead-code-allow")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn dead_code_allowance_is_rejected_in_production() {
         let diagnostics = rules("#[allow(dead_code)] fn disconnected() {}");
         assert!(diagnostics.contains(&"no-dead-code-allow"));
     }
@@ -838,62 +919,104 @@ mod tests {
     }
 
     #[test]
-    fn zeroclaw_profile_preserves_wire_json_and_schema_vocabulary() {
-        let diagnostics = zeroclaw_rules(
-            "use serde_json::Value;\n\
-             struct RequestShape;\n\
-             fn dispatch(input: Value) -> Value {\n\
-                 let payload: Value = input;\n\
-                 payload\n\
-             }",
+    fn unsafe_attributes_require_safety_comments() {
+        let diagnostics = rules(
+            "#[unsafe(no_mangle)]\n\
+             pub extern \"C\" fn exported() {}\n\
+             // SAFETY: the symbol name is uniquely owned by this crate.\n\
+             #[unsafe(export_name = \"owned_symbol\")]\n\
+             pub extern \"C\" fn justified() {}",
         );
-        assert!(diagnostics.is_empty());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|rule| **rule == "require-safety-comment-for-unsafe")
+                .count(),
+            1
+        );
     }
 
     #[test]
-    fn zeroclaw_profile_allows_documented_expect_and_test_downcast() {
-        let diagnostics = zeroclaw_rules(
+    fn descriptive_expect_message_documents_the_invariant() {
+        let diagnostics = rules(
             "fn required(value: Option<u8>) -> u8 {\n\
                  value.expect(\"validated by the caller\")\n\
-             }\n\
-             #[cfg(test)] mod tests {\n\
-                 fn typed(error: &anyhow::Error) { let _ = error.downcast_ref::<Error>(); }\n\
              }",
         );
         assert!(diagnostics.is_empty());
     }
 
     #[test]
-    fn zeroclaw_profile_preserves_canonical_any_capability_seam() {
-        let diagnostics = zeroclaw_rules(
-            "trait Observer { fn as_any(&self) -> &dyn std::any::Any; }\n\
-             fn backend(observer: &dyn Observer) {\n\
-                 let _ = observer.as_any().downcast_ref::<Backend>();\n\
-             }",
+    fn panic_macros_require_invariants_outside_tests() {
+        let diagnostics = rules(
+            "fn production() { panic!(\"broken\"); todo!(); unimplemented!(); unreachable!(); }\n\
+             #[test] fn test_can_assert() { panic!(\"fixture\"); }",
         );
-        assert!(diagnostics.is_empty());
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|rule| **rule == "require-invariant-comment-for-panics")
+                .count(),
+            4
+        );
     }
 
     #[test]
-    fn zeroclaw_profile_keeps_any_unwrap_and_dead_code_guards() {
-        let diagnostics = zeroclaw_rules(
-            "#[allow(dead_code)] fn decode(value: Box<dyn std::any::Any>) {\n\
-                 let _ = Some(value).unwrap();\n\
-             }",
-        );
-        assert!(diagnostics.contains(&"no-dead-code-allow"));
-        assert!(diagnostics.contains(&"no-erased-parameter-types"));
-        assert!(diagnostics.contains(&"require-invariant-comment-for-panics"));
-    }
-
-    #[test]
-    fn zeroclaw_profile_accepts_case_insensitive_safety_tag() {
-        let diagnostics = zeroclaw_rules(
+    fn safety_tag_is_case_insensitive() {
+        let diagnostics = rules(
             "fn boundary() {\n\
                  // Safety: caller guarantees the pointer is valid.\n\
                  unsafe { core::hint::unreachable_unchecked(); }\n\
              }",
         );
         assert!(diagnostics.is_empty());
+    }
+
+    #[test]
+    fn string_literals_do_not_count_as_justification_comments() {
+        let diagnostics = rules(
+            "fn boundary(marker: *mut &str, value: Option<u8>) {\n\
+                 *marker = \"SAFETY: INVARIANT:\";\n\
+                 unsafe { core::hint::unreachable_unchecked(); }\n\
+                 let _ = value.unwrap();\n\
+             }",
+        );
+        assert!(diagnostics.contains(&"require-safety-comment-for-unsafe"));
+        assert!(diagnostics.contains(&"require-invariant-comment-for-panics"));
+    }
+
+    #[test]
+    fn code_between_a_comment_and_boundary_breaks_proximity() {
+        let diagnostics = rules(
+            "fn boundary(pointer: *mut u8) {\n\
+                 // SAFETY: this belongs to the earlier operation.\n\
+                 *pointer = 1;\n\
+                 unsafe { core::hint::unreachable_unchecked(); }\n\
+             }",
+        );
+        assert!(diagnostics.contains(&"require-safety-comment-for-unsafe"));
+    }
+
+    #[test]
+    fn real_inline_block_comments_are_recognized() {
+        let diagnostics = rules(
+            "fn boundary() {\n\
+                 let _setup = (); /* SAFETY: the fixture establishes the precondition. */ unsafe { core::hint::unreachable_unchecked(); }\n\
+             }",
+        );
+        assert!(!diagnostics.contains(&"require-safety-comment-for-unsafe"));
+    }
+
+    #[test]
+    fn unicode_columns_preserve_same_line_comment_order() {
+        let justified = rules(
+            "fn boundary() { let _ = \"🦀\"; /* rationale 🦀 SAFETY: the precondition holds. */ unsafe { core::hint::unreachable_unchecked(); } }",
+        );
+        assert!(!justified.contains(&"require-safety-comment-for-unsafe"));
+
+        let trailing = rules(
+            "fn boundary() { let _ = \"🦀\"; unsafe { core::hint::unreachable_unchecked(); } /* 🦀 SAFETY: too late. */ }",
+        );
+        assert!(trailing.contains(&"require-safety-comment-for-unsafe"));
     }
 }

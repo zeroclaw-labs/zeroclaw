@@ -10,8 +10,8 @@ name = "anti-slop"
 path = "src/main.rs"
 
 [dependencies]
-proc-macro2 = { version = "1", features = ["span-locations"] }
-syn = { version = "2", features = ["full", "visit"] }
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
 
 [dev-dependencies]
 tempfile = "3.26"

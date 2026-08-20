@@ -1,22 +1,19 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use zeroclaw_anti_slop::changed::{changed_rust_lines, collect_rust_files};
-use zeroclaw_anti_slop::{PolicyProfile, RULES, check_source_with_profile};
+use zeroclaw_anti_slop::{RULES, check_source};
 
-const DEFAULT_ROOTS: &[&str] = &[
-    "src", "crates", "apps", "xtask", "tools", "tests", "benches", "firmware",
-];
+const DEFAULT_ROOTS: &[&str] = &["."];
 
 #[derive(Debug, Default)]
 struct Args {
     changed_since: Option<String>,
     help: bool,
     list_rules: bool,
-    profile: PolicyProfile,
     roots: Vec<PathBuf>,
     summary: bool,
 }
@@ -63,7 +60,7 @@ fn run(mut args: Args) -> ExitCode {
         },
         None => None,
     };
-    let mut files = match &changed {
+    let files = match &changed {
         Some(changed) => changed
             .files()
             .filter(|path| repo.join(path).is_file())
@@ -77,10 +74,6 @@ fn run(mut args: Args) -> ExitCode {
             }
         },
     };
-    // The upstream plugin also excludes its vendored implementation: a checker
-    // necessarily contains the syntax and rule names that it rejects.
-    files.retain(|path| !path.starts_with("tools/anti-slop"));
-
     let mut violation_count = 0;
     let mut file_counts = BTreeMap::<PathBuf, usize>::new();
     let mut rule_counts = BTreeMap::<&'static str, usize>::new();
@@ -94,7 +87,7 @@ fn run(mut args: Args) -> ExitCode {
                 continue;
             }
         };
-        let diagnostics = match check_source_with_profile(path, &source, args.profile) {
+        let diagnostics = match check_source(path, &source) {
             Ok(diagnostics) => diagnostics,
             Err(error) => {
                 eprintln!("{}: failed to parse: {error}", path.display());
@@ -102,12 +95,42 @@ fn run(mut args: Args) -> ExitCode {
                 continue;
             }
         };
+        let baseline_diagnostics = match &changed {
+            Some(changed) => match changed.baseline_source(&repo, path) {
+                Ok(Some(source)) => match check_source(changed.baseline_path(path), &source) {
+                    Ok(diagnostics) => diagnostics
+                        .into_iter()
+                        .map(|diagnostic| (diagnostic.line, diagnostic.column, diagnostic.rule))
+                        .collect::<BTreeSet<_>>(),
+                    Err(error) => {
+                        eprintln!("{} at merge-base: failed to parse: {error}", path.display());
+                        failed = true;
+                        continue;
+                    }
+                },
+                Ok(None) => BTreeSet::new(),
+                Err(error) => {
+                    eprintln!("{} at merge-base: {error}", path.display());
+                    failed = true;
+                    continue;
+                }
+            },
+            None => BTreeSet::new(),
+        };
         for diagnostic in diagnostics {
-            if changed
-                .as_ref()
-                .is_some_and(|changed| !changed.contains(path, diagnostic.line))
-            {
-                continue;
+            if let Some(changed) = &changed {
+                let existed_at_merge_base = changed
+                    .old_line_for_new(path, diagnostic.line)
+                    .is_some_and(|old_line| {
+                        baseline_diagnostics.contains(&(
+                            old_line,
+                            diagnostic.column,
+                            diagnostic.rule,
+                        ))
+                    });
+                if !changed.contains(path, diagnostic.line) && existed_at_merge_base {
+                    continue;
+                }
             }
             if !args.summary {
                 println!(
@@ -161,18 +184,6 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 parsed.changed_since = Some(base);
             }
             "--list-rules" => parsed.list_rules = true,
-            "--profile" => {
-                parsed.profile = match args.next().as_deref() {
-                    Some("strict") => PolicyProfile::Strict,
-                    Some("zeroclaw") => PolicyProfile::ZeroClaw,
-                    Some(profile) => {
-                        return Err(format!(
-                            "unknown profile `{profile}`; expected `zeroclaw` or `strict`"
-                        ));
-                    }
-                    None => return Err("--profile requires `zeroclaw` or `strict`".to_string()),
-                };
-            }
             "--summary" => parsed.summary = true,
             "-h" | "--help" => parsed.help = true,
             _ if argument.starts_with('-') => return Err(format!("unknown option: {argument}")),
@@ -183,11 +194,11 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
 }
 
 fn usage() -> &'static str {
-    "Usage: anti-slop [--changed-since REV] [--profile PROFILE] [--list-rules] [--summary] [PATH ...]\n\
+    "Usage: anti-slop [--changed-since REV] [--list-rules] [--summary] [PATH ...]\n\
      \n\
-     PROFILE is `zeroclaw` (default) or `strict`.\n\
-     With --changed-since, only added or modified lines since REV's merge-base\n\
-     with HEAD are enforced. Without it, every Rust file below PATH is checked."
+     With --changed-since, findings on touched lines and findings newly exposed\n\
+     since REV's merge-base with HEAD are enforced. Without it, every Rust file\n\
+     below PATH is checked."
 }
 
 fn print_summary(
@@ -245,19 +256,5 @@ mod tests {
     fn recognizes_summary_mode() {
         let args = parse_args(["--summary".to_string()]).expect("summary should parse");
         assert!(args.summary);
-    }
-
-    #[test]
-    fn parses_strict_profile() {
-        let args = parse_args(["--profile".to_string(), "strict".to_string()])
-            .expect("strict profile should parse");
-        assert_eq!(args.profile, PolicyProfile::Strict);
-    }
-
-    #[test]
-    fn rejects_unknown_profile() {
-        let error = parse_args(["--profile".to_string(), "wat".to_string()])
-            .expect_err("unknown profile must fail");
-        assert!(error.contains("unknown profile"));
     }
 }

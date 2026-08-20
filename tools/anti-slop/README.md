@@ -1,94 +1,125 @@
-# ZeroClaw anti-slop for Rust
+# ZeroClaw Rust anti-slop gate
 
-This is a stable-toolchain Rust source checker inspired by
-[`dmmulroy/anti-slop`](https://github.com/dmmulroy/anti-slop). It translates the
-original project's low-evidence policy into Rust concepts and adds the two
-production-code rules already stated in ZeroClaw's contributor contract.
+This stable-toolchain checker protects three production-code rules already
+stated by ZeroClaw's contributor contract:
 
-The CLI defaults to the `zeroclaw` policy profile. It preserves ZeroClaw's
-canonical `serde_json::Value` wire/tool contracts, legitimate schema `Shape`
-vocabulary, documented `expect(...)` invariants, and test-only typed-error
-downcasts. Pass `--profile strict` for the upstream-style interpretation that
-treats those patterns as suspect too.
+- Do not hide unused production code with `#[allow(dead_code)]` or broader
+  groups such as `#[allow(unused)]` and `#[allow(warnings)]`.
+- Explain every unsafe boundary with a nearby `SAFETY:` comment.
+- Propagate production failures or document impossible panic paths with a
+  nearby `INVARIANT:` comment or a descriptive `expect("...")` message.
 
-The checker is intentionally a normal workspace binary built on `syn`, not a
-`rustc_private` or Dylint plugin. That keeps it usable with ZeroClaw's pinned
-stable toolchain. It is AST-aware, but it does not claim compiler type
-resolution.
+It parses Rust with `syn` so strings, comments, attributes, and test modules
+are distinguished reliably. It is developer and CI tooling only: the package is
+not published, has no runtime dependents, and is not an agent-callable tool.
 
-## Usage
+## Run the canonical gate
 
-Check only lines introduced on the current branch:
+From the repository root:
 
 ```sh
-just anti-slop origin/master
+bash scripts/ci/anti_slop_delta_gate.sh
 ```
 
-The equivalent direct command is:
+The wrapper prefers `upstream/master` for local fork work and falls back to
+`origin/master`. Pass an explicit base when needed:
 
 ```sh
-cargo run --locked -p zeroclaw-anti-slop -- \
-  --changed-since origin/master
+bash scripts/ci/anti_slop_delta_gate.sh origin/master
 ```
 
-`--changed-since` diffs from the merge-base to the current working tree, so it
-includes committed, staged, and unstaged changes. Untracked Rust files are
-checked in full. This delta mode lets ZeroClaw adopt stronger policy without
-requiring unrelated legacy cleanup. The checker's own `tools/anti-slop/` source
-is excluded, matching the upstream project's treatment of its vendored plugin.
+Refresh the relevant tracking ref first. The wrapper deliberately performs no
+network operation and prints the exact base ref and commit it checked.
 
-To inspect every Rust file under explicit roots:
+The checker diffs from the merge-base through the current working tree, so the
+scan includes committed, staged, unstaged, and untracked Rust files. It reports
+findings on touched lines and findings newly exposed by context changes, such
+as deleting a `SAFETY:` comment or removing `cfg(test)`. An unchanged finding
+that already existed at the merge-base does not block an unrelated branch.
+
+The PR-authoring skill treats this command as a pre-submission gate. CI runs the
+same command in advisory mode for 20 representative Rust PRs while false
+positives are recorded in #10118; removing the workflow's `continue-on-error`
+then promotes it to required enforcement without changing the checker or
+contributor command.
+
+Diagnostics use:
+
+```text
+path:line:column: rule: message
+```
+
+Exit status `0` means clean, `1` means findings were reported, and `2`
+means the scan could not complete.
+
+## Remediate findings
+
+### `no-dead-code-allow`
+
+Remove the unused item, connect it to its intended production path, or place a
+test-only helper behind a precise test configuration. This also applies to
+conditional `cfg_attr` suppression. A deliberately retained compatibility
+surface may use a narrowly scoped compiler-checked expectation with a concrete
+reason:
+
+```rust
+#[expect(dead_code, reason = "public compatibility surface")]
+```
+
+Do not replace a broad allowance with an underscore name or another lint escape
+hatch.
+
+### `require-safety-comment-for-unsafe`
+
+Keep the unsafe operation only when necessary. State why its actual
+preconditions hold:
+
+```rust
+// SAFETY: the descriptor is owned by this process and remains live for the call.
+unsafe { invoke_descriptor(fd) }
+```
+
+### `require-invariant-comment-for-panics`
+
+Prefer returning or propagating an error. When a panic is genuinely impossible,
+state the checked invariant:
+
+```rust
+// INVARIANT: validation above guarantees at least one route.
+let route = routes.first().unwrap();
+```
+
+A nonempty literal `expect("...")` message also documents the invariant.
+Production `panic!`, `todo!`, `unimplemented!`, and `unreachable!`
+require the same justification. Test-only panic paths are excluded.
+
+## Full-tree accounting
+
+To inspect the repository baseline without printing every diagnostic:
 
 ```sh
-cargo run --locked -p zeroclaw-anti-slop -- crates/zeroclaw-api src
+cargo run --locked -p zeroclaw-anti-slop -- --summary .
 ```
 
-For a repository-wide baseline without printing every diagnostic:
+The pull-request gate uses changed-line mode. Full-tree scans are for cleanup
+accounting and release of the legacy baseline.
 
-```sh
-cargo run --locked -p zeroclaw-anti-slop -- \
-  --summary src crates apps xtask tools tests benches firmware
-```
+## Dependency boundary
 
-Summary mode reports counts by rule and the 20 highest-volume files.
+- `syn` parses Rust on the pinned stable toolchain.
+- `proc-macro2` provides line and column spans for actionable diagnostics.
+- `tempfile` is test-only and creates an isolated real Git repository for
+  merge-base, worktree, and untracked-file coverage.
 
-To list rule identifiers:
-
-```sh
-cargo run --locked -p zeroclaw-anti-slop -- --list-rules
-```
-
-Diagnostics use `path:line:column: rule: message` and the process exits `1` for
-violations or `2` when a file/git operation cannot be checked.
-
-## Rule mapping
-
-| Rust rule | Upstream idea |
-|---|---|
-| `no-chained-casts` | `no-chained-type-assertions` |
-| `no-known-value-widening` | `no-known-value-widening` |
-| `no-mock-macros` | `no-module-mocking` |
-| `no-shape-in-symbol-names` | same rule |
-| `no-erased-parameter-types` | `no-unknown-parameters` + `no-object-parameters` |
-| `no-erased-return-types` | `no-unknown-returns` |
-| `no-erased-type-aliases` | `no-unknown-type-aliases` |
-| `no-unsafe-dictionary-types` | same rule, using string-keyed Rust maps |
-| `no-runtime-downcasting` | `no-runtime-typeof`, `no-reflect-get`, and widen/assert flows |
-| `require-safety-comment-for-unsafe` | safety comments for type assertions |
-| `require-invariant-comment-for-panics` | ZeroClaw's documented-panic contract |
-| `no-dead-code-allow` | ZeroClaw's no-suppressed-production-code contract |
-
-`no-conditional-empty-object-spread` has no Rust equivalent. The Effect-specific
-service-constructor rule is also not ported. ZeroClaw's provider-dispatch gate in
-`scripts/ci/rust_quality_gate.sh` already owns the comparable application rule,
-so this tool does not duplicate it.
+All three dependencies and resolved versions already exist in ZeroClaw's
+workspace graph; this tool adds no new third-party package versions.
 
 ## Known limits
 
-- Imported `serde_json::Value` aliases are followed within a file; arbitrary
-  cross-module re-exports are not.
-- Runtime downcast checks are syntax-based and intentionally opinionated.
-- Macro-expanded code is outside `syn`'s view; macro invocations themselves are
-  checked where a rule applies.
-- Changed-line mode reports a diagnostic only when its primary span begins on a
-  changed line.
+- The checker validates the presence and placement of comments, not whether a
+  justification is true; review still owns the semantic claim.
+- Arbitrary macro token grammars are opaque to `syn`. Named panic macros are
+  checked, but an `unwrap()` embedded inside another macro invocation may rely
+  on Clippy or review.
+- This is a source-policy gate, not compiler type analysis. It does not replace
+  formatting, Clippy, tests, or architecture checks.

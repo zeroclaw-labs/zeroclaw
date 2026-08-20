@@ -9,16 +9,6 @@ use syn::visit::Visit;
 
 pub use rules::RULES;
 
-/// Rule-policy presets exposed by the checker.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum PolicyProfile {
-    /// Upstream-style policy: dynamic JSON and `shape` are treated as erasure.
-    Strict,
-    /// Preserve ZeroClaw's canonical wire JSON and schema vocabulary.
-    #[default]
-    ZeroClaw,
-}
-
 /// One source-level anti-slop violation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Diagnostic {
@@ -31,17 +21,8 @@ pub struct Diagnostic {
 
 /// Parse and check one Rust source file.
 pub fn check_source(path: &Path, source: &str) -> syn::Result<Vec<Diagnostic>> {
-    check_source_with_profile(path, source, PolicyProfile::Strict)
-}
-
-/// Parse and check one Rust source file under a named policy profile.
-pub fn check_source_with_profile(
-    path: &Path,
-    source: &str,
-    profile: PolicyProfile,
-) -> syn::Result<Vec<Diagnostic>> {
     let file = syn::parse_file(source)?;
-    let mut analyzer = rules::Analyzer::new(path, source, &file, profile);
+    let mut analyzer = rules::Analyzer::new(path, source);
     analyzer.visit_file(&file);
     let mut diagnostics = analyzer.finish();
     diagnostics.sort_by(|left, right| {
