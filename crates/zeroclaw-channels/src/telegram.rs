@@ -8531,8 +8531,9 @@ mod tests {
     }
 
     /// Factory/config-backed assertion: proves that `allowed_groups` from the
-    /// config schema reaches the TelegramChannel resolver closure at
-    /// construction time — mirroring the wiring in `collect_configured_channels`.
+    /// config schema reaches the `allowed_groups_resolver` closure that
+    /// `collect_configured_channels` wires into `TelegramChannel`, and that the
+    /// resolver reads live from the shared config handle (no-cache contract).
     #[test]
     fn factory_allowed_groups_resolver_reads_config_field() {
         use zeroclaw_config::schema::TelegramConfig;
@@ -8547,27 +8548,31 @@ mod tests {
                 ..Default::default()
             },
         );
-
-        // Reproduces the resolver closure pattern from
-        // collect_configured_channels (orchestrator/mod.rs lines 8446-8458).
         let cfg_arc = Arc::new(RwLock::new(config.clone()));
-        let alias = "home";
-        let allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = Arc::clone(&cfg_arc);
-            let alias = alias.to_string();
-            Arc::new(move || {
-                cfg_arc
-                    .read()
-                    .channels
-                    .telegram
-                    .get(&alias)
-                    .map(|tg| tg.allowed_groups.clone())
-                    .unwrap_or_default()
-            })
-        };
 
-        // The resolver closure must read the same values from the config.
-        let resolved = allowed_groups_resolver();
+        // Mirror the resolver closure that collect_configured_channels
+        // constructs (orchestrator/mod.rs 8458-8466): capture config_arc and
+        // alias, read allowed_groups live at call-time.
+        let alias = "home".to_string();
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+            Arc::new(Vec::new);
+        let ch = TelegramChannel::new("t".into(), "home", peer_resolver, false)
+            .with_allowed_groups_resolver({
+                let cfg_arc = Arc::clone(&cfg_arc);
+                let alias = alias.clone();
+                Arc::new(move || {
+                    cfg_arc
+                        .read()
+                        .channels
+                        .telegram
+                        .get(&alias)
+                        .map(|tg| tg.allowed_groups.clone())
+                        .unwrap_or_default()
+                })
+            });
+
+        // The resolver closure must read the same values from config.
+        let resolved = (ch.allowed_groups_resolver)();
         assert_eq!(
             resolved,
             vec!["-1001234567890", "-1009876543210"],
@@ -8586,7 +8591,7 @@ mod tests {
                 .allowed_groups
                 .push("-1005555555555".to_string());
         }
-        let resolved2 = allowed_groups_resolver();
+        let resolved2 = (ch.allowed_groups_resolver)();
         assert_eq!(
             resolved2,
             vec!["-1001234567890", "-1009876543210", "-1005555555555"],
