@@ -3959,7 +3959,9 @@ impl RpcDispatcher {
         // that models.dev may not carry yet) rather than silently falling back.
         let config = self.ctx.config.read().clone();
         let (models, pricing, live) =
-            crate::quickstart::model_catalog_with_config(Some(&config), &req.model_provider).await;
+            crate::quickstart::model_catalog_with_config_result(Some(&config), &req.model_provider)
+                .await
+                .map_err(|error| rpc_err(INVALID_PARAMS, error.to_string()))?;
         to_result(CatalogModelsResult {
             model_provider: req.model_provider,
             models,

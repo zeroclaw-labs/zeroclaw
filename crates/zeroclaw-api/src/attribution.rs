@@ -222,6 +222,7 @@ pub enum ModelProviderKind {
     Together,
     Bedrock,
     Ollama,
+    HailoOllama,
     Gemini,
     GeminiCli,
     GoogleAi,

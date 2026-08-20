@@ -556,8 +556,12 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
     }
 }
 
+pub(crate) fn is_prompt_tool_result_content(content: &str) -> bool {
+    content.trim_start().starts_with("[Tool results]")
+}
+
 pub(crate) fn is_prompt_tool_result_message(message: &ChatMessage) -> bool {
-    message.role == "user" && message.content.trim_start().starts_with("[Tool results]")
+    message.role == "user" && is_prompt_tool_result_content(&message.content)
 }
 
 fn is_tool_result_carrier(message: &ChatMessage) -> bool {

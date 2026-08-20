@@ -373,6 +373,7 @@ zc-model-switch-provider-ok = model_provider を { $provider } に切り替え�
 zc-model-switch-failed = モデルの切り替えに失敗しました: { $error }
 zc-model-catalog-no-provider = 設定からこのエージェントの model_provider を解決できませんでした。
 zc-model-catalog-empty = アクティブな model_provider に利用可能なモデルがありません。
+zc-model-catalog-failed = アクティブな model_provider のモデルを読み込めませんでした: { $error }
 zc-model-catalog-loading = モデルを読み込み中…
 zc-model-provider-catalog-failed = model_providers を読み込めませんでした: { $error }
 zc-chat-label-you = あなた:

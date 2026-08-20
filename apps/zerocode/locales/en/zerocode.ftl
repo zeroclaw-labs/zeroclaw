@@ -423,6 +423,7 @@ zc-model-switch-provider-ok = model_provider switched to { $provider } (model: {
 zc-model-switch-failed = Model switch failed: { $error }
 zc-model-catalog-no-provider = Could not resolve this agent's model_provider from config.
 zc-model-catalog-empty = No models available for the active model_provider.
+zc-model-catalog-failed = Could not load models for the active model_provider: { $error }
 zc-model-catalog-loading = Loading models…
 zc-model-provider-catalog-failed = Could not load model_providers: { $error }
 

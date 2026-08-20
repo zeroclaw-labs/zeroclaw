@@ -5557,12 +5557,28 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         .nth(3)
                         .map(|alias| format!("{provider_type}.{alias}"));
                     let catalog_selector = provider_ref.as_deref().unwrap_or(provider_type);
-                    let (models, _pricing, live) =
-                        zeroclaw_runtime::quickstart::model_catalog_with_config(
-                            Some(&config),
-                            catalog_selector,
-                        )
-                        .await;
+                    let catalog = zeroclaw_runtime::quickstart::model_catalog_with_config_result(
+                        Some(&config),
+                        catalog_selector,
+                    )
+                    .await;
+                    let (models, _pricing, live) = match catalog {
+                        Ok(catalog) => catalog,
+                        Err(error) => {
+                            let error = error.to_string();
+                            eprintln!(
+                                "{}",
+                                ta(
+                                    "cli-config-catalog-unavailable-manual",
+                                    &[("provider", catalog_selector), ("error", &error)],
+                                    &format!(
+                                        "  ⚠ Catalog for {catalog_selector} is unavailable ({error}); enter the model ID manually."
+                                    ),
+                                )
+                            );
+                            (Vec::new(), None, false)
+                        }
+                    };
                     if live && !models.is_empty() {
                         let current = config.get_prop(&path).unwrap_or_default();
                         let default = models.iter().position(|m| m == &current).unwrap_or(0);
