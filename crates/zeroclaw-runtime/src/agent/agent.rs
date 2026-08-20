@@ -363,6 +363,10 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// The shell this agent's runtime adapter will spawn, so the system
+    /// prompt reports the dialect the agent actually executes under.
+    /// `None` for a shell-less runtime.
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     /// Cross-channel HITL: resolved from the active risk profile's
     /// `approval_route`. When set, the per-turn approval bridge asks the named
     /// approver channel (bounded + fail-closed) instead of the originating
@@ -397,6 +401,20 @@ pub struct Agent {
     channel_name: String,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    /// The `DelegateTool` this Agent's registry registered, in its concrete
+    /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
+    /// otherwise cannot drive the *constructed* delegate's nested-registry
+    /// build and can only re-derive the wiring by hand - which is precisely
+    /// what must not be trusted for live-config threading. `None` when the
+    /// agent has no configured delegation targets.
+    ///
+    /// `allow(dead_code)`: its only reader is the delegated live-config
+    /// regression, which additionally needs `plugins-wasm-cranelift` to have a
+    /// plugin tool to execute at all. Under a narrower test feature set the
+    /// field is written and never read.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Drop for Agent {
@@ -515,6 +533,7 @@ pub struct AgentBuilder {
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     mcp_pinned_section: Option<String>,
@@ -527,6 +546,8 @@ pub struct AgentBuilder {
     provider_switch_config: Option<ProviderSwitchConfig>,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Default for AgentBuilder {
@@ -565,6 +586,7 @@ impl AgentBuilder {
             response_cache: None,
             security_summary: None,
             autonomy_level: None,
+            shell_profile: None,
             approval_route: None,
             activated_tools: None,
             mcp_pinned_section: None,
@@ -577,6 +599,8 @@ impl AgentBuilder {
             provider_switch_config: None,
             #[cfg(test)]
             turn_datetime: None,
+            #[cfg(test)]
+            delegate_tool: None,
         }
     }
 
@@ -744,6 +768,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the shell reported in the system prompt.
+    ///
+    /// Pass `RuntimeAdapter::shell_profile()` from the same adapter the
+    /// agent's tools were built with, so the prompt cannot name a shell other
+    /// than the one that will execute. Unset means no shell is reported.
+    pub fn shell_profile(
+        mut self,
+        profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    ) -> Self {
+        self.shell_profile = profile;
+        self
+    }
+
     pub fn approval_route(
         mut self,
         route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
@@ -788,6 +825,14 @@ impl AgentBuilder {
 
     pub fn channel_name(mut self, name: String) -> Self {
         self.channel_name = Some(name);
+        self
+    }
+
+    /// Retain the concrete `DelegateTool` the registry built, for regressions
+    /// that must drive the *constructed* delegate rather than a hand-rolled one.
+    #[cfg(test)]
+    fn delegate_tool(mut self, delegate_tool: Option<Arc<crate::tools::DelegateTool>>) -> Self {
+        self.delegate_tool = delegate_tool;
         self
     }
 
@@ -929,6 +974,7 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
@@ -941,6 +987,8 @@ impl AgentBuilder {
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(test)]
             turn_datetime: self.turn_datetime,
+            #[cfg(test)]
+            delegate_tool: self.delegate_tool,
         })
     }
 }
@@ -1592,12 +1640,25 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
-            None,
+            // Daemon-backed constructors supply the shared handle; tools that
+            // resolve config per call (plugin tools, `send_via` authority) must
+            // follow reloads rather than this call's `config` snapshot. `None`
+            // here would silently pin them to startup state for the Agent's
+            // whole lifetime. One-shot callers pass `None` and keep the
+            // documented snapshot fallback.
+            live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
+        // Captured before `assemble` consumes the result: the concrete delegate
+        // instance this registry built, so live-config regressions can drive its
+        // nested-registry construction instead of re-deriving the wiring.
+        #[cfg(test)]
+        let built_delegate_tool = all_tools_result.delegate_tool.clone();
+        // Capture before `runtime` is moved into `ScopedAssembly`.
+        let shell_profile = runtime.shell_profile();
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
@@ -1718,7 +1779,10 @@ impl Agent {
                 Arc::new(move || max)
             };
 
-        let mut agent = Agent::builder()
+        let builder = Agent::builder();
+        #[cfg(test)]
+        let builder = builder.delegate_tool(built_delegate_tool);
+        let mut agent = builder
             .model_provider(model_provider)
             .tools(tools)
             .memory(memory.clone())
@@ -1732,6 +1796,7 @@ impl Agent {
                 ),
             )
             .prompt_builder(SystemPromptBuilder::with_defaults())
+            .shell_profile(shell_profile)
             .config(
                 config
                     .resolved_agent_config(agent_alias)
@@ -1902,6 +1967,22 @@ impl Agent {
         fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
         event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> String {
+        let with_notice = Self::format_model_fallback_notice(response.clone(), fallback);
+        if with_notice == response {
+            return response;
+        }
+        let Some(delta) = with_notice.strip_prefix(&response) else {
+            return response;
+        };
+        let delta = delta.to_string();
+        let _ = event_tx.send(TurnEvent::Chunk { delta }).await;
+        with_notice
+    }
+
+    fn format_model_fallback_notice(
+        response: String,
+        fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+    ) -> String {
         let Some(fallback) = fallback else {
             return response;
         };
@@ -1921,16 +2002,10 @@ impl Agent {
                 ("actual_provider", fallback.actual_provider.as_str()),
             ],
         );
-        let delta = format!("\n\n{notice}");
-        let _ = event_tx
-            .send(TurnEvent::Chunk {
-                delta: delta.clone(),
-            })
-            .await;
         if response.is_empty() {
             notice
         } else {
-            format!("{response}{delta}")
+            format!("{response}\n\n{notice}")
         }
     }
 
@@ -1971,6 +2046,7 @@ impl Agent {
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            shell_profile: self.shell_profile.clone(),
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
         let receipts = &self.config.resolved.tool_receipts;
@@ -2554,6 +2630,8 @@ impl Agent {
         };
 
         let response = self.append_receipts_block(response, receipt_scope.as_ref());
+        let response =
+            Self::format_model_fallback_notice(response, turn_provider_recovery.as_ref());
 
         // Store in the response cache only when the turn was a single
         // tool-free exchange (exactly one assistant message), mirroring the
@@ -2664,8 +2742,7 @@ impl Agent {
         // task-local record inside `zeroclaw_providers::reliable`, consumed
         // once per round below; this is a per-turn transient resolved at
         // use-time, never stored on the agent.
-        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo> =
-            None;
+        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo>;
         let mut turn_provider_context_truncated = false;
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
@@ -2967,9 +3044,10 @@ impl Agent {
                     )
                 })
                 .await;
-            if round_fallback.is_some() {
-                turn_provider_recovery = round_fallback;
-            }
+            // Each accepted round owns the recovery presentation state. A
+            // later primary/direct response must clear an earlier fallback,
+            // rather than leaving its notice attached to the final answer.
+            turn_provider_recovery = round_fallback;
             turn_provider_context_truncated |= round_context_truncated;
 
             // Feed cumulative usage into the AgentEnd guard before any return
@@ -3245,6 +3323,14 @@ mod safety_net;
 #[path = "parity.rs"]
 mod parity;
 
+// Live-config plugin regression (child module so it can read the constructed
+// Agent's tool registry the same way `mod tests` does). Needs a WASM compiler
+// on the host: `WasmTool::from_wasm` refuses to register a tool it cannot load,
+// so a runtime-only plugin backend has no plugin tool to execute.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+#[path = "plugin_live_config.rs"]
+mod plugin_live_config;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3447,10 +3533,38 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[test]
+    fn fallback_notice_fluent_key_stays_localized_without_new_keys() {
+        let args = [
+            ("requested_model", "requested-model"),
+            ("requested_provider", "primary"),
+            ("actual_model", "served-model"),
+            ("actual_provider", "fallback"),
+        ];
+        let english =
+            crate::i18n::get_english_cli_string_with_args("turn-model-fallback-notice", &args);
+        let french = crate::i18n::get_disk_override_cli_string_for_test(
+            "fr",
+            include_str!("../../locales/fr/cli.ftl"),
+            "turn-model-fallback-notice",
+            &args,
+        );
+
+        assert_ne!(french, "{turn-model-fallback-notice}");
+        assert_ne!(french, english, "French must not fall back to English");
+        for (_, value) in args {
+            assert!(
+                french.contains(value),
+                "localized fallback notice lost {value}"
+            );
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum RuntimeStreamPlan {
         Unsupported,
         Text(&'static str),
+        EmptyWithUsage,
         Error,
     }
 
@@ -3509,6 +3623,17 @@ mod tests {
                 RuntimeStreamPlan::Text(text) => futures_util::stream::iter(vec![
                     Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
                         zeroclaw_providers::traits::StreamChunk::delta(text),
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed(),
+                RuntimeStreamPlan::EmptyWithUsage => futures_util::stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::Usage(
+                        zeroclaw_providers::traits::TokenUsage {
+                            input_tokens: Some(13),
+                            output_tokens: Some(7),
+                            cached_input_tokens: None,
+                        },
                     )),
                     Ok(zeroclaw_providers::traits::StreamEvent::Final),
                 ])
@@ -3704,6 +3829,225 @@ mod tests {
         assert_eq!(
             outcome.response, "primary final",
             "failed fallback streams must not leave stale fallback notice state"
+        );
+    }
+
+    /// A billed fallback stream is only a transport candidate. If its final
+    /// response is semantically empty and Reliable recovers to primary chat,
+    /// neither the Agent result nor its chunks may retain the fallback notice.
+    #[tokio::test]
+    async fn streamed_empty_fallback_recovery_does_not_leak_a_provider_notice() {
+        let reliable = streaming_probe_reliable_provider(
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Unsupported,
+                chat_text: Some("primary recovery"),
+            },
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::EmptyWithUsage,
+                chat_text: None,
+            },
+        );
+
+        let mut agent = blank_input_agent(Box::new(reliable));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("primary recovery must succeed after an empty fallback stream");
+
+        assert_eq!(outcome.response, "primary recovery");
+        let mut chunks = String::new();
+        while let Ok(TurnEvent::Chunk { delta }) = rx.try_recv() {
+            chunks.push_str(&delta);
+        }
+        assert!(
+            !chunks.contains("provider-served") && !chunks.contains("provider-requested"),
+            "rejected fallback must not leak its notice into streamed chunks: {chunks}"
+        );
+    }
+
+    /// A tool-call response is accepted for this iteration, but its recovery
+    /// record must be replaced by the route of the final accepted answer.
+    #[tokio::test]
+    async fn tool_call_then_final_fallback_surfaces_exactly_one_final_notice() {
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".to_string(),
+                    Box::new(ToolThenFailingModelProvider {
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(MockModelProvider {
+                        responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            text: Some("fallback final".to_string()),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        }]),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("test memory must initialize"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(vec![Box::new(MockTool)])
+            .memory(memory)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("test agent must initialize");
+
+        let response = agent.turn("run the tool").await.expect("turn must recover");
+        assert_eq!(
+            response.matches("fallback").count(),
+            2,
+            "final text plus one notice"
+        );
+        assert!(
+            response.contains("primary"),
+            "notice identifies the requested route"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_tool_call_then_primary_final_clears_the_stale_notice() {
+        struct PrimaryFailsOnceThenFinal(std::sync::atomic::AtomicUsize);
+        struct FallbackToolCall;
+
+        macro_rules! attributable {
+            ($type:ty, $alias:literal) => {
+                impl ::zeroclaw_api::attribution::Attributable for $type {
+                    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                        ::zeroclaw_api::attribution::Role::Provider(
+                            ::zeroclaw_api::attribution::ProviderKind::Model(
+                                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                            ),
+                        )
+                    }
+                    fn alias(&self) -> &str {
+                        $alias
+                    }
+                }
+            };
+        }
+        attributable!(PrimaryFailsOnceThenFinal, "PrimaryFailsOnceThenFinal");
+        attributable!(FallbackToolCall, "FallbackToolCall");
+
+        #[async_trait]
+        impl ModelProvider for PrimaryFailsOnceThenFinal {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("unused".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    anyhow::bail!("primary unavailable for first tool request");
+                }
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("primary final".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        #[async_trait]
+        impl ModelProvider for FallbackToolCall {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("unused".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("tool request".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "fallback-tool".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(PrimaryFailsOnceThenFinal(
+                        std::sync::atomic::AtomicUsize::new(0),
+                    )) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(FallbackToolCall) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(vec![Box::new(MockTool)])
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(
+                    &zeroclaw_config::schema::MemoryConfig {
+                        backend: "none".into(),
+                        ..Default::default()
+                    },
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .expect("test memory must initialize"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("test agent must initialize");
+
+        assert_eq!(
+            agent.turn("run the tool").await.expect("turn must recover"),
+            "primary final"
         );
     }
 

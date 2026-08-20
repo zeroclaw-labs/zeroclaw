@@ -472,6 +472,9 @@ zc-chat-copied-clipboard = Copied to clipboard
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
 zc-chat-context-menu-copy = Copy
+zc-chat-context-menu-send-now = Send now
+zc-chat-context-menu-edit = Edit
+zc-chat-context-menu-delete = Delete
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section

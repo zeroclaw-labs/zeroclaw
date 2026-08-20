@@ -95,6 +95,7 @@ async fn probe(url: &str, follow: bool, egress: Option<EgressHostService>) -> St
         wasm_path: Some("egress-fixture.wasm".to_string()),
         capabilities: vec![PluginCapability::Tool],
         permissions: vec![PluginPermission::HttpClient],
+        config_schema: None,
         signature: None,
         publisher_key: None,
         egress: Default::default(),
@@ -114,14 +115,15 @@ async fn probe(url: &str, follow: bool, egress: Option<EgressHostService>) -> St
             .await
             .expect("instantiate fixture tool");
 
+    // The fixture requests no `config_read` and declares no schema, so this
+    // resolves to the empty validated view production would hand the guest.
+    let resolved = zeroclaw_plugins::config::resolve_plugin_config(&manifest, &scope, None)
+        .expect("resolve empty fixture config");
+
     let args = format!(r#"{{"url":"{url}","follow":{follow}}}"#);
-    let result = zeroclaw_plugins::runtime::call_execute(
-        &mut plugin,
-        args.as_bytes(),
-        &std::collections::HashMap::new(),
-    )
-    .await
-    .expect("fixture execute must return, denied or not");
+    let result = zeroclaw_plugins::runtime::call_execute(&mut plugin, args.as_bytes(), &resolved)
+        .await
+        .expect("fixture execute must return, denied or not");
     assert!(result.success, "fixture reported failure: {result:?}");
     result.output.to_string()
 }

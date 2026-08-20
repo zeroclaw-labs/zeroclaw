@@ -102,6 +102,9 @@ jobs:
       - name: Test monthly outdated result classification
         run: bash scripts/ci/monthly_outdated_result.test.sh
 
+      - name: Test release tool installer mappings
+        run: bash scripts/ci/install_release_tool.test.sh
+
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
 
@@ -381,21 +384,20 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+      - name: Verify plugin backend change filter
+        run: bash scripts/ci/plugin_backend_change_filter.test.sh
       - name: Detect plugin backend changes
         id: changed
         run: |
           base="${{ github.event.pull_request.base.sha }}"
           if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^wit/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
+          run="$(git diff --name-only "$base" HEAD | bash scripts/ci/plugin_backend_change_filter.sh)"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         if: steps.changed.outputs.run == 'true'
         with:
           toolchain: 1.96.1
-      - name: Install channel plugin fixture target
+      - name: Install plugin fixture target
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: rustup target add wasm32-wasip2
       - uses: ./.github/actions/rust-cache
@@ -407,12 +409,15 @@ jobs:
       - name: Check
         if: steps.changed.outputs.run == 'true'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
-      - name: Run channel plugin component test
+      - name: Run plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
-        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e
+        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test egress_plugin_e2e --test reference_plugin --test reference_plugin_e2e
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
+      - name: Run runtime live-config plugin regression
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib live_agent_plugin_tool_observes_config_reload_after_construction
 
   msrv:
     name: MSRV (declared floor)
@@ -725,9 +730,70 @@ jobs:
       - name: Run cargo audit (RustSec advisory database)
         run: cargo audit
 
+  # Detect which non-Rust job families a PR actually touches, so a pure-Rust
+  # PR does not spin runners it cannot affect. Cheap and always-on; forces every
+  # family true on push / merge_group so master cache-warming and the required
+  # gate keep exercising the full set. A path-skipped job leaves `CI Required
+  # Gate` green (it only trips on failure/cancelled), and this detector is never
+  # skipped, so a job that should run never is.
+  path-changes:
+    name: Detect changed paths
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+      nix: ${{ steps.filter.outputs.nix }}
+      nix_hash: ${{ steps.filter.outputs.nix_hash }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Non-PR events (push to master, merge_group) always run every gated
+          # job: warms caches and keeps the required gate exercising the full set.
+          case "${{ github.event_name }}" in
+            pull_request) ;;
+            *)
+              {
+                echo "docs=true"
+                echo "nix=true"
+                echo "nix_hash=true"
+                echo "web=true"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          changed="$(mktemp)"
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed"
+
+          emit() {
+            local name="$1" pattern="$2"
+            if grep -Eq "$pattern" "$changed"; then
+              echo "${name}=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "${name}=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          # Any change to this workflow re-runs all gated families.
+          wf='^\.github/workflows/ci\.yml$'
+          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/docs_(quality_gate|links_gate)\.sh$|${wf}"
+          emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
+          emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
+          emit web      "^web/|^\.nvmrc$|${wf}"
+
   nix-eval:
     name: Nix Module Eval
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.nix == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -741,7 +807,8 @@ jobs:
 
   nix-hash-drift:
     name: Nix Hash Drift
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.nix_hash == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -782,7 +849,8 @@ jobs:
 
   docs-style:
     name: Docs Style
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -862,7 +930,8 @@ jobs:
 
   web-permission-tests:
     name: Web Permission Tests
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -889,7 +958,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, repo-structure, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

@@ -173,6 +173,8 @@ keyactions! {
         PauseResumeQueue        [Chord::with(KeyCode::Char('p'), KeyModifiers::ALT)] => "pause/resume queue",
         QueueNavUp              [Chord::with(KeyCode::Up, KeyModifiers::ALT)] => "queue prev",
         QueueNavDown            [Chord::with(KeyCode::Down, KeyModifiers::ALT)] => "queue next",
+        QueueSendNow            [Chord::with(KeyCode::Char('s'), KeyModifiers::ALT)] => "send queued now",
+        QueueCopy               [Chord::with(KeyCode::Char('c'), KeyModifiers::ALT)] => "copy queued",
         QueueDelete             [Chord::with(KeyCode::Char('x'), KeyModifiers::ALT)] => "delete queued",
         QueueEdit               [Chord::with(KeyCode::Char('e'), KeyModifiers::ALT)] => "edit queued",
         QueueWiden              [Chord::shift(KeyCode::Left)] => "widen queue",

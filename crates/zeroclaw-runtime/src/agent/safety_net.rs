@@ -1639,6 +1639,54 @@ async fn safety_net_graceful_summary_persists_assistant_summary() {
     );
 }
 
+// ACP and other event-driven channels render message content exclusively
+// from `TurnEvent::Chunk`. The graceful summary must reach that channel on
+// the max-iteration exit the same way an ordinary final response does, or
+// the client shows nothing even though the turn resolved successfully.
+#[tokio::test]
+async fn safety_net_graceful_summary_emits_turn_event_chunk() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut agent = build_agent_with_runtime(
+        Box::new(ScriptedProvider::new(vec![
+            tool_response(vec![tool_call("s1", "echo")]),
+            tool_response(vec![tool_call("s2", "echo")]),
+            text_response("wrap-up summary"),
+        ])),
+        vec![Box::new(CountingTool {
+            name: "echo",
+            calls,
+        })],
+        zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: 2,
+            ..zeroclaw_config::schema::ResolvedRuntime::default()
+        },
+    );
+    let (tx, mut rx) = mpsc::channel(256);
+    let outcome = agent
+        .turn_streamed_with_steering_state("exhaust the cap", tx, None, None)
+        .await
+        .expect("graceful summary must succeed on the streamed path");
+    assert!(
+        outcome.response.contains("wrap-up summary"),
+        "unexpected response: {}",
+        outcome.response
+    );
+
+    let mut chunk_delta = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let TurnEvent::Chunk { delta } = ev {
+            chunk_delta = Some(delta);
+        }
+    }
+    let delta = chunk_delta.expect(
+        "max-iteration exit must emit a TurnEvent::Chunk so ACP clients render the summary",
+    );
+    assert!(
+        delta.contains("wrap-up summary"),
+        "chunk must carry the graceful summary text: {delta}"
+    );
+}
+
 #[tokio::test]
 async fn safety_net_failed_graceful_summary_does_not_persist_prompt() {
     let calls = Arc::new(AtomicUsize::new(0));

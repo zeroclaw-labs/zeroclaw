@@ -49,7 +49,8 @@ pub use outcome::{
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
-    interpret_chat_response, resolve_display_text, unforwarded_narration,
+    interpret_chat_response, record_accepted_chat_response, resolve_display_text,
+    unforwarded_narration,
 };
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
@@ -873,7 +874,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let ProviderCallOutcome {
             chat_result,
-            rejected_attempt_usage,
+            mut rejected_attempts,
+            mut provisional_stream_attempt,
+            accepted_route,
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
@@ -888,13 +891,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
-        if let Some(usage) = rejected_attempt_usage.as_ref() {
+        let has_accounted_rejections = !rejected_attempts.is_empty();
+        for rejected in &rejected_attempts {
             crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                ctx.provider_name,
-                ctx.model,
-                usage,
+                rejected.provider_ref(),
+                rejected.model(),
+                rejected.usage(),
             );
         }
+
+        // Reliable reports its actually served candidate; direct providers
+        // intentionally retain the requested route as the accounting fallback.
+        let (served_provider, served_model) = accepted_route
+            .as_ref()
+            .map(|route| (route.provider_ref(), route.model()))
+            .unwrap_or((ctx.provider_name, provider_request_model));
 
         // Reliable providers classify this before retries and fallback. Keep
         // the turn-level guard for direct/unwrapped providers: a transport
@@ -902,10 +913,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // This runs before response-success telemetry and history mutation.
         let chat_result = chat_result.and_then(|response| {
             if response.is_semantically_empty_terminal() {
+                if let Some(rejected_stream) = provisional_stream_attempt.take()
+                    && let Some(usage) = response.usage.clone()
+                {
+                    rejected_attempts.push(rejected_stream.with_usage(usage));
+                }
                 if let Some(usage) = response.usage.as_ref() {
                     crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        ctx.provider_name,
-                        ctx.model,
+                        served_provider,
+                        served_model,
                         usage,
                     );
                 }
@@ -926,16 +942,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             protocol_suppressed,
             response_streamed_live,
             reported_input_tokens,
+            response_usage,
         ) = match chat_result {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
                     &ctx,
-                    provider_request_model,
+                    served_provider,
+                    served_model,
                     resp,
                     &provider_request_messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
-                    llm_started_at,
                     iteration,
                     knobs.detect_protocol_without_tools,
                 )
@@ -950,12 +967,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
                     interpreted.input_tokens,
+                    interpreted.usage,
                 )
             }
             Err(e) => {
-                if let Some(rejected) = e.chain().find_map(|cause| {
-                    cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
-                }) {
+                if !has_accounted_rejections
+                    && let Some(rejected) = e.chain().find_map(|cause| {
+                        cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
+                    })
+                {
                     crate::agent::cost::record_rejected_tool_loop_cost_usage(
                         ctx.provider_name,
                         ctx.model,
@@ -1013,9 +1033,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             !native_tool_calls.is_empty(),
         );
 
-        // Native provider tool_calls are converted into parsed `tool_calls`
-        // above; if this branch is reached there is no valid native call to run.
-        if tool_calls.is_empty() && parse_issue_detected {
+        // Any parser or stream-protocol guard finding rejects the transport
+        // candidate, including a response that also carries native tool calls.
+        if parse_issue_detected {
+            if let Some(rejected_stream) = provisional_stream_attempt.take()
+                && let Some(usage) = response_usage.clone()
+            {
+                rejected_attempts.push(rejected_stream.with_usage(usage));
+            }
+            if let Some(usage) = response_usage.as_ref() {
+                crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                    served_provider,
+                    served_model,
+                    usage,
+                );
+            }
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1071,6 +1103,25 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_state.push_dual(msg);
             return Ok(accumulated_display_text);
         }
+
+        record_accepted_chat_response(
+            &ctx,
+            served_provider,
+            served_model,
+            &response_text,
+            &native_tool_calls,
+            tool_calls.len(),
+            response_usage.as_ref(),
+            &provider_request_messages,
+            llm_started_at,
+            iteration,
+        )
+        .await;
+
+        // A provider transport success is only a candidate. Commit (or clear)
+        // presentation state after parsing has accepted the response, so a
+        // malformed fallback completion cannot leak a stale recovery notice.
+        zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -1414,6 +1465,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         accumulated_display_text,
         turn_id,
         knobs,
+        event_tx.as_ref(),
         turn_state.canonical.as_deref_mut(),
     )
     .await
@@ -1575,6 +1627,10 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's deferred+pinned MCP prompt section (single-block
     /// shape, same as `run` / `process_message`).
     mcp_prompt_section: String,
+    /// The shell this step's runtime adapter will spawn, carried so the step's
+    /// system prompt reports the same dialect the step will execute under.
+    /// `None` for a shell-less runtime.
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -1659,6 +1715,8 @@ pub(crate) async fn assemble_owned_execution(
         None,
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
+    // Capture before `runtime` is moved into `ScopedAssembly` below.
+    let shell_profile = runtime.shell_profile();
     // The same gated seam run(), process_message, and independent delegation use:
     // step 2 filters with THIS agent's SecurityPolicy, `connect_mcp` grants only
     // this agent's MCP bundles, and its skills register as tools. Peripherals stay
@@ -1732,6 +1790,9 @@ pub(crate) async fn assemble_owned_execution(
         skills,
         mcp_tool_names,
         mcp_prompt_section,
+        // Captured from the same adapter this step's tools were built with, so
+        // the prompt names the shell the step will actually run under.
+        shell_profile,
     })
 }
 
@@ -1778,6 +1839,7 @@ fn build_owned_step_system_prompt(
         true,
         config.channels.show_tool_calls,
         None,
+        owned.shell_profile.as_ref(),
     )
 }
 
@@ -3083,6 +3145,7 @@ mod sop_step_reassembly_tests {
             skills: Vec::new(),
             mcp_tool_names,
             mcp_prompt_section: String::new(),
+            shell_profile: None,
         }
     }
 
@@ -3816,6 +3879,7 @@ mod sop_step_reassembly_tests {
                 skills: Vec::new(),
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),
+                shell_profile: None,
             },
         );
 
