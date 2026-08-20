@@ -32,7 +32,7 @@ Name the YOLO posture explicitly on a dedicated risk profile (`yolo` is a good i
 | Forbidden paths | `/etc`, `/sys`, `/boot`, `~/.ssh` etc. blocked | No path is off-limits |
 | Sandbox | Docker / Firejail / Landlock / Seatbelt isolates tool execution | Tools run as the ZeroClaw process user |
 | OTP gating | Gated actions require a code | No gate |
-| Emergency stop | `zeroclaw estop` halts running ops | No halt semantics beyond `SIGTERM` |
+| Emergency stop | `zeroclaw estop` refuses the agent's next tool call | No halt semantics beyond `SIGTERM` |
 | Gateway pairing | Clients must pair first | Anyone who reaches the port owns the agent |
 
 ## What you keep

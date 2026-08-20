@@ -147,21 +147,21 @@ impl<'a> EstopEnforcement<'a> {
         })
     }
 
-    /// Return the reason to refuse `tool_name`, or `None` to allow it, consulting
-    /// the live state file merged with the process latch (see [`Self::enforced_state`]).
-    ///
-    /// Test-only single-name convenience; production always routes through
-    /// [`Self::block_reason_any`] so a tool's advertised and delegated canonical
-    /// names are both checked in one read.
+    // Return the reason to refuse `tool_name`, or `None` to allow it, consulting
+    // the live state file merged with the process latch (see `enforced_state`).
+    //
+    // Test-only single-name convenience; production always routes through
+    // `block_reason_any` so a tool's advertised and delegated canonical names
+    // are both checked in one read.
     #[cfg(test)]
     pub(crate) fn block_reason(&self, tool_name: &str) -> Option<String> {
         self.enforced_state().tool_block_reason(tool_name)
     }
 
-    /// Like [`Self::block_reason`] but blocks if *any* of `tool_names` is halted,
-    /// reading the state once. The dispatcher passes both a tool's advertised
-    /// name and its delegated canonical name so a skill-scoped alias cannot slip
-    /// a frozen builtin past the gate.
+    /// Refuse the call if *any* of `tool_names` is halted, reading the live
+    /// state file folded into the process latch once. The dispatcher passes both
+    /// a tool's advertised name and its delegated canonical name so a
+    /// skill-scoped alias cannot slip a frozen builtin past the gate.
     pub fn block_reason_any(&self, tool_names: &[&str]) -> Option<String> {
         let state = self.enforced_state();
         tool_names
