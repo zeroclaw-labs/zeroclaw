@@ -22,8 +22,6 @@ struct LoadedPlugin {
     plugin_dir: PathBuf,
     /// Resolved path to the WASM file. `None` for skill-only plugins.
     wasm_path: Option<PathBuf>,
-    #[allow(dead_code)]
-    verification: VerificationResult,
 }
 
 impl PluginHost {
@@ -135,7 +133,7 @@ impl PluginHost {
                     // Verify plugin signature
                     let manifest_toml = std::fs::read_to_string(&manifest_path).unwrap_or_default();
                     match self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest) {
-                        Ok(verification) => {
+                        Ok(_) => {
                             if ambiguous_packages.contains(&manifest.name) {
                                 continue;
                             }
@@ -164,7 +162,6 @@ impl PluginHost {
                                     manifest,
                                     plugin_dir: path.clone(),
                                     wasm_path,
-                                    verification,
                                 },
                             );
                         }
@@ -253,8 +250,7 @@ impl PluginHost {
 
         // Verify plugin signature before installing
         let manifest_toml = std::fs::read_to_string(&manifest_path)?;
-        let verification =
-            self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
+        self.verify_plugin_signature(&manifest.name, &manifest_toml, &manifest)?;
 
         // Copy plugin to plugins directory
         let dest_dir = self.plugins_dir.join(&manifest.name);
@@ -292,7 +288,6 @@ impl PluginHost {
                 manifest,
                 plugin_dir: dest_dir,
                 wasm_path: wasm_dest,
-                verification,
             },
         );
 

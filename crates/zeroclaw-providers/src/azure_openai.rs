@@ -13,10 +13,6 @@ pub struct AzureOpenAiModelProvider {
     /// `[providers.models.azure.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
-    #[allow(dead_code)]
-    resource_name: String,
-    #[allow(dead_code)]
-    deployment_name: String,
     api_version: String,
     base_url: String,
     /// Operator-configured reasoning effort (minimal/low/medium/high).
@@ -272,8 +268,6 @@ impl AzureOpenAiBuilder {
         AzureOpenAiModelProvider {
             alias: self.alias,
             credential: self.credential,
-            resource_name,
-            deployment_name,
             api_version: version,
             base_url,
             reasoning_effort: self.reasoning_effort,
@@ -791,8 +785,10 @@ mod tests {
             .credential(Some("azure-test-credential"))
             .build();
         assert_eq!(p.credential.as_deref(), Some("azure-test-credential"));
-        assert_eq!(p.resource_name, "resource");
-        assert_eq!(p.deployment_name, "deployment");
+        assert_eq!(
+            p.base_url,
+            "https://resource.openai.azure.com/openai/deployments/deployment"
+        );
         assert_eq!(p.api_version, DEFAULT_API_VERSION);
     }
 

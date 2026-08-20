@@ -46,7 +46,6 @@ struct NotificationListResponse {
     cursor: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct Notification {
     uri: String,
@@ -60,13 +59,10 @@ struct Notification {
     indexed_at: String,
 }
 
-#[allow(dead_code)]
 #[derive(Deserialize)]
 struct NotificationAuthor {
     did: String,
     handle: String,
-    #[serde(rename = "displayName")]
-    display_name: Option<String>,
 }
 
 /// AT Protocol record for creating a post.
@@ -523,7 +519,6 @@ mod tests {
             author: NotificationAuthor {
                 did: did.into(),
                 handle: handle.into(),
-                display_name: None,
             },
             reason: reason.into(),
             record: Some(serde_json::json!({ "text": text })),

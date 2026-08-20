@@ -58,15 +58,11 @@ pub(crate) mod doctor;
 #[cfg(feature = "gateway")]
 pub mod gateway;
 #[cfg(feature = "agent-runtime")]
-pub(crate) mod hardware;
-#[cfg(feature = "agent-runtime")]
 pub(crate) mod health;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod heartbeat;
 #[cfg(feature = "agent-runtime")]
 pub mod hooks;
-#[cfg(feature = "agent-runtime")]
-pub(crate) mod integrations;
 pub mod memory;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod multimodal;
@@ -85,10 +81,6 @@ pub mod rag;
 pub mod routines;
 #[cfg(feature = "agent-runtime")]
 pub(crate) mod security;
-#[cfg(feature = "agent-runtime")]
-pub(crate) mod service;
-#[cfg(feature = "agent-runtime")]
-pub(crate) mod skills;
 #[cfg(feature = "agent-runtime")]
 pub mod sop;
 #[cfg(feature = "agent-runtime")]

@@ -3,7 +3,6 @@ pub use zeroclaw_runtime::service::*;
 use crate::config::Config;
 use anyhow::Result;
 
-#[allow(dead_code)]
 pub fn handle_command(
     command: &crate::ServiceCommands,
     config: &Config,

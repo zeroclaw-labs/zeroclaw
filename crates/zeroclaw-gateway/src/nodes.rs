@@ -157,11 +157,6 @@ enum NodeMessage {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum GatewayMessage {
-    #[allow(dead_code)] // Wire-format ack; only the test constructs it today.
-    Registered {
-        node_id: String,
-        capabilities_count: usize,
-    },
     Invoke {
         call_id: String,
         capability: String,
@@ -735,18 +730,6 @@ mod tests {
             }
             NodeMessage::Register { .. } => panic!("Expected Result message"),
         }
-    }
-
-    #[test]
-    fn gateway_message_serialize() {
-        let msg = GatewayMessage::Registered {
-            node_id: "phone-1".to_string(),
-            capabilities_count: 3,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        assert!(json.contains("\"type\":\"registered\""));
-        assert!(json.contains("\"node_id\":\"phone-1\""));
-        assert!(json.contains("\"capabilities_count\":3"));
     }
 
     #[test]
