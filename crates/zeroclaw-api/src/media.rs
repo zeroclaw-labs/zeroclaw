@@ -19,8 +19,8 @@
 //! `looks_like_image`), but `kind` is independent and may disagree with both.
 //! Callers that render user-visible annotations must therefore not let two of
 //! these decide the same attachment: the channel that received the bytes
-//! records what it rendered in [`MediaAttachment::marker_target`], and later
-//! stages defer to that instead of re-deciding.
+//! records what it rendered in [`MediaAttachment::marker`], and later stages
+//! defer to that instead of re-deciding.
 
 /// Classifies an attachment by MIME type or file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,6 +29,59 @@ pub enum MediaKind {
     Image,
     Video,
     Unknown,
+}
+
+/// The disposition a receiving channel chose when it rendered an attachment's
+/// marker into the message text.
+///
+/// A channel resolves this against the provider's loadability contract before
+/// it renders: an image the multimodal loader will accept becomes [`Image`],
+/// and one it will not becomes [`Document`] so the saved path stays reachable
+/// without promising the provider bytes it drops.
+///
+/// [`Image`]: MarkerKind::Image
+/// [`Document`]: MarkerKind::Document
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkerKind {
+    /// A re-loadable `[IMAGE:<target>]` the multimodal loader accepts.
+    Image,
+    /// An `[AUDIO:<target>]` reference.
+    Audio,
+    /// A `[VIDEO:<target>]` reference.
+    Video,
+    /// A `[Document: name] <target>`, deliberately not an image.
+    Document,
+}
+
+impl MarkerKind {
+    /// Whether a later enrichment stage must defer to this rendered marker
+    /// rather than re-deciding the attachment's kind from its payload.
+    ///
+    /// True for the two visual dispositions a channel resolves against the
+    /// provider's loadability contract. Re-running payload classification on a
+    /// channel-rendered image or document produces a contradictory second
+    /// annotation, and for a non-loadable image document an `[IMAGE:data:...]`
+    /// copy the provider then rejects. Audio and video carry no such
+    /// image/document ambiguity, so they keep the existing per-kind enrichment.
+    pub fn defers_enrichment(self) -> bool {
+        matches!(self, MarkerKind::Image | MarkerKind::Document)
+    }
+}
+
+/// The marker a receiving channel rendered into the message text for an
+/// attachment's exact bytes: the target it referenced and the disposition it
+/// chose.
+///
+/// The two are kept together so they cannot drift apart. A target without a
+/// disposition cannot say whether the channel rendered an image or a document,
+/// which is exactly the distinction a downstream stage needs to avoid
+/// re-classifying a rendered document as an image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderedMarker {
+    /// The exact target the channel rendered (a saved path or a URL).
+    pub target: String,
+    /// The disposition the channel chose when it rendered the marker.
+    pub kind: MarkerKind,
 }
 
 /// A single media attachment on an inbound message.
@@ -40,22 +93,23 @@ pub struct MediaAttachment {
     pub data: Vec<u8>,
     /// MIME type if known (e.g. `audio/ogg`, `image/jpeg`).
     pub mime_type: Option<String>,
-    /// The exact `[Kind:<target>]` target the receiving channel already
-    /// rendered into the message text for **these** bytes, if it rendered
-    /// one.
+    /// The marker the receiving channel already rendered into the message text
+    /// for **these** bytes, if it rendered one: the exact target it referenced
+    /// and the disposition it chose.
     ///
     /// This field creates the fact. A channel's text rendering is otherwise
     /// unrecoverable from the envelope: `file_name` is the sender's name,
     /// which need not equal the on-disk name the channel marked (Discord
-    /// prefixes a UUID; a URL fallback is not a file name at all). Consumers
-    /// that need to know whether the text already carries a re-loadable
-    /// reference to this attachment must compare against this target rather
-    /// than pattern-matching the rendered text, which also carries
-    /// sender-authored content.
+    /// prefixes a UUID; a URL fallback is not a file name at all), and nothing
+    /// else records whether the channel rendered an image or a document.
+    /// Consumers that need to know whether the text already carries a
+    /// re-loadable reference to this attachment, or which disposition the
+    /// channel committed to, must read this rather than pattern-matching the
+    /// rendered text, which also carries sender-authored content.
     ///
     /// `None` means the channel supplied bytes without rendering a marker for
     /// them; consumers must then treat the attachment as unreferenced.
-    pub marker_target: Option<String>,
+    pub marker: Option<RenderedMarker>,
 }
 
 impl MediaAttachment {
@@ -99,8 +153,27 @@ impl MediaAttachment {
             file_name,
             data,
             mime_type,
-            marker_target: None,
+            marker: None,
         })
+    }
+
+    /// The exact target the receiving channel rendered for these bytes, if it
+    /// rendered a marker. See [`RenderedMarker::target`].
+    pub fn marker_target(&self) -> Option<&str> {
+        self.marker.as_ref().map(|m| m.target.as_str())
+    }
+
+    /// Whether the receiving channel already rendered a marker whose
+    /// disposition a later enrichment stage must not override.
+    ///
+    /// See [`MarkerKind::defers_enrichment`]. The channel saw the payload, the
+    /// sender's declared type, and the transport's own notion of what was
+    /// sent, so its image-or-document verdict wins over a second, payload-only
+    /// classification downstream.
+    pub fn channel_rendered_owned_disposition(&self) -> bool {
+        self.marker
+            .as_ref()
+            .is_some_and(|m| m.kind.defers_enrichment())
     }
 
     /// Classify this attachment into a [`MediaKind`].
@@ -287,7 +360,7 @@ mod tests {
             file_name: file_name.to_string(),
             data: Vec::new(),
             mime_type: mime_type.map(str::to_string),
-            marker_target: None,
+            marker: None,
         }
     }
 
@@ -335,7 +408,7 @@ mod tests {
             file_name: file_name.to_string(),
             data: data.to_vec(),
             mime_type: mime_type.map(str::to_string),
-            marker_target: None,
+            marker: None,
         }
     }
 

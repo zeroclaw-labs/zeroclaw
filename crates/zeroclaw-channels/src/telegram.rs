@@ -393,18 +393,35 @@ fn telegram_audio_send_spec(
 /// `[Document: ...]` line that would have kept the saved path reachable was
 /// never emitted. Formats outside the provider's set therefore stay documents,
 /// which leaves both the bytes and a usable path in the model's hands.
+/// The disposition Telegram commits to for an inbound attachment, resolved once
+/// against the provider's loadability contract.
+///
+/// `parse_attachment_metadata` only yields documents and photos, so an
+/// attachment is either a loadable image the provider will accept or a
+/// document. The rendered text and the typed envelope both read this one
+/// verdict, so a document the loader would reject cannot be re-decided as an
+/// image by a later payload-only classifier.
+fn attachment_marker_kind(
+    attachment: &zeroclaw_api::media::MediaAttachment,
+) -> zeroclaw_api::media::MarkerKind {
+    if attachment.provider_loadable_image_mime().is_some() {
+        zeroclaw_api::media::MarkerKind::Image
+    } else {
+        zeroclaw_api::media::MarkerKind::Document
+    }
+}
+
 fn format_attachment_content(
     attachment: &zeroclaw_api::media::MediaAttachment,
     local_path: &Path,
 ) -> String {
-    if attachment.provider_loadable_image_mime().is_some() {
-        format!("[IMAGE:{}]", local_path.display())
-    } else {
-        format!(
+    match attachment_marker_kind(attachment) {
+        zeroclaw_api::media::MarkerKind::Image => format!("[IMAGE:{}]", local_path.display()),
+        _ => format!(
             "[Document: {}] {}",
             attachment.file_name,
             local_path.display()
-        )
+        ),
     }
 }
 
@@ -2178,15 +2195,24 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // carried through: `looks_like_image()` classifies by MIME, extension,
         // or magic bytes, so an image sent "as file" (even extensionless) is
         // still reported as an image.
-        let media_attachment = zeroclaw_api::media::MediaAttachment {
+        let mut media_attachment = zeroclaw_api::media::MediaAttachment {
             file_name: local_filename.clone(),
             data: file_data,
             mime_type: attachment.mime_type.clone(),
-            // The saved path is exactly what the rendering below references,
-            // so downstream consumers can join text markers back to these
-            // bytes without guessing at file names.
-            marker_target: Some(local_path.display().to_string()),
+            marker: None,
         };
+
+        // Record the disposition this channel commits to together with the
+        // saved path it references, resolved once against the loadability
+        // contract. The rendering below reads the same verdict, so an
+        // unsupported image document stays a document end to end: the pipeline
+        // reads `marker` and defers instead of re-classifying the bytes as an
+        // image and inlining a base64 copy the provider would reject.
+        let marker_kind = attachment_marker_kind(&media_attachment);
+        media_attachment.marker = Some(zeroclaw_api::media::RenderedMarker {
+            target: local_path.display().to_string(),
+            kind: marker_kind,
+        });
 
         // Build message content. The marker is decided by the envelope's
         // loadable-image verdict, not Telegram's photo/document
@@ -8848,7 +8874,7 @@ mod tests {
             file_name: file_name.to_string(),
             data: data.to_vec(),
             mime_type: mime_type.map(str::to_string),
-            marker_target: None,
+            marker: None,
         }
     }
 

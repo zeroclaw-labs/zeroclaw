@@ -13,7 +13,7 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelGatePrompt, ChannelMessage,
     GateChoiceEmphasis, SendMessage,
 };
-use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_api::media::{MarkerKind, MediaAttachment, RenderedMarker};
 use zeroclaw_runtime::i18n;
 
 // Contract tier: `embed` holds the embed value object that `types`'
@@ -1230,17 +1230,18 @@ async fn process_attachments(
             },
         };
 
+        let marker_label = discord_marker_label(marker_kind);
         let marker_target = match workspace_dir {
             Some(dir) => match save_attachment_bytes_to_workspace(dir, name, &bytes).await {
                 Ok(local_path) => local_path.display().to_string(),
                 Err(e) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": marker_kind, "error": format!("{}", e)})), "attachment save failed, falling back to url");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": marker_label, "error": format!("{}", e)})), "attachment save failed, falling back to url");
                     url.to_string()
                 }
             },
             None => url.to_string(),
         };
-        text_parts.push(format!("[{marker_kind}:{marker_target}]"));
+        text_parts.push(format!("[{marker_label}:{marker_target}]"));
 
         media.push(MediaAttachment {
             file_name: name.to_string(),
@@ -1252,8 +1253,12 @@ async fn process_attachments(
             },
             // The saved name carries a uniqueness prefix, so `file_name` alone
             // cannot identify the marker just rendered above; record the
-            // target verbatim instead.
-            marker_target: Some(marker_target.clone()),
+            // target and the disposition this channel chose so a later stage
+            // reads the verdict instead of re-deciding it from the payload.
+            marker: Some(RenderedMarker {
+                target: marker_target.clone(),
+                kind: marker_kind,
+            }),
         });
     }
 
@@ -1346,15 +1351,26 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
 /// the canonical outbound marker kind. Pulled out of `process_attachments`
 /// so the MIME-to-marker dispatch can be unit-tested without a live HTTP
 /// download.
-fn marker_kind_for(content_type: &str, is_audio: bool) -> &'static str {
+fn marker_kind_for(content_type: &str, is_audio: bool) -> MarkerKind {
     if content_type.starts_with("image/") {
-        "IMAGE"
+        MarkerKind::Image
     } else if is_audio {
-        "AUDIO"
+        MarkerKind::Audio
     } else if content_type.starts_with("video/") {
-        "VIDEO"
+        MarkerKind::Video
     } else {
-        "DOCUMENT"
+        MarkerKind::Document
+    }
+}
+
+/// The uppercase `[KIND:target]` label Discord renders for a disposition. The
+/// label format is Discord's own; `MarkerKind` stays channel-agnostic.
+fn discord_marker_label(kind: MarkerKind) -> &'static str {
+    match kind {
+        MarkerKind::Image => "IMAGE",
+        MarkerKind::Audio => "AUDIO",
+        MarkerKind::Video => "VIDEO",
+        MarkerKind::Document => "DOCUMENT",
     }
 }
 
@@ -4266,8 +4282,7 @@ mod tests {
 
         assert_eq!(media.len(), 1, "one attachment in, one envelope out");
         let saved = media[0]
-            .marker_target
-            .as_deref()
+            .marker_target()
             .expect("a saved attachment must record the target it rendered");
         assert!(
             saved.contains("discord_files/"),
@@ -6801,20 +6816,29 @@ mod tests {
 
     #[test]
     fn marker_kind_for_classifies_each_mime_family() {
-        assert_eq!(marker_kind_for("image/png", false), "IMAGE");
-        assert_eq!(marker_kind_for("image/jpeg", false), "IMAGE");
-        assert_eq!(marker_kind_for("video/mp4", false), "VIDEO");
-        assert_eq!(marker_kind_for("application/pdf", false), "DOCUMENT");
-        assert_eq!(marker_kind_for("application/zip", false), "DOCUMENT");
-        assert_eq!(marker_kind_for("", false), "DOCUMENT");
+        assert_eq!(marker_kind_for("image/png", false), MarkerKind::Image);
+        assert_eq!(marker_kind_for("image/jpeg", false), MarkerKind::Image);
+        assert_eq!(marker_kind_for("video/mp4", false), MarkerKind::Video);
+        assert_eq!(
+            marker_kind_for("application/pdf", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("application/zip", false),
+            MarkerKind::Document
+        );
+        assert_eq!(marker_kind_for("", false), MarkerKind::Document);
     }
 
     #[test]
     fn marker_kind_for_treats_audio_flag_as_audio_regardless_of_content_type() {
         // Filename-detected audio with no content_type should still classify
         // as AUDIO, matching the unified inbound pipeline.
-        assert_eq!(marker_kind_for("", true), "AUDIO");
-        assert_eq!(marker_kind_for("application/octet-stream", true), "AUDIO");
+        assert_eq!(marker_kind_for("", true), MarkerKind::Audio);
+        assert_eq!(
+            marker_kind_for("application/octet-stream", true),
+            MarkerKind::Audio
+        );
     }
 
     #[test]
@@ -6822,7 +6846,7 @@ mod tests {
         // Defensive: if a Discord attachment somehow tripped both heuristics,
         // image MIME wins so vision-capable providers still receive image
         // bytes through the MediaAttachment path.
-        assert_eq!(marker_kind_for("image/png", true), "IMAGE");
+        assert_eq!(marker_kind_for("image/png", true), MarkerKind::Image);
     }
 
     #[test]

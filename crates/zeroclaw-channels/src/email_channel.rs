@@ -227,7 +227,7 @@ impl EmailChannel {
                 file_name,
                 data,
                 mime_type: mime_str,
-                marker_target: None,
+                marker: None,
             });
         }
         attachments

@@ -7,7 +7,7 @@ use zeroclaw_config::schema::MediaPipelineConfig;
 use super::super::transcription::TranscriptionManager;
 
 // Re-export media types from zeroclaw-types for backwards compatibility.
-pub use zeroclaw_api::media::{MediaAttachment, MediaKind};
+pub use zeroclaw_api::media::{MarkerKind, MediaAttachment, MediaKind, RenderedMarker};
 
 /// The media understanding pipeline.
 /// Consumes a message's text and attachments, returning enriched text with
@@ -45,24 +45,32 @@ impl<'a> MediaPipeline<'a> {
         let mut annotations = Vec::new();
 
         for attachment in attachments {
-            // A channel that saved these bytes and rendered a re-loadable
-            // `[IMAGE:<path>]` marker for them has already classified this
-            // attachment, with more to go on than the pipeline has: the
-            // payload, the sender's declared type, and the transport's own
-            // notion of what was sent. That verdict wins outright.
+            // A channel that saved these bytes and rendered a marker for them
+            // has already classified this attachment, with more to go on than
+            // the pipeline has: the payload, the sender's declared type, and
+            // the transport's own notion of what was sent. When it committed to
+            // an image or a document disposition, that verdict wins outright.
             //
             // Skipping the whole attachment — not just its image branch — is
             // what keeps the two classifiers from contradicting each other.
             // `kind()` resolves a single kind with the declared MIME first, so
             // a `photo.jpg` sent as `video/mp4` routes to video here while the
             // channel marked it an image; annotating it would put an image
-            // marker and a `[Video: ...]` note on one attachment. Deferring
-            // also avoids a second, base64-inlined copy of an image the marker
-            // already carries, which would send it to the provider twice and
-            // persist megabytes of base64 into session history (the current
-            // turn is stored verbatim; only older turns get inline payloads
-            // collapsed).
-            if text_already_references_image(original_text, attachment) {
+            // marker and a `[Video: ...]` note on one attachment. It also stops
+            // a channel-rendered `[Document: ...]` for a non-loadable image
+            // (HEIC, TIFF, SVG, BMP) from being re-decided as an image by
+            // `kind()` and gaining an `[IMAGE:data:...]` copy the provider
+            // rejects. Deferring likewise avoids a second, base64-inlined copy
+            // of an image the marker already carries, which would send it to
+            // the provider twice and persist megabytes of base64 into session
+            // history (the current turn is stored verbatim; only older turns
+            // get inline payloads collapsed).
+            //
+            // The verdict is read from the typed envelope, not by scanning the
+            // rendered text: the text also carries sender-authored content, so
+            // a caption that types `[IMAGE:/other.jpg]` has no channel
+            // provenance and cannot suppress a real attachment.
+            if attachment.channel_rendered_owned_disposition() {
                 continue;
             }
 
@@ -150,46 +158,6 @@ impl<'a> MediaPipeline<'a> {
     }
 }
 
-/// True when the message text already carries an `[IMAGE:<target>]` marker
-/// that the receiving channel rendered for **these exact bytes**.
-///
-/// The join is on [`MediaAttachment::marker_target`] — the target the channel
-/// recorded when it rendered the marker — compared verbatim against each
-/// marker in the text. Nothing is inferred from file names. That matters in
-/// both directions:
-///
-/// * A channel whose on-disk name differs from the sender's name (Discord
-///   prefixes a uniqueness token) is still recognized, so its marker is not
-///   duplicated by a second base64-inlined copy.
-/// * Sender-authored text cannot suppress a real attachment. A caption
-///   containing `[IMAGE:/some/other/photo.jpg]` carries no channel
-///   provenance, so it never matches, and the attachment's own annotation —
-///   the only one holding the bytes — is still produced.
-///
-/// An attachment with no `marker_target` was supplied without the channel
-/// referencing it in the text, so it is treated as unreferenced.
-fn text_already_references_image(text: &str, attachment: &MediaAttachment) -> bool {
-    let Some(target) = attachment.marker_target.as_deref() else {
-        return false;
-    };
-    if target.is_empty() {
-        return false;
-    }
-
-    let mut rest = text;
-    while let Some(start) = rest.find("[IMAGE:") {
-        let after = &rest[start + "[IMAGE:".len()..];
-        let Some(end) = after.find(']') else {
-            return false;
-        };
-        if &after[..end] == target {
-            return true;
-        }
-        rest = &after[end + 1..];
-    }
-    false
-}
-
 fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {
     let mime = attachment.mime_type.as_deref().unwrap_or("image/jpeg");
 
@@ -251,7 +219,7 @@ mod tests {
             file_name: "voice.ogg".to_string(),
             data: vec![0u8; 100],
             mime_type: Some("audio/ogg".to_string()),
-            marker_target: None,
+            marker: None,
         }
     }
 
@@ -260,7 +228,7 @@ mod tests {
             file_name: "photo.jpg".to_string(),
             data: vec![0u8; 50],
             mime_type: Some("image/jpeg".to_string()),
-            marker_target: None,
+            marker: None,
         }
     }
 
@@ -269,7 +237,7 @@ mod tests {
             file_name: "clip.mp4".to_string(),
             data: vec![0u8; 200],
             mime_type: Some("video/mp4".to_string()),
-            marker_target: None,
+            marker: None,
         }
     }
 
@@ -279,7 +247,7 @@ mod tests {
             file_name: "file".to_string(),
             data: vec![],
             mime_type: Some("audio/ogg".to_string()),
-            marker_target: None,
+            marker: None,
         };
         assert_eq!(audio.kind(), MediaKind::Audio);
 
@@ -287,7 +255,7 @@ mod tests {
             file_name: "file".to_string(),
             data: vec![],
             mime_type: Some("image/png".to_string()),
-            marker_target: None,
+            marker: None,
         };
         assert_eq!(image.kind(), MediaKind::Image);
 
@@ -295,7 +263,7 @@ mod tests {
             file_name: "file".to_string(),
             data: vec![],
             mime_type: Some("video/mp4".to_string()),
-            marker_target: None,
+            marker: None,
         };
         assert_eq!(video.kind(), MediaKind::Video);
     }
@@ -306,7 +274,7 @@ mod tests {
             file_name: "voice.ogg".to_string(),
             data: vec![],
             mime_type: None,
-            marker_target: None,
+            marker: None,
         };
         assert_eq!(audio.kind(), MediaKind::Audio);
 
@@ -314,7 +282,7 @@ mod tests {
             file_name: "photo.png".to_string(),
             data: vec![],
             mime_type: None,
-            marker_target: None,
+            marker: None,
         };
         assert_eq!(image.kind(), MediaKind::Image);
 
@@ -322,7 +290,7 @@ mod tests {
             file_name: "clip.mp4".to_string(),
             data: vec![],
             mime_type: None,
-            marker_target: None,
+            marker: None,
         };
         assert_eq!(video.kind(), MediaKind::Video);
 
@@ -330,7 +298,7 @@ mod tests {
             file_name: "data.bin".to_string(),
             data: vec![],
             mime_type: None,
-            marker_target: None,
+            marker: None,
         };
         assert_eq!(unknown.kind(), MediaKind::Unknown);
     }
@@ -410,14 +378,34 @@ mod tests {
         );
     }
 
-    /// An attachment as a channel hands it over: bytes plus the target the
-    /// channel already rendered for them.
+    /// An attachment as a channel hands it over when it rendered an image
+    /// marker: bytes plus the target and the `Image` disposition it committed
+    /// to.
     fn marked(file_name: &str, mime: &str, marker_target: &str) -> MediaAttachment {
         MediaAttachment {
             file_name: file_name.to_string(),
             data: vec![0xFF, 0xD8, 0xFF, 0xE0],
             mime_type: Some(mime.to_string()),
-            marker_target: Some(marker_target.to_string()),
+            marker: Some(RenderedMarker {
+                target: marker_target.to_string(),
+                kind: MarkerKind::Image,
+            }),
+        }
+    }
+
+    /// An attachment a channel rendered as a `[Document: ...]` even though its
+    /// payload looks like an image: the non-loadable image-document case
+    /// (HEIC, TIFF, SVG, BMP). `kind()` still reports `Image`, so only the
+    /// recorded `Document` disposition can stop a second image annotation.
+    fn marked_document(file_name: &str, mime: &str, marker_target: &str) -> MediaAttachment {
+        MediaAttachment {
+            file_name: file_name.to_string(),
+            data: vec![0xFF, 0xD8, 0xFF, 0xE0],
+            mime_type: Some(mime.to_string()),
+            marker: Some(RenderedMarker {
+                target: marker_target.to_string(),
+                kind: MarkerKind::Document,
+            }),
         }
     }
 
@@ -448,8 +436,9 @@ mod tests {
         let pipeline = MediaPipeline::new(&config, None, true);
 
         // Discord saves under a uniqueness-prefixed name while the envelope
-        // keeps the sender's name, so the two never share a basename. Joining
-        // on the rendered target is what keeps this single-copy.
+        // keeps the sender's name, so the two never share a basename. Deferring
+        // on the recorded disposition, not on any name comparison, is what
+        // keeps this single-copy.
         let saved = "/ws/discord_files/6f1e4a4c-2b77-4a2f-9d0e-5c1f0b3a7e11_photo.jpg";
         let attachment = marked("photo.jpg", "image/jpeg", saved);
         let original = format!("[IMAGE:{saved}]\n\nwhat is this?");
@@ -471,11 +460,13 @@ mod tests {
         let config = default_pipeline_config(true);
         let pipeline = MediaPipeline::new(&config, None, true);
 
-        // The sender typed a marker naming the same basename as the real
-        // attachment, but pointing somewhere else entirely. Only the channel's
-        // own target counts, so the byte-backed annotation is still produced.
-        let attachment = marked("photo.jpg", "image/jpeg", "/ws/telegram_files/photo.jpg");
-        let original = "[IMAGE:/ws/telegram_files/old/photo.jpg] describe the attached one";
+        // The sender typed a marker in the caption, but the real attachment
+        // carries no channel-rendered disposition. Deference reads the typed
+        // envelope, not the text, so the sender's marker cannot impersonate a
+        // channel verdict and drop the only copy of the bytes.
+        let mut attachment = sample_image();
+        attachment.marker = None;
+        let original = "[IMAGE:/ws/telegram_files/photo.jpg] describe the attached one";
 
         let result = pipeline.process(original, &[attachment]).await;
 
@@ -497,7 +488,10 @@ mod tests {
             file_name: "photo.jpg".to_string(),
             data: vec![0xFF, 0xD8, 0xFF, 0xE0],
             mime_type: Some("video/mp4".to_string()),
-            marker_target: Some("/ws/telegram_files/photo.jpg".to_string()),
+            marker: Some(RenderedMarker {
+                target: "/ws/telegram_files/photo.jpg".to_string(),
+                kind: MarkerKind::Image,
+            }),
         };
         assert_eq!(
             attachment.kind(),
@@ -534,63 +528,39 @@ mod tests {
         );
     }
 
-    #[test]
-    fn text_already_references_image_joins_on_the_channel_target() {
-        let att = |target: Option<&str>| MediaAttachment {
-            file_name: "photo.jpg".to_string(),
-            data: Vec::new(),
-            mime_type: Some("image/jpeg".to_string()),
-            marker_target: target.map(str::to_string),
-        };
+    #[tokio::test]
+    async fn channel_rendered_document_is_not_reclassified_as_image() {
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
 
-        // Exact match against the target the channel recorded.
-        assert!(text_already_references_image(
-            "[IMAGE:/ws/files/photo.jpg]",
-            &att(Some("/ws/files/photo.jpg"))
-        ));
-        // Second marker matches after a non-matching first one.
-        assert!(text_already_references_image(
-            "[IMAGE:/ws/old.png] and [IMAGE:/ws/photo.jpg]",
-            &att(Some("/ws/photo.jpg"))
-        ));
-        // A URL target (no workspace configured) joins the same way.
-        assert!(text_already_references_image(
-            "[IMAGE:https://cdn.example/attachments/1/photo.jpg]",
-            &att(Some("https://cdn.example/attachments/1/photo.jpg"))
-        ));
+        // The reviewer's boundary: a non-loadable image document (HEIC) the
+        // channel deliberately rendered as `[Document: ...]`. `kind()` still
+        // reports Image from the MIME, so without the recorded Document
+        // disposition the pipeline would add an `[IMAGE:data:...]` copy the
+        // provider then rejects.
+        let attachment =
+            marked_document("photo.heic", "image/heic", "/ws/telegram_files/photo.heic");
+        assert_eq!(
+            attachment.kind(),
+            MediaKind::Image,
+            "this test is only meaningful while the declared image MIME wins routing"
+        );
 
-        // Same basename, different directory: not this attachment.
-        assert!(!text_already_references_image(
-            "[IMAGE:/ws/old/photo.jpg]",
-            &att(Some("/ws/files/photo.jpg"))
-        ));
-        // A prefix of the target is not the target.
-        assert!(!text_already_references_image(
-            "[IMAGE:/ws/files/photo.jp]",
-            &att(Some("/ws/files/photo.jpg"))
-        ));
-        // Marker present only as caption prose.
-        assert!(!text_already_references_image(
-            "see /ws/files/photo.jpg",
-            &att(Some("/ws/files/photo.jpg"))
-        ));
-        // Data-URI markers are the pipeline's own output, never a channel target.
-        assert!(!text_already_references_image(
-            "[IMAGE:data:image/jpeg;base64,AAAA]",
-            &att(Some("/ws/files/photo.jpg"))
-        ));
-        // Unterminated marker cannot match.
-        assert!(!text_already_references_image(
-            "[IMAGE:/ws/files/photo.jpg",
-            &att(Some("/ws/files/photo.jpg"))
-        ));
-        // No recorded target: the attachment is unreferenced by definition.
-        assert!(!text_already_references_image(
-            "[IMAGE:/ws/files/photo.jpg]",
-            &att(None)
-        ));
-        // An empty target never matches.
-        assert!(!text_already_references_image("[IMAGE:]", &att(Some(""))));
+        let original = "[Document: photo.heic] /ws/telegram_files/photo.heic\n\nwhat is this?";
+        let result = pipeline.process(original, &[attachment]).await;
+
+        assert_eq!(
+            result, original,
+            "the channel's document verdict must stand alone"
+        );
+        assert!(
+            !result.contains("IMAGE:data:"),
+            "a channel-rendered document must not gain an inline image copy: {result}"
+        );
+        assert!(
+            !result.contains("[Image:"),
+            "a channel-rendered document must not gain an image annotation: {result}"
+        );
     }
 
     #[cfg(feature = "image-normalization")]
@@ -611,7 +581,7 @@ mod tests {
             file_name: "sticker.webp".to_string(),
             data: cursor.into_inner(),
             mime_type: Some("image/webp".to_string()),
-            marker_target: None,
+            marker: None,
         };
 
         let result = pipeline.process("what is this?", &[sticker]).await;

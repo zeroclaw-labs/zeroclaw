@@ -196,7 +196,7 @@ fn from_wit_media(a: WitMediaAttachment) -> MediaAttachment {
         // plugin-supplied attachment is unreferenced by definition. Widening
         // the WIT record would be a breaking ABI change for no gain: a plugin
         // channel has no marker for the pipeline to join against.
-        marker_target: None,
+        marker: None,
     }
 }
 
@@ -764,7 +764,7 @@ mod tests {
             file_name: "photo.jpg".into(),
             data: vec![0xFF, 0xD8, 0xFF],
             mime_type: Some("image/jpeg".into()),
-            marker_target: None,
+            marker: None,
         };
         let back = from_wit_media(to_wit_media(&ma));
         assert_eq!(back.file_name, "photo.jpg");
