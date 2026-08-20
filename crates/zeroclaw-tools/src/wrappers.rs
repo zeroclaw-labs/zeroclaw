@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use zeroclaw_api::attribution::{Attributable, Role};
+use zeroclaw_api::attribution::{Attributable, Role, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -28,6 +28,9 @@ impl<T: Tool> Attributable for RateLimitedTool<T> {
     }
     fn alias(&self) -> &str {
         self.inner.alias()
+    }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.inner.tool_provenance()
     }
 }
 
@@ -122,6 +125,9 @@ impl<T: Tool> Attributable for PathGuardedTool<T> {
     }
     fn alias(&self) -> &str {
         self.inner.alias()
+    }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.inner.tool_provenance()
     }
 }
 

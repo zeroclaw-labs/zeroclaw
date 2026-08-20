@@ -8,7 +8,7 @@ use crate::runtime;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::PathBuf;
-use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+use zeroclaw_api::attribution::{Attributable, Role, ToolKind, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// A tool backed by a WASM plugin function.
@@ -30,7 +30,7 @@ pub struct WasmTool {
 
 impl Attributable for WasmTool {
     fn role(&self) -> Role {
-        Role::Tool(ToolKind::Plugin)
+        Role::Tool(ToolKind::WasmPlugin)
     }
 
     fn alias(&self) -> &str {
@@ -39,6 +39,10 @@ impl Attributable for WasmTool {
         // binding identity remains on the host-issued scope and is emitted by
         // component logging under distinct plugin attributes.
         &self.name
+    }
+
+    fn tool_provenance(&self) -> ToolProvenance {
+        ToolProvenance::Extension
     }
 }
 
@@ -171,6 +175,7 @@ impl Tool for WasmTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 
     fn tool_scope() -> PluginInstanceScope {
         crate::instance::test_scope(PluginCapability::Tool, "redaction-primary", [])
@@ -211,6 +216,7 @@ mod tests {
         assert_eq!(tool.name(), "redact");
         assert_eq!(tool.description(), "does things");
         assert_eq!(tool.parameters_schema(), schema);
+        assert_eq!(tool.role(), Role::Tool(ToolKind::WasmPlugin));
         assert_eq!(tool.alias(), "redact");
         assert_eq!(tool.scope.id().package(), "fixture");
         assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
