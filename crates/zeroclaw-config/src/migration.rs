@@ -2168,6 +2168,137 @@ vision_model_provider = "custom"
     }
 
     #[test]
+    fn v2_bare_stepfun_with_intl_variant_stays_fail_closed() {
+        // A bare `stepfun` reference must NOT be redirected to a
+        // `stepfun-intl` alias that holds a different endpoint URI.
+        // The variant's international URI is identity-bearing; a bare
+        // family reference has no variant identity and must stay fail-closed.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.stepfun-intl]
+api_key = "test-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "stepfun"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("stepfun"),
+            "bare stepfun must stay bare when the only producer is stepfun-intl"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("stepfun", "default")
+            .expect("stepfun-intl must materialize at stepfun.default");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://api.stepfun.com/intl/v1"),
+            "the variant alias must retain its intl uri"
+        );
+    }
+
+    #[test]
+    fn v2_bare_family_with_oauth_variant_stays_fail_closed() {
+        // `openai-codex` adds `wire_api = responses` + `requires_openai_auth`;
+        // a bare `openai` reference must not accept that variant producer.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai-codex]
+api_key = "test-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai"),
+            "bare openai must stay bare when the only producer is the codex variant"
+        );
+    }
+
+    #[test]
+    fn v2_empty_global_extra_headers_with_second_family_keeps_single_owner() {
+        // An empty `extra_headers = {}` is a semantic no-op and must not
+        // claim alias ownership across multiple families. The existing
+        // per-provider alias should remain reachable.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "global-test-key"
+default_model = "vision-model"
+extra_headers = {}
+
+[providers.models.openai]
+api_key = "openai-test-key"
+model = "vision-model"
+
+[providers.models.opencode-go]
+api_key = "other-test-key"
+model = "other-model"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "empty extra_headers must not strand a valid keyed vision alias"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("openai", "default")
+            .expect("openai.default must exist");
+        assert_eq!(alias.api_key.as_deref(), Some("openai-test-key"));
+    }
+
+    #[test]
+    fn v2_matching_colon_url_with_global_api_path_rewrites() {
+        // A colon-URL `default_provider` with a global `api_path` is
+        // materialized as `uri = base + path`. A matching colon-URL vision
+        // reference naming just the base must be considered the same effective
+        // source after the same composition and rewrite to the dotted alias.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "custom:https://vision.example.invalid"
+api_path = "/v1"
+api_key = "test-key"
+default_model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom:https://vision.example.invalid"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom.default"),
+            "matching colon-URL with api_path must rewrite to the dotted alias"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("custom", "default")
+            .expect("custom.default must exist");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://vision.example.invalid/v1"),
+            "the composed URI must survive as base + api_path"
+        );
+        assert_eq!(alias.api_key.as_deref(), Some("test-key"));
+    }
+
+    #[test]
     fn provider_pruner_never_panics_on_non_table_shapes() {
         // Array-of-tables where a family map is expected, scalar [providers],
         // array alias value. The salvage path is the daemon's never-fail
