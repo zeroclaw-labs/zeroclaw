@@ -196,21 +196,23 @@ where
         mut writer: Writer<'_>,
         event: &tracing::Event<'_>,
     ) -> std::fmt::Result {
-        let label = ctx
-            .event_scope()
-            .and_then(|scope| {
-                scope.into_iter().find_map(|span| {
-                    span.extensions()
-                        .get::<ZeroclawAttribution>()
-                        .and_then(|attribution| {
-                            attribution
-                                .get("agent_alias")
-                                .or_else(|| attribution.get("channel"))
-                                .map(str::to_string)
-                        })
-                })
-            })
-            .unwrap_or_else(|| "system".to_string());
+        let label = ctx.event_scope().and_then(|scope| {
+            let mut channel = None;
+            for span in scope {
+                let extensions = span.extensions();
+                let Some(attribution) = extensions.get::<ZeroclawAttribution>() else {
+                    continue;
+                };
+                if let Some(agent_alias) = attribution.get("agent_alias") {
+                    return Some(agent_alias.to_string());
+                }
+                if channel.is_none() {
+                    channel = attribution.get("channel").map(str::to_string);
+                }
+            }
+            channel
+        });
+        let label = label.as_deref().unwrap_or("system");
         write!(writer, "[{label}] ")?;
         self.inner.format_event(ctx, writer, event)
     }
@@ -244,6 +246,81 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             BufGuard(self.0.clone())
         }
+    }
+
+    #[test]
+    fn event_semantics_foreground_label_prefers_agent_across_nested_spans() {
+        let buf = BufMakeWriter::default();
+        let fmt_layer = fmt::layer()
+            .fmt_fields(RedactEphemeralFields)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .event_format(AgentAliasFormatter::new());
+        let subscriber = tracing_subscriber::registry()
+            .with(LogCaptureLayer)
+            .with(fmt_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            {
+                let outer_agent = tracing::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "outer_agent",
+                    agent_alias = "outer"
+                );
+                let _outer_agent_guard = outer_agent.enter();
+                let nearest_agent = tracing::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "nearest_agent",
+                    agent_alias = "clamps"
+                );
+                let _nearest_agent_guard = nearest_agent.enter();
+                let inner_channel = tracing::info_span!(
+                    target: "zeroclaw_log_internal_scope",
+                    "inner_channel",
+                    channel = "discord.glados"
+                );
+                let _inner_channel_guard = inner_channel.enter();
+                tracing::info!(
+                    target: "zeroclaw_log_internal_test",
+                    "agent precedence event"
+                );
+            }
+
+            let outer_channel = tracing::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "outer_channel",
+                channel = "telegram.outer"
+            );
+            let _outer_channel_guard = outer_channel.enter();
+            let inner_channel = tracing::info_span!(
+                target: "zeroclaw_log_internal_scope",
+                "nearest_channel",
+                channel = "discord.inner"
+            );
+            let _inner_channel_guard = inner_channel.enter();
+            tracing::info!(
+                target: "zeroclaw_log_internal_test",
+                "channel precedence event"
+            );
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out
+            .lines()
+            .find(|line| line.contains("agent precedence event"))
+            .expect("agent precedence event should be formatted");
+        assert!(
+            line.starts_with("[clamps] "),
+            "nearest agent alias must take global precedence over a closer channel: {line:?}"
+        );
+        let line = out
+            .lines()
+            .find(|line| line.contains("channel precedence event"))
+            .expect("channel precedence event should be formatted");
+        assert!(
+            line.starts_with("[discord.inner] "),
+            "nearest channel must win when no agent alias is present: {line:?}"
+        );
     }
 
     /// Regression for the ephemeral-credential-at-verbose-stderr leak: the

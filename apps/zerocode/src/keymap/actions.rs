@@ -154,7 +154,10 @@ keyactions! {
         FastScrollUp            [Chord::with(KeyCode::Up, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll up",
         FastScrollDown          [Chord::with(KeyCode::Down, KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "fast scroll down",
         BrowseExitSelection     [Chord::key(KeyCode::Esc)] => "exit selection",
-        CopySelection           [Chord::char('y')] => "copy selection",
+        CopySelection           [
+            Chord::char('y'),
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
+        ] => "copy selection",
         CopyAllVisible          [Chord::with(KeyCode::Char('C'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT))] => "copy all visible",
         ToggleThoughts          [Chord::char('t')] => "toggle thoughts",
         TodoToggle              [Chord::ctrl('p')] => "toggle todo tracker",
@@ -320,6 +323,8 @@ keyactions! {
         NewLine            [Chord::shift(KeyCode::Enter)] => "new line",
         CursorLeft         [Chord::key(KeyCode::Left)] => "cursor left",
         CursorRight        [Chord::key(KeyCode::Right)] => "cursor right",
+        CursorWordLeft     [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)] => "word left",
+        CursorWordRight    [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "word right",
         CursorStart        [Chord::key(KeyCode::Home)] => "line start",
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
         OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
@@ -389,8 +394,38 @@ keyactions! {
         Cancel    [Chord::key(KeyCode::Esc)] => "cancel",
         Save      [Chord::ctrl('s')] => "save",
         Backspace [Chord::key(KeyCode::Backspace)] => "backspace",
+        CursorLeft      [Chord::key(KeyCode::Left)] => "cursor left",
+        CursorRight     [Chord::key(KeyCode::Right)] => "cursor right",
+        CursorWordLeft  [Chord::with(KeyCode::Left, KeyModifiers::ALT), Chord::with(KeyCode::Char('b'), KeyModifiers::ALT)] => "word left",
+        CursorWordRight [Chord::with(KeyCode::Right, KeyModifiers::ALT), Chord::with(KeyCode::Char('f'), KeyModifiers::ALT)] => "word right",
+        CursorStart     [Chord::key(KeyCode::Home)] => "input start",
+        CursorEnd       [Chord::key(KeyCode::End)] => "input end",
         Up        [Chord::key(KeyCode::Up)] => "prev",
         Down      [Chord::key(KeyCode::Down)] => "next",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+
+    #[test]
+    fn copy_selection_resolves_from_super_c_and_terminal_fallback() {
+        let command_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER);
+        assert_eq!(
+            ChatTabAction::from_chord(&command_c),
+            Some(ChatTabAction::CopySelection)
+        );
+
+        let terminal_copy = KeyEvent::new(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+        );
+        assert_eq!(
+            ChatTabAction::from_chord(&terminal_copy),
+            Some(ChatTabAction::CopyAllVisible)
+        );
     }
 }
 

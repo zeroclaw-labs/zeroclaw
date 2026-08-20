@@ -24,6 +24,10 @@ pub mod tool_receipts;
 pub(crate) mod turn;
 
 pub use turn::context::TurnMeta;
+pub use turn::{
+    is_semantic_empty_terminal_completion, semantic_empty_terminal_completion_message,
+    terminal_completion_error_message,
+};
 
 pub(crate) fn is_runtime_approved_arg_tool(tool_name: &str) -> bool {
     matches!(

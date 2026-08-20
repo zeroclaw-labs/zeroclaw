@@ -324,12 +324,6 @@ api_token = "linq-api-token"
 from_phone = "+15555550103"
 allowed_senders = ["+15555550104"]
 
-[channels_config.wati]
-enabled = false
-api_token = "wati-api-token"
-api_url = "https://live-mt-server.wati.io"
-allowed_numbers = ["+15555550105"]
-
 [channels_config.nextcloud_talk]
 enabled = false
 base_url = "https://cloud.example.com"

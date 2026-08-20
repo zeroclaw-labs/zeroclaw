@@ -88,9 +88,19 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| render_docker_arg(root, cur),
         },
         Surface {
+            name: "dockerfile-alpine",
+            file: "Dockerfile.alpine",
+            render: |root, cur| render_docker_arg(root, cur),
+        },
+        Surface {
             name: "pkgbuild",
             file: "dist/aur/PKGBUILD",
             render: |root, cur| packaging::render_pkgbuild(root, cur),
+        },
+        Surface {
+            name: "aur-srcinfo",
+            file: "dist/aur/.SRCINFO",
+            render: |root, cur| packaging::render_srcinfo(root, cur),
         },
         Surface {
             name: "scoop",

@@ -369,6 +369,9 @@ pub struct ChannelMessage {
     pub explicitly_addressed: bool,
     /// Controls whether conversation history is sender-scoped or room-scoped.
     pub conversation_scope: ChannelConversationScope,
+    /// Inbound email References chain (parent thread); used to build the
+    /// reply's References header. Empty for non-email channels.
+    pub references: Vec<String>,
 }
 
 /// Message to send through a channel
@@ -386,6 +389,8 @@ pub struct SendMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Message-ID to set as In-Reply-To header (email threading).
     pub in_reply_to: Option<String>,
+    /// RFC 5322 References chain for email replies; ignored by non-email channels.
+    pub references: Vec<String>,
     /// When `true`, channels that support TTS must not synthesise this
     /// message as a voice note. Use for error notices, system alerts, and
     /// other non-conversational content that should never be voiced.
@@ -469,6 +474,7 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
         }
@@ -500,6 +506,7 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            references: Vec::new(),
             suppress_voice: false,
             force_voice: false,
         }
@@ -563,9 +570,12 @@ impl ChannelMessage {
 
 impl SendMessage {
     pub fn reply_to(msg: &ChannelMessage, content: impl Into<String>) -> Self {
+        let mut references = msg.references.clone();
+        references.push(msg.id.clone());
         let mut sm = Self::new(content, &msg.reply_target)
             .in_thread(msg.thread_ts.clone())
             .in_reply_to(Some(msg.id.clone()));
+        sm.references = references;
         if let Some(ref subj) = msg.subject {
             let reply_subject = if subj.to_ascii_lowercase().starts_with("re:") {
                 subj.clone()
@@ -1094,6 +1104,7 @@ mod tests {
         assert!(!msg.passive_context);
         assert!(!msg.explicitly_addressed);
         assert_eq!(msg.conversation_scope, ChannelConversationScope::Sender);
+        assert!(msg.references.is_empty());
     }
 
     #[test]
@@ -1129,6 +1140,51 @@ mod tests {
         let reply = SendMessage::reply_to(&inbound, "pong");
         assert!(reply.subject.is_none());
         assert_eq!(reply.in_reply_to.as_deref(), Some("msg-003"));
+    }
+
+    #[test]
+    fn send_message_reply_to_appends_parent_to_references_chain() {
+        let inbound = ChannelMessage {
+            references: vec!["a".to_string(), "b".to_string()],
+            ..ChannelMessage::new("c", "alice", "user@example.com", "", "email", 0)
+        };
+        let reply = SendMessage::reply_to(&inbound, "Got it");
+        assert_eq!(
+            reply.references,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn send_message_new_starts_without_attachments() {
+        let msg = SendMessage::new("content", "recipient@example.com");
+        assert!(msg.attachments.is_empty());
+    }
+
+    #[test]
+    fn send_message_with_attachments_stores_the_given_files() {
+        let msg = SendMessage::new("content", "recipient@example.com").with_attachments(vec![
+            MediaAttachment {
+                file_name: "test.pdf".to_string(),
+                data: vec![1, 2, 3],
+                mime_type: Some("application/pdf".to_string()),
+            },
+        ]);
+
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].file_name, "test.pdf");
+        assert_eq!(msg.attachments[0].data, vec![1, 2, 3]);
+        assert_eq!(
+            msg.attachments[0].mime_type.as_deref(),
+            Some("application/pdf")
+        );
+    }
+
+    #[test]
+    fn send_message_reply_to_references_defaults_to_parent_id_only() {
+        let inbound = ChannelMessage::new("c", "alice", "user@example.com", "", "email", 0);
+        let reply = SendMessage::reply_to(&inbound, "Got it");
+        assert_eq!(reply.references, vec!["c".to_string()]);
     }
 
     #[test]

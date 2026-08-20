@@ -1,12 +1,15 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::process::Command;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::CodexCliConfig;
+
+use crate::coding_cli::{
+    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, DirectCodingCliExecutor,
+    add_safe_env,
+};
 
 /// Environment variables safe to pass through to the `codex` subprocess.
 const SAFE_ENV_VARS: &[&str] = &[
@@ -16,12 +19,50 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct CodexCliTool {
     security: Arc<SecurityPolicy>,
     config: CodexCliConfig,
+    executor: Arc<dyn CodingCliExecutor>,
 }
 
 impl CodexCliTool {
+    /// Construct a standalone tool that executes directly on the host.
+    ///
+    /// Runtime registries should use `new_with_executor` so the configured
+    /// runtime and sandbox own process execution.
     pub fn new(security: Arc<SecurityPolicy>, config: CodexCliConfig) -> Self {
-        Self { security, config }
+        Self::new_with_executor(security, config, DirectCodingCliExecutor::shared())
     }
+
+    /// Construct the tool with an injected process executor.
+    pub fn new_with_executor(
+        security: Arc<SecurityPolicy>,
+        config: CodexCliConfig,
+        executor: Arc<dyn CodingCliExecutor>,
+    ) -> Self {
+        Self {
+            security,
+            config,
+            executor,
+        }
+    }
+}
+
+fn codex_exec_args<'a>(config: &'a CodexCliConfig, prompt: &'a str) -> Vec<&'a str> {
+    let mut args = vec!["exec"];
+    let mut has_terminator = false;
+
+    for (_, arg) in config.effective_extra_args() {
+        has_terminator |= arg == "--";
+        args.push(arg);
+    }
+
+    // Keep the model-supplied prompt in the positional-argument lane. Without
+    // this boundary, a dangling value-taking extra arg could consume the
+    // prompt as its value instead of letting Codex parse it as the prompt.
+    if !has_terminator {
+        args.push("--");
+    }
+    args.push(prompt);
+
+    args
 }
 
 #[async_trait]
@@ -55,10 +96,10 @@ impl Tool for CodexCliTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
-        // Enforce act policy
+        // The production wrapper owns accounting; the adapter owns authorization.
         if let Err(error) = self
             .security
-            .enforce_tool_operation(ToolOperation::Act, "codex_cli")
+            .authorize_tool_operation(ToolOperation::Act, "codex_cli")
         {
             return Ok(ToolResult {
                 success: false,
@@ -134,51 +175,13 @@ impl Tool for CodexCliTool {
         };
 
         // Build CLI command: `codex exec [extra_args...] <prompt>`
-        let codex_bin = if cfg!(target_os = "windows") {
-            "codex.cmd"
-        } else {
-            "codex"
-        };
-        let mut cmd = Command::new(codex_bin);
-        cmd.arg("exec");
+        let mut cmd = CodingCliCommand::new("codex", work_dir.clone(), self.config.timeout_secs);
+        cmd.args(codex_exec_args(&self.config, prompt));
 
-        // Append user-configured extra arguments (e.g. --sandbox, --skip-git-repo-check)
-        for arg in &self.config.extra_args {
-            let trimmed = arg.trim();
-            if !trimmed.is_empty() {
-                cmd.arg(trimmed);
-            }
-        }
+        add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
 
-        cmd.arg(prompt);
-
-        // Environment: clear everything, pass only safe vars + configured passthrough.
-        cmd.env_clear();
-        for var in SAFE_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-        for var in &self.config.env_passthrough {
-            let trimmed = var.trim();
-            if !trimmed.is_empty()
-                && let Ok(val) = std::env::var(trimmed)
-            {
-                cmd.env(trimmed, val);
-            }
-        }
-
-        cmd.current_dir(&work_dir);
-        // Execute with timeout — use kill_on_drop(true) so the child process
-        // is automatically killed when the future is dropped on timeout,
-        // preventing zombie processes.
-        let timeout = Duration::from_secs(self.config.timeout_secs);
-        cmd.kill_on_drop(true);
-
-        let result = tokio::time::timeout(timeout, cmd.output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
+        match self.executor.output(cmd).await {
+            Ok(output) => {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -202,7 +205,7 @@ impl Tool for CodexCliTool {
                     },
                 })
             }
-            Ok(Err(e)) => {
+            Err(CodingCliExecutionError::Io(e)) => {
                 let err_msg = e.to_string();
                 let msg = if err_msg.contains("No such file or directory")
                     || err_msg.contains("not found")
@@ -218,18 +221,19 @@ impl Tool for CodexCliTool {
                     error: Some(msg),
                 })
             }
-            Err(_) => {
-                // Timeout — kill_on_drop(true) ensures the child is killed
-                // when the future is dropped.
-                Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "Codex CLI timed out after {}s and was killed",
-                        self.config.timeout_secs
-                    )),
-                })
-            }
+            Err(CodingCliExecutionError::Timeout) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Codex CLI timed out after {}s and was killed",
+                    self.config.timeout_secs
+                )),
+            }),
+            Err(CodingCliExecutionError::Prepare(e)) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to prepare codex execution: {e}")),
+            }),
         }
     }
 }
@@ -292,7 +296,10 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = CodexCliTool::new(security, test_config());
+        let tool = crate::wrappers::RateLimitedTool::new(
+            CodexCliTool::new(security.clone(), test_config()),
+            security,
+        );
         let result = tool
             .execute(json!({"prompt": "hello"}))
             .await
@@ -413,6 +420,48 @@ mod tests {
         assert!(
             config.extra_args.is_empty(),
             "extra_args should default to empty"
+        );
+    }
+
+    #[test]
+    fn codex_cli_command_args_separate_prompt_from_dangling_value_flags() {
+        let prompt = "danger-full-access";
+
+        for flag in [
+            "--sandbox",
+            "--config",
+            "-c",
+            "--profile",
+            "--cd",
+            "-C",
+            "--add-dir",
+            "--enable",
+            "--disable",
+        ] {
+            let mut config = test_config();
+            config.extra_args = vec![flag.to_string()];
+
+            assert_eq!(
+                codex_exec_args(&config, prompt),
+                vec!["exec", flag, "--", prompt],
+                "{flag} must not consume the prompt as its value"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_cli_command_args_preserve_an_explicit_terminator() {
+        let mut config = test_config();
+        config.extra_args = vec!["  --skip-git-repo-check  ".to_string(), "--".to_string()];
+
+        assert_eq!(
+            codex_exec_args(&config, "--prompt-starting-with-a-dash"),
+            vec![
+                "exec",
+                "--skip-git-repo-check",
+                "--",
+                "--prompt-starting-with-a-dash"
+            ]
         );
     }
 

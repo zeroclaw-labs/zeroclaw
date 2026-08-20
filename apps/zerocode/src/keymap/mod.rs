@@ -27,11 +27,25 @@ fn chord_bypasses_text_input(chord: &Chord) -> bool {
     !modifiers.is_empty()
 }
 
-pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
-    GlobalAction::Help
+pub(crate) fn action_bypasses_text_input<A: RebindableActions>(
+    action: A,
+    event: &KeyEvent,
+) -> bool {
+    action
         .resolved()
         .iter()
         .any(|chord| chord_bypasses_text_input(chord) && chord.matches(event))
+}
+
+pub fn help_bypasses_text_input(event: &KeyEvent) -> bool {
+    action_bypasses_text_input(GlobalAction::Help, event)
+}
+
+pub fn input_bar_claims_pane_navigation(event: &KeyEvent) -> bool {
+    matches!(
+        InputBarAction::from_chord(event),
+        Some(InputBarAction::CursorWordLeft | InputBarAction::CursorWordRight)
+    )
 }
 
 /// Uniform interface over every `keyactions!`-generated enum so generic
@@ -135,6 +149,26 @@ mod tests {
     }
 
     #[test]
+    fn action_bypass_distinguishes_text_from_command_chords() {
+        assert!(!action_bypasses_text_input(
+            ChatTabAction::CopySelection,
+            &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        ));
+        assert!(action_bypasses_text_input(
+            ChatTabAction::CopySelection,
+            &KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER),
+        ));
+        assert!(action_bypasses_text_input(
+            ChatTabAction::PageUp,
+            &KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        ));
+        assert!(!action_bypasses_text_input(
+            ChatTabAction::CopySelection,
+            &KeyEvent::new(KeyCode::Char('y'), KeyModifiers::SHIFT),
+        ));
+    }
+
+    #[test]
     fn browse_enter_resolves_from_control_k() {
         let ev = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL);
         assert_eq!(
@@ -149,6 +183,34 @@ mod tests {
         assert_eq!(
             InputBarAction::from_chord(&ev),
             Some(InputBarAction::Submit)
+        );
+    }
+
+    #[test]
+    fn input_bar_word_navigation_claims_global_pane_chords() {
+        for event in [
+            KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        ] {
+            assert!(matches!(
+                GlobalAction::from_chord(&event),
+                Some(GlobalAction::PaneNavLeft | GlobalAction::PaneNavRight)
+            ));
+            assert!(input_bar_claims_pane_navigation(&event));
+        }
+    }
+
+    #[test]
+    fn config_cursor_actions_use_config_editor_registry_keys() {
+        assert_eq!(
+            ConfigEditorAction::CursorWordLeft.action_key(),
+            "config_editor.cursor_word_left"
+        );
+        assert_eq!(
+            ConfigEditorAction::CursorWordRight.action_key(),
+            "config_editor.cursor_word_right"
         );
     }
 
