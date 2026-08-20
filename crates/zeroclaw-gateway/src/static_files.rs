@@ -8,7 +8,7 @@ use axum::{
     http::{StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use super::AppState;
 
@@ -20,11 +20,9 @@ static EMBEDDED_WEB_DIST: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../web/
 
 /// Serve static files from `/_app/*` path
 pub async fn handle_static(State(state): State<AppState>, uri: Uri) -> Response {
-    let path = uri
-        .path()
-        .strip_prefix("/_app/")
-        .unwrap_or(uri.path())
-        .trim_start_matches('/');
+    let Some(path) = static_request_path(&uri) else {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    };
 
     #[cfg(feature = "embedded-web")]
     if let Some(resp) = serve_embedded_file(path) {
@@ -109,22 +107,30 @@ async fn load_index_html_bytes(dist_dir: Option<&PathBuf>) -> Option<Vec<u8>> {
         return Some(file.contents().to_vec());
     }
 
-    let dir = dist_dir?;
-    let index_path = dir.join("index.html");
+    let index_path = resolve_fs_file(dist_dir?, Path::new("index.html"))
+        .await
+        .ok()?;
     tokio::fs::read(&index_path).await.ok()
 }
 
 async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
+    if !is_valid_relative_path(path) {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+
     let Some(dir) = dist_dir else {
         return (StatusCode::NOT_FOUND, "Not found").into_response();
     };
 
-    // Sanitize: reject path traversal attempts
-    if path.contains("..") {
-        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
-    }
-
-    let file_path = dir.join(path);
+    let file_path = match resolve_fs_file(dir, Path::new(path)).await {
+        Ok(path) => path,
+        Err(FsPathError::Invalid) => {
+            return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+        }
+        Err(FsPathError::Unavailable) => {
+            return (StatusCode::NOT_FOUND, "Not found").into_response();
+        }
+    };
 
     match tokio::fs::read(&file_path).await {
         Ok(content) => {
@@ -155,6 +161,61 @@ async fn serve_fs_file(dist_dir: Option<&PathBuf>, path: &str) -> Response {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FsPathError {
+    Invalid,
+    Unavailable,
+}
+
+fn static_request_path(uri: &Uri) -> Option<&str> {
+    let path = uri.path().strip_prefix("/_app/").unwrap_or(uri.path());
+
+    is_valid_relative_path(path).then_some(path)
+}
+
+fn is_valid_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.starts_with('/')
+        && !path.ends_with('/')
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|component| !matches!(component, "" | "." | ".."))
+        && Path::new(path)
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+async fn resolve_fs_file(root: &Path, relative: &Path) -> Result<PathBuf, FsPathError> {
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(FsPathError::Invalid);
+    }
+
+    let canonical_root = tokio::fs::canonicalize(root)
+        .await
+        .map_err(|_| FsPathError::Unavailable)?;
+    let canonical_file = tokio::fs::canonicalize(canonical_root.join(relative))
+        .await
+        .map_err(|_| FsPathError::Unavailable)?;
+
+    if !canonical_file.starts_with(&canonical_root) {
+        return Err(FsPathError::Unavailable);
+    }
+
+    let metadata = tokio::fs::metadata(&canonical_file)
+        .await
+        .map_err(|_| FsPathError::Unavailable)?;
+    if !metadata.is_file() {
+        return Err(FsPathError::Unavailable);
+    }
+
+    Ok(canonical_file)
+}
+
 #[cfg(feature = "embedded-web")]
 fn serve_embedded_file(path: &str) -> Option<Response> {
     if path.contains("..") {
@@ -179,4 +240,160 @@ fn serve_embedded_file(path: &str) -> Option<Response> {
         )
             .into_response(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn response_body(response: Response) -> Vec<u8> {
+        to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body")
+            .to_vec()
+    }
+
+    #[test]
+    fn static_route_rejects_malformed_path_syntax() {
+        for path in [
+            "/_app//index.html",
+            "/_app/assets//app.js",
+            "/_app/assets/./app.js",
+            "/_app/assets/app.js/",
+        ] {
+            let uri: Uri = path.parse().unwrap();
+            assert_eq!(
+                static_request_path(&uri),
+                None,
+                "route path should be rejected: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_asset_serves_contained_nested_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let assets = tmp.path().join("assets");
+        std::fs::create_dir(&assets).unwrap();
+        std::fs::write(assets.join("app.js"), b"console.log('ok');").unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let response = serve_fs_file(Some(&root), "assets/app.js").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_body(response).await,
+            b"console.log('ok');".to_vec()
+        );
+    }
+
+    #[tokio::test]
+    async fn fs_asset_rejects_invalid_components_before_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        for path in [
+            "../secret",
+            "assets/../secret",
+            "./index.html",
+            "/etc/passwd",
+            "assets//app.js",
+            "assets/./app.js",
+            "assets/app.js/",
+            r"assets\\app.js",
+            r"assets\.\app.js",
+            r"\assets\app.js",
+            r"assets\app.js\",
+        ] {
+            let response = serve_fs_file(Some(&root), path).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "path should be rejected: {path}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn fs_asset_rejects_windows_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        let response = serve_fs_file(Some(&root), r"C:\\Windows\\win.ini").await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn fs_asset_returns_not_found_for_missing_or_non_file_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("assets")).unwrap();
+        let root = tmp.path().to_path_buf();
+
+        for path in ["missing.js", "assets"] {
+            let response = serve_fs_file(Some(&root), path).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "target should not be served: {path}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_asset_rejects_symlink_that_resolves_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), b"outside-secret").unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("escape.txt"),
+        )
+        .unwrap();
+        let root_path = root.path().to_path_buf();
+
+        let response = serve_fs_file(Some(&root_path), "escape.txt").await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_ne!(response_body(response).await, b"outside-secret".to_vec());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fs_asset_allows_symlink_that_resolves_inside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("app.js"), b"inside-asset").unwrap();
+        symlink("app.js", root.path().join("alias.js")).unwrap();
+        let root_path = root.path().to_path_buf();
+
+        let response = serve_fs_file(Some(&root_path), "alias.js").await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response_body(response).await, b"inside-asset".to_vec());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spa_index_rejects_symlink_that_resolves_outside_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("index.html"), b"outside-shell").unwrap();
+        symlink(
+            outside.path().join("index.html"),
+            root.path().join("index.html"),
+        )
+        .unwrap();
+        let root_path = root.path().to_path_buf();
+
+        assert!(load_index_html_bytes(Some(&root_path)).await.is_none());
+    }
 }

@@ -117,9 +117,18 @@ mod tests {
     #[test]
     fn zone_default_is_lean_dist() {
         let z = render_zone(&root()).unwrap();
-        assert!(z.contains("\"channel-matrix\""));
-        assert!(z.contains("\"whatsapp-web\""));
-        assert!(!z.contains("\"channel-slack\""));
+        for feature in spec::resolve_feature_list(&root(), &Selection::Dist).unwrap() {
+            assert!(
+                z.contains(&format!("\"{feature}\"")),
+                "dist feature {feature} not rendered"
+            );
+        }
+        for feature in spec::features_outside_dist(&root()).unwrap() {
+            assert!(
+                !z.contains(&format!("\"{feature}\"")),
+                "{feature} leaked into lean dist"
+            );
+        }
     }
 
     #[test]

@@ -35,7 +35,13 @@ services:
       # - ZEROCLAW_providers__models__anthropic__default__api_key=${ANTHROPIC_API_KEY:-}
       # - ZEROCLAW_providers__models__openai__default__api_key=${OPENAI_API_KEY:-}
 
-      # Allow public bind inside Docker (required for container networking)
+      # Listen on the container interface so Docker's published port can reach
+      # the gateway. Docker bridge traffic never arrives on container loopback,
+      # so a persisted `host = "127.0.0.1"` config stays unreachable without
+      # this. `allow_public_bind` only acknowledges the non-loopback listener
+      # and silences the startup warning; it does not refuse a public bind.
+      # Host-side exposure is bounded by the `ports:` mapping below.
+      - ZEROCLAW_gateway__host=0.0.0.0
       - ZEROCLAW_gateway__allow_public_bind=true
       # Default gateway port inside container
       - ZEROCLAW_gateway__port=${ZEROCLAW_GATEWAY_PORT:-42617}
@@ -45,8 +51,13 @@ services:
       - zeroclaw-data:/zeroclaw-data
       
     ports:
-      # Gateway API port (override HOST_PORT if 42617 is taken)
-      - "${HOST_PORT:-42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
+      # Published on host loopback only. The in-container listener is
+      # `0.0.0.0`, so without this prefix the gateway would be reachable from
+      # the LAN, and `require_pairing = false` configs answer unauthenticated
+      # requests. To serve other hosts, drop the `127.0.0.1:` prefix (or set
+      # HOST_PORT to an explicit interface) and enable pairing or a tunnel.
+      # Override HOST_PORT if 42617 is taken.
+      - "${HOST_PORT:-127.0.0.1:42617}:${ZEROCLAW_GATEWAY_PORT:-42617}"
     
     # Resource limits
     deploy:

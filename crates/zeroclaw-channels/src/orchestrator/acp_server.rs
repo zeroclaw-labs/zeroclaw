@@ -54,7 +54,12 @@ enum TerminalOutcome {
         persist_error: Option<String>,
     },
     Failed {
+        /// Raw diagnostic, for the failure log line.
         error: String,
+        /// The wire error, built in the turn task where the `anyhow::Error` is
+        /// still live, so the localized delivery projection reaches the client
+        /// instead of the raw diagnostic.
+        rpc_error: RpcError,
         persist_error: Option<String>,
     },
 }
@@ -377,10 +382,6 @@ impl AcpServer {
             })?;
         zeroclaw_spawn::spawn!(writer_task(writer_rx));
 
-        let stdin = tokio::io::stdin();
-        let mut reader = BufReader::new(stdin);
-        let mut line = String::new();
-
         // Spawn session reaper
         let sessions = Arc::clone(&self.sessions);
         let timeout = Duration::from_secs(self.acp_config.session_timeout_secs);
@@ -433,27 +434,44 @@ impl AcpServer {
             }
         });
 
+        // Read newline-delimited JSON-RPC from the process's real stdin.
+        // Factored into `serve_reader` so tests can drive the exact same
+        // framing loop with an in-memory pipe instead of the stdin handle.
+        self.serve_reader(tokio::io::stdin()).await?;
+
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Channel),
+            "ACP server: stdin closed, shutting down"
+        );
+
+        Ok(())
+    }
+
+    /// Read newline-delimited JSON-RPC requests from `reader`, dispatching each
+    /// non-empty line through the shared `process_line` path. This is the exact
+    /// framing loop the stdio front door uses: `run()` calls it with the
+    /// process's real stdin, and tests drive it with an in-memory pipe to prove
+    /// `session/new` end-to-end through the stdio surface.
+    async fn serve_reader<R>(self: &Arc<Self>, reader: R) -> Result<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
         loop {
             line.clear();
             let bytes_read = reader.read_line(&mut line).await?;
             if bytes_read == 0 {
-                ::zeroclaw_log::record!(
-                    DEBUG,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_category(::zeroclaw_log::EventCategory::Channel),
-                    "ACP server: stdin closed, shutting down"
-                );
                 break;
             }
-
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
             }
-
             self.process_line(trimmed).await;
         }
-
         Ok(())
     }
 
@@ -569,7 +587,7 @@ impl AcpServer {
                             .with_attrs(::serde_json::json!({
                                 "method": request.method,
                                 "error_code": e.code,
-                                "error": e.message,
+                                "error": e.diagnostic(),
                             })),
                         "ACP request failed"
                     );
@@ -701,19 +719,6 @@ impl AcpServer {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let config = self.config_snapshot();
-        let requested_cwd = self.requested_session_cwd(params, &config);
-
-        let workspace_dir = std::fs::canonicalize(&requested_cwd)
-            .map_err(|e| RpcError {
-                code: INVALID_PARAMS,
-                message: format!(
-                    "cwd is not a usable directory ({}): {e}",
-                    requested_cwd.display()
-                ),
-                data: None,
-            })?
-            .to_string_lossy()
-            .into_owned();
 
         // Every ACP session is bound to an explicit agent alias.
         // Accept `agentAlias` (camelCase) or `agent_alias` / `agent`,
@@ -721,6 +726,9 @@ impl AcpServer {
         // `[acp].default_agent`. When all are absent and exactly one agent
         // is configured, auto-select it so single-agent setups work without
         // extra config.
+        // NOTE: agent_alias MUST be resolved before workspace_dir so the
+        // default fallback can use the per-agent workspace path instead of
+        // the daemon process CWD.
         let agent_alias = params
             .get("agentAlias")
             .or_else(|| params.get("agent_alias"))
@@ -747,6 +755,49 @@ impl AcpServer {
                 data: None,
             })?;
         Self::validate_dispatchable_agent_alias(&config, &agent_alias)?;
+
+        // Default workspace is the per-agent directory. An explicit
+        // `cwd`/`workspaceDir`/`workspace_dir` is the session's file-access
+        // boundary and is honored exactly as given — including a narrower
+        // subdirectory under the install root. The ONE exception is a cwd that
+        // resolves to the install root itself: clients such as Thunderbolt pass
+        // `.` as a placeholder, which canonicalizes to the daemon's working
+        // directory. Treating that lone placeholder as "no meaningful cwd" and
+        // falling back to the per-agent workspace keeps uploads and the tool
+        // sandbox out of the daemon root, without silently broadening any other
+        // explicit path.
+        //
+        // Canonicalize the install root too: the explicit cwd goes through
+        // `canonicalize`, so comparing it against a non-canonical install root
+        // silently never matches whenever the path is symlinked or carries a
+        // platform prefix (macOS `/var`->`/private/var`, Windows `\\?\`
+        // verbatim). Both sides must be canonical for the equality to hold.
+        //
+        // An explicitly-provided cwd that cannot be resolved is a client error,
+        // not a silent substitution: fail with INVALID_PARAMS. Only an absent
+        // cwd falls back to the per-agent workspace.
+        let install_root = std::fs::canonicalize(config.install_root_dir())
+            .unwrap_or_else(|_| config.install_root_dir());
+        let workspace_dir = match self.requested_session_cwd(params) {
+            Some(requested) => {
+                let canon = std::fs::canonicalize(&requested).map_err(|e| RpcError {
+                    code: INVALID_PARAMS,
+                    message: format!(
+                        "cwd is not a usable directory ({}): {e}",
+                        requested.display()
+                    ),
+                    data: None,
+                })?;
+                if canon == install_root {
+                    config.agent_workspace_dir(&agent_alias)
+                } else {
+                    canon
+                }
+            }
+            None => config.agent_workspace_dir(&agent_alias),
+        }
+        .to_string_lossy()
+        .into_owned();
 
         let session_id = Uuid::new_v4().to_string();
 
@@ -960,6 +1011,9 @@ impl AcpServer {
         // a terminal transcript is still being committed — including the window
         // after `session/close`/`session/stop` remove the live map entry (see
         // `session_gates`). Held across the store read and the map insert below.
+        // Declared before the gate so it drops last: reclamation only succeeds
+        // once the map is the sole owner of the entry.
+        let mut restore_gate = self.restore_gate(&session_id);
         let finalize_gate = self.session_gate(&session_id);
         let _finalize_guard = finalize_gate.lock().await;
 
@@ -1107,6 +1161,9 @@ impl AcpServer {
         agent.channel_handles().register_channel("acp", acp_channel);
 
         let now = Instant::now();
+        // The session is about to become live, so `session/close` owns the gate
+        // from here on.
+        restore_gate.disarm();
         // Atomically insert and release reservation
         {
             let mut sessions = self.sessions.lock().await;
@@ -1210,6 +1267,7 @@ impl AcpServer {
 
         // Wait out any in-flight prompt on this session before reading the store
         // (same finalization barrier as `session/load`; see `session_gates`).
+        let mut restore_gate = self.restore_gate(&session_id);
         let finalize_gate = self.session_gate(&session_id);
         let _finalize_guard = finalize_gate.lock().await;
 
@@ -1348,6 +1406,9 @@ impl AcpServer {
         agent.channel_handles().register_channel("acp", acp_channel);
 
         let now = Instant::now();
+        // The session is about to become live, so `session/close` owns the gate
+        // from here on.
+        restore_gate.disarm();
         // Atomically insert and release reservation
         {
             let mut sessions = self.sessions.lock().await;
@@ -1479,14 +1540,13 @@ impl AcpServer {
         Ok(serde_json::json!({}))
     }
 
-    fn requested_session_cwd(&self, params: &Value, config: &Config) -> PathBuf {
+    fn requested_session_cwd(&self, params: &Value) -> Option<PathBuf> {
         params
             .get("cwd")
             .or_else(|| params.get("workspaceDir"))
             .or_else(|| params.get("workspace_dir"))
             .and_then(|v| v.as_str())
             .map(PathBuf::from)
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| config.data_dir.clone()))
     }
 
     async fn handle_session_prompt(&self, params: &Value, _request_id: &Value) -> RpcResult {
@@ -1731,7 +1791,7 @@ impl AcpServer {
                     TerminalOutcome::Cancelled { persist_error }
                 }
                 Err(failure) => {
-                    let error = failure.error.to_string();
+                    let (error, rpc_error) = acp_turn_failure(&failure.error);
                     // A rejected prompt (e.g. empty/whitespace) fails before
                     // producing any transcript, leaving `new_messages` empty.
                     // Keep the old no-write behavior there so repeating an
@@ -1751,6 +1811,7 @@ impl AcpServer {
                     };
                     TerminalOutcome::Failed {
                         error,
+                        rpc_error,
                         persist_error,
                     }
                 }
@@ -1886,6 +1947,7 @@ impl AcpServer {
             }
             TerminalOutcome::Failed {
                 error,
+                mut rpc_error,
                 persist_error,
             } => {
                 ::zeroclaw_log::record!(
@@ -1897,17 +1959,16 @@ impl AcpServer {
                         })),
                     "ACP session/prompt turn failed"
                 );
-                let message = match persist_error {
-                    Some(detail) => format!(
-                        "Agent turn failed: {error} (its transcript also could not be persisted: {detail})"
-                    ),
-                    None => format!("Agent turn failed: {error}"),
-                };
-                return Err(RpcError {
-                    code: INTERNAL_ERROR,
-                    message,
-                    data: None,
-                });
+                if let Some(detail) = persist_error {
+                    // The turn already failed; say so, and say that its
+                    // transcript did not survive either, without losing the
+                    // localized message the client renders.
+                    rpc_error.message = format!(
+                        "{} (its transcript also could not be persisted: {detail})",
+                        rpc_error.message
+                    );
+                }
+                return Err(rpc_error);
             }
         };
 
@@ -1996,6 +2057,24 @@ impl AcpServer {
     /// persistence; `session/load`/`session/resume` acquire it before reading the
     /// store so a restore waits for an in-flight prompt to commit rather than
     /// seeding a replacement agent from pre-append rows.
+    /// Take the session's finalization gate, arranging for the map entry to be
+    /// reclaimed if the caller leaves without registering a session.
+    ///
+    /// `session_gate` creates the entry on a miss, and a restore has to take it
+    /// *before* the session-limit, already-active, and store-existence checks so
+    /// it cannot read the store underneath an in-flight prompt. Those checks
+    /// reject client-supplied session ids, so without this every rejected id
+    /// would leave a permanent `session_gates` entry that a client can grow
+    /// without bound. Call `disarm` once the session is registered; from then on
+    /// `session/close` owns reclamation.
+    fn restore_gate(&self, session_id: &str) -> RestoreGate<'_> {
+        RestoreGate {
+            server: self,
+            session_id: session_id.to_string(),
+            armed: true,
+        }
+    }
+
     fn session_gate(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.session_gates
             .lock()
@@ -2125,19 +2204,78 @@ impl AcpServer {
     fn sanitize_restored_history(
         messages: Vec<ConversationMessage>,
     ) -> (Vec<ConversationMessage>, Vec<ConversationMessage>, usize) {
-        let mut stored: Vec<ConversationMessage> = messages
+        let stored: Vec<ConversationMessage> = messages
             .into_iter()
             .filter(|message| {
                 !matches!(message, ConversationMessage::Chat(chat) if chat.role == "system")
             })
             .collect();
-        let repaired = Self::repair_incomplete_tool_calls(&mut stored);
-        let seed = stored
+        // The two projections diverge on purpose. `stored` is what the client
+        // replays, so a tool call the turn never answered and an attachment the
+        // provider rejected both stay visible: that activity happened, and
+        // #9333 asks for it to survive reload. `seed` is what the next provider
+        // request is built from, so it is the only one repaired.
+        let mut seed: Vec<ConversationMessage> = stored
             .iter()
             .filter(|message| !Self::is_cancellation_event(message))
             .cloned()
             .collect();
+        let repaired = Self::repair_incomplete_tool_calls(&mut seed);
+        Self::degrade_failed_turn_media(&mut seed);
         (stored, seed, repaired)
+    }
+
+    /// Drop image references from the messages of a turn that ended in failure.
+    ///
+    /// Persisting a failed turn makes its prompt durable, and an image the
+    /// provider rejected is part of that prompt. `resolve_vision_provider`
+    /// keeps historical image markers whenever the active provider advertises
+    /// vision, so without this the concrete attachment that failed the turn is
+    /// attached to every later request on the session: one rejection becomes a
+    /// permanently poisoned transcript. The reference is replaced with a note
+    /// rather than deleted so the model still sees that something was attached.
+    ///
+    /// A failed turn is the run of messages ending at the `turn-failed` marker
+    /// and beginning at the user prompt that opened it. Only the provider seed
+    /// is touched; the stored transcript still replays the image to the client.
+    fn degrade_failed_turn_media(seed: &mut [ConversationMessage]) {
+        let marker = zeroclaw_runtime::i18n::get_required_cli_string("turn-failed");
+        let omitted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-failed-attachment-omitted");
+        let is_failure_marker = |message: &ConversationMessage| {
+            matches!(message, ConversationMessage::Chat(chat)
+                if chat.role == "assistant" && chat.content == marker)
+        };
+        let is_user_prompt = |message: &ConversationMessage| matches!(message, ConversationMessage::Chat(chat) if chat.role == "user");
+
+        let failure_marks: Vec<usize> = seed
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| is_failure_marker(message))
+            .map(|(index, _)| index)
+            .collect();
+
+        for end in failure_marks {
+            let start = seed[..end]
+                .iter()
+                .rposition(is_user_prompt)
+                .unwrap_or_default();
+            for message in &mut seed[start..end] {
+                let ConversationMessage::Chat(chat) = message else {
+                    continue;
+                };
+                let (cleaned, refs) =
+                    zeroclaw_providers::multimodal::parse_image_markers(&chat.content);
+                if refs.is_empty() {
+                    continue;
+                }
+                chat.content = if cleaned.is_empty() {
+                    omitted.clone()
+                } else {
+                    format!("{cleaned}\n\n{omitted}")
+                };
+            }
+        }
     }
 
     /// Repair an interrupted native-tool exchange in a restored ACP transcript
@@ -3068,8 +3206,62 @@ fn history_notifications_for_message(
 struct RpcError {
     code: i32,
     message: String,
-    #[allow(dead_code)] // JSON-RPC spec field, used for structured error data
+    /// Reserved for JSON-RPC structured error data. The ACP writer currently
+    /// deliberately omits it, so terminal-turn failures use it internally to
+    /// retain their stable diagnostic while `message` carries localized text.
     data: Option<Value>,
+}
+
+impl RpcError {
+    fn diagnostic(&self) -> &str {
+        self.data
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap_or(&self.message)
+    }
+}
+
+/// Keep the stable diagnostic used by logs separate from the localized text
+/// exposed through the ACP JSON-RPC boundary.
+fn acp_turn_failure(error: &anyhow::Error) -> (String, RpcError) {
+    let diagnostic = error.to_string();
+    let user_message = zeroclaw_runtime::agent::terminal_completion_error_message(error, None);
+    (
+        diagnostic.clone(),
+        acp_turn_failure_from_parts(&diagnostic, user_message.as_deref()),
+    )
+}
+
+fn acp_turn_failure_from_parts(diagnostic: &str, user_message: Option<&str>) -> RpcError {
+    RpcError {
+        code: INTERNAL_ERROR,
+        message: user_message
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Agent turn failed: {diagnostic}")),
+        data: Some(Value::String(diagnostic.to_owned())),
+    }
+}
+
+/// Reclaims a finalization-gate entry a restore created but never got to use.
+/// See [`AcpServer::restore_gate`].
+struct RestoreGate<'a> {
+    server: &'a AcpServer,
+    session_id: String,
+    armed: bool,
+}
+
+impl RestoreGate<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for RestoreGate<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.server.reclaim_session_gate(&self.session_id);
+        }
+    }
 }
 
 type RpcResult = std::result::Result<Value, RpcError>;
@@ -3130,6 +3322,180 @@ mod tests {
                 reasoning_content: None,
             })
         }
+    }
+
+    use zeroclaw_api::model_provider::ModelProvider;
+
+    struct EmptyTerminalProvider;
+
+    #[async_trait]
+    impl ModelProvider for EmptyTerminalProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for EmptyTerminalProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "EmptyTerminalProvider"
+        }
+    }
+
+    fn acp_test_agent(workspace_dir: std::path::PathBuf) -> Agent {
+        Agent::builder()
+            .model_provider(Box::new(EmptyTerminalProvider))
+            .tools(Vec::new())
+            .observer(Arc::from(zeroclaw_runtime::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(
+                zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .workspace_dir(workspace_dir)
+            .exclude_memory(true)
+            .build()
+            .expect("test agent must build")
+    }
+
+    #[test]
+    fn acp_terminal_failure_keeps_diagnostic_out_of_localized_delivery() {
+        let diagnostic = "provider completed without final text or tool calls";
+        let localized = "Réponse terminale invalide.";
+
+        let error = acp_turn_failure_from_parts(diagnostic, Some(localized));
+
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(error.message, "Réponse terminale invalide.");
+        assert!(
+            !error.message.contains(diagnostic),
+            "ACP must not expose the stable diagnostic when Fluent supplies delivery text"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_projects_a_terminal_failure_through_acp_rpc() {
+        let cwd = tempfile::tempdir().unwrap();
+        let server = Arc::new(AcpServer::new(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+        ));
+        let session = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = session["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session must be registered");
+        session.lock().await.agent = acp_test_agent(cwd.path().to_path_buf());
+
+        let error = server
+            .handle_session_prompt(
+                &serde_json::json!({"sessionId": session_id, "prompt": "hello"}),
+                &serde_json::json!(1),
+            )
+            .await
+            .expect_err("a terminal empty completion must become an ACP error");
+
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert_eq!(
+            error.message,
+            zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
+        );
+        assert_ne!(
+            error.message, "provider completed without final text or tool calls",
+            "ACP wire delivery must not expose the stable diagnostic"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_line_serializes_terminal_failure_without_relogging_localized_text() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(8);
+        let server = Arc::new(AcpServer::new_with_writer(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+        ));
+        let session = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": cwd.path().to_string_lossy(),
+                "agentAlias": "test-agent"
+            }))
+            .await
+            .expect("session/new must succeed");
+        let session_id = session["sessionId"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(&session_id)
+            .cloned()
+            .expect("session must be registered");
+        session.lock().await.agent = acp_test_agent(cwd.path().to_path_buf());
+
+        server
+            .process_line(
+                &serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 7,
+                    "method": "session/prompt",
+                    "params": {"sessionId": session_id, "prompt": "hello"}
+                })
+                .to_string(),
+            )
+            .await;
+        let wire = tokio::time::timeout(Duration::from_secs(5), writer_rx.recv())
+            .await
+            .expect("serialized ACP response deadline")
+            .expect("serialized ACP response");
+        let response: Value = serde_json::from_str(&wire).expect("valid JSON-RPC");
+        let error = &response["error"];
+
+        assert_eq!(error["code"], INTERNAL_ERROR);
+        assert_eq!(
+            error["message"],
+            zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
+        );
+        assert_ne!(
+            error["message"], "provider completed without final text or tool calls",
+            "only the localized delivery projection may reach the ACP wire"
+        );
+
+        let error = acp_turn_failure_from_parts(
+            "provider completed without final text or tool calls",
+            Some("Réponse terminale invalide."),
+        );
+        assert_eq!(
+            error.diagnostic(),
+            "provider completed without final text or tool calls"
+        );
+        assert_eq!(error.message, "Réponse terminale invalide.");
     }
 
     /// Upper bound for "this must not deadlock" waits in these tests.
@@ -3306,30 +3672,187 @@ mod tests {
     }
 
     #[test]
-    fn session_new_defaults_to_launch_cwd_when_client_omits_cwd() {
+    fn session_new_omits_cwd_when_client_does_not_specify() {
         let config = Config {
             data_dir: PathBuf::from("/not/the/project"),
             ..Default::default()
         };
         let server = AcpServer::new(config, AcpServerConfig::default());
-        let expected = std::env::current_dir().unwrap();
-        let config = server.config_snapshot();
 
-        assert_eq!(
-            server.requested_session_cwd(&serde_json::json!({}), &config),
-            expected
-        );
+        assert_eq!(server.requested_session_cwd(&serde_json::json!({})), None);
     }
 
     #[test]
     fn session_new_respects_client_cwd_when_present() {
         let server = AcpServer::new(Config::default(), AcpServerConfig::default());
         let cwd = std::env::current_dir().unwrap();
-        let config = server.config_snapshot();
 
         assert_eq!(
-            server.requested_session_cwd(&serde_json::json!({"cwd": cwd}), &config),
-            cwd
+            server.requested_session_cwd(&serde_json::json!({"cwd": cwd})),
+            Some(cwd),
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_ignores_cwd_when_equal_to_install_root() {
+        // When a client passes cwd = '.' (resolved to the install root), the
+        // session must still use the per-agent workspace — not the daemon cwd.
+        let cwd = tempfile::tempdir().unwrap();
+        // A fully-wired config (valid `anthropic.default` provider + `test-agent`)
+        // so agent construction succeeds. A failing construction would emit the
+        // shared "ACP session/new failed" log line and race the attribution test
+        // that matches events by message text alone.
+        let mut config = make_test_config(cwd.path());
+        // Pin the install root to the temp dir (parent of config_path) so
+        // install_root_dir() resolves to a real, canonicalizable directory.
+        config.config_path = cwd.path().join("config.toml");
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let snapshot = server.config_snapshot();
+        let install_root = snapshot.install_root_dir();
+        let expected_workspace = snapshot.agent_workspace_dir("test-agent");
+
+        // Pass install_root as cwd — simulates what Thunderbolt does with cwd: '.'
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": install_root.to_string_lossy(),
+                "agentAlias": "test-agent",
+            }))
+            .await
+            .expect("session/new must succeed");
+
+        let session_workspace = result["workspaceDir"].as_str().unwrap();
+
+        // Positive contract: workspaceDir is exactly the per-agent workspace.
+        // Asserting the concrete value (not merely "!= install_root") is what
+        // makes this a real regression test — the per-agent workspace is a
+        // subdirectory of the install root, so an inequality check passes even
+        // when the guard is removed and cannot detect the regression.
+        assert_eq!(
+            session_workspace,
+            expected_workspace.to_string_lossy(),
+            "cwd equal to install_root must resolve to the per-agent workspace"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_new_pins_explicit_subdir_under_install_root() {
+        // A client that explicitly narrows the session to a subdirectory under
+        // the install root must have that exact directory honored as the
+        // file-access boundary. Only a cwd equal to the install root itself is
+        // treated as the '.' placeholder; anything narrower must NOT be widened
+        // back to the whole per-agent workspace.
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = make_test_config(cwd.path());
+        config.config_path = cwd.path().join("config.toml");
+        let server = AcpServer::new(config, AcpServerConfig::default());
+        let snapshot = server.config_snapshot();
+        let install_root = snapshot.install_root_dir();
+        let agent_workspace = snapshot.agent_workspace_dir("test-agent");
+
+        // A real, canonicalizable subdirectory under the install root that is
+        // NOT the per-agent workspace, so the two outcomes are distinguishable.
+        let explicit_subdir = install_root.join("project-subdir");
+        std::fs::create_dir_all(&explicit_subdir).unwrap();
+        let expected = std::fs::canonicalize(&explicit_subdir).unwrap();
+        assert_ne!(
+            expected,
+            std::fs::canonicalize(&agent_workspace).unwrap_or(agent_workspace),
+            "test setup: the explicit subdir must differ from the agent workspace"
+        );
+
+        let result = server
+            .handle_session_new(&serde_json::json!({
+                "cwd": explicit_subdir.to_string_lossy(),
+                "agentAlias": "test-agent",
+            }))
+            .await
+            .expect("session/new must succeed");
+
+        let session_workspace = result["workspaceDir"].as_str().unwrap();
+        assert_eq!(
+            session_workspace,
+            expected.to_string_lossy(),
+            "an explicit subdirectory under the install root must be honored \
+             exactly, not widened to the per-agent workspace"
+        );
+    }
+
+    /// Front-door proof for the CLI stdio surface. The tests above call
+    /// `handle_session_new` directly; this one drives the real stdio serve loop
+    /// (`serve_reader`, the exact framing loop `run()` uses for `zeroclaw acp`)
+    /// through an in-memory pipe, feeding newline-delimited JSON-RPC just as an
+    /// editor/IDE ACP client would over the process's stdin. An omitted-`cwd`
+    /// `session/new` must return the per-agent workspace — the behavior this PR
+    /// introduces — not the daemon process CWD.
+    #[tokio::test]
+    async fn stdio_front_door_omitted_cwd_uses_agent_workspace() {
+        use tokio::io::AsyncWriteExt;
+
+        let cwd = tempfile::tempdir().unwrap();
+        let mut config = make_test_config(cwd.path());
+        // Pin config_path so `agent_workspace_dir` resolves under a real,
+        // canonicalizable install root.
+        config.config_path = cwd.path().join("config.toml");
+        let expected_ws = config
+            .agent_workspace_dir("test-agent")
+            .to_string_lossy()
+            .into_owned();
+
+        // The server writes response frames to `writer_rx`; no store, so
+        // `session/new` skips persistence.
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer(
+            config,
+            AcpServerConfig::default(),
+            writer_tx,
+        ));
+
+        // In-memory stdin: the server reads `server_stdin`; the test writes
+        // framed JSON-RPC to `client`.
+        let (mut client, server_stdin) = tokio::io::duplex(4096);
+        let reader = Arc::clone(&server);
+        let reader_task =
+            zeroclaw_spawn::spawn!(async move { reader.serve_reader(server_stdin).await });
+
+        client
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        client
+            .write_all(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"session/new\",\
+                  \"params\":{\"agentAlias\":\"test-agent\"}}\n",
+            )
+            .await
+            .unwrap();
+        client.flush().await.unwrap();
+
+        let workspace_dir = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(frame) = writer_rx.recv().await {
+                let value: Value = match serde_json::from_str(&frame) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if value.get("id").and_then(|i| i.as_i64()) == Some(2) {
+                    if let Some(err) = value.get("error") {
+                        panic!("session/new returned an error: {err}");
+                    }
+                    return value["result"]["workspaceDir"].as_str().map(String::from);
+                }
+            }
+            None
+        })
+        .await
+        .expect("session/new response should arrive before timeout");
+
+        drop(client); // EOF → serve_reader returns
+        let _ = reader_task.await;
+
+        assert_eq!(
+            workspace_dir.as_deref(),
+            Some(expected_ws.as_str()),
+            "omitted-cwd session/new over the real stdio serve loop must return \
+             the per-agent workspace, not the daemon CWD"
         );
     }
 
@@ -6203,6 +6726,233 @@ mod tests {
                 "resumed provider history leaked an unmatched call / cancellation: {message:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn session_load_replays_incomplete_call_but_seeds_repaired_history() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
+
+        // #9333 splits the two projections: the failed turn's visible activity
+        // must survive reload for the client, while only provider-facing history
+        // drops the unsafe partial exchange. Repairing the replay source too
+        // would delete the tool call the user already saw.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-replay-vs-seed";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::failed_turn_transcript(vec![
+                    ConversationMessage::Chat(ChatMessage::user("inspect the workspace")),
+                    ConversationMessage::AssistantToolCalls {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "toolu_incomplete".to_string(),
+                            name: "shell".to_string(),
+                            arguments: "{}".to_string(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                ]),
+            )
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+
+        let mut notifications = Vec::new();
+        while let Ok(msg) = writer_rx.try_recv() {
+            notifications.push(msg);
+        }
+        assert!(
+            notifications.iter().any(|n| n.contains("toolu_incomplete")),
+            "the client must still see the tool call the failed turn produced: {notifications:?}"
+        );
+
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .expect("loaded session must be active");
+        session
+            .lock()
+            .await
+            .agent
+            .set_model_provider(Box::new(RecordingNativeProvider {
+                requests: Arc::clone(&requests),
+            }));
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "continue" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        for message in &requests[0] {
+            assert!(
+                !message.content.contains("toolu_incomplete"),
+                "the provider seed must not carry the unmatched call: {message:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn session_load_replays_rejected_image_but_keeps_it_out_of_the_seed() {
+        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+
+        // A turn whose image the provider rejected is now durable. If the seed
+        // keeps the marker, a vision-capable provider re-attaches that same
+        // image to every later prompt and the session stays broken.
+        let cwd = tempfile::tempdir().unwrap();
+        let image_path = cwd.path().join("rejected.png");
+        std::fs::write(&image_path, b"not really a png").unwrap();
+        let marker = format!("look at this [IMAGE:{}]", image_path.display());
+
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-rejected-image";
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+        store
+            .append_turn(
+                session_id,
+                &AcpServer::failed_turn_transcript(vec![ConversationMessage::Chat(
+                    ChatMessage::user(marker.clone()),
+                )]),
+            )
+            .unwrap();
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+        server
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed");
+
+        let mut notifications = Vec::new();
+        while let Ok(msg) = writer_rx.try_recv() {
+            notifications.push(msg);
+        }
+        assert!(
+            notifications.iter().any(|n| n.contains("rejected.png")),
+            "the client must still replay the attachment the user sent: {notifications:?}"
+        );
+
+        let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let session = server
+            .sessions
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .expect("loaded session must be active");
+        session
+            .lock()
+            .await
+            .agent
+            .set_model_provider(Box::new(RecordingNativeProvider {
+                requests: Arc::clone(&requests),
+            }));
+        server
+            .handle_session_prompt(
+                &serde_json::json!({ "sessionId": session_id, "prompt": "just text now" }),
+                &serde_json::json!(2),
+            )
+            .await
+            .expect("the next prompt must reach the provider");
+
+        let requests = requests.lock();
+        assert_eq!(requests.len(), 1, "expected exactly one provider request");
+        for message in &requests[0] {
+            assert!(
+                !message.content.contains("rejected.png"),
+                "the rejected attachment must not be resent: {message:?}"
+            );
+        }
+        let omitted =
+            zeroclaw_runtime::i18n::get_required_cli_string("turn-failed-attachment-omitted");
+        assert!(
+            requests[0]
+                .iter()
+                .any(|message| message.content.contains(&omitted)),
+            "the seed should say an attachment was dropped, not silently lose it: {:?}",
+            requests[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_restore_does_not_leak_a_finalization_gate() {
+        // `session_gate` creates its entry on a miss and a restore must take it
+        // before the existence check, so a client that asks for session ids that
+        // do not exist could otherwise grow `session_gates` without bound.
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let server = Arc::new(AcpServer::new_with_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            Arc::clone(&store),
+        ));
+
+        for id in ["ghost-load-1", "ghost-load-2"] {
+            server
+                .handle_session_load(&serde_json::json!({
+                    "sessionId": id,
+                    "cwd": cwd.path().to_string_lossy()
+                }))
+                .await
+                .expect_err("loading an unknown session must fail");
+        }
+        server
+            .handle_session_resume(&serde_json::json!({
+                "sessionId": "ghost-resume",
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect_err("resuming an unknown session must fail");
+
+        assert!(
+            server.session_gates.lock().unwrap().is_empty(),
+            "rejected restores left gates behind: {:?}",
+            server
+                .session_gates
+                .lock()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -174,6 +174,16 @@ impl ProxyConfigTool {
         })
     }
 
+    fn dns_pinned_tool_warnings(
+        config: &Config,
+    ) -> Vec<zeroclaw_config::validation_warnings::ValidationWarning> {
+        config
+            .collect_warnings()
+            .into_iter()
+            .filter(|warning| warning.code == "proxy_conflicts_with_dns_pinned_tools")
+            .collect()
+    }
+
     fn handle_get(&self) -> anyhow::Result<ToolResult> {
         let file_proxy = self.load_config_without_env()?.proxy;
         let runtime_proxy = runtime_proxy_config();
@@ -195,10 +205,14 @@ impl ProxyConfigTool {
             output: serde_json::to_string_pretty(&json!({
                 "supported_service_keys": ProxyConfig::supported_service_keys(),
                 "supported_selectors": ProxyConfig::supported_service_selectors(),
+                "dns_pinned_tool_constraints": {
+                    "tool.http_request": "Cannot be proxied: selecting this key makes http_request fail closed so its validated DNS answer remains pinned.",
+                    "tool.web_fetch": "Cannot be proxied and has no exact service key; selecting tool.* makes the standard web_fetch request fail closed."
+                },
                 "usage_example": {
                     "action": "set",
                     "scope": "services",
-                    "services": ["model_provider.openai", "tool.http_request", "channel.telegram"]
+                    "services": ["model_provider.openai", "tool.browser", "channel.telegram"]
                 }
             }))?
             .into(),
@@ -306,6 +320,7 @@ impl ProxyConfigTool {
         proxy.validate()?;
 
         cfg.proxy = proxy.clone();
+        let warnings = Self::dns_pinned_tool_warnings(&cfg);
         cfg.save().await?;
         set_runtime_proxy_config(proxy.clone());
 
@@ -321,6 +336,7 @@ impl ProxyConfigTool {
                 "message": "Proxy configuration updated",
                 "proxy": Self::proxy_json(&proxy),
                 "environment": Self::env_snapshot(),
+                "warnings": warnings,
             }))?
             .into(),
             error: None,
@@ -357,7 +373,7 @@ impl ProxyConfigTool {
 
     fn handle_apply_env(&self) -> anyhow::Result<ToolResult> {
         let cfg = self.load_config_without_env()?;
-        let proxy = cfg.proxy;
+        let proxy = cfg.proxy.clone();
         proxy.validate()?;
 
         if !proxy.enabled {
@@ -373,6 +389,7 @@ impl ProxyConfigTool {
 
         proxy.apply_to_process_env();
         set_runtime_proxy_config(proxy.clone());
+        let warnings = Self::dns_pinned_tool_warnings(&cfg);
 
         Ok(ToolResult {
             success: true,
@@ -380,6 +397,7 @@ impl ProxyConfigTool {
                 "message": "Proxy environment variables applied",
                 "proxy": Self::proxy_json(&proxy),
                 "environment": Self::env_snapshot(),
+                "warnings": warnings,
             }))?
             .into(),
             error: None,
@@ -537,6 +555,21 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("model_provider.openai"));
         assert!(result.output.contains("tool.http_request"));
+        let output: Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(
+            output["dns_pinned_tool_constraints"]["tool.http_request"],
+            "Cannot be proxied: selecting this key makes http_request fail closed so its validated DNS answer remains pinned."
+        );
+        assert!(
+            output["dns_pinned_tool_constraints"]["tool.web_fetch"]
+                .as_str()
+                .unwrap()
+                .contains("tool.*")
+        );
+        assert_eq!(
+            output["usage_example"]["services"],
+            json!(["model_provider.openai", "tool.browser", "channel.telegram"])
+        );
     }
 
     #[tokio::test]
@@ -579,6 +612,18 @@ mod tests {
             .await
             .unwrap();
         assert!(set_result.success, "{:?}", set_result.error);
+        let set_output: Value = serde_json::from_str(&set_result.output).unwrap();
+        assert_eq!(
+            set_output["warnings"][0]["code"],
+            "proxy_conflicts_with_dns_pinned_tools"
+        );
+        assert_eq!(set_output["warnings"][0]["path"], "proxy.services");
+        assert!(
+            set_output["warnings"][0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("http_request")
+        );
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         assert!(get_result.success);

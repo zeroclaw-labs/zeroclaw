@@ -1,9 +1,9 @@
 # FND-005: Contribution Culture: Human Collaboration, AI Partnership, and Team Growth
 
-> Starting v0.7.0 · Type: Culture · Rev. 1
+> Starting v0.7.0 · Type: Culture · Rev. 2
 >
-> **Canonical reference** · Ratified by the team · Rev. 1
-> Discussion thread and full revision history: [#5615](https://github.com/zeroclaw-labs/zeroclaw/issues/5615)
+> **Canonical reference** · Ratified by the team · Rev. 2
+> Original RFC discussion: [#5615](https://github.com/zeroclaw-labs/zeroclaw/issues/5615)
 
 ---
 
@@ -70,6 +70,15 @@ build, the examples we set, and the intentionality we bring to it.
    - [What this means for your career](#what-this-means-for-your-career)
 5. [The feedback taxonomy](#5-the-feedback-taxonomy)
 6. [A note to reviewers and mentors](#6-a-note-to-reviewers-and-mentors)
+
+---
+
+## Revision History
+
+| Rev | Date | Summary |
+|---|---|---|
+| 1 | 2026-04-11 | Initial draft |
+| 2 | 2026-05-09 | Aligned the review-weight contract with the maintained PR review protocol, including resolved findings ([#6473](https://github.com/zeroclaw-labs/zeroclaw/pull/6473)) |
 
 ---
 

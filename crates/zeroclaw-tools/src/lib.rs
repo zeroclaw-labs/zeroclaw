@@ -20,6 +20,7 @@ pub mod cli_discovery;
 pub mod cloud_ops;
 pub mod cloud_patterns;
 pub mod codex_cli;
+pub mod coding_cli;
 pub mod composio;
 pub mod content_search;
 pub mod data_management;
@@ -87,6 +88,9 @@ pub mod web_fetch;
 pub mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod wrappers;
+
+#[cfg(all(test, unix))]
+mod coding_agent_budget_tests;
 
 pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_store",

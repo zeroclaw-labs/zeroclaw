@@ -163,7 +163,6 @@ impl Tool for ImageInfoTool {
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(path) => path,
             Err(e) => {
-                let _ = self.security.record_action();
                 let error = if e.kind() == std::io::ErrorKind::NotFound {
                     format!("File not found: {path_str}")
                 } else {
@@ -727,7 +726,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_file_probe_consumes_action_budget() {
+    async fn wrapped_missing_file_probe_preserves_action_budget() {
         let root = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
@@ -736,12 +735,16 @@ mod tests {
             max_actions_per_hour: 1,
             ..SecurityPolicy::default()
         });
-        let tool = ImageInfoTool::new(security.clone());
+        let tool = wrapped_tool_with_security(security.clone());
 
         assert!(!security.is_rate_limited());
         let result = tool.execute(json!({"path": "missing.png"})).await.unwrap();
 
         assert!(!result.success);
+        assert!(
+            security.record_action(),
+            "failed call must release its reservation"
+        );
         assert!(security.is_rate_limited());
     }
 

@@ -6,6 +6,7 @@ zc-pane-chat = Chat
 zc-pane-logs = Logs
 zc-pane-quickstart = Quickstart
 zc-pane-sop = SOPs
+zc-sop-runs-stale = SOP run status is stale. Retrying…
 zc-chrome-summary-sessions = sessions
 zc-chrome-summary-ram = ram
 zc-chrome-summary-cpu = cpu
@@ -174,6 +175,9 @@ zc-doctor-detail-title = Detail
 zc-doctor-no-selection = No diagnostic selected
 zc-doctor-label-message = Message
 zc-doctor-help-mouse = Mouse: click filter/select, scroll wheel
+zc-doctor-error-daemon-timeout = The doctor check timed out. The daemon may be busy, unreachable, or processing a long-running request. Try again or check daemon connectivity.
+zc-doctor-partial-banner = ⚠ Partial results — model probing timed out
+zc-doctor-partial-hint = Some provider catalogs could not be reached. Results from config, workspace, and daemon checks are shown below. Press the refresh key to retry.
 
 zc-dashboard-tab-overview = Overview
 zc-dashboard-tab-sessions = Sessions
@@ -209,8 +213,8 @@ zc-dashboard-label-endpoint = Endpoint
 zc-dashboard-label-workspace = Workspace
 zc-dashboard-label-code-cwd = Code CWD
 zc-dashboard-label-chat-cwd = Chat CWD
-zc-dashboard-label-memory = Memory
-zc-dashboard-label-cpu = CPU
+zc-dashboard-label-daemon-memory = Daemon Memory
+zc-dashboard-label-daemon-cpu = Daemon CPU
 zc-dashboard-label-insecure-tls = ⚠ unverified TLS — certificate not checked
 zc-dashboard-label-uptime = Uptime
 zc-dashboard-label-pid = PID
@@ -467,6 +471,7 @@ zc-chat-clipboard-agent = Agent: { $text }
 zc-chat-copied-clipboard = Copied to clipboard
 zc-chat-copy-message = [Copy]
 zc-chat-copy-message-copied = [Copied]
+zc-chat-context-menu-copy = Copy
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section
@@ -562,3 +567,5 @@ zc-config-footer-action-new-line = new line
 ## Inline hint shown on the selected config field row. The { $keys } placeholder
 ## is resolved from the current keybinding for ConfigTabAction::Enter.
 zc-config-field-edit-hint = { $keys } → press to edit
+
+zc-doctor-log-path = log: { $path }

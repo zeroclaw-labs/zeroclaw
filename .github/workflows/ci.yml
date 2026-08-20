@@ -24,6 +24,24 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
 
+# ── Runner selection: closed Blacksmith toggle (compile-heavy jobs) ─────────
+# The ten Rust-compiling jobs below (lint, build, check, check-plugin-backends,
+# check-32bit, bench, test, msrv, parallel-runtime-test, installer-drift) and the
+# Linux `build` matrix entry pick their runner
+# from a single boolean Actions variable, mapped here to two pinned choices only:
+#   • CI_USE_BLACKSMITH == 'true'        → blacksmith-8vcpu-ubuntu-2404 (pinned in-workflow)
+#   • any other value / unset (default)  → GitHub-hosted ubuntu-latest (today's behavior)
+# The label is hard-coded in this reviewed workflow, so a mutable repo variable can only
+# flip between these two vetted runners — it can never redirect a required check to an
+# arbitrary runner without a `.github/**` review. An unexpected value fails safe to
+# ubuntu-latest. Only the boolean toggle is operator-controlled.
+#
+# PRECONDITION before setting CI_USE_BLACKSMITH=true: an org admin must DISABLE Blacksmith
+# triggerer SSH (Blacksmith → Settings → Features → SSH Access) so a green required check
+# attests only the reviewed commit, and that control must be attested in review. Requires
+# the Blacksmith GitHub App installed on the org; never set the toggle while the App is
+# uninstalled or these jobs queue with no runner (~24h) instead of failing fast.
+
 jobs:
   # ── Fast serial gate: fail formatting errors before burning compute ───────
 
@@ -81,6 +99,12 @@ jobs:
       - name: Test translation release submodule handling
         run: scripts/release/refresh-translations.test.sh
 
+      - name: Test monthly outdated result classification
+        run: bash scripts/ci/monthly_outdated_result.test.sh
+
+      - name: Test release tool installer mappings
+        run: bash scripts/ci/install_release_tool.test.sh
+
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
 
@@ -89,7 +113,9 @@ jobs:
   lint:
     name: Lint
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
+    # Measured green run on b86b1737: rustdoc step 2m22s, total Lint 10m40s
+    # (under the prior 15m ceiling). Keep 15 unless a cold-cache run proves more.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -99,58 +125,31 @@ jobs:
         with:
           toolchain: 1.96.1
           components: clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
         run: bash scripts/ci/apt_install.sh libudev-dev ripgrep
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
+      - name: Clippy runner contract tests
+        run: bash scripts/ci/run_clippy.test.sh
       - name: Clippy
         shell: bash
         run: |
-          set +e
-          cargo_log="${RUNNER_TEMP}/cargo-clippy.log"
-          SECONDS=0
-          cargo clippy \
-            --workspace \
-            --exclude zeroclaw-desktop \
-            --all-targets \
-            --features ci-all \
-            -- -D warnings 2>&1 | tee "$cargo_log"
-          cargo_status=${PIPESTATUS[0]}
-          duration_seconds=$SECONDS
-          set -e
-
-          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
-          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
-          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
-          cache_hit="${RUST_CACHE_HIT:-unknown}"
-          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
-
-          {
-            echo "### Lint diagnostics"
-            echo ""
-            echo "| Field | Value |"
-            echo "| --- | --- |"
-            echo "| Runner OS | \`${{ runner.os }}\` |"
-            echo "| Rust cache exact hit | \`${cache_hit}\` |"
-            echo "| Clippy duration | \`${duration_seconds}s\` |"
-            echo "| Clippy status | \`${cargo_status}\` |"
-            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
-            echo "| Total compile lines | \`${total_compiles}\` |"
-            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
-          } >> "$summary_file"
-
-          exit "$cargo_status"
+          bash scripts/ci/run_clippy.sh \
+            --scope workspace \
+            --summary-title "Lint diagnostics" \
+            --log-name cargo-clippy.log
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
-      - name: Config-write isolation guard
-        run: cargo test --test architecture tests_that_persist_config_isolate_the_path
-      - name: Fluent coverage guard (no bare user-facing strings)
-        run: cargo test --test architecture user_facing_strings_route_through_fluent
+      - name: Rustdoc warnings gate
+        # Exclude zeroclaw-desktop: same surface as xtask build_api / docs-deploy.
+        # Desktop pulls glib-sys on Linux; the lint runner does not install GTK libs.
+        run: cargo doc --no-deps --workspace --exclude zeroclaw-desktop
       - name: Comment hygiene gate (no issue refs / review notes / truncation artifacts)
         run: |
           bash scripts/ci/comment_hygiene_gate.test.sh
@@ -191,7 +190,7 @@ jobs:
               ;;
           esac
 
-          if grep -Eq '^(crates/zeroclaw-tools/|\.github/workflows/(ci|cross-platform-clippy)\.yml$)' "$changed_files"; then
+          if grep -Eq '^(crates/zeroclaw-tools/|scripts/ci/run_clippy\.sh$|\.github/workflows/(ci|cross-platform-clippy)\.yml$)' "$changed_files"; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -210,7 +209,7 @@ jobs:
           toolchain: 1.96.1
           components: clippy
           targets: x86_64-pc-windows-msvc
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -221,42 +220,11 @@ jobs:
       - name: Clippy
         shell: bash
         run: |
-          set +e
-          cargo_log="${RUNNER_TEMP}/cargo-clippy-windows-tools.log"
-          SECONDS=0
-          cargo clippy \
-            -p zeroclaw-tools \
-            --all-targets \
-            --all-features \
+          bash scripts/ci/run_clippy.sh \
+            --scope tools \
             --target x86_64-pc-windows-msvc \
-            --no-deps \
-            -- -D warnings 2>&1 | tee "$cargo_log"
-          cargo_status=${PIPESTATUS[0]}
-          duration_seconds=$SECONDS
-          set -e
-
-          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
-          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
-          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
-          cache_hit="${RUST_CACHE_HIT:-unknown}"
-          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
-
-          {
-            echo "### Targeted Windows Clippy diagnostics"
-            echo ""
-            echo "| Field | Value |"
-            echo "| --- | --- |"
-            echo "| Target | \`x86_64-pc-windows-msvc\` |"
-            echo "| Runner OS | \`${{ runner.os }}\` |"
-            echo "| Rust cache exact hit | \`${cache_hit}\` |"
-            echo "| Clippy duration | \`${duration_seconds}s\` |"
-            echo "| Clippy status | \`${cargo_status}\` |"
-            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
-            echo "| Total compile lines | \`${total_compiles}\` |"
-            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
-          } >> "$summary_file"
-
-          exit "$cargo_status"
+            --summary-title "Targeted Windows Clippy diagnostics" \
+            --log-name cargo-clippy-windows-tools.log
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
 
@@ -271,7 +239,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
             target: x86_64-unknown-linux-gnu
             cmd: build
             label: Build
@@ -289,14 +257,15 @@ jobs:
         with:
           toolchain: 1.96.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH == 'true' && matrix.target == 'x86_64-unknown-linux-gnu' }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Install mold linker
+      - name: Install Linux system dependencies
         if: runner.os == 'Linux'
-        run: bash scripts/ci/apt_install.sh mold
+        run: bash scripts/ci/apt_install.sh mold libasound2-dev
       - name: Ensure web/dist placeholder exists
         shell: bash
         run: mkdir -p web/dist && touch web/dist/.gitkeep
@@ -337,12 +306,25 @@ jobs:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Check voice-wake
+        if: runner.os != 'Linux'
+        shell: bash
+        run: cargo check --locked -p zeroclaw-channels --no-default-features --features voice-wake --target ${{ matrix.target }}
+      - name: Test voice-wake
+        if: runner.os == 'Linux'
+        shell: bash
+        run: cargo test --locked -p zeroclaw-channels --no-default-features --features voice-wake --target ${{ matrix.target }} --lib voice_wake
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   check:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     strategy:
       fail-fast: false
       matrix:
@@ -350,17 +332,29 @@ jobs:
           - name: all features
             args: --features ci-all
             sys_deps: libudev-dev
+            rustflags: ""
           - name: no default features
-            args: --no-default-features
+            args: --workspace --exclude zeroclaw-desktop --no-default-features
             sys_deps: ""
+            rustflags: -D warnings
+          # Lint already denies warnings with --all-targets, but only at
+          # --features ci-all. Feature-gated call sites are live there, so a
+          # helper whose gate is wider than its callers reads as used and the
+          # drift lands green. This row compiles the test targets on the
+          # default surface, where that mismatch is visible.
+          - name: default features, all targets
+            args: --workspace --exclude zeroclaw-desktop --all-targets
+            sys_deps: ""
+            rustflags: -D warnings
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
@@ -374,7 +368,7 @@ jobs:
   check-plugin-backends:
     name: Check (${{ matrix.name }})
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
@@ -395,7 +389,7 @@ jobs:
         run: |
           base="${{ github.event.pull_request.base.sha }}"
           if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^wit/|^Cargo\.(toml|lock)$'; then
+          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^wit/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
@@ -407,9 +401,10 @@ jobs:
       - name: Install channel plugin fixture target
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: rustup target add wasm32-wasip2
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         if: steps.changed.outputs.run == 'true'
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check
@@ -418,11 +413,14 @@ jobs:
       - name: Run channel plugin component test
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e
+      - name: Run plugins lib unit tests
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
 
   msrv:
     name: MSRV (declared floor)
-    needs: [fmt]
-    runs-on: ubuntu-latest
+    needs: [fmt, installer-drift]
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -443,25 +441,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install system dependencies
         run: bash scripts/ci/apt_install.sh libudev-dev
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
-      # ci-all is the load-bearing one: the container variant that regressed
-      # compiles the widest feature set, and a default-features pass would not
-      # have caught it.
+      # Consume the exact container kitchen-sink selection resolved by the
+      # installer-drift job so the declared-floor check cannot drift from
+      # Containerfile or rebuild the generator under the MSRV toolchain.
       - name: Check at the declared MSRV
         run: |
-          cargo check --locked --workspace --exclude zeroclaw-desktop --features ci-all
+          cargo check --locked --workspace --exclude zeroclaw-desktop \
+            --no-default-features \
+            --features "${{ needs.installer-drift.outputs.all_features }}"
 
   check-32bit:
     name: Check (32-bit)
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -469,9 +470,10 @@ jobs:
         with:
           toolchain: 1.96.1
           targets: i686-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Install 32-bit system libraries
@@ -484,16 +486,17 @@ jobs:
   bench:
     name: Benchmarks Compile
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Ensure web/dist placeholder exists
@@ -538,7 +541,7 @@ jobs:
   test:
     name: Test
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -546,9 +549,10 @@ jobs:
         with:
           toolchain: 1.96.1
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check firmware protocol crate
@@ -561,6 +565,15 @@ jobs:
         run: curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ~/.cargo/bin
       - name: Run tests
         run: cargo nextest run --locked --workspace --exclude zeroclaw-desktop
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-wechat` is outside `default-channels` and `channels-full`, so
+      # the workspace run above compiles neither the module nor its unit tests.
+      # Adding it to `ci-all` gives Lint and Check compile coverage; this step
+      # is what actually executes the tests.
+      - name: Run WeChat channel lib unit tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --features channel-wechat --lib wechat::"
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
@@ -612,16 +625,17 @@ jobs:
     name: Parallel Runtime Test
     needs: [parallel-runtime-test-changes]
     if: needs.parallel-runtime-test-changes.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           shared-key: test
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -646,7 +660,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -675,7 +689,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         id: rust-cache
         with:
           cache-on-failure: true
@@ -684,6 +698,8 @@ jobs:
         run: |
           curl -LsSf https://github.com/EmbarkStudios/cargo-deny/releases/download/0.19.9/cargo-deny-0.19.9-x86_64-unknown-linux-musl.tar.gz \
             | tar zxf - -C ~/.cargo/bin --strip-components=1
+      - name: Validate scoped lru advisory exception
+        run: python3 scripts/ci/lru_advisory_scope_test.py
       - name: Check licenses, sources, and advisories
         run: cargo deny check
       - name: Lockfile integrity
@@ -712,9 +728,70 @@ jobs:
       - name: Run cargo audit (RustSec advisory database)
         run: cargo audit
 
+  # Detect which non-Rust job families a PR actually touches, so a pure-Rust
+  # PR does not spin runners it cannot affect. Cheap and always-on; forces every
+  # family true on push / merge_group so master cache-warming and the required
+  # gate keep exercising the full set. A path-skipped job leaves `CI Required
+  # Gate` green (it only trips on failure/cancelled), and this detector is never
+  # skipped, so a job that should run never is.
+  path-changes:
+    name: Detect changed paths
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs: ${{ steps.filter.outputs.docs }}
+      nix: ${{ steps.filter.outputs.nix }}
+      nix_hash: ${{ steps.filter.outputs.nix_hash }}
+      web: ${{ steps.filter.outputs.web }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Classify changed paths
+        id: filter
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Non-PR events (push to master, merge_group) always run every gated
+          # job: warms caches and keeps the required gate exercising the full set.
+          case "${{ github.event_name }}" in
+            pull_request) ;;
+            *)
+              {
+                echo "docs=true"
+                echo "nix=true"
+                echo "nix_hash=true"
+                echo "web=true"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          changed="$(mktemp)"
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed"
+
+          emit() {
+            local name="$1" pattern="$2"
+            if grep -Eq "$pattern" "$changed"; then
+              echo "${name}=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "${name}=false" >> "$GITHUB_OUTPUT"
+            fi
+          }
+
+          # Any change to this workflow re-runs all gated families.
+          wf='^\.github/workflows/ci\.yml$'
+          emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/docs_(quality_gate|links_gate)\.sh$|${wf}"
+          emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
+          emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
+          emit web      "^web/|^\.nvmrc$|${wf}"
+
   nix-eval:
     name: Nix Module Eval
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.nix == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -728,7 +805,8 @@ jobs:
 
   nix-hash-drift:
     name: Nix Hash Drift
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.nix_hash == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -769,7 +847,8 @@ jobs:
 
   docs-style:
     name: Docs Style
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.docs == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -817,8 +896,10 @@ jobs:
   installer-drift:
     name: Installer Drift
     needs: [fmt]
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.CI_USE_BLACKSMITH == 'true' && 'blacksmith-8vcpu-ubuntu-2404' || 'ubuntu-latest' }}
     timeout-minutes: 15
+    outputs:
+      all_features: ${{ steps.all_features.outputs.value }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Test installer target detection
@@ -826,22 +907,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: 1.96.1
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: ./.github/actions/rust-cache
         id: rust-cache
         with:
+          use-blacksmith: ${{ vars.CI_USE_BLACKSMITH }}
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check generated install surfaces are in sync with the spec
         run: cargo generate installers --check
+      - name: Resolve canonical all-feature selection
+        id: all_features
+        run: |
+          set -euo pipefail
+          value="$(cargo generate features --selection all)"
+          if [ -z "$value" ]; then
+            echo "::error::canonical all-feature selection is empty"
+            exit 1
+          fi
+          printf 'value=%s\n' "$value" >> "$GITHUB_OUTPUT"
 
   web-permission-tests:
     name: Web Permission Tests
-    needs: [fmt]
+    needs: [path-changes]
+    if: needs.path-changes.outputs.web == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: '.nvmrc'
           cache: npm
@@ -863,7 +956,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, repo-structure, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

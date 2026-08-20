@@ -1,7 +1,8 @@
 use crate::schema::DockerRuntimeConfig;
 use anyhow::{Context, Result};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use zeroclaw_api::runtime_traits::RuntimeAdapter;
+use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
 
 /// Canonicalization failures that the runtime layer can present through
 /// localized tool diagnostics without parsing an English error chain.
@@ -80,43 +81,12 @@ impl DockerRuntime {
 
         Ok(resolved)
     }
-}
 
-impl RuntimeAdapter for DockerRuntime {
-    fn name(&self) -> &str {
-        "docker"
-    }
-
-    fn has_shell_access(&self) -> bool {
-        true
-    }
-
-    fn has_filesystem_access(&self) -> bool {
-        self.config.mount_workspace
-    }
-
-    fn storage_path(&self) -> PathBuf {
-        if self.config.mount_workspace {
-            PathBuf::from("/workspace/.zeroclaw")
-        } else {
-            PathBuf::from("/tmp/.zeroclaw")
-        }
-    }
-
-    fn supports_long_running(&self) -> bool {
-        false
-    }
-
-    fn memory_budget(&self) -> u64 {
-        self.config
-            .memory_limit_mb
-            .map_or(0, |mb| mb.saturating_mul(1024 * 1024))
-    }
-
-    fn build_shell_command(
+    fn build_shell_command_inner(
         &self,
         command: &str,
         workspace_dir: &Path,
+        env_keys: &[&OsStr],
     ) -> anyhow::Result<tokio::process::Command> {
         let mut process = tokio::process::Command::new("docker");
         process
@@ -140,6 +110,11 @@ impl RuntimeAdapter for DockerRuntime {
 
         if self.config.read_only_rootfs {
             process.arg("--read-only");
+        }
+
+        for key in env_keys {
+            let key = docker_env_key(key)?;
+            process.arg("--env").arg(key);
         }
 
         if self.config.mount_workspace {
@@ -167,6 +142,65 @@ impl RuntimeAdapter for DockerRuntime {
     }
 }
 
+fn docker_env_key(key: &OsStr) -> Result<&str> {
+    let key = key
+        .to_str()
+        .context("Docker runtime environment passthrough key must be valid UTF-8")?;
+    if key.is_empty() || key.contains('=') {
+        anyhow::bail!("Docker runtime environment passthrough key must be a variable name");
+    }
+    Ok(key)
+}
+
+impl RuntimeAdapter for DockerRuntime {
+    fn name(&self) -> &str {
+        "docker"
+    }
+
+    fn has_filesystem_access(&self) -> bool {
+        self.config.mount_workspace
+    }
+
+    fn storage_path(&self) -> PathBuf {
+        if self.config.mount_workspace {
+            PathBuf::from("/workspace/.zeroclaw")
+        } else {
+            PathBuf::from("/tmp/.zeroclaw")
+        }
+    }
+
+    fn supports_long_running(&self) -> bool {
+        false
+    }
+
+    fn memory_budget(&self) -> u64 {
+        self.config
+            .memory_limit_mb
+            .map_or(0, |mb| mb.saturating_mul(1024 * 1024))
+    }
+
+    fn shell_dialect(&self) -> ShellDialect {
+        ShellDialect::Posix
+    }
+
+    fn build_shell_command(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+    ) -> anyhow::Result<tokio::process::Command> {
+        self.build_shell_command_inner(command, workspace_dir, &[])
+    }
+
+    fn build_shell_command_with_env_keys(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+        env_keys: &[&OsStr],
+    ) -> anyhow::Result<tokio::process::Command> {
+        self.build_shell_command_inner(command, workspace_dir, env_keys)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +219,12 @@ mod tests {
         };
         let runtime = DockerRuntime::new(cfg);
         assert_eq!(runtime.memory_budget(), 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn docker_reports_posix_shell_dialect() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig::default());
+        assert_eq!(runtime.shell_dialect(), ShellDialect::Posix);
     }
 
     #[test]
@@ -213,6 +253,53 @@ mod tests {
         assert!(debug.contains("1.5"));
         assert!(debug.contains("--workdir"));
         assert!(debug.contains("echo hello"));
+    }
+
+    #[test]
+    fn docker_build_shell_command_forwards_env_keys_without_values() {
+        let cfg = DockerRuntimeConfig {
+            image: "alpine:3.20".into(),
+            mount_workspace: false,
+            ..DockerRuntimeConfig::default()
+        };
+        let runtime = DockerRuntime::new(cfg);
+        let secret_value = "secret-value-should-not-appear-in-docker-args";
+
+        let command = runtime
+            .build_shell_command_with_env_keys(
+                "printf '%s' \"$ZC_CLI_TOKEN\"",
+                &std::env::temp_dir(),
+                &[
+                    std::ffi::OsStr::new("ZC_CLI_TOKEN"),
+                    std::ffi::OsStr::new("OPENAI_API_KEY"),
+                ],
+            )
+            .unwrap();
+        let debug = format!("{command:?}");
+
+        assert!(debug.contains("--env"));
+        assert!(debug.contains("ZC_CLI_TOKEN"));
+        assert!(debug.contains("OPENAI_API_KEY"));
+        assert!(!debug.contains("ZC_CLI_TOKEN="));
+        assert!(!debug.contains("OPENAI_API_KEY="));
+        assert!(!debug.contains(secret_value));
+    }
+
+    #[test]
+    fn docker_build_shell_command_rejects_env_key_values() {
+        let runtime = DockerRuntime::new(DockerRuntimeConfig {
+            mount_workspace: false,
+            ..DockerRuntimeConfig::default()
+        });
+
+        let result = runtime.build_shell_command_with_env_keys(
+            "echo hello",
+            &std::env::temp_dir(),
+            &[std::ffi::OsStr::new("ZC_CLI_TOKEN=secret")],
+        );
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("variable name"));
     }
 
     #[test]
