@@ -233,17 +233,75 @@ pub fn truncate_tool_message(msg_content: &str, max_chars: usize) -> String {
     truncate_tool_result(msg_content, max_chars)
 }
 
-/// Estimate the token cost of a single message using the ~4 chars/token
-/// heuristic plus ~4 framing tokens (role, delimiters). Single-sourced so the
-/// history and system-floor estimates stay in lock-step.
+/// Conservative token estimate for one `[IMAGE:...]` marker.
+///
+/// The multimodal pipeline expands a marker into a base64 data URI at
+/// send-time without downscaling (`multimodal::normalize_image_reference`), so
+/// the provider sees roughly `bytes * 4 / 3` characters of payload. At the
+/// shared ~4 chars/token heuristic that is `bytes / 3` tokens — orders of
+/// magnitude more than the ~30-character marker string the text heuristic would
+/// otherwise count.
+///
+/// Local files are sized from disk; already-inlined base64 data URIs from their
+/// payload length. References we cannot size here (remote URLs, missing files)
+/// fall back to a non-trivial constant so the estimate errs high rather than
+/// reporting an image-heavy turn as nearly free.
+fn estimate_image_marker_tokens(payload: &str) -> usize {
+    const IMAGE_BYTES_PER_TOKEN: usize = 3;
+    // Best-effort floor for references that cannot be sized locally; keeps an
+    // unsizable image from being counted as free without wildly over-trimming.
+    const UNSIZABLE_IMAGE_TOKENS: usize = 1_000;
+
+    if let Some(base64_payload) = payload
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(";base64,"))
+        .map(|(_, data)| data)
+    {
+        return base64_payload.len().div_ceil(4);
+    }
+
+    if payload.starts_with("http://") || payload.starts_with("https://") {
+        return UNSIZABLE_IMAGE_TOKENS;
+    }
+
+    match std::fs::metadata(payload) {
+        Ok(meta) => (meta.len() as usize).div_ceil(IMAGE_BYTES_PER_TOKEN),
+        Err(_) => UNSIZABLE_IMAGE_TOKENS,
+    }
+}
+
+/// Estimate the raw text token cost of a single message using the ~4
+/// chars/token heuristic plus ~4 framing tokens (role, delimiters).
 fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    message.content.len().div_ceil(4) + 4
+    let (text, _) = zeroclaw_providers::multimodal::parse_image_markers(&message.content);
+    text.len().div_ceil(4) + 4
+}
+
+/// Estimate one provider-ready message without charging inline image data as
+/// both ordinary text and image payload. This must only be used after
+/// multimodal preparation has removed stale/failed/capped image references.
+fn estimate_prepared_message_tokens(message: &ChatMessage) -> usize {
+    let (text, image_refs) = zeroclaw_providers::multimodal::parse_image_markers(&message.content);
+    let text_tokens = text.len().div_ceil(4) + 4;
+    text_tokens
+        + image_refs
+            .iter()
+            .map(|payload| estimate_image_marker_tokens(payload))
+            .sum::<usize>()
 }
 
 /// Estimate token count for a message history using ~4 chars/token heuristic.
 /// Includes a small overhead per message for role/framing tokens.
 pub fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     history.iter().map(estimate_message_tokens).sum()
+}
+
+/// Estimate the effective provider-ready history after multimodal preparation.
+///
+/// Image caps, age trimming, failed references, and stale tool-result images
+/// must already have been applied by the caller.
+pub fn estimate_prepared_history_tokens(history: &[ChatMessage]) -> usize {
+    history.iter().map(estimate_prepared_message_tokens).sum()
 }
 
 pub fn estimate_system_floor_tokens(history: &[ChatMessage]) -> usize {
@@ -261,6 +319,19 @@ pub fn context_floor_remediation(system_floor: usize, budget: usize) -> String {
     crate::i18n::get_required_cli_string_with_args(
         "history-trim-floor-exceeds-budget",
         &[("floor", floor_s.as_str()), ("budget", budget_s.as_str())],
+    )
+}
+
+/// Diagnostic for a single turn whose prepared multimodal payload alone
+/// exceeds the context budget, so no amount of history trimming can make it
+/// fit. Surfaced instead of dispatching a request the provider will reject.
+#[must_use]
+pub fn multimodal_budget_remediation(prepared_tokens: usize, budget: usize) -> String {
+    let tokens_s = prepared_tokens.to_string();
+    let budget_s = budget.to_string();
+    crate::i18n::get_required_cli_string_with_args(
+        "history-trim-multimodal-exceeds-budget",
+        &[("tokens", tokens_s.as_str()), ("budget", budget_s.as_str())],
     )
 }
 
@@ -446,6 +517,129 @@ mod tests {
         // Floor = system message only; conversation turns are prunable.
         assert_eq!(estimate_system_floor_tokens(&history), 8);
         assert!(estimate_system_floor_tokens(&history) < estimate_history_tokens(&history));
+    }
+
+    #[test]
+    fn prepared_estimate_charges_images_without_affecting_raw_preflight() {
+        // Five image markers in one tool result must not be estimated as a few
+        // dozen text tokens — the markers expand to un-downscaled base64 at
+        // send-time, so each ~1.5 MiB image is ~500K tokens.
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = 1_500_000usize;
+        let mut content = String::from("Here are the slides:\n");
+        for i in 0..5 {
+            let path = dir.path().join(format!("slide{i}.png"));
+            std::fs::write(&path, vec![0u8; bytes]).unwrap();
+            content.push_str(&format!("[IMAGE:{}]\n", path.display()));
+        }
+        let history = vec![ChatMessage::user(&content)];
+
+        let (raw_text, _) = zeroclaw_providers::multimodal::parse_image_markers(&content);
+        let text_only = raw_text.len().div_ceil(4) + 4;
+        assert_eq!(
+            estimate_history_tokens(&history),
+            text_only,
+            "raw-history preflight must not charge images before preparation applies caps"
+        );
+        assert!(
+            text_only < 1_000,
+            "text-only estimate should be small: {text_only}"
+        );
+        let estimate = estimate_prepared_history_tokens(&history);
+        let expected_image_floor = 5 * (bytes / 3);
+        assert!(
+            estimate >= expected_image_floor,
+            "image-heavy turn must be charged for its payload: estimate={estimate}, \
+             expected at least {expected_image_floor}"
+        );
+    }
+
+    #[test]
+    fn estimate_image_marker_unsizable_reference_is_not_free() {
+        // A missing local file and a remote URL cannot be sized here, but must
+        // still cost more than their marker text so the meter errs high.
+        assert_eq!(
+            estimate_image_marker_tokens("/no/such/file/missing.png"),
+            1_000
+        );
+        assert_eq!(
+            estimate_image_marker_tokens("https://example.com/photo.jpg"),
+            1_000
+        );
+    }
+
+    #[test]
+    fn estimate_image_marker_sizes_base64_data_uri_from_payload() {
+        // 400 base64 chars -> 100 tokens, independent of the filesystem.
+        let payload = "A".repeat(400);
+        let uri = format!("data:image/png;base64,{payload}");
+        assert_eq!(estimate_image_marker_tokens(&uri), 100);
+    }
+
+    #[test]
+    fn prepared_estimate_does_not_double_count_inline_image_data_as_text() {
+        let payload = "A".repeat(400);
+        let content = format!("caption [IMAGE:data:image/png;base64,{payload}]");
+        let history = vec![ChatMessage::user(&content)];
+
+        assert_eq!(
+            estimate_prepared_history_tokens(&history),
+            "caption".len().div_ceil(4) + 4 + 100
+        );
+        assert_eq!(
+            estimate_history_tokens(&history),
+            "caption".len().div_ceil(4) + 4,
+            "raw preflight must leave image enforcement to prepared accounting"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_estimate_only_charges_images_that_survive_the_cap() {
+        let payload = "A".repeat(400);
+        let history: Vec<ChatMessage> = (0..3)
+            .map(|index| {
+                ChatMessage::user(format!(
+                    "caption {index} [IMAGE:data:image/png;base64,{payload}]"
+                ))
+            })
+            .collect();
+        let config = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            ..Default::default()
+        };
+
+        let prepared =
+            zeroclaw_providers::multimodal::prepare_messages_for_provider(&history, &config)
+                .await
+                .unwrap();
+        assert_eq!(
+            zeroclaw_providers::multimodal::count_image_markers(&prepared.messages),
+            1
+        );
+        let estimate = estimate_prepared_history_tokens(&prepared.messages);
+        assert!(
+            estimate < 200,
+            "capped images must not remain in effective-payload accounting: {estimate}"
+        );
+    }
+
+    #[test]
+    fn prepared_estimate_charges_each_image_in_a_multi_image_round_once() {
+        // A single native-tool round can return several images in one message.
+        // Each surviving image must be charged once — its decoded bytes, not the
+        // base64 text — and not double-counted as both text and image payload.
+        let payload = "A".repeat(400); // 400 base64 chars -> 100 image tokens each
+        let message = ChatMessage::user(format!(
+            "two screenshots [IMAGE:data:image/png;base64,{payload}] [IMAGE:data:image/png;base64,{payload}]"
+        ));
+        let (text, refs) = zeroclaw_providers::multimodal::parse_image_markers(&message.content);
+        assert_eq!(refs.len(), 2, "two image markers in one round");
+        // Charged as the stripped caption text (not the base64 content length,
+        // which would double-count) plus each image once.
+        assert_eq!(
+            estimate_prepared_history_tokens(std::slice::from_ref(&message)),
+            text.len().div_ceil(4) + 4 + 100 + 100
+        );
     }
 
     #[test]

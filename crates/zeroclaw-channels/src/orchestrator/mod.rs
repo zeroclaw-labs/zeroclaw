@@ -6014,6 +6014,11 @@ async fn process_channel_message_body(
                     ctx.non_cli_excluded_tools.as_ref()
                 };
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
+                // This path rebuilds `history` for every turn from the system
+                // prompt plus the prior turns it loaded, and it never persists a
+                // synthetic trim breadcrumb of its own, so a fresh history never
+                // begins with one. Provenance is per-turn state from here on.
+                history_has_trim_breadcrumb: false,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider: active_model_provider.as_ref(),
@@ -11672,7 +11677,11 @@ pub async fn start_channels(
             }),
             pacing: config.pacing.clone(),
             max_tool_result_chars: agent.resolved.max_tool_result_chars,
-            context_token_budget: agent.resolved.max_context_tokens,
+            // The enforced budget, not the raw ceiling: an enabled
+            // `history_pruning.max_tokens` floor is lower than
+            // `max_context_tokens`, and a payload between the two must be
+            // trimmed on this path exactly as it is on the Agent/RPC path.
+            context_token_budget: agent.resolved.effective_context_budget(),
             debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
                 Duration::from_millis(config.channels.debounce_ms),
             )),

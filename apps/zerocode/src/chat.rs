@@ -2570,10 +2570,14 @@ impl Chat {
         }
     }
 
-    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
+    pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>, bool) {
         match &self.phase {
-            ChatPhase::Active(s) => (s.context_input_tokens, s.context_max_tokens),
-            _ => (None, None),
+            ChatPhase::Active(s) => (
+                s.context_input_tokens,
+                s.context_max_tokens,
+                s.context_is_estimate,
+            ),
+            _ => (None, None, false),
         }
     }
 
@@ -5503,6 +5507,10 @@ pub struct ChatState {
     pub context_input_tokens: Option<u64>,
     /// Configured context limit for this session's model.
     pub context_max_tokens: Option<u64>,
+    /// `true` when `context_input_tokens` currently holds a pre-dispatch
+    /// estimate (from the prepared payload) rather than a provider-reported
+    /// figure. Reset to `false` by the next measured `ContextUsage`.
+    pub context_is_estimate: bool,
     /// Outbound message queue; the front dispatches when the session is free.
     message_queue: VecDeque<QueuedMessage>,
     /// Monotonic id source for queued messages.
@@ -5601,6 +5609,7 @@ impl ChatState {
             cached_total_rows: 0,
             context_input_tokens: None,
             context_max_tokens: None,
+            context_is_estimate: false,
             message_queue: VecDeque::new(),
             next_queue_id: 0,
             queue_paused: false,
@@ -6583,10 +6592,12 @@ impl ChatState {
             SessionUpdate::ContextUsage {
                 input_tokens,
                 max_context_tokens,
+                estimated,
                 ..
             } => {
                 if input_tokens.is_some() {
                     self.context_input_tokens = input_tokens;
+                    self.context_is_estimate = estimated;
                 }
                 if max_context_tokens.is_some() {
                     self.context_max_tokens = max_context_tokens;
@@ -7101,6 +7112,7 @@ impl ChatState {
         // ContextUsage event.
         self.context_input_tokens = None;
         self.context_max_tokens = None;
+        self.context_is_estimate = false;
         self.clear_queue();
     }
 }
@@ -7214,6 +7226,59 @@ mod tests {
             "myagent".to_string(),
             crate::todo_tracker::TodoTrackerSettings::default(),
         )
+    }
+
+    #[test]
+    fn context_usage_estimate_marks_only_its_own_session_and_clears_on_measurement() {
+        // The estimate marker is per-session state, and an estimated figure must
+        // never be rendered as a measured one. Both facts are behavioural: the
+        // RPC boundary job only checks the dependency boundary.
+        let mut owner = state();
+        let mut sibling = ChatState::new(
+            "sess-2".to_string(),
+            "myagent".to_string(),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        let estimate = SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(1_234),
+            max_context_tokens: Some(10_000),
+            estimated: true,
+        };
+        owner.apply_update(estimate.clone());
+        sibling.apply_update(estimate);
+
+        assert_eq!(owner.context_input_tokens, Some(1_234));
+        assert!(owner.context_is_estimate);
+        assert_eq!(
+            sibling.context_input_tokens, None,
+            "an update addressed to another session must not move this meter"
+        );
+        assert!(!sibling.context_is_estimate);
+
+        let rendered =
+            crate::widgets::CtxBar::new(owner.context_input_tokens, owner.context_max_tokens)
+                .with_estimated(owner.context_is_estimate)
+                .widget()
+                .expect("the bar has content");
+        let text = format!("{rendered:?}");
+        assert!(
+            text.contains("est"),
+            "an estimated figure must be tagged as one: {text}"
+        );
+
+        owner.apply_update(SessionUpdate::ContextUsage {
+            session_id: "sess-1".to_string(),
+            input_tokens: Some(2_000),
+            max_context_tokens: Some(10_000),
+            estimated: false,
+        });
+        assert_eq!(owner.context_input_tokens, Some(2_000));
+        assert!(
+            !owner.context_is_estimate,
+            "a measured update must clear the estimate marker"
+        );
     }
 
     fn command_action_from_initialize(

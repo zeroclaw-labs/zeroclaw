@@ -193,6 +193,18 @@ pub struct ToolLoop<'a> {
     /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
     pub exec: ResolvedAgentExecution<'a>,
     pub history: &'a mut Vec<ChatMessage>,
+    /// Whether `history` already begins with a synthetic trim breadcrumb, so
+    /// this turn treats it as such rather than as the oldest real turn.
+    ///
+    /// This is a seed describing the vector passed in `history`, and nothing is
+    /// written back. The caller's own flag describes the caller's own history:
+    /// `Agent::turn` hands the loop a *copy* of provider-facing history and
+    /// replays only the new messages afterwards, so a breadcrumb the loop
+    /// inserts never reaches canonical `Agent::history`. Writing provenance back
+    /// would leave the agent claiming a breadcrumb its history does not have,
+    /// and the next turn would then skip a real user turn as though it were
+    /// synthetic. Paths whose history cannot carry one pass `false`.
+    pub history_has_trim_breadcrumb: bool,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -231,15 +243,18 @@ pub struct ToolLoop<'a> {
     pub sop_reassembly: Option<SopStepReassembly<'a>>,
 }
 
+/// Trim `history` to the provider-reported token budget, returning whether this
+/// call inserted a synthetic trim breadcrumb — so the caller can carry that
+/// provenance into `has_leading_breadcrumb` and the agent's persisted flag.
 async fn enforce_reported_budget(
     history: &mut Vec<ChatMessage>,
     reported_input_tokens: usize,
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
-) {
+) -> bool {
     if context_token_budget == 0 || reported_input_tokens <= context_token_budget {
-        return;
+        return false;
     }
     let taken = std::mem::take(history);
     let result = crate::agent::history_trim::trim_to_reported_budget(
@@ -249,7 +264,8 @@ async fn enforce_reported_budget(
     );
     if result.trimmed {
         let mut trimmed = result.history;
-        crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
+        let inserted_breadcrumb =
+            crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
         *history = trimmed;
         if let Some(tx) = event_tx {
             let _ = tx
@@ -270,8 +286,10 @@ async fn enforce_reported_budget(
                 turn_id: None,
             },
         );
+        inserted_breadcrumb
     } else {
         *history = result.history;
+        false
     }
 }
 
@@ -354,22 +372,22 @@ impl<'a> TurnState<'a> {
     }
 
     /// Trim history to the given token budget, writing the result back
-    /// into `self.history`.  Returns the trim metadata so the caller can
-    /// emit log/observer events (the returned `history` field is empty —
-    /// it was consumed by the assignment to `self.history`).
+    /// into `self.history`.  Returns the trim metadata plus whether this call
+    /// inserted a synthetic breadcrumb, so the caller can carry breadcrumb
+    /// provenance forward and emit log/observer events (the returned `history`
+    /// field is empty — it was consumed by the assignment to `self.history`).
     fn trim_to_budget(
         &mut self,
         context_token_budget: usize,
-    ) -> crate::agent::history_trim::TrimResult {
+    ) -> (crate::agent::history_trim::TrimResult, bool) {
         let taken = std::mem::take(self.history);
         let mut result =
             crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
         let mut history = std::mem::take(&mut result.history);
-        if result.trimmed {
-            crate::agent::history_trim::insert_breadcrumb_deduped(&mut history);
-        }
+        let inserted_breadcrumb =
+            result.trimmed && crate::agent::history_trim::insert_breadcrumb_deduped(&mut history);
         *self.history = history;
-        result
+        (result, inserted_breadcrumb)
     }
 }
 
@@ -383,6 +401,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
         exec,
         history: raw_history,
+        history_has_trim_breadcrumb: seeded_breadcrumb,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -560,6 +579,21 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let mut sop_exec_cache: std::collections::HashMap<String, OwnedAgentExecution> =
         std::collections::HashMap::new();
 
+    // Provenance for the synthetic trim breadcrumb: true once we have inserted
+    // one at the head of `turn_state.history` (preflight trim or the multimodal
+    // enforcement loop). Trimming uses this — not the breadcrumb's localized
+    // text — to skip it, so a user-authored breadcrumb-equivalent message is
+    // never mistaken for the synthetic one. Persists across iterations because
+    // the breadcrumb stays in history once inserted.
+    //
+    // Seed from the agent's persisted flag so a breadcrumb inserted on an earlier
+    // turn (already leading this turn's restored history) is recognised at
+    // iteration zero instead of being miscounted as the oldest real turn, trimmed,
+    // and reinserted with no progress. Any change made below is written back
+    // provenance stays attached to `turn_state.history` for the life of this
+    // turn and is never written back to the caller's flag.
+    let mut has_leading_breadcrumb = seeded_breadcrumb;
+
     for iteration in 0..max_iterations {
         for steering_message in drain_steering_messages(&mut steering) {
             match ingress_policy(&steering_message, &ingress, &ingress_policy_cfg) {
@@ -635,8 +669,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     )
                 );
             }
-            let result = turn_state.trim_to_budget(context_token_budget);
+            let (result, inserted_breadcrumb) = turn_state.trim_to_budget(context_token_budget);
             if result.trimmed {
+                // Carry provenance from the actual insertion: a trim that skipped
+                // inserting because a real user message already matched the
+                // breadcrumb text must not mark that message as synthetic.
+                has_leading_breadcrumb |= inserted_breadcrumb;
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                         target: "zeroclaw_log_internal_scope",
@@ -746,13 +784,128 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
-        let prepared_messages = prepare_messages_for_iteration(
-            turn_state.history,
-            multimodal_config,
-            degrade_strip_images,
-            image_cache.as_deref_mut(),
-        )
-        .await?;
+        // Enforce the context budget against the EFFECTIVE prepared payload on
+        // every dispatch, not just the first iteration. `[IMAGE:...]` markers
+        // expand to un-downscaled base64 only during preparation, so a tool
+        // round that returns screenshots can blow far past the context window
+        // even when the raw history text looked small — and the oversized
+        // request lands *after* a native-tool round, past the iteration==0
+        // pre-trim above. Measure the prepared messages (post image-cap,
+        // provider-ready), drop whole old turns and re-prepare until the
+        // payload fits, and if the current turn alone still exceeds the budget,
+        // stop with a targeted diagnostic rather than dispatching a doomed
+        // multi-million-token request the provider will only reject. The same
+        // prepared figure is emitted to the context meter so it reflects the
+        // real pre-dispatch size instead of the last provider-reported usage.
+        let prepared_messages = {
+            let mut prepared = prepare_messages_for_iteration(
+                turn_state.history,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
+            )
+            .await?;
+
+            if context_token_budget > 0 {
+                loop {
+                    let prepared_tokens =
+                        crate::agent::history::estimate_prepared_history_tokens(&prepared.messages);
+                    if !prepared.contains_images || prepared_tokens <= context_token_budget {
+                        break;
+                    }
+                    let Some(dropped_messages) = crate::agent::history_trim::drop_oldest_turn(
+                        turn_state.history,
+                        has_leading_breadcrumb,
+                    ) else {
+                        // Only system messages plus the current turn remain, and
+                        // that turn's prepared payload alone exceeds the budget.
+                        // Surface the estimate so the meter shows the overflow,
+                        // then fail fast with an actionable message instead of
+                        // dispatching a request the provider cannot accept.
+                        if let Some(tx) = event_tx.as_ref() {
+                            let _ = tx
+                                .send(TurnEvent::UsageEstimate {
+                                    estimated_input_tokens: Some(prepared_tokens as u64),
+                                })
+                                .await;
+                        }
+                        let remediation = crate::agent::history::multimodal_budget_remediation(
+                            prepared_tokens,
+                            context_token_budget,
+                        );
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Reject
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "prepared_tokens": prepared_tokens,
+                                "budget": context_token_budget,
+                                "error_key": "multimodal_exceeds_budget",
+                            })),
+                            remediation.as_str()
+                        );
+                        return Err(anyhow::Error::msg(remediation));
+                    };
+                    // Carry provenance from the actual insertion, so a dedup
+                    // skip against a real breadcrumb-equivalent message does not
+                    // mark that message as synthetic.
+                    has_leading_breadcrumb |=
+                        crate::agent::history_trim::insert_breadcrumb_deduped(turn_state.history);
+                    if let Some(tx) = event_tx.as_ref() {
+                        let _ = tx
+                            .send(TurnEvent::HistoryTrimmed {
+                                dropped_messages,
+                                kept_turns: crate::agent::history_trim::count_turns_pub(
+                                    turn_state.history,
+                                    has_leading_breadcrumb,
+                                ),
+                                reason: crate::i18n::get_required_cli_string(
+                                    "history-trim-reason-multimodal-budget",
+                                ),
+                            })
+                            .await;
+                    }
+                    observer.record_event(
+                        &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                            dropped_messages,
+                            kept_turns: crate::agent::history_trim::count_turns_pub(
+                                turn_state.history,
+                                has_leading_breadcrumb,
+                            ),
+                            reason: crate::i18n::get_required_cli_string(
+                                "history-trim-reason-multimodal-budget",
+                            ),
+                            channel: None,
+                            agent_alias: None,
+                            turn_id: None,
+                        },
+                    );
+                    prepared = prepare_messages_for_iteration(
+                        turn_state.history,
+                        multimodal_config,
+                        degrade_strip_images,
+                        image_cache.as_deref_mut(),
+                    )
+                    .await?;
+                }
+
+                let prepared_tokens =
+                    crate::agent::history::estimate_prepared_history_tokens(&prepared.messages);
+                if let Some(tx) = event_tx.as_ref() {
+                    let _ = tx
+                        .send(TurnEvent::UsageEstimate {
+                            estimated_input_tokens: Some(prepared_tokens as u64),
+                        })
+                        .await;
+                }
+            }
+
+            prepared
+        };
         let mut provider_request_messages = prepared_messages.messages;
         let mut hook_selected_model = None;
 
@@ -1172,6 +1325,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let msg = ChatMessage::assistant(response_text.clone());
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
+                // The turn ends here, so nothing reads the provenance again;
+                // the trim itself still has to run so `turn_state.history` is
+                // left within budget for whatever reuses it.
                 enforce_reported_budget(
                     turn_state.history,
                     reported as usize,
@@ -1442,7 +1598,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         }
 
         if let Some(reported) = reported_input_tokens {
-            enforce_reported_budget(
+            let inserted = enforce_reported_budget(
                 turn_state.history,
                 reported as usize,
                 context_token_budget,
@@ -1450,6 +1606,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 observer,
             )
             .await;
+            if inserted {
+                has_leading_breadcrumb = true;
+            }
         }
     }
 
@@ -2142,6 +2301,7 @@ async fn drive_live_sop_actions(
                             let step_result = crate::sop::executor::scope_step_call_sink(
                                 step_call_sink.clone(),
                                 Box::pin(run_tool_call_loop(ToolLoop {
+                                    history_has_trim_breadcrumb: false,
                                     exec: ResolvedAgentExecution::resolve(
                                         ResolvedModelAccess {
                                             model_provider: eff_model_provider,

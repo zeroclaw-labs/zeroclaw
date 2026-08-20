@@ -460,6 +460,7 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let (dtx, mut drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+        history_has_trim_breadcrumb: false,
         parent_agent_alias: None,
         sop_reassembly: None,
         exec: crate::agent::loop_::ResolvedAgentExecution {
@@ -851,6 +852,7 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         Some("thread-1".into()),
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                history_has_trim_breadcrumb: false,
                 parent_agent_alias: None,
                 sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution {
@@ -2051,4 +2053,251 @@ async fn safety_net_loop_cron_add_does_not_trust_model_supplied_approved_arg() {
         args["approved"], false,
         "model-supplied approved=true must be stripped even with no approval gate"
     );
+}
+
+// ── seam: multimodal budget enforced at the post-tool dispatch boundary ──
+// The oversized request in the multimodal-context bug lands on the SECOND
+// provider call — after a tool round returns image markers that expand to
+// un-downscaled base64 during preparation. Enforcement therefore has to run on
+// every dispatch, measured against the prepared payload, and stop the turn
+// before that doomed call rather than trimming based on the raw marker text.
+
+/// Scripted provider that also counts how many times the model was dispatched,
+/// so a test can prove the post-tool call was never made.
+struct CountingScriptedProvider {
+    responses: parking_lot::Mutex<VecDeque<ChatResponse>>,
+    calls: Arc<AtomicUsize>,
+    requests: Arc<parking_lot::Mutex<Vec<Vec<ChatMessage>>>>,
+}
+
+#[async_trait]
+impl ModelProvider for CountingScriptedProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<String> {
+        Ok("ok".into())
+    }
+
+    async fn chat(
+        &self,
+        request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<ChatResponse> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.requests.lock().push(request.messages.to_vec());
+        Ok(self
+            .responses
+            .lock()
+            .pop_front()
+            .unwrap_or_else(|| text_response("done")))
+    }
+
+    fn capabilities_for_model(
+        &self,
+        _model: &str,
+    ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+        // Vision-capable: the oversized-request bug only occurs when the
+        // provider accepts images, so tool-result markers are kept and expanded
+        // rather than stripped for a text-only route.
+        zeroclaw_api::model_provider::ProviderCapabilities {
+            vision: true,
+            ..Default::default()
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for CountingScriptedProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        "CountingScriptedProvider"
+    }
+}
+
+/// Tool whose result carries a fixed `[IMAGE:...]` marker, used to inject an
+/// image into history via a real tool round.
+struct ImageEmittingTool {
+    name: &'static str,
+    marker: String,
+}
+
+zeroclaw_api::tool_attribution!(
+    ImageEmittingTool,
+    ::zeroclaw_api::attribution::ToolKind::Plugin
+);
+
+#[async_trait]
+impl Tool for ImageEmittingTool {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        self.name
+    }
+    fn parameters_schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    async fn execute(&self, _args: serde_json::Value) -> Result<crate::tools::ToolResult> {
+        Ok(crate::tools::ToolResult {
+            success: true,
+            output: self.marker.clone().into(),
+            error: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn safety_net_multimodal_budget_stops_second_dispatch_with_multiple_tool_images() {
+    // Two image-returning tools run in one native-tool round. Each image stays
+    // below the per-image cap, but their combined prepared payload exceeds the
+    // context budget before the second provider dispatch.
+    let payload = "A".repeat(2_800_000); // valid base64, decodes to 2.1 MB per image
+    let marker = format!("[IMAGE:data:image/png;base64,{payload}]");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = CountingScriptedProvider {
+        responses: parking_lot::Mutex::new(
+            vec![
+                // Call 1: ask to run the image tool.
+                tool_response(vec![
+                    tool_call("img-1", "attach_image_one"),
+                    tool_call("img-2", "attach_image_two"),
+                ]),
+                // Call 2: would summarize — must never be reached.
+                text_response("here is the image"),
+            ]
+            .into(),
+        ),
+        calls: Arc::clone(&calls),
+        requests: Arc::new(parking_lot::Mutex::new(Vec::new())),
+    };
+
+    let mut agent = build_agent_with_runtime(
+        Box::new(provider),
+        vec![
+            Box::new(ImageEmittingTool {
+                name: "attach_image_one",
+                marker: marker.clone(),
+            }),
+            Box::new(ImageEmittingTool {
+                name: "attach_image_two",
+                marker,
+            }),
+        ],
+        zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: 4,
+            // Comfortably fits the text-only first turn, far below the image.
+            max_context_tokens: 100_000,
+            // Keep the giant marker intact through the tool-result pipeline.
+            max_tool_result_chars: 50_000_000,
+            ..zeroclaw_config::schema::ResolvedRuntime::default()
+        },
+    );
+
+    let err = agent
+        .turn("show me the screenshot")
+        .await
+        .expect_err("prepared image payload exceeds the budget; turn must stop, not dispatch");
+
+    assert!(
+        err.to_string().contains("send fewer or smaller images"),
+        "turn must stop with the targeted multimodal-budget diagnostic, got: {err}"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "the post-tool provider call must be stopped, not dispatched over budget"
+    );
+}
+
+#[tokio::test]
+async fn safety_net_multimodal_budget_drops_two_real_turns_and_dispatches() {
+    let old_payload = "A".repeat(20_000);
+    let tool_payload = "A".repeat(32_000);
+    let old_one = format!("old-one [IMAGE:data:image/png;base64,{old_payload}]");
+    let old_two = format!("old-two [IMAGE:data:image/png;base64,{old_payload}]");
+    let tool_marker = format!("[IMAGE:data:image/png;base64,{tool_payload}]");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let provider = CountingScriptedProvider {
+        responses: parking_lot::Mutex::new(
+            vec![
+                tool_response(vec![
+                    tool_call("img-1", "attach_image_one"),
+                    tool_call("img-2", "attach_image_two"),
+                ]),
+                text_response("images ready"),
+            ]
+            .into(),
+        ),
+        calls: Arc::clone(&calls),
+        requests: Arc::clone(&requests),
+    };
+    let mut agent = build_agent_with_runtime(
+        Box::new(provider),
+        vec![
+            Box::new(ImageEmittingTool {
+                name: "attach_image_one",
+                marker: tool_marker.clone(),
+            }),
+            Box::new(ImageEmittingTool {
+                name: "attach_image_two",
+                marker: tool_marker,
+            }),
+        ],
+        zeroclaw_config::schema::ResolvedRuntime {
+            max_tool_iterations: 4,
+            max_context_tokens: 20_000,
+            max_tool_result_chars: 1_000_000,
+            ..zeroclaw_config::schema::ResolvedRuntime::default()
+        },
+    );
+    agent.seed_history(&[
+        ChatMessage::user(old_one),
+        ChatMessage::assistant("old answer one"),
+        ChatMessage::user(old_two),
+        ChatMessage::assistant("old answer two"),
+    ]);
+
+    let answer = agent
+        .turn("attach both current images")
+        .await
+        .expect("two old turns should be dropped until the prepared payload fits");
+    assert_eq!(answer, "images ready");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "trimming must converge and allow the second provider dispatch"
+    );
+
+    let recorded = requests.lock();
+    assert_eq!(recorded.len(), 2);
+    let chat_contents: Vec<&str> = recorded[1]
+        .iter()
+        .map(|message| message.content.as_str())
+        .collect();
+    assert!(
+        !chat_contents
+            .iter()
+            .any(|content| content.contains("old-one"))
+    );
+    assert!(
+        !chat_contents
+            .iter()
+            .any(|content| content.contains("old-two"))
+    );
+    assert!(chat_contents.iter().any(|content| {
+        *content == crate::i18n::get_required_cli_string("history-trim-breadcrumb")
+    }));
 }

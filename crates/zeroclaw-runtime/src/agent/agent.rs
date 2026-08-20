@@ -1050,6 +1050,16 @@ impl Agent {
         )
     }
 
+    /// The effective context-token budget this agent enforces before dispatch,
+    /// resolved from its own configuration snapshot (the lower of
+    /// `max_context_tokens` and an enabled `history_pruning.max_tokens`). External
+    /// surfaces (the Zerocode usage meter) source the displayed denominator from
+    /// here so it always matches what the live agent enforces — not the global
+    /// config, which may have been edited without refreshing this session.
+    pub fn effective_context_budget(&self) -> usize {
+        self.config.resolved.effective_context_budget()
+    }
+
     pub fn clear_history(&mut self) {
         self.history.clear();
         self.history_has_trim_breadcrumb = false;
@@ -2461,6 +2471,7 @@ impl Agent {
             crate::agent::tool_receipts::scope_receipts(
                 receipt_scope.clone(),
                 crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                    history_has_trim_breadcrumb: self.history_has_trim_breadcrumb,
                     exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                         crate::agent::loop_::ResolvedModelAccess {
                             model_provider: self.model_provider.as_ref(),
@@ -2895,6 +2906,7 @@ impl Agent {
                 crate::agent::tool_receipts::scope_receipts(
                     receipt_scope.clone(),
                     crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                        history_has_trim_breadcrumb: self.history_has_trim_breadcrumb,
                         exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                             crate::agent::loop_::ResolvedModelAccess {
                                 model_provider: self.model_provider.as_ref(),
@@ -4984,6 +4996,51 @@ mod tests {
     }
 
     #[test]
+    fn effective_context_budget_reads_agent_snapshot_not_live_global_config() {
+        // The agent enforces its budget from its own resolved snapshot, and the
+        // Zerocode usage meter now sources the displayed denominator from the
+        // same accessor. So a later runtime-profile / history_pruning edit to the
+        // GLOBAL config — which `config/set` does not refresh into an already
+        // live session — cannot make the meter diverge from enforcement.
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(
+                &zeroclaw_config::schema::MemoryConfig {
+                    backend: "none".into(),
+                    ..zeroclaw_config::schema::MemoryConfig::default()
+                },
+                std::path::Path::new("/tmp"),
+                None,
+            )
+            .expect("memory creation should succeed"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                max_context_tokens: 48_000,
+                ..zeroclaw_config::schema::ResolvedRuntime::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+        let agent = Agent::builder()
+            .model_provider(Box::new(MockModelProvider {
+                responses: Mutex::new(vec![]),
+            }))
+            .tools(vec![Box::new(MockTool)])
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(agent_config)
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("agent builder should succeed with valid config");
+
+        // The value the meter emits is exactly the value enforcement uses — both
+        // read `config.resolved.effective_context_budget()` on this same agent —
+        // fixed at the session's snapshot (48_000), independent of any global edit.
+        assert_eq!(agent.effective_context_budget(), 48_000);
+    }
+
+    #[test]
     fn native_agent_prompt_omits_duplicate_tools_section() {
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
             backend: "none".into(),
@@ -6101,6 +6158,102 @@ mod tests {
                 .filter(|event| matches!(event, ObserverEvent::HistoryTrimmed { .. }))
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_facing_trim_leaves_canonical_breadcrumb_provenance_alone() {
+        // The loop trims a *copy* of provider-facing history, and `Agent::turn`
+        // replays only the new messages afterwards, so a breadcrumb the loop
+        // inserts never reaches canonical history. Writing that provenance back
+        // left the agent claiming a leading breadcrumb it does not have; the next
+        // turn then seeded `has_leading_breadcrumb = true` and `drop_oldest_turn`
+        // skipped its oldest real turn as though it were synthetic.
+        let seen_messages = Arc::new(Mutex::new(Vec::new()));
+        let over_budget = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(10_000),
+            cached_input_tokens: None,
+            output_tokens: Some(1),
+        };
+        let provider = TranscriptCaptureModelProvider {
+            alias: "capture".into(),
+            responses: Mutex::new(vec![
+                zeroclaw_providers::ChatResponse {
+                    text: Some("first answer".into()),
+                    tool_calls: vec![],
+                    usage: Some(over_budget.clone()),
+                    reasoning_content: None,
+                },
+                zeroclaw_providers::ChatResponse {
+                    text: Some("second answer".into()),
+                    tool_calls: vec![],
+                    usage: Some(over_budget),
+                    reasoning_content: None,
+                },
+            ]),
+            seen_messages: Arc::clone(&seen_messages),
+        };
+
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(vec![])
+            .memory(mem)
+            .observer(Arc::from(crate::observability::NoopObserver {}) as Arc<dyn Observer>)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(zeroclaw_config::schema::AliasedAgentConfig {
+                resolved: zeroclaw_config::schema::ResolvedRuntime {
+                    // Every reported usage figure lands far above this, so the
+                    // reported-budget trim fires on each turn.
+                    max_context_tokens: 100,
+                    ..zeroclaw_config::schema::ResolvedRuntime::default()
+                },
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            })
+            .build()
+            .expect("agent builder should succeed");
+        agent.seed_history(&[
+            ChatMessage::user("oldest real turn"),
+            ChatMessage::assistant("oldest answer"),
+        ]);
+
+        agent.turn("first prompt").await.expect("first turn");
+
+        let breadcrumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+        let canonical_has_breadcrumb = agent.history().iter().any(|message| {
+            matches!(message, ConversationMessage::Chat(chat) if chat.content == breadcrumb)
+        });
+        assert!(
+            !canonical_has_breadcrumb,
+            "a provider-facing trim must not reach canonical history"
+        );
+        assert_eq!(
+            agent.history_has_trim_breadcrumb, canonical_has_breadcrumb,
+            "the flag must describe the history it is stored next to"
+        );
+
+        agent.turn("second prompt").await.expect("second turn");
+
+        let seen = seen_messages.lock();
+        let second: Vec<&str> = seen
+            .last()
+            .expect("the second turn must have dispatched")
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert!(
+            second
+                .iter()
+                .any(|content| content.contains("second prompt")),
+            "the current turn must survive trimming: {second:?}"
         );
     }
 
@@ -9640,11 +9793,18 @@ mod tests {
                 .await
         });
 
-        assert!(
-            matches!(
-                event_rx.recv().await,
-                Some(TurnEvent::Chunk { delta }) if delta == "draft"
-            ),
+        // The pre-dispatch budget check emits a non-visible `UsageEstimate` (and may emit other
+        // metadata events) before the first streamed chunk. Consume those while waiting for the
+        // first visible chunk, preserving the contract: the client sees `draft` before the error.
+        let first_chunk = loop {
+            match event_rx.recv().await {
+                Some(TurnEvent::Chunk { delta }) => break delta,
+                Some(_) => continue,
+                None => panic!("the client should see the streamed text before the provider error"),
+            }
+        };
+        assert_eq!(
+            first_chunk, "draft",
             "the client should see the streamed text before the provider error"
         );
 

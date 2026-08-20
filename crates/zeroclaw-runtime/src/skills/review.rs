@@ -80,6 +80,7 @@ pub async fn maybe_run_skill_review(
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                history_has_trim_breadcrumb: false,
                 sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {

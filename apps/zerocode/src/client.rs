@@ -251,10 +251,13 @@ pub enum SessionUpdate {
         timeout_secs: u64,
     },
     /// Emitted once per LLM call with current context size and configured limit.
+    /// `estimated` marks a pre-dispatch estimate (from the prepared payload)
+    /// rather than a provider-reported figure.
     ContextUsage {
         session_id: String,
         input_tokens: Option<u64>,
         max_context_tokens: Option<u64>,
+        estimated: bool,
     },
     /// Older complete turns were removed from structured session history.
     HistoryTrimmed {
@@ -334,6 +337,10 @@ pub fn parse_session_update(params: &serde_json::Value) -> Option<SessionUpdate>
             session_id: sid,
             input_tokens: params.get("input_tokens").and_then(|v| v.as_u64()),
             max_context_tokens: params.get("max_context_tokens").and_then(|v| v.as_u64()),
+            estimated: params
+                .get("estimated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
         }),
         "history_trimmed" => Some(SessionUpdate::HistoryTrimmed {
             session_id: sid,

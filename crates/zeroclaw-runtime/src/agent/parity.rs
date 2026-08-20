@@ -146,6 +146,7 @@ async fn parity_l1_engine_honors_excluded_tools() {
     let (dtx, _drx) = mpsc::channel(256);
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = run_tool_call_loop(ToolLoop {
+        history_has_trim_breadcrumb: false,
         parent_agent_alias: None,
         sop_reassembly: None,
         exec: ResolvedAgentExecution::resolve(
