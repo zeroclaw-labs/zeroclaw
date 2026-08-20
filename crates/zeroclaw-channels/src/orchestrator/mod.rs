@@ -303,6 +303,32 @@ fn channel_runtime_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> Str
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
 }
 
+fn append_provider_fallback_footer(
+    mut response: String,
+    fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+) -> String {
+    let Some(fallback) = fallback else {
+        return response;
+    };
+    let requested_family = fallback.requested_provider.split(':').next().unwrap_or("");
+    let actual_family = fallback.actual_provider.split(':').next().unwrap_or("");
+    let same_family = requested_family == actual_family
+        || requested_family.starts_with(actual_family)
+        || actual_family.starts_with(requested_family);
+    if !same_family {
+        response.push_str("\n\n---\n");
+        response.push_str(&channel_runtime_cli_string_with_args(
+            "channel-runtime-fallback-footer",
+            &[
+                ("requested", fallback.requested_provider.as_str()),
+                ("actual", fallback.actual_provider.as_str()),
+                ("model", fallback.actual_model.as_str()),
+            ],
+        ));
+    }
+    response
+}
+
 fn channel_runtime_scope_label(scope: OverrideScope) -> String {
     match scope {
         OverrideScope::User => channel_runtime_cli_string("channel-runtime-scope-user"),
@@ -5078,18 +5104,6 @@ fn record_passive_context(ctx: &ChannelRuntimeContext, msg: &ChannelMessage, his
     );
 }
 
-/// Whether a recovered request crossed provider families and needs a channel footer.
-///
-/// Exact configured aliases deliberately do not participate here: callers of this
-/// channel boundary receive stable provider-family display names only.
-fn fallback_crossed_provider_family(requested_provider: &str, actual_provider: &str) -> bool {
-    let requested_base = requested_provider.split(':').next().unwrap_or("");
-    let actual_base = actual_provider.split(':').next().unwrap_or("");
-    !(requested_base == actual_base
-        || requested_base.starts_with(actual_base)
-        || actual_base.starts_with(requested_base))
-}
-
 async fn process_channel_message_body(
     ctx: Arc<ChannelRuntimeContext>,
     msg: zeroclaw_api::channel::ChannelMessage,
@@ -6395,21 +6409,10 @@ async fn process_channel_message_body(
                 &msg.reply_target,
             );
 
-            // Append a footer when the response was served by a different model_provider family.
-            // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
-            if let Some(fb) = fallback_info.as_ref()
-                && fallback_crossed_provider_family(&fb.requested_provider, &fb.actual_provider)
-            {
-                delivered_response.push_str("\n\n---\n");
-                delivered_response.push_str(&channel_runtime_cli_string_with_args(
-                    "channel-runtime-fallback-footer",
-                    &[
-                        ("requested", fb.requested_provider.as_str()),
-                        ("actual", fb.actual_provider.as_str()),
-                        ("model", fb.actual_model.as_str()),
-                    ],
-                ));
-            }
+            // The runtime commits this candidate only after semantic acceptance.
+            // This renderer must therefore receive only the final accepted route.
+            delivered_response =
+                append_provider_fallback_footer(delivered_response, fallback_info.as_ref());
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -12311,6 +12314,26 @@ mod tests {
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
 
     #[test]
+    fn accepted_provider_fallback_footer_is_rendered_once_and_primary_has_none() {
+        let fallback = zeroclaw_providers::reliable::ProviderFallbackInfo {
+            requested_provider: "openai.primary".to_string(),
+            requested_model: "model-a".to_string(),
+            actual_provider: "anthropic.backup".to_string(),
+            actual_model: "model-b".to_string(),
+        };
+        let delivered =
+            append_provider_fallback_footer("final response".to_string(), Some(&fallback));
+        assert!(delivered.starts_with("final response\n\n---\n"));
+        assert!(delivered.contains("openai.primary"));
+        assert!(delivered.contains("anthropic.backup"));
+        assert_eq!(delivered.matches("---").count(), 1);
+        assert_eq!(
+            append_provider_fallback_footer("primary final".to_string(), None),
+            "primary final"
+        );
+    }
+
+    #[test]
     fn channel_terminal_cause_precedes_transient_hint_from_earlier_attempt() {
         let error =
             anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
@@ -13842,19 +13865,6 @@ api_key = "anthropic-key"
             "15551234567@s.whatsapp.net",
         );
         assert_eq!(result, "Hello");
-    }
-
-    #[test]
-    fn same_family_alias_fallback_does_not_need_channel_footer() {
-        // Reliable retains these family fields for the channel boundary even
-        // when delegate-local attribution distinguishes aliases such as
-        // `custom.primary` and `custom.backup`.
-        assert!(!fallback_crossed_provider_family("custom", "custom"));
-    }
-
-    #[test]
-    fn cross_family_fallback_needs_channel_footer() {
-        assert!(fallback_crossed_provider_family("anthropic", "openai"));
     }
 
     #[test]

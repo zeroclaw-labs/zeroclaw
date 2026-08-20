@@ -132,7 +132,6 @@
   - [Arduino Uno Q](./hardware/arduino-uno-q-setup.md)
   - [STM32 Nucleo](./hardware/nucleo-setup.md)
   - [Android](./hardware/android-setup.md)
-  - [Aardvark](./hardware/aardvark.md)
   - [Raspberry Pi](./hardware/raspberry-pi-setup.md)
 - [Standard Operating Procedures](./sop/index.md)
   - [How SOPs run](./sop/how-it-works.md)

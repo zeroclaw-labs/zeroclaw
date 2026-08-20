@@ -163,6 +163,21 @@ assert_contains "$output" 'apt install: attempt 1/2 timed out (status: 124)'
 assert_contains "$output" 'apt install: attempt 2/2 succeeded'
 unset timeout_phase timeout_attempts
 
+new_fixture permanent_install_failure
+fail_phase=install
+fail_attempts=2
+set +e
+run_helper libudev-dev ripgrep
+status=$?
+set -e
+if [[ "$status" -ne 42 ]]; then
+    fail "permanent install failure should exit 42, got $status"
+fi
+assert_call_count "$calls" 2 'apt-get|install|-y|libudev-dev|ripgrep'
+assert_contains "$output" 'apt install: attempt 2/2 failed (status: 42)'
+assert_contains "$output" 'apt install: failed after 2 attempts (last status: 42)'
+unset fail_phase fail_attempts
+
 new_fixture permanent_timeout
 timeout_phase=update
 timeout_attempts=2

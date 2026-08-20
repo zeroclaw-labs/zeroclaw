@@ -140,6 +140,11 @@ First triage step for a new issue: check if the reported outdated crates have se
 
 Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU and MUSL plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
 
+MUSL legs install `cross` through `scripts/ci/install_release_tool.sh`, which
+downloads the exact pinned upstream release asset and verifies its SHA-256
+before installing it. The required Repository Structure job tests the supported
+runner-to-asset mapping without making network calls.
+
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
 Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows x86_64 targets. It mirrors the required PR lint command with `--target` set for each platform, but intentionally does not run on PRs and is not part of `CI Required Gate`.
@@ -156,6 +161,13 @@ both SBOM formats are checksummed and attested before the release is created.
 Cosign remains limited to GHCR image signing.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
+
+Release-only build tools do not compile from source on every run. The workflow
+installs pinned upstream `cross` and Tauri CLI release binaries through
+`scripts/ci/install_release_tool.sh`; that script verifies a repository-owned
+SHA-256 for each runner-specific archive before placing the binary in Cargo's
+bin directory. Updating either tool requires updating its version, asset name,
+and checksum together, then running `scripts/ci/install_release_tool.test.sh`.
 
 ### Package Publishers
 

@@ -102,6 +102,9 @@ jobs:
       - name: Test monthly outdated result classification
         run: bash scripts/ci/monthly_outdated_result.test.sh
 
+      - name: Test release tool installer mappings
+        run: bash scripts/ci/install_release_tool.test.sh
+
       - name: Test apt install timeout and retry behavior
         run: bash scripts/ci/apt_install.test.sh
 
