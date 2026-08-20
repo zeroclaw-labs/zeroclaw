@@ -5,14 +5,44 @@ use std::sync::Arc;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_memory::Memory;
 
+/// Fallback recall depth when neither the model nor the caller configures one.
+/// Matches the historical hardcoded default so behavior is unchanged for
+/// callers that keep using [`MemoryRecallTool::new`].
+const DEFAULT_RECALL_LIMIT: usize = 5;
+
 /// Let the agent search its own memory
 pub struct MemoryRecallTool {
     memory: Arc<dyn Memory>,
+    /// Default `limit` used when the model omits one. Sourced from the agent's
+    /// resolved config (runtime-profile `memory_recall_limit`, else hindsight
+    /// `top_k`) so a configured recall depth / `ZC_HINDSIGHT_TOP_K` actually
+    /// takes effect instead of being overridden by a hardcoded 5. Always a
+    /// bounded, prompt-safe number (never "unlimited").
+    default_limit: usize,
 }
 
 impl MemoryRecallTool {
+    /// Construct with the historical default recall limit (5). Retained for
+    /// callers/tests that do not thread a per-agent config.
     pub fn new(memory: Arc<dyn Memory>) -> Self {
-        Self { memory }
+        Self {
+            memory,
+            default_limit: DEFAULT_RECALL_LIMIT,
+        }
+    }
+
+    /// Construct with a config-driven default recall limit (used when the model
+    /// omits `limit`). A `0` is treated as "unset" and falls back to the
+    /// historical default, since a bare tool call should stay prompt-safe.
+    pub fn with_default_limit(memory: Arc<dyn Memory>, default_limit: usize) -> Self {
+        Self {
+            memory,
+            default_limit: if default_limit == 0 {
+                DEFAULT_RECALL_LIMIT
+            } else {
+                default_limit
+            },
+        }
     }
 }
 
@@ -36,7 +66,7 @@ impl Tool for MemoryRecallTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Max results to return (default: 5)"
+                    "description": "Max results to return. Defaults to the agent's configured recall depth (runtime-profile memory_recall_limit, or the hindsight top_k) when omitted."
                 },
                 "since": {
                     "type": "string",
@@ -101,7 +131,7 @@ impl Tool for MemoryRecallTool {
         let limit = args
             .get("limit")
             .and_then(serde_json::Value::as_u64)
-            .map_or(5, |v| v as usize);
+            .map_or(self.default_limit, |v| v as usize);
 
         match self.memory.recall(query, limit, None, since, until).await {
             Ok(entries) if entries.is_empty() => Ok(ToolResult {
@@ -406,6 +436,158 @@ mod tests {
         let score: Option<f64> = None;
         let formatted = score.map_or_else(String::new, |s| format!(" [{:.0}%]", s * 100.0));
         assert_eq!(formatted, "");
+    }
+
+    /// Records the `limit` that reached `recall`, so a test can assert which
+    /// default the tool applied when the model omitted one.
+    struct LimitEchoMemory {
+        last_limit: Arc<Mutex<Option<usize>>>,
+    }
+
+    #[async_trait]
+    impl Memory for LimitEchoMemory {
+        fn name(&self) -> &str {
+            "limit_echo"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            *self.last_limit.lock().unwrap() = Some(limit);
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for LimitEchoMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "LimitEchoMemory"
+        }
+    }
+
+    #[tokio::test]
+    async fn omitted_limit_uses_configured_default_not_hardcoded_five() {
+        // Regression for the dead top_k / hardcoded-5 bug: when the model omits
+        // `limit`, the tool must apply the config-driven default it was built
+        // with, not a hardcoded 5.
+        let last_limit = Arc::new(Mutex::new(None));
+        let mem = Arc::new(LimitEchoMemory {
+            last_limit: last_limit.clone(),
+        });
+        let tool = MemoryRecallTool::with_default_limit(mem, 15);
+
+        tool.execute(json!({"query": "birthday"})).await.unwrap();
+        assert_eq!(*last_limit.lock().unwrap(), Some(15));
+    }
+
+    #[tokio::test]
+    async fn explicit_limit_still_overrides_configured_default() {
+        let last_limit = Arc::new(Mutex::new(None));
+        let mem = Arc::new(LimitEchoMemory {
+            last_limit: last_limit.clone(),
+        });
+        let tool = MemoryRecallTool::with_default_limit(mem, 15);
+
+        tool.execute(json!({"query": "birthday", "limit": 3}))
+            .await
+            .unwrap();
+        assert_eq!(*last_limit.lock().unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn zero_configured_default_falls_back_to_historical_five() {
+        // A 0 default is "unset"; a bare tool call must stay prompt-safe at 5.
+        let last_limit = Arc::new(Mutex::new(None));
+        let mem = Arc::new(LimitEchoMemory {
+            last_limit: last_limit.clone(),
+        });
+        let tool = MemoryRecallTool::with_default_limit(mem, 0);
+
+        tool.execute(json!({"query": "birthday"})).await.unwrap();
+        assert_eq!(*last_limit.lock().unwrap(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn new_preserves_historical_default_limit() {
+        let last_limit = Arc::new(Mutex::new(None));
+        let mem = Arc::new(LimitEchoMemory {
+            last_limit: last_limit.clone(),
+        });
+        let tool = MemoryRecallTool::new(mem);
+
+        tool.execute(json!({"query": "birthday"})).await.unwrap();
+        assert_eq!(*last_limit.lock().unwrap(), Some(5));
     }
 
     #[test]
