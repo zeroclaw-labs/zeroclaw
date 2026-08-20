@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::sync::Arc;
-use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
+use zeroclaw_api::tool::{ChildToolGuard, Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::PipelineConfig;
 
 use crate::tool_search::ToolAccessPolicy;
@@ -22,6 +22,12 @@ pub enum PipelineError {
         index: usize,
         tool: String,
         message: String,
+    },
+    #[error("Step {index} ({tool}) blocked: {reason}")]
+    StepBlocked {
+        index: usize,
+        tool: String,
+        reason: String,
     },
 }
 
@@ -65,11 +71,23 @@ pub struct StepResult {
     pub output: String,
 }
 
+/// Result of a parallel step's task: either the estop gate blocked it before it
+/// ran, or it executed and produced a tool result (or error).
+enum ParallelStepOutcome {
+    Blocked(String),
+    Ran(Result<ToolResult>),
+}
+
 /// The execute_pipeline tool that runs multi-step tool chains.
 pub struct PipelineTool {
     config: PipelineConfig,
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
+    /// Optional emergency-stop gate consulted immediately before each child
+    /// tool runs. `execute_pipeline` bypasses the tool loop's direct dispatch,
+    /// so without this a frozen tool could still run through a pipeline. The
+    /// runtime injects it; `None` leaves behavior unchanged (e.g. estop off).
+    guard: Option<Arc<dyn ChildToolGuard>>,
     access_policy: Option<ToolAccessPolicy>,
 }
 
@@ -90,7 +108,42 @@ impl PipelineTool {
             config,
             tools,
             allowed_set,
+            guard: None,
             access_policy,
+        }
+    }
+
+    /// Attach an emergency-stop child guard so tools run through the pipeline are
+    /// halted by the same estop that gates direct tool dispatch.
+    #[must_use]
+    pub fn with_guard(mut self, guard: Arc<dyn ChildToolGuard>) -> Self {
+        self.guard = Some(guard);
+        self
+    }
+
+    /// The canonical identities to check a tool against: its advertised name plus
+    /// its delegated target, so a skill-scoped alias can't slip a frozen builtin
+    /// past the gate (mirrors the direct-dispatch estop check).
+    fn canonical_names(tool: &dyn Tool) -> Vec<String> {
+        let mut names = vec![tool.name().to_string()];
+        if let Some(delegated) = tool.delegated_tool_name() {
+            names.push(delegated.to_string());
+        }
+        names
+    }
+
+    /// Consult the guard (if any) for a tool. `Err(reason)` means the tool must
+    /// not execute right now.
+    fn guard_check(
+        guard: &Option<Arc<dyn ChildToolGuard>>,
+        names: &[String],
+    ) -> Result<(), String> {
+        match guard {
+            Some(guard) => {
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                guard.check(&refs)
+            }
+            None => Ok(()),
         }
     }
 
@@ -152,6 +205,16 @@ impl PipelineTool {
                 .find_tool(&step.tool)
                 .ok_or_else(|| PipelineError::UnknownTool(step.tool.clone()))?;
 
+            // Emergency stop: consult the live estop gate immediately before the
+            // child runs, so a frozen tool cannot execute through the pipeline.
+            if let Err(reason) = Self::guard_check(&self.guard, &Self::canonical_names(tool)) {
+                return Err(PipelineError::StepBlocked {
+                    index: i,
+                    tool: step.tool.clone(),
+                    reason,
+                });
+            }
+
             // Interpolate previous step results into args.
             let interpolated_args = interpolate_args(&step.args, &results);
 
@@ -202,14 +265,22 @@ impl PipelineTool {
             // Clone what we need for the spawned task.
             let tool_name = step.tool.clone();
             let args = step.args.clone();
+            let names = Self::canonical_names(tool);
+            let guard = self.guard.clone();
 
             // We need a reference that lives long enough — use Arc.
             let tool_arc = self.tools.iter().find(|t| t.name() == tool.name()).cloned();
 
             if let Some(tool_arc) = tool_arc {
                 join_set.spawn(async move {
+                    // Emergency stop: check the live estop gate inside the task,
+                    // immediately before this child executes, so a freeze that
+                    // lands mid-flight still halts a not-yet-started child.
+                    if let Err(reason) = Self::guard_check(&guard, &names) {
+                        return (i, tool_name, ParallelStepOutcome::Blocked(reason));
+                    }
                     let result = tool_arc.execute(args).await;
-                    (i, tool_name, result)
+                    (i, tool_name, ParallelStepOutcome::Ran(result))
                 });
             }
         }
@@ -217,18 +288,29 @@ impl PipelineTool {
         let mut results: Vec<StepResult> = Vec::with_capacity(steps.len());
 
         while let Some(join_result) = join_set.join_next().await {
-            let (index, tool_name, tool_result) =
+            let (index, tool_name, outcome) =
                 join_result.map_err(|e| PipelineError::StepFailed {
                     index: 0,
                     tool: "unknown".to_string(),
                     message: format!("Task join error: {e}"),
                 })?;
 
-            let tool_result = tool_result.map_err(|e| PipelineError::StepFailed {
-                index,
-                tool: tool_name.clone(),
-                message: e.to_string(),
-            })?;
+            let tool_result = match outcome {
+                ParallelStepOutcome::Blocked(reason) => {
+                    return Err(PipelineError::StepBlocked {
+                        index,
+                        tool: tool_name,
+                        reason,
+                    });
+                }
+                ParallelStepOutcome::Ran(result) => {
+                    result.map_err(|e| PipelineError::StepFailed {
+                        index,
+                        tool: tool_name.clone(),
+                        message: e.to_string(),
+                    })?
+                }
+            };
 
             if !tool_result.success {
                 return Err(PipelineError::StepFailed {
@@ -908,5 +990,130 @@ mod tests {
         assert!(res.success);
         assert!(res.output.contains("FIRST_BIG_BLOB"));
         assert!(res.output.contains("final answer"));
+    }
+
+    // ── Emergency-stop child guard ─────────────────────────
+
+    struct CountingTool {
+        name: String,
+        executed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(CountingTool);
+
+    #[async_trait::async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "counting"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            self.executed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "ran".into(),
+                error: None,
+            })
+        }
+    }
+
+    /// A guard that freezes one named tool, standing in for an engaged estop.
+    struct FreezeGuard {
+        frozen: String,
+    }
+
+    impl zeroclaw_api::tool::ChildToolGuard for FreezeGuard {
+        fn check(&self, canonical_tool_names: &[&str]) -> std::result::Result<(), String> {
+            if canonical_tool_names.iter().any(|name| *name == self.frozen) {
+                Err(format!("[emergency stop] {} is frozen", self.frozen))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn frozen_pipeline() -> (PipelineTool, Arc<std::sync::atomic::AtomicUsize>) {
+        let executed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["frozen".to_string(), "other".to_string()],
+        };
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(CountingTool {
+                name: "frozen".into(),
+                executed: Arc::clone(&executed),
+            }),
+            Arc::new(CountingTool {
+                name: "other".into(),
+                executed: Arc::clone(&executed),
+            }),
+        ];
+        let pipeline = PipelineTool::new(config, tools).with_guard(Arc::new(FreezeGuard {
+            frozen: "frozen".into(),
+        }));
+        (pipeline, executed)
+    }
+
+    #[tokio::test]
+    async fn sequential_estop_guard_blocks_frozen_tool_before_it_runs() {
+        let (pipeline, executed) = frozen_pipeline();
+        let args = serde_json::json!({
+            "steps": [{"tool": "frozen", "args": {}}],
+            "parallel": false
+        });
+        let err = pipeline.execute(args).await;
+        // The pipeline surfaces the block as a failed tool result, and the frozen
+        // tool never executed.
+        assert!(
+            !err.as_ref().unwrap().success,
+            "a blocked pipeline must not succeed"
+        );
+        assert_eq!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the frozen tool must never execute through the pipeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_estop_guard_blocks_frozen_tool_before_it_runs() {
+        let (pipeline, executed) = frozen_pipeline();
+        let args = serde_json::json!({
+            "steps": [{"tool": "frozen", "args": {}}],
+            "parallel": true
+        });
+        let res = pipeline.execute(args).await;
+        assert!(
+            !res.as_ref().unwrap().success,
+            "a blocked parallel pipeline must not succeed"
+        );
+        assert_eq!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the frozen tool must never execute in the parallel path"
+        );
+    }
+
+    #[tokio::test]
+    async fn estop_guard_allows_unfrozen_tool() {
+        let (pipeline, executed) = frozen_pipeline();
+        let args = serde_json::json!({
+            "steps": [{"tool": "other", "args": {}}],
+            "parallel": false
+        });
+        let res = pipeline.execute(args).await.unwrap();
+        assert!(res.success, "an unfrozen tool runs normally");
+        assert_eq!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the unfrozen tool executes once"
+        );
     }
 }

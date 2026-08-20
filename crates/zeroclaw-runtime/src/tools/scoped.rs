@@ -228,7 +228,7 @@ impl ScopedToolRegistry {
             .cloned()
             .collect();
         let pipeline_tool = config.pipeline.enabled.then(|| {
-            Arc::new(tools::PipelineTool::with_access_policy(
+            let mut pipeline = tools::PipelineTool::with_access_policy(
                 config.pipeline.clone(),
                 context_filtered_tool_arcs.clone(),
                 zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
@@ -236,7 +236,15 @@ impl ScopedToolRegistry {
                     security.excluded_tools.as_deref(),
                     caller_allowed,
                 ),
-            )) as Arc<dyn Tool>
+            );
+            // Route child tools through the same emergency stop as direct
+            // dispatch, so a frozen tool cannot be run indirectly via
+            // `execute_pipeline`.
+            if let Some(guard) = crate::security::EstopChildGuard::from_config(config) {
+                pipeline = pipeline
+                    .with_guard(Arc::new(guard) as Arc<dyn zeroclaw_api::tool::ChildToolGuard>);
+            }
+            Arc::new(pipeline) as Arc<dyn Tool>
         });
         if let Some(tool) = pipeline_tool.as_ref() {
             tools_registry.push(Box::new(tools::ArcToolRef(Arc::clone(tool))));

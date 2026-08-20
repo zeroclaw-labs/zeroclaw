@@ -59,6 +59,177 @@ impl EstopState {
         self.blocked_domains = dedup_sort(&self.blocked_domains);
         self.frozen_tools = dedup_sort(&self.frozen_tools);
     }
+
+    /// Fold another state's engaged dimensions into this one, never clearing an
+    /// already-engaged dimension. Used by the enforcement latch so a freshly
+    /// engaged stop is picked up while a deletion or disengaged replacement
+    /// cannot turn an engaged dimension back off.
+    fn merge_engaged_from(&mut self, other: &EstopState) {
+        self.kill_all |= other.kill_all;
+        self.network_kill |= other.network_kill;
+        self.blocked_domains
+            .extend(other.blocked_domains.iter().cloned());
+        self.frozen_tools.extend(other.frozen_tools.iter().cloned());
+        self.normalize();
+    }
+
+    /// Read the current estop state for a per-tool-call enforcement check
+    /// WITHOUT mutating anything on disk. Unlike [`EstopManager::load`] this
+    /// never persists a fail-closed file, so it is safe to call on every tool
+    /// dispatch. A missing file means "not engaged"; an unreadable or corrupt
+    /// file fails closed (`kill_all`) so a truncated or tampered state cannot
+    /// silently disable the stop.
+    pub fn load_for_enforcement(config: &EstopConfig, config_dir: &Path) -> Self {
+        let path = resolve_state_file_path(config_dir, &config.state_file);
+        match fs::read_to_string(&path) {
+            Ok(raw) => match serde_json::from_str::<EstopState>(&raw) {
+                Ok(mut parsed) => {
+                    parsed.normalize();
+                    parsed
+                }
+                Err(_) => Self::fail_closed(),
+            },
+            // A genuinely absent file means "never engaged". Any other read
+            // error (permission denied, partial/interrupted read, …) must fail
+            // closed instead of being collapsed by a prior `Path::exists()`
+            // check into a disengaged default, which a truncated or tampered
+            // state could exploit to silently disable the stop.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
+            Err(_) => Self::fail_closed(),
+        }
+    }
+
+    /// Whether a specific tool is frozen (case-insensitively, matching the
+    /// normalization applied when the freeze was engaged).
+    pub fn is_tool_frozen(&self, tool_name: &str) -> bool {
+        let normalized = tool_name.trim().to_ascii_lowercase();
+        self.frozen_tools.iter().any(|frozen| frozen == &normalized)
+    }
+
+    /// The reason a tool call must be refused right now, or `None` to allow it.
+    /// Covers the whole-agent kill switch and per-tool freezes; domain/network
+    /// gating is evaluated separately at the network layer.
+    pub fn tool_block_reason(&self, tool_name: &str) -> Option<String> {
+        if self.kill_all {
+            Some("emergency stop engaged: all tool calls are halted (kill_all)".to_string())
+        } else if self.is_tool_frozen(tool_name) {
+            Some(format!(
+                "emergency stop engaged: tool '{tool_name}' is frozen"
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// Borrowed enforcement context threaded into the tool dispatcher so it can
+/// consult the live estop state before each tool call. Cheap to copy (two
+/// references) and only constructed when estop is enabled.
+#[derive(Debug, Clone, Copy)]
+pub struct EstopEnforcement<'a> {
+    config: &'a EstopConfig,
+    config_dir: &'a Path,
+}
+
+impl<'a> EstopEnforcement<'a> {
+    /// Build enforcement context from the agent config, or `None` when estop is
+    /// disabled or the config directory is unknown. `config_dir` mirrors the
+    /// `zeroclaw estop` CLI (`config_path.parent()`) so both processes resolve
+    /// the same state file.
+    pub fn from_config(config: &'a zeroclaw_config::schema::Config) -> Option<Self> {
+        if !config.security.estop.enabled {
+            return None;
+        }
+        let config_dir = config.config_path.parent()?;
+        Some(Self {
+            config: &config.security.estop,
+            config_dir,
+        })
+    }
+
+    // Return the reason to refuse `tool_name`, or `None` to allow it, consulting
+    // the live state file merged with the process latch (see `enforced_state`).
+    //
+    // Test-only single-name convenience; production always routes through
+    // `block_reason_any` so a tool's advertised and delegated canonical names
+    // are both checked in one read.
+    #[cfg(test)]
+    pub(crate) fn block_reason(&self, tool_name: &str) -> Option<String> {
+        self.enforced_state().tool_block_reason(tool_name)
+    }
+
+    /// Refuse the call if *any* of `tool_names` is halted, reading the live
+    /// state file folded into the process latch once. The dispatcher passes both
+    /// a tool's advertised name and its delegated canonical name so a
+    /// skill-scoped alias cannot slip a frozen builtin past the gate.
+    pub fn block_reason_any(&self, tool_names: &[&str]) -> Option<String> {
+        let state = self.enforced_state();
+        tool_names
+            .iter()
+            .find_map(|name| state.tool_block_reason(name))
+    }
+
+    /// The live state file folded into a per-state-file process latch.
+    ///
+    /// Reading per call means a `zeroclaw estop` engaged from another process
+    /// takes effect on the next tool call. The latch additionally makes an
+    /// engaged stop tamper-resistant: once any engagement is observed, deleting
+    /// the state file or replacing it with a disengaged one — exactly what the
+    /// halted tool activity could attempt — no longer clears the stop for this
+    /// process. A concurrently engaged dimension is still merged in (monotonic
+    /// union), so live engage works; a legitimate disengage takes effect after
+    /// the agent restarts.
+    fn enforced_state(&self) -> EstopState {
+        let live = EstopState::load_for_enforcement(self.config, self.config_dir);
+        let path = resolve_state_file_path(self.config_dir, &self.config.state_file);
+        let mut guard = engaged_latch()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let latched = guard.entry(path).or_default();
+        latched.merge_engaged_from(&live);
+        latched.clone()
+    }
+
+    /// Construct enforcement context directly from owned parts held elsewhere
+    /// (e.g. [`EstopChildGuard`]) or from tests that don't build a whole `Config`.
+    pub fn from_parts(config: &'a EstopConfig, config_dir: &'a Path) -> Self {
+        Self { config, config_dir }
+    }
+}
+
+/// Owned emergency-stop gate for indirect execution paths — notably the
+/// `execute_pipeline` tool, which invokes child tools' `execute()` without going
+/// through the tool loop's direct dispatch. It holds an owned config + directory
+/// so it can live behind an `Arc<dyn ChildToolGuard>` inside the tools crate, and
+/// re-reads the live state on every check exactly as direct dispatch does, so a
+/// `zeroclaw estop` engaged from another process halts the next child call.
+#[derive(Debug, Clone)]
+pub struct EstopChildGuard {
+    config: EstopConfig,
+    config_dir: PathBuf,
+}
+
+impl EstopChildGuard {
+    /// Build the guard from the agent config, or `None` when estop is disabled or
+    /// the config directory is unknown — mirroring [`EstopEnforcement::from_config`].
+    pub fn from_config(config: &zeroclaw_config::schema::Config) -> Option<Self> {
+        if !config.security.estop.enabled {
+            return None;
+        }
+        let config_dir = config.config_path.parent()?.to_path_buf();
+        Some(Self {
+            config: config.security.estop.clone(),
+            config_dir,
+        })
+    }
+}
+
+impl zeroclaw_api::tool::ChildToolGuard for EstopChildGuard {
+    fn check(&self, canonical_tool_names: &[&str]) -> std::result::Result<(), String> {
+        EstopEnforcement::from_parts(&self.config, &self.config_dir)
+            .block_reason_any(canonical_tool_names)
+            .map_or(Ok(()), Err)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -72,27 +243,26 @@ impl EstopManager {
     pub fn load(config: &EstopConfig, config_dir: &Path) -> Result<Self> {
         let state_path = resolve_state_file_path(config_dir, &config.state_file);
         let mut should_fail_closed = false;
-        let mut state = if state_path.exists() {
-            match fs::read_to_string(&state_path) {
-                Ok(raw) => match serde_json::from_str::<EstopState>(&raw) {
-                    Ok(mut parsed) => {
-                        parsed.normalize();
-                        parsed
-                    }
-                    Err(error) => {
-                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": state_path.display().to_string(), "error": format!("{}", error)})), "Failed to parse estop state file; entering fail-closed mode: ");
-                        should_fail_closed = true;
-                        EstopState::fail_closed()
-                    }
-                },
+        let mut state = match fs::read_to_string(&state_path) {
+            Ok(raw) => match serde_json::from_str::<EstopState>(&raw) {
+                Ok(mut parsed) => {
+                    parsed.normalize();
+                    parsed
+                }
                 Err(error) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": state_path.display().to_string(), "error": format!("{}", error)})), "Failed to read estop state file; entering fail-closed mode: ");
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": state_path.display().to_string(), "error": format!("{}", error)})), "Failed to parse estop state file; entering fail-closed mode: ");
                     should_fail_closed = true;
                     EstopState::fail_closed()
                 }
+            },
+            // Only a genuinely absent file is treated as "never engaged". Any
+            // other read error fails closed rather than defaulting to disengaged.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => EstopState::default(),
+            Err(error) => {
+                ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"path": state_path.display().to_string(), "error": format!("{}", error)})), "Failed to read estop state file; entering fail-closed mode: ");
+                should_fail_closed = true;
+                EstopState::fail_closed()
             }
-        } else {
-            EstopState::default()
         };
 
         state.normalize();
@@ -248,6 +418,16 @@ impl EstopManager {
     }
 }
 
+/// Per-state-file latch of engaged estop dimensions, preserved for the process
+/// lifetime. Keyed by the resolved state-file path so independent agents/tests
+/// don't cross-contaminate. See [`EstopEnforcement::enforced_state`].
+fn engaged_latch() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, EstopState>> {
+    static LATCH: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, EstopState>>,
+    > = std::sync::OnceLock::new();
+    LATCH.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 pub fn resolve_state_file_path(config_dir: &Path, state_file: &str) -> PathBuf {
     let expanded = shellexpand::tilde(state_file).into_owned();
     let path = PathBuf::from(expanded);
@@ -388,6 +568,183 @@ mod tests {
             .resume(ResumeSelector::KillAll, None, None)
             .expect_err("resume should require OTP");
         assert!(err.to_string().contains("OTP code is required"));
+    }
+
+    #[test]
+    fn load_for_enforcement_reports_engagement_without_persisting() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+
+        // Missing file → not engaged, and nothing is written.
+        let state = EstopState::load_for_enforcement(&cfg, dir.path());
+        assert!(!state.is_engaged());
+        assert!(
+            !state_path.exists(),
+            "enforcement read must not create a file"
+        );
+
+        // A `zeroclaw estop` from another process writes the file; the next
+        // enforcement read sees it.
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["shell".into()]))
+                .unwrap();
+        }
+        let state = EstopState::load_for_enforcement(&cfg, dir.path());
+        assert!(state.is_tool_frozen("shell"));
+        assert!(state.is_tool_frozen("SHELL"), "match is case-insensitive");
+        assert!(!state.is_tool_frozen("browser"));
+        assert_eq!(state.tool_block_reason("browser"), None);
+        assert!(state.tool_block_reason("shell").unwrap().contains("frozen"));
+    }
+
+    #[test]
+    fn load_for_enforcement_fails_closed_on_corruption_without_persisting() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        fs::write(&state_path, "{ truncated").unwrap();
+        let cfg = estop_config(&state_path);
+
+        let state = EstopState::load_for_enforcement(&cfg, dir.path());
+        assert!(state.kill_all, "corrupt state must fail closed");
+        // kill_all blocks every tool by name.
+        assert!(state.tool_block_reason("anything").is_some());
+        // The read did not rewrite the file (still the corrupt bytes).
+        assert_eq!(fs::read_to_string(&state_path).unwrap(), "{ truncated");
+    }
+
+    #[test]
+    fn load_for_enforcement_fails_closed_when_state_path_is_unreadable() {
+        // A parent path component that is a regular file makes the state path
+        // unreadable with a non-`NotFound` error. `Path::exists()` reports
+        // false here, so the old exists()-then-read shortcut would have
+        // defaulted to *disengaged*; the fail-closed read must instead halt.
+        let dir = tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, b"x").unwrap();
+        let state_path = blocker.join("estop-state.json");
+        assert!(
+            !state_path.exists(),
+            "precondition: exists() is false for a path under a file component"
+        );
+        let cfg = estop_config(&state_path);
+
+        let state = EstopState::load_for_enforcement(&cfg, dir.path());
+        assert!(
+            state.kill_all,
+            "an unreadable (non-NotFound) state path must fail closed, not default to disengaged"
+        );
+        assert!(state.tool_block_reason("anything").is_some());
+    }
+
+    #[test]
+    fn enforcement_latch_survives_state_file_deletion() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+        let enforcement = EstopEnforcement::from_parts(&cfg, dir.path());
+
+        // Operator freezes `shell`; the gate observes it.
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["shell".into()]))
+                .unwrap();
+        }
+        assert!(enforcement.block_reason("shell").is_some());
+
+        // The halted tool deletes the state file to unblock itself.
+        fs::remove_file(&state_path).unwrap();
+        assert!(!state_path.exists());
+
+        // The stop is preserved: the frozen tool is still refused.
+        assert!(
+            enforcement.block_reason("shell").is_some(),
+            "deleting the state file must not clear an engaged freeze"
+        );
+    }
+
+    #[test]
+    fn enforcement_latch_survives_disengaged_replacement() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+        let enforcement = EstopEnforcement::from_parts(&cfg, dir.path());
+
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager.engage(EstopLevel::KillAll).unwrap();
+        }
+        assert!(enforcement.block_reason("anything").is_some());
+
+        // The halted tool overwrites the file with a valid, disengaged state.
+        let disengaged = serde_json::to_string(&EstopState::default()).unwrap();
+        fs::write(&state_path, disengaged).unwrap();
+
+        assert!(
+            enforcement.block_reason("anything").is_some(),
+            "replacing the state file with a disengaged one must not clear kill_all"
+        );
+    }
+
+    #[test]
+    fn enforcement_latch_still_picks_up_a_new_engagement() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+        let enforcement = EstopEnforcement::from_parts(&cfg, dir.path());
+
+        // Nothing engaged yet: tools run.
+        assert!(enforcement.block_reason("shell").is_none());
+
+        // A concurrent `zeroclaw estop` engages a freeze; the latch merges it in.
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["shell".into()]))
+                .unwrap();
+        }
+        assert!(
+            enforcement.block_reason("shell").is_some(),
+            "a freshly engaged freeze must take effect live"
+        );
+        // A different tool is unaffected by a scoped freeze.
+        assert!(enforcement.block_reason("browser").is_none());
+    }
+
+    #[test]
+    fn block_reason_any_blocks_on_delegated_name() {
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("estop-state.json");
+        let cfg = estop_config(&state_path);
+        let enforcement = EstopEnforcement::from_parts(&cfg, dir.path());
+
+        {
+            let mut manager = EstopManager::load(&cfg, dir.path()).unwrap();
+            manager
+                .engage(EstopLevel::ToolFreeze(vec!["shell".into()]))
+                .unwrap();
+        }
+        // The advertised alias is not frozen by name, but its delegated target is.
+        assert!(enforcement.block_reason("my_skill__shell").is_none());
+        assert!(
+            enforcement
+                .block_reason_any(&["my_skill__shell", "shell"])
+                .is_some(),
+            "a skill alias delegating to a frozen builtin must be refused"
+        );
+    }
+
+    #[test]
+    fn kill_all_blocks_every_tool() {
+        let state = EstopState {
+            kill_all: true,
+            ..EstopState::default()
+        };
+        assert!(state.tool_block_reason("shell").is_some());
+        assert!(state.tool_block_reason("browser").is_some());
     }
 
     #[test]

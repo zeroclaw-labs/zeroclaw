@@ -315,6 +315,22 @@ impl OptionEntry {
     }
 }
 
+/// A narrow gate the pipeline executor consults immediately before invoking
+/// each child tool, so an engaged emergency stop — whose state is owned by the
+/// runtime — also halts tools run indirectly through `execute_pipeline`, not
+/// just those dispatched directly by the tool loop.
+///
+/// Kept deliberately minimal so `zeroclaw-tools` depends only on this contract
+/// and never on runtime estop state: the executor asks whether a canonical
+/// child identity may run and does nothing else. The runtime implements it.
+pub trait ChildToolGuard: Send + Sync {
+    /// `Err(reason)` when none of `canonical_tool_names` may be invoked right now
+    /// (e.g. an engaged `zeroclaw estop` has frozen the tool); `Ok(())` to allow.
+    /// Callers pass a tool's advertised name and its [`Tool::delegated_tool_name`]
+    /// so a skill-scoped alias cannot slip a frozen builtin past the gate.
+    fn check(&self, canonical_tool_names: &[&str]) -> Result<(), String>;
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Tool name (used in LLM function calling)
@@ -340,6 +356,15 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// selectable choices. Default: no domain-typed parameters.
     fn param_domains(&self) -> Vec<(&'static str, OptionDomain)> {
         Vec::new()
+    }
+
+    /// The canonical name of the underlying tool this one delegates to, when it
+    /// is a wrapper around another tool (e.g. a skill-scoped alias that calls a
+    /// builtin). Security gates such as the emergency stop consult this so that
+    /// freezing `shell` also halts a `my_skill__shell` alias whose `name()` is
+    /// the composed alias but which executes `shell`. `None` for a plain tool.
+    fn delegated_tool_name(&self) -> Option<&str> {
+        None
     }
 
     /// Execute the tool with given arguments
