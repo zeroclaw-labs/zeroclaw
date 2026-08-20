@@ -2212,9 +2212,9 @@ impl AcpServer {
             .collect();
         // The two projections diverge on purpose. `stored` is what the client
         // replays, so a tool call the turn never answered and an attachment the
-        // provider rejected both stay visible: that activity happened, and
-        // #9333 asks for it to survive reload. `seed` is what the next provider
-        // request is built from, so it is the only one repaired.
+        // provider rejected both stay visible: that activity happened, and the
+        // durable transcript is expected to survive reload. `seed` is what the
+        // next provider request is built from, so it is the only one repaired.
         let mut seed: Vec<ConversationMessage> = stored
             .iter()
             .filter(|message| !Self::is_cancellation_event(message))
@@ -6732,8 +6732,8 @@ mod tests {
     async fn session_load_replays_incomplete_call_but_seeds_repaired_history() {
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall};
 
-        // #9333 splits the two projections: the failed turn's visible activity
-        // must survive reload for the client, while only provider-facing history
+        // The two projections are split: the failed turn's visible activity must
+        // survive reload for the client, while only provider-facing history
         // drops the unsafe partial exchange. Repairing the replay source too
         // would delete the tool call the user already saw.
         let cwd = tempfile::tempdir().unwrap();
