@@ -20210,6 +20210,42 @@ impl Config {
             }
         }
 
+        // Eval harness live provider — a dotted `providers.models` reference, or
+        // empty to opt out of live mode. Validated at the top level (not per agent)
+        // because it is a global `[eval]` field, mirroring the per-agent typed
+        // provider-ref checks below.
+        let eval_live_provider = self.eval.live_provider.trim();
+        if !eval_live_provider.is_empty() {
+            match eval_live_provider.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("providers.models.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            "eval.live_provider",
+                            "eval.live_provider = {eval_live_provider:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    "eval.live_provider",
+                    "eval.live_provider must be dotted form `<type>.<alias>` (got {eval_live_provider:?})",
+                ),
+            }
+        }
+        // A zero live turn timeout produces a zero-duration `tokio::time::timeout`,
+        // which makes every live turn fail on the first scheduling boundary. Reject
+        // it here rather than letting the harness look intermittently broken.
+        if self.eval.case_timeout_secs == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "eval.case_timeout_secs",
+                "eval.case_timeout_secs must be greater than zero (a zero timeout expires every live turn immediately)",
+            );
+        }
         let mut lucid_aliases: Vec<&String> = self.storage.lucid.keys().collect();
         lucid_aliases.sort();
         for alias in lucid_aliases {
@@ -37891,6 +37927,92 @@ allowed_users = []
                 && msg.contains("providers.models.custom.nope is not configured"),
             "expected DanglingReference for profile summary_provider, got: {msg}"
         );
+    }
+
+    fn eval_live_provider_config(live_provider: &str) -> Config {
+        let toml = format!(
+            r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            live_provider = "{live_provider}"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_eval_live_provider_bad_format() {
+        let cfg = eval_live_provider_config("notdotted");
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("non-dotted live_provider must fail")
+        );
+        assert!(
+            msg.contains("eval.live_provider") && msg.contains("dotted form"),
+            "expected InvalidFormat for eval.live_provider, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_eval_live_provider_dangling_alias() {
+        let cfg = eval_live_provider_config("custom.does-not-exist");
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("dangling live_provider must fail")
+        );
+        assert!(
+            msg.contains("eval.live_provider")
+                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+            "expected DanglingReference for eval.live_provider, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_validate_accepts_empty_eval_live_provider() {
+        // Empty is the opt-out; it must validate.
+        let cfg = eval_live_provider_config("");
+        cfg.validate()
+            .expect("empty eval.live_provider must validate");
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_zero_eval_case_timeout() {
+        // A zero timeout yields a zero-duration `tokio::time::timeout`, so every
+        // live turn expires at the first scheduling boundary.
+        let mut cfg = eval_live_provider_config("");
+        cfg.eval.case_timeout_secs = 0;
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("zero eval.case_timeout_secs must fail")
+        );
+        assert!(
+            msg.contains("eval.case_timeout_secs") && msg.contains("greater than zero"),
+            "expected InvalidNumericRange for eval.case_timeout_secs, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_validate_accepts_positive_eval_case_timeout() {
+        let mut cfg = eval_live_provider_config("");
+        cfg.eval.case_timeout_secs = 1;
+        cfg.validate()
+            .expect("a positive eval.case_timeout_secs must validate");
     }
 
     // effective_summary_provider precedence — agent → profile → None.

@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
 use zeroclaw_api::model_provider::{
-    ChatRequest, ChatResponse, ModelProvider, TokenUsage, ToolCall,
+    ChatRequest, ChatResponse, ModelProvider, ProviderCapabilities, TokenUsage, ToolCall,
 };
 
 use crate::case::{LlmTrace, TraceResponse};
@@ -19,23 +19,47 @@ struct ReplayState {
     current: usize,
 }
 
+/// Replays a trace's scripted steps, keeping each turn's steps in their own queue.
+///
+/// The provider is opaque to the runner (it is injected as a boxed `ModelProvider`
+/// through `RunDeps`), so the runner enforces the turn boundary through a
+/// [`ReplayHandle`] carried alongside it: after every `Agent::turn` the handle
+/// asserts the turn consumed all of its scripted steps. Without that boundary a
+/// leftover step bleeds into the next turn, shifting the whole trace out of phase
+/// while still reporting green. Requesting more responses than the current turn
+/// scripts is an error (exhaustion guard).
 pub struct TraceLlmProvider {
     state: Arc<Mutex<ReplayState>>,
     trace_name: String,
 }
 
 impl TraceLlmProvider {
-    /// Build a replay provider from a trace, keeping each turn's steps in its own queue.
-    pub fn from_trace(trace: &LlmTrace) -> Self {
-        let turns = trace
-            .turns
-            .iter()
-            .map(|turn| turn.steps.iter().map(|s| s.response.clone()).collect())
-            .collect();
-        Self {
+    /// Build a replay provider from a trace, keeping each turn's steps in its own
+    /// queue. Fails if any turn has no scripted steps: replay requires every LLM
+    /// round-trip to be scripted, so an empty turn is an authoring error rather
+    /// than a live case.
+    pub fn try_from_trace(trace: &LlmTrace) -> anyhow::Result<Self> {
+        let mut turns = Vec::with_capacity(trace.turns.len());
+        for (turn_index, turn) in trace.turns.iter().enumerate() {
+            let turn_steps = turn.steps.as_deref().unwrap_or_default();
+            if turn_steps.is_empty() {
+                anyhow::bail!(
+                    "replay case '{}' turn {} has no scripted steps",
+                    trace.model_name,
+                    turn_index
+                );
+            }
+            turns.push(
+                turn_steps
+                    .iter()
+                    .map(|step| step.response.clone())
+                    .collect::<VecDeque<_>>(),
+            );
+        }
+        Ok(Self {
             state: Arc::new(Mutex::new(ReplayState { turns, current: 0 })),
             trace_name: trace.model_name.clone(),
-        }
+        })
     }
 
     /// A handle the runner uses to advance turn boundaries while it drives the agent.
@@ -84,6 +108,16 @@ impl Attributable for TraceLlmProvider {
 
 #[async_trait]
 impl ModelProvider for TraceLlmProvider {
+    /// Truthful capabilities so the provider stays correct if ever routed through
+    /// dispatcher resolution (`tool_dispatcher_for_provider`): the scripted tool
+    /// calls are native tool calls.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            native_tool_calling: true,
+            ..ProviderCapabilities::default()
+        }
+    }
+
     async fn chat_with_system(
         &self,
         _system_prompt: Option<&str>,

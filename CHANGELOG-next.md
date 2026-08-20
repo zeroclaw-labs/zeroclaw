@@ -50,6 +50,8 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 - Nest memory and RAG spans under the turn trace, and classify web-search provider HTTP failures with precise `search_status` values (#8752, #8890).
 - Preserve complete lifecycle events, trim history by whole turns, and prevent duplicate streamed narration (#9490, #9007, #8951).
 - Recommend the capability-bounded `local_small` runtime profile for newly configured local model providers while leaving existing agent configurations unchanged (#8987).
+- Live eval cases can now seed isolated per-case SQLite memory and grade exact-key memory side effects, with memory tools gated by both case and operator allowlists (#9226).
+- Live eval fails closed when a case effectively requests `shell`, preventing a fallback to application-only path checks when no portable OS sandbox is guaranteed.
 
 ### Configuration, Logging, and Tools
 
