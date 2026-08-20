@@ -127,8 +127,9 @@ pub enum TurnEvent {
     /// `prepared.messages`: native tool schemas are not part of that payload,
     /// and a compatible/Codex adapter may prepare the payload again under its
     /// own multimodal policy, so the figure the provider finally sees can be
-    /// larger. Related #9713, which covers tool-schema and provider-facing
-    /// accounting.
+    /// larger. Tool-schema and provider-facing accounting are tracked
+    /// separately; the pull request body carries that link, because the comment
+    /// hygiene gate rejects issue references in source comments.
     UsageEstimate {
         estimated_input_tokens: Option<u64>,
     },
