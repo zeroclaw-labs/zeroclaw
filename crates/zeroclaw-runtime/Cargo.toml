@@ -111,6 +111,13 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-
 
 browser-native = []
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
+# Adds the Cranelift JIT to the plugin host so a `.wasm` component can be
+# compiled on the host instead of requiring a precompiled `.cwasm`. Production
+# builds get this through the root crate's feature of the same name; the runtime
+# crate declares it so the live-Agent plugin regression can be compiled and run
+# against a real component (`WasmTool::from_wasm` refuses to register a tool it
+# cannot load, so a runtime-only backend has no plugin tool to execute).
+plugins-wasm-cranelift = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift"]
 webauthn = []
 sandbox-bubblewrap = []
 

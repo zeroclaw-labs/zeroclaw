@@ -498,6 +498,15 @@ pub struct AllToolsResult {
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
+    /// The exact `DelegateTool` this factory registered, in its concrete type.
+    ///
+    /// Test-only. `tools`/`unfiltered_tool_arcs` erase the type behind
+    /// `dyn Tool`, so a regression cannot otherwise drive the *production*
+    /// delegate instance's nested-registry construction - it can only
+    /// re-derive the wiring by hand, which is exactly the thing that must not
+    /// be trusted. `None` when no agents are configured.
+    #[cfg(test)]
+    pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -562,6 +571,58 @@ fn filter_agent_peer_groups(
         .filter(|(_, pg)| pg.agents.iter().any(|a| a.as_str() == agent_alias))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn plugin_config_values(
+    config: &Config,
+    instance_key: &str,
+    package: &str,
+) -> Result<Option<HashMap<String, String>>, zeroclaw_plugins::error::PluginError> {
+    config
+        .plugins
+        .entry_config(instance_key)
+        .map(|configured| configured.cloned())
+        .map_err(|_| {
+            zeroclaw_plugins::error::PluginError::InvalidConfig(format!(
+                "plugin '{package}' has duplicate config entries for its instance key"
+            ))
+        })
+}
+
+#[cfg(feature = "plugins-wasm")]
+fn plugin_config_resolver(
+    host: Arc<zeroclaw_plugins::host::PluginHost>,
+    config: Arc<Config>,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> zeroclaw_plugins::config::PluginConfigResolver {
+    // A live daemon handle and a fallback snapshot are mutually exclusive in
+    // the long-lived service, so the resolver never retains two config sources.
+    let fallback_config = live_config.is_none().then_some(config);
+    zeroclaw_plugins::config::PluginConfigResolver::new(move |scope| {
+        let package = scope.id().package();
+        let config_entry_key = scope.id().config_entry_key()?;
+        let manifest = host
+            .manifest(package)
+            .ok_or_else(|| zeroclaw_plugins::error::PluginError::NotFound(package.to_string()))?;
+        if let Some(live_config) = &live_config {
+            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                // Transient per-call view: schema/grant checks happen before
+                // this access, and the global lock is released before guest
+                // setup.
+                plugin_config_values(&live_config.read(), &config_entry_key, package)
+            })
+        } else {
+            let config = fallback_config.as_ref().ok_or_else(|| {
+                zeroclaw_plugins::error::PluginError::InvalidConfig(
+                    "plugin config source is unavailable".to_string(),
+                )
+            })?;
+            zeroclaw_plugins::config::resolve_plugin_config_from(manifest, scope, || {
+                plugin_config_values(config, &config_entry_key, package)
+            })
+        }
+    })
 }
 
 /// Create full tool registry including memory tools and optional Composio.
@@ -1410,6 +1471,8 @@ pub fn all_tools_with_runtime(
                     unfiltered_tool_arcs: tool_arcs.clone(),
                     tools: boxed_registry_from_arcs(tool_arcs),
                     delegate_handle: None,
+                    #[cfg(test)]
+                    delegate_tool: None,
                     ask_user_handle,
                     channel_room_handle,
                     reaction_handle,
@@ -1489,6 +1552,8 @@ pub fn all_tools_with_runtime(
     let provider_runtime_options =
         zeroclaw_providers::provider_runtime_options_for_agent(root_config, agent_alias);
 
+    #[cfg(test)]
+    let mut built_delegate_tool: Option<Arc<DelegateTool>> = None;
     let delegate_handle: Option<DelegateParentToolsHandle> = if agents.is_empty() {
         None
     } else {
@@ -1525,8 +1590,19 @@ pub fn all_tools_with_runtime(
         .with_runtime_profiles(root_config.runtime_profiles.clone())
         .with_skill_bundles(root_config.skill_bundles.clone())
         .with_root_config(config.clone())
+        // `with_root_config` above is only a snapshot. Delegated targets get
+        // their own nested registry, whose plugin tools and `send_via`
+        // authority resolve per execution; without the shared handle they would
+        // resolve against that snapshot forever. Same contract as the
+        // `live_config` argument this function received.
+        .with_live_config(live_config.clone())
         .with_caller_alias(agent_alias);
-        tool_arcs.push(Arc::new(delegate_tool));
+        let delegate_tool = Arc::new(delegate_tool);
+        #[cfg(test)]
+        {
+            built_delegate_tool = Some(Arc::clone(&delegate_tool));
+        }
+        tool_arcs.push(delegate_tool as Arc<dyn Tool>);
         Some(parent_tools)
     };
 
@@ -1553,6 +1629,12 @@ pub fn all_tools_with_runtime(
                 trusted_publisher_keys,
             ) {
                 Ok(host) => {
+                    let host = Arc::new(host);
+                    let config_resolver = plugin_config_resolver(
+                        Arc::clone(&host),
+                        Arc::clone(&config),
+                        live_config.clone(),
+                    );
                     let mut details = host.tool_plugin_details();
                     details.sort_unstable_by(|(left, _), (right, _)| left.name.cmp(&right.name));
                     let discovered_count = details.len();
@@ -1575,23 +1657,16 @@ pub fn all_tools_with_runtime(
                         max_instances: config.plugins.limits.max_instances,
                     };
                     for (manifest, wasm_path) in details {
-                        let plugin_config = config
-                            .plugins
-                            .entry_config(&manifest.name)
-                            .cloned()
-                            .unwrap_or_default();
                         let tool = (|| -> anyhow::Result<_> {
-                            let scope =
-                                zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
-                                    manifest,
-                                    zeroclaw_plugins::PluginCapability::Tool,
-                                    manifest.name.clone(),
-                                    manifest.permissions.iter().copied(),
-                                )?;
+                            let scope = zeroclaw_plugins::instance::PluginInstanceScope::for_package_binding(
+                                manifest,
+                                zeroclaw_plugins::PluginCapability::Tool,
+                                manifest.permissions.iter().copied(),
+                            )?;
                             zeroclaw_plugins::wasm_tool::WasmTool::from_wasm(
                                 wasm_path.to_path_buf(),
                                 scope,
-                                plugin_config,
+                                config_resolver.clone(),
                                 plugin_limits,
                             )
                         })();
@@ -1689,6 +1764,8 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
+        #[cfg(test)]
+        delegate_tool: built_delegate_tool,
     }
 }
 
@@ -1735,6 +1812,89 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         }
+    }
+
+    #[cfg(feature = "plugins-wasm")]
+    #[test]
+    fn plugin_config_service_uses_live_instance_owned_values() {
+        let plugins_dir = TempDir::new().unwrap();
+        let plugin_dir = plugins_dir.path().join("fixture-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("plugin.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.toml"),
+            r#"name = "fixture-plugin"
+version = "0.1.0"
+wasm_path = "plugin.wasm"
+capabilities = ["tool"]
+permissions = ["config_read"]
+
+[config_schema]
+type = "object"
+required = ["enabled"]
+additionalProperties = false
+
+[config_schema.properties.enabled]
+type = "boolean"
+const = true
+"#,
+        )
+        .unwrap();
+        let host = Arc::new(
+            zeroclaw_plugins::host::PluginHost::from_plugins_dir(plugins_dir.path()).unwrap(),
+        );
+        let manifest = host.manifest("fixture-plugin").unwrap();
+        let scope = zeroclaw_plugins::instance::PluginInstanceScope::from_manifest(
+            manifest,
+            zeroclaw_plugins::PluginCapability::Tool,
+            "work",
+            [zeroclaw_plugins::PluginPermission::ConfigRead],
+        )
+        .unwrap();
+        let instance_key = scope.id().config_entry_key().unwrap();
+        let entry = |name: &str, enabled: &str| zeroclaw_config::schema::PluginEntryConfig {
+            name: name.to_string(),
+            config: HashMap::from([("enabled".to_string(), enabled.to_string())]),
+            egress_hosts: Vec::new(),
+            egress_allow_private: Vec::new(),
+        };
+        let mut snapshot = Config::default();
+        snapshot.plugins.entries = vec![entry(&instance_key, "false")];
+        let mut current = Config::default();
+        current.plugins.entries = vec![
+            entry("fixture-plugin", "true"),
+            entry("work", "true"),
+            entry(&instance_key, "true"),
+        ];
+        let live = Arc::new(parking_lot::RwLock::new(current));
+        let resolver = plugin_config_resolver(
+            Arc::clone(&host),
+            Arc::new(snapshot),
+            Some(Arc::clone(&live)),
+        );
+
+        assert!(resolver.resolve(&scope).is_ok());
+        live.write()
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == instance_key)
+            .unwrap()
+            .config
+            .insert("enabled".to_string(), "false".to_string());
+        assert!(
+            resolver.resolve(&scope).is_err(),
+            "a raw package or binding entry must not bypass the canonical key"
+        );
+        live.write()
+            .plugins
+            .entries
+            .iter_mut()
+            .find(|entry| entry.name == instance_key)
+            .unwrap()
+            .config
+            .insert("enabled".to_string(), "true".to_string());
+        assert!(resolver.resolve(&scope).is_ok());
     }
 
     #[test]

@@ -384,21 +384,20 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+      - name: Verify plugin backend change filter
+        run: bash scripts/ci/plugin_backend_change_filter.test.sh
       - name: Detect plugin backend changes
         id: changed
         run: |
           base="${{ github.event.pull_request.base.sha }}"
           if [ -z "$base" ]; then echo "run=true" >> "$GITHUB_OUTPUT"; exit 0; fi
-          if git diff --name-only "$base" HEAD | grep -qE '^crates/zeroclaw-plugins/|^wit/|^Cargo\.(toml|lock)$|^\.github/workflows/ci\.yml$'; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
+          run="$(git diff --name-only "$base" HEAD | bash scripts/ci/plugin_backend_change_filter.sh)"
+          echo "run=$run" >> "$GITHUB_OUTPUT"
       - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         if: steps.changed.outputs.run == 'true'
         with:
           toolchain: 1.96.1
-      - name: Install channel plugin fixture target
+      - name: Install plugin fixture target
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: rustup target add wasm32-wasip2
       - uses: ./.github/actions/rust-cache
@@ -410,12 +409,15 @@ jobs:
       - name: Check
         if: steps.changed.outputs.run == 'true'
         run: cargo check --locked -p zeroclaw-plugins --no-default-features --features ${{ matrix.features }}
-      - name: Run channel plugin component test
+      - name: Run plugin component tests
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
-        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e
+        run: cargo test --locked -p zeroclaw-plugins --features plugins-wasm-cranelift --test channel_plugin_e2e --test reference_plugin --test reference_plugin_e2e
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
+      - name: Run runtime live-config plugin regression
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib live_agent_plugin_tool_observes_config_reload_after_construction
 
   msrv:
     name: MSRV (declared floor)
