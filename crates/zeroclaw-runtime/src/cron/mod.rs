@@ -222,17 +222,21 @@ pub fn update_shell_job_with_approval(
     approved: bool,
 ) -> Result<CronJob> {
     if patch.command.is_none() {
-        // Still an agent-facing write, so it takes the scoped path too.
-        return update_job_for_agent(config, job_id, agent_alias, patch);
+        return update_job(config, job_id, patch);
     }
 
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
     let runtime = crate::platform::create_runtime(&config.runtime)?;
+    // `owner: None` — this is the OPERATOR entry point, used by the gateway API
+    // and the CLI. Its `agent_alias` names whose risk profile validates the
+    // command, which is not necessarily the job's owner: patching an agent-type
+    // job's prompt is not agent-gated at all and may omit the agent entirely.
+    // Scoping here would stop an operator patching a job.
     update_shell_job_with_runtime(
         config,
         runtime.as_ref(),
         &security,
-        agent_alias,
+        None,
         job_id,
         patch,
         approved,
@@ -243,8 +247,9 @@ pub(crate) fn update_shell_job_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
-    // Calling agent — the ownership test is carried into the write below.
-    agent_alias: &str,
+    // Some(alias) for an agent-facing call, which carries the ownership test
+    // into the write; None for operator callers, which have no owning agent.
+    owner: Option<&str>,
     job_id: &str,
     patch: CronJobPatch,
     approved: bool,
@@ -252,10 +257,12 @@ pub(crate) fn update_shell_job_with_runtime(
     if let Some(command) = patch.command.as_deref() {
         validate_shell_command_with_security(runtime, security, command, approved)?;
     }
-    // Scoped: this is an agent-facing path, so the ownership test travels with
-    // the write rather than being a separate read the operator's rename cascade
-    // can slip between.
-    update_job_for_agent(config, job_id, agent_alias, patch)
+    match owner {
+        // Scoped: the ownership test travels with the write rather than being a
+        // separate read the operator's rename cascade can slip between.
+        Some(agent_alias) => update_job_for_agent(config, job_id, agent_alias, patch),
+        None => update_job(config, job_id, patch),
+    }
 }
 
 /// Create a one-shot validated shell job from a delay string (e.g. "30m").

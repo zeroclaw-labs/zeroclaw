@@ -282,7 +282,7 @@ impl Tool for CronUpdateTool {
             &self.config,
             self.runtime.as_ref(),
             &self.security,
-            &self.agent_alias,
+            Some(self.agent_alias.as_str()),
             job_id,
             patch,
             approved,

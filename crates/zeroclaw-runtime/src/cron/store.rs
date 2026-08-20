@@ -1888,6 +1888,34 @@ mod tests {
     }
 
     #[test]
+    fn the_operator_shell_update_path_is_not_agent_scoped() {
+        // update_shell_job_with_approval is the gateway API's and the CLI's entry
+        // point. Its agent_alias names whose risk profile validates a command, NOT
+        // the job's owner — patching an agent-type job's prompt is not agent-gated
+        // and may name a different agent entirely. Scoping it once broke exactly
+        // that, so pin the behaviour here rather than only in the gateway crate.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        crate::cron::update_shell_job_with_approval(
+            &config,
+            "some-other-agent",
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed by the operator".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .expect("an operator patch must not require owning the job");
+
+        let updated = get_job(&config, &job.id).unwrap();
+        assert_eq!(updated.name.as_deref(), Some("renamed by the operator"));
+        assert_eq!(updated.agent_alias, "owner-agent", "ownership is unchanged");
+    }
+
+    #[test]
     fn unscoped_helpers_still_serve_operator_callers() {
         // The gateway and scheduler call these with no agent in hand; scoping the
         // agent-facing paths must not take that away.
