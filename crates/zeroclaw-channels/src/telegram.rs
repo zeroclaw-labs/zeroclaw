@@ -641,20 +641,6 @@ pub(crate) enum UpdateDisposition {
     RetryTransient,
 }
 
-#[cfg(test)]
-impl UpdateDisposition {
-    /// Unwrap a `Parsed` disposition in tests, panicking with `context` on the
-    /// skip/retry variants. Keeps parser regressions terse now that the parser
-    /// returns a disposition rather than an `Option`.
-    pub(crate) fn expect_parsed(self, context: &str) -> ChannelMessage {
-        match self {
-            UpdateDisposition::Parsed(msg) => *msg,
-            UpdateDisposition::SkipPermanent => panic!("{context}: got SkipPermanent"),
-            UpdateDisposition::RetryTransient => panic!("{context}: got RetryTransient"),
-        }
-    }
-}
-
 /// Result of routing a single update through [`TelegramChannel::process_update`].
 ///
 /// Both the startup/restart probe and the main long-poll loop drive their
@@ -4706,6 +4692,23 @@ Ensure only one `zeroclaw` process is using this bot token."
             };
 
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+impl UpdateDisposition {
+    /// Unwrap a `Parsed` disposition in tests, panicking with `context` on the
+    /// skip/retry variants. Keeps parser regressions terse now that the parser
+    /// returns a disposition rather than an `Option`. Defined alongside the
+    /// test module rather than beside the enum so the first `#[cfg(test)]` in
+    /// this file stays after the production code, keeping the config-isolation
+    /// architecture gate's test-region scan off `persist_allowed_identity`.
+    pub(crate) fn expect_parsed(self, context: &str) -> ChannelMessage {
+        match self {
+            UpdateDisposition::Parsed(msg) => *msg,
+            UpdateDisposition::SkipPermanent => panic!("{context}: got SkipPermanent"),
+            UpdateDisposition::RetryTransient => panic!("{context}: got RetryTransient"),
+        }
     }
 }
 

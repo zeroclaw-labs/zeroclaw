@@ -27432,6 +27432,7 @@ This is an example JSON object for profile settings."#;
     /// history. The channel emits the same re-loadable `[IMAGE:<path>]` marker
     /// for image documents as for photos, and the pipeline recognizes it as
     /// already marked instead of describing it again.
+    #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     async fn telegram_image_document_with_enabled_pipeline_never_inlines_base64() {
         use wiremock::matchers::{method, path_regex};
@@ -27569,6 +27570,7 @@ This is an example JSON object for profile settings."#;
     /// stay a document end to end: the saved path reaches the provider and
     /// stored history, with no image annotation, no inline base64, and no
     /// load-failure replacement.
+    #[cfg(feature = "channel-telegram")]
     #[tokio::test]
     async fn telegram_unsupported_image_document_stays_a_document_end_to_end() {
         async fn run_case(file_name: &str, mime: &str) {

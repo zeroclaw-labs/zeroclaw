@@ -13342,7 +13342,7 @@ dependencies = [
  "url",
  "uuid",
  "webpki-roots 1.0.7",
- "windows 0.61.3",
+ "windows",
  "zeroclaw-api",
  "zeroclaw-infra",
  "zeroclaw-log",
