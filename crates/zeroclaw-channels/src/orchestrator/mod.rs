@@ -27482,7 +27482,7 @@ This is an example JSON object for profile settings."#;
         let msg = telegram
             .try_parse_attachment_message(&update)
             .await
-            .expect("image document update should parse");
+            .expect_parsed("image document update should parse");
         assert!(
             msg.content.contains("[IMAGE:"),
             "channel must emit the path marker for image documents: {}",
@@ -27631,7 +27631,7 @@ This is an example JSON object for profile settings."#;
             let msg = telegram
                 .try_parse_attachment_message(&update)
                 .await
-                .expect("unsupported image document update should parse");
+                .expect_parsed("unsupported image document update should parse");
             assert!(
                 msg.content.contains("[Document:"),
                 "an unsupported image document must render as a document \

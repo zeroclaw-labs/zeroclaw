@@ -1176,6 +1176,7 @@ mod tests {
             file_name: file_name.into(),
             data,
             mime_type: None,
+            marker: None,
         }
     }
 

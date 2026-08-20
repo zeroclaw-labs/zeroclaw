@@ -4,7 +4,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use zeroclaw_api::media::{
-    image_mime_from_extension, image_mime_from_magic, is_provider_image_mime,
+    PROVIDER_IMAGE_MIME_TYPES, image_mime_from_extension, image_mime_from_magic,
+    is_provider_image_mime,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
@@ -125,7 +126,7 @@ pub(crate) enum ImageDataUriRejection {
     NotADataUri,
     /// A `data:` URI whose header does not declare `;base64`.
     NotBase64Encoded,
-    /// Media type outside [`ALLOWED_IMAGE_MIME_TYPES`].
+    /// Media type outside [`PROVIDER_IMAGE_MIME_TYPES`].
     UnsupportedMediaType,
     /// Payload is empty or is not canonical padded base64.
     MalformedBase64,
@@ -191,7 +192,7 @@ pub(crate) fn split_base64_image_data_uri(
     }
 
     let media_type = header.split(';').next().unwrap_or_default().trim();
-    if !ALLOWED_IMAGE_MIME_TYPES
+    if !PROVIDER_IMAGE_MIME_TYPES
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(media_type))
     {
@@ -1471,7 +1472,7 @@ mod tests {
 
     #[test]
     fn split_data_uri_accepts_every_allowlisted_media_type() {
-        for mime in ALLOWED_IMAGE_MIME_TYPES {
+        for mime in PROVIDER_IMAGE_MIME_TYPES {
             let uri = format!("data:{mime};base64,{CANONICAL_PNG_B64}");
             let (media_type, _) = split_base64_image_data_uri(&uri, TEN_MB)
                 .unwrap_or_else(|reason| panic!("{mime} rejected: {reason}"));

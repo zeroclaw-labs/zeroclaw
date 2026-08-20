@@ -631,12 +631,28 @@ enum EditMessageResult {
 /// transcription, disk writes) so the caller can leave the update
 /// unacknowledged and retry it on the next poll instead of silently dropping
 /// it.
-enum UpdateDisposition {
+// `pub(crate)` so orchestrator regressions can receive the disposition returned
+// by `try_parse_attachment_message` and unwrap the parsed message.
+pub(crate) enum UpdateDisposition {
     // Boxed: `ChannelMessage` is far larger than the unit variants, and this
     // enum is constructed on every incoming update regardless of outcome.
     Parsed(Box<ChannelMessage>),
     SkipPermanent,
     RetryTransient,
+}
+
+#[cfg(test)]
+impl UpdateDisposition {
+    /// Unwrap a `Parsed` disposition in tests, panicking with `context` on the
+    /// skip/retry variants. Keeps parser regressions terse now that the parser
+    /// returns a disposition rather than an `Option`.
+    pub(crate) fn expect_parsed(self, context: &str) -> ChannelMessage {
+        match self {
+            UpdateDisposition::Parsed(msg) => *msg,
+            UpdateDisposition::SkipPermanent => panic!("{context}: got SkipPermanent"),
+            UpdateDisposition::RetryTransient => panic!("{context}: got RetryTransient"),
+        }
+    }
 }
 
 /// Result of routing a single update through [`TelegramChannel::process_update`].
@@ -9793,7 +9809,7 @@ mod tests {
         let msg = ch
             .try_parse_attachment_message(&update)
             .await
-            .expect("photo update should parse into a channel message");
+            .expect_parsed("photo update should parse into a channel message");
 
         // The typed envelope is the source of truth for image presence, so a
         // real photo must land here even though the marker is also emitted.
@@ -9858,7 +9874,7 @@ mod tests {
         let msg = ch
             .try_parse_attachment_message(&update)
             .await
-            .expect("document update should parse into a channel message");
+            .expect_parsed("document update should parse into a channel message");
 
         // An image sent "as file" must classify as an image in the envelope,
         // so image-turn behavior cannot be sidestepped by attaching the photo
@@ -9930,7 +9946,7 @@ mod tests {
         let msg = ch
             .try_parse_attachment_message(&update)
             .await
-            .expect("document update should parse into a channel message");
+            .expect_parsed("document update should parse into a channel message");
 
         assert_eq!(msg.attachments.len(), 1);
         assert_eq!(msg.attachments[0].mime_type.as_deref(), Some("image/jpeg"));
