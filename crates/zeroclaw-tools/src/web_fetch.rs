@@ -1523,6 +1523,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_negotiates_and_decodes_through_the_production_client() {
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The rest of the decompression matrix calls `standard_fetch` with a
+        // client the test built, so it would stay green if the production
+        // client stopped advertising the encodings. This one goes through
+        // `Tool::execute`, which builds its client in
+        // `build_redirect_guarded_client`: the mock answers only a request that
+        // carries the exact Accept-Encoding value, so a decoded body here proves
+        // the production wiring end to end.
+        let payload = "ZEROCLAW_PRODUCTION_PATH_OK";
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .and(header_exists("accept-encoding"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .insert_header("content-type", "text/plain")
+                    .set_body_raw(gzip_bytes(payload.as_bytes()), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = WebFetchTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            vec!["*".into()],
+            vec![],
+            0,
+            30,
+            FirecrawlConfig::default(),
+            vec!["127.0.0.1".into()],
+            vec![],
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(serde_json::json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+
+        let seen = server.received_requests().await.unwrap();
+        let negotiated: Vec<String> = seen
+            .iter()
+            .flat_map(|request| request.headers.get_all("accept-encoding"))
+            .map(|value| value.to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            negotiated,
+            vec!["gzip, deflate, br".to_string()],
+            "the production client must advertise exactly the codings http_decode can decode"
+        );
+        assert!(
+            result.output.as_str().contains(payload),
+            "the production client must negotiate and decode gzip: {}",
+            result.output.as_str()
+        );
+    }
+
+    #[tokio::test]
     async fn standard_fetch_decodes_every_gzip_member() {
         // RFC 1952 allows a gzip body to be a series of members. A single-member
         // decoder returns the first one and silently drops the rest, which reads
