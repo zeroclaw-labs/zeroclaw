@@ -257,10 +257,10 @@ fn count_turns(history: &[ChatMessage]) -> usize {
 /// that need the kept-turn figure after a [`drop_oldest_turn`] pass.
 ///
 /// When `has_leading_breadcrumb` is set, a synthetic trim breadcrumb occupies
-/// the first non-system slot and is counted as a turn boundary by
-/// [`count_turns`]; discount it so `kept_turns` reflects only real retained
-/// turns. Provenance comes from the caller, not the breadcrumb's text, so a
-/// real user message with the same content is still counted as a real turn.
+/// the first non-system slot and counts as a turn boundary; discount it so
+/// `kept_turns` reflects only real retained turns. Provenance comes from the
+/// caller, not the breadcrumb's text, so a real user message with the same
+/// content is still counted as a real turn.
 #[must_use]
 pub fn count_turns_pub(history: &[ChatMessage], has_leading_breadcrumb: bool) -> usize {
     count_turns(history).saturating_sub(usize::from(has_leading_breadcrumb))
