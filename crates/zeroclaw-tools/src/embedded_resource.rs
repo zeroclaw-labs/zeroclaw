@@ -1,7 +1,6 @@
 //! Materialize embedded `resource.blob` payloads into the session workspace.
-//! Store-agnostic: no RPC `SessionStore` / `file/attach`. Used by ACP inbound
-//! prompt intake; the store-agnostic helper is reusable by other protocol
-//! adapters.
+//! Store-agnostic: no RPC `SessionStore` / `file/attach`. Shared by ACP inbound
+//! and MCP tools/call postprocessing.
 
 use base64::Engine;
 use sha2::{Digest, Sha256};
@@ -9,6 +8,51 @@ use std::path::{Path, PathBuf};
 
 /// Per-file decoded size limit for embedded blobs (matches RPC attach / ACP).
 pub const MAX_EMBEDDED_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Estimated aggregate decoded size limit for all embedded blobs in a single
+/// `tools/call` result. Beyond this, every resource blob is replaced with an
+/// aggregate-limit marker and no file is written.
+///
+/// `pub(crate)` so the MCP transport can size its encoded response ceiling to
+/// this decoded budget plus base64 and JSON overhead, keeping the two layers in
+/// lockstep instead of duplicating the literal.
+pub(crate) const MAX_AGGREGATE_BLOB_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Maximum number of embedded resource blobs materialized from a single
+/// `tools/call` result. A byte budget alone does not bound the per-item work: an
+/// untrusted server can return a large array of empty or tiny blobs whose
+/// estimated total stays under [`MAX_AGGREGATE_BLOB_BYTES`], yet still forces one
+/// decode + hash + filesystem write attempt per item. This caps the item count
+/// independently; beyond it, every resource blob is degraded with a marker and
+/// nothing is written.
+const MAX_AGGREGATE_BLOB_ITEMS: usize = 64;
+
+/// Estimated decoded byte length of a base64 `blob` string, computed without
+/// decoding. Base64 encodes 3 bytes per 4 characters; the trailing `=` padding
+/// (0-2 chars) is not data, so it is subtracted. Counting padding as data (a
+/// plain `len * 3 / 4`) overestimates by up to 2 bytes, which wrongly rejects a
+/// blob whose real decoded size is exactly at the limit. A malformed length that
+/// is not a multiple of 4 undercounts the final partial group, which is safe:
+/// the per-file decode still enforces the hard cap on the real bytes.
+///
+/// Only the two canonical padding positions are subtracted. Valid standard
+/// base64 has at most two trailing `=`, so a server-controlled string made
+/// mostly or entirely of `=` must not estimate as near-zero: without this cap
+/// its full `=` run would be subtracted, the aggregate byte gate would be
+/// bypassed, and `Engine::decode()` would still allocate a buffer sized from the
+/// original encoded length (~3/4 of it) before rejecting the input. Counting at
+/// most two padding characters keeps such a blob's estimate proportional to its
+/// length so the aggregate gate degrades it before any decode allocation.
+fn estimated_decoded_blob_len(blob: &str) -> u64 {
+    let len = blob.len() as u64;
+    let pad = blob
+        .bytes()
+        .rev()
+        .take_while(|&b| b == b'=')
+        .take(2)
+        .count() as u64;
+    ((len / 4) * 3).saturating_sub(pad)
+}
 
 /// Result of writing an embedded resource into the session workspace.
 #[derive(Debug)]
@@ -279,6 +323,156 @@ fn write_blob_content_addressed(
     Ok(())
 }
 
+/// Whether an MCP tools/call content item is a `resource` with a `blob` field.
+pub(crate) fn content_item_has_resource_blob(item: &serde_json::Value) -> bool {
+    item.get("type").and_then(|t| t.as_str()) == Some("resource")
+        && item
+            .get("resource")
+            .and_then(|r| r.get("blob"))
+            .and_then(|b| b.as_str())
+            .is_some()
+}
+
+/// Format an MCP `tools/call` result for the model.
+///
+/// When `content` contains any `type: "resource"` item with `blob`, materialize
+/// each blob under `{workspace}/uploads/` and return the full result as JSON with
+/// only the binary payloads redacted: a resource `blob` is replaced by a
+/// Document/IMAGE `materialized` marker, and image/audio `data` by a concise
+/// marker — never raw base64. Every non-binary field (text, `resource_link`,
+/// unknown content types, per-item `annotations`, and top-level
+/// `structuredContent`/`_meta`/`isError`) is preserved verbatim. Results without a
+/// resource blob keep the existing pretty-printed JSON shape.
+///
+/// Crate-internal: the only caller is [`crate::mcp_tool::McpToolWrapper`]; the
+/// serialized `CallToolResult` from `McpRegistry::call_tool` remains the public
+/// surface.
+pub(crate) fn format_mcp_tool_result_for_model(
+    mut result: serde_json::Value,
+    workspace_dir: &Path,
+) -> Result<String, EmbeddedResourceError> {
+    // Preflight over an immutable borrow: count resource blobs and estimate their
+    // aggregate decoded size WITHOUT decoding. Two independent per-call bounds
+    // guard the untrusted result: the item count (bounds decode/hash/write
+    // attempts, which a byte budget alone does not — empty blobs estimate zero)
+    // and the estimated aggregate bytes. Nothing is cloned; the owned `result` is
+    // mutated in place below.
+    let (blob_count, aggregate_estimate): (usize, u64) =
+        match result.get("content").and_then(|c| c.as_array()) {
+            Some(content) => content
+                .iter()
+                .filter(|i| content_item_has_resource_blob(i))
+                .fold((0usize, 0u64), |(count, bytes), item| {
+                    let blob = item
+                        .get("resource")
+                        .and_then(|r| r.get("blob"))
+                        .and_then(|b| b.as_str())
+                        .unwrap_or("");
+                    (
+                        count + 1,
+                        bytes.saturating_add(estimated_decoded_blob_len(blob)),
+                    )
+                }),
+            None => (0, 0),
+        };
+
+    if blob_count == 0 {
+        return Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()));
+    }
+
+    // Which per-call bound was exceeded, if any. When set, every resource blob is
+    // degraded with this marker and nothing is decoded, hashed, or written.
+    let over_budget_marker: Option<&str> = if blob_count > MAX_AGGREGATE_BLOB_ITEMS {
+        Some("[attachment unavailable: too many embedded blobs in one result]")
+    } else if aggregate_estimate > MAX_AGGREGATE_BLOB_BYTES {
+        Some("[attachment unavailable: aggregate blob size exceeds limit]")
+    } else {
+        None
+    };
+
+    // Preserve the entire result and redact ONLY binary payloads. This keeps the
+    // machine-readable provenance the model (and downstream tooling) may rely on:
+    // structuredContent, _meta, per-item annotations, isError, text, resource_link,
+    // and unknown content types all survive; only base64 blob/data are removed.
+    let Some(items) = result.get_mut("content").and_then(|c| c.as_array_mut()) else {
+        return Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()));
+    };
+    for item in items.iter_mut() {
+        let typ = item
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        match typ.as_str() {
+            "resource" => {
+                let Some(res) = item.get_mut("resource").and_then(|r| r.as_object_mut()) else {
+                    continue;
+                };
+                // A `resource` without a string `blob` (e.g. resource_link) carries
+                // through untouched.
+                if res.get("blob").and_then(|b| b.as_str()).is_none() {
+                    continue;
+                }
+                // Small metadata; cloning these is not the base64 payload.
+                let uri = res.get("uri").and_then(|v| v.as_str()).map(str::to_string);
+                let mime = res
+                    .get("mimeType")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                // Take OWNERSHIP of the base64 blob string instead of copying it:
+                // over-budget simply drops it (no decode/hash/write, no copy), and
+                // the accepted path materializes from the owned string.
+                let blob = match res.remove("blob") {
+                    Some(serde_json::Value::String(blob)) => blob,
+                    // Non-string blob can't happen after the check above; if it
+                    // somehow does, the field is already removed and we degrade.
+                    _ => String::new(),
+                };
+                // Over an exceeded per-call bound, degrade without touching disk.
+                // Otherwise degrade per-item: one malformed/oversized blob must
+                // not fail the whole result or leak base64.
+                let marker = if let Some(m) = over_budget_marker {
+                    m.to_string()
+                } else {
+                    match materialize_resource_blob(
+                        workspace_dir,
+                        uri.as_deref(),
+                        mime.as_deref(),
+                        &blob,
+                    ) {
+                        Ok(materialized) => materialized.marker,
+                        Err(e) => format!("[attachment unavailable: {e}]"),
+                    }
+                };
+                res.insert(
+                    "materialized".to_string(),
+                    serde_json::Value::String(marker),
+                );
+            }
+            "image" | "audio" => {
+                let mime = item
+                    .get("mimeType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                if let Some(obj) = item.as_object_mut()
+                    && obj.remove("data").is_some()
+                {
+                    obj.insert(
+                        "materialized".to_string(),
+                        serde_json::Value::String(format!("[{typ} attachment: {mime}]")),
+                    );
+                }
+            }
+            _ => {
+                // text, resource_link and unknown content types carry through verbatim.
+            }
+        }
+    }
+
+    Ok(serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string()))
+}
+
 fn filename_from_uri(uri: Option<&str>) -> String {
     let Some(uri) = uri.map(str::trim).filter(|s| !s.is_empty()) else {
         return "upload.bin".to_string();
@@ -348,6 +542,7 @@ fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use tempfile::tempdir;
 
     #[test]
@@ -545,5 +740,418 @@ mod tests {
                 "unsafe ext {bad:?} must be dropped from the identity"
             );
         }
+    }
+
+    #[test]
+    fn mcp_intake_materializes_blob_and_omits_base64() {
+        let dir = tempdir().unwrap();
+        let bytes = b"%PDF-1.4 fake";
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
+        let result = json!({
+            "content": [
+                { "type": "text", "text": "Fetched original" },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": b64,
+                    }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("Fetched original"));
+        assert!(out.contains("[Document: report.pdf]"));
+        assert!(
+            !out.contains(&b64),
+            "base64 must not reach the model: {out}"
+        );
+        let uploads = dir.path().join("uploads");
+        assert!(uploads.exists());
+        let entries: Vec<_> = std::fs::read_dir(&uploads).unwrap().collect();
+        assert_eq!(entries.len(), 1);
+        let path = entries[0].as_ref().unwrap().path();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn mcp_intake_image_blob_uses_image_marker() {
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"img");
+        let result = json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///a.png",
+                    "mimeType": "image/png",
+                    "blob": b64,
+                }
+            }]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[IMAGE:"));
+        assert!(!out.contains(&b64));
+    }
+
+    #[test]
+    fn mcp_intake_bad_base64_degrades_per_item() {
+        // A single malformed blob must degrade to an inline marker, not Err.
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///x.bin",
+                    "blob": "%%%",
+                }
+            }]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[attachment unavailable:"));
+        assert!(out.to_lowercase().contains("base64"));
+    }
+
+    #[test]
+    fn mcp_intake_oversized_blob_degrades_per_item() {
+        let dir = tempdir().unwrap();
+        let big = vec![0u8; (MAX_EMBEDDED_FILE_BYTES as usize) + 1];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &big);
+        let result = json!({
+            "content": [{
+                "type": "resource",
+                "resource": {
+                    "uri": "file:///big.bin",
+                    "blob": b64,
+                }
+            }]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[attachment unavailable:"));
+        assert!(out.contains("MB") || out.contains("limit"));
+    }
+
+    #[test]
+    fn mcp_intake_degrades_bad_blob_keeps_sibling_text() {
+        // Valid text sibling must survive when a neighbouring blob is malformed.
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [
+                { "type": "text", "text": "keep me" },
+                {
+                    "type": "resource",
+                    "resource": { "uri": "file:///x.bin", "blob": "%%%" }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("keep me"));
+        assert!(out.contains("[attachment unavailable:"));
+    }
+
+    #[test]
+    fn mcp_intake_preserves_resource_link() {
+        // resource_link (no blob) is preserved verbatim alongside a redacted blob.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
+        let result = json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": b64,
+                    }
+                },
+                {
+                    "type": "resource_link",
+                    "uri": "https://example.com/spec",
+                    "name": "The Spec",
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("resource_link"));
+        assert!(out.contains("The Spec"));
+        assert!(out.contains("https://example.com/spec"));
+        assert!(!out.contains(&b64));
+    }
+
+    #[test]
+    fn mcp_intake_image_item_yields_marker_not_base64() {
+        // A non-resource `image` block emits a marker, never its base64 data.
+        let dir = tempdir().unwrap();
+        let doc_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
+        let img_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"this-is-the-raw-image-data",
+        );
+        let result = json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": doc_b64,
+                    }
+                },
+                {
+                    "type": "image",
+                    "data": img_b64,
+                    "mimeType": "image/png",
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[image attachment: image/png]"));
+        assert!(
+            !out.contains(&img_b64),
+            "raw image base64 must not reach the model: {out}"
+        );
+    }
+
+    #[test]
+    fn mcp_intake_preserves_iserror_and_text() {
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"doc");
+        let result = json!({
+            "isError": true,
+            "content": [
+                { "type": "text", "text": "boom" },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": b64,
+                    }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        // The error flag is preserved as structured data, not flattened to prose.
+        assert!(out.contains("isError"));
+        assert!(out.contains("boom"));
+        assert!(!out.contains(&b64));
+    }
+
+    #[test]
+    fn mcp_intake_preserves_structured_content_meta_and_annotations() {
+        // Core MCP#1 property: everything non-binary survives; only the blob is
+        // redacted. structuredContent/_meta/annotations must not be silently dropped.
+        let dir = tempdir().unwrap();
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"%PDF");
+        let result = json!({
+            "structuredContent": { "rows": 3, "status": "ok" },
+            "_meta": { "trace": "abc123" },
+            "content": [
+                { "type": "text", "text": "summary", "annotations": { "audience": ["user"] } },
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///kb/report.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": b64,
+                    }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            out.contains("structuredContent"),
+            "structuredContent dropped: {out}"
+        );
+        assert!(out.contains("\"rows\""));
+        assert!(
+            out.contains("_meta") && out.contains("abc123"),
+            "_meta dropped: {out}"
+        );
+        assert!(
+            out.contains("annotations") && out.contains("audience"),
+            "annotations dropped: {out}"
+        );
+        assert!(out.contains("summary"));
+        // Binary blob is materialized to disk and never leaked as base64.
+        assert!(out.contains("[Document: report.pdf]"));
+        assert!(!out.contains(&b64), "base64 leaked: {out}");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("uploads"))
+                .unwrap()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mcp_intake_without_blob_keeps_pretty_json() {
+        let dir = tempdir().unwrap();
+        let result = json!({
+            "content": [{ "type": "text", "text": "plain" }]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("\"type\": \"text\"") || out.contains("\"type\":\"text\""));
+        assert!(out.contains("plain"));
+        assert!(!dir.path().join("uploads").exists());
+    }
+
+    #[test]
+    fn mcp_intake_gates_on_shape_not_tool_name() {
+        // Shape gate: resource+blob is enough; no tool-name checks.
+        assert!(content_item_has_resource_blob(&json!({
+            "type": "resource",
+            "resource": { "uri": "u", "blob": "YQ==" }
+        })));
+        assert!(!content_item_has_resource_blob(&json!({
+            "type": "resource",
+            "resource": { "uri": "u", "text": "hi" }
+        })));
+        assert!(!content_item_has_resource_blob(&json!({
+            "type": "text",
+            "text": "hi"
+        })));
+    }
+
+    #[test]
+    fn mcp_intake_within_aggregate_budget() {
+        // Multiple blobs whose total is within the aggregate limit all materialize.
+        let dir = tempdir().unwrap();
+        let blob1 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"small payload a",
+        );
+        let blob2 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"small payload b",
+        );
+        let result = json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": { "uri": "file:///a.txt", "blob": blob1 }
+                },
+                {
+                    "type": "resource",
+                    "resource": { "uri": "file:///b.txt", "blob": blob2 }
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(out.contains("[Document: a.txt]"));
+        assert!(out.contains("[Document: b.txt]"));
+        assert!(dir.path().join("uploads").exists());
+    }
+
+    #[test]
+    fn mcp_intake_exceeds_aggregate_budget() {
+        // When aggregate estimated size exceeds the limit, all resource blobs
+        // are degraded with an aggregate-limit marker and nothing is written.
+        let dir = tempdir().unwrap();
+        let chunk = vec![0u8; (MAX_AGGREGATE_BLOB_BYTES as usize) / 2 + 1]; // > 5 MiB each
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &chunk);
+        let result = json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": { "uri": "file:///a.bin", "blob": b64.clone() }
+                },
+                {
+                    "type": "resource",
+                    "resource": { "uri": "file:///b.bin", "blob": b64.clone() }
+                },
+                {
+                    "type": "text",
+                    "text": "survivor"
+                }
+            ]
+        });
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(!dir.path().join("uploads").exists());
+        assert!(out.contains("aggregate blob size exceeds limit"));
+        assert!(!out.contains("[Document:"));
+        assert!(out.contains("survivor"));
+    }
+
+    #[test]
+    fn mcp_intake_rejects_excessive_empty_blob_items() {
+        // An untrusted server can return a large array of empty blobs. Each
+        // estimates zero decoded bytes, so the byte budget alone never trips;
+        // only the item-count bound stops the per-item decode/hash/write work.
+        // Every blob must be degraded and nothing written to disk.
+        let dir = tempdir().unwrap();
+        let items: Vec<_> = (0..MAX_AGGREGATE_BLOB_ITEMS + 1)
+            .map(|i| {
+                json!({
+                    "type": "resource",
+                    "resource": { "uri": format!("file:///f{i}.bin"), "blob": "" }
+                })
+            })
+            .collect();
+        let result = json!({ "content": items });
+
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            !dir.path().join("uploads").exists(),
+            "an over-count result must not write any file"
+        );
+        assert!(out.contains("too many embedded blobs in one result"));
+        assert!(!out.contains("[Document:"));
+    }
+
+    #[test]
+    fn mcp_intake_materializes_blob_at_exact_aggregate_limit() {
+        // A single blob whose decoded size is exactly the aggregate limit must be
+        // materialized, not rejected. Estimating base64 as `len * 3 / 4` counts
+        // the `=` padding as data and pushes an exact-limit blob two bytes over,
+        // wrongly tripping the gate; subtracting padding keeps it at the limit.
+        let dir = tempdir().unwrap();
+        let payload = vec![0u8; MAX_AGGREGATE_BLOB_BYTES as usize];
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &payload);
+        let result = json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": { "uri": "file:///big.bin", "blob": b64 }
+                }
+            ]
+        });
+
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            !out.contains("aggregate blob size exceeds limit"),
+            "an exact-limit blob must not be rejected by the aggregate gate"
+        );
+        assert!(out.contains("[Document: big.bin]"));
+        assert!(dir.path().join("uploads").exists());
+    }
+
+    #[test]
+    fn mcp_intake_rejects_malformed_all_padding_blob_without_decoding() {
+        // A server-controlled blob made entirely of `=` is non-canonical base64.
+        // If every trailing `=` were subtracted, its estimate would collapse to
+        // zero and bypass the aggregate byte gate, yet `Engine::decode()` would
+        // still allocate ~3/4 of the encoded length before rejecting the input.
+        // Capping the subtracted padding at two keeps the estimate proportional
+        // to the length, so the aggregate gate degrades it with a marker and no
+        // decode, hash, or filesystem write occurs.
+        let dir = tempdir().unwrap();
+        let blob = "=".repeat((MAX_AGGREGATE_BLOB_BYTES as usize) * 2);
+        let result = json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": { "uri": "file:///malformed.bin", "blob": blob }
+                }
+            ]
+        });
+
+        let out = format_mcp_tool_result_for_model(result, dir.path()).unwrap();
+        assert!(
+            !dir.path().join("uploads").exists(),
+            "a malformed all-padding blob must not be decoded or written"
+        );
+        assert!(out.contains("aggregate blob size exceeds limit"));
+        assert!(!out.contains("[Document:"));
     }
 }
