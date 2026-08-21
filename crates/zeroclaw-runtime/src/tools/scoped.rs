@@ -43,9 +43,10 @@ impl std::ops::Deref for ScopedToolRegistry {
 }
 
 impl ScopedToolRegistry {
-    /// Consume the assembled registry into the owned `Vec` for crate-internal
-    /// non-turn consumers and tests. Turn carriers accept only the sealed type.
-    pub(crate) fn into_inner(self) -> Vec<Box<dyn Tool>> {
+    /// Consume the assembled registry into the owned `Vec` for non-turn
+    /// consumers such as the gateway's listing-only registry. Turn carriers
+    /// accept only the sealed type.
+    pub fn into_inner(self) -> Vec<Box<dyn Tool>> {
         self.0
     }
 

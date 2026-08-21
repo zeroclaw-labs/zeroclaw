@@ -535,6 +535,8 @@ impl AllToolsResult {
             poll_handle: None,
             escalate_handle: None,
             unfiltered_tool_arcs: Vec::new(),
+            #[cfg(test)]
+            delegate_tool: None,
         }
     }
 }

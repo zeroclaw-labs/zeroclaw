@@ -8367,6 +8367,18 @@ mod tests {
 
         struct DeliverFileFixture;
 
+        impl zeroclaw_api::attribution::Attributable for DeliverFileFixture {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(
+                    zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+
+            fn alias(&self) -> &str {
+                "deliver_file"
+            }
+        }
+
         #[async_trait]
         impl Tool for DeliverFileFixture {
             fn name(&self) -> &str {
