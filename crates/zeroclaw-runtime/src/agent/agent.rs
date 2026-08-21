@@ -401,6 +401,20 @@ pub struct Agent {
     channel_name: String,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    /// The `DelegateTool` this Agent's registry registered, in its concrete
+    /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
+    /// otherwise cannot drive the *constructed* delegate's nested-registry
+    /// build and can only re-derive the wiring by hand - which is precisely
+    /// what must not be trusted for live-config threading. `None` when the
+    /// agent has no configured delegation targets.
+    ///
+    /// `allow(dead_code)`: its only reader is the delegated live-config
+    /// regression, which additionally needs `plugins-wasm-cranelift` to have a
+    /// plugin tool to execute at all. Under a narrower test feature set the
+    /// field is written and never read.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Drop for Agent {
@@ -532,6 +546,8 @@ pub struct AgentBuilder {
     provider_switch_config: Option<ProviderSwitchConfig>,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Default for AgentBuilder {
@@ -583,6 +599,8 @@ impl AgentBuilder {
             provider_switch_config: None,
             #[cfg(test)]
             turn_datetime: None,
+            #[cfg(test)]
+            delegate_tool: None,
         }
     }
 
@@ -810,6 +828,14 @@ impl AgentBuilder {
         self
     }
 
+    /// Retain the concrete `DelegateTool` the registry built, for regressions
+    /// that must drive the *constructed* delegate rather than a hand-rolled one.
+    #[cfg(test)]
+    fn delegate_tool(mut self, delegate_tool: Option<Arc<crate::tools::DelegateTool>>) -> Self {
+        self.delegate_tool = delegate_tool;
+        self
+    }
+
     #[cfg(test)]
     fn turn_datetime<F>(mut self, provider: F) -> Self
     where
@@ -961,6 +987,8 @@ impl AgentBuilder {
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(test)]
             turn_datetime: self.turn_datetime,
+            #[cfg(test)]
+            delegate_tool: self.delegate_tool,
         })
     }
 }
@@ -1612,12 +1640,23 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
-            None,
+            // Daemon-backed constructors supply the shared handle; tools that
+            // resolve config per call (plugin tools, `send_via` authority) must
+            // follow reloads rather than this call's `config` snapshot. `None`
+            // here would silently pin them to startup state for the Agent's
+            // whole lifetime. One-shot callers pass `None` and keep the
+            // documented snapshot fallback.
+            live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
+        // Captured before `assemble` consumes the result: the concrete delegate
+        // instance this registry built, so live-config regressions can drive its
+        // nested-registry construction instead of re-deriving the wiring.
+        #[cfg(test)]
+        let built_delegate_tool = all_tools_result.delegate_tool.clone();
         // Capture before `runtime` is moved into `ScopedAssembly`.
         let shell_profile = runtime.shell_profile();
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
@@ -1740,7 +1779,10 @@ impl Agent {
                 Arc::new(move || max)
             };
 
-        let mut agent = Agent::builder()
+        let builder = Agent::builder();
+        #[cfg(test)]
+        let builder = builder.delegate_tool(built_delegate_tool);
+        let mut agent = builder
             .model_provider(model_provider)
             .tools(tools)
             .memory(memory.clone())
@@ -2439,6 +2481,7 @@ impl Agent {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -2813,6 +2856,7 @@ impl Agent {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -3280,6 +3324,14 @@ mod safety_net;
 #[cfg(test)]
 #[path = "parity.rs"]
 mod parity;
+
+// Live-config plugin regression (child module so it can read the constructed
+// Agent's tool registry the same way `mod tests` does). Needs a WASM compiler
+// on the host: `WasmTool::from_wasm` refuses to register a tool it cannot load,
+// so a runtime-only plugin backend has no plugin tool to execute.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+#[path = "plugin_live_config.rs"]
+mod plugin_live_config;
 
 #[cfg(test)]
 mod tests {

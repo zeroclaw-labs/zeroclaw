@@ -493,6 +493,7 @@ mod cost_usd_regression_tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: None,
             turn_id: "turn-cost-regression",
         };
@@ -633,6 +634,7 @@ mod cost_usd_regression_tests {
             strict_tool_parsing: false,
             channel: None,
             agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             turn_id: "malformed-protocol-usage",
         };
         let specs = IterationToolSpecs {

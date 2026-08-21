@@ -805,8 +805,8 @@ cli-plugin-install-resolving = Resolving '{$source}' from plugin registry...
 cli-plugin-installed-from = Plugin installed from {$source}
 cli-plugin-installed-name-version = Installed plugin {$name} v{$version}
 cli-plugin-config-entry-seeded = Seeded [[plugins.entries]] for '{$name}'. Set plugin config values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Config entry key ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = warning: skipped seeding the config entry for '{$name}': the [plugins] section on disk is malformed. Repair it, add a [[plugins.entries]] block with `name = "{$name}"`, then set values with `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-seed-unaddressable = warning: skipped seeding the config entry for '{$name}': plugin names containing '.' cannot be addressed by dotted config paths (`config set` splits on '.'). Add a [[plugins.entries]] block with `name = "{$name}"` to the config file by hand.
 cli-config-section-degraded = warning: config section `{$section}` in {$path} is malformed and was reset to defaults for this run. Values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-config-section-retired-wati = warning: retired WATI channel config section `{$section}` is ignored because WATI support was removed. Migrate to `[channels.whatsapp.<alias>]` using the Cloud API or WhatsApp Web, then revoke the unused WATI API token.
 cli-plugin-removed = Plugin '{$name}' removed.
@@ -944,6 +944,7 @@ channel-runtime-progress-waiting-on-model = Waiting on model
 channel-runtime-progress-running-tool = Running tool
 channel-runtime-progress-compacting-context = Compacting context
 channel-runtime-progress-finalizing-response = Finalizing response
+channel-runtime-matrix-progress-item-too-large = ⚠️ This line is too large to fit in a single Matrix message. ⚠️
 channel-runtime-new-session = Conversation history cleared. Starting fresh.
 channel-runtime-stop-sent = Stop signal sent.
 channel-runtime-stop-no-task = No in-flight task for this sender scope.

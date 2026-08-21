@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -352,7 +352,7 @@ metrics = ["observability-prometheus"]
 #   where Cranelift isn't available (e.g., ARM32), but has the slowest runtime
 #   performance.
 plugins-wasm-runtime-only = ["plugins-wasm", "zeroclaw-plugins/plugins-wasmtime"]
-plugins-wasm-cranelift    = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift"]
+plugins-wasm-cranelift    = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift", "zeroclaw-runtime/plugins-wasm-cranelift"]
 plugins-wasm-pulley       = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-pulley"]
 
 # CI meta-feature

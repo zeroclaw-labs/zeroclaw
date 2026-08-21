@@ -481,22 +481,22 @@ use zeroclaw_config::schema::{
     DeepseekModelProviderConfig, DoubaoModelProviderConfig, FeatherlessModelProviderConfig,
     FireworksModelProviderConfig, FriendliModelProviderConfig, GeminiCliModelProviderConfig,
     GeminiModelProviderConfig, GithubModelsModelProviderConfig, GlmModelProviderConfig,
-    GroqModelProviderConfig, HuggingfaceModelProviderConfig, HunyuanModelProviderConfig,
-    HyperbolicModelProviderConfig, InceptionModelProviderConfig, KiloCliModelProviderConfig,
-    KiloModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-    LitellmModelProviderConfig, LlamacppModelProviderConfig, LmstudioModelProviderConfig,
-    ManifestModelProviderConfig, MinimaxModelProviderConfig, MistralModelProviderConfig,
-    MoonshotEndpoint, MoonshotModelProviderConfig, MorphModelProviderConfig,
-    NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-    NscaleModelProviderConfig, NvidiaModelProviderConfig, OllamaModelProviderConfig,
-    OpenAIModelProviderConfig, OpenRouterModelProviderConfig, OpencodeModelProviderConfig,
-    OsaurusModelProviderConfig, OvhModelProviderConfig, PerplexityModelProviderConfig,
-    QianfanModelProviderConfig, QwenModelProviderConfig, RekaModelProviderConfig,
-    SambanovaModelProviderConfig, SglangModelProviderConfig, SiliconflowModelProviderConfig,
-    StepfunModelProviderConfig, SyntheticModelProviderConfig, TelnyxModelProviderConfig,
-    TogetherModelProviderConfig, UpstageModelProviderConfig, VeniceModelProviderConfig,
-    VercelModelProviderConfig, VllmModelProviderConfig, XaiModelProviderConfig,
-    YiModelProviderConfig, ZaiModelProviderConfig,
+    GrokCliModelProviderConfig, GroqModelProviderConfig, HuggingfaceModelProviderConfig,
+    HunyuanModelProviderConfig, HyperbolicModelProviderConfig, InceptionModelProviderConfig,
+    KiloCliModelProviderConfig, KiloModelProviderConfig, LambdaAiModelProviderConfig,
+    LeptonModelProviderConfig, LitellmModelProviderConfig, LlamacppModelProviderConfig,
+    LmstudioModelProviderConfig, ManifestModelProviderConfig, MinimaxModelProviderConfig,
+    MistralModelProviderConfig, MoonshotEndpoint, MoonshotModelProviderConfig,
+    MorphModelProviderConfig, NearaiModelProviderConfig, NebiusModelProviderConfig,
+    NovitaModelProviderConfig, NscaleModelProviderConfig, NvidiaModelProviderConfig,
+    OllamaModelProviderConfig, OpenAIModelProviderConfig, OpenRouterModelProviderConfig,
+    OpencodeModelProviderConfig, OsaurusModelProviderConfig, OvhModelProviderConfig,
+    PerplexityModelProviderConfig, QianfanModelProviderConfig, QwenModelProviderConfig,
+    RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
+    SiliconflowModelProviderConfig, StepfunModelProviderConfig, SyntheticModelProviderConfig,
+    TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
+    VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
+    XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
 };
 
 #[must_use]
@@ -1516,6 +1516,43 @@ impl FamilyProviderFactory for GeminiCliModelProviderConfig {
     }
 }
 
+impl FamilyProviderFactory for GrokCliModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        _api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        if has_api_key(key) {
+            anyhow::bail!(
+                "grok_cli does not accept api_key; use `grok login`, or export `XAI_API_KEY` and list it in the alias env_passthrough"
+            );
+        }
+        Ok(Box::new(
+            crate::grok_cli::GrokCliModelProvider::builder(alias)
+                .binary_path(self.binary_path.as_deref())
+                .working_directory(&self.working_directory)
+                .env_passthrough(self.env_passthrough.clone())
+                .extra_args(self.extra_args.clone())
+                .max_acp_stdout_bytes(self.max_acp_stdout_bytes)
+                .timeout_secs(self.base.timeout_secs)
+                // Optional send-path only: alias `vision = true` makes
+                // ZeroClaw emit ACP image blocks. Grok still advertises
+                // image=false through 0.2.118 and does not reliably use the
+                // pixels; leave unset in production until upstream vision works.
+                .vision_enabled(opts.vision == Some(true))
+                .build()?,
+        ))
+    }
+
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
 impl FamilyProviderFactory for KiloCliModelProviderConfig {
     const ENDPOINT: ProviderEndpoint = ProviderEndpoint::CliBacked;
 
@@ -1846,7 +1883,7 @@ mod tests {
                 "{family} requires operator endpoint input"
             );
         }
-        for family in ["gemini_cli", "kilocli"] {
+        for family in ["gemini_cli", "grok_cli", "kilocli"] {
             assert_eq!(
                 endpoint_for_family(family),
                 Some(ProviderEndpoint::CliBacked),
@@ -1867,6 +1904,67 @@ mod tests {
             KiloEndpoint::default().uri(),
             "https://api.kilo.ai/api/gateway"
         );
+    }
+
+    #[test]
+    fn grok_cli_factory_rejects_typed_api_key_instead_of_ignoring_it() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "default",
+            Some("typed-test-key"),
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("grok_cli api_key must not be silently ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("does not accept api_key"));
+    }
+
+    #[test]
+    fn grok_cli_factory_forwards_acp_stdout_limit() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            max_acp_stdout_bytes: Some(0),
+            ..Default::default()
+        };
+        let error = match config.create_provider(
+            "default",
+            None,
+            None,
+            &ModelProviderRuntimeOptions::default(),
+        ) {
+            Ok(_) => panic!("invalid ACP stdout limit must not be ignored"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("max_acp_stdout_bytes"));
+    }
+
+    #[test]
+    fn grok_cli_factory_enables_explicit_vision_override() {
+        let working_directory = tempfile::tempdir().expect("temporary working directory");
+        let config = GrokCliModelProviderConfig {
+            working_directory: working_directory.path().display().to_string(),
+            ..Default::default()
+        };
+        let provider = config
+            .create_provider(
+                "default",
+                None,
+                None,
+                &ModelProviderRuntimeOptions {
+                    vision: Some(true),
+                    ..Default::default()
+                },
+            )
+            .expect("vision opt-in must build the Grok CLI provider");
+
+        assert!(provider.capabilities().vision);
     }
 
     #[test]
