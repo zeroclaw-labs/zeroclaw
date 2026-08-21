@@ -88,6 +88,10 @@ impl ::zeroclaw_api::attribution::Attributable for SopWorkshopTool {
     fn alias(&self) -> &str {
         "sop_workshop"
     }
+
+    fn tool_provenance(&self) -> ::zeroclaw_api::attribution::ToolProvenance {
+        ::zeroclaw_api::attribution::ToolProvenance::Native
+    }
 }
 
 #[async_trait]
@@ -315,7 +319,17 @@ fn parse_status(status: &str) -> anyhow::Result<ProposalStatus> {
 mod tests {
     use super::*;
     use crate::sop::SopEngine;
+    use zeroclaw_api::attribution::{Attributable, ToolProvenance};
     use zeroclaw_config::schema::SopConfig;
+
+    #[test]
+    fn first_party_sop_workshop_is_native() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Mutex::new(SopEngine::new(SopConfig::default())));
+        let tool = SopWorkshopTool::new(engine, tmp.path().to_path_buf());
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Native);
+    }
 
     #[tokio::test]
     async fn propose_and_list_round_trip() {

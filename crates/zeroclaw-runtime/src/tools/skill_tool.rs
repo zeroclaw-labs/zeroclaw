@@ -432,6 +432,7 @@ mod tests {
     use crate::platform::DockerRuntime;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use crate::skills::SkillTool;
+    use zeroclaw_api::attribution::{Attributable, ToolProvenance};
     use zeroclaw_config::schema::DockerRuntimeConfig;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -729,6 +730,13 @@ mod tests {
         assert_eq!(spec.parameters["type"], "object");
     }
 
+    #[test]
+    fn manifest_loaded_skill_shell_is_an_extension() {
+        let tool = SkillShellTool::new("browser", &sample_skill_tool(), test_security());
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
+    }
+
     // ─── SkillBuiltinTool tests ──────────────────────────────────────────────
 
     /// Minimal mock tool for testing builtin delegation.
@@ -803,6 +811,55 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(tool.name(), "my_skill__use_shell");
+    }
+
+    #[test]
+    fn skill_builtin_tool_is_extension_even_when_target_is_native() {
+        struct NativeMockBuiltinTool(MockBuiltinTool);
+
+        impl ::zeroclaw_api::attribution::Attributable for NativeMockBuiltinTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                self.0.role()
+            }
+
+            fn alias(&self) -> &str {
+                self.0.alias()
+            }
+
+            fn tool_provenance(&self) -> ToolProvenance {
+                ToolProvenance::Native
+            }
+        }
+
+        #[async_trait]
+        impl Tool for NativeMockBuiltinTool {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+
+            fn description(&self) -> &str {
+                self.0.description()
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                self.0.parameters_schema()
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                self.0.execute(args).await
+            }
+        }
+
+        let target: Arc<dyn Tool> =
+            Arc::new(NativeMockBuiltinTool(MockBuiltinTool::new("browser")));
+        let tool = SkillBuiltinTool::new(
+            "skill_browser",
+            &sample_builtin_skill_tool(),
+            target,
+            HashMap::new(),
+        );
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
     }
 
     #[test]

@@ -240,6 +240,9 @@ impl ::zeroclaw_api::attribution::Attributable for ArcDelegatingTool {
     fn alias(&self) -> &str {
         self.inner.alias()
     }
+    fn tool_provenance(&self) -> ::zeroclaw_api::attribution::ToolProvenance {
+        self.inner.tool_provenance()
+    }
 }
 
 #[async_trait]

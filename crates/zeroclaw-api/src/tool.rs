@@ -4,12 +4,18 @@ use serde::{Deserialize, Serialize};
 #[macro_export]
 macro_rules! tool_attribution {
     ($ty:ty, $kind:expr) => {
+        $crate::tool_attribution!($ty, $kind, $crate::attribution::ToolProvenance::Native);
+    };
+    ($ty:ty, $kind:expr, $provenance:expr) => {
         impl $crate::attribution::Attributable for $ty {
             fn role(&self) -> $crate::attribution::Role {
                 $crate::attribution::Role::Tool($kind)
             }
             fn alias(&self) -> &str {
                 <Self as $crate::tool::Tool>::name(self)
+            }
+            fn tool_provenance(&self) -> $crate::attribution::ToolProvenance {
+                $provenance
             }
         }
     };
