@@ -2264,9 +2264,11 @@ vision_model_provider = "openai"
     #[test]
     fn v2_matching_colon_url_with_global_api_path_rewrites() {
         // A colon-URL `default_provider` with a global `api_path` is
-        // materialized as `uri = base + path`. A matching colon-URL vision
-        // reference naming just the base must be considered the same effective
-        // source after the same composition and rewrite to the dotted alias.
+        // materialized as `uri = base + path`. The vision reference that
+        // names the same effective source (base + path) must rewrite to the
+        // dotted alias; the `api_path` composition is handled at the fold
+        // site where the selector's URL is composed before the equivalence
+        // check, so the rewrite requires exact normalized equality.
         let raw = r#"
 schema_version = 2
 
@@ -2277,7 +2279,7 @@ api_key = "test-key"
 default_model = "vision-model"
 
 [multimodal]
-vision_model_provider = "custom:https://vision.example.invalid"
+vision_model_provider = "custom:https://vision.example.invalid/v1"
 "#;
         let cfg = migrate_to_current(raw).unwrap();
         assert_eq!(
@@ -2296,6 +2298,40 @@ vision_model_provider = "custom:https://vision.example.invalid"
             "the composed URI must survive as base + api_path"
         );
         assert_eq!(alias.api_key.as_deref(), Some("test-key"));
+    }
+
+    #[test]
+    fn v2_colon_url_with_different_path_stays_fail_closed() {
+        // A sole `custom:https://.../v2` producer and a base-only reference
+        // with no `api_path` must remain fail-closed. The previous permissive
+        // prefix check (`base` matches any `/v2` descendant) would have
+        // incorrectly rewritten this distinct endpoint.
+        let raw = r#"
+schema_version = 2
+
+[providers.models."custom:https://vision.example.invalid/v2"]
+api_key = "test-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "custom:https://vision.example.invalid"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("custom:https://vision.example.invalid"),
+            "a base-only reference must not match a distinct /v2 endpoint with no api_path"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("custom", "default")
+            .expect("custom.default must exist");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://vision.example.invalid/v2"),
+            "the distinct /v2 URI must be retained"
+        );
     }
 
     #[test]
