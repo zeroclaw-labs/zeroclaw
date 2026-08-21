@@ -381,7 +381,6 @@ pub fn load_page_multi(
     // basename, and its line_byte_end.
     let mut window: VecDeque<(LogEvent, String, u64)> = VecDeque::with_capacity(limit + 1);
     let mut dropped_older = false;
-    let mut stopped_early = false;
 
     for (i, (seg_path, seg_name)) in segs.iter().enumerate() {
         if i > cursor_idx {
@@ -420,7 +419,6 @@ pub fn load_page_multi(
             if let Some(cap) = seg_until_line_offset
                 && line_byte_end >= cap
             {
-                stopped_early = true;
                 break;
             }
 
@@ -476,7 +474,16 @@ pub fn load_page_multi(
     events.reverse();
 
     let next_cursor = events.last().map(|e| (e.timestamp.clone(), e.id.clone()));
-    let at_end = !dropped_older && !stopped_early || events.is_empty();
+    // `at_end` answers "are there OLDER events past this page?". Every segment
+    // up to and including the cursor's is scanned in full, so the only way an
+    // older match can exist is if the sliding window evicted one. Hitting the
+    // cursor mid-segment truncates that segment's *newer* tail, which says
+    // nothing about older events, so it deliberately does not feed this
+    // decision — unlike single-file `load_page`, which folds that in and is
+    // therefore conservative. Being conservative here would pin `at_end` to
+    // false on every cross-segment page, since the cursor segment is always
+    // truncated.
+    let at_end = !dropped_older;
 
     Ok(LogPage {
         events,
