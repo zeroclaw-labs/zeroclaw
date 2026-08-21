@@ -1710,6 +1710,18 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     let (next_config, next_defaults) =
         load_runtime_config_and_defaults(&config_path, ctx.agent_alias.as_str()).await?;
     let next_config = Arc::new(next_config);
+
+    // Sync the reloaded config into the shared handle that channel resolver
+    // closures (peer_resolver, allowed_groups_resolver, etc.) read on every
+    // message. This must happen BEFORE provider warmup so that authorization
+    // policy (allowed_groups, peer allowlist) is refreshed even if warmup
+    // fails — admission should never lag behind a config edit.
+    *ctx.config_arc.write() = (*next_config).clone();
+
+    *ctx.last_applied_config_stamp
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(stamp);
+
     let next_options = zeroclaw_providers::options_for_provider_ref(
         next_config.as_ref(),
         &next_defaults.default_model_provider,
@@ -1765,16 +1777,6 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         cache.insert(cache_key, Arc::clone(&model_provider_instance));
         *override_guard = Some(next_override);
     }
-
-    // Sync the reloaded config into the shared handle that channel resolver
-    // closures (peer_resolver, allowed_groups_resolver, etc.) read on every
-    // message. Without this, direct config.toml edits to authorization fields
-    // would be loaded into the override but invisible to inbound dispatch.
-    *ctx.config_arc.write() = (*next_config).clone();
-
-    *ctx.last_applied_config_stamp
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(stamp);
 
     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"path": config_path.display().to_string(), "model_provider": next_defaults.default_model_provider, "model": next_defaults.model, "temperature": next_defaults.temperature, "agent_model_provider": next_defaults.default_model_provider})), "Applied updated channel runtime config from disk");
 
@@ -8495,6 +8497,7 @@ fn collect_configured_channels(
                     )
                     .with_voice_peer_resolver(voice_peer_resolver)
                     .with_persistence(config_arc.clone())
+                    .with_config_path(config.config_path.clone())
                     .with_api_base(tg.api_base_url.clone())
                     .with_ack_reactions(ack)
                     .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)

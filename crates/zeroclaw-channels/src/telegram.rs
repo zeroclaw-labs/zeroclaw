@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use reqwest::multipart::{Form, Part};
 use std::fmt::Write as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
@@ -589,6 +589,12 @@ pub struct TelegramChannel {
     /// allowlist and pairing flow. Resolved live from config at call-time
     /// (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH" — no cache).
     allowed_groups_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    /// Path to the on-disk config.toml, used by `refresh_runtime_config` to
+    /// detect file changes before admission decisions.
+    config_path: Option<PathBuf>,
+    /// Last-known (modified, len) stamp of config.toml. Compared on each poll
+    /// iteration to skip redundant disk reads when the file hasn't changed.
+    last_config_stamp: Mutex<Option<(std::time::SystemTime, u64)>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -670,6 +676,8 @@ impl TelegramChannel {
             approval_timeout_secs: 120,
             allowed_groups_resolver: Arc::new(Vec::new)
                 as Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+            config_path: None,
+            last_config_stamp: Mutex::new(None),
         }
     }
 
@@ -916,6 +924,95 @@ impl TelegramChannel {
     pub fn with_persistence(mut self, config: Arc<RwLock<Config>>) -> Self {
         self.persist = Some(config);
         self
+    }
+
+    /// Set the on-disk config path used for live-reload of authorization
+    /// policy (allowed_groups, peer allowlist). The listener calls
+    /// `refresh_runtime_config` at the top of each poll iteration to sync
+    /// `config_arc` *before* admission, so config edits to authorization
+    /// fields take effect without waiting for a message round-trip.
+    pub fn with_config_path(mut self, path: std::path::PathBuf) -> Self {
+        self.config_path = Some(path);
+        self
+    }
+
+    /// Lightweight config refresh: checks the file stamp, and if changed,
+    /// reloads + migrates the config and writes the new `Config` into
+    /// `self.persist` (the shared `config_arc`). This runs at the top of
+    /// each poll iteration in `listen()`, ensuring admission checks
+    /// (`is_from_allowed_group`, `is_any_user_allowed`) see the latest
+    /// authorization policy before a message is admitted.
+    ///
+    /// Provider warmup and model-provider cache updates are deliberately
+    /// NOT done here — that heavier work stays in the orchestrator's
+    /// `maybe_apply_runtime_config_update` so it doesn't block the listener.
+    async fn refresh_runtime_config(&self) {
+        let Some(config_path) = &self.config_path else {
+            return;
+        };
+
+        let Some(persist) = &self.persist else {
+            return;
+        };
+
+        let metadata = match tokio::fs::metadata(config_path).await {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        let modified = match metadata.modified() {
+            Ok(t) => t,
+            Err(_) => return,
+        };
+        let len = metadata.len();
+        let stamp = (modified, len);
+
+        {
+            let last = self.last_config_stamp.lock();
+            if *last == Some(stamp) {
+                return;
+            }
+        }
+
+        // Stamp changed — reload config and write into shared handle.
+        let contents = match tokio::fs::read_to_string(config_path).await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut parsed: Config = match zeroclaw_config::migration::migrate_to_current(&contents) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        parsed.config_path = config_path.clone();
+
+        if let Some(zeroclaw_dir) = config_path.parent()
+            && let Ok(store) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                zeroclaw_runtime::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt)
+            }))
+        {
+            let _ = parsed.decrypt_secrets(&store);
+        }
+        if let Ok(applied) = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed) {
+            parsed.env_overridden_paths = applied.paths;
+            parsed.pre_override_snapshots = applied.snapshots;
+        }
+
+        *persist.write() = parsed;
+
+        {
+            let mut guard = self.last_config_stamp.lock();
+            *guard = Some(stamp);
+        }
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "path": config_path.display().to_string(),
+                    "alias": self.alias.as_str(),
+                })
+            ),
+            "Refreshed runtime config for authorization policy"
+        );
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
@@ -3890,6 +3987,11 @@ impl Channel for TelegramChannel {
                     let _ = self.get_bot_username().await;
                 }
             }
+
+            // Refresh authorization policy from disk before polling for updates,
+            // so admission checks (allowed_groups, peer allowlist) see the
+            // latest config before any message is admitted.
+            self.refresh_runtime_config().await;
 
             let url = self.api_url("getUpdates");
             let body = serde_json::json!({
@@ -8437,7 +8539,7 @@ mod tests {
     /// as a ChannelMessage — no pairing prompt (sendMessage) is sent.
     #[tokio::test]
     async fn listen_mention_only_dispatches_mentioned_group_message() {
-        use wiremock::matchers::{method, path_regex};
+        use wiremock::matchers::{body_json, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
@@ -8481,7 +8583,25 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // getUpdates always returns a message that mentions the bot from an authorized peer.
+        // Startup probe (timeout=0, offset=0): empty result so the target
+        // update reaches the main loop rather than being consumed by the probe.
+        let probe_body = serde_json::json!({
+            "offset": 0,
+            "timeout": 0,
+            "allowed_updates": ["message", "callback_query"]
+        });
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(&probe_body))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": []
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Main loop (timeout=30): returns a message that mentions the bot from
+        // an authorized peer (wildcard peer resolver) — should be dispatched.
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/getUpdates$"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
