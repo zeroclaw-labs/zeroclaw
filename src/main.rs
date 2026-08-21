@@ -3020,7 +3020,7 @@ fn report_existing_egress_grant(
 }
 
 /// The migration diagnostic, on the surface an operator already
-/// runs: for every installed `http_client` plugin, one terse line naming the
+/// runs: for every installed `http_client` plugin, a terse report of the
 /// destinations it declares that its instance row does not grant — denials
 /// waiting to happen — and the exact command that closes the gap.
 ///
@@ -3032,43 +3032,122 @@ fn report_existing_egress_grant(
 /// package, until its alias-aware key path lands) yields no entries and is
 /// skipped in silence: there is no row to compare against, and inventing one
 /// would report a gap against a key nothing reads.
+///
+/// [`egress_grant_gap_lines`] builds what this prints, including the ordering
+/// rule for an install whose grant is still on a legacy row.
 #[cfg(feature = "plugins-wasm")]
 fn print_egress_grant_gaps(
     config: &crate::config::schema::Config,
     host: &zeroclaw::plugins::host::PluginHost,
     plugins: &[zeroclaw::plugins::PluginInfo],
 ) -> Result<()> {
-    use crate::plugins::egress_ceremony::{diff_declaration, egress_set_command};
-    use zeroclaw::plugins::PluginPermission;
     for p in plugins {
-        if !p.permissions.contains(&PluginPermission::HttpClient) {
-            continue;
-        }
         let Some(manifest) = host.manifest(&p.name) else {
             continue;
         };
-        let declared = manifest.egress.hosts.clone();
-        for (_, instance_key) in manifest_config_entries(manifest)? {
-            let (granted, _private) = config.plugins.entry_egress(&instance_key);
-            let diff = diff_declaration(&declared, &granted);
-            if diff.declared_not_granted.is_empty() {
-                continue;
-            }
-            println!(
-                "  {}",
-                ta(
-                    "cli-plugin-egress-gap",
-                    &[
-                        ("name", &p.name),
-                        ("hosts", &diff.declared_not_granted.join(", ")),
-                        ("command", &egress_set_command(&instance_key, &diff.union())),
-                    ],
-                    "This plugin declares destinations its entry does not grant."
-                )
-            );
+        for line in egress_grant_gap_lines(config, manifest)? {
+            println!("{line}");
         }
     }
     Ok(())
+}
+
+/// The lines [`print_egress_grant_gaps`] emits for one installed package,
+/// already rendered through Fluent and indented. Empty when the package has
+/// nothing to report.
+///
+/// Split out from the printing so the diagnostic's *ordering* is assertable:
+/// on a legacy install the migration step has to come before the grant
+/// command, and a test that could only inspect stdout could not pin that.
+///
+/// The reported gap and the command that closes it are two different
+/// questions. `entry_egress` resolves the grant by the canonical `zpi1_` key,
+/// so a pre-typed-config install whose row is still keyed by the package name
+/// reads back as "grants nothing" and is reported as a gap. But
+/// `plugins.entries.<key>.…` only resolves rows already in live config, so the
+/// grant command would fail against a key with no row. When the grant is
+/// stranded on such a row, print the documented rename first and the grant
+/// second, explicitly numbered: applied in that order they work, and applied
+/// in the printed order there is no way to run the failing one first.
+#[cfg(feature = "plugins-wasm")]
+fn egress_grant_gap_lines(
+    config: &crate::config::schema::Config,
+    manifest: &zeroclaw::plugins::PluginManifest,
+) -> Result<Vec<String>> {
+    use crate::plugins::egress_ceremony::{
+        diff_declaration, egress_set_command, stranded_legacy_grant_row,
+    };
+    use zeroclaw::plugins::PluginPermission;
+
+    if !manifest.permissions.contains(&PluginPermission::HttpClient) {
+        return Ok(Vec::new());
+    }
+    let package = manifest.name.clone();
+    let declared = manifest.egress.hosts.clone();
+    // Every key this call derives comes from the default tool binding, whose
+    // binding string is the package name, so the package name is the whole
+    // candidate set. An alias-aware key path extends this list, not the rule.
+    let legacy_candidates = [package.clone()];
+    let row_names: Vec<String> = config
+        .plugins
+        .entries
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect();
+
+    let mut lines = Vec::new();
+    for (_, instance_key) in manifest_config_entries(manifest)? {
+        let (granted, _private) = config.plugins.entry_egress(&instance_key);
+        let diff = diff_declaration(&declared, &granted);
+        if diff.declared_not_granted.is_empty() {
+            continue;
+        }
+        let hosts = diff.declared_not_granted.join(", ");
+        let command = egress_set_command(&instance_key, &diff.union());
+        let Some(legacy_row) =
+            stranded_legacy_grant_row(&instance_key, &legacy_candidates, &row_names)
+        else {
+            lines.push(format!(
+                "  {}",
+                ta(
+                    "cli-plugin-egress-gap",
+                    &[("name", &package), ("hosts", &hosts), ("command", &command),],
+                    "This plugin declares destinations its entry does not grant."
+                )
+            ));
+            continue;
+        };
+        lines.push(format!(
+            "  {}",
+            ta(
+                "cli-plugin-egress-gap-legacy",
+                &[("name", &package), ("hosts", &hosts)],
+                "This plugin declares destinations its entry does not grant, \
+                 and its grant is still on a legacy config row."
+            )
+        ));
+        lines.push(format!(
+            "    {}",
+            ta(
+                "cli-plugin-egress-migrate-step",
+                &[
+                    ("name", &package),
+                    ("legacy", &legacy_row),
+                    ("key", &instance_key),
+                ],
+                "1) migrate the row: rename it to the instance key, then save."
+            )
+        ));
+        lines.push(format!(
+            "    {}",
+            ta(
+                "cli-plugin-egress-grant-step",
+                &[("command", &command)],
+                "2) grant the destinations with the printed command."
+            )
+        ));
+    }
+    Ok(lines)
 }
 
 /// Seed `[[plugins.entries]]` blocks for a freshly installed plugin's canonical
@@ -10618,6 +10697,139 @@ mod tests {
             hosts,
             vec!["api.example.com"],
             "the on-disk grant must be untouched by the upgrade"
+        );
+    }
+
+    /// A `[[plugins.entries]]` row as a pre-typed-config install left it:
+    /// keyed by the package name, carrying the operator's values.
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn legacy_package_named_entry(
+        package: &str,
+        hosts: &[&str],
+    ) -> crate::config::schema::PluginEntryConfig {
+        crate::config::schema::PluginEntryConfig {
+            name: package.to_string(),
+            config: std::collections::HashMap::from([(
+                "api_key".to_string(),
+                "operator-secret".to_string(),
+            )]),
+            egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+            egress_allow_private: Vec::new(),
+        }
+    }
+
+    /// `plugin list`'s gap diagnostic, canonical case: the row the printed
+    /// command addresses exists, so the command resolves and is printed on its
+    /// own. This is the shape the legacy case below must NOT take.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn the_gap_diagnostic_prints_the_grant_command_alone_when_the_canonical_row_exists() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![crate::config::schema::PluginEntryConfig {
+            name: instance_key.clone(),
+            config: std::collections::HashMap::new(),
+            egress_hosts: vec!["api.example.com".to_string()],
+            egress_allow_private: Vec::new(),
+        }];
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        assert_eq!(lines.len(), 1, "one gap, one line: {lines:?}");
+        assert!(
+            lines[0].contains("api2.example.com"),
+            "the gap must name the ungranted destination: {lines:?}"
+        );
+        assert!(
+            lines[0].contains(&crate::plugins::egress_ceremony::egress_set_command(
+                &instance_key,
+                &[
+                    "api.example.com".to_string(),
+                    "api2.example.com".to_string()
+                ],
+            )),
+            "the command must carry the union against the canonical key: {lines:?}"
+        );
+    }
+
+    /// REGRESSION: on a pre-typed-config install the row is still keyed by the
+    /// package name, so `entry_egress` resolves nothing against the canonical
+    /// `zpi1_` key, the gap is reported, and the command the diagnostic used to
+    /// print addressed a row that does not exist. Running it as printed fails
+    /// with `Unknown property` and grants nothing.
+    ///
+    /// The diagnostic must detect that state and print the documented rename
+    /// FIRST, naming both the legacy row and the key to give it, with the grant
+    /// command explicitly second. Detection only: a list command must not
+    /// rewrite the operator's config.
+    #[test]
+    #[cfg(all(feature = "plugins-wasm", feature = "agent-runtime"))]
+    fn a_legacy_package_named_row_gets_the_migration_step_before_the_grant_command() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut config = config_in_dir(tmp.path());
+        let manifest = tool_manifest(
+            "weather-tool",
+            &["api.example.com", "api2.example.com"],
+            true,
+        );
+        let instance_key = expected_instance_key(&manifest);
+        config.plugins.entries = vec![legacy_package_named_entry(
+            "weather-tool",
+            &["api.example.com"],
+        )];
+        assert!(
+            config.plugins.entry_egress(&instance_key).0.is_empty(),
+            "the premise: the canonical key resolves no grant on a legacy install"
+        );
+
+        let lines = egress_grant_gap_lines(&config, &manifest).expect("gap lines must build");
+        let rendered = lines.join("\n");
+
+        // The migration instruction names the row to rename and the name to
+        // give it. Either one missing leaves the operator unable to act.
+        assert!(
+            rendered.contains("weather-tool") && rendered.contains(&instance_key),
+            "the output must name both the legacy row and the canonical key: {rendered}"
+        );
+
+        // Ordering is the fix. The grant command only resolves after the
+        // rename, so it must never be the first thing offered.
+        let grant_at = lines
+            .iter()
+            .position(|line| line.contains("zeroclaw config set"))
+            .expect("the grant command must still be printed");
+        let migrate_at = lines
+            .iter()
+            .position(|line| line.contains(&instance_key) && !line.contains("zeroclaw config set"))
+            .expect("a migration line naming the canonical key must be printed");
+        assert!(
+            migrate_at < grant_at,
+            "the rename must precede the grant command: {lines:?}"
+        );
+        assert!(
+            !lines[0].contains("zeroclaw config set"),
+            "the bare grant command must not lead the report: {lines:?}"
+        );
+
+        // Detection, not mutation: `plugin list` never edits config.
+        assert_eq!(
+            config.plugins.entries.len(),
+            1,
+            "the diagnostic must not create a row"
+        );
+        assert_eq!(
+            config.plugins.entries[0].name, "weather-tool",
+            "the diagnostic must not rename the operator's row"
+        );
+        assert_eq!(
+            config.plugins.entries[0].egress_hosts,
+            vec!["api.example.com".to_string()],
+            "the diagnostic must not rewrite the operator's grant"
         );
     }
 

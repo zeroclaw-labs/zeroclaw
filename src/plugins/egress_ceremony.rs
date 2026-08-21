@@ -48,6 +48,44 @@ pub fn egress_set_command(instance_key: &str, hosts: &[String]) -> String {
     )
 }
 
+/// The legacy `[[plugins.entries]]` row an instance's grant is stranded on, if
+/// any.
+///
+/// [`egress_set_command`] addresses the canonical `zpi1_` row, and dotted
+/// `plugins.entries.<key>.…` paths resolve through natural-key lookup, which
+/// only matches rows **already present in live config**. So on a pre-typed-config
+/// install, where the row is still keyed by the package name, that command
+/// targets a row that does not exist and fails with `Unknown property` instead
+/// of writing the grant. The row has to be renamed first.
+///
+/// Returns `Some(row_name)` only when the canonical row is absent *and* one of
+/// `legacy_candidates` is present, which is exactly the state that needs the
+/// rename step printed before the grant command.
+///
+/// `legacy_candidates` is the set of names a pre-typed-config row could carry
+/// for this instance: the package name, and the binding when a future
+/// alias-aware key path makes the two differ. Every key derived today comes
+/// from the default tool binding, whose binding string *is* the package name,
+/// so callers pass one candidate and get the same answer.
+///
+/// `None` covers both "the canonical row is present" (the command resolves) and
+/// "no row exists at all" (the command fails, but renaming nothing would not
+/// help). Only the first is a state the printed grant command can act on.
+#[must_use]
+pub fn stranded_legacy_grant_row(
+    instance_key: &str,
+    legacy_candidates: &[String],
+    row_names: &[String],
+) -> Option<String> {
+    if row_names.iter().any(|name| name == instance_key) {
+        return None;
+    }
+    legacy_candidates
+        .iter()
+        .find(|candidate| row_names.iter().any(|name| name == *candidate))
+        .cloned()
+}
+
 /// Canonicalize a declared or granted list for comparison and for seeding.
 ///
 /// Uses the same grammar the manifest and the config are validated against, so
@@ -252,6 +290,37 @@ mod tests {
             cmd.contains('"'),
             "an unquoted '*.suffix' would be glob-expanded by the operator's shell"
         );
+    }
+
+    #[test]
+    fn a_package_name_row_strands_the_grant_only_while_the_canonical_row_is_absent() {
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        let legacy = v(&["weather-tool"]);
+
+        // Pre-typed-config install: the row is still package-name keyed, so the
+        // printed `config set ...<key>.egress_hosts` command cannot resolve.
+        assert_eq!(
+            stranded_legacy_grant_row(key, &legacy, &v(&["weather-tool"])),
+            Some("weather-tool".to_string())
+        );
+
+        // The canonical row is what the command addresses. Once it exists the
+        // command resolves, even if the stale row was left behind.
+        assert_eq!(
+            stranded_legacy_grant_row(key, &legacy, &v(&[key, "weather-tool"])),
+            None,
+            "a present canonical row makes the grant command resolvable"
+        );
+
+        // Someone else's package-name row is not this instance's grant.
+        assert_eq!(
+            stranded_legacy_grant_row(key, &legacy, &v(&["other-tool"])),
+            None
+        );
+
+        // No rows at all: renaming nothing would not help, so there is no
+        // migration step to print.
+        assert_eq!(stranded_legacy_grant_row(key, &legacy, &[]), None);
     }
 
     #[test]

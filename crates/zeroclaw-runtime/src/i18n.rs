@@ -621,7 +621,7 @@ mod tests {
         /// the substrings the rendered value must contain.
         type EgressStringCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
 
-        let cases: [EgressStringCase<'_>; 10] = [
+        let cases: [EgressStringCase<'_>; 13] = [
             (
                 "cli-plugin-egress-seeded",
                 &[("name", "weather-tool"), ("count", "2")],
@@ -676,6 +676,31 @@ mod tests {
                 ],
                 &["weather-tool", "api2.example.com", command.as_str()],
             ),
+            // The legacy-row arm of the same diagnostic. Its first line must
+            // NOT carry `{$command}`: the command only works after the rename,
+            // so the ordered steps below own it.
+            (
+                "cli-plugin-egress-gap-legacy",
+                &[("name", "weather-tool"), ("hosts", "api2.example.com")],
+                &["weather-tool", "api2.example.com"],
+            ),
+            // A catalogue that drops `{$legacy}` or `{$key}` ships a rename
+            // instruction naming neither the row to rename nor the name to
+            // give it, which is worse than no instruction at all.
+            (
+                "cli-plugin-egress-migrate-step",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                ],
+                &["weather-tool", key],
+            ),
+            (
+                "cli-plugin-egress-grant-step",
+                &[("command", command.as_str())],
+                &[command.as_str()],
+            ),
         ];
 
         for (source, locale) in [
@@ -699,6 +724,23 @@ mod tests {
                     );
                 }
             }
+
+            // The legacy-row headline must not carry the grant command itself.
+            // That command only resolves after the rename, so a catalogue that
+            // folds it back into the headline hands the operator the failing
+            // step before the one that makes it work.
+            let headline = format_ftl_message(
+                source,
+                locale,
+                "cli-plugin-egress-gap-legacy",
+                &[("name", "weather-tool"), ("hosts", "api2.example.com")],
+            )
+            .unwrap_or_else(|| panic!("cli-plugin-egress-gap-legacy should format in {locale}"));
+            assert!(
+                !headline.contains("zeroclaw config set"),
+                "cli-plugin-egress-gap-legacy in {locale} must leave the grant \
+                 command to the ordered steps; got: {headline:?}"
+            );
         }
     }
 

@@ -287,6 +287,14 @@ grant with no matching declaration is a first-class path, not a finding: the
 plugin whose destination is deployment configuration (a self-hosted Gitea, a
 LAN Nextcloud) cannot have that host declared by its author, so you author it.
 
+When the instance's row still carries a pre-1.0 key (a package name rather than
+the `zpi1_…` key), `plugin list` prints the rename described above first and
+numbers the two steps. Dotted `plugins.entries.<key>.…` paths only resolve rows
+already present in live config, so a `zeroclaw config set` against the
+canonical key fails with `Unknown property` until the row is renamed. Applying
+the printed steps in the printed order works; `plugin list` diagnoses this and
+never edits your config itself.
+
 Channel-only packages are silent on both surfaces until the alias-aware key
 path above lands, because no instance row can yet be derived to compare
 against.
