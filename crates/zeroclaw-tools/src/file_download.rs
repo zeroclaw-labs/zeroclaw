@@ -286,9 +286,14 @@ fn parse_endpoint_url(raw_url: &str) -> Result<(String, String, u16), String> {
     match parsed.scheme() {
         "http" | "https" => {}
         _ => {
+            // Report only the scheme, not the full configured URL. The raw
+            // endpoint may embed userinfo or a query with credentials, and the
+            // error is model-visible tool output; echoing it here would leak
+            // operator-configured secrets before the userinfo guard in
+            // `extract_download_url_host` runs.
             return Err(tool_msg_with_args(
                 "tool-file-download-error-bad-scheme",
-                &[("url", url)],
+                &[("scheme", parsed.scheme())],
             ));
         }
     }
@@ -1864,6 +1869,25 @@ mod tests {
         assert!(
             err.contains("http://") || err.contains("scheme"),
             "non-http scheme must still be rejected; got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_endpoint_url_bad_scheme_does_not_echo_credentials() {
+        // A non-http(s) endpoint that carries userinfo or a query with a
+        // credential must not echo that secret in the model-visible error.
+        // The bad-scheme error reports only the scheme, never the full URL, so
+        // an operator-configured `ftp://user:pass@host/file` leaks neither the
+        // userinfo nor the query.
+        let err =
+            parse_endpoint_url("ftp://user:secret@example.invalid:21/file?v=key").unwrap_err();
+        assert!(
+            !err.contains("user:secret") && !err.contains("secret") && !err.contains("key"),
+            "bad-scheme error must not echo URL credentials; got: {err}"
+        );
+        assert!(
+            err.contains("ftp") && err.contains("http://"),
+            "bad-scheme error should still identify the rejected scheme; got: {err}"
         );
     }
 
