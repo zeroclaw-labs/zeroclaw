@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Bot,
@@ -35,7 +35,10 @@ import {
   runtimeValueForSubmit,
   type RuntimeSelection,
 } from "./runtime-selection";
-import { initialChannelFieldValues } from "./channel-fields";
+import {
+  channelFieldStateReducer,
+  initialChannelFieldState,
+} from "./channel-fields";
 
 // Shared tokenized field control classes. Calm input surface with an accent
 // focus ring — replaces the legacy `input-electric` utility.
@@ -1047,32 +1050,30 @@ function ChannelAddForm({
   onAdd: (c: StagedChannel) => void;
   onCancel: () => void;
 }) {
-  const [mode, setMode] = useState<"existing" | "fresh">(
-    reusable.length > 0 ? "existing" : "fresh",
+  const [channelFields, dispatchChannelFields] = useReducer(
+    channelFieldStateReducer,
+    initialChannelFieldState(reusable.length > 0 ? "existing" : "fresh"),
   );
   const [existingRef, setExistingRef] = useState(reusable[0] ?? "");
-  const [type, setType] = useState("");
   const [alias, setAlias] = useState("");
-  const [descriptors, setDescriptors] = useState<QuickstartFieldDescriptor[]>(
-    [],
-  );
-  const [fields, setFields] = useState<Record<string, string>>({});
+  const { mode, type, descriptors, fields } = channelFields;
 
   useEffect(() => {
-    if (!type) {
-      setDescriptors([]);
-      return;
-    }
+    if (!type) return;
     let cancelled = false;
     void (async () => {
       try {
         const f = await quickstartFields({ section: "channel", type_key: type });
         if (!cancelled) {
-          setDescriptors(f.fields);
-          setFields((current) => initialChannelFieldValues(f.fields, current));
+          dispatchChannelFields({
+            kind: "descriptors-loaded",
+            channelType: type,
+            descriptors: f.fields,
+          });
         }
       } catch {
-        if (!cancelled) setDescriptors([]);
+        // Keep the current field state so a transient descriptor failure does
+        // not discard values the user has already entered.
       }
     })();
     return () => {
@@ -1110,14 +1111,18 @@ function ChannelAddForm({
           variant={mode === "existing" ? "primary" : "ghost"}
           size="sm"
           disabled={reusable.length === 0}
-          onClick={() => setMode("existing")}
+          onClick={() =>
+            dispatchChannelFields({ kind: "mode-changed", mode: "existing" })
+          }
         >
           {t("quickstart.use_existing")}
         </Button>
         <Button
           variant={mode === "fresh" ? "primary" : "ghost"}
           size="sm"
-          onClick={() => setMode("fresh")}
+          onClick={() =>
+            dispatchChannelFields({ kind: "mode-changed", mode: "fresh" })
+          }
         >
           {t("quickstart.create_new")}
         </Button>
@@ -1156,9 +1161,11 @@ function ChannelAddForm({
               value={type}
               onChange={(e) => {
                 const next = e.target.value;
-                setType(next);
+                dispatchChannelFields({
+                  kind: "channel-type-changed",
+                  channelType: next,
+                });
                 setAlias((prev) => (prev === "" || prev === type ? next : prev));
-                setFields({});
               }}
             >
               <option value="" disabled>
@@ -1185,7 +1192,13 @@ function ChannelAddForm({
               label={d.label}
               type={d.is_secret ? "password" : "text"}
               value={fields[d.key] ?? ""}
-              onChange={(v) => setFields((x) => ({ ...x, [d.key]: v }))}
+              onChange={(v) =>
+                dispatchChannelFields({
+                  kind: "field-changed",
+                  key: d.key,
+                  value: v,
+                })
+              }
               placeholder={d.help}
               required={d.required}
             />
