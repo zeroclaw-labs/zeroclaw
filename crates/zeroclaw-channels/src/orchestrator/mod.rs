@@ -961,12 +961,19 @@ impl ConversationLaneRegistry {
 
         // An interrupted predecessor is awaited before the permit is taken,
         // so a turn never occupies the in-flight budget while waiting for
-        // one that is still winding down.
+        // one that is still winding down. The wait covers the immediate
+        // predecessor *and* its superseded chain: a canceled middle turn
+        // exits (and marks its completion) without running, so waiting on it
+        // alone would let this turn start while the turn it interrupted is
+        // still winding down in another final lane.
         if let Some(superseded) = turn
             .registration
             .as_mut()
             .and_then(|registration| registration.superseded.take())
         {
+            for predecessor in &superseded.superseded_completions {
+                predecessor.wait().await;
+            }
             superseded.completion.wait().await;
         }
 
@@ -1214,6 +1221,14 @@ struct InFlightSenderTaskState {
     task_id: u64,
     cancellation: CancellationToken,
     completion: Arc<InFlightTaskCompletion>,
+    /// Completions of the still-unfinished turns this one superseded,
+    /// transitively. A successor must wait on these as well as `completion`:
+    /// a canceled middle turn marks its own completion on whichever early
+    /// exit drops its registration, which can happen while the turn *it*
+    /// superseded is still winding down in another final lane. Waiting on
+    /// the whole chain keeps "at most one running turn per interruption
+    /// scope" true regardless of where a middle turn dies.
+    superseded_completions: Vec<Arc<InFlightTaskCompletion>>,
 }
 
 struct InFlightTaskCompletion {
@@ -1232,6 +1247,12 @@ impl InFlightTaskCompletion {
     fn mark_done(&self) {
         self.done.store(true, Ordering::Release);
         self.notify.notify_waiters();
+    }
+
+    /// `done` is sticky, so a `true` here is final and safe to use for
+    /// pruning finished predecessors out of a superseded chain.
+    fn is_done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
     }
 
     async fn wait(&self) {
@@ -7685,10 +7706,29 @@ async fn register_inbound_turn(
         let mut active = in_flight.lock().unwrap_or_else(|e| e.into_inner());
         let states = active.entry(scope_key.clone()).or_default();
         let previous = states.last().cloned();
+        // With interruption enabled this registration supersedes `previous`,
+        // and its own successor must inherit a completion dependency on every
+        // unfinished turn of that chain, not only on this one: a canceled
+        // middle turn drops its registration (and marks its completion) on
+        // whichever early exit it takes, possibly while the turn it
+        // superseded is still winding down. The chain is snapshotted under
+        // the same lock that publishes the state. A state still present in
+        // the map cannot have finished its release, so pruning here only
+        // drops predecessors that have fully exited.
+        let superseded_completions = match (interrupt_enabled, previous.as_ref()) {
+            (true, Some(previous)) => {
+                let mut chain = previous.superseded_completions.clone();
+                chain.retain(|superseded| !superseded.is_done());
+                chain.push(Arc::clone(&previous.completion));
+                chain
+            }
+            _ => Vec::new(),
+        };
         states.push(InFlightSenderTaskState {
             task_id,
             cancellation: cancellation.clone(),
             completion: Arc::clone(&completion),
+            superseded_completions,
         });
         previous
     };
@@ -7728,7 +7768,10 @@ struct TurnRegistration {
     cancellation: CancellationToken,
     completion: Arc<InFlightTaskCompletion>,
     /// The in-flight turn this one interrupted, if `interrupt_on_new_message`
-    /// is enabled for the channel. Awaited before this turn starts.
+    /// is enabled for the channel. Awaited before this turn starts, together
+    /// with that turn's own superseded chain: the immediate predecessor may
+    /// be canceled and exit without ever running, while an older turn it
+    /// interrupted is still winding down.
     superseded: Option<InFlightSenderTaskState>,
     in_flight: Arc<Mutex<HashMap<String, Vec<InFlightSenderTaskState>>>>,
 }
@@ -25606,6 +25649,423 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             position("message_id=m2") < position("message_id=m1"),
             "a reroute bound elsewhere must not wait for the stalled one: {sent:?}"
+        );
+    }
+
+    /// Routes each turn of the three-turn cancellation-chain tests into its
+    /// own final conversation, so lane serialization cannot mask a broken
+    /// predecessor wait. `mC` shares `m2`'s destination on purpose: it keeps
+    /// that lane busy while `m2` waits in its queue.
+    struct CancellationChainLaneHook {
+        /// When set, `m2`'s hook flags entry and parks until released, so a
+        /// test can cancel `m2` while its hook is still resolving.
+        hold_m2: Option<(Arc<std::sync::atomic::AtomicBool>, Arc<tokio::sync::Notify>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl zeroclaw_runtime::hooks::HookHandler for CancellationChainLaneHook {
+        fn name(&self) -> &str {
+            "cancellation-chain-lane"
+        }
+
+        async fn on_message_received(
+            &self,
+            mut message: ChannelMessage,
+        ) -> zeroclaw_runtime::hooks::HookResult<ChannelMessage> {
+            if message.id == "m2"
+                && let Some((entered, release)) = self.hold_m2.as_ref()
+            {
+                entered.store(true, Ordering::Release);
+                release.notified().await;
+            }
+            let (room, topic) = match message.id.as_str() {
+                "m1" => ("-1009991:91", "91"),
+                "m2" | "mC" => ("-1009992:92", "92"),
+                _ => ("-1009993:93", "93"),
+            };
+            message.reply_target = room.into();
+            message.thread_ts = Some(topic.into());
+            zeroclaw_runtime::hooks::HookResult::Continue(message)
+        }
+    }
+
+    /// Records which turns reach the provider, in order, and can hold a
+    /// specific turn open until the test releases it. Turn identity comes
+    /// from the `message_id=` marker the rendered prompt embeds.
+    #[derive(Default)]
+    struct GatedProbeModelProvider {
+        entered: std::sync::Mutex<Vec<String>>,
+        gates: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    }
+
+    impl GatedProbeModelProvider {
+        fn hold(&self, id: &str) {
+            self.gates
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), Arc::new(tokio::sync::Notify::new()));
+        }
+
+        fn release(&self, id: &str) {
+            if let Some(gate) = self.gates.lock().unwrap().get(id) {
+                gate.notify_one();
+            }
+        }
+
+        fn entered_ids(&self) -> Vec<String> {
+            self.entered.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for GatedProbeModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            // Reply-intent classification shares this provider in the test
+            // runtime. It must not consume a turn gate: only the following
+            // agent call is relevant to cancellation ordering.
+            if message.starts_with("Decide whether the assistant should send") {
+                return Ok("REPLY".to_string());
+            }
+            // The rendered prompt may contain recalled context from an
+            // earlier turn. The current inbound message is appended last, so
+            // choose the marker with the final byte position, not the first
+            // matching id in the fixed test list.
+            let id = ["m1", "m2", "m3", "mC"]
+                .into_iter()
+                .filter_map(|id| {
+                    message
+                        .rfind(&format!("message_id={id}"))
+                        .map(|position| (position, id))
+                })
+                .max_by_key(|(position, _)| *position)
+                .map_or("unknown", |(_, id)| id)
+                .to_string();
+            let gate = self.gates.lock().unwrap().get(&id).cloned();
+            self.entered.lock().unwrap().push(id.clone());
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            Ok(format!("done for message_id={id}"))
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for GatedProbeModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "GatedProbeModelProvider"
+        }
+    }
+
+    /// A telegram-named transport that parks `m1`'s post-turn reaction
+    /// cleanup until released, holding the canceled turn observably inside
+    /// its wind-down.
+    #[derive(Default)]
+    struct WindDownGateChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+        m1_wind_down_entered: std::sync::atomic::AtomicBool,
+        m1_wind_down_release: tokio::sync::Notify,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for WindDownGateChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "wind-down-gate-test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for WindDownGateChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn remove_reaction(
+            &self,
+            _channel_id: &str,
+            message_id: &str,
+            _emoji: &str,
+        ) -> anyhow::Result<()> {
+            if message_id == "m1" {
+                self.m1_wind_down_entered.store(true, Ordering::Release);
+                self.m1_wind_down_release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    /// The cancellation-chain tests need interruption on for Telegram; the
+    /// shared helper builds contexts with it off.
+    fn cancellation_chain_test_ctx(
+        channel: Arc<dyn Channel>,
+        provider: Arc<dyn ModelProvider>,
+        hook: CancellationChainLaneHook,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut hooks = zeroclaw_runtime::hooks::HookRunner::new();
+        hooks.register(Box::new(hook));
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            provider,
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            Some(Arc::new(hooks)),
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("the freshly built context has no other handles yet")
+            .interrupt_on_new_message = InterruptOnNewMessageConfig {
+            telegram: true,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: false,
+        };
+        ctx
+    }
+
+    /// Poll a condition under virtual time. Each probe yields a 1ms virtual
+    /// tick, so the paused clock's auto-advance drives the pipeline between
+    /// probes and the loop settles deterministically.
+    async fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..1000 {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
+    }
+
+    /// The three-turn interruption chain with the middle turn canceled while
+    /// it sits in a final lane queue: `register_inbound_turn` links `m3` only
+    /// to `m2`, and the canceled `m2` exits its lane slot without running, so
+    /// `m3`'s predecessor wait must transitively cover `m1`. Hooks route each
+    /// turn into its own final lane, so lane serialization supplies no
+    /// accidental ordering. `m3` may start only after canceled `m1` has
+    /// fully exited its wind-down.
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_chain_waits_for_canceled_middle_turns_predecessor() {
+        let channel_impl = Arc::new(WindDownGateChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider = Arc::new(GatedProbeModelProvider::default());
+        provider.hold("m1");
+        provider.hold("mC");
+        let ctx = cancellation_chain_test_ctx(
+            channel,
+            provider.clone(),
+            CancellationChainLaneHook { hold_m2: None },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+        let dispatch = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(Arc::clone(&ctx)),
+            4
+        ));
+
+        // m1 starts and parks inside the provider.
+        tx.send(shared_topic_message("alice", "m1", "first"))
+            .await
+            .unwrap();
+        assert!(
+            eventually(|| provider.entered_ids().contains(&"m1".to_string())).await,
+            "m1 must reach the provider before it can be interrupted"
+        );
+
+        // Carol occupies the final lane the hook assigns to m2, so m2 will
+        // still be queued, not yet cancel-checked, when m3 cancels it.
+        tx.send(shared_topic_message(
+            "carol",
+            "mC",
+            "keeps the middle lane busy",
+        ))
+        .await
+        .unwrap();
+        assert!(
+            eventually(|| provider.entered_ids().contains(&"mC".to_string())).await,
+            "carol must occupy m2's final lane first"
+        );
+
+        // m2 interrupts m1: m1 starts winding down and parks at the gated
+        // reaction cleanup while m2 queues behind carol.
+        tx.send(shared_topic_message("alice", "m2", "second"))
+            .await
+            .unwrap();
+        // Let the canceled provider call return. The channel's reaction
+        // cleanup below then gives the test an explicit, observable point
+        // within m1's remaining wind-down.
+        provider.release("m1");
+        assert!(
+            eventually(|| channel_impl.m1_wind_down_entered.load(Ordering::Acquire)).await,
+            "canceled m1 must be observably winding down"
+        );
+        // Let m2 come to rest in its lane queue before m3 arrives: paused
+        // time only advances once every task is parked.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // m3 cancels the queued m2.
+        tx.send(shared_topic_message("alice", "m3", "third"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Carol finishes; her lane picks the canceled m2 up and drops it,
+        // marking m2 complete. m3's predecessor wait must survive that.
+        provider.release("mC");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !provider.entered_ids().contains(&"m3".to_string()),
+            "m3 must not enter the provider while canceled m1 is still winding down: {:?}",
+            provider.entered_ids()
+        );
+
+        // Only m1's full exit releases m3.
+        channel_impl.m1_wind_down_release.notify_one();
+        assert!(
+            eventually(|| provider.entered_ids().contains(&"m3".to_string())).await,
+            "m3 must start once m1 has fully exited: {:?}",
+            provider.entered_ids()
+        );
+
+        drop(tx);
+        dispatch.await.expect("the dispatch loop must drain");
+
+        assert_eq!(
+            provider.entered_ids(),
+            vec!["m1", "mC", "m3"],
+            "the canceled middle turn must never reach the provider"
+        );
+        let sent = channel_impl.sent_messages.lock().await;
+        assert!(
+            sent.iter().any(|m| m.contains("message_id=m3")),
+            "m3 must complete: {sent:?}"
+        );
+    }
+
+    /// The same transitive guarantee when the canceled middle turn dies even
+    /// earlier: `m2` is canceled while its inbound hook is still resolving
+    /// and is dropped at the post-admission cancel check, before it ever
+    /// reaches a lane. `m3` must still wait for canceled `m1`'s full exit,
+    /// which pins that the predecessor dependency survives every early-exit
+    /// path of the middle turn, not just the lane-queue one.
+    #[tokio::test(start_paused = true)]
+    async fn interrupted_chain_waits_when_middle_turn_dies_before_its_lane() {
+        let channel_impl = Arc::new(WindDownGateChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider = Arc::new(GatedProbeModelProvider::default());
+        provider.hold("m1");
+        let m2_hook_entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let m2_hook_release = Arc::new(tokio::sync::Notify::new());
+        let ctx = cancellation_chain_test_ctx(
+            channel,
+            provider.clone(),
+            CancellationChainLaneHook {
+                hold_m2: Some((Arc::clone(&m2_hook_entered), Arc::clone(&m2_hook_release))),
+            },
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+        let dispatch = zeroclaw_spawn::spawn!(run_message_dispatch_loop(
+            rx,
+            AgentRouter::single(Arc::clone(&ctx)),
+            4
+        ));
+
+        // m1 starts and parks inside the provider.
+        tx.send(shared_topic_message("alice", "m1", "first"))
+            .await
+            .unwrap();
+        assert!(
+            eventually(|| provider.entered_ids().contains(&"m1".to_string())).await,
+            "m1 must reach the provider before it can be interrupted"
+        );
+
+        // m2 interrupts m1 and parks inside its own inbound hook.
+        tx.send(shared_topic_message("alice", "m2", "second"))
+            .await
+            .unwrap();
+        assert!(
+            eventually(|| m2_hook_entered.load(Ordering::Acquire)).await,
+            "m2 must be parked inside its hook"
+        );
+        // m2 has cancelled m1; let m1 advance from its provider call to the
+        // channel cleanup that intentionally keeps its final exit pending.
+        provider.release("m1");
+        assert!(
+            eventually(|| channel_impl.m1_wind_down_entered.load(Ordering::Acquire)).await,
+            "canceled m1 must be observably winding down"
+        );
+
+        // m3 cancels m2 while m2's hook is still resolving, then waits for
+        // m2's admission slot ahead of its own.
+        tx.send(shared_topic_message("alice", "m3", "third"))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // m2's hook resolves; the canceled m2 is dropped at the admission
+        // cancel check, marking m2 complete without ever reaching a lane.
+        m2_hook_release.notify_one();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            !provider.entered_ids().contains(&"m3".to_string()),
+            "m3 must not enter the provider while canceled m1 is still winding down: {:?}",
+            provider.entered_ids()
+        );
+
+        // Only m1's full exit releases m3.
+        channel_impl.m1_wind_down_release.notify_one();
+        assert!(
+            eventually(|| provider.entered_ids().contains(&"m3".to_string())).await,
+            "m3 must start once m1 has fully exited: {:?}",
+            provider.entered_ids()
+        );
+
+        drop(tx);
+        dispatch.await.expect("the dispatch loop must drain");
+
+        assert_eq!(
+            provider.entered_ids(),
+            vec!["m1", "m3"],
+            "the canceled middle turn must never reach the provider"
         );
     }
 
