@@ -503,6 +503,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use http_body_util::BodyExt;
@@ -911,6 +913,112 @@ mod tests {
                 Err(ErrorCode::ConnectionTimeout)
             ),
             "a spent budget must not fund another attempt"
+        );
+    }
+
+    /// A live loopback listener that speaks just enough HTTP/1.1 to let a hook
+    /// send complete, counting every connection it accepts.
+    ///
+    /// Deliberately raw `std::net` on its own thread, like the e2e server: this
+    /// proves which endpoint the host's client actually dialed, so the listener
+    /// adds no framework machinery that might mask the answer.
+    fn counting_http_listener() -> (SocketAddr, Arc<AtomicUsize>) {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback peer");
+        let address = listener.local_addr().expect("loopback address");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                counter.fetch_add(1, Ordering::SeqCst);
+                // Read just past the request head; the fixture request has no body.
+                let mut buf = [0_u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+                let _ = stream.flush();
+            }
+        });
+        (address, hits)
+    }
+
+    /// The pin holds across a changing resolver: the hook dials only the address
+    /// set validated during authorization, never a later resolution.
+    ///
+    /// This is the crown-jewel property of the pinned send path, exercised at
+    /// the real `send_request` boundary rather than at `dial_pinned` in
+    /// isolation. `authorize` performs the one resolution and pins listener A;
+    /// the resolver is then armed to answer with listener B on any *second*
+    /// call. A regression that re-resolved before connecting — the DNS-rebinding
+    /// / TOCTOU window pinning closes — would consult that second answer and land
+    /// on B.
+    ///
+    /// Both listeners are loopback, so the address-class verdict treats them
+    /// identically: the class check cannot be what keeps the connection off B.
+    /// The *only* thing that can is the pin, so B asserts it is never dialed.
+    /// The request port matches A's port so the pinned answer passes the
+    /// resolved-address port check, and the host is a public name so nothing but
+    /// the pin selects which loopback endpoint is reached.
+    #[tokio::test]
+    async fn the_hook_dials_only_the_pinned_answer_not_a_later_resolution() {
+        let (pinned, pinned_hits) = counting_http_listener();
+        let (rebind, rebind_hits) = counting_http_listener();
+
+        // A resolver whose answer changes between calls: the first resolution —
+        // the one `authorize` pins — is A; any later resolution is B. The switch
+        // is a deterministic counter, so nothing depends on DNS or address order.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = move |_host: &str, _port: u16| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                vec![pinned]
+            } else {
+                vec![rebind]
+            }
+        };
+        let service = EgressHostService::with_test_resolver(
+            EgressPolicyResolver::new(|_| {
+                // The public name is granted, and the private carveout is what
+                // lets its (loopback) resolved address pass the class check —
+                // the same carveout every loopback destination here needs.
+                EgressPolicy::new(
+                    &["rebind.example.com".to_string()],
+                    &["rebind.example.com".to_string()],
+                    &[],
+                    4,
+                )
+            }),
+            resolver,
+        );
+        let mut hooks = hooks(Some(service));
+
+        let response = hooks
+            .send_request(
+                request(&format!("http://rebind.example.com:{}/", pinned.port())),
+                config(),
+            )
+            .expect("an authorized destination is dialed asynchronously");
+        let HostFutureIncomingResponse::Pending(handle) = response else {
+            panic!("an authorized destination is dialed asynchronously");
+        };
+        let outcome = handle.await.expect("the send task must not trap");
+
+        assert!(
+            outcome.is_ok(),
+            "the pinned destination must be reachable; got: {outcome:?}"
+        );
+        assert_eq!(
+            pinned_hits.load(Ordering::SeqCst),
+            1,
+            "the connection must land on the pinned answer"
+        );
+        assert_eq!(
+            rebind_hits.load(Ordering::SeqCst),
+            0,
+            "a re-resolved answer must never be dialed: the pin is the only \
+             address set the hook may use"
         );
     }
 

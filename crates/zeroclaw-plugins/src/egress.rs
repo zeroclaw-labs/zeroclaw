@@ -417,6 +417,15 @@ impl AuthorizedEgress {
     }
 }
 
+/// Test-only stand-in for `tokio::net::lookup_host`.
+///
+/// A deterministic closure from a requested host and port to an address set,
+/// used only to model a resolver whose answer changes between calls (DNS
+/// rebinding) without depending on real DNS or resolver ordering. Production
+/// has no equivalent and never installs one.
+#[cfg(test)]
+type TestAddressResolver = Arc<dyn Fn(&str, u16) -> Vec<SocketAddr> + Send + Sync>;
+
 /// Shared service injected into plugin stores and cloned across transports.
 ///
 /// Policy is per service, because a service is built around one resolver.
@@ -427,6 +436,11 @@ impl AuthorizedEgress {
 pub struct EgressHostService {
     resolver: EgressPolicyResolver,
     connections: ConnectionRegistry,
+    /// Test-only DNS override. `None` in every production build (the field
+    /// does not exist there at all), so the resolve path stays the shipped
+    /// `lookup_host` call.
+    #[cfg(test)]
+    resolver_override: Option<TestAddressResolver>,
 }
 
 impl fmt::Debug for EgressHostService {
@@ -446,6 +460,8 @@ impl EgressHostService {
         Self {
             resolver,
             connections: ConnectionRegistry::shared(),
+            #[cfg(test)]
+            resolver_override: None,
         }
     }
 
@@ -463,6 +479,33 @@ impl EgressHostService {
         Self {
             resolver,
             connections: ConnectionRegistry::default(),
+            resolver_override: None,
+        }
+    }
+
+    /// A service whose DNS resolution is replaced by a deterministic closure.
+    ///
+    /// Test-only. The override stands in for `tokio::net::lookup_host`, so a
+    /// test can pin one answer and then observe that a *different* later answer
+    /// is never dialed — the DNS-rebinding / TOCTOU property, made deterministic
+    /// and free of any dependence on resolver ordering. Accounting is private to
+    /// the caller for the same reason [`Self::with_private_connection_accounting`]
+    /// is. Production has no equivalent constructor and never sets the override.
+    ///
+    /// The gate matches the *caller's*: the only caller is in [`crate::wasi_http`]'s
+    /// tests, and that module exists only under `plugins-wasmtime`. A wider gate
+    /// makes this dead code on the default feature surface, which the `default
+    /// features, all targets` CI row compiles with `-D warnings`.
+    #[cfg(all(test, feature = "plugins-wasmtime"))]
+    #[must_use]
+    pub(crate) fn with_test_resolver(
+        resolver: EgressPolicyResolver,
+        addresses: impl Fn(&str, u16) -> Vec<SocketAddr> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            resolver,
+            connections: ConnectionRegistry::default(),
+            resolver_override: Some(Arc::new(addresses)),
         }
     }
 
@@ -478,6 +521,15 @@ impl EgressHostService {
     /// or connection-budget acquisition fails.
     pub async fn authorize(&self, request: EgressRequest) -> Result<AuthorizedEgress, EgressError> {
         let policy = self.resolve_policy(&request)?;
+        // Test-only DNS override. Production never installs one, so under
+        // `not(test)` this block compiles to nothing and the resolution below is
+        // exactly the shipped `lookup_host` path. Under test it lets a case pin
+        // the first answer and prove a later, different answer is never dialed.
+        #[cfg(test)]
+        if let Some(resolver) = &self.resolver_override {
+            let addresses = resolver(request.host(), request.port());
+            return self.authorize_with_policy(request, addresses, &policy);
+        }
         let addresses = tokio::net::lookup_host((request.host(), request.port()))
             .await
             .map_err(|error| EgressError::DnsFailed {
