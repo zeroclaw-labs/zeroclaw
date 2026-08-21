@@ -1455,6 +1455,170 @@ fn command_basename(raw: &str) -> &str {
     after_fwd.rsplit('\\').next().unwrap_or(after_fwd)
 }
 
+/// Drop single- and double-quoted spans so a pattern search sees only the
+/// text the shell would actually execute.
+fn strip_quoted_spans(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for ch in command.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(q) => {
+                if ch == '\\' && q == '"' {
+                    escaped = true;
+                } else if ch == q {
+                    quote = None;
+                }
+            }
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => escaped = true,
+                _ => out.push(ch),
+            },
+        }
+    }
+    out
+}
+
+/// A self-replicating function that exhausts the process table. Matched on
+/// the unquoted text with whitespace removed, so spacing variants collapse
+/// onto one pattern.
+fn contains_fork_bomb(command: &str) -> bool {
+    let compact: String = strip_quoted_spans(command)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    compact.contains(":(){:|:&};:")
+}
+
+/// Whether a `dd` operand names a raw block device rather than a file.
+/// `/dev/null` and `/dev/zero` are character devices and stay allowed.
+///
+/// Covers the physical-disk families plus the virtual layers that front them:
+/// on an LVM or RAID host `/dev/mapper/vg-root` and `/dev/md0` *are* the
+/// system disk, so omitting them would leave the common server case open.
+/// Still a prefix list, so still best-effort — see
+/// [`is_irreversible_destructive_command`].
+fn dd_writes_raw_block_device(arg: &str) -> bool {
+    let Some(target) = arg.strip_prefix("of=") else {
+        return false;
+    };
+    let target = strip_wrapping_quotes(target);
+    [
+        "/dev/sd",
+        "/dev/hd",
+        "/dev/vd",
+        "/dev/nvme",
+        "/dev/mmcblk",
+        "/dev/disk",
+        "/dev/loop",
+        "/dev/md",
+        "/dev/mapper/",
+        "/dev/dm-",
+    ]
+    .iter()
+    .any(|prefix| target.starts_with(prefix))
+}
+
+/// Whether an `rm` operand names the filesystem root itself.
+///
+/// An absolute path is the root when every one of its components is a no-op:
+/// empty (`//`), `.`, `..`, or a bare glob. `/`, `//`, `/.`, `/..`, and `/*`
+/// all name or expand to the same directory, and a literal `== "/"` comparison
+/// catches only the first. Anything with a real component (`/tmp/scratch`,
+/// `/home/*`) names something *under* the root and is left alone.
+///
+/// Lexical, so still partial: `/tmp/..` is the root too and is not matched.
+/// GNU `rm` refuses all of these itself (`--preserve-root` is the default), so
+/// this is a second line rather than the only one — but a tier whose stated
+/// job is to be the floor should not lean on coreutils' safety net.
+fn rm_targets_filesystem_root(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        let target = strip_wrapping_quotes(arg);
+        target.starts_with('/')
+            && target.split('/').all(|part| {
+                part.is_empty() || part == "." || part == ".." || part.chars().all(|c| c == '*')
+            })
+    })
+}
+
+/// Whether a command is a **direct spelling** of an operation whose effect is
+/// immediate and irreversible: formatting a filesystem, overwriting a raw
+/// block device, exhausting the process table, or deleting the filesystem
+/// root.
+///
+/// # This is best-effort hardening, not a security boundary
+///
+/// Read this before relying on it, and before widening what it claims.
+///
+/// The matcher is lexical: it inspects the first word of each outer shell
+/// segment. It therefore cannot see an operation passed as an *argument* to
+/// another command, and the native runtime hands the accepted string to
+/// `<shell> -c` unchanged. Under `allowed_commands = ["*"]` with
+/// `block_high_risk_commands = false` — the posture that permits arbitrary
+/// shell syntax — every one of these reaches the shell:
+///
+/// ```text
+/// sh -c 'mkfs.ext4 /dev/sda1'      bash -c "mkfs.ext4 /dev/sda1"
+/// env mkfs.ext4 /dev/sda1          sudo mkfs.ext4 /dev/sda1
+/// echo /dev/sda1 | xargs mkfs.ext4
+/// ```
+///
+/// and so does any equivalent through `nohup`, `timeout`, `find -exec`, or a
+/// language interpreter. Closing that class is not a matter of adding
+/// patterns: a lexical scan of the outer token cannot constrain arbitrary
+/// shell execution. It requires a mechanism that can — the sandbox or runtime
+/// layer — which is a much larger change than this function.
+///
+/// So: this raises the cost of the common accident and the lazy spelling. It
+/// does **not** make the wildcard posture safe against these operations, and
+/// no caller, error message, or document should say that it does. An operator
+/// told "this cannot be disabled" would reasonably conclude the wildcard
+/// posture is bounded, and that belief is more dangerous than not having the
+/// tier at all.
+///
+/// It does run ahead of the wildcard opt-out, so the direct spellings it does
+/// cover fail closed in every posture. That placement is deliberate; putting
+/// it after would make it dead code in exactly the configuration it exists for.
+///
+/// `catastrophic_deny_does_not_bound_the_wildcard_posture` pins the bypasses
+/// above as *permitted*, so the boundary is written down rather than assumed.
+fn is_irreversible_destructive_command(command: &str) -> bool {
+    if contains_fork_bomb(command) {
+        return true;
+    }
+
+    for segment in split_unquoted_segments(command) {
+        let cmd_part = skip_env_assignments(&segment);
+        let mut words = cmd_part.split_whitespace();
+        let Some(base_raw) = words.next() else {
+            continue;
+        };
+        let base_owned = command_basename(strip_wrapping_quotes(base_raw)).to_ascii_lowercase();
+        let base = strip_windows_exe_suffix(&base_owned);
+        let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
+
+        // `mkfs` and every `mkfs.<fstype>` variant format a device.
+        if base == "mkfs" || base.starts_with("mkfs.") {
+            return true;
+        }
+
+        if base == "dd" && args.iter().any(|arg| dd_writes_raw_block_device(arg)) {
+            return true;
+        }
+
+        if base == "rm" && rm_targets_filesystem_root(&args) {
+            return true;
+        }
+    }
+
+    false
+}
+
 /// Strip common Windows executable suffixes (.exe, .cmd, .bat) for uniform
 /// matching against allowlists and risk tables. On non-Windows platforms this
 /// is a no-op that returns the input unchanged.
@@ -2208,6 +2372,13 @@ impl SecurityPolicy {
             return Err("Command blocked: configured runtime has no shell access".into());
         }
 
+        if is_irreversible_destructive_command(command) {
+            return Err(
+                "Command not allowed: direct spelling of an irreversible destructive operation"
+                    .into(),
+            );
+        }
+
         if !self.is_command_allowed_for_shell(command, dialect) {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
@@ -2414,6 +2585,14 @@ impl SecurityPolicy {
 
     fn is_posix_like_command_allowed(&self, command: &str, dialect: ShellDialect) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
+            return false;
+        }
+
+        // Ahead of the wildcard opt-out below, so the direct spellings this
+        // covers fail closed in every posture. It does NOT bound the posture:
+        // the same operation via `sh -c`, `env`, `xargs`, … is still permitted
+        // here. See `is_irreversible_destructive_command`.
+        if is_irreversible_destructive_command(command) {
             return false;
         }
 
@@ -4539,6 +4718,138 @@ mod tests {
         let result = p.validate_command_execution("rm -rf /tmp/test", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("high-risk"));
+    }
+
+    /// The most permissive posture an operator can configure: wildcard
+    /// allowlist, high-risk blocking off, full autonomy, pre-approved.
+    fn most_permissive_policy() -> SecurityPolicy {
+        SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["*".into()],
+            block_high_risk_commands: false,
+            ..SecurityPolicy::default()
+        }
+    }
+
+    /// The direct spellings this tier does cover fail closed even when the
+    /// operator has disabled every other gate. This is the guarantee the tier
+    /// actually makes — see
+    /// `catastrophic_deny_does_not_bound_the_wildcard_posture` for the
+    /// guarantee it does NOT make.
+    #[test]
+    fn catastrophic_direct_spellings_are_denied_in_the_most_permissive_posture() {
+        let p = most_permissive_policy();
+
+        for command in [
+            ":(){ :|:& };:",
+            ":(){:|:&};:",
+            "mkfs.ext4 /dev/sda1",
+            "mkfs -t ext4 /dev/sda1",
+            "dd if=/dev/zero of=/dev/sda",
+            "dd if=/dev/zero of=/dev/nvme0n1 bs=1M",
+            // Virtual block layers that front the real disk. On an LVM or
+            // RAID host these ARE the system disk.
+            "dd if=/dev/zero of=/dev/mapper/vg-root",
+            "dd if=/dev/zero of=/dev/dm-0",
+            "dd if=/dev/zero of=/dev/md0",
+            "dd if=/dev/zero of=/dev/loop0",
+            "rm -rf /",
+            "rm -rf /*",
+            "rm --recursive --force /",
+            // Spellings that resolve to the same directory as `/`.
+            "rm -rf //",
+            "rm -rf /.",
+            "rm -rf /..",
+            "rm -rf /**",
+        ] {
+            assert!(
+                !p.is_command_allowed(command),
+                "{command:?} must stay denied even when the operator disables every other gate"
+            );
+            let err = p
+                .validate_command_execution(command, true)
+                .expect_err("catastrophic command must not validate");
+            assert!(
+                err.contains("irreversible"),
+                "{command:?} should report the destructive-operation deny, got: {err}"
+            );
+        }
+    }
+
+    /// The boundary, written down.
+    ///
+    /// Asserting that these are **permitted** looks alarming, and that is the
+    /// point: the matcher is lexical and inspects only the first word of each
+    /// outer segment, so an operation passed as an argument to another command
+    /// reaches `<shell> -c` untouched. Pinning it stops a future reader from
+    /// assuming the tier bounds the wildcard posture, and makes any change
+    /// that *does* close the class an explicit, visible edit to this test
+    /// rather than a silent widening of what the tier claims.
+    ///
+    /// Closing this needs enforcement at a layer that can constrain arbitrary
+    /// shell execution (sandbox/runtime), not more patterns here.
+    #[test]
+    fn catastrophic_deny_does_not_bound_the_wildcard_posture() {
+        let p = most_permissive_policy();
+
+        for command in [
+            // Interpreter and wrapper indirection: first word is sh/bash/env/…
+            "sh -c 'mkfs.ext4 /dev/sda1'",
+            "bash -c \"mkfs.ext4 /dev/sda1\"",
+            "env mkfs.ext4 /dev/sda1",
+            "sudo mkfs.ext4 /dev/sda1",
+            "echo /dev/sda1 | xargs mkfs.ext4",
+            // Path indirection the lexical comparison cannot resolve.
+            "rm -rf /tmp/..",
+        ] {
+            assert!(
+                p.is_command_allowed(command),
+                "{command:?} is NOT blocked by this tier — if that changed, the \
+                 tier's documented contract must change with it"
+            );
+        }
+    }
+
+    #[test]
+    fn catastrophic_deny_does_not_capture_ordinary_work() {
+        let p = most_permissive_policy();
+
+        for command in [
+            "dd if=input.iso of=output.img bs=4M",
+            "dd if=/dev/zero of=./disk.img count=1",
+            "rm -rf ./build",
+            "rm -rf /tmp/scratch",
+            "rm -rf /home/agent/workspace/node_modules",
+            "echo ':(){ :|:& };:'",
+            "grep -r mkfs docs/",
+        ] {
+            assert!(
+                p.is_command_allowed(command),
+                "{command:?} is ordinary work and must remain allowed under a wildcard allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn catastrophic_deny_survives_a_high_risk_command_being_explicitly_listed() {
+        // Explicitly listing `dd` is the documented way to opt into a
+        // high-risk command. It must not also unlock writing to a raw device.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["dd".into()],
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        assert!(p.is_command_allowed("dd if=a.img of=b.img"));
+        assert!(!p.is_command_allowed("dd if=/dev/zero of=/dev/sda"));
+    }
+
+    #[test]
+    fn catastrophic_deny_applies_to_every_segment_of_a_chain() {
+        let p = most_permissive_policy();
+        assert!(!p.is_command_allowed("ls -la && mkfs.ext4 /dev/sdb1"));
+        assert!(!p.is_command_allowed("echo hi; rm -rf /"));
     }
 
     #[test]
