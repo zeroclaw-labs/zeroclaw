@@ -4583,6 +4583,7 @@ pub(crate) mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            pre_hook: None,
         };
         let mut decls = std::collections::HashMap::new();
         decls.insert("decl-job".to_string(), decl.clone());

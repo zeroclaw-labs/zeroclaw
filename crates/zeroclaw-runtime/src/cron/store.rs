@@ -1426,6 +1426,17 @@ fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Resul
         }
     }
 
+    if let Some(pre_hook) = &decl.pre_hook {
+        if pre_hook.command.trim().is_empty() {
+            anyhow::bail!("Declarative cron job '{id}': pre_hook requires a non-empty 'command'");
+        }
+        if pre_hook.timeout_secs == 0 {
+            anyhow::bail!(
+                "Declarative cron job '{id}': pre_hook 'timeout_secs' must be at least 1"
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -2604,6 +2615,7 @@ mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            pre_hook: None,
         };
         config.cron.insert("raw-shadow".to_string(), decl);
 
@@ -2736,6 +2748,7 @@ mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            pre_hook: None,
         };
         config.cron.insert("blob-shadow".to_string(), decl);
 
@@ -2943,6 +2956,7 @@ mod tests {
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
+                pre_hook: None,
             },
         )
     }
@@ -2970,6 +2984,7 @@ mod tests {
                 session_target: None,
                 delivery: None,
                 shell_output_format: Default::default(),
+                pre_hook: None,
             },
         )
     }
@@ -3180,6 +3195,7 @@ mod tests {
             session_target: None,
             delivery: None,
             shell_output_format: Default::default(),
+            pre_hook: None,
         };
 
         let mut decls = std::collections::HashMap::new();
@@ -3228,6 +3244,95 @@ schedule = { kind = "every", every_ms = 300000 }
             health.schedule,
             zeroclaw_config::schema::CronScheduleDecl::Every { every_ms: 300_000 }
         ));
+    }
+
+    #[test]
+    fn declarative_pre_hook_parses_from_toml() {
+        let toml_str = r#"
+[cron.daily-triage]
+job_type = "agent"
+prompt = "Run daily personal triage"
+schedule = { kind = "cron", expr = "0 6 * * *" }
+
+[cron.daily-triage.pre_hook]
+command = "python3 scripts/check_sources.py"
+timeout_secs = 45
+
+[cron.nightly-sync]
+command = "echo sync"
+schedule = { kind = "cron", expr = "0 2 * * *" }
+
+[cron.nightly-sync.pre_hook]
+command = "test -f /var/run/sync.ready"
+        "#;
+
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            cron: std::collections::HashMap<String, zeroclaw_config::schema::CronJobDecl>,
+        }
+        let parsed: Wrap = toml::from_str(toml_str).unwrap();
+
+        let triage = parsed.cron.get("daily-triage").unwrap();
+        let hook = triage.pre_hook.as_ref().expect("pre_hook should parse");
+        assert_eq!(hook.command, "python3 scripts/check_sources.py");
+        assert_eq!(hook.timeout_secs, 45);
+        validate_decl("daily-triage", triage).expect("a complete pre_hook should validate");
+
+        // `timeout_secs` is optional and falls back to the documented default.
+        let sync = parsed.cron.get("nightly-sync").unwrap();
+        let hook = sync.pre_hook.as_ref().expect("pre_hook should parse");
+        assert_eq!(
+            hook.timeout_secs,
+            zeroclaw_config::schema::DEFAULT_CRON_PRE_HOOK_TIMEOUT_SECS
+        );
+
+        // A job with no `pre_hook` table stays ungated.
+        assert!(
+            parsed
+                .cron
+                .values()
+                .all(|decl| decl.pre_hook.is_some() || decl.command.is_some())
+        );
+    }
+
+    #[test]
+    fn validate_decl_rejects_an_unusable_pre_hook() {
+        use zeroclaw_config::schema::{CronJobDecl, CronPreHookDecl, CronScheduleDecl};
+
+        let base = CronJobDecl {
+            job_type: "shell".into(),
+            command: Some("echo ok".into()),
+            schedule: CronScheduleDecl::Cron {
+                expr: "0 2 * * *".into(),
+                tz: None,
+            },
+            ..CronJobDecl::default()
+        };
+
+        let empty_command = CronJobDecl {
+            pre_hook: Some(CronPreHookDecl {
+                command: "   ".into(),
+                timeout_secs: 30,
+            }),
+            ..base.clone()
+        };
+        let err = validate_decl("gated", &empty_command).expect_err("empty command is unusable");
+        assert!(err.to_string().contains("non-empty 'command'"));
+
+        // A zero timeout would expire before the hook could answer, turning
+        // every run into a precondition failure. Reject it at sync time.
+        let zero_timeout = CronJobDecl {
+            pre_hook: Some(CronPreHookDecl {
+                command: "check.sh".into(),
+                timeout_secs: 0,
+            }),
+            ..base
+        };
+        let err = validate_decl("gated", &zero_timeout).expect_err("zero timeout is unusable");
+        assert!(
+            err.to_string()
+                .contains("'timeout_secs' must be at least 1")
+        );
     }
 
     #[test]
@@ -3467,6 +3572,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
         // Populate config.cron so resolution finds the canonical source.
@@ -3521,6 +3627,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Raw,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("raw-decl".to_string(), decl.clone())]);
         config.cron.insert("raw-decl".to_string(), decl.clone());
@@ -3649,6 +3756,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
         config.cron.insert("decl-job".to_string(), decl);
@@ -3697,6 +3805,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("decl-job".to_string(), decl.clone())]);
         config.cron.insert("decl-job".to_string(), decl);
@@ -3805,6 +3914,7 @@ schedule = { kind = "every", every_ms = 300000 }
             session_target: None,
             delivery: None,
             shell_output_format: zeroclaw_config::schema::CronShellOutputFormat::Wrapped,
+            pre_hook: None,
         };
         let decls = decls_map(vec![("orphan-decl".to_string(), decl.clone())]);
         config.cron.insert("orphan-decl".to_string(), decl.clone());

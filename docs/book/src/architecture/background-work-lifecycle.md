@@ -21,6 +21,8 @@ Cron combines declarative membership with a SQLite execution store. Runtime-crea
 
 The scheduler polls for due, enabled, unclaimed rows. Claiming a row prevents duplicate selection while it is in flight. Completion records bounded output, then reschedules a recurring job, deletes a successful auto-delete one-shot, or disables another one-shot. If the process exits before releasing a claim, the next scheduler startup clears the stale lock.
 
+A job may also declare a `pre_hook` precondition gate in config. The gate runs once per run, inside the in-flight claim and before the job body, on scheduled and manual runs alike. Exit `0` runs the job, exit `10` records a clean skip, and any other exit — plus a timeout, a spawn failure, or a security-policy refusal — records a precondition failure. The two outcomes get their own run statuses, `skipped_precondition` and `precondition_failed`, so neither collapses into an ordinary `ok` or `error`, and a clean skip is recorded without being announced. The gate is a config-declared command the daemon executes on a timer, so it runs under the owning agent's security policy, is re-validated on every run, is never treated as approved, and is declarable only in `config.toml` — the cron tools an agent can call cannot create one.
+
 Startup behavior is explicit. With catch-up enabled, overdue jobs are considered for execution. Otherwise an overdue one-shot is disabled with a skipped result, while a recurring job advances to its next future occurrence without recording a run result. The scheduler checks its cancellation token between polling iterations, so shutdown waits for the current due-job batch to finish before the loop exits. Cancelling the scheduler is not a promise that an already-dispatched external side effect can be rolled back.
 
 ## SOP runs
@@ -66,6 +68,7 @@ For background-work changes, answer these before reviewer sign-off:
 ## Source pointers
 
 - Cron scheduler and persistence: `crates/zeroclaw-runtime/src/cron/scheduler.rs`, `crates/zeroclaw-runtime/src/cron/store.rs`
+- Cron precondition gate: `crates/zeroclaw-runtime/src/cron/precondition.rs`
 - SOP engine and run stores: `crates/zeroclaw-runtime/src/sop/engine.rs`, `crates/zeroclaw-runtime/src/sop/store/`
 - Delegation and subagent behavior: [Delegation & SubAgents](../agents/delegation.md), `crates/zeroclaw-runtime/src/tools/delegate.rs`, `crates/zeroclaw-runtime/src/tools/spawn_subagent.rs`, `crates/zeroclaw-runtime/src/subagent/mod.rs`
 - Durable task control plane and recovery: `crates/zeroclaw-runtime/src/control_plane/`

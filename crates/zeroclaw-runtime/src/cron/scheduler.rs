@@ -1,3 +1,6 @@
+use crate::cron::precondition::{
+    self, PreconditionOutcome, STATUS_PRECONDITION_FAILED, STATUS_SKIPPED_PRECONDITION,
+};
 use crate::cron::store::{
     RunCompletionAction, persist_manual_run_result, persist_run_completion_state,
     persist_run_result,
@@ -127,14 +130,106 @@ pub struct CronDeliveryOutcome {
     pub output: String,
 }
 
+/// Result of one cron job execution attempt, including the deterministic
+/// precondition gate that runs before the job body.
+///
+/// The three variants are what keeps "skipped by pre_hook", "failed in
+/// pre_hook", and an ordinary job failure distinguishable in run history
+/// instead of collapsing into one boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CronRunOutcome {
+    /// The gate (if any) passed and the job body ran. `success` is the body's
+    /// own result.
+    Executed { success: bool, output: String },
+    /// The gate exited `10`: preconditions not met. The body never started and
+    /// this is not a failure.
+    SkippedByPrecondition { output: String },
+    /// The gate could not authorize the run. The body never started.
+    PreconditionFailed { output: String },
+}
+
+impl CronRunOutcome {
+    /// Constructor for the ordinary `(success, output)` shape.
+    fn executed(success: bool, output: String) -> Self {
+        Self::Executed { success, output }
+    }
+
+    /// `true` unless the run actually failed. A clean precondition skip counts
+    /// as a success: the gate did exactly what it was asked to do.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        match self {
+            Self::Executed { success, .. } => *success,
+            Self::SkippedByPrecondition { .. } => true,
+            Self::PreconditionFailed { .. } => false,
+        }
+    }
+
+    /// `true` when the job body ran; `false` when the gate short-circuited it.
+    #[must_use]
+    pub fn ran_body(&self) -> bool {
+        matches!(self, Self::Executed { .. })
+    }
+
+    #[must_use]
+    pub fn output(&self) -> &str {
+        match self {
+            Self::Executed { output, .. }
+            | Self::SkippedByPrecondition { output }
+            | Self::PreconditionFailed { output } => output,
+        }
+    }
+
+    /// Run-history status before delivery classification adjusts it.
+    #[must_use]
+    pub fn base_status(&self) -> &'static str {
+        match self {
+            Self::Executed { success: true, .. } => "ok",
+            Self::Executed { success: false, .. } => "error",
+            Self::SkippedByPrecondition { .. } => STATUS_SKIPPED_PRECONDITION,
+            Self::PreconditionFailed { .. } => STATUS_PRECONDITION_FAILED,
+        }
+    }
+
+    fn into_output(self) -> String {
+        match self {
+            Self::Executed { output, .. }
+            | Self::SkippedByPrecondition { output }
+            | Self::PreconditionFailed { output } => output,
+        }
+    }
+}
+
+/// One scheduled run as `process_due_jobs` reports it back to the poll loop.
+struct ScheduledRunReport {
+    job_id: String,
+    status: String,
+    success: bool,
+    output: String,
+}
+
 pub async fn deliver_and_classify_run_result(
     config: &Config,
     job: &CronJob,
-    mut success: bool,
-    mut output: String,
+    outcome: CronRunOutcome,
     context: CronDeliveryContext,
 ) -> CronDeliveryOutcome {
-    let mut status = if success { "ok" } else { "error" }.to_string();
+    let mut success = outcome.is_success();
+    let mut status = outcome.base_status().to_string();
+    let ran_body = outcome.ran_body();
+    let skipped_by_precondition = matches!(outcome, CronRunOutcome::SkippedByPrecondition { .. });
+    let mut output = outcome.into_output();
+
+    // A clean precondition skip means "nothing to do". Announcing it would put
+    // exactly the noise on the channel that the gate exists to avoid, so the
+    // skip is recorded in history and goes no further.
+    if skipped_by_precondition {
+        return CronDeliveryOutcome {
+            success,
+            status,
+            output,
+        };
+    }
 
     if let Err(e) = deliver_if_configured(config, job, &output).await {
         // Cron add-time accepts dangling delivery refs (the job's channel
@@ -177,7 +272,12 @@ pub async fn deliver_and_classify_run_result(
                     })),
                 context.failure_message(false)
             );
-            status = "error".to_string();
+            // A precondition failure keeps its own status: the delivery error
+            // is appended to the output, but the run's cause of death is the
+            // gate, not the job body.
+            if ran_body {
+                status = "error".to_string();
+            }
         }
 
         if output.trim().is_empty() {
@@ -224,10 +324,10 @@ async fn run_manual_job_inner(
     approved: bool,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
-    let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
+    let run = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
+    let outcome = deliver_and_classify_run_result(config, job, run, context).await;
 
     if let Err(e) = persist_manual_run_result(
         config,
@@ -298,6 +398,7 @@ pub async fn run(
             uses_memory: true,
             session_target: None,
             delivery: None,
+            pre_hook: None,
             shell_output_format: CronShellOutputFormat::default(),
         };
         ::zeroclaw_log::record!(
@@ -520,7 +621,7 @@ async fn skip_missed_jobs_on_startup(config: &Config) {
     );
 }
 
-pub async fn execute_job_now(config: &Config, job: &CronJob) -> (bool, String) {
+pub async fn execute_job_now(config: &Config, job: &CronJob) -> CronRunOutcome {
     execute_job_now_with_runtime(config, job, None, false).await
 }
 
@@ -529,12 +630,12 @@ async fn execute_job_now_with_runtime(
     job: &CronJob,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
-) -> (bool, String) {
+) -> CronRunOutcome {
     // Reject orphaned declarative jobs: a declarative row whose canonical
     // config declaration has been removed must not execute through any
     // path (automatic polling or manual trigger).
     if job.source == "declarative" && !super::store::is_valid_declarative_owner(config, &job.id) {
-        return (
+        return CronRunOutcome::executed(
             false,
             format!(
                 "cron job {id:?} is an orphaned declarative entry \
@@ -546,7 +647,7 @@ async fn execute_job_now_with_runtime(
     }
     use zeroclaw_log::Instrument;
     let Some(agent_alias) = resolve_owning_agent(config, job) else {
-        return (
+        return CronRunOutcome::executed(
             false,
             format!(
                 "cron job {id:?} has no owning agent; add the alias to an [agents.<x>].cron_jobs list",
@@ -557,7 +658,12 @@ async fn execute_job_now_with_runtime(
     let agent_alias = agent_alias.to_string();
     let security = match SecurityPolicy::for_agent(config, &agent_alias) {
         Ok(s) => s,
-        Err(e) => return (false, format!("agent {agent_alias} risk profile: {e}")),
+        Err(e) => {
+            return CronRunOutcome::executed(
+                false,
+                format!("agent {agent_alias} risk profile: {e}"),
+            );
+        }
     };
     let span = zeroclaw_log::attribution_span!(job);
     Box::pin(execute_job_with_retry(
@@ -601,16 +707,71 @@ async fn execute_job_with_retry(
     job: &CronJob,
     runtime: Option<&dyn RuntimeAdapter>,
     approved: bool,
-) -> (bool, String) {
-    let owned_runtime = if matches!(job.job_type, JobType::Shell) && runtime.is_none() {
+) -> CronRunOutcome {
+    // A gate is declared in config only, so it is resolved from config rather
+    // than from the cron row; agent jobs can carry one just as shell jobs can.
+    let pre_hook = precondition::declared_for(config, &job.source, &job.id);
+
+    let needs_runtime = matches!(job.job_type, JobType::Shell) || pre_hook.is_some();
+    let owned_runtime = if needs_runtime && runtime.is_none() {
         match crate::platform::create_runtime(&config.runtime) {
             Ok(runtime) => Some(runtime),
-            Err(error) => return (false, format!("shell setup error: {error}")),
+            Err(error) => {
+                let output = format!("shell setup error: {error}");
+                // With a gate declared, an unusable runtime means the gate was
+                // never evaluated — fail closed rather than run the body.
+                return if pre_hook.is_some() {
+                    CronRunOutcome::PreconditionFailed { output }
+                } else {
+                    CronRunOutcome::executed(false, output)
+                };
+            }
         }
     } else {
         None
     };
     let runtime = runtime.or(owned_runtime.as_deref());
+
+    // The gate runs once, inside the in-flight claim and before the retry
+    // loop. It is a deterministic local check, so retrying it would only ask
+    // the same question again.
+    if let Some(hook) = pre_hook {
+        let Some(runtime) = runtime else {
+            return CronRunOutcome::PreconditionFailed {
+                output: "pre_hook setup error: runtime missing for cron precondition".to_string(),
+            };
+        };
+        match precondition::evaluate(config, runtime, security, hook).await {
+            PreconditionOutcome::Proceed => {}
+            PreconditionOutcome::Skip { output } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "job_id": job.id,
+                            "agent_alias": agent_alias,
+                            "output": output
+                        })),
+                    "Cron job skipped by pre_hook precondition"
+                );
+                return CronRunOutcome::SkippedByPrecondition { output };
+            }
+            PreconditionOutcome::Failed { output } => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "job_id": job.id,
+                            "agent_alias": agent_alias,
+                            "output": output
+                        })),
+                    "Cron job pre_hook precondition failed"
+                );
+                return CronRunOutcome::PreconditionFailed { output };
+            }
+        }
+    }
 
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
@@ -620,7 +781,7 @@ async fn execute_job_with_retry(
         let (success, output) = match job.job_type {
             JobType::Shell => {
                 let Some(runtime) = runtime else {
-                    return (
+                    return CronRunOutcome::executed(
                         false,
                         "shell setup error: runtime missing for shell cron job".to_string(),
                     );
@@ -632,12 +793,12 @@ async fn execute_job_with_retry(
         last_output = output;
 
         if success {
-            return (true, last_output);
+            return CronRunOutcome::executed(true, last_output);
         }
 
         if last_output.starts_with("blocked by security policy:") {
             // Deterministic policy violations are not retryable.
-            return (false, last_output);
+            return CronRunOutcome::executed(false, last_output);
         }
 
         if attempt < retries {
@@ -647,7 +808,7 @@ async fn execute_job_with_retry(
         }
     }
 
-    (false, last_output)
+    CronRunOutcome::executed(false, last_output)
 }
 
 fn claim_due_jobs(config: &Config, jobs: Vec<CronJob>) -> Vec<CronJob> {
@@ -719,23 +880,30 @@ async fn process_due_jobs(
     }))
     .buffer_unordered(max_concurrent);
 
-    while let Some((job_id, success, output)) = in_flight.next().await {
-        if !success {
+    while let Some(report) = in_flight.next().await {
+        if !report.success {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"job_id": job_id, "output": output})),
+                    .with_attrs(::serde_json::json!({
+                        "job_id": report.job_id,
+                        "status": report.status,
+                        "output": report.output
+                    })),
                 "Scheduler job '' failed: "
             );
         }
-        // Broadcast cron result to dashboard/SSE clients.
+        // Broadcast cron result to dashboard/SSE clients. `status` carries the
+        // distinction a bare `success` flag cannot: a precondition skip is not
+        // a plain success and a precondition failure is not a plain error.
         if let Some(tx) = event_tx {
             let _ = tx.send(serde_json::json!({
                 "type": "cron_result",
-                "job_id": job_id,
-                "success": success,
-                "output": output,
+                "job_id": report.job_id,
+                "status": report.status,
+                "success": report.success,
+                "output": report.output,
                 "timestamp": chrono::Utc::now().to_rfc3339(),
             }));
         }
@@ -748,13 +916,13 @@ async fn execute_and_persist_job(
     agent_alias: &str,
     job: &CronJob,
     component: &str,
-) -> (String, bool, String) {
+) -> ScheduledRunReport {
     crate::health::mark_component_ok(component);
     warn_if_high_frequency_agent_job(job);
 
     let started_at = Utc::now();
     let span = zeroclaw_log::attribution_span!(job);
-    let (success, output) = Box::pin(execute_job_with_retry(
+    let run = Box::pin(execute_job_with_retry(
         config,
         security,
         agent_alias,
@@ -765,11 +933,10 @@ async fn execute_and_persist_job(
     .instrument(span)
     .await;
     let finished_at = Utc::now();
-    let success = Box::pin(persist_job_result(
+    let outcome = Box::pin(persist_job_result(
         config,
         job,
-        success,
-        &output,
+        run,
         started_at,
         finished_at,
     ))
@@ -789,7 +956,12 @@ async fn execute_and_persist_job(
         );
     }
 
-    (job.id.clone(), success, output)
+    ScheduledRunReport {
+        job_id: job.id.clone(),
+        status: outcome.status,
+        success: outcome.success,
+        output: outcome.output,
+    }
 }
 
 async fn run_agent_job(
@@ -929,22 +1101,19 @@ async fn run_agent_job(
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
-    success: bool,
-    output: &str,
+    run: CronRunOutcome,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
-) -> bool {
+) -> CronDeliveryOutcome {
     let duration_ms = (finished_at - started_at).num_milliseconds();
-    let outcome = deliver_and_classify_run_result(
-        config,
-        job,
-        success,
-        output.to_string(),
-        CronDeliveryContext::Scheduled,
-    )
-    .await;
+    let ran_body = run.ran_body();
+    let outcome =
+        deliver_and_classify_run_result(config, job, run, CronDeliveryContext::Scheduled).await;
 
-    let action = if is_one_shot_auto_delete(job) && outcome.success {
+    // Auto-delete is the reward for a one-shot that actually did its work. A
+    // one-shot whose gate skipped it never ran, so it is disabled instead —
+    // that keeps the skip visible in history rather than erasing the row.
+    let action = if is_one_shot_auto_delete(job) && ran_body && outcome.success {
         RunCompletionAction::Delete
     } else if matches!(job.schedule, Schedule::At { .. }) {
         RunCompletionAction::Disable
@@ -1015,7 +1184,7 @@ async fn persist_job_result(
         }
     }
 
-    outcome.success
+    outcome
 }
 
 fn is_one_shot_auto_delete(job: &CronJob) -> bool {
@@ -2128,7 +2297,7 @@ mod tests {
         .unwrap();
         let job = test_job("sh ./retry-once.sh");
 
-        let (success, output) = Box::pin(execute_job_with_retry(
+        let outcome = Box::pin(execute_job_with_retry(
             &config,
             &security,
             "test-agent",
@@ -2137,6 +2306,7 @@ mod tests {
             false,
         ))
         .await;
+        let (success, output) = (outcome.is_success(), outcome.output().to_string());
         assert!(success);
         assert!(output.contains("recovered"));
     }
@@ -2152,7 +2322,7 @@ mod tests {
 
         let job = test_job("ls always_missing_for_retry_test");
 
-        let (success, output) = Box::pin(execute_job_with_retry(
+        let outcome = Box::pin(execute_job_with_retry(
             &config,
             &security,
             "test-agent",
@@ -2161,6 +2331,7 @@ mod tests {
             false,
         ))
         .await;
+        let (success, output) = (outcome.is_success(), outcome.output().to_string());
         assert!(!success);
         assert!(output.contains("always_missing_for_retry_test"));
     }
@@ -2261,7 +2432,15 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -2279,7 +2458,15 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
 
         assert!(success);
         assert_eq!(
@@ -2301,7 +2488,15 @@ mod tests {
             let finished = started + ChronoDuration::milliseconds(10);
             let output = format!("run-{idx}");
 
-            let success = persist_job_result(&config, &job, true, &output, started, finished).await;
+            let success = persist_job_result(
+                &config,
+                &job,
+                CronRunOutcome::executed(true, output.clone()),
+                started,
+                finished,
+            )
+            .await
+            .success;
             assert!(success);
         }
 
@@ -2337,7 +2532,15 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
 
         assert!(success);
         assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
@@ -2371,7 +2574,15 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
@@ -2399,7 +2610,15 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(false, "boom".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -2429,7 +2648,15 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(false, "boom".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
 
         assert!(!success);
         assert_eq!(
@@ -2475,7 +2702,15 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -2512,7 +2747,15 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2533,7 +2776,15 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
@@ -2550,7 +2801,15 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(false, "boom".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -2589,7 +2848,15 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2617,7 +2884,15 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2653,8 +2928,7 @@ mod tests {
         let outcome = deliver_and_classify_run_result(
             &config,
             &job,
-            true,
-            String::new(),
+            CronRunOutcome::executed(true, String::new()),
             CronDeliveryContext::Scheduled,
         )
         .await;
@@ -2687,7 +2961,15 @@ mod tests {
 
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            CronRunOutcome::executed(true, "ok".into()),
+            started,
+            finished,
+        )
+        .await
+        .success;
         assert!(success);
 
         // After reschedule_after_run, At schedule jobs should be disabled
@@ -3107,5 +3389,328 @@ mod tests {
 
         process_due_jobs(&config, vec![job], &component, &event_tx).await;
         // If we got here without panic, the test passes.
+    }
+
+    // ── Precondition gate (`[cron.<alias>.pre_hook]`) ─────────────────
+
+    /// Marker the gate tests' job bodies echo. Its presence in the recorded
+    /// output is the evidence that the body actually ran.
+    const GATED_BODY_MARKER: &str = "gated-body-ran";
+
+    /// Declare a shell job with a gate in config, sync it, and return the row
+    /// the scheduler would pick up.
+    fn declarative_gated_job(
+        config: &mut Config,
+        id: &str,
+        pre_hook_command: &str,
+        timeout_secs: u64,
+    ) -> CronJob {
+        use zeroclaw_config::schema::{CronJobDecl, CronPreHookDecl, CronScheduleDecl};
+
+        config.cron.insert(
+            id.to_string(),
+            CronJobDecl {
+                job_type: "shell".into(),
+                schedule: CronScheduleDecl::Cron {
+                    expr: "*/5 * * * *".into(),
+                    tz: None,
+                },
+                command: Some(format!("echo {GATED_BODY_MARKER}")),
+                pre_hook: Some(CronPreHookDecl {
+                    command: pre_hook_command.into(),
+                    timeout_secs,
+                }),
+                ..CronJobDecl::default()
+            },
+        );
+        config
+            .agents
+            .get_mut(TEST_AGENT)
+            .expect("test agent exists")
+            .cron_jobs
+            .push(id.to_string());
+
+        let decls = config.cron.clone();
+        cron::sync_declarative_jobs(config, &decls).expect("declarative sync should succeed");
+        cron::get_job(config, id).expect("synced job should be readable")
+    }
+
+    /// Allow only what the gate tests use: `exit`/`sleep` for the hook and
+    /// `echo` for the body. Anything else the gate reaches for must be refused.
+    fn allow_gate_test_commands(config: &mut Config) {
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["exit".into(), "sleep".into(), "echo".into()];
+    }
+
+    /// Evidence that the gated job body ran, taken from what was recorded.
+    fn body_ran(result: &ManualCronRunResult) -> bool {
+        result.output.contains(GATED_BODY_MARKER)
+    }
+
+    #[tokio::test]
+    async fn pre_hook_exit_zero_runs_the_job_and_records_ok() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "gate-proceed", "exit 0", 30);
+
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+
+        assert!(
+            result.success,
+            "exit 0 should let the job run: {}",
+            result.output
+        );
+        assert_eq!(result.status, "ok");
+        assert!(body_ran(&result), "job body should have run");
+
+        let runs = cron::list_runs(&config, &job.id, 10).expect("run history should list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+    }
+
+    #[tokio::test]
+    async fn pre_hook_exit_ten_records_a_clean_skip_and_never_starts_the_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "gate-skip", "exit 10", 30);
+
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+
+        // A clean skip is not a failure.
+        assert!(
+            result.success,
+            "a precondition skip must not report failure"
+        );
+        assert_eq!(result.status, STATUS_SKIPPED_PRECONDITION);
+        assert!(result.output.contains("pre_hook requested skip (exit 10)"));
+        assert!(!body_ran(&result), "job body must not run after a skip");
+
+        // The skip is distinguishable in history, not folded into "ok".
+        let runs = cron::list_runs(&config, &job.id, 10).expect("run history should list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, STATUS_SKIPPED_PRECONDITION);
+
+        let updated = cron::get_job(&config, &job.id).expect("job state should update");
+        assert_eq!(
+            updated.last_status.as_deref(),
+            Some(STATUS_SKIPPED_PRECONDITION)
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_hook_other_nonzero_exit_records_a_precondition_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "gate-fail", "exit 3", 30);
+
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+
+        assert!(!result.success, "a failing gate is a failed run");
+        assert_eq!(result.status, STATUS_PRECONDITION_FAILED);
+        assert!(result.output.contains("pre_hook failed (exit 3)"));
+        assert!(
+            !body_ran(&result),
+            "job body must not run after a gate failure"
+        );
+
+        // Distinct from both "ok" and a plain "error" job failure.
+        let runs = cron::list_runs(&config, &job.id, 10).expect("run history should list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, STATUS_PRECONDITION_FAILED);
+    }
+
+    #[tokio::test]
+    #[cfg(not(target_os = "windows"))]
+    async fn pre_hook_timeout_records_a_precondition_failure() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        let job = declarative_gated_job(&mut config, "gate-timeout", "sleep 30", 1);
+
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+
+        assert!(!result.success, "a timed-out gate is a failed run");
+        assert_eq!(result.status, STATUS_PRECONDITION_FAILED);
+        assert!(
+            result.output.contains("pre_hook timed out after 1s"),
+            "unexpected output: {}",
+            result.output
+        );
+        assert!(
+            !body_ran(&result),
+            "job body must not run after a gate timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_hook_blocked_by_security_policy_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        allow_gate_test_commands(&mut config);
+        // `curl` is not in the allowlist: the gate is refused, and a refused
+        // gate must be a loud failure rather than a quiet skip.
+        let job = declarative_gated_job(
+            &mut config,
+            "gate-blocked",
+            "curl https://example.invalid",
+            30,
+        );
+
+        let result = run_manual_job(&config, &job, CronDeliveryContext::RpcManual, &None).await;
+
+        assert!(!result.success);
+        assert_eq!(result.status, STATUS_PRECONDITION_FAILED);
+        assert!(
+            result.output.contains("blocked by security policy"),
+            "unexpected output: {}",
+            result.output
+        );
+        assert!(
+            !body_ran(&result),
+            "job body must not run when the gate is refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_hook_in_config_does_not_gate_a_same_id_imperative_job() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.into())
+            .or_default()
+            .allowed_commands = vec!["echo".into(), "exit".into()];
+
+        // A declarative entry that would skip everything…
+        declarative_gated_job(&mut config, "shared-id", "exit 10", 30);
+
+        // …must not attach itself to an imperative job that shares its id.
+        // Imperative jobs have no gate: only config can declare one.
+        let mut job = test_job("echo imperative-body-ran");
+        job.id = "shared-id".into();
+        job.source = "imperative".into();
+
+        let outcome = execute_job_now(&config, &job).await;
+
+        assert!(outcome.ran_body(), "imperative job should not be gated");
+        assert!(outcome.is_success());
+        assert!(outcome.output().contains("imperative-body-ran"));
+    }
+
+    #[tokio::test]
+    async fn precondition_skip_is_recorded_but_never_announced() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        // announce mode with no channel: any delivery attempt fails loudly.
+        let mut job = test_job("echo unused");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: None,
+            to: None,
+            thread_id: None,
+            best_effort: false,
+        };
+
+        let skipped = deliver_and_classify_run_result(
+            &config,
+            &job,
+            CronRunOutcome::SkippedByPrecondition {
+                output: "pre_hook requested skip (exit 10)".into(),
+            },
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+
+        assert!(skipped.success);
+        assert_eq!(skipped.status, STATUS_SKIPPED_PRECONDITION);
+        assert!(
+            !skipped.output.contains("delivery failed"),
+            "a clean skip must not enter the delivery path: {}",
+            skipped.output
+        );
+
+        // Control: an executed run with the same delivery config does try to
+        // deliver, so the assertion above is testing the skip, not the config.
+        let executed = deliver_and_classify_run_result(
+            &config,
+            &job,
+            CronRunOutcome::Executed {
+                success: true,
+                output: "real output".into(),
+            },
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(executed.output.contains("delivery failed"));
+    }
+
+    #[tokio::test]
+    async fn precondition_failure_keeps_its_status_through_delivery_failure() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = test_job("echo unused");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: None,
+            to: None,
+            thread_id: None,
+            best_effort: false,
+        };
+
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            CronRunOutcome::PreconditionFailed {
+                output: "pre_hook failed (exit 3)".into(),
+            },
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+
+        assert!(!outcome.success);
+        // The delivery error is appended, but the cause of death stays the gate.
+        assert_eq!(outcome.status, STATUS_PRECONDITION_FAILED);
+        assert!(outcome.output.contains("delivery failed"));
+    }
+
+    #[test]
+    fn cron_run_outcome_maps_each_class_to_its_own_status() {
+        assert_eq!(
+            CronRunOutcome::executed(true, String::new()).base_status(),
+            "ok"
+        );
+        assert_eq!(
+            CronRunOutcome::executed(false, String::new()).base_status(),
+            "error"
+        );
+        assert_eq!(
+            CronRunOutcome::SkippedByPrecondition {
+                output: String::new()
+            }
+            .base_status(),
+            STATUS_SKIPPED_PRECONDITION
+        );
+        assert_eq!(
+            CronRunOutcome::PreconditionFailed {
+                output: String::new()
+            }
+            .base_status(),
+            STATUS_PRECONDITION_FAILED
+        );
+        // All four statuses are distinct, which is the whole point of the enum.
+        let statuses = [
+            CronRunOutcome::executed(true, String::new()).base_status(),
+            CronRunOutcome::executed(false, String::new()).base_status(),
+            STATUS_SKIPPED_PRECONDITION,
+            STATUS_PRECONDITION_FAILED,
+        ];
+        let unique: std::collections::HashSet<&str> = statuses.iter().copied().collect();
+        assert_eq!(unique.len(), statuses.len());
     }
 }

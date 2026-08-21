@@ -3,6 +3,7 @@ use anyhow::{Result, bail};
 use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
+mod precondition;
 mod schedule;
 mod store;
 mod types;
