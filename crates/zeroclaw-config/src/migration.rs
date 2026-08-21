@@ -2267,6 +2267,136 @@ vision_model_provider = "qwen"
     }
 
     #[test]
+    fn v2_legacy_qwen_oauth_variants_migrate_with_typed_auth_mode() {
+        // Legacy Qwen OAuth variant spellings (`qwen-code`, `qwen-oauth`,
+        // `qwen_oauth`) materialize an `auth_mode` extra. The V3 `AuthMode`
+        // enum serializes snake_case, so the emitted value must be `o_auth`:
+        // any other spelling fails config deserialization during migration
+        // itself (`unknown variant \`oauth\``, expected `api_key` or
+        // `o_auth`). Each spelling must therefore migrate successfully,
+        // carry the typed OAuth mode plus the credential on the migrated
+        // alias, and rewrite its own matching vision reference.
+        for raw_source in ["qwen-code", "qwen-oauth", "qwen_oauth"] {
+            let raw = format!(
+                r#"
+schema_version = 2
+
+[providers.models.{raw_source}]
+api_key = "test-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "{raw_source}"
+"#
+            );
+            let cfg = migrate_to_current(&raw)
+                .unwrap_or_else(|e| panic!("legacy variant {raw_source} must migrate: {e}"));
+            assert_eq!(
+                cfg.multimodal.vision_model_provider.as_deref(),
+                Some("qwen.default"),
+                "{raw_source} must not strand its own credential-bearing alias"
+            );
+            let typed = cfg
+                .providers
+                .models
+                .qwen
+                .get("default")
+                .expect("migrated entry must live at qwen.default");
+            assert_eq!(
+                typed.auth_mode,
+                Some(crate::schema::AuthMode::OAuth),
+                "{raw_source} must materialize the typed V3 OAuth mode"
+            );
+            assert_eq!(
+                typed.base.api_key.as_deref(),
+                Some("test-key"),
+                "the credential must survive migration"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_legacy_minimax_oauth_variants_migrate_with_typed_auth_mode() {
+        // Same contract as the Qwen OAuth variants, for the MiniMax OAuth
+        // spellings (`minimax-oauth`, `minimax-oauth-global`,
+        // `minimax-oauth-cn`): the emitted `auth_mode` must deserialize as
+        // the typed V3 `AuthMode::OAuth`, and each spelling's own vision
+        // reference must reach its migrated credential-bearing alias.
+        for raw_source in ["minimax-oauth", "minimax-oauth-global", "minimax-oauth-cn"] {
+            let raw = format!(
+                r#"
+schema_version = 2
+
+[providers.models.{raw_source}]
+api_key = "test-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "{raw_source}"
+"#
+            );
+            let cfg = migrate_to_current(&raw)
+                .unwrap_or_else(|e| panic!("legacy variant {raw_source} must migrate: {e}"));
+            assert_eq!(
+                cfg.multimodal.vision_model_provider.as_deref(),
+                Some("minimax.default"),
+                "{raw_source} must not strand its own credential-bearing alias"
+            );
+            let typed = cfg
+                .providers
+                .models
+                .minimax
+                .get("default")
+                .expect("migrated entry must live at minimax.default");
+            assert_eq!(
+                typed.auth_mode,
+                Some(crate::schema::AuthMode::OAuth),
+                "{raw_source} must materialize the typed V3 OAuth mode"
+            );
+            assert_eq!(
+                typed.base.api_key.as_deref(),
+                Some("test-key"),
+                "the credential must survive migration"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_bare_qwen_with_oauth_variant_producer_stays_fail_closed() {
+        // A bare `qwen` reference names only the canonical cn-endpoint
+        // identity; a `qwen-code` producer carries code-endpoint plus OAuth
+        // identity the reference did not name, so the reference must stay
+        // bare rather than adopt that variant's credentials.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen-code]
+api_key = "test-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "qwen"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen"),
+            "bare qwen must stay bare when the only producer is the qwen-code oauth variant"
+        );
+        let typed = cfg
+            .providers
+            .models
+            .qwen
+            .get("default")
+            .expect("qwen-code must materialize at qwen.default");
+        assert_eq!(
+            typed.auth_mode,
+            Some(crate::schema::AuthMode::OAuth),
+            "the variant alias itself must still migrate with typed OAuth mode"
+        );
+    }
+
+    #[test]
     fn v2_empty_global_extra_headers_with_second_family_keeps_single_owner() {
         // An empty `extra_headers = {}` is a semantic no-op and must not
         // claim alias ownership across multiple families. The existing

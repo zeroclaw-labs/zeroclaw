@@ -538,6 +538,11 @@ fn dot_delivery_channel(job: &mut toml::Table) {
     }
 }
 
+/// The one canonical serialized spelling of [`AuthMode::OAuth`] for materialized
+/// V3 alias fields (`#[serde(rename_all = "snake_case")]`). Variant extras must
+/// emit this exact value or migration output fails config deserialization.
+const AUTH_MODE_OAUTH: &str = "o_auth";
+
 fn normalize_provider_type(
     raw: &str,
     incoming_alias: &str,
@@ -678,7 +683,10 @@ fn normalize_provider_type(
     }
     if matches!(raw, "qwen-code" | "qwen-oauth" | "qwen_oauth") {
         extras.push(("endpoint", toml::Value::String("code".to_string())));
-        extras.push(("auth_mode", toml::Value::String("oauth".to_string())));
+        extras.push((
+            "auth_mode",
+            toml::Value::String(AUTH_MODE_OAUTH.to_string()),
+        ));
         return ("qwen".to_string(), incoming_alias.to_string(), extras);
     }
     if matches!(raw, "bailian" | "aliyun-bailian" | "aliyun") {
@@ -721,7 +729,10 @@ fn normalize_provider_type(
     }
     if matches!(raw, "minimax-oauth" | "minimax-oauth-global") {
         extras.push(("endpoint", toml::Value::String("intl".to_string())));
-        extras.push(("auth_mode", toml::Value::String("oauth".to_string())));
+        extras.push((
+            "auth_mode",
+            toml::Value::String(AUTH_MODE_OAUTH.to_string()),
+        ));
         return ("minimax".to_string(), incoming_alias.to_string(), extras);
     }
     if matches!(raw, "minimax-cn" | "minimaxi" | "minimax-portal-cn") {
@@ -730,7 +741,10 @@ fn normalize_provider_type(
     }
     if matches!(raw, "minimax-oauth-cn") {
         extras.push(("endpoint", toml::Value::String("cn".to_string())));
-        extras.push(("auth_mode", toml::Value::String("oauth".to_string())));
+        extras.push((
+            "auth_mode",
+            toml::Value::String(AUTH_MODE_OAUTH.to_string()),
+        ));
         return ("minimax".to_string(), incoming_alias.to_string(), extras);
     }
 
