@@ -255,20 +255,28 @@ impl MediaAttachment {
     /// bytes reachable some other way rather than emitting a marker that is
     /// guaranteed to be discarded.
     pub fn provider_loadable_image_mime(&self) -> Option<&'static str> {
-        let ext = self
-            .file_name
-            .rsplit_once('.')
-            .map(|(_, e)| e.to_ascii_lowercase())
-            .unwrap_or_default();
-
-        // Mirrors the loader's own precedence: a declared extension wins over
-        // the payload, so bytes that merely *look* loadable cannot rescue a
-        // file whose name commits it to a format the provider rejects.
-        let resolved =
-            image_mime_from_extension(&ext).or_else(|| image_mime_from_magic(&self.data));
-
-        resolved.filter(|mime| is_provider_image_mime(mime))
+        provider_loadable_image_mime_for(&self.file_name, &self.data)
     }
+}
+
+/// The provider-loadable image MIME for a `(file_name, bytes)` pair, or `None`
+/// when the loader would reject it. Free-standing so a channel can consult the
+/// same contract before it owns a `MediaAttachment`: Discord decides a marker's
+/// disposition from the borrowed download bytes, and duplicating the precedence
+/// here would let the two drift. `MediaAttachment::provider_loadable_image_mime`
+/// is the borrowing convenience over this.
+pub fn provider_loadable_image_mime_for(file_name: &str, data: &[u8]) -> Option<&'static str> {
+    let ext = file_name
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    // Mirrors the loader's own precedence: a declared extension wins over
+    // the payload, so bytes that merely *look* loadable cannot rescue a
+    // file whose name commits it to a format the provider rejects.
+    let resolved = image_mime_from_extension(&ext).or_else(|| image_mime_from_magic(data));
+
+    resolved.filter(|mime| is_provider_image_mime(mime))
 }
 
 /// Image MIME types the multimodal provider path accepts.
