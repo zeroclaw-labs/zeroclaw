@@ -84,6 +84,7 @@ use std::io::Write as _;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::TOOL_SPECS_OVERRIDE;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::ingress::{IngressContext, IngressDecision};
@@ -722,13 +723,27 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             .into());
         }
 
-        let mut iteration_tool_specs = build_iteration_tool_specs(
-            model_provider,
-            model,
-            tools_registry,
-            excluded_tools,
-            activated_tools,
-        )?;
+        // When TOOL_SPECS_OVERRIDE is Some, the turn is request-scoped
+        // (chat-completions `tools` parameter). On default paths the override
+        // is absent — the full agent tool set is available, and the
+        // per-iteration rebuild (including activated/deferred tools) runs
+        // normally. `from_override` is a frozen snapshot: it does not consult
+        // the activated-tool set or re-collect from the registry.
+        let mut iteration_tool_specs =
+            match TOOL_SPECS_OVERRIDE.try_with(Clone::clone).ok().flatten() {
+                Some(override_specs) => IterationToolSpecs::from_override(
+                    model_provider,
+                    &override_specs,
+                    excluded_tools,
+                ),
+                None => build_iteration_tool_specs(
+                    model_provider,
+                    model,
+                    tools_registry,
+                    excluded_tools,
+                    activated_tools,
+                )?,
+            };
 
         let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
             config,

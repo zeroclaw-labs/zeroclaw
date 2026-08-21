@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use zeroclaw_api::TOOL_SPECS_OVERRIDE;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::{
     AliasedAgentConfig, Config, DelegateExecutionMode, DelegateToolConfig, ModelProviderConfig,
@@ -47,6 +48,22 @@ where
     F: std::future::Future,
 {
     TOOL_LOOP_SESSION_KEY.scope(session_key, future).await
+}
+
+/// Re-scope the parent's request-level tool allow-set into a spawned child
+/// task. When the parent is serving a chat-completions request with `tools:
+/// [...]`, this keeps the delegate from rebuilding the full agent registry.
+async fn scope_delegate_tool_specs_override<F>(
+    override_specs: Option<Vec<zeroclaw_api::tool::ToolSpec>>,
+    future: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    match override_specs {
+        Some(specs) => TOOL_SPECS_OVERRIDE.scope(Some(specs), future).await,
+        None => future.await,
+    }
 }
 
 /// Serializable result of a background delegate task.
@@ -1653,10 +1670,12 @@ impl DelegateTool {
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_tool_specs_override = TOOL_SPECS_OVERRIDE.try_with(Clone::clone).ok().flatten();
         let __zc_delegate_alias = agent_name_owned.clone();
 
         zeroclaw_spawn::spawn!(
             scope_delegate_session_key(parent_session_key, async move {
+                scope_delegate_tool_specs_override(parent_tool_specs_override, async move {
                 let inner = DelegateTool {
                     agents,
                     security,
@@ -1766,6 +1785,8 @@ impl DelegateTool {
                 Self::background_task_cancels()
                     .lock()
                     .remove(&task_id_clone);
+                })
+                .await
             })
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(__zc_delegate_alias.as_str())
@@ -1872,6 +1893,7 @@ impl DelegateTool {
             .ok()
             .flatten();
         let parent_session_key = current_tool_loop_session_key();
+        let parent_tool_specs_override = TOOL_SPECS_OVERRIDE.try_with(Clone::clone).ok().flatten();
 
         // Spawn all agents concurrently
         let mut handles = Vec::with_capacity(agent_names.len());
@@ -1904,6 +1926,7 @@ impl DelegateTool {
             let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
+            let tool_specs_override = parent_tool_specs_override.clone();
             let memory = self.memory.clone();
             let __zc_delegate_alias = agent_name.clone();
 
@@ -1931,15 +1954,23 @@ impl DelegateTool {
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
-                    let result = scope_delegate_session_key(session_key, async move {
-                        crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
-                            .scope(receipt_scope, async move {
-                                Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone))
+                    let result =
+                        scope_delegate_tool_specs_override(tool_specs_override, async move {
+                            scope_delegate_session_key(session_key, async move {
+                                crate::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT
+                                    .scope(receipt_scope, async move {
+                                        Box::pin(inner.execute_sync(
+                                            &agent_name,
+                                            &prompt,
+                                            &args_clone,
+                                        ))
+                                        .await
+                                    })
                                     .await
                             })
                             .await
-                    })
-                    .await;
+                        })
+                        .await;
                     (agent_name_for_return, result)
                 }
                 .instrument(::zeroclaw_log::attribution_span!(

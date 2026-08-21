@@ -6945,6 +6945,18 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
+    /// Expose the OpenAI-compatible `POST /v1/chat/completions` endpoint.
+    /// Disabled by default: this surface runs authenticated agent turns, so it
+    /// stays opt-in until an operator explicitly enables it. (default: false)
+    #[serde(default)]
+    pub chat_completions_enabled: bool,
+
+    /// Max `/v1/chat/completions` requests per minute per client key.
+    /// 0 disables chat rate limiting (matching pair/webhook's `0` semantics).
+    /// (default: 60)
+    #[serde(default = "default_chat_rate_limit")]
+    pub chat_rate_limit_per_minute: u32,
+
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
     #[serde(default)]
@@ -7057,6 +7069,10 @@ fn default_webhook_rate_limit() -> u32 {
     60
 }
 
+fn default_chat_rate_limit() -> u32 {
+    60
+}
+
 fn default_idempotency_ttl_secs() -> u64 {
     300
 }
@@ -7096,6 +7112,8 @@ impl Default for GatewayConfig {
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            chat_completions_enabled: false,
+            chat_rate_limit_per_minute: default_chat_rate_limit(),
             trust_forwarded_headers: false,
             path_prefix: None,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
@@ -29780,6 +29798,8 @@ allowed_numbers = ["+1", "+2"]
         );
         assert_eq!(g.pair_rate_limit_per_minute, 10);
         assert_eq!(g.webhook_rate_limit_per_minute, 60);
+        assert!(!g.chat_completions_enabled, "chat completions stays opt-in");
+        assert_eq!(g.chat_rate_limit_per_minute, 60);
         assert!(!g.trust_forwarded_headers);
         assert_eq!(g.rate_limit_max_keys, 10_000);
         assert_eq!(g.idempotency_ttl_secs, 300);
@@ -29812,6 +29832,8 @@ allowed_numbers = ["+1", "+2"]
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
+            chat_completions_enabled: true,
+            chat_rate_limit_per_minute: 120,
             trust_forwarded_headers: true,
             path_prefix: Some("/zeroclaw".into()),
             rate_limit_max_keys: 2048,
@@ -29837,6 +29859,8 @@ allowed_numbers = ["+1", "+2"]
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
+        assert!(parsed.chat_completions_enabled);
+        assert_eq!(parsed.chat_rate_limit_per_minute, 120);
         assert!(parsed.trust_forwarded_headers);
         assert_eq!(parsed.path_prefix.as_deref(), Some("/zeroclaw"));
         assert_eq!(parsed.rate_limit_max_keys, 2048);

@@ -1,7 +1,7 @@
 //! SQLite-backed session persistence with FTS5 search.
 
 use crate::session_backend::{
-    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+    ClaimOutcome, SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
 };
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Duration, Utc};
@@ -1378,6 +1378,50 @@ impl SessionBackend for SqliteSessionBackend {
         Ok(())
     }
 
+    /// Atomic claim via a guarded upsert: insert-or-update the alias only
+    /// while the incumbent is NULL. One row changed means the caller now owns
+    /// the session (fresh insert or NULL alias claimed); zero rows means an
+    /// owner exists, so re-read the winner to report it.
+    fn claim_session_agent_alias(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+    ) -> std::io::Result<ClaimOutcome> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        let affected = conn
+            .execute(
+                "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
+                 VALUES (?1, ?2, ?3, 0, ?4)
+                 ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias
+                     WHERE session_metadata.agent_alias IS NULL",
+                params![session_key, now, now, agent_alias],
+            )
+            .map_err(std::io::Error::other)?;
+        if affected > 0 {
+            // Fresh row, or an existing row whose alias was NULL is now
+            // claimed by `agent_alias`.
+            return Ok(ClaimOutcome::Claimed);
+        }
+        // affected == 0: a non-NULL owner exists. Re-read the winner and
+        // report it; equal owner is still a successful re-entry.
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT agent_alias FROM session_metadata WHERE session_key = ?1",
+                params![session_key],
+                |row| row.get(0),
+            )
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(std::io::Error::other(other)),
+            })?;
+        if existing.as_deref() == Some(agent_alias) {
+            Ok(ClaimOutcome::Claimed)
+        } else {
+            Ok(ClaimOutcome::Conflict(existing.unwrap_or_default()))
+        }
+    }
+
     fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
         let conn = self.conn.lock();
         conn.query_row(
@@ -2726,6 +2770,40 @@ mod tests {
 
         let alias = backend.get_session_agent_alias("s1").unwrap();
         assert_eq!(alias.as_deref(), Some("scout"));
+    }
+
+    #[test]
+    fn claim_session_agent_alias_is_atomic_and_sticky() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
+        // Unowned non-empty session: the first caller claims it and the
+        // owner is stamped (ownership contract — not a 400 gap).
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        assert_eq!(
+            backend.claim_session_agent_alias("s1", "scout").unwrap(),
+            ClaimOutcome::Claimed
+        );
+        assert_eq!(
+            backend.get_session_agent_alias("s1").unwrap().as_deref(),
+            Some("scout")
+        );
+
+        // Same-owner re-entry: still Claimed, owner unchanged.
+        assert_eq!(
+            backend.claim_session_agent_alias("s1", "scout").unwrap(),
+            ClaimOutcome::Claimed
+        );
+
+        // Different owner: Conflict(existing); the incumbent is preserved.
+        assert_eq!(
+            backend.claim_session_agent_alias("s1", "other").unwrap(),
+            ClaimOutcome::Conflict("scout".to_string())
+        );
+        assert_eq!(
+            backend.get_session_agent_alias("s1").unwrap().as_deref(),
+            Some("scout")
+        );
     }
 
     #[test]

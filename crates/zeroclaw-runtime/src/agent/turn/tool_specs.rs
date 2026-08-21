@@ -24,6 +24,36 @@ impl IterationToolSpecs {
             .native_tool_calling
             && !self.tool_specs.is_empty();
     }
+
+    /// Construct iteration tool specs from a per-request override, bypassing
+    /// the normal `tools_registry` → `tool.spec()` rebuild.
+    ///
+    /// Applies `excluded_tools` filtering to honour security policy — tools
+    /// excluded by policy are removed even if present in the override.
+    /// Unlike `build_iteration_tool_specs`, this is a snapshot frozen at
+    /// request time (the chat-completions `tools` allow-list), so tools
+    /// activated later in the turn are intentionally not surfaced.
+    pub(crate) fn from_override(
+        model_provider: &dyn ModelProvider,
+        override_specs: &[ToolSpec],
+        excluded_tools: &[String],
+    ) -> Self {
+        let tool_specs: Vec<ToolSpec> = override_specs
+            .iter()
+            .filter(|s| !excluded_tools.iter().any(|ex| ex == &s.name))
+            .cloned()
+            .collect();
+        let known_tool_names: HashSet<String> = tool_specs
+            .iter()
+            .map(|s| s.name.to_ascii_lowercase())
+            .collect();
+        let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
+        IterationToolSpecs {
+            tool_specs,
+            known_tool_names,
+            use_native_tools,
+        }
+    }
 }
 
 pub(crate) fn build_iteration_tool_specs(
@@ -257,5 +287,46 @@ mod tests {
             !specs.use_native_tools,
             "active provider must decide whether this turn uses native tool transport"
         );
+    }
+
+    #[test]
+    fn from_override_filters_excluded_and_flags_native_mode() {
+        use super::IterationToolSpecs;
+        use crate::tools::ToolSpec;
+
+        let specs = vec![
+            ToolSpec::new(
+                "alpha",
+                "Alpha does A",
+                serde_json::json!({"type": "object"}),
+            ),
+            ToolSpec::new("beta", "Beta does B", serde_json::json!({"type": "object"})),
+            ToolSpec::new(
+                "secret_tool",
+                "Policy-excluded",
+                serde_json::json!({"type": "object"}),
+            ),
+        ];
+        let excluded = vec!["secret_tool".to_string()];
+
+        // A chat-completions allow-list must never re-expose a tool the
+        // security policy excluded, even if the client names it explicitly.
+        let iter = IterationToolSpecs::from_override(&NativeToolsProvider, &specs, &excluded);
+        assert_eq!(iter.tool_specs.len(), 2);
+        assert!(iter.known_tool_names.contains("alpha"));
+        assert!(iter.known_tool_names.contains("beta"));
+        assert!(!iter.known_tool_names.contains("secret_tool"));
+        assert!(iter.use_native_tools);
+
+        // Prompt-transport providers never advertise native tools even with a
+        // non-empty override.
+        let iter = IterationToolSpecs::from_override(&PromptToolsProvider, &specs, &[]);
+        assert!(!iter.use_native_tools);
+        assert_eq!(iter.tool_specs.len(), 3);
+
+        // Empty override (tool_choice "none") disables native tool transport.
+        let iter = IterationToolSpecs::from_override(&NativeToolsProvider, &[], &[]);
+        assert!(iter.tool_specs.is_empty());
+        assert!(!iter.use_native_tools);
     }
 }

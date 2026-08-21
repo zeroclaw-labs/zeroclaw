@@ -1,10 +1,13 @@
 //! Runtime-generated OpenAPI 3.1 document for the new `/api/config/*` surface.
 
 use axum::{
+    extract::State,
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use std::sync::OnceLock;
+
+use crate::AppState;
 
 /// Route-specific CSP for the Scalar explorer page. The finalized router is
 /// wrapped by the default security-header layer, whose `set_if_absent` keeps a
@@ -26,7 +29,8 @@ const DOCS_CSP: &str = "default-src 'self'; \
 #[cfg(feature = "schema-export")]
 use schemars::{JsonSchema, schema_for};
 
-static CACHED: OnceLock<serde_json::Value> = OnceLock::new();
+static CACHED_ENABLED: OnceLock<serde_json::Value> = OnceLock::new();
+static CACHED_DISABLED: OnceLock<serde_json::Value> = OnceLock::new();
 
 pub async fn handle_docs() -> Response {
     let html = include_str!("openapi_docs.html");
@@ -43,10 +47,17 @@ pub async fn handle_docs() -> Response {
 }
 
 /// `GET /api/openapi.json` — returns the OpenAPI 3.1 document for the gateway
-/// surface that is documented today (`/api/config/*`). Static per build;
-/// browsers and the eventual Scalar explorer consume this as their data source.
-pub async fn handle_openapi_json() -> Response {
-    let body = CACHED.get_or_init(build_spec).clone();
+/// surface that is documented today (`/api/config/*`). The chat-completions
+/// contract is included only while `gateway.chat_completions_enabled` is set,
+/// so the document never advertises an endpoint that would 405.
+/// Cached per enabled-state; refreshing the runtime flag requires a restart.
+pub async fn handle_openapi_json(State(state): State<AppState>) -> Response {
+    let enabled = state.config.read().gateway.chat_completions_enabled;
+    let body = if enabled {
+        CACHED_ENABLED.get_or_init(|| build_spec(true)).clone()
+    } else {
+        CACHED_DISABLED.get_or_init(|| build_spec(false)).clone()
+    };
     let mut response = (StatusCode::OK, axum::Json(body)).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -56,7 +67,10 @@ pub async fn handle_openapi_json() -> Response {
 }
 
 #[cfg(feature = "schema-export")]
-pub fn build_spec() -> serde_json::Value {
+pub fn build_spec(chat_completions_enabled: bool) -> serde_json::Value {
+    use crate::api_chat_completions::{
+        ChatCompletionRequest, ChatCompletionResponse, ErrorResponse,
+    };
     use crate::api_config::{
         DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
         PatchResponse, PropPutBody, PropResponse, ReloadStatusResponse, SecretResponse,
@@ -408,8 +422,68 @@ pub fn build_spec() -> serde_json::Value {
         schema_value::<crate::a2a::JsonRpcRequest>(),
         schema_value::<crate::a2a::OutTask>(),
     );
+    if chat_completions_enabled {
+        augment_spec_with_chat_completions(
+            &mut spec,
+            schema_value::<ChatCompletionRequest>(),
+            schema_value::<ChatCompletionResponse>(),
+            schema_value::<ErrorResponse>(),
+        );
+    }
     flatten_defs_into_components(&mut spec);
     spec
+}
+
+/// Add the `/v1/chat/completions` endpoint and its request/response schemas to
+/// the spec. Gated on `feature = "schema-export"` (wire types derive
+/// `JsonSchema` only there). Called only while the endpoint is enabled so the
+/// document does not advertise a route that currently 405s.
+#[cfg(feature = "schema-export")]
+fn augment_spec_with_chat_completions(
+    spec: &mut serde_json::Value,
+    request_schema: serde_json::Value,
+    response_schema: serde_json::Value,
+    error_schema: serde_json::Value,
+) {
+    if let Some(schemas) = spec
+        .pointer_mut("/components/schemas")
+        .and_then(|v| v.as_object_mut())
+    {
+        schemas.insert("ChatRequest".to_string(), request_schema);
+        schemas.insert("ChatResponse".to_string(), response_schema);
+        schemas.insert("ChatError".to_string(), error_schema);
+    }
+    if let Some(paths) = spec.pointer_mut("/paths").and_then(|v| v.as_object_mut()) {
+        paths.insert(
+            "/v1/chat/completions".to_string(),
+            serde_json::json!({
+                "post": {
+                    "tags": ["chat"],
+                    "summary": "Send a chat-completions request",
+                    "description": "OpenAI-compatible chat completions adapter. The request routes to an agent by model name (or the default agent); `tools` contributes a name-only allow-list resolved against the agent's authoritative tool specs, and `tool_choice` supports only \"auto\"/\"none\". Errors follow the OpenAI `{ \"error\": { ... } }` envelope.",
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/ChatRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Chat completion. With `stream: true` this is a server-sent event stream ending in `data: [DONE]`.",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatResponse" } } }
+                        },
+                        "400": { "description": "Invalid request (unknown tool, unsupported param, empty messages, bad `tool_choice` shape).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ChatError" } } } },
+                        "401": { "description": "Missing or invalid pairing bearer token." },
+                        "408": { "description": "Turn deadline exceeded while the session was queued or running." },
+                        "409": { "description": "Session key is owned by an active connection." },
+                        "413": { "description": "Request body exceeds the gateway body-size limit." },
+                        "429": { "description": "Chat rate limit exceeded (see `x-ratelimit-*` response headers)." },
+                        "500": { "description": "Internal error." }
+                    }
+                }
+            }),
+        );
+    }
 }
 
 /// Add the A2A task endpoint and its request/response schemas to the spec.
@@ -549,8 +623,8 @@ fn strip_defs(value: &mut serde_json::Value) {
 }
 
 #[cfg(not(feature = "schema-export"))]
-pub fn build_spec() -> serde_json::Value {
-    serde_json::json!({
+pub fn build_spec(chat_completions_enabled: bool) -> serde_json::Value {
+    let mut spec = serde_json::json!({
         "openapi": "3.1.0",
         "info": {
             "title": "ZeroClaw Gateway",
@@ -558,7 +632,28 @@ pub fn build_spec() -> serde_json::Value {
             "description": "OpenAPI generation requires the `schema-export` feature; this build was compiled without it.",
         },
         "paths": {},
-    })
+    });
+    if chat_completions_enabled {
+        if let Some(paths) = spec.pointer_mut("/paths").and_then(|v| v.as_object_mut()) {
+            paths.insert(
+                "/v1/chat/completions".to_string(),
+                serde_json::json!({
+                    "post": {
+                        "tags": ["chat"],
+                        "summary": "Send a chat-completions request",
+                        "description": "OpenAI-compatible chat completions adapter (contract requires the `schema-export` feature; schemas omitted in this build).",
+                        "responses": {
+                            "200": { "description": "Chat completion (or SSE stream with `stream: true`)." },
+                            "400": { "description": "Invalid request." },
+                            "401": { "description": "Missing or invalid pairing bearer token." },
+                            "429": { "description": "Chat rate limit exceeded." }
+                        }
+                    }
+                }),
+            );
+        }
+    }
+    spec
 }
 
 #[cfg(test)]
@@ -568,7 +663,7 @@ mod tests {
     #[cfg(feature = "schema-export")]
     #[test]
     fn spec_has_expected_paths() {
-        let spec = build_spec();
+        let spec = build_spec(false);
         let paths = spec.get("paths").unwrap();
         assert!(paths.get("/api/config/prop").is_some());
         assert!(paths.get("/api/config/list").is_some());
@@ -588,7 +683,7 @@ mod tests {
     #[cfg(feature = "schema-export")]
     #[test]
     fn spec_registers_version_schemas() {
-        let spec = build_spec();
+        let spec = build_spec(false);
         let schemas = spec.pointer("/components/schemas").unwrap();
         assert!(schemas.get("VersionCheckResponse").is_some());
         assert!(schemas.get("UpgradeRequest").is_some());
@@ -606,7 +701,7 @@ mod tests {
     #[cfg(feature = "schema-export")]
     #[test]
     fn config_api_schemas_keep_operator_descriptions() {
-        let spec = build_spec();
+        let spec = build_spec(false);
         let cases = [
             ("/components/schemas/PatchOp/description", "JSON Patch"),
             (
@@ -642,7 +737,7 @@ mod tests {
     #[cfg(all(feature = "schema-export", feature = "a2a"))]
     #[test]
     fn spec_registers_a2a_task_schemas() {
-        let spec = build_spec();
+        let spec = build_spec(false);
         let schemas = spec.pointer("/components/schemas").unwrap();
         assert!(schemas.get("A2aTaskRequest").is_some());
         assert!(schemas.get("A2aTask").is_some());
@@ -651,11 +746,44 @@ mod tests {
     #[cfg(feature = "schema-export")]
     #[test]
     fn spec_declares_bearer_auth() {
-        let spec = build_spec();
+        let spec = build_spec(false);
         let scheme = spec
             .pointer("/components/securitySchemes/bearerAuth/scheme")
             .and_then(|v| v.as_str());
         assert_eq!(scheme, Some("bearer"));
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn chat_completions_contract_present_when_enabled() {
+        let spec = build_spec(true);
+        let paths = spec.get("paths").unwrap();
+        let post = paths
+            .get("/v1/chat/completions")
+            .and_then(|p| p.get("post"))
+            .expect("enabled spec must declare POST /v1/chat/completions");
+        assert!(post.get("requestBody").is_some());
+        assert!(post.get("responses").is_some());
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        assert!(schemas.get("ChatRequest").is_some());
+        assert!(schemas.get("ChatResponse").is_some());
+        assert!(schemas.get("ChatError").is_some());
+        // Request/response schemas come from the wire types themselves.
+        let req = schemas.get("ChatRequest").unwrap();
+        assert!(req.get("properties").is_some());
+    }
+
+    #[cfg(feature = "schema-export")]
+    #[test]
+    fn chat_completions_contract_absent_when_disabled() {
+        let spec = build_spec(false);
+        assert!(
+            spec.pointer("/paths//v1/chat/completions").is_none(),
+            "disabled spec must not advertise a route that 405s"
+        );
+        let schemas = spec.pointer("/components/schemas").unwrap();
+        assert!(schemas.get("ChatRequest").is_none());
+        assert!(schemas.get("ChatError").is_none());
     }
 
     #[tokio::test]
@@ -695,7 +823,7 @@ mod tests {
     #[cfg(all(feature = "schema-export", feature = "a2a"))]
     #[test]
     fn a2a_task_operation_requires_bearer_auth() {
-        let spec = build_spec();
+        let spec = build_spec(false);
         // No per-operation security override: the endpoint inherits the
         // global `bearerAuth` requirement. A tool-enabled agent turn is never
         // served unauthenticated.

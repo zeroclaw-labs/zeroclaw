@@ -38,4 +38,12 @@ tokio::task_local! {
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
     pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;
+
+    /// Request-level tool allow-set override (name → authoritative spec).
+    /// Scoped by the agent turn loop and explicitly re-scoped into delegate
+    /// spawns (task-locals do not cross `tokio::spawn`). Read by the turn
+    /// engine when assembling native tool specs for a request that carried a
+    /// `tools` allow-list. `Some(Vec::new())` disables all tools
+    /// (`tool_choice: "none"`); `None` leaves the full agent tool set intact.
+    pub static TOOL_SPECS_OVERRIDE: Option<Vec<crate::tool::ToolSpec>>;
 }

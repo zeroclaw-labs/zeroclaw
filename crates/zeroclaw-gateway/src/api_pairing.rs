@@ -909,7 +909,7 @@ mod tests {
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
         state.trust_forwarded_headers = true;
-        state.rate_limiter = Arc::new(GatewayRateLimiter::new(1, 100, 100));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(1, 100, 100, 100));
         let peer: SocketAddr = "10.0.0.2:55555".parse().unwrap();
 
         for forwarded in ["198.51.100.10", "198.51.100.11"] {
@@ -957,7 +957,7 @@ mod tests {
     async fn submit_pairing_enhanced_enforces_pair_request_limiter_threshold() {
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
-        state.rate_limiter = Arc::new(GatewayRateLimiter::new(2, 100, 100));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(2, 100, 100, 100));
         let peer: SocketAddr = "203.0.113.20:55555".parse().unwrap();
 
         for attempt in 0..2 {
@@ -997,7 +997,7 @@ mod tests {
     async fn submit_pairing_enhanced_enforces_shared_auth_limiter_threshold() {
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
-        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100, 100));
         state.auth_limiter = Arc::new(AuthRateLimiter::new());
         let peer: SocketAddr = "203.0.113.30:55555".parse().unwrap();
         let client_id = peer.ip().to_string();
@@ -1038,7 +1038,7 @@ mod tests {
         // limiter the handler fed.
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
-        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100, 100));
         state.auth_limiter = Arc::new(AuthRateLimiter::new());
         let peer: SocketAddr = "203.0.113.40:55555".parse().unwrap();
         let client_id = peer.ip().to_string();
@@ -1142,7 +1142,7 @@ mod tests {
         // lockout. After five wrong attempts the sixth is locked out (429).
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
-        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100, 100));
         state.auth_limiter = Arc::new(AuthRateLimiter::new());
         state.trust_forwarded_headers = false;
 
@@ -1168,7 +1168,7 @@ mod tests {
         // and A's sixth request is the one that is locked out.
         let mut state = test_state(Config::default());
         state.pairing = Arc::new(PairingGuard::new(true, &[]));
-        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100));
+        state.rate_limiter = Arc::new(GatewayRateLimiter::new(100, 100, 100, 100));
         state.auth_limiter = Arc::new(AuthRateLimiter::new());
         state.trust_forwarded_headers = true;
 

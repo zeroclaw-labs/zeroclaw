@@ -1394,7 +1394,7 @@ mod tests {
                 &[],
             )),
             trust_forwarded_headers: false,
-            rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100)),
+            rate_limiter: std::sync::Arc::new(crate::GatewayRateLimiter::new(100, 100, 100, 100)),
             auth_limiter: std::sync::Arc::new(crate::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: std::sync::Arc::new(crate::IdempotencyStore::new(
                 std::time::Duration::from_secs(300),
@@ -1436,6 +1436,9 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            ws_connections: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

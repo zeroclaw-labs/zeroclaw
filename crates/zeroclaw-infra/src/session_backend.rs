@@ -65,6 +65,23 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Outcome of an atomic ownership claim
+/// ([`SessionBackend::claim_session_agent_alias`]).
+///
+/// Ownership contract: a claim either succeeds — the caller is now (or
+/// already was) the owning agent — or reports the incumbent owner so the
+/// caller can reject the handoff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimOutcome {
+    /// No owner was recorded (and the requesting alias is now stamped), or
+    /// the recorded owner already equals the requesting alias. The session
+    /// belongs to the requesting agent.
+    Claimed,
+    /// The session is owned by a different agent, returned verbatim for
+    /// fail-closed rejection.
+    Conflict(String),
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
@@ -192,6 +209,27 @@ pub trait SessionBackend: Send + Sync {
     /// Get the agent alias associated with a session, if recorded.
     fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Ok(None)
+    }
+
+    /// Atomically claim ownership of a session for `agent_alias`.
+    ///
+    /// Ownership contract (supersedes the TOCTOU-prone two-phase
+    /// `set`/`get`): no recorded owner → write it and return `Claimed`;
+    /// recorded owner equal to `agent_alias` → `Claimed`; recorded owner
+    /// different → `Conflict(existing)`.
+    ///
+    /// Backends that cannot guarantee atomicity return `Err(Unsupported)`;
+    /// callers must fail closed on that variant — a non-empty session is
+    /// refused, a fresh empty session passes.
+    fn claim_session_agent_alias(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+    ) -> std::io::Result<ClaimOutcome> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "session backend does not support atomic ownership claim",
+        ))
     }
 
     fn set_session_context(
