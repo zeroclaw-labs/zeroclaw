@@ -5,9 +5,13 @@ use std::sync::{Arc, Mutex};
 use super::audit::SopAuditLogger;
 use super::engine::{SopEngine, now_iso8601};
 use super::types::{
-    SopAdmission, SopEvent, SopExecutionMode, SopRun, SopRunAction, SopTriggerSource,
+    SopAdmission, SopEvent, SopExecutionMode, SopRun, SopRunAction, SopRunStatus, SopTriggerSource,
 };
 use crate::security::{ContentSafety, ScanOutcome, ScreenVerdict};
+
+/// Public request bound for semantic work-item identifiers. Git message IDs are
+/// short; the cap prevents an API caller from retaining unbounded key material.
+pub const MAX_ACTIVE_DEDUP_KEY_BYTES: usize = 512;
 
 // ── Dispatch result ─────────────────────────────────────────────
 
@@ -108,6 +112,36 @@ impl<'a> SopIngress<'a> {
         target_sop: Option<&str>,
         dedup: Option<(String, bool)>,
     ) -> SopIngressOutcome {
+        self.dispatch_with_keys(source, topic, payload, target_sop, dedup, None)
+            .await
+    }
+
+    /// Lift a fresh delivery with a semantic key shared across independent
+    /// producers. If another producer already started the same SOP under this
+    /// key and that run is still active, dispatch coalesces into it. This is
+    /// intentionally distinct from AMQP redelivery idempotency: both callers
+    /// are fresh and neither should mark the key ambiguous.
+    pub async fn dispatch_deduplicated(
+        &self,
+        source: SopTriggerSource,
+        topic: Option<&str>,
+        payload: Option<&str>,
+        target_sop: Option<&str>,
+        dedup_key: String,
+    ) -> SopIngressOutcome {
+        self.dispatch_with_keys(source, topic, payload, target_sop, None, Some(dedup_key))
+            .await
+    }
+
+    async fn dispatch_with_keys(
+        &self,
+        source: SopTriggerSource,
+        topic: Option<&str>,
+        payload: Option<&str>,
+        target_sop: Option<&str>,
+        delivery_dedup: Option<(String, bool)>,
+        active_dedup: Option<String>,
+    ) -> SopIngressOutcome {
         let Some(engine) = self.engine else {
             let reason = if self.audit.is_some() {
                 SopIngressUnavailable::MissingEngine
@@ -151,7 +185,8 @@ impl<'a> SopIngress<'a> {
                     topic,
                     payload,
                     target_sop,
-                    dedup,
+                    delivery_dedup,
+                    active_dedup,
                     max_bytes,
                 },
             )
@@ -391,15 +426,53 @@ fn coalesce_confirmed_redelivery(
     }
 }
 
+/// Coalesce two fresh producers that name the same semantic work item while
+/// its run is active. Unlike AMQP message-id handling, key reuse is expected:
+/// the Git channel and reconciliation sweep deliberately compute the same key.
+fn coalesce_active_duplicate(
+    eng: &SopEngine,
+    sop_name: &str,
+    dedup_key: Option<&str>,
+) -> Option<DispatchResult> {
+    let key = dedup_key?;
+    let existing_run_id = eng.active_dispatch_dedup_lookup(sop_name, key)?;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+            ::serde_json::json!({
+                "sop_name": sop_name,
+                "dedup_key": key,
+                "run_id": existing_run_id.as_str(),
+                "existing_run_id": existing_run_id,
+            })
+        ),
+        &format!(
+            "SOP dispatch: coalesced duplicate '{sop_name}' into active run \
+             {existing_run_id} (shared producer key)"
+        )
+    );
+    Some(DispatchResult::Coalesced {
+        sop_name: sop_name.to_string(),
+        existing_run_id,
+    })
+}
+
 /// Remember a successfully started run for later confirmed-redelivery coalescing.
 fn remember_dispatch_start(
     eng: &mut SopEngine,
     sop_name: &str,
-    dedup: Option<(&str, bool)>,
+    delivery_dedup: Option<(&str, bool)>,
+    active_dedup: Option<&str>,
     result: &DispatchResult,
 ) {
-    if let (Some((key, _)), DispatchResult::Started { run_id, .. }) = (dedup, result) {
+    let DispatchResult::Started { run_id, .. } = result else {
+        return;
+    };
+    if let Some((key, _)) = delivery_dedup {
         eng.record_dispatch_dedup(sop_name, key, run_id);
+    }
+    if let Some(key) = active_dedup {
+        eng.record_active_dispatch_dedup(sop_name, key, run_id);
     }
 }
 
@@ -410,7 +483,7 @@ pub async fn dispatch_sop_event(
     audit: &SopAuditLogger,
     event: SopEvent,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, None, None).await
+    dispatch_sop_event_filtered(engine, audit, event, None, None, None).await
 }
 
 /// Dispatch an incoming event to one named SOP, after normal trigger matching.
@@ -422,7 +495,27 @@ pub async fn dispatch_sop_event_to(
     event: SopEvent,
     target_sop: &str,
 ) -> Vec<DispatchResult> {
-    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop), None).await
+    dispatch_sop_event_filtered(engine, audit, event, Some(target_sop), None, None).await
+}
+
+/// Dispatch to one named SOP with an active-run key shared by independent
+/// producers (for example Git-channel polling and a reconciliation sweep).
+pub async fn dispatch_sop_event_to_deduplicated(
+    engine: &Arc<Mutex<SopEngine>>,
+    audit: &SopAuditLogger,
+    event: SopEvent,
+    target_sop: &str,
+    dedup_key: &str,
+) -> Vec<DispatchResult> {
+    dispatch_sop_event_filtered(
+        engine,
+        audit,
+        event,
+        Some(target_sop),
+        None,
+        Some(dedup_key),
+    )
+    .await
 }
 
 async fn dispatch_sop_event_filtered(
@@ -437,7 +530,10 @@ async fn dispatch_sop_event_filtered(
     // never coalesces (so a distinct delivery that reuses a message-id is never ACKed
     // away, only redeliveries of the same message are). `None` = no dedup (at-most-once
     // sources: cron ticks, webhooks, the manual/API path).
-    dedup: Option<(&str, bool)>,
+    delivery_dedup: Option<(&str, bool)>,
+    // Semantic key shared by fresh producers. Coalesces only while its run is
+    // active; terminal retries remain possible.
+    active_dedup: Option<&str>,
 ) -> Vec<DispatchResult> {
     let safety = match engine.lock() {
         Ok(eng) => ContentSafety::from_sop_config(eng.config()),
@@ -556,12 +652,17 @@ async fn dispatch_sop_event_filtered(
             }
         };
 
-        // Keep message-id idempotency orthogonal to admission. This pre-pass removes
-        // only SOPs already known to have started for a confirmed redelivery; every
-        // remaining SOP still follows the same single-run or atomic AMQP-batch path.
+        // Keep producer/delivery idempotency orthogonal to admission. This pre-pass
+        // removes SOPs already active for a shared producer key, or already known to
+        // have started for a confirmed AMQP redelivery. Every remaining SOP still
+        // follows the same single-run or atomic AMQP-batch path.
         let mut candidate_names = Vec::with_capacity(matched_names.len());
         for sop_name in &matched_names {
-            if let Some(result) = coalesce_confirmed_redelivery(&mut eng, sop_name, dedup) {
+            if let Some(result) = coalesce_active_duplicate(&eng, sop_name, active_dedup) {
+                results.push(result);
+            } else if let Some(result) =
+                coalesce_confirmed_redelivery(&mut eng, sop_name, delivery_dedup)
+            {
                 results.push(result);
             } else {
                 candidate_names.push(sop_name.clone());
@@ -853,7 +954,7 @@ async fn dispatch_sop_event_filtered(
             }
             for (sop_name, action) in activated {
                 let result = record_started_run(&mut eng, &sop_name, action, &mut started_runs);
-                remember_dispatch_start(&mut eng, &sop_name, dedup, &result);
+                remember_dispatch_start(&mut eng, &sop_name, delivery_dedup, active_dedup, &result);
                 results.push(result);
             }
         } else {
@@ -926,7 +1027,13 @@ async fn dispatch_sop_event_filtered(
                     Ok(action) => {
                         let result =
                             record_started_run(&mut eng, sop_name, action, &mut started_runs);
-                        remember_dispatch_start(&mut eng, sop_name, dedup, &result);
+                        remember_dispatch_start(
+                            &mut eng,
+                            sop_name,
+                            delivery_dedup,
+                            active_dedup,
+                            &result,
+                        );
                         results.push(result);
                     }
                     Err(e) => {
@@ -942,14 +1049,27 @@ async fn dispatch_sop_event_filtered(
     for run in &started_runs {
         let span = zeroclaw_log::attribution_span!(run);
         let run_id = run.run_id.clone();
-        if let Err(e) = zeroclaw_log::scope!(
-            session_key: run_id,
+        let audit_result = zeroclaw_log::scope!(
+            session_key: run_id.as_str(),
+            sop_run_id: run_id.as_str(),
             =>
-            audit.log_run_start(run)
+            async {
+                audit.log_run_start(run).await?;
+                for result in &run.step_results {
+                    audit.log_step_result(&run.run_id, result).await?;
+                }
+                if matches!(
+                    run.status,
+                    SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled
+                ) {
+                    audit.log_run_complete(run).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
         )
         .instrument(span)
-        .await
-        {
+        .await;
+        if let Err(e) = audit_result {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1131,7 +1251,8 @@ struct PreparedSopIngress<'a> {
     topic: Option<&'a str>,
     payload: Option<&'a str>,
     target_sop: Option<&'a str>,
-    dedup: Option<(String, bool)>,
+    delivery_dedup: Option<(String, bool)>,
+    active_dedup: Option<String>,
     max_bytes: usize,
 }
 
@@ -1145,7 +1266,8 @@ async fn dispatch_untrusted_fan_in_inner(
         topic,
         payload,
         target_sop,
-        dedup,
+        delivery_dedup,
+        active_dedup,
         max_bytes,
     } = ingress;
     let (topic, topic_truncated) = match topic {
@@ -1187,7 +1309,10 @@ async fn dispatch_untrusted_fan_in_inner(
         audit,
         event,
         target_sop,
-        dedup.as_ref().map(|(k, r)| (k.as_str(), *r)),
+        delivery_dedup
+            .as_ref()
+            .map(|(key, redelivered)| (key.as_str(), *redelivered)),
+        active_dedup.as_deref(),
     )
     .await;
     process_headless_results(&results);
@@ -1359,7 +1484,8 @@ pub async fn check_sop_cron_triggers(
 mod tests {
     use super::*;
     use crate::sop::types::{
-        Sop, SopExecutionMode, SopPriority, SopRunAction, SopStep, SopTrigger, SopTriggerSource,
+        Sop, SopExecutionMode, SopPriority, SopRunAction, SopStep, SopStepResult, SopStepStatus,
+        SopTrigger, SopTriggerSource,
     };
     use zeroclaw_config::schema::SopConfig;
     use zeroclaw_memory::traits::{Memory, MemoryCategory, MemoryEntry};
@@ -1627,6 +1753,88 @@ mod tests {
         let results = dispatch_sop_event_to(&engine, &audit, event, "missing-sop").await;
         assert_eq!(results.len(), 1);
         assert!(matches!(&results[0], DispatchResult::NoMatch));
+    }
+
+    #[tokio::test]
+    async fn shared_producer_key_coalesces_only_while_run_is_active() {
+        let engine = test_engine(vec![test_sop(
+            "pr-review",
+            vec![
+                SopTrigger::Channel {
+                    channel: "git".into(),
+                    alias: Some("main".into()),
+                    condition: None,
+                },
+                SopTrigger::Manual,
+            ],
+        )]);
+        let audit = test_audit();
+        let key = "ghpr_zeroclaw-labs/zeroclaw#42";
+        let channel_event = SopEvent {
+            source: SopTriggerSource::Channel,
+            topic: Some("git.main:pull_request.opened".into()),
+            payload: Some(r#"{"sop":"pr-review","number":42}"#.into()),
+            timestamp: now_iso8601(),
+        };
+
+        let first =
+            dispatch_sop_event_to_deduplicated(&engine, &audit, channel_event, "pr-review", key)
+                .await;
+        let first_run_id = match first.first() {
+            Some(DispatchResult::Started { run_id, .. }) => run_id.clone(),
+            other => panic!("Git producer should start the run, got {other:?}"),
+        };
+
+        let manual_event = SopEvent {
+            source: SopTriggerSource::Manual,
+            topic: None,
+            payload: Some(r#"{"pr":42}"#.into()),
+            timestamp: now_iso8601(),
+        };
+        let duplicate = dispatch_sop_event_to_deduplicated(
+            &engine,
+            &audit,
+            manual_event.clone(),
+            "pr-review",
+            key,
+        )
+        .await;
+        assert!(
+            matches!(
+                duplicate.first(),
+                Some(DispatchResult::Coalesced { existing_run_id, .. })
+                    if existing_run_id == &first_run_id
+            ),
+            "the sweep/API producer must converge on the Git producer's active run: {duplicate:?}"
+        );
+        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+
+        // Once that run is terminal, the same semantic work item can be retried.
+        let action = engine
+            .lock()
+            .unwrap()
+            .advance_step(
+                &first_run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Failed,
+                    output: "review provider unavailable".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Failed { .. }));
+
+        let retry =
+            dispatch_sop_event_to_deduplicated(&engine, &audit, manual_event, "pr-review", key)
+                .await;
+        assert!(
+            matches!(retry.first(), Some(DispatchResult::Started { run_id, .. }) if run_id != &first_run_id),
+            "a terminal failure must not permanently suppress a retry: {retry:?}"
+        );
     }
 
     #[tokio::test]

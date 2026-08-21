@@ -2915,6 +2915,8 @@ pub struct LogsQueryParams {
     pub outcome: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sop_run_id: Option<String>,
     #[serde(default)]
     pub hide_internal: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

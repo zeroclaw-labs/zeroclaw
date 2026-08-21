@@ -9,6 +9,7 @@ import {
   decideSop,
   getSop,
   getSopGraph,
+  isTerminalRunStatus,
   overlayStateByStep,
   runStatusBadge,
   type Sop,
@@ -18,6 +19,7 @@ import { useRunOverlay } from '@/hooks/useRunOverlay';
 import { t } from '@/lib/i18n';
 import { Badge, Card, PageHeader } from '@/components/ui';
 import SopStepList from '@/components/SopStepList';
+import RunLogsPanel from '@/components/RunLogsPanel';
 import SopCanvas from './SopCanvas';
 
 function noop() {}
@@ -160,6 +162,13 @@ export default function RunDetail() {
       ) : null}
 
       {graph && overlay ? <SopStepList graph={graph} overlay={overlay} showPins={false} /> : null}
+
+      {runId ? (
+        <RunLogsPanel
+          runId={runId}
+          active={overlay ? !isTerminalRunStatus(overlay.status) : false}
+        />
+      ) : null}
     </div>
   );
 }

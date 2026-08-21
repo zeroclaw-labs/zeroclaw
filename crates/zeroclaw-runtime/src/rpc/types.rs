@@ -1294,6 +1294,10 @@ rpc_type! {
         pub outcome: Option<String>,
         #[serde(default)]
         pub trace_id: Option<String>,
+        /// Exact SOP run correlation. Uses the canonical persisted-log
+        /// attribution filter, including its compatibility bridge for older rows.
+        #[serde(default)]
+        pub sop_run_id: Option<String>,
         #[serde(default)]
         pub hide_internal: bool,
         #[serde(default)]
@@ -1705,6 +1709,17 @@ mod tests {
         // to `1` so the handshake succeeds without an explicit version.
         let p: InitializeParams = serde_json::from_value(json!({})).unwrap();
         assert_eq!(p.protocol_version, 1);
+    }
+
+    #[test]
+    fn logs_query_params_accepts_sop_run_filter() {
+        let params: LogsQueryParams = serde_json::from_value(json!({
+            "sop_run_id": "run-123-0001",
+            "limit": 25
+        }))
+        .unwrap();
+        assert_eq!(params.sop_run_id.as_deref(), Some("run-123-0001"));
+        assert_eq!(params.limit, Some(25));
     }
 
     #[test]

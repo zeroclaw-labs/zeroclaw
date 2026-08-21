@@ -500,6 +500,10 @@ cli-sop-none = No SOPs found.
 cli-sop-pending-none = No SOP runs waiting for approval.
 cli-sop-pending-header = SOP runs waiting for approval:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+cli-sop-logs-none = No persisted logs found for SOP run {$run_id}.
+cli-sop-logs-header = Logs for SOP run {$run_id}:
+cli-sop-logs-row = {$timestamp} {$severity} {$category}.{$action} {$message}
+cli-sop-logs-disabled = Log persistence is not enabled.
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}

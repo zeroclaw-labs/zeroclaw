@@ -83,6 +83,13 @@ pub struct SopEngine {
     /// in-process) would remove the redelivery and thus this dependency entirely - tracked
     /// as a follow-up, out of scope for the dedup window here.
     dispatch_dedup: std::collections::VecDeque<(String, String)>,
+    /// Cross-producer active-run deduplication. Unlike `dispatch_dedup`, this
+    /// key is semantic (for example `ghpr_owner/repo#42`) and two fresh
+    /// producers may legitimately submit it at the same time. It coalesces
+    /// only while the recorded run is active, so a later retry after a terminal
+    /// failure is still allowed. Bounded FIFO; stale terminal entries are safe
+    /// because lookup also checks `active_runs`.
+    active_dispatch_dedup: std::collections::VecDeque<(String, String)>,
     /// Run IDs parked at a checkpoint whose denial tried to take the terminal
     /// path, but the terminal write failed after the run's exec claim was
     /// reacquired. The parked snapshot is already durable, so this set only
@@ -253,6 +260,7 @@ impl SopEngine {
             claims_pending_persist: std::collections::HashSet::new(),
             approval_broker: Arc::new(super::approval::ApprovalBroker::disabled()),
             dispatch_dedup: std::collections::VecDeque::new(),
+            active_dispatch_dedup: std::collections::VecDeque::new(),
             claims_retained_after_terminal_rollback: std::collections::HashSet::new(),
         }
     }
@@ -1560,6 +1568,44 @@ impl SopEngine {
                      key (window full); a later redelivery of that message may re-run it"
                 );
             }
+        }
+    }
+
+    /// Return the active run already admitted for a semantic producer key.
+    /// Terminal runs deliberately do not match: a reconciliation sweep may
+    /// retry a failed review later, while simultaneous Git-channel and sweep
+    /// submissions still converge on one live run.
+    pub(crate) fn active_dispatch_dedup_lookup(
+        &self,
+        sop_name: &str,
+        dedup_key: &str,
+    ) -> Option<String> {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        self.active_dispatch_dedup
+            .iter()
+            .rev()
+            .find(|(key, _)| *key == composite)
+            .and_then(|(_, run_id)| {
+                self.active_runs
+                    .contains_key(run_id)
+                    .then(|| run_id.clone())
+            })
+    }
+
+    /// Remember a semantic producer key for the run that just started.
+    pub(crate) fn record_active_dispatch_dedup(
+        &mut self,
+        sop_name: &str,
+        dedup_key: &str,
+        run_id: &str,
+    ) {
+        let composite = dispatch_dedup_composite(sop_name, dedup_key);
+        self.active_dispatch_dedup
+            .retain(|(key, _)| *key != composite);
+        self.active_dispatch_dedup
+            .push_back((composite, run_id.to_string()));
+        while self.active_dispatch_dedup.len() > DISPATCH_DEDUP_CAP {
+            self.active_dispatch_dedup.pop_front();
         }
     }
 

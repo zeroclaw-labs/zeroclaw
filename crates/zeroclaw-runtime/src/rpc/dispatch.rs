@@ -4023,6 +4023,10 @@ impl RpcDispatcher {
         let path = zeroclaw_log::current_log_path()
             .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Log persistence is not enabled"))?;
 
+        let field_eq = p
+            .sop_run_id
+            .map(|run_id| std::collections::BTreeMap::from([("sop_run_id".into(), run_id)]))
+            .unwrap_or_default();
         let filter = zeroclaw_log::LogFilter {
             since_ts: p.since_ts,
             until_ts: p.until_ts,
@@ -4035,7 +4039,7 @@ impl RpcDispatcher {
             trace_id: p.trace_id,
             q: p.q,
             hide_internal: p.hide_internal,
-            field_eq: std::collections::BTreeMap::new(),
+            field_eq,
         };
 
         let limit = p.limit.unwrap_or(200);
@@ -4250,6 +4254,21 @@ impl RpcDispatcher {
             .map(str::trim)
             .filter(|p| !p.is_empty())
             .map(str::to_string);
+        let dedup_key = req
+            .dedup_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty());
+        if dedup_key.is_some_and(|key| key.len() > crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES)
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "dedup_key exceeds {} bytes",
+                    crate::sop::dispatch::MAX_ACTIVE_DEDUP_KEY_BYTES
+                ),
+            ));
+        }
 
         let event = crate::sop::SopEvent {
             source: crate::sop::SopTriggerSource::Manual,
@@ -4258,8 +4277,14 @@ impl RpcDispatcher {
             timestamp: crate::sop::engine::now_iso8601(),
         };
 
-        let results =
-            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await;
+        let results = if let Some(dedup_key) = dedup_key {
+            crate::sop::dispatch::dispatch_sop_event_to_deduplicated(
+                engine, audit, event, &req.name, dedup_key,
+            )
+            .await
+        } else {
+            crate::sop::dispatch::dispatch_sop_event_to(engine, audit, event, &req.name).await
+        };
         crate::sop::dispatch::process_headless_results(&results);
 
         for result in &results {

@@ -763,6 +763,58 @@ mod e2e_tests {
         crate::clear_broadcast_hook();
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn scope_promotes_sop_run_id_to_attribution() {
+        let _subscriber_guard = TEST_LOCK.lock();
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        try_install_capture_subscriber();
+        let mut rx = subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let run_id = "run-scope-test-0001";
+        zeroclaw_log::scope!(
+            sop_run_id: run_id,
+            => async {
+                zeroclaw_log::record!(
+                    INFO,
+                    Event::new(module_path!(), Action::Invoke),
+                    "sop-run scope e2e test"
+                );
+            }
+        )
+        .await;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut found = false;
+        while !found && std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value))
+                    if value.get("message").and_then(|v| v.as_str())
+                        == Some("sop-run scope e2e test") =>
+                {
+                    assert_eq!(
+                        value
+                            .pointer("/zeroclaw/sop_run_id")
+                            .and_then(|v| v.as_str()),
+                        Some(run_id),
+                        "scope field must be promoted into canonical attribution: {value:?}",
+                    );
+                    assert!(value.pointer("/attributes/sop_run_id").is_none());
+                    found = true;
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) | Err(_) | Ok(Ok(_)) => {}
+            }
+        }
+        assert!(found, "did not receive the scoped SOP run event");
+        crate::clear_broadcast_hook();
+    }
+
     /// Ephemeral attrs attached at the call site must reach the broadcast
     /// copy (deep-merged into `attributes`) through the full `record!` →
     /// layer → writer pipeline. The at-rest exclusion is covered by

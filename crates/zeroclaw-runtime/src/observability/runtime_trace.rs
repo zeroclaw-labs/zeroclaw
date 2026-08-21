@@ -28,6 +28,10 @@ pub fn init_from_config(
     workspace_dir: &Path,
 ) {
     zeroclaw_log::init_from_config(&to_log_config(config), workspace_dir);
+    #[cfg(feature = "observability-otel")]
+    super::otel_logs::configure(config);
+    #[cfg(not(feature = "observability-otel"))]
+    zeroclaw_log::clear_log_exporter();
 }
 
 /// Resolve the configured log path (used by the doctor command).

@@ -1091,6 +1091,17 @@ pub enum SopCommands {
     },
     /// List SOP runs currently waiting for approval (talks to the running daemon)
     Pending,
+    /// Show persisted logs for one SOP run (talks to the running daemon)
+    Logs {
+        /// The run ID to inspect
+        run_id: String,
+        /// Maximum number of newest matching events to return
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Print the complete gateway response as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Render an SOP's node graph as text
     Graph {
         /// Name of the SOP to render

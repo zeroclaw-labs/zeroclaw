@@ -5101,7 +5101,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
             // engine). List/Validate/Show stay local + synchronous.
             cmd @ (SopCommands::Approve { .. }
             | SopCommands::Deny { .. }
-            | SopCommands::Pending) => sop_admin_dispatch(cmd, &config).await,
+            | SopCommands::Pending
+            | SopCommands::Logs { .. }) => sop_admin_dispatch(cmd, &config).await,
             other => sop::handle_command(other, &config),
         },
 
@@ -6846,7 +6847,7 @@ async fn sop_admin_dispatch(cmd: SopCommands, config: &crate::config::Config) ->
     {
         let _ = (cmd, config);
         anyhow::bail!(
-            "`zeroclaw sop approve/deny/pending` requires the agent-runtime build (the gateway client)"
+            "`zeroclaw sop approve/deny/pending/logs` requires the agent-runtime build (the gateway client)"
         )
     }
 }
@@ -6923,6 +6924,107 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             }
             Ok(())
         }
+        SopCommands::Logs {
+            run_id,
+            limit,
+            json,
+        } => {
+            let url = gateway_admin_url(&host, port, prefix, "/admin/sop/logs");
+            let resp = client
+                .get(&url)
+                .query(&[("run_id", run_id.as_str()), ("limit", &limit.to_string())])
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map_err(|e| anyhow::Error::msg(format!("Failed to connect to gateway: {e}")))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            if !status.is_success() {
+                let err = body
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("request failed");
+                anyhow::bail!("Gateway responded {status}: {err}");
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&body)?);
+                return Ok(());
+            }
+
+            if body
+                .get("persistence_enabled")
+                .and_then(|value| value.as_bool())
+                == Some(false)
+            {
+                println!(
+                    "{}",
+                    t("cli-sop-logs-disabled", "Log persistence is not enabled.")
+                );
+                return Ok(());
+            }
+
+            let events = body
+                .get("events")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
+            if events.is_empty() {
+                println!(
+                    "{}",
+                    ta(
+                        "cli-sop-logs-none",
+                        &[("run_id", run_id.as_str())],
+                        "No persisted logs found for this SOP run."
+                    )
+                );
+                return Ok(());
+            }
+            println!(
+                "{}",
+                ta(
+                    "cli-sop-logs-header",
+                    &[("run_id", run_id.as_str())],
+                    "SOP run logs:"
+                )
+            );
+            for event in events.iter().rev() {
+                let timestamp = event
+                    .get("@timestamp")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let severity = event
+                    .get("severity_text")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let category = event
+                    .pointer("/event/category")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let action = event
+                    .pointer("/event/action")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("?");
+                let message = event
+                    .get("message")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("");
+                println!(
+                    "{}",
+                    ta(
+                        "cli-sop-logs-row",
+                        &[
+                            ("timestamp", timestamp),
+                            ("severity", severity),
+                            ("category", category),
+                            ("action", action),
+                            ("message", message),
+                        ],
+                        "  (log event)",
+                    )
+                );
+            }
+            Ok(())
+        }
         SopCommands::Approve { run_id } => {
             let url = gateway_admin_url(&host, port, prefix, "/admin/sop/approve");
             sop_admin_post(&client, &url, serde_json::json!({ "run_id": run_id })).await
@@ -6936,7 +7038,7 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             )
             .await
         }
-        // List/Validate/Show are dispatched on the local synchronous path.
+        // List/Validate/Show/Graph/Delete are dispatched on the local path.
         _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
     }
 }
@@ -8334,6 +8436,30 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    fn sop_logs_cli_parses_run_limit_and_json_output() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "sop",
+            "logs",
+            "run-123-0001",
+            "--limit",
+            "42",
+            "--json",
+        ])
+        .expect("sop logs command should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Sop {
+                sop_command: SopCommands::Logs {
+                    run_id,
+                    limit: 42,
+                    json: true,
+                }
+            } if run_id == "run-123-0001"
+        ));
+    }
 
     #[test]
     #[cfg(feature = "agent-runtime")]

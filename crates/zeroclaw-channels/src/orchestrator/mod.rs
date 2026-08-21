@@ -8362,12 +8362,12 @@ async fn dispatch_channel_sop_event(
         router.sop_engine.as_ref(),
         router.sop_audit.as_deref(),
     )
-    .dispatch(
+    .dispatch_deduplicated(
         zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
         Some(topic),
         Some(&msg.content),
         target_sop.as_deref(),
-        None,
+        msg.id.clone(),
     )
     .await;
     true

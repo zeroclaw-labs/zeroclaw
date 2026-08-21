@@ -1611,6 +1611,7 @@ pub async fn run_gateway(
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
         .route("/admin/sop/pending", get(api_sop::handle_sop_pending))
+        .route("/admin/sop/logs", get(api_sop::handle_sop_logs))
         .route("/admin/sop/approve", post(api_sop::handle_sop_approve))
         .route("/admin/sop/deny", post(api_sop::handle_sop_deny))
         .route("/admin/paircode", get(handle_admin_paircode))

@@ -3,10 +3,14 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use super::engine::now_iso8601;
-use super::types::{SopRun, SopStepResult, SopTriggerSource};
+use super::types::{SopRun, SopStepResult, SopStepStatus, SopTriggerSource};
+use crate::agent::history::truncate_tool_result;
+use crate::agent::turn::redact::scrub_credentials;
 use zeroclaw_memory::traits::{Memory, MemoryCategory};
 
 const SOP_CATEGORY: &str = "sop";
+const MAX_STEP_LOG_OUTPUT_CHARS: usize = 4096;
+const MAX_STEP_LOG_SUMMARY_CHARS: usize = 240;
 
 pub struct SopAuditLogger {
     memory: Arc<dyn Memory>,
@@ -24,7 +28,8 @@ impl SopAuditLogger {
         self.memory.store(&key, &content, category(), None).await?;
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"run_id": run.run_id.as_str()})),
             &format!(
                 "SOP audit: run {} started for '{}'",
                 run.run_id, run.sop_name
@@ -38,6 +43,56 @@ impl SopAuditLogger {
         let key = step_key(run_id, result.step_number);
         let content = serde_json::to_string_pretty(result)?;
         self.memory.store(&key, &content, category(), None).await?;
+
+        // The durable audit record retains the canonical result. The structured
+        // event is a bounded, credential-scrubbed projection for run-log surfaces.
+        let output = truncate_tool_result(
+            &scrub_credentials(&result.output),
+            MAX_STEP_LOG_OUTPUT_CHARS,
+        );
+        let summary = truncate_tool_result(
+            output
+                .lines()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or(""),
+            MAX_STEP_LOG_SUMMARY_CHARS,
+        );
+        let message = if summary.is_empty() {
+            format!("SOP audit: step {} {}", result.step_number, result.status)
+        } else {
+            format!(
+                "SOP audit: step {} {}: {summary}",
+                result.step_number, result.status
+            )
+        };
+        let event = ::zeroclaw_log::Event::new(
+            module_path!(),
+            match result.status {
+                SopStepStatus::Completed | SopStepStatus::Skipped => {
+                    ::zeroclaw_log::Action::Complete
+                }
+                SopStepStatus::Failed => ::zeroclaw_log::Action::Fail,
+            },
+        )
+        .with_outcome(match result.status {
+            SopStepStatus::Completed => ::zeroclaw_log::EventOutcome::Success,
+            SopStepStatus::Failed => ::zeroclaw_log::EventOutcome::Failure,
+            SopStepStatus::Skipped => ::zeroclaw_log::EventOutcome::Unknown,
+        })
+        .with_attrs(::serde_json::json!({
+            "run_id": run_id,
+            "step": result.step_number,
+            "status": result.status.to_string(),
+            "effective_agent": result.effective_agent.as_deref(),
+            "tool_call_count": result.tool_calls.len(),
+            "output": output,
+        }));
+        match result.status {
+            SopStepStatus::Failed => ::zeroclaw_log::record!(WARN, event, &message),
+            SopStepStatus::Completed | SopStepStatus::Skipped => {
+                ::zeroclaw_log::record!(INFO, event, &message)
+            }
+        }
         Ok(())
     }
 
@@ -116,7 +171,8 @@ impl SopAuditLogger {
         self.memory.store(&key, &content, category(), None).await?;
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"run_id": run.run_id.as_str()})),
             &format!(
                 "SOP audit: run {} finished with status {}",
                 run.run_id, run.status
@@ -273,5 +329,64 @@ mod tests {
         let logger = SopAuditLogger::new(memory);
         let result = logger.get_run("nonexistent").await.unwrap();
         assert!(result.is_none());
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn step_result_emits_bounded_scrubbed_run_log_event() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let mem_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "sqlite".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let logger = SopAuditLogger::new(memory);
+        let secret = "super-secret-credential";
+        let mut step = test_step_result(2);
+        step.output = format!("token={secret}\n{}", "x".repeat(6000));
+
+        logger
+            .log_step_result("run-log-proof", &step)
+            .await
+            .unwrap();
+
+        let mut selected = None;
+        loop {
+            match rx.try_recv() {
+                Ok(value)
+                    if value
+                        .get("message")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|message| {
+                            message.starts_with("SOP audit: step 2 completed")
+                        }) =>
+                {
+                    selected = Some(value);
+                    break;
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        let event = selected.expect("step result should emit a structured log event");
+        assert_eq!(event["attributes"]["run_id"], "run-log-proof");
+        assert_eq!(event["attributes"]["step"], 2);
+        assert_eq!(event["event"]["action"], "complete");
+        assert_eq!(event["event"]["outcome"], "success");
+        let output = event["attributes"]["output"].as_str().unwrap();
+        assert!(output.contains("[REDACTED]"));
+        assert!(!output.contains(secret));
+        assert!(output.chars().count() <= MAX_STEP_LOG_OUTPUT_CHARS + 64);
+        assert!(output.contains("truncated"));
+
+        zeroclaw_log::clear_broadcast_hook();
     }
 }

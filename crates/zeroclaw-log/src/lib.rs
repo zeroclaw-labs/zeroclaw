@@ -4,6 +4,7 @@ pub mod broadcast;
 pub mod chain;
 pub mod config;
 pub mod event;
+mod export_bridge;
 pub mod layer;
 pub mod migrate;
 pub mod observer_bridge;
@@ -35,6 +36,9 @@ pub use event::{
     ATTRIBUTION_FIELDS, Action, COMPOSITE_PREFIXES, Event, EventCategory, EventOutcome, LogEvent,
     Severity, ZeroclawAttribution, is_attribution_field, severity_text_from_number,
     severity_text_from_tracing_level,
+};
+pub use export_bridge::{
+    LogRecordExporter, clear_log_exporter, flush_log_exporter, set_log_exporter,
 };
 pub use layer::LogCaptureLayer;
 pub use writer::{

@@ -2181,7 +2181,7 @@ export interface LogEvent {
   service?: { name: string; version: string };
   trace_id?: string | null;
   span_id?: string | null;
-  zeroclaw: Record<string, string> & { duration_ms?: number };
+  zeroclaw: Record<string, string | number | undefined> & { duration_ms?: number };
   message?: string;
   attributes?: Record<string, unknown>;
   schema_version?: number;
@@ -2202,6 +2202,7 @@ export interface LogsResponse {
    *  `null` when the page is empty. */
   next_cursor_line_offset: number | null;
   at_end: boolean;
+  persistence_enabled: boolean;
   daemon_started_at: string;
   /** Canonical attribution-field names the daemon currently emits. Sourced
    *  from `ATTRIBUTION_FIELDS` + `COMPOSITE_PREFIXES` in zeroclaw-log so

@@ -210,23 +210,32 @@ async fn drive_headless_run(
                 let started_at = crate::sop::engine::now_iso8601();
                 let session_path =
                     std::path::PathBuf::from(format!("sop-{run_id}-step-{}", step.number));
-                let run_result = Box::pin(crate::agent::run(
-                    config.clone(),
-                    &agent_alias,
-                    Some(context),
-                    None,
-                    None,
-                    config
-                        .model_provider_for_agent(&agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path),
-                    None,
-                    zeroclaw_api::ingress::TurnOrigin::Daemon,
-                    crate::agent::loop_::AgentRunOverrides::default(),
-                ))
+                let step_call_sink = new_step_call_sink();
+                let run_result = zeroclaw_log::scope!(
+                    sop_run_id: run_id.as_str(),
+                    =>
+                    scope_step_call_sink(
+                        step_call_sink.clone(),
+                        Box::pin(crate::agent::run(
+                            config.clone(),
+                            &agent_alias,
+                            Some(context),
+                            None,
+                            None,
+                            config
+                                .model_provider_for_agent(&agent_alias)
+                                .and_then(|e| e.temperature),
+                            vec![],
+                            false,
+                            Some(session_path),
+                            None,
+                            zeroclaw_api::ingress::TurnOrigin::Daemon,
+                            crate::agent::loop_::AgentRunOverrides::default(),
+                        )),
+                    )
+                )
                 .await;
+                let tool_calls = drain_step_calls(&step_call_sink);
                 let completed_at = crate::sop::engine::now_iso8601();
                 let step_result = match run_result {
                     Ok(output) => SopStepResult {
@@ -236,7 +245,7 @@ async fn drive_headless_run(
                         started_at,
                         completed_at: Some(completed_at),
                         effective_agent: Some(agent_alias.clone()),
-                        tool_calls: Vec::new(),
+                        tool_calls,
                     },
                     Err(e) => SopStepResult {
                         step_number: step.number,
@@ -245,7 +254,7 @@ async fn drive_headless_run(
                         started_at,
                         completed_at: Some(completed_at),
                         effective_agent: Some(agent_alias.clone()),
-                        tool_calls: Vec::new(),
+                        tool_calls,
                     },
                 };
                 match advance_sop_step(&engine, &run_id, step_result.clone()) {

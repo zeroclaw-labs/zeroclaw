@@ -509,6 +509,7 @@ pub fn record_event(event: LogEvent) {
     };
 
     observer_bridge::forward(&event);
+    crate::export_bridge::forward(&event);
 
     if let Some(hook) = current_broadcast_hook() {
         let mut broadcast_value = value.clone();

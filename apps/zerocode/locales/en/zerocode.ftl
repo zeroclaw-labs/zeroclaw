@@ -156,6 +156,8 @@ zc-logs-no-event-selected = No event selected
 zc-logs-loading = Loading…
 zc-logs-search-action-apply = apply
 zc-logs-search-action-cancel = cancel
+zc-logs-run-filter-label = run
+zc-logs-run-filter-clear = R:clear
 
 zc-logs-help-mouse-label = Mouse
 zc-logs-help-mouse-desc = Click to select, scroll wheel, double-click detail
