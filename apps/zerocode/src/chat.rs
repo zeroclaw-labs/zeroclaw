@@ -2653,6 +2653,12 @@ impl Chat {
         let ChatPhase::Active(state) = &mut self.phase else {
             return;
         };
+        // Approval overlays own input while an agent turn is paused for a
+        // decision. Keep paste aligned with the keyboard-input guard so it
+        // cannot mutate the hidden composer beneath the modal.
+        if state.pending_approval().is_some() {
+            return;
+        }
         let action = state.input_bar.handle_paste(text);
         if let InputBarAction::StatusMessage(msg) = action {
             state.set_info_notice(msg);
@@ -12542,6 +12548,23 @@ mod tests {
             state.take_next_dispatchable().is_none(),
             "an active turn must not dispatch the queued pasted input"
         );
+    }
+
+    #[tokio::test]
+    async fn paste_does_not_mutate_composer_while_approval_is_pending() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.pending_approval = Some(PendingApproval {
+            request_id: "request-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+
+        chat.handle_paste(" must not reach the composer");
+
+        assert_eq!(active_state(&mut chat).input_bar.input(), "alpha beta");
     }
 
     #[tokio::test]
