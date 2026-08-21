@@ -1,4 +1,4 @@
-use crate::helpers::{domain_guard, response_body};
+use crate::helpers::domain_guard;
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
@@ -387,11 +387,21 @@ impl HttpRequestTool {
         } else {
             self.timeout_secs
         };
+        // Negotiate the encodings `http_decode` can decode. reqwest's own
+        // compression features are intentionally disabled workspace-wide, so
+        // this header is set explicitly. A caller-supplied `Accept-Encoding` in
+        // `headers` overrides it (per-request headers win over defaults).
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT_ENCODING,
+            reqwest::header::HeaderValue::from_static("gzip, deflate, br"),
+        );
         let builder = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            .default_headers(default_headers);
         let builder = if target.host.parse::<IpAddr>().is_ok() {
             builder
         } else {
@@ -408,9 +418,15 @@ impl HttpRequestTool {
         Ok(request.send().await?)
     }
 
+    /// Read the response body, decoding a `Content-Encoding: gzip | deflate | br`
+    /// body, while bounding memory to the display cap. A small compressed
+    /// response can decode into a much larger body, so the shared reader stops
+    /// the decoder once the decoded output passes the cap instead of buffering
+    /// the whole body first. A malformed compressed body surfaces as an error so
+    /// the caller can report a failed execution.
     async fn read_response_text(&self, response: reqwest::Response) -> anyhow::Result<String> {
         let limit = (self.max_response_size != 0).then_some(self.max_response_size);
-        let (mut text, overflowed) = response_body::read_text(response, limit).await?;
+        let (mut text, overflowed) = crate::http_decode::read_decoded_text(response, limit).await?;
         if overflowed {
             text.push_str("\n\n... [Response truncated due to size limit] ...");
         }
@@ -644,10 +660,17 @@ impl Tool for HttpRequestTool {
                     .collect::<Vec<_>>()
                     .join(", ");
 
-                // Get response body with size limit
-                let response_text = match self.read_response_text(response).await {
-                    Ok(text) => text,
-                    Err(e) => format!("[Failed to read response body: {e}]"),
+                // Get response body with a streamed size limit so transparent
+                // decompression cannot expand past the cap in memory. A body /
+                // decoder failure (e.g. a 2xx advertising gzip with malformed
+                // bytes) is an operational failure, not a successful execution,
+                // so track it separately from the HTTP status.
+                let (response_text, body_error) = match self.read_response_text(response).await {
+                    Ok(text) => (text, None),
+                    Err(e) => (
+                        format!("[Failed to read response body: {e}]"),
+                        Some(e.to_string()),
+                    ),
                 };
 
                 let output = format!(
@@ -669,13 +692,16 @@ impl Tool for HttpRequestTool {
                     "body": body_value,
                 });
 
+                let http_error = status.is_client_error() || status.is_server_error();
                 Ok(ToolResult {
-                    success: status.is_success(),
+                    success: status.is_success() && body_error.is_none(),
                     output: ToolOutput::json_with_text(data, output),
-                    error: if status.is_client_error() || status.is_server_error() {
-                        Some(format!("HTTP {}", status_code))
-                    } else {
-                        None
+                    error: match (&body_error, http_error) {
+                        (Some(detail), _) => {
+                            Some(format!("Failed to read response body: {detail}"))
+                        }
+                        (None, true) => Some(format!("HTTP {status_code}")),
+                        (None, false) => None,
                     },
                 })
             }
@@ -1424,6 +1450,308 @@ api_token = "Bearer from-secret"
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn read_response_text_bounds_decompressed_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A tiny gzip body that decodes to 10 KiB. `http_request` decodes gzip
+        // in `http_decode`, so this must not buffer the whole decoded body
+        // before the cap applies.
+        let payload = "a".repeat(10_000);
+        let gz = {
+            use flate2::{Compression, write::GzEncoder};
+            use std::io::Write;
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(payload.as_bytes()).unwrap();
+            enc.finish().unwrap()
+        };
+        assert!(gz.len() < 200, "compressed fixture should be small");
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(gz, "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            128,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        // Fetch with a plain decoding client and read through the cap directly.
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("reqwest client");
+        let response = client.get(&url).send().await.expect("request succeeds");
+        let text = tool.read_response_text(response).await.expect("body reads");
+
+        // The read stops at the 128-byte cap, nowhere near the 10 KiB decoded
+        // body, and the over-limit marker is appended.
+        assert!(
+            text.starts_with(&"a".repeat(128)),
+            "decoded prefix preserved up to the cap"
+        );
+        assert!(
+            text.contains("[Response truncated"),
+            "an over-cap body must be marked truncated: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decodes_every_gzip_member() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // RFC 1952 allows a gzip body to be a series of members. A single-member
+        // decoder returns the first one and drops the rest, reporting a partial
+        // body as a complete success.
+        let mut body = {
+            use flate2::{Compression, write::GzEncoder};
+            use std::io::Write;
+            let member = |payload: &[u8]| {
+                let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+                enc.write_all(payload).unwrap();
+                enc.finish().unwrap()
+            };
+            let mut out = member(b"first half, ");
+            out.extend_from_slice(&member(b"second half"));
+            out
+        };
+        body.shrink_to_fit();
+
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(body, "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(result.success, "error={:?}", result.error);
+        assert!(
+            result.output.as_str().contains("first half, second half"),
+            "every gzip member must decode, got {}",
+            result.output.as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_content_encoding_lines_are_refused() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Separate field lines carry the same meaning as `gzip, br` in one line,
+        // and the chain is refused rather than half-decoded.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("content-encoding", "gzip")
+                    .append_header("content-encoding", "br")
+                    .set_body_raw(b"whatever".to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(!result.success, "a coding chain must not be decoded");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("Content-Encoding")),
+            "error should name the encoding contract, got {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_compressed_2xx_reports_failure() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A 200 that advertises gzip but sends bytes that are not a valid gzip
+        // stream. The body cannot be read, so the tool must report a failure —
+        // not `success: true` with an error string smuggled into the body — at
+        // the public `Tool::execute` boundary.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip")
+                    .set_body_raw(b"not really gzip".to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            !result.success,
+            "a body that could not be decoded must not be a successful execution"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("read response body")),
+            "error must explain the body-read failure, got {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn request_advertises_accept_encoding() {
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The mock only matches when the request carries an Accept-Encoding
+        // header; a request without it falls through to a 404, so a 200 result
+        // proves the tool negotiates encodings.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .and(header_exists("accept-encoding"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(
+            result.success,
+            "request must advertise Accept-Encoding (else the mock 404s): {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
+    async fn compound_content_encoding_reports_failure() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A compound coding (`gzip, br`) is not a single supported token; the
+        // decoder must reject it rather than return the still-encoded bytes as
+        // model-visible garbage.
+        let server = MockServer::start().await;
+        let addr = server.address();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-encoding", "gzip, br")
+                    .set_body_raw(b"still-encoded bytes".to_vec(), "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["*".into()],
+            1_048_576,
+            30,
+            true,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let url = format!("http://{}:{}/", addr.ip(), addr.port());
+        let result = tool
+            .execute(json!({ "url": url }))
+            .await
+            .expect("execute resolves");
+
+        assert!(!result.success, "a compound encoding must not succeed");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("read response body")),
+            "error must explain the body-read failure, got {:?}",
+            result.error
+        );
     }
 
     #[test]
