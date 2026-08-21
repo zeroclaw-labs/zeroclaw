@@ -2662,6 +2662,7 @@ fn build_integration_descriptor_method(
     let mut display_name: Option<String> = None;
     let mut description: Option<String> = None;
     let mut status_field: Option<syn::LitStr> = None;
+    let mut status_method: Option<syn::LitStr> = None;
     let mut found = false;
 
     for attr in attrs {
@@ -2693,6 +2694,7 @@ fn build_integration_descriptor_method(
                 "display_name" => display_name = Some(value.value()),
                 "description" => description = Some(value.value()),
                 "status_field" => status_field = Some(value.clone()),
+                "status_method" => status_method = Some(value.clone()),
                 _ => {}
             }
         }
@@ -2705,9 +2707,33 @@ fn build_integration_descriptor_method(
     let category_lit = category.unwrap_or_default();
     let display_name_lit = display_name.unwrap_or_default();
     let description_lit = description.unwrap_or_default();
-    let status_field_ident = match status_field {
-        Some(name) => name.parse::<syn::Ident>()?,
-        None => syn::Ident::new("enabled", proc_macro2::Span::call_site()),
+    // Two ways to answer "is this integration active?". `status_field` names
+    // a single bool field and stays the default (`enabled`). `status_method`
+    // names a zero-argument `&self -> bool` method, for integrations whose
+    // activation is a predicate over several fields — e.g. a config that
+    // gates two separate tools on two independent flags, where neither flag
+    // alone is the operator-visible status. They are mutually exclusive:
+    // accepting both would give one descriptor two disagreeing sources.
+    let active_expr = match (status_field, status_method) {
+        (Some(_), Some(_)) => {
+            return Err(syn::Error::new(
+                proc_macro2::Span::call_site(),
+                "`status_field` and `status_method` are mutually exclusive; use \
+                 `status_method` when activation depends on more than one field",
+            ));
+        }
+        (None, Some(method)) => {
+            let ident = method.parse::<syn::Ident>()?;
+            quote! { self.#ident() }
+        }
+        (Some(field), None) => {
+            let ident = field.parse::<syn::Ident>()?;
+            quote! { self.#ident }
+        }
+        (None, None) => {
+            let ident = syn::Ident::new("enabled", proc_macro2::Span::call_site());
+            quote! { self.#ident }
+        }
     };
 
     Ok(quote! {
@@ -2720,7 +2746,7 @@ fn build_integration_descriptor_method(
                 display_name: #display_name_lit,
                 description: #description_lit,
                 category: #category_lit,
-                active: self.#status_field_ident,
+                active: #active_expr,
             }
         }
     })
@@ -2880,5 +2906,77 @@ mod tests {
         }];
 
         assert!(build_integration_descriptor_method(&attrs).is_err());
+    }
+
+    #[test]
+    fn integration_status_method_rejects_invalid_identifier() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_method = "not-valid"
+            )]
+        }];
+
+        assert!(build_integration_descriptor_method(&attrs).is_err());
+    }
+
+    #[test]
+    fn integration_rejects_status_field_and_status_method_together() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "enabled",
+                status_method = "integration_active"
+            )]
+        }];
+
+        assert!(
+            build_integration_descriptor_method(&attrs).is_err(),
+            "two status sources for one descriptor must be rejected"
+        );
+    }
+
+    #[test]
+    fn integration_status_method_emits_method_call() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_method = "integration_active"
+            )]
+        }];
+
+        let tokens = build_integration_descriptor_method(&attrs)
+            .expect("status_method descriptor must build")
+            .to_string();
+        assert!(
+            tokens.contains("active : self . integration_active ()"),
+            "expected a method call for the active field, got: {tokens}"
+        );
+    }
+
+    #[test]
+    fn integration_status_field_emits_field_access() {
+        let attrs: Vec<syn::Attribute> = vec![parse_quote! {
+            #[integration(
+                category = "ToolsAutomation",
+                display_name = "Browser",
+                description = "Chrome control",
+                status_field = "enabled"
+            )]
+        }];
+
+        let tokens = build_integration_descriptor_method(&attrs)
+            .expect("status_field descriptor must build")
+            .to_string();
+        assert!(
+            tokens.contains("active : self . enabled ,"),
+            "expected a plain field read for the active field, got: {tokens}"
+        );
     }
 }
