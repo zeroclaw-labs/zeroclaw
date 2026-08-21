@@ -52,6 +52,7 @@ pub fn install_global_subscriber(
         .with(fmt_layer);
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+    install_log_bridge();
 }
 
 #[doc(hidden)]
@@ -59,6 +60,33 @@ pub fn try_install_capture_subscriber() {
     use tracing_subscriber::Registry;
     let subscriber = Registry::default().with(LogCaptureLayer);
     let _ = tracing::subscriber::set_global_default(subscriber);
+    install_log_bridge();
+}
+
+/// Route records emitted through the `log` facade into `tracing`.
+///
+/// Dependencies log through `log`, not `tracing` — `whatsapp-rust` and
+/// friends. Installing a `tracing` subscriber does nothing for them: `log`
+/// keeps its own global logger slot, and while that slot is empty every
+/// `log::warn!` in the dependency tree is discarded at the macro's own
+/// max-level check. Those records reached neither stderr nor the JSONL
+/// trace, so a transport failure inside a dependency left no evidence at
+/// any verbosity.
+///
+/// `LogTracer` fills that slot and re-dispatches each record as a `tracing`
+/// event against the current subscriber, so bridged records go through the
+/// same `EnvFilter` directives, the same `LogCaptureLayer` persistence and
+/// the same alias-prefixed stderr formatting as native `record!` emissions.
+/// It sets the `log` max level to `Trace` on purpose: `log`-side filtering
+/// would silently pre-empt the `RUST_LOG` directives, so the tracing filters
+/// stay the single place that decides.
+///
+/// Idempotent. `log` permits exactly one global logger per process, so a
+/// second call — a re-entrant setup, or the next test in a shared test
+/// binary — returns `Err` and is deliberately discarded, mirroring how
+/// `try_install_capture_subscriber` treats a repeated `set_global_default`.
+fn install_log_bridge() {
+    let _ = tracing_log::LogTracer::init();
 }
 
 /// Field formatter that renders event fields exactly like the default
@@ -423,6 +451,64 @@ mod tests {
         assert!(
             !out.contains(F_EPHEMERAL_ATTRS),
             "bool-recorded ephemeral field leaked: {out:?}"
+        );
+    }
+
+    /// Regression for dependency logs vanishing without a trace: transports
+    /// like `whatsapp-rust` emit through the `log` facade, not `tracing`.
+    /// Installing a `tracing` subscriber leaves `log`'s own global logger
+    /// slot empty, and every such record used to be discarded at the macro's
+    /// max-level check — reaching neither stderr nor the JSONL trace at any
+    /// verbosity. Installing this crate's subscriber machinery must be
+    /// enough on its own for a bare `log::warn!` to arrive as a tracing
+    /// event; removing the `LogTracer` init makes this test go silent.
+    #[test]
+    fn log_facade_records_reach_the_subscriber() {
+        // Real entry point: installs the capture layer *and* the bridge.
+        crate::try_install_capture_subscriber();
+
+        let buf = BufMakeWriter::default();
+        let fmt_layer = fmt::layer()
+            .fmt_fields(RedactEphemeralFields)
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .event_format(AgentAliasFormatter::new());
+        let subscriber = tracing_subscriber::registry().with(fmt_layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            log::warn!(
+                target: "zeroclaw_log_bridge_probe",
+                "dependency log facade marker"
+            );
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        let line = out
+            .lines()
+            .find(|line| line.contains("dependency log facade marker"))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a `log` record must reach the tracing subscriber; without the \
+                     LogTracer bridge it is dropped at the log facade: {out:?}"
+                )
+            });
+        assert!(
+            line.starts_with("[system] "),
+            "bridged record must go through the alias-prefixing formatter: {line:?}"
+        );
+        assert!(
+            line.contains("WARN"),
+            "bridged record must keep its severity: {line:?}"
+        );
+        assert!(
+            line.contains("zeroclaw_log_bridge_probe"),
+            "bridged record must keep the dependency's own target so RUST_LOG \
+             directives still address it: {line:?}"
+        );
+        assert!(
+            !line.contains("log.target"),
+            "normalized metadata must replace the raw `log.*` transport fields \
+             rather than printing them alongside: {line:?}"
         );
     }
 }
