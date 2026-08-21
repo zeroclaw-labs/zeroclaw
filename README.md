@@ -183,11 +183,11 @@ Built and maintained by the community — original creator [@theonlyhennygod](ht
 Thanks to the communities that incubated early work: **Harvard University**, **MIT**, **Sundai Club**, and every contributor pushing it forward.
 
 <p align="center">
-  <a href="https://www.star-history.com/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
+  <a href="https://star-history.dera.page/#zeroclaw-labs/zeroclaw&type=date&legend=top-left">
     <picture>
-     <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
-     <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
-     <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=zeroclaw-labs/zeroclaw&type=date&theme=dark&legend=top-left" />
+     <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
+     <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=zeroclaw-labs/zeroclaw&type=date&legend=top-left" />
     </picture>
   </a>
 </p>
