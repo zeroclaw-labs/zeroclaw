@@ -845,28 +845,21 @@ fn effective_source_identity_matches(
     let Some(toml::Value::Table(alias_table)) = family_table.get(alias) else {
         return false;
     };
-    // URI is identity-bearing: compare both directions and allow the
-    // provider-facing composition of `api_path` onto a bare base URL. A
-    // selector `custom:https://vision.example.invalid` with global
-    // `api_path = "/v1"` materializes `https://vision.example.invalid/v1`;
-    // the bare base still names that same effective source.
+    // URI is identity-bearing: require exact normalized equality. The
+    // global `api_path` composition (`base + api_path` → `uri`) is handled
+    // at the fold site where the selector's URL is composed with the same
+    // `api_path` before the equivalence check, so the rewrite can require
+    // exact equality without a permissive prefix. A base URL must not match
+    // an unrelated `/v2` endpoint merely because it is a slash-descendant.
     match (
         expected_url,
         alias_table.get("uri").and_then(toml::Value::as_str),
     ) {
         (Some(expected), Some(actual)) => {
-            if actual == expected {
-                // exact match
-            } else {
+            if actual != expected {
                 let exp_trim = expected.trim_end_matches('/');
                 let act_trim = actual.trim_end_matches('/');
-                if act_trim == exp_trim {
-                    // slash-normalized exact
-                } else if act_trim.starts_with(exp_trim)
-                    && act_trim[exp_trim.len()..].starts_with('/')
-                {
-                    // actual is expected base plus an api_path suffix
-                } else {
+                if act_trim != exp_trim {
                     return false;
                 }
             }
