@@ -22432,15 +22432,40 @@ impl Config {
             // typo, and silently ignoring it leaves an operator believing they
             // opened a path they did not.
             for private in &entry.egress_allow_private {
-                if !zeroclaw_infra::net_guard::egress_host_matches(
-                    private.trim_start_matches("*."),
-                    &entry.egress_hosts,
-                ) && !entry.egress_hosts.iter().any(|h| h == private)
-                {
+                // A carve-out only relaxes an address class for hosts
+                // `egress_hosts` already grants, so it must be compared the way
+                // the runtime matcher (`egress_host_matches`) compares a
+                // request. Trimming `*.` and asking only whether the apex is
+                // granted validates a wildcard carve-out that the matcher then
+                // renders inert: `egress_hosts=["api.example.com"]` names the
+                // apex alone, while `*.api.example.com` grants only its
+                // subdomains, so no request could ever use the carve-out.
+                let granted = match private.strip_prefix("*.") {
+                    // A wildcard carve-out `*.X` widens the class for every
+                    // strict subdomain of `X`. Only an equal-or-broader
+                    // *wildcard* grant reaches those hosts: `*.X` itself, or
+                    // `*.Y` where `X` is `Y` or a subdomain of `Y`. An exact
+                    // grant `X` reaches no subdomain, so it never validates a
+                    // wildcard carve-out.
+                    Some(apex) => entry
+                        .egress_hosts
+                        .iter()
+                        .filter_map(|grant| grant.strip_prefix("*."))
+                        .any(|grant_apex| {
+                            apex == grant_apex || apex.ends_with(&format!(".{grant_apex}"))
+                        }),
+                    // An exact carve-out `X` is granted when `X` is named
+                    // exactly or falls under a wildcard grant — exactly the
+                    // reachability question the runtime matcher answers.
+                    None => {
+                        zeroclaw_infra::net_guard::egress_host_matches(private, &entry.egress_hosts)
+                    }
+                };
+                if !granted {
                     validation_bail!(
                         InvalidFormat,
                         format!("plugins.entries.{}.egress_allow_private", entry.name),
-                        "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one",
+                        "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one. A wildcard carveout ('*.host') needs an equal-or-broader wildcard grant, not an exact one",
                         entry.name
                     );
                 }
@@ -25840,6 +25865,62 @@ enabled = true
             assert!(
                 config.validate().is_ok(),
                 "a carveout of {carveout:?} is a subset of the *.example.com grant and must validate"
+            );
+        }
+    }
+
+    /// A wildcard carve-out must be validated the way the runtime matcher
+    /// matches it — an exact grant names an apex alone and reaches no subdomain,
+    /// so it cannot make `*.host` do anything. Compared semantically rather than
+    /// by trimming `*.` and asking whether the apex is granted.
+    #[test]
+    async fn validate_rejects_a_wildcard_carveout_under_only_an_exact_grant() {
+        let mut config = Config::default();
+        config.plugins.entries = vec![super::PluginEntryConfig {
+            name: "wild_under_exact".into(),
+            egress_hosts: vec!["api.example.com".into()],
+            egress_allow_private: vec!["*.api.example.com".into()],
+            ..Default::default()
+        }];
+        let err = config
+            .validate()
+            .expect_err("a wildcard carveout under an exact grant is inert and must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("egress_allow_private"),
+            "error must name the offending path; got: {text}"
+        );
+        assert!(
+            text.contains("not granted by egress_hosts"),
+            "error must explain the carveout is not granted; got: {text}"
+        );
+    }
+
+    /// The valid wildcard-carve-out shapes still pass: an equal wildcard grant,
+    /// a broader wildcard grant, and (for an exact carve-out) an exact grant.
+    #[test]
+    async fn validate_accepts_wildcard_carveouts_under_a_wildcard_grant_and_exact_under_exact() {
+        let cases: &[(&[&str], &str)] = &[
+            // equal wildcard grant
+            (&["*.api.example.com"], "*.api.example.com"),
+            // broader wildcard grant
+            (&["*.example.com"], "*.api.example.com"),
+            // exact carveout under an exact grant
+            (&["api.example.com"], "api.example.com"),
+            // exact carveout under a wildcard grant (matcher reaches it)
+            (&["*.example.com"], "host.example.com"),
+        ];
+        for (hosts, carveout) in cases {
+            let mut config = Config::default();
+            config.plugins.entries = vec![super::PluginEntryConfig {
+                name: "wild_ok".into(),
+                egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+                egress_allow_private: vec![(*carveout).to_string()],
+                ..Default::default()
+            }];
+            assert!(
+                config.validate().is_ok(),
+                "carveout {carveout:?} under grant {hosts:?} must validate"
             );
         }
     }

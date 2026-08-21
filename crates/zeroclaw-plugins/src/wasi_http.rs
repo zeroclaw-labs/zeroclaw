@@ -131,6 +131,17 @@ fn authority_endpoint(
     }
     // Whatever `host()` did not claim is the port, separator included.
     let host = authority.host();
+    // A trailing root dot (`api.example.`) is kept by `as_str()` — the value
+    // that fills the `Host` header — but stripped by request-host
+    // normalization, which drives both policy matching and resolution. The two
+    // ends would then name different endpoints (and the absolute dotted form
+    // also suppresses DNS search-list expansion that the stripped form
+    // re-enables), so refuse it outright rather than reconcile the divergence.
+    // Config entries reject the same trailing dot in `normalize_egress_pattern`
+    // ("not in canonical form"), so neither side can carry one.
+    if host.ends_with('.') {
+        return Err(ErrorCode::HttpRequestUriInvalid);
+    }
     let Some(rest) = text.strip_prefix(host) else {
         return Err(ErrorCode::HttpRequestUriInvalid);
     };
@@ -295,8 +306,15 @@ async fn send(
     // ── authorize ────────────────────────────────────────────────
     // The shared boundary checks the effective grant and the operator's
     // allowlist *before* it resolves anything, then performs the one resolution
-    // and pins what it validated. The deadline covers the call so a stalled
-    // resolver cannot hang the guest either.
+    // and pins what it validated. The deadline bounds how long the *guest* waits
+    // here and how long this future can hold a connection lease — not the
+    // resolver's own work: `tokio::net::lookup_host` runs the platform
+    // `getaddrinfo` on a `spawn_blocking` thread that cannot be cancelled, so on
+    // expiry the guest is released with `ConnectionTimeout` while that blocking
+    // lookup keeps running to its own OS-level completion, bounded by the OS
+    // resolver timeout rather than by this deadline. No egress lease leaks: the
+    // lease is acquired only after resolution succeeds, so the cost of a wedged
+    // resolver is a blocking thread, not a held slot.
     //
     // The requested host is scoped to this block on purpose: past it the only
     // host in hand is the pin's, so there is nothing left to resolve a second
@@ -589,6 +607,11 @@ mod tests {
             // authorized endpoint and the wire `Host` value would disagree.
             "user@example.com",
             "user:pass@example.com:8443",
+            // Trailing root dot: `as_str()`/`host()` keep it for the wire `Host`
+            // header, while request-host normalization strips it for policy and
+            // resolution, so the two ends would name different endpoints.
+            "api.example.",
+            "api.example.:8443",
         ] {
             assert!(
                 matches!(
@@ -598,6 +621,34 @@ mod tests {
                 "{rejected:?} names no single endpoint and must be refused"
             );
         }
+
+        // The same host without the trailing dot is a single well-formed
+        // endpoint, so the rejection turns on the dot alone.
+        assert_eq!(
+            authority_endpoint(&authority("api.example"), false).unwrap(),
+            ("api.example".to_string(), 80)
+        );
+    }
+
+    /// Through the hook the guest actually calls: a trailing-dot authority is
+    /// refused as a malformed URI rather than authorized under its dot-stripped
+    /// form while the wire `Host` header still carries the dot.
+    #[test]
+    fn a_trailing_dot_authority_is_refused_as_malformed() {
+        let service =
+            EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(
+                // The dot-stripped host is granted, so a regression that let the
+                // dot through would reach authorization rather than fail.
+                |_| EgressPolicy::new(&["api.example".to_string()], &[], &[], 4),
+            ));
+        let mut hooks = hooks(Some(service));
+        let response = hooks
+            .send_request(request("http://api.example./"), config())
+            .expect("a malformed URI is a guest-visible error, never a trap");
+        assert!(
+            matches!(denial(response), ErrorCode::HttpRequestUriInvalid),
+            "a trailing-dot authority must be refused as a malformed URI"
+        );
     }
 
     /// The same contract through the hook the guest actually calls: an
