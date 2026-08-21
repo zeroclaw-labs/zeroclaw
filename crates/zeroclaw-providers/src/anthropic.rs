@@ -1174,15 +1174,11 @@ impl AnthropicModelProvider {
                     // finished list for the same thing: `dedupe_tool_results_by_id`
                     // only sees duplicates that already share a message, and this
                     // is what puts them there.
-                    if native_messages
-                        .last()
-                        .is_some_and(|m| m.role == tool_msg.role)
+                    if let Some(last) = native_messages
+                        .last_mut()
+                        .filter(|message| message.role == tool_msg.role)
                     {
-                        native_messages
-                            .last_mut()
-                            .unwrap()
-                            .content
-                            .extend(tool_msg.content);
+                        last.content.extend(tool_msg.content);
                     } else {
                         native_messages.push(tool_msg);
                     }
@@ -1308,12 +1304,11 @@ impl AnthropicModelProvider {
                     // Merge into previous user message if present (e.g.
                     // when a user message immediately follows tool results
                     // which are also role "user" in Anthropic's format).
-                    if native_messages.last().is_some_and(|m| m.role == "user") {
-                        native_messages
-                            .last_mut()
-                            .unwrap()
-                            .content
-                            .extend(content_blocks);
+                    if let Some(last) = native_messages
+                        .last_mut()
+                        .filter(|message| message.role == "user")
+                    {
+                        last.content.extend(content_blocks);
                     } else {
                         native_messages.push(NativeMessage {
                             role: "user".to_string(),

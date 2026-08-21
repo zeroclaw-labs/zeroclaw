@@ -1022,8 +1022,9 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                         current.push(ch);
                         // Detect `<<` (heredoc) but not `<<<` (here-string).
                         if chars.peek() == Some(&'<') {
-                            let second = chars.next().unwrap();
-                            current.push(second);
+                            if let Some(second) = chars.next() {
+                                current.push(second);
+                            }
                             if chars.peek() != Some(&'<') {
                                 reading_heredoc_word = true;
                             }
@@ -1171,7 +1172,7 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
             r"\d*>[ ]?/dev/({})(\s|[;&|)]|$)",
             safe_device_redirect_names_pattern()
         ))
-        .unwrap()
+        .expect("static safe-device redirect regex must compile")
     });
 
     let safe = re.replace_all(command, "$2").to_string();

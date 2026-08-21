@@ -20202,7 +20202,7 @@ impl Config {
             (true, true) => "http_request and web_fetch",
             (true, false) => "http_request",
             (false, true) => "web_fetch",
-            (false, false) => unreachable!(),
+            (false, false) => return,
         };
         warnings.push(crate::validation_warnings::ValidationWarning::new(
             "proxy_conflicts_with_dns_pinned_tools",

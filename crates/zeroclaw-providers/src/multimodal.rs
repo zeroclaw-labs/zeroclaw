@@ -448,7 +448,7 @@ pub fn strip_media_markers(text: &str) -> String {
             r"(?i)\[(?:{}):[^\]]*\]",
             MEDIA_MARKER_KINDS.join("|")
         ))
-        .unwrap()
+        .expect("static media-marker regex must compile")
     });
     RE.replace_all(text, "[media attachment]").into_owned()
 }
@@ -460,7 +460,7 @@ static AUDIO_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock:
         r"(?i)\[(?:{}):([^\]]*)\]",
         AUDIO_MARKER_KINDS.join("|")
     ))
-    .unwrap()
+    .expect("static audio-marker regex must compile")
 });
 
 /// Replace audio markers (`[AUDIO:...]`, `[VOICE:...]`) whose payload is a
