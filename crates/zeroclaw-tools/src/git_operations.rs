@@ -522,6 +522,74 @@ impl GitOperationsTool {
         Ok(affected)
     }
 
+    /// Enumerate the worktree administrative directories `git worktree prune`
+    /// would delete and reject the operation when any resolves to a
+    /// `deny_write`-guarded path. Prune does not touch tracked working-tree
+    /// files; it removes stale `<git-common-dir>/worktrees/<name>` metadata
+    /// directories, which is why this resolves against the common Git
+    /// directory rather than `working_dir` like the other preflights in this
+    /// file. Fails closed if the common Git directory or the dry-run listing
+    /// cannot be determined or parsed.
+    async fn preflight_worktree_prune(&self, working_dir: &std::path::Path) -> anyhow::Result<()> {
+        let common_dir = self
+            .run_git_command(&["rev-parse", "--git-common-dir"], working_dir)
+            .await
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Worktree prune blocked: cannot determine the common Git directory: {e}"
+                ))
+            })?;
+        let common_dir = common_dir.trim();
+        let common_dir = if std::path::Path::new(common_dir).is_absolute() {
+            std::path::PathBuf::from(common_dir)
+        } else {
+            working_dir.join(common_dir)
+        };
+
+        // Unlike every other Git subcommand in this file, `worktree prune`'s
+        // dry-run listing goes to stderr, not stdout, even on a successful
+        // (exit 0) run — `run_git_command` only returns stdout, so this
+        // invokes the process directly.
+        let output = tokio::process::Command::new("git")
+            .args(["worktree", "prune", "--dry-run", "--verbose"])
+            .current_dir(working_dir)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|e| {
+                anyhow::Error::msg(format!(
+                    "Worktree prune blocked: cannot determine which administrative \
+                     directories it would remove: {e}"
+                ))
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!(
+                "Worktree prune blocked: cannot determine which administrative directories \
+                 it would remove: {stderr}"
+            );
+        }
+        let dry_run = String::from_utf8_lossy(&output.stderr).to_string();
+
+        let mut affected = String::new();
+        for line in dry_run.lines().filter(|line| !line.is_empty()) {
+            let relative = line
+                .strip_prefix("Removing ")
+                .and_then(|rest| rest.split(':').next())
+                .ok_or_else(|| {
+                    anyhow::Error::msg(format!(
+                        "Worktree prune blocked: cannot interpret the affected path in git \
+                         output: {line}"
+                    ))
+                })?;
+            affected.push_str(relative);
+            affected.push('\n');
+        }
+
+        self.ensure_git_paths_allowed(&affected, &common_dir, GitAccess::Write, "Worktree prune")
+    }
+
     async fn git_status(
         &self,
         _args: serde_json::Value,
@@ -1255,6 +1323,14 @@ impl GitOperationsTool {
                 })
             }
             "prune" => {
+                if let Err(e) = self.preflight_worktree_prune(working_dir).await {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: ToolOutput::default(),
+                        error: Some(format!("{e}")),
+                    });
+                }
+
                 self.run_git_command(&["worktree", "prune"], working_dir)
                     .await?;
                 Ok(ToolResult {
@@ -2726,6 +2802,98 @@ mod tests {
             "materializing a denied path through worktree add must be refused"
         );
         assert!(!wt.exists(), "a blocked worktree add must create nothing");
+    }
+
+    #[tokio::test]
+    async fn worktree_prune_rejected_when_stale_admin_directory_is_denied() {
+        // Prune deletes stale `.git/worktrees/<name>` metadata, not tracked
+        // working-tree files, so the denial is on the admin directory Git
+        // itself would remove, not on anything under the workspace root.
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        std::process::Command::new("git")
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        // Remove the worktree directory by hand (not via `worktree remove`)
+        // so Git considers its admin entry stale and prunable.
+        std::fs::remove_dir_all(&wt).unwrap();
+        let admin_dir = root.join(".git").join("worktrees").join("wt");
+        assert!(
+            admin_dir.exists(),
+            "admin dir should still exist before pruning"
+        );
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![admin_dir.clone()],
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, root.clone());
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "prune",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "pruning a denied worktree admin directory must be refused"
+        );
+        assert!(
+            admin_dir.exists(),
+            "a blocked prune must not delete the protected admin directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_prune_succeeds_when_no_denied_administrative_path() {
+        let tmp = TempDir::new().unwrap();
+        bootstrap_repo(tmp.path(), &["notes.txt"]).await;
+        let root = tmp.path().canonicalize().unwrap();
+        let wt = root.join("wt");
+
+        std::process::Command::new("git")
+            .args(["worktree", "add", wt.to_str().unwrap(), "-b", "side"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&wt).unwrap();
+        let admin_dir = root.join(".git").join("worktrees").join("wt");
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: root.clone(),
+            deny_write: vec![root.join("untouched.txt")],
+            ..SecurityPolicy::default()
+        });
+        let tool = GitOperationsTool::new(security, root.clone());
+
+        let result = tool
+            .execute(json!({
+                "operation": "worktree",
+                "subcommand": "prune",
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "pruning with no denied administrative path must work: {:?}",
+            result.error
+        );
+        assert!(
+            !admin_dir.exists(),
+            "the stale worktree admin directory should be pruned"
+        );
     }
 
     #[tokio::test]
