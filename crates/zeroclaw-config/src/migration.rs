@@ -2224,6 +2224,49 @@ vision_model_provider = "openai"
     }
 
     #[test]
+    fn v2_canonical_qwen_with_oauth_rewrites_bare_qwen() {
+        // A canonical `qwen` alias with an operator-selected `auth_mode =
+        // "o_auth"` is still the uniquely sourced canonical credential — a
+        // bare `qwen` reference must rewrite to the dotted alias so the
+        // migrated OAuth configuration reaches the alias-aware vision
+        // factory. This is distinct from a variant source like `qwen-code`
+        // which normalizes to different extras; see
+        // `v2_bare_family_with_oauth_variant_stays_fail_closed`.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.qwen]
+model = "vision-model"
+auth_mode = "o_auth"
+oauth_refresh_token = "test-token"
+
+[multimodal]
+vision_model_provider = "qwen"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("qwen.default"),
+            "bare qwen must rewrite to qwen.default even when the canonical alias carries operator oauth"
+        );
+        let typed = cfg
+            .providers
+            .models
+            .qwen
+            .get("default")
+            .expect("qwen.default must exist");
+        assert_eq!(typed.auth_mode, Some(crate::schema::AuthMode::OAuth));
+        assert_eq!(typed.oauth_refresh_token.as_deref(), Some("test-token"));
+        assert_eq!(
+            cfg.providers
+                .models
+                .find("qwen", "default")
+                .and_then(|b| b.model.as_deref()),
+            Some("vision-model")
+        );
+    }
+
+    #[test]
     fn v2_empty_global_extra_headers_with_second_family_keeps_single_owner() {
         // An empty `extra_headers = {}` is a semantic no-op and must not
         // claim alias ownership across multiple families. The existing
