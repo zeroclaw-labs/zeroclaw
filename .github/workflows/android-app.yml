@@ -55,7 +55,9 @@ jobs:
       - name: Install pinned Android components
         shell: bash
         run: |
-          sdkmanager \
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$SDKMANAGER"
+          "$SDKMANAGER" \
             "platforms;android-36" \
             "build-tools;36.1.0" \
             "ndk;28.2.13676358"
