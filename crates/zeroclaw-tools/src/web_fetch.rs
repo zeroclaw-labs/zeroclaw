@@ -2462,12 +2462,33 @@ mod tests {
     }
 
     #[test]
-    fn nat64_embedded_addresses_pass_without_a_configured_prefix() {
-        // Honest boundary: nothing in the address marks it as NAT64.
+    fn nat64_embedded_private_v4_passes_without_a_configured_prefix() {
+        // Honest boundary for *non-metadata* destinations: nothing in the
+        // address marks it as NAT64 to a private host, so without a declared
+        // prefix the SSRF gate accepts it. This is the hole
+        // `security.nat64_prefixes` closes for general private routing, and the
+        // reason the key exists. Metadata is the deliberate exception, refused
+        // whether or not the prefix is declared; see
+        // `undeclared_prefix_metadata_is_refused_without_a_configured_prefix`.
         let private = vec!["2001:67c:2b0:db32:0:1:a00:1".parse().unwrap()];
         assert!(validate_resolved_ips_for_ssrf("attacker.example", false, &private, &[]).is_ok());
+    }
+
+    #[test]
+    fn undeclared_prefix_metadata_is_refused_without_a_configured_prefix() {
+        // Metadata is refused even with the private opt-in and no declared
+        // prefix: the unconditional RFC 6052 layout decode catches the embedded
+        // 169.254.169.254 regardless of whether the operator declared its
+        // translator. Mirrors the net_guard contract
+        // (`undeclared_prefix_metadata_is_refused_under_every_rfc6052_layout`).
         let metadata = vec!["2001:67c:2b0:db32:0:1:a9fe:a9fe".parse().unwrap()];
-        assert!(validate_resolved_ips_for_ssrf("attacker.example", true, &metadata, &[]).is_ok());
+        let err = validate_resolved_ips_for_ssrf("attacker.example", true, &metadata, &[])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("cloud metadata address 169.254.169.254"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
