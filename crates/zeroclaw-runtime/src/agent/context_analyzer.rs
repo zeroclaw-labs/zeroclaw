@@ -53,10 +53,8 @@ fn tools_for_keyword(keyword: &str) -> &'static [&'static str] {
         }
         "shell" | "command" | "run" | "execute" | "install" | "build" => &["shell"],
         "memory" | "remember" | "recall" | "store" | "forget" => &["memory_store", "memory_recall"],
-        "search" | "find" | "grep" | "look" => {
-            &["content_search", "glob_search", "web_search_tool"]
-        }
-        "browser" | "website" | "url" | "http" | "fetch" => &["web_fetch", "web_search_tool"],
+        "search" | "find" | "grep" | "look" => &["content_search", "glob_search", "web_research"],
+        "browser" | "website" | "url" | "http" | "fetch" => &["web_fetch", "web_research"],
         "image" | "screenshot" | "picture" => &["image_info"],
         "git" | "commit" | "branch" | "push" | "pull" => &["git_operations", "shell"],
         _ => &[],
@@ -102,6 +100,24 @@ mod tests {
         ];
         let signals = analyze_turn_context(&history, "ok", 1, &[]);
         assert!(signals.suggested_tools.contains(&"file_read".to_string()));
+    }
+
+    /// Search-ish and browse-ish hints must point at the `web_research`
+    /// delegate, not the raw search tool — which is no longer registered into
+    /// the main loop, so suggesting it would name a tool the agent cannot call.
+    #[test]
+    fn web_keywords_suggest_web_research_not_the_raw_search_tool() {
+        for keyword in ["search", "find", "browser", "website", "url", "fetch"] {
+            let suggested = tools_for_keyword(keyword);
+            assert!(
+                suggested.contains(&"web_research"),
+                "'{keyword}' must suggest web_research, got {suggested:?}"
+            );
+            assert!(
+                !suggested.contains(&"web_search_tool"),
+                "'{keyword}' must not suggest the demoted raw tool, got {suggested:?}"
+            );
+        }
     }
 
     #[test]

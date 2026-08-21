@@ -115,6 +115,7 @@ pub use zeroclaw_tools::text_browser::TextBrowserTool;
 pub use zeroclaw_tools::tool_search::ToolSearchTool;
 pub use zeroclaw_tools::weather_tool::WeatherTool;
 pub use zeroclaw_tools::web_fetch::WebFetchTool;
+pub use zeroclaw_tools::web_research::WebResearchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
@@ -510,6 +511,97 @@ pub struct AllToolsResult {
     /// be trusted. `None` when no agents are configured.
     #[cfg(test)]
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
+}
+
+/// Resolve the model binding a tool-hosted sub-agent should use for its own
+/// LLM calls.
+///
+/// Prefers the calling agent's own `model_provider` entry, so a sub-agent
+/// thinks with the same model as its parent. Falls back to the first configured
+/// entry that actually has a model, which keeps sub-agent tools usable on
+/// contexts whose alias is not a configured agent (gateway listings, tests).
+///
+/// There is deliberately no cheap/small-model tier here: the config schema has
+/// no model-routing surface to express one, and inventing a config key for it
+/// is out of scope. Sub-agents share the session's model.
+fn sub_agent_model_binding<'a>(
+    root_config: &'a zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Option<(
+    &'static str,
+    &'a str,
+    &'a zeroclaw_config::schema::ModelProviderConfig,
+)> {
+    root_config
+        .resolved_model_provider_for_agent(agent_alias)
+        .or_else(|| {
+            root_config
+                .providers
+                .models
+                .iter_entries()
+                .find(|(_, _, entry)| entry.model.as_deref().is_some_and(|m| !m.trim().is_empty()))
+        })
+}
+
+/// Metering seam handed to tool-hosted sub-agents.
+///
+/// The cost tracker and its budget are runtime-internal task-locals, so the
+/// tools crate cannot reach them directly. This is the one adapter that lets a
+/// sub-agent's provider calls participate in the same budget and the same spend
+/// ledger as the main agent loop's calls.
+struct ToolLoopSubAgentMeter {
+    model_provider_name: String,
+    model: String,
+}
+
+impl zeroclaw_tools::web_research::SubAgentMeter for ToolLoopSubAgentMeter {
+    fn enforce_budget(&self) -> Result<(), String> {
+        crate::agent::turn::provider_call::enforce_tool_loop_budget().map_err(|e| e.to_string())
+    }
+
+    fn record_usage(&self, usage: &zeroclaw_api::model_provider::TokenUsage) {
+        let _ = crate::agent::cost::record_tool_loop_cost_usage(
+            &self.model_provider_name,
+            &self.model,
+            usage,
+        );
+    }
+}
+
+/// Assemble the tool scope handed to the `web_research` sub-agent.
+///
+/// The raw search tool, plus the already-registered `web_fetch` handle when one
+/// exists — reusing that instance rather than constructing a second one keeps
+/// the sub-agent on the same domain allowlist and rate limiter as the main
+/// loop. Deliberately excludes shell, write, and local-filesystem tools: a
+/// hostile page could otherwise steer the sub-agent into reading local files
+/// and exfiltrating them through a fetch URL.
+///
+/// The active profile's denylist applies here exactly as it applies to a
+/// registered tool, so excluding `web_fetch` or `web_search_tool` degrades the
+/// sub-agent to search-only, fetch-only, or an empty scope it refuses to run
+/// with. The allowlist deliberately does not gate the scope: `allowed_tools`
+/// narrows the surface the *model* sees, and naming `web_search_tool` there is
+/// already the documented way to resurrect the raw tool into the main registry,
+/// so requiring it for nested use would make "web_research with search, but no
+/// raw search tool" inexpressible. Granting `web_research` grants the
+/// read-only searching and fetching its description promises.
+fn web_research_scope(
+    raw_web_search: &Arc<dyn Tool>,
+    registered: &[Arc<dyn Tool>],
+    security: &SecurityPolicy,
+) -> Vec<Arc<dyn Tool>> {
+    let mut scope: Vec<Arc<dyn Tool>> = Vec::new();
+    if !security.is_tool_excluded(raw_web_search.name()) {
+        scope.push(Arc::clone(raw_web_search));
+    }
+    if let Some(web_fetch) = registered
+        .iter()
+        .find(|t| t.name() == "web_fetch" && !security.is_tool_excluded(t.name()))
+    {
+        scope.push(Arc::clone(web_fetch));
+    }
+    scope
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -1026,9 +1118,13 @@ pub fn all_tools_with_runtime(
         }
     }
 
-    // Web search tool (enabled by default for GLM and other models)
+    // Web research delegate. `[web_search]` still configures the *backend*
+    // (provider, keys, limits); what changed is the surface the main agent
+    // sees. Raw `web_search_tool` is constructed here but lives only inside
+    // `web_research`'s scope, so search-engine result text is distilled by a
+    // bounded sub-agent instead of landing in the primary context window.
     if root_config.web_search.enabled {
-        tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
+        let raw_web_search: Arc<dyn Tool> = Arc::new(WebSearchTool::new_with_config(
             root_config.web_search.search_provider.clone(),
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.tavily_api_key.clone(),
@@ -1038,7 +1134,61 @@ pub fn all_tools_with_runtime(
             root_config.web_search.timeout_secs,
             root_config.config_path.clone(),
             root_config.secrets.encrypt,
-        )));
+        ));
+
+        let scoped_tools = web_research_scope(&raw_web_search, &tool_arcs, security);
+
+        match sub_agent_model_binding(root_config, agent_alias) {
+            Some((family, alias, entry)) => {
+                let model = entry.model.clone().unwrap_or_default();
+                let meter = Arc::new(ToolLoopSubAgentMeter {
+                    model_provider_name: family.to_string(),
+                    model: model.clone(),
+                });
+                tool_arcs.push(Arc::new(WebResearchTool::new(
+                    security.clone(),
+                    scoped_tools,
+                    zeroclaw_tools::web_research::SubAgentBinding {
+                        config: Arc::clone(&config),
+                        family: family.to_string(),
+                        alias: alias.to_string(),
+                        model,
+                        temperature: entry.temperature,
+                        api_key: entry.api_key.clone(),
+                        runtime_options: zeroclaw_providers::provider_runtime_options_for_alias(
+                            root_config,
+                            family,
+                            alias,
+                        ),
+                    },
+                    meter,
+                )));
+            }
+            None => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "error_key": "tools.web_research.no_model",
+                            "agent_alias": agent_alias,
+                        })),
+                    "web_research: no model_provider resolves for this agent, skipping registration"
+                );
+            }
+        }
+
+        // Resurrection path. `allowed_tools` can only ever NARROW an already
+        // built registry (`apply_policy_tool_filter` uses `retain`), so an
+        // operator who explicitly names the raw tool gets it registered here —
+        // otherwise the allowlist would have nothing to keep.
+        if security
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|names| names.iter().any(|n| n == "web_search_tool"))
+        {
+            tool_arcs.push(raw_web_search);
+        }
     }
 
     // Notion API tool (conditionally registered)
@@ -3508,6 +3658,381 @@ const = true
             names.contains(&"shell"),
             "positive control: the registry must still be populated"
         );
+    }
+    // ── web_research registration / raw web_search scoping ───────────
+
+    /// Build a config where `[web_search]` is on and a model provider actually
+    /// resolves, so `web_research` has something to think with.
+    fn web_search_config(tmp: &TempDir) -> Config {
+        let mut cfg = test_config(tmp);
+        cfg.web_search.enabled = true;
+        cfg.providers
+            .models
+            .ensure("openrouter", "default")
+            .expect("openrouter is a known provider family")
+            .model = Some("test-model".to_string());
+        cfg
+    }
+
+    fn web_registry_names(
+        cfg: &Config,
+        security: &Arc<SecurityPolicy>,
+        tmp: &TempDir,
+    ) -> Vec<String> {
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+
+        all_tools(
+            Arc::new(cfg.clone()),
+            security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &cfg.web_fetch,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            cfg,
+            None,
+            false,
+            None,
+        )
+        .tools
+        .iter()
+        .map(|t| t.name().to_string())
+        .collect()
+    }
+
+    /// The headline behavior: `[web_search] enabled` now registers the
+    /// `web_research` delegate, and the raw search tool is NOT in the main
+    /// registry — so search-engine result text cannot reach the primary
+    /// context window.
+    #[test]
+    fn web_search_enabled_registers_web_research_and_not_the_raw_tool() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = web_search_config(&tmp);
+        let names = web_registry_names(&cfg, &Arc::new(SecurityPolicy::default()), &tmp);
+
+        assert!(
+            names.iter().any(|n| n == "web_research"),
+            "web_research must be registered when web_search is enabled, got {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "web_search_tool"),
+            "raw web_search_tool must NOT reach the main registry, got {names:?}"
+        );
+    }
+
+    /// `allowed_tools` can only ever narrow a built registry, so naming the raw
+    /// tool has to make registration happen — otherwise the allowlist would
+    /// have nothing to keep and the tool would be unreachable forever.
+    #[test]
+    fn raw_web_search_is_resurrected_when_allowed_tools_names_it() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = web_search_config(&tmp);
+        let security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec!["web_search_tool".into(), "web_research".into()]),
+            ..SecurityPolicy::default()
+        });
+
+        let names = web_registry_names(&cfg, &security, &tmp);
+        assert!(
+            names.iter().any(|n| n == "web_search_tool"),
+            "explicitly allow-listing web_search_tool must register it, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "web_research"),
+            "web_research must still be registered alongside, got {names:?}"
+        );
+    }
+
+    /// A restrictive allowlist that does not name the raw tool must not
+    /// resurrect it — resurrection is opt-in by name, not by having any
+    /// allowlist at all.
+    #[test]
+    fn raw_web_search_stays_hidden_when_allowed_tools_omits_it() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = web_search_config(&tmp);
+        let security = Arc::new(SecurityPolicy {
+            allowed_tools: Some(vec!["shell".into(), "web_research".into()]),
+            ..SecurityPolicy::default()
+        });
+
+        let names = web_registry_names(&cfg, &security, &tmp);
+        assert!(
+            !names.iter().any(|n| n == "web_search_tool"),
+            "an allowlist without web_search_tool must not resurrect it, got {names:?}"
+        );
+    }
+
+    #[test]
+    fn web_research_absent_when_web_search_is_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = web_search_config(&tmp);
+        cfg.web_search.enabled = false;
+
+        let names = web_registry_names(&cfg, &Arc::new(SecurityPolicy::default()), &tmp);
+        assert!(
+            !names.iter().any(|n| n == "web_research"),
+            "web_research must follow [web_search] enabled, got {names:?}"
+        );
+        assert!(!names.iter().any(|n| n == "web_search_tool"));
+    }
+
+    /// `[web_search]` configures the backend, not the surface: turning it on
+    /// must not require any new config key.
+    #[test]
+    fn web_research_needs_no_config_key_beyond_web_search_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let mut cfg = test_config(&tmp);
+        cfg.web_search.enabled = true;
+        cfg.providers
+            .models
+            .ensure("openrouter", "default")
+            .expect("known family")
+            .model = Some("test-model".to_string());
+
+        let names = web_registry_names(&cfg, &Arc::new(SecurityPolicy::default()), &tmp);
+        assert!(names.iter().any(|n| n == "web_research"), "{names:?}");
+    }
+
+    // ── sub-agent scope composition ──────────────────────────────────
+
+    struct ScopeStub(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for ScopeStub {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "stub"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<zeroclaw_api::tool::ToolResult> {
+            Ok(zeroclaw_api::tool::ToolResult::ok("stub"))
+        }
+    }
+    zeroclaw_api::mock_tool_attribution!(ScopeStub);
+
+    #[test]
+    fn web_research_scope_is_search_plus_fetch_only() {
+        let raw: Arc<dyn Tool> = Arc::new(ScopeStub("web_search_tool"));
+        let registered: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(ScopeStub("shell")),
+            Arc::new(ScopeStub("file_write")),
+            Arc::new(ScopeStub("web_fetch")),
+            Arc::new(ScopeStub("content_search")),
+        ];
+
+        let scope = web_research_scope(&raw, &registered, &SecurityPolicy::default());
+        let names: Vec<&str> = scope.iter().map(|t| t.name()).collect();
+
+        assert_eq!(names, vec!["web_search_tool", "web_fetch"]);
+        assert!(!names.contains(&"shell"), "no shell in the research scope");
+        assert!(
+            !names.contains(&"file_write"),
+            "no write tools in the research scope"
+        );
+        assert!(
+            !names.contains(&"content_search"),
+            "no local-filesystem readers in the research scope"
+        );
+    }
+
+    /// The scope must reuse the registered `web_fetch` instance rather than
+    /// constructing a second one, so both share a domain allowlist and rate
+    /// limiter.
+    #[test]
+    fn web_research_scope_reuses_the_registered_web_fetch_handle() {
+        let raw: Arc<dyn Tool> = Arc::new(ScopeStub("web_search_tool"));
+        let web_fetch: Arc<dyn Tool> = Arc::new(ScopeStub("web_fetch"));
+        let registered: Vec<Arc<dyn Tool>> = vec![Arc::clone(&web_fetch)];
+
+        let scope = web_research_scope(&raw, &registered, &SecurityPolicy::default());
+        assert!(
+            Arc::ptr_eq(&scope[1], &web_fetch),
+            "web_research must hold the same web_fetch Arc the registry holds"
+        );
+    }
+
+    #[test]
+    fn web_research_scope_degrades_to_search_only_without_web_fetch() {
+        let raw: Arc<dyn Tool> = Arc::new(ScopeStub("web_search_tool"));
+        let registered: Vec<Arc<dyn Tool>> = vec![Arc::new(ScopeStub("shell"))];
+
+        let scope = web_research_scope(&raw, &registered, &SecurityPolicy::default());
+        let names: Vec<&str> = scope.iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["web_search_tool"]);
+    }
+
+    // ── The sub-agent scope honors the profile's denylist ────────────
+
+    /// A profile that excludes `web_fetch` must not be able to reach it through
+    /// the delegate. The nested handles carry the same denylist decision a
+    /// registered tool does.
+    #[test]
+    fn web_research_scope_drops_an_excluded_web_fetch() {
+        let raw: Arc<dyn Tool> = Arc::new(ScopeStub("web_search_tool"));
+        let registered: Vec<Arc<dyn Tool>> = vec![Arc::new(ScopeStub("web_fetch"))];
+        let security = SecurityPolicy {
+            excluded_tools: Some(vec!["web_fetch".into()]),
+            ..SecurityPolicy::default()
+        };
+
+        let scope = web_research_scope(&raw, &registered, &security);
+        let names: Vec<&str> = scope.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names,
+            vec!["web_search_tool"],
+            "excluding web_fetch must degrade the scope to search-only"
+        );
+    }
+
+    #[test]
+    fn web_research_scope_drops_an_excluded_search_tool() {
+        let raw: Arc<dyn Tool> = Arc::new(ScopeStub("web_search_tool"));
+        let registered: Vec<Arc<dyn Tool>> = vec![Arc::new(ScopeStub("web_fetch"))];
+        let security = SecurityPolicy {
+            excluded_tools: Some(vec!["web_search_tool".into()]),
+            ..SecurityPolicy::default()
+        };
+
+        let scope = web_research_scope(&raw, &registered, &security);
+        let names: Vec<&str> = scope.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            names,
+            vec!["web_fetch"],
+            "excluding the search tool must degrade the scope to fetch-only"
+        );
+    }
+
+    /// Excluding both leaves an empty scope, which `execute` refuses rather
+    /// than running a sub-agent that can only guess.
+    #[test]
+    fn web_research_scope_is_empty_when_both_tools_are_excluded() {
+        let raw: Arc<dyn Tool> = Arc::new(ScopeStub("web_search_tool"));
+        let registered: Vec<Arc<dyn Tool>> = vec![Arc::new(ScopeStub("web_fetch"))];
+        let security = SecurityPolicy {
+            excluded_tools: Some(vec!["web_search_tool".into(), "web_fetch".into()]),
+            ..SecurityPolicy::default()
+        };
+
+        assert!(
+            web_research_scope(&raw, &registered, &security).is_empty(),
+            "excluding both research tools must leave nothing in the scope"
+        );
+    }
+
+    /// `allowed_tools` narrows the surface the model sees, not the delegate's
+    /// internals: granting `web_research` grants the read-only searching and
+    /// fetching its description promises. Requiring `web_search_tool` in the
+    /// allowlist would also resurrect the raw tool into the main registry,
+    /// making "research with search, but no raw search tool" inexpressible.
+    #[test]
+    fn web_research_scope_survives_an_allowlist_that_names_only_the_delegate() {
+        let raw: Arc<dyn Tool> = Arc::new(ScopeStub("web_search_tool"));
+        let registered: Vec<Arc<dyn Tool>> = vec![Arc::new(ScopeStub("web_fetch"))];
+        let security = SecurityPolicy {
+            allowed_tools: Some(vec!["web_research".into()]),
+            ..SecurityPolicy::default()
+        };
+
+        let scope = web_research_scope(&raw, &registered, &security);
+        let names: Vec<&str> = scope.iter().map(|t| t.name()).collect();
+        assert_eq!(names, vec!["web_search_tool", "web_fetch"]);
+    }
+
+    // ── Readonly agents keep web access ──────────────────────────────
+
+    /// `docs/book/src/security/autonomy.md` permits web search at the
+    /// `readonly` autonomy level, and raw search now reaches the agent only
+    /// through this delegate. A readonly profile must therefore still get
+    /// `web_research` registered, with its full read-only scope.
+    #[test]
+    fn readonly_profile_registers_web_research_with_a_search_and_fetch_scope() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = web_search_config(&tmp);
+        let security = Arc::new(SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        assert!(!security.can_act(), "precondition: the profile is readonly");
+
+        let names = web_registry_names(&cfg, &security, &tmp);
+        assert!(
+            names.iter().any(|n| n == "web_research"),
+            "a readonly agent must keep web access through the delegate, got {names:?}"
+        );
+
+        let raw: Arc<dyn Tool> = Arc::new(ScopeStub("web_search_tool"));
+        let registered: Vec<Arc<dyn Tool>> = vec![Arc::new(ScopeStub("web_fetch"))];
+        let scope = web_research_scope(&raw, &registered, &security);
+        let scope_names: Vec<&str> = scope.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            scope_names,
+            vec!["web_search_tool", "web_fetch"],
+            "readonly keeps both read-only research tools"
+        );
+    }
+
+    /// The delegate is executable under readonly, not merely registered: its
+    /// own policy gate must not reject the call.
+    #[tokio::test]
+    async fn readonly_profile_can_execute_web_research() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: zeroclaw_config::policy::AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = WebResearchTool::new(
+            security,
+            vec![Arc::new(ScopeStub("web_search_tool")) as Arc<dyn Tool>],
+            zeroclaw_tools::web_research::SubAgentBinding {
+                config: Arc::new(Config::default()),
+                family: "openrouter".to_string(),
+                alias: "default".to_string(),
+                model: "test-model".to_string(),
+                temperature: None,
+                api_key: None,
+                runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            },
+            Arc::new(ToolLoopSubAgentMeter {
+                model_provider_name: "openrouter".to_string(),
+                model: "test-model".to_string(),
+            }),
+        );
+
+        // No API key is configured, so the run cannot reach a provider — but it
+        // must fail there rather than at the read-only autonomy gate.
+        let result = tool
+            .execute(serde_json::json!({"question": "anything"}))
+            .await
+            .expect("execute");
+        if let Some(error) = result.error {
+            assert!(
+                !error.contains("read-only mode"),
+                "readonly must not block web_research: {error}"
+            );
+        }
     }
 }
 
