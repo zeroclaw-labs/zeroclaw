@@ -20,7 +20,7 @@ The installed app and package retain the `zerodroid` name for upgrade compatibil
 agent runtime is ZeroClaw from the same repository revision.
 
 The APK is a sideload build, not a Play Store package. Fresh installs keep phone tools, autonomous
-control, LAN access, SSH, boot start, and the overlay off. Accessibility and overlay access still
+control, encrypted remote access, SSH, boot start, and the overlay off. Accessibility and overlay access still
 require explicit grants in Android Settings.
 
 | Flavor | Minimum Android | Difference |

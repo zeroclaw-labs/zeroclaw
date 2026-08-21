@@ -10,9 +10,11 @@ class GeneratedConfigPolicyTest {
         val section = GeneratedConfigPolicy.gatewayIsolation(
             pathPrefix = "/zd-unit-test-path",
             webhookSecret = "unit-test-webhook-secret",
+            loopbackAdminSecret = "unit-test-admin-secret",
         ).joinToString("\n")
 
         assertTrue(section.contains("path_prefix = \"/zd-unit-test-path\""))
+        assertTrue(section.contains("loopback_admin_secret = \"unit-test-admin-secret\""))
         assertTrue(section.contains("[channels.webhook.zerodroid_internal]"))
         assertTrue(section.contains("enabled = false"))
         assertTrue(section.contains("secret = \"unit-test-webhook-secret\""))
@@ -21,11 +23,13 @@ class GeneratedConfigPolicyTest {
     @Test
     fun configPreviewRedactsProviderAndWebhookSecrets() {
         val preview = GeneratedConfigPolicy.redactSecrets(
-            "api_key = \"provider-value\"\nsecret = \"gateway-value\"\npath_prefix = \"/zd-visible\"\n"
+            "api_key = \"provider-value\"\nsecret = \"gateway-value\"\n" +
+                "loopback_admin_secret = \"admin-value\"\npath_prefix = \"/zd-visible\"\n"
         )
 
         assertFalse(preview.contains("provider-value"))
         assertFalse(preview.contains("gateway-value"))
+        assertFalse(preview.contains("admin-value"))
         assertTrue(preview.contains("path_prefix = \"/zd-visible\""))
     }
 

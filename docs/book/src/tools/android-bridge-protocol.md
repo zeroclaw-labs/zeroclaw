@@ -1,4 +1,4 @@
-# Android UI Bridge: UDS JSON-RPC contract (v1)
+# Android UI Bridge: UDS JSON-RPC contract (v2)
 
 Shared interface between:
 - **Client** = Rust `android_*` tools (`crates/zeroclaw-tools/src/android/`).
@@ -52,7 +52,9 @@ Failure:
 Error codes (closed set): `service_unavailable` (accessibility service not connected /
 not enabled), `bad_args`, `timeout`, `no_focus` (no input-focused field for `text`),
 `not_found` (target text/element/package not found), `screenshot_failed`,
-`unsupported_op`, `internal`.
+`unsupported_op`, `wrong_foreground`, `sensitive_target` (zerodroid's own
+credential UI), `manual_confirmation_required` (ordinary action attempted on a
+system dialog), and `internal`.
 
 Text entry is the one operation with a documented fallback. Plenty of real editors reject
 `ACTION_SET_TEXT` while still honouring `ACTION_PASTE`, which is the path the system's own
@@ -70,18 +72,18 @@ error, because the client then reasons about a screen that never changed.
 
 | op | args | data (on ok) | notes |
 |---|---|---|---|
-| `ping` | (none) | `{ "version": "1", "service_connected": bool }` | health probe; never fails except `internal` |
+| `ping` | (none) | `{ "version": "2", "service_connected": bool }` | health probe; never fails except `internal` |
 | `screenshot` | `{ "max_width"?: int=540 }` | `{ "png_base64": string, "width": int, "height": int }` | AccessibilityService.takeScreenshot; downscale so width≤max_width; PNG. Enforce cap below. |
 | `read` | `{ "max_depth"?: int=15 }` | `{ "foreground_package": string, "system_dialog": bool, "dialog"?: {"kind": string, "buttons": [string]}, "nodes": [Node] }` | UI-tree read |
 | `foreground` | (none) | `{ "package": string, "activity"?: string }` | current foreground app |
-| `tap` | `{ "x": int, "y": int }` OR `{ "text": string }` | `{ "dispatched": true }` | coordinate tap via dispatchGesture, or tap-by-visible-text (walk to clickable ancestor) |
-| `swipe` | `{ "x1": int, "y1": int, "x2": int, "y2": int, "duration_ms"?: int=300 }` | `{ "dispatched": true }` | dispatchGesture stroke |
-| `scroll` | `{ "direction": "forward"\|"backward"\|"up"\|"down", "x"?: int, "y"?: int }` | `{ "dispatched": true }` | prefer ACTION_SCROLL_* on nearest scrollable, else gesture |
-| `text` | `{ "text": string }` | `{ "set": true, "method": "set_text"\|"paste" }` | ACTION_SET_TEXT on the input-focused node; `no_focus` if none. On refusal, falls back to clipboard + ACTION_PASTE and reports which path worked; `internal` only if both fail |
-| `key` | `{ "key": "back"\|"home"\|"recents"\|"enter" }` | `{ "dispatched": true }` | global actions / key events |
+| `tap` | `{ "expect_package": string, "x": int, "y": int }` OR `{ "expect_package": string, "text": string }` | `{ "dispatched": true }` | revalidate foreground, then coordinate tap or tap-by-visible-text |
+| `swipe` | `{ "expect_package": string, "x1": int, "y1": int, "x2": int, "y2": int, "duration_ms"?: int=300 }` | `{ "dispatched": true }` | revalidate foreground, then dispatchGesture stroke |
+| `scroll` | `{ "expect_package": string, "direction": "forward"\|"backward"\|"up"\|"down", "x"?: int, "y"?: int }` | `{ "dispatched": true }` | revalidate foreground; prefer ACTION_SCROLL_* on nearest scrollable, else gesture |
+| `text` | `{ "expect_package": string, "text": string }` | `{ "set": true, "method": "set_text"\|"paste" }` | revalidate foreground, then ACTION_SET_TEXT; on refusal, clipboard + ACTION_PASTE |
+| `key` | `{ "expect_package": string, "key": "back"\|"home"\|"recents"\|"enter" }` | `{ "dispatched": true }` | revalidate foreground, then global action / key event |
 | `launch` | `{ "package": string, "activity"?: string }` | `{ "launched": true }` | launch intent for package |
 | `device` | `{ "what": "sensors"\|"location"\|"telephony" }` | the requested reading | read-only platform facts; answered by the socket server directly, since none of them need the accessibility service |
-| `dialog` | `{ "button": string }` | `{ "handled": true }` | click a system-dialog button; synonym-expand ("allow" → Allow/ALLOW/"While using the app"/"Only this time") |
+| `dialog` | `{ "expect_package": string, "button": "allow"\|"deny" }` | `{ "handled": true }` | privileged path only; require a recognized system-dialog package and synonym-expand the closed decision |
 
 ### Node (from `read`)
 
@@ -93,6 +95,7 @@ error, because the client then reasons about a screen that never changed.
   "resource_id"?: string,
   "clickable": bool,
   "editable": bool,
+  "password"?: true,       // text and desc MUST be omitted for password nodes
   "bounds": { "l": int, "t": int, "r": int, "b": int },
   "center": { "x": int, "y": int }   // precomputed tap point
 }
@@ -122,14 +125,20 @@ server samples on a grid and uses a 92% threshold, chosen because the status and
 render), answer `screenshot_failed` with a message saying the frame was blank, so the client
 captures again.
 
-## Foreground assertion (client-side)
+## Foreground assertion (client + server)
 
 The screen is shared mutable state owned by the user and the system, not by the agent: a
 notification, a launcher gesture, or the agent's own stray tap can change the foreground app
-between two calls. Clients should therefore state which app they believe they are driving and
-verify it with `foreground` before acting or capturing, rather than assuming continuity. The Rust
-tools expose this as an `expect_package` argument and refuse the call on a mismatch; no new op is
-needed, since `foreground` already provides the fact.
+between two calls. Every mutating request therefore carries `expect_package`.
+The Rust client verifies it first for useful feedback, and the
+AccessibilityService verifies it again immediately before mutation. The second
+check is normative: client-only verification leaves a time-of-check/time-of-use
+window. Ordinary actions MUST reject recognized system-dialog packages;
+`dialog` is the only privileged path and is exposed by a separately
+approval-gated Rust tool.
+
+The service MUST refuse reads and screenshots when zerodroid itself is the
+foreground package, and MUST omit text/description for password nodes.
 
 ## Size caps (screenshot)
 
@@ -140,12 +149,15 @@ needed, since `foreground` already provides the fact.
 
 ## Client-side behavior (Rust): normative for `android_screenshot`
 
-On `screenshot` success, the Rust tool writes the decoded PNG bytes to a temp file
-(under the OS temp dir) and appends **`[IMAGE:<absolute-path>]`** on its own line to the
+On `screenshot` success, the Rust tool writes the decoded PNG bytes to a private
+0700 cache (0600 files) under the OS temp dir and appends
+**`[IMAGE:<absolute-path>]`** on its own line to the
 ToolResult output text, so the existing multimodal pipeline
 (`zeroclaw-providers/src/multimodal.rs`) routes it to the vision model. Follow the
 `crates/zeroclaw-tools/src/image_info.rs` marker pattern exactly (absolute path, on its
 own line). Do NOT emit a bare `data:` URI (that is the existing ScreenshotTool bug).
+The cache MUST enforce bounded age, file count, and total bytes while protecting
+the current capture long enough for the following provider request.
 
 ## Overlay coordination (server)
 
@@ -162,7 +174,9 @@ coordinate `tap`, then restore; otherwise it appears in captures and intercepts 
 
 ## Versioning
 
-`ping.version` is `"1"`. Additive fields are allowed without a version bump; removing or
+`ping.version` is `"2"`. Version 2 requires `expect_package` for every
+mutating operation and separates privileged dialogs from ordinary actions.
+Additive fields are allowed without a version bump; removing or
 renaming a field or op is a breaking change and requires bumping this doc + both sides.
 
 ## Conformance

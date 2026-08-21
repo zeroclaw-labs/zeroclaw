@@ -1,5 +1,5 @@
-//! `android_action` — drive the phone UI (tap, swipe, scroll, type, keys,
-//! system dialogs).
+//! `android_action` — drive an ordinary app UI (tap, swipe, scroll, type,
+//! and navigation keys).
 //!
 //! This is the one tool in the family that mutates device state, so it is
 //! deliberately kept out of `default_auto_approve()`: an unlisted tool falls
@@ -19,7 +19,7 @@ use super::client::AndroidBridgeClient;
 use super::{tool_msg, tool_msg_with_args};
 
 /// Actions the model may select, each mapping to one protocol op.
-const ACTIONS: &[&str] = &["tap", "swipe", "scroll", "text", "key", "dialog"];
+const ACTIONS: &[&str] = &["tap", "swipe", "scroll", "text", "key"];
 /// Scroll directions the protocol accepts.
 const SCROLL_DIRECTIONS: &[&str] = &["forward", "backward", "up", "down"];
 /// Keys the protocol accepts.
@@ -100,8 +100,19 @@ fn one_of(value: &str, allowed: &[&str], param: &str) -> anyhow::Result<()> {
 pub(crate) fn build_request(args: &Value) -> anyhow::Result<(&'static str, Value)> {
     let action = required_str(args, "action")?;
     one_of(action, ACTIONS, "action")?;
+    let expected = required_str(args, "expect_package")?;
+    if expected.len() > 255
+        || !expected
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+    {
+        anyhow::bail!(tool_msg_with_args(
+            "tool-android-action-error-bad-package",
+            &[("package", expected)],
+        ));
+    }
 
-    match action {
+    let result: anyhow::Result<(&'static str, Value)> = match action {
         "tap" => {
             // Contract: `{x, y}` OR `{text}`. Prefer explicit coordinates.
             if args.get("x").is_some() || args.get("y").is_some() {
@@ -162,10 +173,6 @@ pub(crate) fn build_request(args: &Value) -> anyhow::Result<(&'static str, Value
             one_of(key, KEYS, "key")?;
             Ok(("key", json!({ "key": key })))
         }
-        "dialog" => {
-            let button = required_str(args, "button")?;
-            Ok(("dialog", json!({ "button": button })))
-        }
         // `one_of` above already rejected anything outside ACTIONS.
         other => anyhow::bail!(tool_msg_with_args(
             "tool-android-action-error-enum",
@@ -175,7 +182,14 @@ pub(crate) fn build_request(args: &Value) -> anyhow::Result<(&'static str, Value
                 ("allowed", &ACTIONS.join(", ")),
             ],
         )),
-    }
+    };
+    let (op, mut payload) = result?;
+    // This precondition crosses the wire and is revalidated by the
+    // AccessibilityService immediately before mutation. The earlier client
+    // check below gives a quick error; the service-side check closes the
+    // foreground-change race between two socket calls.
+    payload["expect_package"] = json!(expected);
+    Ok((op, payload))
 }
 
 /// Human-readable one-line description of what an action call will do.
@@ -230,10 +244,6 @@ pub(crate) fn describe(action: &str, payload: &Value) -> String {
             "tool-android-action-did-key",
             &[("key", payload["key"].as_str().unwrap_or_default())],
         ),
-        "dialog" => tool_msg_with_args(
-            "tool-android-action-did-dialog",
-            &[("button", payload["button"].as_str().unwrap_or_default())],
-        ),
         other => other.to_string(),
     }
 }
@@ -283,16 +293,12 @@ impl Tool for AndroidActionTool {
                     "enum": KEYS,
                     "description": tool_msg("tool-android-action-param-key")
                 },
-                "button": {
-                    "type": "string",
-                    "description": tool_msg("tool-android-action-param-button")
-                },
                 "expect_package": {
                     "type": "string",
                     "description": tool_msg("tool-android-action-param-expect-package")
                 }
             },
-            "required": ["action"]
+            "required": ["action", "expect_package"]
         })
     }
 
@@ -313,9 +319,8 @@ impl Tool for AndroidActionTool {
         // Acting in the wrong app is the failure that actually hurts: a tap meant for one app
         // lands in whatever drifted to the foreground, and the model never learns it moved. When
         // the caller says which app it believes it is driving, verify before touching the screen.
-        if let Some(expected) = args.get("expect_package").and_then(Value::as_str)
-            && let Err(error) = self.client.assert_foreground(expected).await
-        {
+        let expected = payload["expect_package"].as_str().unwrap_or_default();
+        if let Err(error) = self.client.assert_foreground(expected).await {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -337,46 +342,60 @@ impl Tool for AndroidActionTool {
 mod tests {
     use super::*;
 
+    fn target(mut args: Value) -> Value {
+        args["expect_package"] = json!("com.example.target");
+        args
+    }
+
     #[test]
     fn tap_prefers_coordinates() {
-        let (op, payload) = build_request(&json!({ "action": "tap", "x": 540, "y": 160 })).unwrap();
+        let (op, payload) =
+            build_request(&target(json!({ "action": "tap", "x": 540, "y": 160 }))).unwrap();
         assert_eq!(op, "tap");
-        assert_eq!(payload, json!({ "x": 540, "y": 160 }));
+        assert_eq!(payload["x"], 540);
+        assert_eq!(payload["y"], 160);
+        assert_eq!(payload["expect_package"], "com.example.target");
     }
 
     #[test]
     fn tap_falls_back_to_text() {
-        let (op, payload) = build_request(&json!({ "action": "tap", "text": "Submit" })).unwrap();
+        let (op, payload) =
+            build_request(&target(json!({ "action": "tap", "text": "Submit" }))).unwrap();
         assert_eq!(op, "tap");
-        assert_eq!(payload, json!({ "text": "Submit" }));
+        assert_eq!(payload["text"], "Submit");
     }
 
     #[test]
     fn swipe_defaults_duration_to_protocol_default() {
-        let (op, payload) =
-            build_request(&json!({ "action": "swipe", "x1": 1, "y1": 2, "x2": 3, "y2": 4 }))
-                .unwrap();
+        let (op, payload) = build_request(&target(
+            json!({ "action": "swipe", "x1": 1, "y1": 2, "x2": 3, "y2": 4 }),
+        ))
+        .unwrap();
         assert_eq!(op, "swipe");
         assert_eq!(payload["duration_ms"], 300);
     }
 
     #[test]
     fn scroll_rejects_unknown_direction() {
-        let err = build_request(&json!({ "action": "scroll", "direction": "sideways" }))
-            .expect_err("unknown direction rejected");
+        let err = build_request(&target(
+            json!({ "action": "scroll", "direction": "sideways" }),
+        ))
+        .expect_err("unknown direction rejected");
         assert!(err.to_string().contains("sideways"), "got: {err}");
     }
 
     #[test]
     fn scroll_omits_coordinates_when_not_supplied() {
-        let (_, payload) =
-            build_request(&json!({ "action": "scroll", "direction": "forward" })).unwrap();
-        assert_eq!(payload, json!({ "direction": "forward" }));
+        let (_, payload) = build_request(&target(
+            json!({ "action": "scroll", "direction": "forward" }),
+        ))
+        .unwrap();
+        assert_eq!(payload["direction"], "forward");
     }
 
     #[test]
     fn key_rejects_unknown_key() {
-        let err = build_request(&json!({ "action": "key", "key": "power" }))
+        let err = build_request(&target(json!({ "action": "key", "key": "power" })))
             .expect_err("unknown key rejected");
         assert!(err.to_string().contains("power"), "got: {err}");
     }
@@ -384,7 +403,8 @@ mod tests {
     #[test]
     fn key_accepts_protocol_keys() {
         for key in KEYS {
-            let (op, payload) = build_request(&json!({ "action": "key", "key": key })).unwrap();
+            let (op, payload) =
+                build_request(&target(json!({ "action": "key", "key": key }))).unwrap();
             assert_eq!(op, "key");
             assert_eq!(payload["key"], *key);
         }
@@ -401,18 +421,24 @@ mod tests {
             schema["properties"].get("expect_package").is_some(),
             "expect_package must be offered, or the model cannot state which app it is driving"
         );
+        assert!(
+            schema["required"]
+                .as_array()
+                .is_some_and(|required| required.contains(&json!("expect_package"))),
+            "expect_package must be required for every mutating action"
+        );
     }
 
     #[test]
     fn rejects_unknown_action() {
-        let err =
-            build_request(&json!({ "action": "reboot" })).expect_err("unknown action rejected");
+        let err = build_request(&target(json!({ "action": "reboot" })))
+            .expect_err("unknown action rejected");
         assert!(err.to_string().contains("reboot"), "got: {err}");
     }
 
     #[test]
     fn rejects_negative_coordinates() {
-        let err = build_request(&json!({ "action": "tap", "x": -5, "y": 10 }))
+        let err = build_request(&target(json!({ "action": "tap", "x": -5, "y": 10 })))
             .expect_err("negative coordinate rejected");
         assert!(err.to_string().contains("-5"), "got: {err}");
     }
@@ -420,7 +446,7 @@ mod tests {
     #[test]
     fn rejects_oversized_text() {
         let long = "a".repeat(MAX_TEXT_LEN + 1);
-        let err = build_request(&json!({ "action": "text", "text": long }))
+        let err = build_request(&target(json!({ "action": "text", "text": long })))
             .expect_err("oversized text rejected");
         assert!(!err.to_string().is_empty());
     }
@@ -428,23 +454,23 @@ mod tests {
     #[test]
     fn text_allows_empty_string() {
         // Clearing a field is a legitimate ACTION_SET_TEXT payload.
-        let (op, payload) = build_request(&json!({ "action": "text", "text": "" })).unwrap();
+        let (op, payload) =
+            build_request(&target(json!({ "action": "text", "text": "" }))).unwrap();
         assert_eq!(op, "text");
         assert_eq!(payload["text"], "");
     }
 
     #[test]
-    fn dialog_requires_a_button() {
-        build_request(&json!({ "action": "dialog" })).expect_err("missing button rejected");
-        let (op, payload) =
-            build_request(&json!({ "action": "dialog", "button": "Allow" })).unwrap();
-        assert_eq!(op, "dialog");
-        assert_eq!(payload["button"], "Allow");
+    fn mutation_requires_foreground_precondition() {
+        let err = build_request(&json!({ "action": "tap", "x": 1, "y": 2 }))
+            .expect_err("missing target package rejected");
+        assert!(err.to_string().contains("expect_package"), "got: {err}");
     }
 
     #[test]
     fn describe_mentions_the_dispatched_action() {
-        let (op, payload) = build_request(&json!({ "action": "tap", "x": 10, "y": 20 })).unwrap();
+        let (op, payload) =
+            build_request(&target(json!({ "action": "tap", "x": 10, "y": 20 }))).unwrap();
         let summary = describe(op, &payload);
         assert!(
             summary.contains("10") && summary.contains("20"),

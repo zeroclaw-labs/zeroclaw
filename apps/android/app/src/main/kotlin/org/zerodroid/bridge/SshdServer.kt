@@ -3,11 +3,15 @@ package org.zerodroid.bridge
 import android.os.Build
 import org.apache.sshd.common.config.keys.AuthorizedKeyEntry
 import org.apache.sshd.common.config.keys.PublicKeyEntryResolver
+import org.apache.sshd.common.session.Session
+import org.apache.sshd.common.util.net.SshdSocketAddress
 import org.apache.sshd.server.Environment
 import org.apache.sshd.server.ExitCallback
 import org.apache.sshd.server.SshServer
 import org.apache.sshd.server.channel.ChannelSession
 import org.apache.sshd.server.command.Command
+import org.apache.sshd.server.forward.ForwardingFilter
+import org.apache.sshd.server.forward.TcpForwardingFilter
 import org.apache.sshd.server.keyprovider.SimpleGeneratorHostKeyProvider
 import org.apache.sshd.server.shell.ShellFactory
 import java.io.File
@@ -15,13 +19,27 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.security.PublicKey
 
+internal object SshTunnelPolicy {
+    fun allows(
+        type: TcpForwardingFilter.Type,
+        address: SshdSocketAddress,
+        gatewayPort: Int,
+    ): Boolean = type == TcpForwardingFilter.Type.Direct &&
+        address.port == gatewayPort &&
+        SshdSocketAddress.isLoopback(address.hostName)
+}
+
 /**
  * In-process SSH server (Apache MINA SSHD). Replaces the dropbear native binary: runs as the app
  * inside the foreground service, so there are NO setuid/setgid/seccomp problems (dropbear's
  * privilege-drop gets killed by Android seccomp on non-root). Pubkey-only; the shell is the
  * bundled busybox userspace with the agent's env. NIO2 transport requires API 26+.
  */
-class SshdServer(private val rt: NativeRuntime, private val onLog: (String) -> Unit) {
+class SshdServer(
+    private val rt: NativeRuntime,
+    private val gatewayPort: Int,
+    private val onLog: (String) -> Unit,
+) {
 
     @Volatile private var sshd: SshServer? = null
     val running get() = sshd?.isOpen == true
@@ -56,6 +74,19 @@ class SshdServer(private val rt: NativeRuntime, private val onLog: (String) -> U
             android.util.Log.i("zerodroid-ssh", "auth user=$user offered=${offered.algorithm}/${offered.javaClass.simpleName} vs ${keys.size} keys -> $ok")
             ok
         }
+        // Preserve remote dashboard access without exposing the cleartext gateway on Wi-Fi.
+        // `ssh -L` arrives as a Direct request; allow only the app's loopback gateway. Deny
+        // arbitrary direct destinations, remote listeners (`ssh -R`), agent forwarding and X11.
+        s.forwardingFilter = object : ForwardingFilter {
+            override fun canForwardAgent(session: Session, requestType: String): Boolean = false
+            override fun canForwardX11(session: Session, requestType: String): Boolean = false
+            override fun canListen(address: SshdSocketAddress, session: Session): Boolean = false
+            override fun canConnect(
+                type: TcpForwardingFilter.Type,
+                address: SshdSocketAddress,
+                session: Session,
+            ): Boolean = SshTunnelPolicy.allows(type, address, gatewayPort)
+        }
         s.shellFactory = ShellFactory { _ -> ShellCommand(rt) }
         s.addSessionListener(object : org.apache.sshd.common.session.SessionListener {
             override fun sessionException(session: org.apache.sshd.common.session.Session, t: Throwable) {
@@ -65,7 +96,7 @@ class SshdServer(private val rt: NativeRuntime, private val onLog: (String) -> U
         })
         s.start()
         sshd = s
-        d("MINA listening on 0.0.0.0:$port")
+        d("MINA listening on 0.0.0.0:$port (forwarding only to 127.0.0.1:$gatewayPort)")
     }
 
     fun stop() {

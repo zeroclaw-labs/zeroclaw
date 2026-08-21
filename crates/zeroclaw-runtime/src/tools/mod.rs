@@ -37,8 +37,8 @@ pub mod verifiable_intent;
 // Tool types from zeroclaw-tools (direct imports, no shims)
 #[cfg(target_os = "android")]
 pub use zeroclaw_tools::android::{
-    AndroidActionTool, AndroidBridgeClient, AndroidDeviceTool, AndroidLaunchTool,
-    AndroidScreenshotTool, AndroidUiReadTool,
+    AndroidActionTool, AndroidBridgeClient, AndroidDeviceTool, AndroidDialogTool,
+    AndroidLaunchTool, AndroidScreenshotTool, AndroidUiReadTool,
 };
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
@@ -634,12 +634,13 @@ fn plugin_config_resolver(
 }
 
 #[cfg(any(target_os = "android", test))]
-fn android_action_would_be_auto_approved(
+fn android_tool_would_be_auto_approved(
     risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    tool_name: &str,
 ) -> bool {
     matches!(
         crate::approval::ApprovalManager::from_risk_profile(risk_profile)
-            .approval_requirement("android_action"),
+            .approval_requirement(tool_name),
         crate::approval::ApprovalRequirement::Approved
     )
 }
@@ -999,6 +1000,23 @@ pub fn all_tools_with_runtime(
                     security.clone(),
                 )));
 
+                // System permission/install dialogs are a distinct privilege boundary. Keep the
+                // capability available only while the effective profile will ask a real operator;
+                // wildcard/full auto-approval fails closed by omitting the tool entirely.
+                if android_tool_would_be_auto_approved(risk_profile, "android_dialog") {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "android_dialog: skipped registration because the effective risk profile auto-approves it"
+                    );
+                } else {
+                    tool_arcs.push(Arc::new(AndroidDialogTool::new(
+                        client.clone(),
+                        security.clone(),
+                    )));
+                }
+
                 // `android_action` taps, swipes, and types on a real phone.
                 // It is deliberately absent from `default_auto_approve()`, so
                 // it normally falls through to `ApprovalRequirement::Prompt`.
@@ -1006,7 +1024,7 @@ pub fn all_tools_with_runtime(
                 // Full autonomy's unconditional approval, fail closed rather
                 // than granting unattended device control.
                 if android_cfg.require_approval_for_actions
-                    && android_action_would_be_auto_approved(risk_profile)
+                    && android_tool_would_be_auto_approved(risk_profile, "android_action")
                 {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -2152,33 +2170,52 @@ const = true
     #[test]
     fn android_action_approval_guard_uses_effective_autonomy() {
         let supervised = zeroclaw_config::schema::RiskProfileConfig::default();
-        assert!(!android_action_would_be_auto_approved(&supervised));
+        assert!(!android_tool_would_be_auto_approved(
+            &supervised,
+            "android_action"
+        ));
 
         let explicit = zeroclaw_config::schema::RiskProfileConfig {
             auto_approve: vec!["android_action".into()],
             ..Default::default()
         };
-        assert!(android_action_would_be_auto_approved(&explicit));
+        assert!(android_tool_would_be_auto_approved(
+            &explicit,
+            "android_action"
+        ));
+        assert!(
+            !android_tool_would_be_auto_approved(&explicit, "android_dialog"),
+            "ordinary UI autonomy must not auto-approve privileged dialogs"
+        );
 
         let wildcard = zeroclaw_config::schema::RiskProfileConfig {
             auto_approve: vec!["*".into()],
             ..Default::default()
         };
-        assert!(android_action_would_be_auto_approved(&wildcard));
+        assert!(android_tool_would_be_auto_approved(
+            &wildcard,
+            "android_action"
+        ));
 
         let explicit_but_asked = zeroclaw_config::schema::RiskProfileConfig {
             auto_approve: vec!["android_action".into()],
             always_ask: vec!["android_action".into()],
             ..Default::default()
         };
-        assert!(!android_action_would_be_auto_approved(&explicit_but_asked));
+        assert!(!android_tool_would_be_auto_approved(
+            &explicit_but_asked,
+            "android_action"
+        ));
 
         let wildcard_ask = zeroclaw_config::schema::RiskProfileConfig {
             auto_approve: vec!["android_action".into()],
             always_ask: vec!["*".into()],
             ..Default::default()
         };
-        assert!(!android_action_would_be_auto_approved(&wildcard_ask));
+        assert!(!android_tool_would_be_auto_approved(
+            &wildcard_ask,
+            "android_action"
+        ));
 
         let full = zeroclaw_config::schema::RiskProfileConfig {
             level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -2186,7 +2223,7 @@ const = true
             ..Default::default()
         };
         assert!(
-            android_action_would_be_auto_approved(&full),
+            android_tool_would_be_auto_approved(&full, "android_action"),
             "Full autonomy approves before always_ask and must fail the registration guard"
         );
     }
@@ -2281,6 +2318,7 @@ const = true
             "android_screenshot",
             "android_ui_read",
             "android_action",
+            "android_dialog",
             "android_launch",
             "android_device",
         ] {
@@ -2345,6 +2383,7 @@ const = true
             "android_screenshot",
             "android_ui_read",
             "android_action",
+            "android_dialog",
             "android_launch",
             "android_device",
         ] {

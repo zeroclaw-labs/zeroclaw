@@ -35,6 +35,11 @@ import java.util.concurrent.TimeUnit
 internal fun isValidLocalSecret(value: String): Boolean =
     value.length == 32 && value.all { it in '0'..'9' || it in 'a'..'f' }
 
+internal object BridgePathPolicy {
+    fun containsCanonicalFile(base: java.io.File, candidate: java.io.File): Boolean =
+        candidate.canonicalFile.toPath().startsWith(base.canonicalFile.toPath())
+}
+
 /**
  * Localhost HTTP bridge. Each endpoint is a native-Android / GMS / ML-Kit capability the
  * agent (in its own process) reaches by curl-ing 127.0.0.1:8470. Loopback-only by design.
@@ -48,8 +53,8 @@ class ApiServer(private val ctx: Context, port: Int) : NanoHTTPD("127.0.0.1", po
     private val token: String = loadOrCreateToken()
     /** Public so the service can mirror it into the agent's HOME for shell-tool auth. */
     val bridgeToken: String get() = token
-    private val imageBase: String =
-        (ctx.getExternalFilesDir(null) ?: ctx.filesDir).canonicalPath
+    private val imageBase: java.io.File =
+        (ctx.getExternalFilesDir(null) ?: ctx.filesDir).canonicalFile
 
     private fun loadOrCreateToken(): String {
         val f = java.io.File(ctx.filesDir, "bridge-token")
@@ -76,11 +81,11 @@ class ApiServer(private val ctx: Context, port: Int) : NanoHTTPD("127.0.0.1", po
         val q = session.parameters.mapValues { it.value.firstOrNull() ?: "" }
         val uri = session.uri.trimEnd('/')
         if (uri != "/health") {
-            val provided = session.headers["authorization"]?.removePrefix("Bearer ")?.trim() ?: q["token"]
+            val provided = session.headers["authorization"]?.removePrefix("Bearer ")?.trim()
             if (provided == null || provided != token) {
                 return newFixedLengthResponse(Response.Status.UNAUTHORIZED, "application/json",
                     JSONObject().put("error", "unauthorized")
-                        .put("hint", "pass ?token=<bridge-token> or Authorization: Bearer <token>").toString())
+                        .put("hint", "pass Authorization: Bearer <bridge-token>").toString())
             }
         }
         return try {
@@ -143,7 +148,7 @@ class ApiServer(private val ctx: Context, port: Int) : NanoHTTPD("127.0.0.1", po
             .put("gms", try { pm.getPackageInfo("com.google.android.gms", 0); true } catch (e: Exception) { false })
             .put("gemini_app", try { pm.getPackageInfo("com.google.android.apps.bard", 0); true } catch (e: Exception) { false })
         return JSONObject().put("permissions", map).put("features", features)
-            .put("image_dir", imageBase)
+            .put("image_dir", imageBase.path)
             .put("endpoints", JSONArray(listOf(
                 "/device", "/sensors", "/location", "/ble/scan", "/wifi/scan", "/telephony",
                 "/contacts", "/sms/list", "/sms/send?to=&body=", "/notify?title=&text=",
@@ -275,7 +280,10 @@ class ApiServer(private val ctx: Context, port: Int) : NanoHTTPD("127.0.0.1", po
     private fun img(path: String?): InputImage {
         // Restrict to the app's external files dir; reject path traversal / arbitrary file read.
         val f = java.io.File(path ?: "").canonicalFile
-        require(f.path.startsWith(imageBase)) { "path must be under $imageBase (got ${f.path})" }
+        require(BridgePathPolicy.containsCanonicalFile(imageBase, f)) {
+            "path must be under ${imageBase.path} (got ${f.path})"
+        }
+        require(f.isFile) { "path must name an existing image file" }
         return InputImage.fromFilePath(ctx, Uri.fromFile(f))
     }
 

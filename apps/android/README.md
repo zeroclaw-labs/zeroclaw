@@ -8,7 +8,7 @@ existing signing lineage and installed-app upgrades stay compatible. In the mono
 experimental ZeroClaw Android app, not a separate agent runtime.
 
 > **Experimental sideload.** Accessibility can read and act in other apps. Fresh installs
-> keep phone tools, autonomous control, LAN access, SSH, boot start, and the floating overlay off.
+> keep phone tools, autonomous control, encrypted remote access, SSH, boot start, and the floating overlay off.
 > Enable only the capabilities you intend to use on a device you control.
 
 ## What ships
@@ -23,7 +23,8 @@ experimental ZeroClaw Android app, not a separate agent runtime.
   AccessibilityService broker.
 - A CellClaw-derived floating chat circle with agent-state colors and capture-hide coordination.
 - The ZeroClaw dashboard and generic Android skill bundled as APK assets.
-- An optional in-process, public-key-only SSH server for trusted LAN use.
+- An optional in-process, public-key-only SSH server that carries the remote shell and a constrained
+  encrypted tunnel to the otherwise loopback-only gateway.
 
 ## Architecture
 
@@ -43,7 +44,7 @@ experimental ZeroClaw Android app, not a separate agent runtime.
 │  OverlayService ── local paired gateway chat                             │
 └──────────────────────────────────────────────────────────────────────────┘
 
-Optional paired client ── private gateway path + pairing ── phone agent
+Optional paired client ── pubkey SSH tunnel ── loopback gateway + pairing ── phone agent
 ```
 
 The Unix socket is intentionally phone-local. Network clients talk to the paired gateway; they do
@@ -68,7 +69,8 @@ side by side.
 5. Enable **Autonomous control** only while supervising the device. It pre-approves the typed
    Android action tools; shell and file mutation remain separately gated.
 6. Enable the floating circle only after granting **Draw over other apps**.
-7. Enable LAN access only on a trusted network. Pairing remains mandatory.
+7. For remote access, paste an SSH public key and enable the encrypted SSH tunnel. The gateway never
+   binds directly to Wi-Fi; forward local port 42617 as shown in the app, then pair normally.
 
 Changing either Android capability switch restarts a running gateway so stale sessions cannot keep
 an older policy.
@@ -132,8 +134,9 @@ been exercised on a physical arm64 Android 16 device through:
 - Accessibility grant persistence and autonomous-policy restart behavior.
 
 Provider credentials, quota, OEM background restrictions, and manual Android grants remain
-environment-specific. Provider preferences use Keystore-backed encryption where available and
-fall back to Android's app-private, backup-disabled storage on incompatible OEM keystores.
+environment-specific. Provider preferences use Keystore-backed encryption and fail closed when the
+OEM Keystore is unavailable. Generated config stores provider and gateway credentials only as
+ZeroClaw-compatible `enc2:` ciphertext under a 0600 master key.
 
 ## Attribution
 

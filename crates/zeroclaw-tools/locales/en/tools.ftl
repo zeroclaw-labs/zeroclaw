@@ -26,7 +26,7 @@ tool-android-ui-read-dialog = System dialog present (kind: { $kind }); buttons: 
 tool-android-ui-read-node-count = { $count } interactive or labelled nodes:
 tool-android-ui-read-truncated = Output truncated after { $shown } of { $total } nodes to stay within the size limit.
 
-tool-android-action = Control the Android UI: tap, swipe, scroll, type text, press a hardware key, or answer a system dialog. Changes device state, so calls are subject to operator approval.
+tool-android-action = Control an ordinary Android app: tap, swipe, scroll, type text, or press a navigation key. Every call must name the expected foreground package and is refused if the screen moved.
 tool-android-action-param-action = Which UI action to perform.
 tool-android-action-param-x = X coordinate for tap, or an optional scroll anchor.
 tool-android-action-param-y = Y coordinate for tap, or an optional scroll anchor.
@@ -38,19 +38,25 @@ tool-android-action-param-duration = Swipe duration in milliseconds. Defaults to
 tool-android-action-param-direction = Scroll direction.
 tool-android-action-param-text = Text to type for the 'text' action, or the visible label to tap for the 'tap' action.
 tool-android-action-param-key = Hardware or navigation key to press.
-tool-android-action-param-button = System-dialog button label to click, such as 'Allow'.
 tool-android-action-did-tap-xy = Tapped ({ $x }, { $y }).
 tool-android-action-did-tap-text = Tapped the element labelled "{ $text }".
 tool-android-action-did-swipe = Swiped from ({ $x1 }, { $y1 }) to ({ $x2 }, { $y2 }).
 tool-android-action-did-scroll = Scrolled { $direction }.
 tool-android-action-did-text = Typed { $chars } characters into the focused field.
 tool-android-action-did-key = Pressed the { $key } key.
-tool-android-action-did-dialog = Clicked the "{ $button }" dialog button.
 tool-android-action-error-missing-int = The '{ $param }' parameter is required and must be an integer.
 tool-android-action-error-missing-str = The '{ $param }' parameter is required and must be a non-empty string.
 tool-android-action-error-coord-range = The '{ $param }' coordinate { $value } is out of range (0 to { $max }).
 tool-android-action-error-enum = '{ $value }' is not a valid { $param }. Choose one of: { $allowed }.
 tool-android-action-error-text-too-long = Text is too long ({ $bytes } bytes, maximum { $max }).
+tool-android-action-error-bad-package = '{ $package }' is not a valid expected Android package name.
+
+tool-android-dialog = Confirm or deny a currently visible Android system permission/install dialog. This privileged action is separate from ordinary UI control and must remain operator-approved.
+tool-android-dialog-param-button = Decision to make: allow or deny.
+tool-android-dialog-param-expect-package = Expected system-dialog package, such as com.android.permissioncontroller.
+tool-android-dialog-error-button = The dialog button must be 'allow' or 'deny'.
+tool-android-dialog-error-package = android_dialog requires the expected foreground system package.
+tool-android-dialog-did-click = Clicked the privileged system dialog's "{ $button }" decision.
 
 tool-android-launch = Launch an Android app by package name, optionally targeting a specific activity.
 tool-android-launch-param-package = Application package name, such as 'com.android.settings'.
@@ -252,7 +258,7 @@ tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, crea
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
 
-tool-android-action-param-expect-package = Package name the caller believes is on screen (for example com.android.settings). When set, the action is refused if a different app is foreground, so a tap never lands in an app that drifted forward.
+tool-android-action-param-expect-package = Required package name the caller believes is on screen (for example com.android.settings). The bridge revalidates it immediately before acting so a tap never lands in an app that drifted forward.
 tool-android-error-wrong-foreground = Refused: expected { $expected } to be on screen but { $actual } is foreground. Take a screenshot and re-orient before acting.
 
 tool-android-device = Read a device fact from the Android phone: attached sensors, last known location, or telephony/carrier state. Reads only; it never changes the device or touches the screen.

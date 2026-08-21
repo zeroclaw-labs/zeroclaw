@@ -5,6 +5,7 @@ import android.graphics.Typeface
 import android.os.Bundle
 import android.text.InputType
 import android.view.View
+import android.view.WindowManager
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.*
@@ -29,6 +30,9 @@ class ConfigEditorActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Raw config can contain provider and gateway secrets; never expose it to screenshots,
+        // recent-app thumbnails, screen sharing, or another capture service.
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         cfg = ConfigStore(applicationContext)
         rt = NativeRuntime(applicationContext)
         setContentView(buildUi())

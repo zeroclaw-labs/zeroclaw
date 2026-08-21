@@ -3,7 +3,9 @@
 use async_trait::async_trait;
 use base64::Engine;
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use std::time::{Duration, SystemTime};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 use super::client::AndroidBridgeClient;
@@ -22,6 +24,87 @@ const MIN_WIDTH: u32 = 120;
 const MAX_WIDTH: u32 = 4096;
 
 static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
+static SCREENSHOT_SWEEPER: OnceLock<()> = OnceLock::new();
+const CACHE_DIR_NAME: &str = "zeroclaw-android-screenshots";
+const CACHE_MAX_FILES: usize = 8;
+const CACHE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const CACHE_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    path: PathBuf,
+    size: u64,
+    modified: SystemTime,
+}
+
+fn retention_victims(
+    mut entries: Vec<CacheEntry>,
+    now: SystemTime,
+    protected: Option<&Path>,
+) -> Vec<PathBuf> {
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
+    let mut kept = 0usize;
+    let mut bytes = 0u64;
+    let mut victims = Vec::new();
+    for entry in entries {
+        let is_protected = protected.is_some_and(|path| path == entry.path);
+        let expired = now
+            .duration_since(entry.modified)
+            .is_ok_and(|age| age > CACHE_MAX_AGE);
+        let over_budget =
+            kept >= CACHE_MAX_FILES || bytes.saturating_add(entry.size) > CACHE_MAX_BYTES;
+        if !is_protected && (expired || over_budget) {
+            victims.push(entry.path);
+        } else {
+            kept += 1;
+            bytes = bytes.saturating_add(entry.size);
+        }
+    }
+    victims
+}
+
+fn cleanup_cache(dir: &Path, protected: Option<&Path>) {
+    let entries = std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata.is_file().then(|| CacheEntry {
+                path: entry.path(),
+                size: metadata.len(),
+                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            })
+        })
+        .collect();
+    for victim in retention_victims(entries, SystemTime::now(), protected) {
+        let _ = std::fs::remove_file(victim);
+    }
+}
+
+fn screenshot_cache_dir() -> anyhow::Result<PathBuf> {
+    let dir = std::env::temp_dir().join(CACHE_DIR_NAME);
+    std::fs::create_dir_all(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    cleanup_cache(&dir, None);
+    let sweeper_dir = dir.clone();
+    SCREENSHOT_SWEEPER.get_or_init(|| {
+        std::thread::Builder::new()
+            .name("android-screenshot-sweeper".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(5 * 60));
+                    cleanup_cache(&sweeper_dir, None);
+                }
+            })
+            .ok();
+    });
+    Ok(dir)
+}
 
 pub struct AndroidScreenshotTool {
     client: AndroidBridgeClient,
@@ -73,11 +156,24 @@ pub(crate) fn render_screenshot(data: &Value) -> anyhow::Result<ToolResult> {
     // A uniquely named file under the OS temp dir. It must outlive this
     // function: the multimodal pipeline reads the path out of the marker on
     // the next provider request, so an auto-deleting handle would race it.
-    let path = std::env::temp_dir().join(format!(
+    let path = screenshot_cache_dir()?.join(format!(
         "zeroclaw_android_screenshot_{}.png",
         uuid::Uuid::new_v4()
     ));
-    std::fs::write(&path, &bytes).map_err(|e| {
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()
+    })();
+    write_result.map_err(|e| {
         anyhow::Error::msg(tool_msg_with_args(
             "tool-android-screenshot-error-write",
             &[
@@ -86,6 +182,7 @@ pub(crate) fn render_screenshot(data: &Value) -> anyhow::Result<ToolResult> {
             ],
         ))
     })?;
+    cleanup_cache(path.parent().unwrap_or_else(|| Path::new(".")), Some(&path));
 
     let marker_path = path.display().to_string();
     let size_kb = bytes.len() / 1024;
@@ -261,5 +358,46 @@ mod tests {
         let err = render_screenshot(&json!({ "png_base64": "!!!not base64!!!" }))
             .expect_err("invalid base64 is an error");
         assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn retention_keeps_newest_within_count_and_byte_budgets() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let entries: Vec<_> = (0..10)
+            .map(|index| CacheEntry {
+                path: PathBuf::from(format!("shot-{index}.png")),
+                size: 1024,
+                modified: now - Duration::from_secs(index),
+            })
+            .collect();
+        let victims = retention_victims(entries, now, None);
+        assert_eq!(victims.len(), 2);
+        assert!(victims.contains(&PathBuf::from("shot-8.png")));
+        assert!(victims.contains(&PathBuf::from("shot-9.png")));
+    }
+
+    #[test]
+    fn retention_expires_old_files_but_never_the_current_capture() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10_000);
+        let current = PathBuf::from("current.png");
+        let old = now - CACHE_MAX_AGE - Duration::from_secs(1);
+        let victims = retention_victims(
+            vec![
+                CacheEntry {
+                    path: current.clone(),
+                    size: 1,
+                    modified: old,
+                },
+                CacheEntry {
+                    path: PathBuf::from("old.png"),
+                    size: 1,
+                    modified: old,
+                },
+            ],
+            now,
+            Some(&current),
+        );
+        assert!(!victims.contains(&current));
+        assert!(victims.contains(&PathBuf::from("old.png")));
     }
 }

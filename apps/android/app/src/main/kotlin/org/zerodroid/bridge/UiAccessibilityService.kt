@@ -71,29 +71,41 @@ class UiAccessibilityService : AccessibilityService() {
                 // Coordinate gestures inject at screen points; hide the floating bubble first so it
                 // can't intercept the tap (mirrors cellclaw AppControlTool's requestHide(500)).
                 "tap" -> deferGesture(resultReceiver, HIDE_GESTURE_MS) {
-                    handleTap(
-                        intent.getIntExtra("x", Int.MIN_VALUE),
-                        intent.getIntExtra("y", Int.MIN_VALUE),
-                        intent.getStringExtra("text")
-                    )
+                    guardedMutation(intent) {
+                        handleTap(
+                            intent.getIntExtra("x", Int.MIN_VALUE),
+                            intent.getIntExtra("y", Int.MIN_VALUE),
+                            intent.getStringExtra("text")
+                        )
+                    }
                 }
                 "swipe" -> deferGesture(resultReceiver, HIDE_GESTURE_MS) {
-                    handleSwipe(
-                        intent.getIntExtra("x1", 0), intent.getIntExtra("y1", 0),
-                        intent.getIntExtra("x2", 0), intent.getIntExtra("y2", 0),
-                        intent.getIntExtra("duration_ms", 300).toLong()
-                    )
+                    guardedMutation(intent) {
+                        handleSwipe(
+                            intent.getIntExtra("x1", 0), intent.getIntExtra("y1", 0),
+                            intent.getIntExtra("x2", 0), intent.getIntExtra("y2", 0),
+                            intent.getIntExtra("duration_ms", 300).toLong()
+                        )
+                    }
                 }
                 "scroll" -> deferGesture(resultReceiver, HIDE_GESTURE_MS) {
-                    handleScroll(
-                        intent.getStringExtra("direction") ?: "forward",
-                        intent.getIntExtra("x", Int.MIN_VALUE),
-                        intent.getIntExtra("y", Int.MIN_VALUE)
-                    )
+                    guardedMutation(intent) {
+                        handleScroll(
+                            intent.getStringExtra("direction") ?: "forward",
+                            intent.getIntExtra("x", Int.MIN_VALUE),
+                            intent.getIntExtra("y", Int.MIN_VALUE)
+                        )
+                    }
                 }
-                "text" -> sendResult(resultReceiver, handleType(intent.getStringExtra("text") ?: ""))
-                "key" -> sendResult(resultReceiver, handleKey(intent.getStringExtra("key") ?: ""))
-                "dialog" -> sendResult(resultReceiver, handleSystemDialog(intent.getStringExtra("button") ?: "allow"))
+                "text" -> sendResult(resultReceiver, guardedMutation(intent) {
+                    handleType(intent.getStringExtra("text") ?: "")
+                })
+                "key" -> sendResult(resultReceiver, guardedMutation(intent) {
+                    handleKey(intent.getStringExtra("key") ?: "")
+                })
+                "dialog" -> sendResult(resultReceiver, guardedMutation(intent, systemDialog = true) {
+                    handleSystemDialog(intent.getStringExtra("button") ?: "")
+                })
                 // Hide the bubble so it never lands in the capture (mirrors cellclaw
                 // ScreenCaptureTool's requestHide(800)); answered async from the screenshot callback.
                 "screenshot" -> deferScreenshot(resultReceiver, intent.getIntExtra("max_width", 540))
@@ -170,6 +182,28 @@ class UiAccessibilityService : AccessibilityService() {
     private fun foreground(): JSONObject {
         val pkg = rootInActiveWindow?.packageName?.toString() ?: "unknown"
         return JSONObject().put("package", pkg)
+    }
+
+    /** Revalidate the model's target at the final privileged boundary, immediately before input.
+     *  The earlier Rust-side foreground call is useful feedback but cannot close the race where a
+     *  notification or user gesture changes windows between two socket requests. */
+    private fun guardedMutation(
+        intent: Intent,
+        systemDialog: Boolean = false,
+        action: () -> JSONObject,
+    ): JSONObject {
+        val expected = intent.getStringExtra("expect_package")?.trim()
+        val actual = rootInActiveWindow?.packageName?.toString()
+        UiSecurityPolicy.mutationRejection(
+            expected,
+            actual,
+            packageName,
+            systemDialogPackages,
+            systemDialog,
+        )?.let {
+            return err(it.code, it.message)
+        }
+        return action()
     }
 
     // ── tap ─────────────────────────────────────────────────────────────
@@ -344,6 +378,9 @@ class UiAccessibilityService : AccessibilityService() {
             ?: return JSONObject().put("foreground_package", "unknown")
                 .put("system_dialog", false).put("nodes", JSONArray())
         val pkg = root.packageName?.toString() ?: "unknown"
+        UiSecurityPolicy.observationRejection(pkg, packageName)?.let {
+            return err(it.code, it.message)
+        }
         val nodes = JSONArray()
         traverseNode(root, nodes, maxDepth, 0)
 
@@ -367,8 +404,14 @@ class UiAccessibilityService : AccessibilityService() {
 
     private fun traverseNode(node: AccessibilityNodeInfo, out: JSONArray, maxDepth: Int, depth: Int) {
         if (depth > maxDepth) return
-        val text = node.text?.toString()
-        val desc = node.contentDescription?.toString()
+        val password = node.isPassword
+        val visible = UiSecurityPolicy.visibleText(
+            password,
+            node.text?.toString(),
+            node.contentDescription?.toString(),
+        )
+        val text = visible.text
+        val desc = visible.description
         // Mirror CellClaw's filter: keep only nodes with text, a description, or that are interactive.
         if (text != null || desc != null || node.isClickable || node.isEditable) {
             val b = Rect(); node.getBoundsInScreen(b)
@@ -379,6 +422,7 @@ class UiAccessibilityService : AccessibilityService() {
             node.viewIdResourceName?.let { n.put("resource_id", it) }
             n.put("clickable", node.isClickable)
             n.put("editable", node.isEditable)
+            if (password) n.put("password", true)
             n.put("bounds", JSONObject().put("l", b.left).put("t", b.top).put("r", b.right).put("b", b.bottom))
             n.put("center", JSONObject().put("x", b.centerX()).put("y", b.centerY()))
             out.put(n)
@@ -426,9 +470,9 @@ class UiAccessibilityService : AccessibilityService() {
         val alternatives = when (button.lowercase()) {
             "allow" -> listOf("Allow", "ALLOW", "While using the app", "Only this time")
             "deny" -> listOf("Deny", "DENY", "Don't allow", "Don't Allow")
-            else -> emptyList()
+            else -> return err("bad_args", "dialog button must be allow or deny")
         }
-        for (label in listOf(button) + alternatives) {
+        for (label in alternatives) {
             val nodes = root.findAccessibilityNodeInfosByText(label)
             if (nodes.isNullOrEmpty()) continue
             val target = findClickableParent(nodes.first()) ?: nodes.first()
@@ -443,6 +487,11 @@ class UiAccessibilityService : AccessibilityService() {
     private fun handleScreenshot(receiver: ResultReceiver?, maxWidth: Int) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             sendResult(receiver, err("screenshot_failed", "takeScreenshot needs Android 11+ (API 30)"))
+            return
+        }
+        val pkg = rootInActiveWindow?.packageName?.toString()
+        UiSecurityPolicy.observationRejection(pkg, packageName)?.let {
+            sendResult(receiver, err(it.code, it.message))
             return
         }
         val width = maxWidth.coerceIn(64, 4096)

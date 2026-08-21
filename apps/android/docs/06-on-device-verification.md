@@ -28,12 +28,12 @@ OEM accessibility, overlay, battery, telephony, sensor, or app-integration behav
       the repository.
 - [ ] Fresh app data contains no inherited provider config, memories, sessions, or user-specific
       skill bundle.
-- [ ] Phone tools, Autonomous control, LAN access, SSH, boot start, and the bubble are all off.
+- [ ] Phone tools, Autonomous control, encrypted remote access, SSH, boot start, and the bubble are all off.
 - [ ] Accessibility, Draw over other apps, and battery exemptions require deliberate re-granting.
 - [ ] After the clean-install baseline, a same-certificate `adb install -r` preserves app data and
       Android grants. Test lite separately on an API 30 device/emulator when available.
 - [ ] Starting the agent creates a live `libzeroclaw.so` child and a fresh `<filesDir>/ui.sock`.
-- [ ] `GET <private-path>/health` succeeds through the intended loopback/LAN route and reports the
+- [ ] `GET <private-path>/health` succeeds through loopback and reports the
       new PID; the unprefixed admin pairing route is not reachable.
 - [ ] Turning Autonomous control off while running changes the gateway PID and removes mutating
       Android tools from the effective session; the UI must never show OFF over a stale Full profile.
@@ -65,6 +65,8 @@ Query the gateway; do not ask the model which tools it has.
 
 - [ ] `android_action`
 - [ ] `android_device`
+- [ ] `android_dialog` is present only under a profile that will prompt; it is absent under Full or
+      wildcard auto-approval.
 - [ ] `android_launch`
 - [ ] `android_screenshot`
 - [ ] `android_ui_read`
@@ -73,7 +75,7 @@ Query the gateway; do not ask the model which tools it has.
 
 ## 4. UI-control contract
 
-Run every action with `expect_package` when that parameter is available.
+Run every mutating action with the required `expect_package`.
 
 - [ ] `android_launch` opens Settings and reports `com.android.settings`.
 - [ ] `android_ui_read` returns the same foreground package plus real visible nodes/bounds.
@@ -90,8 +92,11 @@ Run every action with `expect_package` when that parameter is available.
 - [ ] Text entry succeeds through `ACTION_SET_TEXT` or clipboard `ACTION_PASTE`, reports its method,
       appears in the target field, and restores the owner's prior clipboard.
 - [ ] Back, Home, Recents, and Enter each execute or return an honest error.
-- [ ] A system dialog is detected and a named button can be handled without tapping arbitrary
-      coordinates.
+- [ ] Ordinary `android_action` calls refuse recognized system-dialog packages.
+- [ ] `android_dialog button=allow|deny` handles a harmless named decision only after operator
+      approval; it rejects arbitrary labels and the wrong foreground package.
+- [ ] A password node returns structural metadata with `password=true` but no text or description.
+- [ ] With zerodroid itself foreground, UI read and screenshot return `sensitive_target`.
 
 ## 5. Read-only device APIs
 
@@ -169,11 +174,15 @@ valid summary unless every row was actually configured and exercised.
       each other's conversation state. Reusing an explicit `X-Session-Id` preserves context only
       for that named conversation.
 - [ ] Pairing-enabled bubble self-pairs and retries once after token rejection.
+- [ ] Restarting the bubble reuses its Keystore-backed pairing token rather than accumulating a new
+      persistent paired device.
 - [ ] A bubble webhook without `X-Webhook-Secret` is rejected even with a valid paired token.
-- [ ] Another local app cannot discover the generated path from the unprefixed gateway root; the
-      complete path is shared only through zerodroid's displayed/copyable dashboard URL.
-- [ ] LAN mode never runs with pairing disabled.
-- [ ] Same-LAN browser/dashboard can drive the phone when LAN mode is explicitly enabled.
+- [ ] A request from loopback with the complete private path but without
+      `X-Loopback-Admin-Secret` cannot read or mint a pairing code.
+- [ ] The gateway remains bound to `127.0.0.1` while encrypted remote access is enabled.
+- [ ] Pubkey SSH allows a local forward to `127.0.0.1:42617`, but rejects forwarding to port 8470,
+      other hosts, remote listeners, agent forwarding, and X11.
+- [ ] Same-Wi-Fi browser/dashboard can drive the phone only through that encrypted SSH tunnel.
 - [ ] USB forwarding is a development console only; unplugging USB does not stop the agent,
       accessibility bridge, bubble, or outbound provider traffic.
 

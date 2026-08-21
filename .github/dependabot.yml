@@ -37,6 +37,8 @@ updates:
     directory: "/apps/android"
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     target-branch: master
     open-pull-requests-limit: 2
     labels:

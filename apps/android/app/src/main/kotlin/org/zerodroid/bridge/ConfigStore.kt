@@ -61,9 +61,18 @@ internal object GeneratedConfigPolicy {
     fun redactSecrets(config: String): String = config
         .replace(Regex("(?m)^api_key = .*$"), "api_key = \"••••••••\"")
         .replace(Regex("(?m)^secret = .*$"), "secret = \"••••••••\"")
+        .replace(
+            Regex("(?m)^loopback_admin_secret = .*$"),
+            "loopback_admin_secret = \"••••••••\"",
+        )
 
-    fun gatewayIsolation(pathPrefix: String, webhookSecret: String): List<String> = listOf(
+    fun gatewayIsolation(
+        pathPrefix: String,
+        webhookSecret: String,
+        loopbackAdminSecret: String,
+    ): List<String> = listOf(
         "path_prefix = ${ConfigStore.tomlStr(pathPrefix)}",
+        "loopback_admin_secret = ${ConfigStore.tomlStr(loopbackAdminSecret)}",
         "",
         "[channels.webhook.zerodroid_internal]",
         "enabled = false",
@@ -122,7 +131,7 @@ internal object GeneratedConfigPolicy {
             if (autonomous) {
                 "excluded_tools = []"
             } else {
-                "excluded_tools = [\"android_action\", \"android_launch\", \"shell\", \"bash\", \"file_write\"]"
+                "excluded_tools = [\"android_action\", \"android_dialog\", \"android_launch\", \"shell\", \"bash\", \"file_write\"]"
             }
         )
         add("")
@@ -132,9 +141,9 @@ internal object GeneratedConfigPolicy {
 class ConfigStore(private val ctx: Context) {
 
     // EncryptedSharedPreferences (Tink/Keystore) can throw on corrupted keysets or OEM keystore
-    // quirks. A thrown exception here would kill the foreground service, so degrade deliberately:
-    // try → wipe the corrupted keyset and retry → fall back to app-private plain prefs. Lazy so the
-    // keystore work happens on first ACCESS (callers arrange that off the main/FGS thread).
+    // quirks. Fail closed without deleting encrypted state: a transient Keystore failure must not
+    // become credential loss, and plaintext fallback would overstate at-rest protection. Lazy so
+    // keystore work happens off the main/FGS thread.
     private val prefs: SharedPreferences by lazy { openPrefs(ctx) }
 
     private fun openPrefs(ctx: Context): SharedPreferences {
@@ -148,16 +157,9 @@ class ConfigStore(private val ctx: Context) {
         }
         return try {
             encrypted()
-        } catch (e: Throwable) {
-            android.util.Log.w(TAG, "encrypted prefs failed (${e.message}); wiping keyset + retrying")
-            try {
-                ctx.deleteSharedPreferences(SECURE_PREFS)
-                ctx.deleteSharedPreferences("__androidx_security_crypto_encrypted_prefs__")
-                encrypted()
-            } catch (e2: Throwable) {
-                android.util.Log.e(TAG, "encrypted prefs unavailable; using app-private plain prefs")
-                ctx.getSharedPreferences("zerodroid-fallback", Context.MODE_PRIVATE)
-            }
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "encrypted prefs unavailable; refusing credential storage")
+            throw IllegalStateException("Android Keystore is unavailable", e)
         }
     }
 
@@ -198,6 +200,8 @@ class ConfigStore(private val ctx: Context) {
     fun setTemperature(id: String, v: String) = prefs.edit().putString("temp_$id", v.trim()).apply()
 
     // ---- gateway / runtime toggles ----
+    /** Enable encrypted remote access through the app's pubkey-only SSH server. The gateway itself
+     *  remains loopback-only; remote clients use an SSH local-forward tunnel. */
     var lanAccess: Boolean
         get() = prefs.getBoolean("lan_access", false)
         set(v) = prefs.edit().putBoolean("lan_access", v).apply()
@@ -271,6 +275,20 @@ class ConfigStore(private val ctx: Context) {
     val activeGatewayWebhookSecret: String?
         get() = if (manualConfig) null else localSecret("gateway_webhook_secret")
 
+    /** App-private second factor for localhost admin endpoints. Unlike the path prefix, this value
+     *  is never shown or copied into a dashboard URL. */
+    val activeGatewayAdminSecret: String?
+        get() = if (manualConfig) null else localSecret("gateway_admin_secret")
+
+    /** Persist the overlay's paired bearer token across process restarts so self-pairing does not
+     *  create an orphaned valid token on every service recreation. */
+    var overlayPairingToken: String?
+        get() = prefs.getString("overlay_pairing_token", null)?.takeIf { it.isNotBlank() }
+        set(v) = prefs.edit().apply {
+            if (v.isNullOrBlank()) remove("overlay_pairing_token")
+            else putString("overlay_pairing_token", v)
+        }.apply()
+
     fun gatewayUrl(host: String): String =
         "http://$host:$gatewayPort${activeGatewayPathPrefix}/"
 
@@ -284,16 +302,23 @@ class ConfigStore(private val ctx: Context) {
     }
 
     /**
-     * Render config.toml from current settings. Loopback + mandatory pairing by default; LAN bind is
-     * opt-in and STILL requires pairing (never an open gateway).
+     * Render config.toml from current settings. The gateway is always loopback-only; remote access
+     * is preserved through the separately authenticated SSH tunnel rather than exposing bearer
+     * tokens and user traffic over cleartext Wi-Fi.
      */
-    fun renderConfig(webDistDir: String? = null): String {
+    fun renderConfig(
+        webDistDir: String? = null,
+        encryptedApiKey: String? = null,
+        encryptedWebhookSecret: String? = null,
+        encryptedAdminSecret: String? = null,
+    ): String {
         val id = providerId
-        val host = if (lanAccess) "0.0.0.0" else "127.0.0.1"
+        val host = "127.0.0.1"
         val androidEnabled = androidToolsEnabled
         val autonomous = androidEnabled && autonomousControlEnabled
         val gatewayPathPrefix = "/zd-${localSecret("gateway_path_secret")}"
         val gatewayWebhookSecret = localSecret("gateway_webhook_secret")
+        val gatewayAdminSecret = localSecret("gateway_admin_secret")
         val L = ArrayList<String>()
         L += "# Generated by zerodroid. (Switch on \"Edit config manually\" to own this file.)"
         L += "schema_version = 3"
@@ -303,7 +328,7 @@ class ConfigStore(private val ctx: Context) {
             L += "requires_openai_auth = true"
             L += "wire_api = \"responses\""
         } else if (apiKey(id).isNotEmpty()) {
-            L += "api_key = ${tomlStr(apiKey(id))}"
+            L += "api_key = ${tomlStr(encryptedApiKey ?: apiKey(id))}"
         }
         if (model(id).isNotEmpty()) L += "model = ${tomlStr(model(id))}"
         if (baseUrl(id).isNotEmpty()) L += "uri = ${tomlStr(baseUrl(id))}"
@@ -312,10 +337,14 @@ class ConfigStore(private val ctx: Context) {
         L += "[gateway]"
         L += "host = ${tomlStr(host)}"
         L += "port = $gatewayPort"
-        L += "allow_public_bind = $lanAccess"
+        L += "allow_public_bind = false"
         L += "require_pairing = true"
         if (webDistDir != null) L += "web_dist_dir = ${tomlStr(webDistDir)}"
-        L += GeneratedConfigPolicy.gatewayIsolation(gatewayPathPrefix, gatewayWebhookSecret)
+        L += GeneratedConfigPolicy.gatewayIsolation(
+            gatewayPathPrefix,
+            encryptedWebhookSecret ?: gatewayWebhookSecret,
+            encryptedAdminSecret ?: gatewayAdminSecret,
+        )
         L += GeneratedConfigPolicy.androidSection(
             androidEnabled,
             autonomousControlEnabled,
@@ -339,11 +368,15 @@ class ConfigStore(private val ctx: Context) {
     fun writeConfig(rt: NativeRuntime) {
         rt.configDir.mkdirs()
         val webDist = rt.webDist.takeIf { File(it, "index.html").exists() }?.absolutePath
+        val encoder = RuntimeSecretEncoder(rt.configDir)
+        val key = apiKey(providerId).takeIf { it.isNotEmpty() }?.let(encoder::encrypt)
+        val webhook = encoder.encrypt(localSecret("gateway_webhook_secret"))
+        val admin = encoder.encrypt(localSecret("gateway_admin_secret"))
         val tmp = File(rt.configDir, "config.toml.tmp")
-        tmp.writeText(renderConfig(webDist))
+        tmp.writeText(renderConfig(webDist, key, webhook, admin))
         try { android.system.Os.chmod(tmp.absolutePath, 384 /* 0600 */) } catch (e: Exception) {}
         if (!tmp.renameTo(rt.configFile)) {
-            rt.configFile.writeText(renderConfig())
+            rt.configFile.writeText(renderConfig(webDist, key, webhook, admin))
             try { android.system.Os.chmod(rt.configFile.absolutePath, 384) } catch (e: Exception) {}
             tmp.delete()
         }

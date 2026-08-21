@@ -9,16 +9,18 @@ offers a tool-capable model. It cannot prove credentials, quotas, or the provide
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
+import os
 import re
+import ssl
 import sys
 import time
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 
-CATALOG_URL = "https://models.dev/api.json"
+CATALOG_HOST = "models.dev"
+CATALOG_PATH = "/api.json"
 
 # The Android app's provider IDs do not always match models.dev's IDs.
 CATALOG_PROVIDER = {
@@ -59,17 +61,37 @@ def parse_defaults(config_store: Path) -> dict[str, str]:
 def load_catalog(path: Path | None) -> dict:
     if path:
         return json.loads(path.read_text())
-    request = urllib.request.Request(
-        CATALOG_URL, headers={"User-Agent": "zeroclaw-android-model-check"}
-    )
+    # python.org macOS installs do not always load the system trust store. Keep
+    # verification enabled while preferring an explicit operator bundle, then
+    # the standard Unix/macOS bundle when present.
+    cert_file = os.environ.get("SSL_CERT_FILE")
+    if not cert_file and Path("/etc/ssl/cert.pem").is_file():
+        cert_file = "/etc/ssl/cert.pem"
+    context = ssl.create_default_context(cafile=cert_file)
     for attempt in range(3):
+        connection = http.client.HTTPSConnection(
+            CATALOG_HOST,
+            timeout=60,
+            context=context,
+        )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:  # noqa: S310
-                return json.load(response)
-        except (TimeoutError, urllib.error.URLError):
+            connection.request(
+                "GET",
+                CATALOG_PATH,
+                headers={"User-Agent": "zeroclaw-android-model-check"},
+            )
+            response = connection.getresponse()
+            if response.status == 429 or response.status >= 500:
+                raise OSError(f"models.dev transient HTTP {response.status}")
+            if response.status != 200:
+                raise RuntimeError(f"models.dev returned HTTP {response.status}")
+            return json.loads(response.read())
+        except (TimeoutError, OSError, http.client.HTTPException):
             if attempt == 2:
                 raise
             time.sleep(2 ** attempt)
+        finally:
+            connection.close()
     raise AssertionError("unreachable")
 
 

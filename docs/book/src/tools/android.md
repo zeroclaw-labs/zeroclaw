@@ -20,7 +20,8 @@ wire contract between the two halves.
 |---|---|
 | `android_screenshot` | Capture the screen and attach it for visual inspection. The image reaches the vision model through an `[IMAGE:<path>]` marker, the same path used by `image_info`. |
 | `android_ui_read` | Read the accessibility tree: visible text, content descriptions, resource IDs, and a precomputed tap point for every interactive node. |
-| `android_action` | Tap, swipe, scroll, type text, press a navigation key, or answer a system dialog. |
+| `android_action` | Tap, swipe, scroll, type text, or press a navigation key in an explicitly named foreground app. |
+| `android_dialog` | Allow or deny a recognized system permission/install dialog through a separately approval-gated path. |
 | `android_launch` | Launch an app by package name, optionally targeting a specific activity. |
 | `android_device` | Read a device fact: attached sensors, last known location, or telephony/carrier state. Reads only, and needs no accessibility service. |
 
@@ -85,6 +86,12 @@ through a `"*"` wildcard, and `always_ask` does not pull it back, the tool is
 not registered at all, and a warning explains why. Set it to `false` only if
 you genuinely intend unattended control of the device.
 
+`android_dialog` is never part of ordinary autonomous control. If its effective
+profile would auto-approve it (including full autonomy or `"*"`), it is omitted
+from the registry. This keeps permission and package-install confirmation
+available to an approval-capable session without letting a broad UI-control
+grant inherit that privilege.
+
 `android_screenshot` and `android_ui_read` only read. `android_launch` and
 `android_action` both pass the autonomy and rate-limit gate, so read-only
 autonomy blocks them.
@@ -100,11 +107,12 @@ one job must not offer a second, unguarded way to do it.
 
 ### Acting in the wrong app
 
-`android_action` and `android_screenshot` accept `expect_package`. Set it to the app you believe
-you are driving and the call is refused when something else is foreground, naming what it found.
-Use it for anything consequential: the screen can change under you between two tool calls, and
-without this a tap aimed at one app lands wherever focus drifted, with nothing in the result to
-say so.
+`android_action` requires `expect_package`; `android_dialog` requires the expected
+system package. The Rust client checks first for useful feedback, then the
+AccessibilityService revalidates at the final mutation boundary. If the screen
+changes between those checks, the action fails instead of landing in the new
+foreground app. Ordinary actions are refused while a system dialog is showing.
+`android_screenshot` accepts the same field as an optional observation guard.
 
 `android_screenshot` also fails rather than returning a blank capture. Slow apps are often caught
 mid-render, and an empty image is worse than an error: there is no way to distinguish "nothing
@@ -120,6 +128,11 @@ untrusted input that may try to steer the agent. The exposure class is the same
 as the browser tools: read output is capped and structured, and the one tool
 that can act on a suggestion is the one behind an approval prompt. Keep it
 there when the agent is looking at content the user did not write.
+
+Password nodes never expose text or descriptions, and zerodroid's own
+credential-bearing UI is excluded from accessibility reads and screenshots.
+Captured PNGs live in a private 0700 cache with 0600 files and are bounded by
+age, count, and bytes; stale captures are swept rather than retained forever.
 
 ## Failure modes
 

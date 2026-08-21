@@ -56,6 +56,9 @@
         android:theme="@style/Theme.Zerodroid"
         android:supportsRtl="true">
 
+        <!-- Android 12+ requires the launcher activity to be exported. MainActivity deliberately
+             consumes no inbound data, extras or actions; it only renders owner-operated controls.
+             Privileged services remain non-exported or protected by a system signature permission. -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -93,7 +96,7 @@
             android:foregroundServiceType="specialUse|connectedDevice">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Self-hosted on-device AI agent: a persistent local HTTP/WebSocket gateway the owner reaches over loopback or their own LAN to run the agent on their phone." />
+                android:value="Self-hosted on-device AI agent: a persistent loopback HTTP/WebSocket gateway the owner reaches locally or through the app's encrypted SSH tunnel." />
         </service>
 
         <!-- UI Accessibility Service: reads + controls the screen of any app on an unrooted phone,

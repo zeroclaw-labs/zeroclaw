@@ -8,8 +8,8 @@ use zeroclaw_api::tool_attribution;
 
 #[cfg(any(target_os = "android", all(test, unix)))]
 use crate::android::{
-    AndroidActionTool, AndroidDeviceTool, AndroidLaunchTool, AndroidScreenshotTool,
-    AndroidUiReadTool,
+    AndroidActionTool, AndroidDeviceTool, AndroidDialogTool, AndroidLaunchTool,
+    AndroidScreenshotTool, AndroidUiReadTool,
 };
 use crate::ask_user::AskUserTool;
 use crate::backup_tool::BackupTool;
@@ -84,6 +84,8 @@ use crate::web_search_tool::WebSearchTool;
 tool_attribution!(AndroidActionTool, ToolKind::Plugin);
 #[cfg(any(target_os = "android", all(test, unix)))]
 tool_attribution!(AndroidDeviceTool, ToolKind::Plugin);
+#[cfg(any(target_os = "android", all(test, unix)))]
+tool_attribution!(AndroidDialogTool, ToolKind::Plugin);
 #[cfg(any(target_os = "android", all(test, unix)))]
 tool_attribution!(AndroidLaunchTool, ToolKind::Plugin);
 #[cfg(any(target_os = "android", all(test, unix)))]

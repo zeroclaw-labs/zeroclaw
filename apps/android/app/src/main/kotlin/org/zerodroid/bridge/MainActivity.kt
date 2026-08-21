@@ -17,6 +17,7 @@ import android.provider.Settings
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
 import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.widget.*
@@ -64,6 +65,8 @@ class MainActivity : AppCompatActivity(), RuntimeState.Listener {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // This activity renders provider credentials, pairing codes and private gateway paths.
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         cfg = ConfigStore(applicationContext)
         rt = NativeRuntime(applicationContext)
         setContentView(buildUi())
@@ -218,10 +221,12 @@ class MainActivity : AppCompatActivity(), RuntimeState.Listener {
 
         // ---- access & network (collapsed) ----
         col.addView(collapsible("Access & network", false) { c ->
-            lanSwitch = Switch(this).apply { text = "Allow LAN access (drive from a PC over wifi)" }
+            lanSwitch = Switch(this).apply {
+                text = "Encrypted remote access (SSH tunnel over wifi)"
+            }
             c.addView(lanSwitch)
-            c.addView(hint("Off = loopback only. On = the gateway binds to wifi so a PC can pair. " +
-                "Pairing is always required; only on a network you trust."))
+            c.addView(hint("The gateway always stays on loopback. On starts the pubkey-only SSH " +
+                "listener so a PC can forward the dashboard through an encrypted tunnel."))
             bootSwitch = Switch(this).apply { text = "Start automatically on boot"; setPadding(0, dp(8), 0, 0) }
             c.addView(bootSwitch)
             c.addView(hint("Bring the agent back after a reboot (pair with battery exemption)."))
@@ -258,8 +263,8 @@ class MainActivity : AppCompatActivity(), RuntimeState.Listener {
         col.addView(collapsible("Remote shell (SSH)", false) { c ->
             sshSwitch = Switch(this).apply { text = "Enable SSH shell (in-process, pubkey-only)" }
             c.addView(sshSwitch)
-            c.addView(hint("Encrypted shell into the phone — no passwords. Paste your PUBLIC key below. " +
-                "Needs LAN access on + battery exemption."))
+            c.addView(hint("Encrypted shell and dashboard tunnel into the phone — no passwords. " +
+                "Paste your PUBLIC key below and enable encrypted remote access."))
             sshPortField = EditText(this).apply { hint = "2222"; inputType = InputType.TYPE_CLASS_NUMBER }
             c.addView(label("SSH port")); c.addView(sshPortField)
             sshKeyField = EditText(this).apply {
@@ -556,17 +561,18 @@ class MainActivity : AppCompatActivity(), RuntimeState.Listener {
     private fun refreshNetwork() {
         val ip = lanIp()                          // WifiManager only — no prefs
         val port = cfg.gatewayPort                // plain val, no keystore
-        val lan = ready && cfg.lanAccess          // only read the pref once warmed off-main
+        val remote = ready && cfg.lanAccess       // encrypted SSH listener, never a gateway bind
         val running = RuntimeState.gatewayState == GatewayProcess.State.RUNNING
         val lines = ArrayList<String>()
         lines += "phone IP : ${ip ?: "(wifi down)"}"
-        lines += "gateway  : ${if (running) "running :$port" else "stopped"} ${if (lan) "(LAN)" else "(loopback)"}"
-        if (ip != null && lan) lines += "dashboard: ${cfg.gatewayUrl(ip)}"
+        lines += "gateway  : ${if (running) "running :$port" else "stopped"} (loopback only)"
         RuntimeState.pairCode?.let { lines += "pair code: $it" }
         lines += "—"
-        if (ready && cfg.sshEnabled && lan && ip != null)
+        if (ready && cfg.sshEnabled && remote && ip != null) {
             lines += "ssh      : ssh -p ${cfg.sshPort} $uidName@$ip"
-        if (ip != null) lines += "adb wifi : adb connect $ip:5555"
+            lines += "tunnel   : ssh -N -L $port:127.0.0.1:$port -p ${cfg.sshPort} $uidName@$ip"
+            lines += "dashboard: ${cfg.gatewayUrl("127.0.0.1")}  (after tunnel)"
+        }
         lines += "CLI      : /data/local/tmp/zeroclaw  (adb/ssh shell)"
         networkView.text = lines.joinToString("\n")
     }
@@ -574,9 +580,9 @@ class MainActivity : AppCompatActivity(), RuntimeState.Listener {
     private fun recycleNetwork() {
         if (!ready) { toast("still loading…"); return }
         persistUi()
-        // Restart the gateway so it re-binds to the current network (covers IP change / stale bind).
+        // Restart the local gateway and encrypted remote-access listener after network changes.
         BridgeService.restart(this)
-        toast("Recycling gateway — rebinding to the current network…")
+        toast("Recycling gateway and remote-access listener…")
         networkView.postDelayed({ refreshNetwork() }, 4000)
     }
 

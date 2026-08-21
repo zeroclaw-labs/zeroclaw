@@ -8,7 +8,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import java.io.File
@@ -108,17 +107,22 @@ class BridgeService : Service() {
         }
     }
 
-    /** Bring up the in-process SSH shell when enabled, configured, and LAN access is on
-     *  (SSH is a remote-access feature; it makes no sense loopback-only and we don't expose a
-     *  network listener unless the user opted into LAN reachability for the gateway too). */
+    /** Bring up the in-process SSH shell + constrained gateway tunnel when the user opted into
+     *  encrypted remote access. The gateway itself remains loopback-only. */
     private fun maybeStartSsh(c: ConfigStore) {
         if (!c.sshEnabled) return
         val hasKey = c.sshAuthorizedKey.isNotBlank() || rt.sshAuthorizedKeys.exists()
         if (!hasKey) { android.util.Log.i("zerodroid-ssh", "no authorized key (pref or file)"); return }
-        if (!c.lanAccess) { RuntimeState.pushLog("[ssh] not started — enable \"Allow LAN access\" first"); return }
+        if (!c.lanAccess) {
+            RuntimeState.pushLog("[ssh] not started — enable encrypted remote access first")
+            return
+        }
         if (Build.VERSION.SDK_INT < 26) { RuntimeState.pushLog("[ssh] needs Android 8+ (API 26)"); return }
         android.util.Log.i("zerodroid-ssh", "maybeStartSsh: starting on ${c.sshPort}")
-        if (sshd == null) sshd = SshdServer(rt) { RuntimeState.pushLog(it); android.util.Log.i("zerodroid-ssh", it) }
+        if (sshd == null) sshd = SshdServer(rt, c.gatewayPort) {
+            RuntimeState.pushLog(it)
+            android.util.Log.i("zerodroid-ssh", it)
+        }
         try { sshd?.start(c.sshPort, c.sshAuthorizedKey) }
         catch (e: Exception) { RuntimeState.pushLog("[ssh] start failed: ${e.message}"); android.util.Log.e("zerodroid-ssh", "start failed", e) }
     }
@@ -136,36 +140,42 @@ class BridgeService : Service() {
     /** Pull the pairing code + compute reachable URLs once the gateway is up. */
     private fun refreshGatewayInfo(epoch: Int) {
         Thread {
-            val code = fetchPairCode()
+            val c = cfg ?: return@Thread
+            val code = fetchPairCode(c)
             // Don't write stale info if a stop/restart happened while we waited.
             if (epoch != infoEpoch || gateway?.state != GatewayProcess.State.RUNNING) return@Thread
-            val c = cfg ?: return@Thread
-            val lan = if (c.lanAccess) lanIp()?.let(c::gatewayUrl) else null
             RuntimeState.setInfo(
                 pair = code,
                 dash = c.gatewayUrl("127.0.0.1"),
-                lan = lan,
+                lan = null,
                 p = gateway?.pid,
             )
         }.apply { isDaemon = true }.start()
     }
 
-    private fun fetchPairCode(): String? {
-        val out = rt.execWithTimeout(
-            listOf(rt.zeroclawBin.absolutePath, "gateway", "get-paircode", "--config-dir", rt.configDir.absolutePath),
-            10_000
-        ) { rt.applyEnv(it) } ?: return null
-        return Regex("([0-9]{6,8}|[A-Z0-9]{6,12})").findAll(out.trim())
-            .map { it.value }.lastOrNull()?.takeIf { it.length in 6..12 }
+    private fun fetchPairCode(c: ConfigStore): String? {
+        return try {
+            val url = java.net.URL(
+                "http://127.0.0.1:${c.gatewayPort}${c.activeGatewayPathPrefix}/admin/paircode"
+            )
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            try {
+                conn.connectTimeout = 4_000
+                conn.readTimeout = 4_000
+                conn.setRequestProperty("X-Loopback-Admin-Secret", c.activeGatewayAdminSecret)
+                if (conn.responseCode !in 200..299) return null
+                val body = conn.inputStream.bufferedReader().use { it.readText() }
+                org.json.JSONObject(body).optString("pairing_code").takeIf {
+                    it.isNotBlank() && it != "null"
+                }
+            } finally {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            RuntimeState.pushLog("[pairing] could not read pair code: ${e.message}")
+            null
+        }
     }
-
-    private fun lanIp(): String? = try {
-        val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
-        @Suppress("DEPRECATION") val ip = wifi.connectionInfo.ipAddress
-        if (ip == 0) null else String.format(
-            "%d.%d.%d.%d", ip and 0xff, ip shr 8 and 0xff, ip shr 16 and 0xff, ip shr 24 and 0xff
-        )
-    } catch (e: Exception) { null }
 
     private fun shutdown() {
         gateway?.stop(); gateway = null

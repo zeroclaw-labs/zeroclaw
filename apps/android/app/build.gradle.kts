@@ -129,16 +129,30 @@ dependencies {
     implementation("com.google.mlkit:language-id:17.0.6")             // language detection
     implementation("com.google.mlkit:translate:17.0.3")              // offline translation
     // Keep the validated entity-extraction line; both APK flavors now start at API 30.
-    implementation("com.google.mlkit:entity-extraction:16.0.0-beta5") // addresses/dates/phones from text
+    implementation("com.google.mlkit:entity-extraction:16.0.0-beta6") // addresses/dates/phones from text
     implementation("com.google.mlkit:barcode-scanning:17.3.0")        // QR / barcodes
     // In-process SSH server (Apache MINA SSHD) — replaces the dropbear native binary. No setuid/
     // setgid/seccomp issues; runs as the app inside the FGS. NIO2 transport needs API 26+.
-    implementation("org.apache.sshd:sshd-core:2.12.1") {
+    implementation("org.apache.sshd:sshd-core:2.19.0") {
         exclude(group = "org.bouncycastle")   // use Android's JCE; avoids the stripped-BC conflict
         exclude(group = "org.slf4j")
     }
-    implementation("net.i2p.crypto:eddsa:0.3.0")        // ed25519 host + client keys (pure Java)
     implementation("org.slf4j:slf4j-nop:1.7.36")        // silence MINA's slf4j logging
+
+    // ML Kit's latest Translate/Entity Extraction artifacts still declare obsolete networking
+    // libraries. OkHttp 4.x is binary-compatible with 3.x callers; these constraints preserve the
+    // APIs while closing the wrong-certificate and malformed-gzip advisories in the resolved APK.
+    constraints {
+        implementation("com.squareup.okhttp3:okhttp:4.12.0") {
+            because("OkHttp < 4.9.2 is affected by GHSA-3cqm-mf7h-prrj")
+        }
+        implementation("com.squareup.okio:okio:3.6.0") {
+            because("Okio < 3.4.0 is affected by GHSA-w33c-445m-f8w7")
+        }
+        "fullImplementation"("com.google.guava:guava:33.4.8-android") {
+            because("AICore exp02 declares vulnerable Guava 31.1-android")
+        }
+    }
 
     // Gemini Nano on-device via Google AI Edge SDK (needs AICore) — FULL flavor only (forces API 31).
     "fullImplementation"("com.google.ai.edge.aicore:aicore:0.0.1-exp02")

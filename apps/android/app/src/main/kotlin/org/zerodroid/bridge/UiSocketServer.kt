@@ -18,7 +18,7 @@ import java.util.concurrent.Executors
 
 /**
  * Unix-domain-socket JSON-RPC server implementing
- * `docs/book/src/tools/android-bridge-protocol.md` (v1).
+ * `docs/book/src/tools/android-bridge-protocol.md` (v2).
  *
  * Transport: a FILESYSTEM-namespace `LocalServerSocket` at `<filesDir>/ui.sock`. The path lives in
  * the app's private data dir (mode 0700), so kernel UID isolation is the whole trust boundary —
@@ -141,25 +141,42 @@ class UiSocketServer(private val ctx: Context) {
                 }
 
                 "tap" -> {
+                    val expected = expectedPackage(args) ?: return fail(
+                        id, "bad_args", "tap needs expect_package"
+                    )
                     when {
-                        args.has("text") -> brokered(id, "tap", 15_000) { it.putExtra("text", args.getString("text")) }
+                        args.has("text") -> brokered(id, "tap", 15_000) {
+                            it.putExtra("text", args.getString("text"))
+                                .putExtra("expect_package", expected)
+                        }
                         args.has("x") && args.has("y") ->
-                            brokered(id, "tap") { it.putExtra("x", args.getInt("x")).putExtra("y", args.getInt("y")) }
+                            brokered(id, "tap") {
+                                it.putExtra("x", args.getInt("x"))
+                                    .putExtra("y", args.getInt("y"))
+                                    .putExtra("expect_package", expected)
+                            }
                         else -> fail(id, "bad_args", "tap needs {x,y} or {text}")
                     }
                 }
 
                 "swipe" -> {
+                    val expected = expectedPackage(args) ?: return fail(
+                        id, "bad_args", "swipe needs expect_package"
+                    )
                     if (!args.has("x1") || !args.has("y1") || !args.has("x2") || !args.has("y2"))
                         return fail(id, "bad_args", "swipe needs x1,y1,x2,y2")
                     brokered(id, "swipe") {
                         it.putExtra("x1", args.getInt("x1")).putExtra("y1", args.getInt("y1"))
                             .putExtra("x2", args.getInt("x2")).putExtra("y2", args.getInt("y2"))
                             .putExtra("duration_ms", args.optInt("duration_ms", 300))
+                            .putExtra("expect_package", expected)
                     }
                 }
 
                 "scroll" -> {
+                    val expected = expectedPackage(args) ?: return fail(
+                        id, "bad_args", "scroll needs expect_package"
+                    )
                     val dir = args.optString("direction").ifEmpty {
                         return fail(id, "bad_args", "scroll needs direction")
                     }
@@ -167,22 +184,42 @@ class UiSocketServer(private val ctx: Context) {
                         it.putExtra("direction", dir)
                         if (args.has("x")) it.putExtra("x", args.getInt("x"))
                         if (args.has("y")) it.putExtra("y", args.getInt("y"))
+                        it.putExtra("expect_package", expected)
                     }
                 }
 
                 "text" -> {
+                    val expected = expectedPackage(args) ?: return fail(
+                        id, "bad_args", "text needs expect_package"
+                    )
                     if (!args.has("text")) return fail(id, "bad_args", "text needs 'text'")
-                    brokered(id, "text") { it.putExtra("text", args.getString("text")) }
+                    brokered(id, "text") {
+                        it.putExtra("text", args.getString("text"))
+                            .putExtra("expect_package", expected)
+                    }
                 }
 
                 "key" -> {
+                    val expected = expectedPackage(args) ?: return fail(
+                        id, "bad_args", "key needs expect_package"
+                    )
                     val key = args.optString("key").ifEmpty { return fail(id, "bad_args", "key needs 'key'") }
-                    brokered(id, "key") { it.putExtra("key", key) }
+                    brokered(id, "key") {
+                        it.putExtra("key", key).putExtra("expect_package", expected)
+                    }
                 }
 
                 "dialog" -> {
+                    val expected = expectedPackage(args) ?: return fail(
+                        id, "bad_args", "dialog needs expect_package"
+                    )
                     val button = args.optString("button").ifEmpty { return fail(id, "bad_args", "dialog needs 'button'") }
-                    brokered(id, "dialog") { it.putExtra("button", button) }
+                    if (button !in setOf("allow", "deny")) {
+                        return fail(id, "bad_args", "dialog button must be allow|deny")
+                    }
+                    brokered(id, "dialog") {
+                        it.putExtra("button", button).putExtra("expect_package", expected)
+                    }
                 }
 
                 else -> fail(id, "unsupported_op", "unknown op: $op")
@@ -203,6 +240,9 @@ class UiSocketServer(private val ctx: Context) {
         return if (code.isNotEmpty()) fail(id, code, res.optString("error", code))
         else ok(id, res)
     }
+
+    private fun expectedPackage(args: JSONObject): String? =
+        args.optString("expect_package").trim().takeIf { it.isNotEmpty() }
 
     private fun launch(id: String?, args: JSONObject): JSONObject {
         val pkg = args.optString("package").ifEmpty { return fail(id, "bad_args", "launch needs 'package'") }
@@ -283,7 +323,7 @@ class UiSocketServer(private val ctx: Context) {
     companion object {
         private const val TAG = "zerodroid-ui-sock"
         const val SOCKET_NAME = "ui.sock"
-        private const val PROTOCOL_VERSION = "1"
+        private const val PROTOCOL_VERSION = "2"
         private const val MAX_REQUEST_BYTES = 64 * 1024
         // Mirrors zeroclaw-tools MAX_BASE64_BYTES (2 MiB) from the contract.
         private const val MAX_BASE64_BYTES = 2 * 1024 * 1024

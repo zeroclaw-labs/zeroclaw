@@ -2,14 +2,14 @@
 
 **What it adds:** the agent running *inside* the APK can now **see and drive the screen of any
 app on the phone**, untethered, on an unrooted device — read the UI tree, take a screenshot, tap,
-swipe, scroll, type, press keys, dismiss dialogs, and launch apps by package.
+swipe, scroll, type, press keys, separately confirm privileged dialogs, and launch apps by package.
 
 > Status legend: ✅ proven on-device · 🔌 wired (needs the right device/setup) · 🛠 designed/next
 
 | Piece | What | Status |
 |---|---|---|
 | `UiAccessibilityService` | AccessibilityService: tree read, `dispatchGesture`, `takeScreenshot` | ✅ physical arm64 Android 16 device |
-| `UiSocketServer` | UDS RPC server at `<filesDir>/ui.sock`, 12 ops, protocol `1` | ✅ |
+| `UiSocketServer` | UDS RPC server at `<filesDir>/ui.sock`, 12 ops, protocol `2` | ✅ |
 | Rust `android_*` tools | screenshot, UI read/action, launch, and read-only device facts | ✅ |
 | Generic `screenshot` | delegates to the guarded Android capture path on Android | ✅ |
 | Screenshot → vision | tool emits `[IMAGE:<path>]`, provider inlines it as a native image block | ✅ (needs a vision-capable model + quota) |
@@ -67,7 +67,7 @@ and reachable by any app. FILESYSTEM namespace is the one that isolates.)
 Newline-delimited JSON, one request per line, one response per line. Request cap 64 KiB.
 
 ```jsonc
-→ {"id":"1","op":"tap","args":{"x":636,"y":2100}}
+→ {"id":"1","op":"tap","args":{"expect_package":"com.example.app","x":636,"y":2100}}
 ← {"id":"1","ok":true,"data":{"dispatched":true}}
 ← {"id":"1","ok":false,"error":{"code":"service_unavailable","message":"…"}}
 ```
@@ -80,13 +80,13 @@ Newline-delimited JSON, one request per line, one response per line. Request cap
 | `read` | `max_depth` (default 15) | flattened node list: text, desc, class, clickable, bounds, center |
 | `foreground` | — | current package and optional activity |
 | `foreground` | — | current package + activity |
-| `tap` | `{x,y}` **or** `{text}` | text form searches the tree (15 s budget) |
-| `swipe` | `x1,y1,x2,y2`, `duration_ms` (300) | |
-| `scroll` | `direction`, optional `x,y` | |
-| `text` | `text` | types into the focused editable |
-| `key` | `key` | `back`, `home`, `recents`, … |
+| `tap` | `expect_package` + `{x,y}` **or** `{text}` | target revalidated at execution time |
+| `swipe` | `expect_package`, `x1,y1,x2,y2`, `duration_ms` (300) | |
+| `scroll` | `expect_package`, `direction`, optional `x,y` | |
+| `text` | `expect_package`, `text` | types into the focused editable |
+| `key` | `expect_package`, `key` | `back`, `home`, `recents`, … |
 | `device` | `what` | read-only sensors, location, or telephony facts |
-| `dialog` | `button` | finds and clicks a dialog button by label |
+| `dialog` | `expect_package`, `button=allow|deny` | privileged path, separate from ordinary actions |
 
 Error codes: `service_unavailable`, `bad_args`, `timeout`, `no_focus`, `not_found`,
 `screenshot_failed`, `unsupported_op`, and `internal`. The canonical wire spec lives at
@@ -97,7 +97,7 @@ socket server and can hand a screenshot over as a path rather than a Binder blob
 
 ## 3. Rust tool family
 
-Five tools in `crates/zeroclaw-tools/src/android/`, registered only when **both** hold:
+Six tools in `crates/zeroclaw-tools/src/android/`, registered only when **both** hold:
 
 ```toml
 [android]
@@ -119,6 +119,9 @@ a test.
   approval-gated through the central `ApprovalManager`, mirroring the browser-automation posture.
   `require_approval_for_actions = true` + no approving operator ⇒ the tool is not registered at all
   (fail-closed, not fail-open).
+- `android_dialog` preserves system permission/install confirmation as a separate tool. It is
+  omitted whenever the active profile would auto-approve it, including full autonomy and `"*"`.
+  Ordinary actions refuse system-dialog packages.
 
 ## 4. Floating bubble (`OverlayService`)
 
@@ -152,7 +155,9 @@ Four non-obvious couplings:
    accent.
 
 Generated installs put every gateway route under a random per-install path because Android shares
-TCP loopback across app UIDs. Inside that namespace the bubble self-pairs
+TCP loopback across app UIDs. Pair-code minting additionally requires an app-private admin secret;
+the path alone grants no authority. Inside that namespace the bubble self-pairs once, persists its
+token in Keystore-backed preferences,
 (`/admin/paircode/new` → pair → Bearer), then sends an independent `X-Webhook-Secret` on the
 prompt. The APK's `bridge-token`, gateway pairing token, private path, and webhook secret are
 different values; none is logged.
@@ -189,5 +194,9 @@ every message, drain a wallet app, and act as you inside any authenticated sessi
 
 - the whole family is off by default and requires two independent switches (`enabled` + platform);
 - `android_action` is never auto-approved by default;
+- every ordinary mutation names and revalidates the foreground package, while privileged system
+  dialogs use a separate non-auto-approved tool;
+- password nodes and zerodroid's own credential UI are excluded from observation;
+- screenshots use a bounded private cache with retention cleanup;
 - the transport is UID-isolated rather than token-guarded;
 - release builds must preserve the default-off capability switches and the explicit Android grants.

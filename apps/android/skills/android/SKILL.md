@@ -135,13 +135,17 @@ the adb-shell UID).
   bounds and center per node, plus the foreground package. Great when the app exposes real labels;
   many apps (especially image-heavy ones) expose almost nothing — fall back to the screenshot.
 - `android_action` — `tap` (by `{x,y}` or by `text`), `swipe`, `scroll`, `text` (type into the
-  focused field), `key` (back/home/recents), `dialog` (press a named dialog button).
+  focused field), and `key` (back/home/recents). Every call must pass `expect_package`.
+- `android_dialog` — separately approval-gated `allow`/`deny` for a recognized Android system
+  dialog. Ordinary actions cannot operate permission or installer windows.
 
 Rules:
 - **Screenshot before every tap; never guess a coordinate.** If the screen isn't what you expected,
   screenshot again and reassess rather than tapping blind.
 - `android_action` is approval-gated by default — it acts on a real device in real apps. Say what
   you are about to do before doing it, and stop after acting unless told to continue.
+- Always pass the package returned by the latest read/capture as `expect_package`; the service
+  revalidates it immediately before mutation and refuses focus drift.
 - If a call fails with `service_unavailable`, the accessibility service is off: tell the user to
   enable **Settings → Accessibility → zerodroid**. Don't fall back to `input tap`; it won't work.
 

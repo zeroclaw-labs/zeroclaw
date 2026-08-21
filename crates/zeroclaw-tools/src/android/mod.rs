@@ -15,6 +15,7 @@
 pub mod action;
 pub mod client;
 pub mod device;
+pub mod dialog;
 pub mod launch;
 pub mod screenshot;
 pub mod ui_read;
@@ -22,6 +23,7 @@ pub mod ui_read;
 pub use action::AndroidActionTool;
 pub use client::AndroidBridgeClient;
 pub use device::AndroidDeviceTool;
+pub use dialog::AndroidDialogTool;
 pub use launch::AndroidLaunchTool;
 pub use screenshot::AndroidScreenshotTool;
 pub use ui_read::AndroidUiReadTool;

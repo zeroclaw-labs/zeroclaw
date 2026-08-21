@@ -6,7 +6,8 @@ CellClaw-derived Accessibility and floating-overlay layer in one APK.
 ## What is included
 
 - Accessibility UI read, screenshot/vision handoff, tap, swipe, scroll, text, keys, app launch,
-  system-dialog handling, and read-only device facts over an app-private Unix socket.
+  separately approval-gated system-dialog handling, and read-only device facts over an app-private
+  Unix socket. Every ordinary mutation revalidates its target package at execution time.
 - The CellClaw overlay state palette and capture-hide behavior, with the initial colour derived from
   the live gateway state.
 - A full Android 12+ flavor and a lite Android 11+ flavor.
@@ -18,13 +19,14 @@ CellClaw-derived Accessibility and floating-overlay layer in one APK.
 
 ## Safe first-run posture
 
-- Phone tools, autonomous UI control, LAN access, SSH, boot start, and the floating bubble default
+- Phone tools, autonomous UI control, encrypted remote access, SSH, boot start, and the floating bubble default
   off.
 - Read-only mode cannot access the generated provider credential or mutate the phone.
 - Autonomous control pre-approves only the typed screen/action tools; shell and file mutation remain
   separately approval-gated.
-- Generated gateways use normal pairing inside a random per-install path. Overlay prompts add a
-  separate webhook secret because Android TCP loopback is shared across app UIDs.
+- Generated gateways stay loopback-only. Remote clients use the pubkey-only SSH tunnel, and
+  localhost pair-code minting requires an app-private admin secret because Android TCP loopback is
+  shared across app UIDs.
 - Only the generic Android capability skill ships. User-specific app automations are not bundled.
 
 ## Upgrade note

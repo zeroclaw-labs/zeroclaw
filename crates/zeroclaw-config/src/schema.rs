@@ -345,7 +345,7 @@ pub struct Config {
     ///
     /// Off by default. When `enabled = true` *and* the process is running on
     /// Android, registers the `android_screenshot`, `android_ui_read`,
-    /// `android_action`, `android_launch`, and `android_device` tools. They expose
+    /// `android_action`, `android_dialog`, `android_launch`, and `android_device` tools. They expose
     /// UI control and read-only device facts through the app-private Android bridge.
     ///
     /// Compatibility: additive and disabled by default; existing configs remain
@@ -6945,6 +6945,18 @@ pub struct GatewayConfig {
     /// (default: false)
     #[serde(default)]
     pub allow_remote_admin: bool,
+    /// Optional second factor for localhost-only admin endpoints.
+    ///
+    /// Desktop loopback normally identifies the local operator. Mobile
+    /// platforms share TCP loopback across application UIDs, so an embedding
+    /// app can set this secret and require callers to prove possession through
+    /// `X-Loopback-Admin-Secret` before minting pairing codes or invoking local
+    /// admin controls. Empty/omitted preserves the existing desktop contract.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub loopback_admin_secret: Option<String>,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -7108,6 +7120,7 @@ impl Default for GatewayConfig {
             require_pairing: true,
             allow_public_bind: false,
             allow_remote_admin: false,
+            loopback_admin_secret: None,
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
@@ -7536,7 +7549,7 @@ impl Default for BrowserComputerUseConfig {
 /// Android UI-control configuration (`[android]` section).
 ///
 /// Gates the `android_screenshot`, `android_ui_read`, `android_action`,
-/// `android_launch`, and `android_device` tools. ZeroClaw running as an ordinary
+/// `android_dialog`, `android_launch`, and `android_device` tools. ZeroClaw running as an ordinary
 /// Android app cannot drive the screen itself, so these tools speak newline-delimited
 /// JSON over a Unix-domain socket to the in-APK Android bridge.
 ///
@@ -27697,16 +27710,19 @@ auto_approve = ["my_custom_tool", "another_tool"]
         assert!(defaults.contains(&"tool_search".to_string()));
     }
 
-    /// `android_action` taps, swipes, and types on a real device. It must
+    /// `android_action` taps, swipes, and types on a real device, while
+    /// `android_dialog` confirms privileged system prompts. Neither must
     /// never be auto-approved by default: staying off this list is what makes
     /// `ApprovalManager::approval_requirement` fall through to `Prompt`.
     #[test]
-    async fn default_auto_approve_excludes_android_action() {
+    async fn default_auto_approve_excludes_android_mutation_boundaries() {
         let defaults = default_auto_approve();
-        assert!(
-            !defaults.contains(&"android_action".to_string()),
-            "android_action must not be auto-approved by default: {defaults:?}"
-        );
+        for tool in ["android_action", "android_dialog"] {
+            assert!(
+                !defaults.contains(&tool.to_string()),
+                "{tool} must not be auto-approved by default: {defaults:?}"
+            );
+        }
     }
 
     /// The whole Android family is opt-in; a config that never mentions
@@ -29952,6 +29968,7 @@ allowed_numbers = ["+1", "+2"]
             require_pairing: true,
             allow_public_bind: false,
             allow_remote_admin: false,
+            loopback_admin_secret: Some("0123456789abcdef0123456789abcdef".into()),
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
@@ -29977,6 +29994,10 @@ allowed_numbers = ["+1", "+2"]
         assert!(parsed.session_persistence);
         assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);
+        assert_eq!(
+            parsed.loopback_admin_secret.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);
