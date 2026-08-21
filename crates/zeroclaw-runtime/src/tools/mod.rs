@@ -35,6 +35,11 @@ pub mod todo_write;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
+#[cfg(target_os = "android")]
+pub use zeroclaw_tools::android::{
+    AndroidActionTool, AndroidBridgeClient, AndroidDeviceTool, AndroidLaunchTool,
+    AndroidScreenshotTool, AndroidUiReadTool,
+};
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
@@ -628,6 +633,17 @@ fn plugin_config_resolver(
     })
 }
 
+#[cfg(any(target_os = "android", test))]
+fn android_action_would_be_auto_approved(
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+) -> bool {
+    matches!(
+        crate::approval::ApprovalManager::from_risk_profile(risk_profile)
+            .approval_requirement("android_action"),
+        crate::approval::ApprovalRequirement::Approved
+    )
+}
+
 /// Create full tool registry including memory tools and optional Composio.
 #[allow(
     clippy::implicit_hasher,
@@ -949,6 +965,69 @@ pub fn all_tools_with_runtime(
         }
     }
 
+    // Set when the android_* family registers, so the generic screenshot tool below can be wired
+    // to the bridge instead of being left in its unusable subprocess form.
+    #[cfg(target_os = "android")]
+    let mut android_screenshot_bridge: Option<(AndroidBridgeClient, u32)> = None;
+
+    // Android UI-control tools. Gated on BOTH explicit opt-in and actually
+    // running on Android: the bridge socket only exists on the phone, so
+    // registering these on a desktop host would hand the model tools that can
+    // never succeed. Production desktop builds do not compile the family.
+    #[cfg(target_os = "android")]
+    {
+        if root_config.android.enabled {
+            if zeroclaw_api::platform::is_android() {
+                let android_cfg = &root_config.android;
+                let client = AndroidBridgeClient::new(android_cfg.socket_path.clone());
+
+                tool_arcs.push(Arc::new(AndroidScreenshotTool::new(
+                    client.clone(),
+                    android_cfg.screenshot_max_width,
+                )));
+                android_screenshot_bridge =
+                    Some((client.clone(), android_cfg.screenshot_max_width));
+                tool_arcs.push(Arc::new(AndroidUiReadTool::new(client.clone())));
+                // Read-only device facts; no accessibility service needed, so it stays useful
+                // even when the service is switched off.
+                tool_arcs.push(Arc::new(AndroidDeviceTool::new(
+                    client.clone(),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(AndroidLaunchTool::new(
+                    client.clone(),
+                    security.clone(),
+                )));
+
+                // `android_action` taps, swipes, and types on a real phone.
+                // It is deliberately absent from `default_auto_approve()`, so
+                // it normally falls through to `ApprovalRequirement::Prompt`.
+                // If the effective profile auto-approves it anyway, including
+                // Full autonomy's unconditional approval, fail closed rather
+                // than granting unattended device control.
+                if android_cfg.require_approval_for_actions
+                    && android_action_would_be_auto_approved(risk_profile)
+                {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "android_action: skipped registration because the effective risk profile auto-approves it while android.require_approval_for_actions is true"
+                    );
+                } else {
+                    tool_arcs.push(Arc::new(AndroidActionTool::new(client, security.clone())));
+                }
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "android: skipped registration because [android] enabled = true but this process is not running on Android"
+                );
+            }
+        }
+    }
+
     if http_config.enabled {
         match HttpRequestTool::new_with_config(
             security.clone(),
@@ -1247,7 +1326,21 @@ pub fn all_tools_with_runtime(
         )));
     }
 
-    // Vision tools are always available
+    // Vision tools are always available. On Android the generic tool's subprocess path cannot
+    // work (it shells out to screencapture / gnome-screenshot, which do not exist and which an app
+    // UID may not run), so where the bridge is available it is wired through to that instead. One
+    // behaviour under both names beats a familiar name that always fails.
+    #[cfg(all(unix, target_os = "android"))]
+    {
+        let screenshot_tool = match android_screenshot_bridge {
+            Some((client, max_width)) => {
+                ScreenshotTool::new(security.clone()).with_android_bridge(client, max_width)
+            }
+            None => ScreenshotTool::new(security.clone()),
+        };
+        tool_arcs.push(Arc::new(screenshot_tool));
+    }
+    #[cfg(not(all(unix, target_os = "android")))]
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(RateLimitedTool::new(
         PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
@@ -2041,6 +2134,223 @@ const = true
             assert!(
                 !names.contains(name),
                 "SOP tool '{name}' must not be registered when engine is absent"
+            );
+        }
+    }
+
+    /// The option-OFF contract. `[android] enabled` defaults to false, so a
+    /// stock config must register none of the `android_*` tools. This holds on
+    /// every platform, including an actual Android host, because the config
+    /// flag is checked before the platform probe.
+    /// The generic `screenshot` tool cannot work under an ordinary Android app UID, but answers
+    /// as though it did. With the android family registered it must not be offered at all, or a
+    /// model will sometimes reach for it, receive a fabricated success, and describe a screen it
+    /// never saw.
+    /// The generic screenshot tool must stay registered. On Android it is wired to the bridge
+    /// rather than removed, so a model reaching for the familiar name gets a working capture
+    /// instead of "not supported"; everywhere else it keeps its subprocess behaviour.
+    #[test]
+    fn android_action_approval_guard_uses_effective_autonomy() {
+        let supervised = zeroclaw_config::schema::RiskProfileConfig::default();
+        assert!(!android_action_would_be_auto_approved(&supervised));
+
+        let explicit = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["android_action".into()],
+            ..Default::default()
+        };
+        assert!(android_action_would_be_auto_approved(&explicit));
+
+        let wildcard = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["*".into()],
+            ..Default::default()
+        };
+        assert!(android_action_would_be_auto_approved(&wildcard));
+
+        let explicit_but_asked = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["android_action".into()],
+            always_ask: vec!["android_action".into()],
+            ..Default::default()
+        };
+        assert!(!android_action_would_be_auto_approved(&explicit_but_asked));
+
+        let wildcard_ask = zeroclaw_config::schema::RiskProfileConfig {
+            auto_approve: vec!["android_action".into()],
+            always_ask: vec!["*".into()],
+            ..Default::default()
+        };
+        assert!(!android_action_would_be_auto_approved(&wildcard_ask));
+
+        let full = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            always_ask: vec!["android_action".into()],
+            ..Default::default()
+        };
+        assert!(
+            android_action_would_be_auto_approved(&full),
+            "Full autonomy approves before always_ask and must fail the registration guard"
+        );
+    }
+
+    #[test]
+    fn generic_screenshot_is_always_registered() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &zeroclaw_config::schema::BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"screenshot"),
+            "the generic screenshot tool must remain registered on every platform"
+        );
+    }
+
+    #[test]
+    fn android_tools_absent_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let cfg = test_config(&tmp);
+        assert!(
+            !cfg.android.enabled,
+            "the test fixture must start from the disabled default"
+        );
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &zeroclaw_config::schema::BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        for name in [
+            "android_screenshot",
+            "android_ui_read",
+            "android_action",
+            "android_launch",
+            "android_device",
+        ] {
+            assert!(
+                !names.contains(&name),
+                "'{name}' must not register while [android] enabled = false"
+            );
+        }
+    }
+
+    /// Enabling the family on a non-Android host must still register nothing:
+    /// the bridge socket only exists on the phone. This asserts the runtime
+    /// platform guard, not just the config flag.
+    ///
+    /// The assertion is meaningful only off-Android, which is where this test
+    /// suite runs; on an Android host the tools legitimately would register.
+    #[test]
+    fn android_tools_absent_off_platform_even_when_enabled() {
+        if zeroclaw_api::platform::is_android() {
+            return;
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let mut cfg = test_config(&tmp);
+        cfg.android.enabled = true;
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &zeroclaw_config::schema::BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        for name in [
+            "android_screenshot",
+            "android_ui_read",
+            "android_action",
+            "android_launch",
+            "android_device",
+        ] {
+            assert!(
+                !names.contains(&name),
+                "'{name}' must not register off-Android even when enabled"
             );
         }
     }

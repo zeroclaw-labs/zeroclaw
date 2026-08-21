@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The three capability flags that make untethered UI control possible on an unrooted phone:
+     canPerformGestures  -> dispatchGesture (tap/swipe/scroll)
+     canRetrieveWindowContent -> rootInActiveWindow (read/find/dialog)
+     canTakeScreenshot   -> AccessibilityService.takeScreenshot (no MediaProjection). -->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:description="@string/a11y_description"
+    android:notificationTimeout="100"
+    android:settingsActivity="org.zerodroid.bridge.MainActivity" />

@@ -33,6 +33,22 @@ updates:
           - minor
           - patch
 
+  - package-ecosystem: gradle
+    directory: "/apps/android"
+    schedule:
+      interval: weekly
+    target-branch: master
+    open-pull-requests-limit: 2
+    labels:
+      - "dependencies"
+    groups:
+      android-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

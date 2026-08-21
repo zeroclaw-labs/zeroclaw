@@ -15,13 +15,44 @@ const MAX_BASE64_BYTES: usize = 2_097_152;
 /// Tool for capturing screenshots using platform-native commands.
 /// macOS: `screencapture`
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
+/// Android: none of those exist and an app UID may not run them, so the capture is delegated to
+/// the accessibility bridge when one is wired in (see [`ScreenshotTool::with_android_bridge`]).
 pub struct ScreenshotTool {
     security: Arc<SecurityPolicy>,
+    /// Present only on Android, where the subprocess path cannot work at all.
+    #[cfg(all(unix, target_os = "android"))]
+    android_bridge: Option<crate::android::AndroidBridgeClient>,
+    #[cfg(all(unix, target_os = "android"))]
+    android_max_width: u32,
 }
 
 impl ScreenshotTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            #[cfg(all(unix, target_os = "android"))]
+            android_bridge: None,
+            #[cfg(all(unix, target_os = "android"))]
+            android_max_width: 540,
+        }
+    }
+
+    /// Route captures through the Android accessibility bridge.
+    ///
+    /// Without this, `screenshot` is dead on Android: it shells out to `screencapture` or
+    /// `gnome-screenshot`, none of which exist there, so every call returns "not supported". A
+    /// model that reaches for the familiar name then has no image and no working alternative under
+    /// that name. Delegating means one behaviour under both names rather than a trap.
+    #[cfg(all(unix, target_os = "android"))]
+    #[must_use]
+    pub fn with_android_bridge(
+        mut self,
+        client: crate::android::AndroidBridgeClient,
+        max_width: u32,
+    ) -> Self {
+        self.android_bridge = Some(client);
+        self.android_max_width = max_width;
+        self
     }
 
     /// Determine the screenshot command for the current platform.
@@ -55,6 +86,28 @@ impl ScreenshotTool {
 
     /// Execute the screenshot capture and return the result.
     async fn capture(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // On Android the subprocess path below cannot succeed, so take the bridge when we have
+        // one. The same expect_package guard applies as on android_screenshot: offering a second
+        // name for the same job must not offer a second, unguarded way to do it.
+        #[cfg(all(unix, target_os = "android"))]
+        if let Some(client) = &self.android_bridge {
+            if let Some(expected) = args
+                .get("expect_package")
+                .and_then(serde_json::Value::as_str)
+            {
+                client.assert_foreground(expected).await?;
+            }
+            let max_width = args
+                .get("max_width")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .unwrap_or(self.android_max_width);
+            let data = client
+                .call("screenshot", json!({ "max_width": max_width }))
+                .await?;
+            return crate::android::screenshot::render_screenshot(&data);
+        }
+
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let filename = args
             .get("filename")
@@ -226,7 +279,10 @@ impl Tool for ScreenshotTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        // Only the android cfg below mutates this; on every other target it is built and returned
+        // as-is, so the binding reads as needlessly mutable there.
+        #[cfg_attr(not(all(unix, target_os = "android")), allow(unused_mut))]
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "filename": {
@@ -238,7 +294,32 @@ impl Tool for ScreenshotTool {
                     "description": "Optional region for macOS: 'selection' for interactive crop, 'window' for front window. Ignored on Linux."
                 }
             }
-        })
+        });
+        // On Android this tool captures through the accessibility bridge, so it accepts the same
+        // arguments as android_screenshot. Advertise them, or the guard is unreachable through
+        // this name and a caller has no way to say which app it means.
+        #[cfg(all(unix, target_os = "android"))]
+        if self.android_bridge.is_some()
+            && let Some(props) = schema
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            props.insert(
+                "expect_package".into(),
+                json!({
+                    "type": "string",
+                    "description": crate::android::tool_msg("tool-android-action-param-expect-package")
+                }),
+            );
+            props.insert(
+                "max_width".into(),
+                json!({
+                    "type": "integer",
+                    "description": crate::android::tool_msg("tool-android-screenshot-param-max-width")
+                }),
+            );
+        }
+        schema
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

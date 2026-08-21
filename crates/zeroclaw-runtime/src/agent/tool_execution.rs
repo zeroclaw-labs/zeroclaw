@@ -473,6 +473,18 @@ pub fn should_execute_tools_in_parallel(
         return false;
     }
 
+    // Android tools share one foreground app, input focus, display, and accessibility bridge.
+    // Their call order is part of the operation: tap a field, then type, then tap Send. Running a
+    // model-emitted batch concurrently can type before focus moves or send before text lands. Force
+    // the whole batch through the sequential executor whenever any Android device call is present,
+    // regardless of approval posture or full autonomy.
+    if tool_calls
+        .iter()
+        .any(|call| call.name.starts_with("android_"))
+    {
+        return false;
+    }
+
     if let Some(mgr) = approval
         && tool_calls.iter().any(|call| mgr.needs_approval(&call.name))
     {
@@ -829,6 +841,39 @@ mod tests {
         assert!(
             should_execute_tools_in_parallel(&calls, None),
             "non-tool_search, non-approval batch must remain parallel-eligible (default branch)"
+        );
+    }
+
+    #[test]
+    fn android_tool_in_batch_forces_serial_without_approval_manager() {
+        let calls = vec![
+            parsed_tool_call("android_action"),
+            parsed_tool_call("android_screenshot"),
+            parsed_tool_call("android_ui_read"),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, None),
+            "stateful Android UI calls must preserve model-emitted order"
+        );
+    }
+
+    #[test]
+    fn android_tool_in_mixed_full_autonomy_batch_stays_serial() {
+        let full = RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            ..RiskProfileConfig::default()
+        };
+        let mgr = ApprovalManager::for_non_interactive(&full);
+        let calls = vec![
+            parsed_tool_call("file_read"),
+            parsed_tool_call("android_launch"),
+            parsed_tool_call("screenshot"),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel(&calls, Some(&mgr)),
+            "full autonomy must not parallelize a batch that mutates Android screen state"
         );
     }
 

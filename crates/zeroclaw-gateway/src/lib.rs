@@ -218,6 +218,17 @@ fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Resolve the memory/session scope for one gateway webhook turn.
+///
+/// Callers that intentionally want a conversation supply `X-Session-Id` and keep using the same
+/// value. A request without that header is a one-shot command, so it gets a fresh scope rather than
+/// falling through to unscoped memory recall. `None` at the runtime boundary means "recall global
+/// memory", which can resurrect an unrelated prior task and is unsafe for command-style clients.
+fn resolved_webhook_session_id(headers: &HeaderMap) -> String {
+    webhook_session_id(headers)
+        .unwrap_or_else(|| format!("webhook_req_{}", Uuid::new_v4().simple()))
+}
+
 fn hash_webhook_secret(value: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1620,7 +1631,6 @@ pub async fn run_gateway(
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
-        .route("/webhook", post(handle_webhook))
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
@@ -1951,12 +1961,18 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
 
-    // Manual cron-trigger and A2A task routes live on their own sub-router so
-    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
+    // Manual cron-trigger, webhook, and A2A task routes live on their own sub-router so
+    // they can opt out of the 30s gateway-wide TimeoutLayer. All run a
     // synchronous agent turn inline. Layers attached here travel with the
     // route through `merge`, so only these endpoints see the longer timeout.
-    let long_running_router: Router<AppState> =
-        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    //
+    // /webhook belongs here for the same reason as the other two, and its absence was a real
+    // bug: any turn that takes a screenshot and calls a vision model comfortably exceeds 30s,
+    // so a caller waiting on the reply got 408 while the agent was still working. Quick
+    // endpoints keep the tight default rather than everything being loosened to suit this one.
+    let long_running_router: Router<AppState> = Router::new()
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+        .route("/webhook", post(handle_webhook));
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
@@ -2809,7 +2825,7 @@ async fn handle_webhook(
     }
 
     let message = &webhook_body.message;
-    let session_id = webhook_session_id(&headers);
+    let session_id = resolved_webhook_session_id(&headers);
 
     if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(message) {
         let key = webhook_memory_key();
@@ -2819,7 +2835,7 @@ async fn handle_webhook(
                 &key,
                 message,
                 MemoryCategory::Conversation,
-                session_id.as_deref(),
+                Some(session_id.as_str()),
             )
             .await;
     }
@@ -2848,7 +2864,8 @@ async fn handle_webhook(
     // gives one webhook prompt two unrelated turn IDs.
     let started_at = Instant::now();
 
-    match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
+    match run_gateway_chat_with_tools(&state, message, Some(session_id.as_str()), agent_override)
+        .await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
             let duration = started_at.elapsed();
@@ -5580,6 +5597,40 @@ mod tests {
     }
 
     #[test]
+    fn resolved_webhook_session_id_preserves_explicit_conversation_scope() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Session-Id",
+            HeaderValue::from_static("overlay-conversation"),
+        );
+
+        assert_eq!(
+            resolved_webhook_session_id(&headers),
+            "overlay-conversation"
+        );
+    }
+
+    #[test]
+    fn resolved_webhook_session_id_is_unique_for_headerless_one_shots() {
+        let headers = HeaderMap::new();
+
+        let first = resolved_webhook_session_id(&headers);
+        let second = resolved_webhook_session_id(&headers);
+
+        assert!(first.starts_with("webhook_req_"));
+        assert!(second.starts_with("webhook_req_"));
+        assert_ne!(first, second);
+        for generated in [first, second] {
+            assert!(generated.len() <= 128);
+            assert!(
+                generated
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+            );
+        }
+    }
+
+    #[test]
     fn webhook_session_id_rejects_empty() {
         let mut headers = HeaderMap::new();
         headers.insert("X-Session-Id", HeaderValue::from_static(""));
@@ -5797,6 +5848,7 @@ mod tests {
     #[derive(Default)]
     struct TrackingMemory {
         keys: Mutex<Vec<String>>,
+        sessions: Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait]
@@ -5810,9 +5862,10 @@ mod tests {
             key: &str,
             _content: &str,
             _category: MemoryCategory,
-            _session_id: Option<&str>,
+            session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             self.keys.lock().push(key.to_string());
+            self.sessions.lock().push(session_id.map(str::to_string));
             Ok(())
         }
 
@@ -6323,6 +6376,17 @@ mod tests {
         assert_ne!(keys[0], keys[1]);
         assert!(keys[0].starts_with("webhook_msg_"));
         assert!(keys[1].starts_with("webhook_msg_"));
+        let sessions = tracking_impl.sessions.lock().clone();
+        assert_eq!(sessions.len(), 2);
+        let first_session = sessions[0]
+            .as_deref()
+            .expect("headerless webhook must still get a request scope");
+        let second_session = sessions[1]
+            .as_deref()
+            .expect("headerless webhook must still get a request scope");
+        assert!(first_session.starts_with("webhook_req_"));
+        assert!(second_session.starts_with("webhook_req_"));
+        assert_ne!(first_session, second_session);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
     }
 

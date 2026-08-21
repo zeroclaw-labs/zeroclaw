@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">zerodroid</string>
+    <string name="a11y_description">Lets the on-device agent read the screen and perform taps, swipes, scrolls and text entry in any app, over a private on-device socket. Enable only on your own device; you can turn it off at any time.</string>
+    <string name="phone_tools_label">Phone tools (read-only)</string>
+    <string name="phone_tools_hint">Lets the agent inspect the foreground app, screenshots and device facts. Tap, type, launch and shell actions stay blocked.</string>
+    <string name="autonomous_control_label">Autonomous control (tap, type and send)</string>
+    <string name="autonomous_control_hint">High risk. The agent can act in other apps without asking for each UI action. Shell and file changes remain separately approval-gated.</string>
+    <string name="autonomous_control_title">Allow autonomous control?</string>
+    <string name="autonomous_control_message">The agent will be able to tap, type, submit forms and send messages by controlling other apps without asking for every UI action. These actions can affect real people, accounts and data. Shell and file changes remain separately approval-gated. Enable this only while you are supervising the phone.</string>
+    <string name="autonomous_control_allow">Allow autonomous control</string>
+    <string name="autonomous_control_cancel">Keep read-only</string>
+    <string name="basic_permissions_label">Grant basic device permissions</string>
+    <string name="sensitive_permissions_label">Grant sensitive phone permissions</string>
+    <string name="sensitive_permissions_title">Allow sensitive phone access?</string>
+    <string name="sensitive_permissions_message">These optional permissions expose SMS, contacts and phone state to zerodroid’s local tools. Grant only the capabilities you intend to use. Android will ask for each permission separately.</string>
+    <string name="sensitive_permissions_allow">Review permissions</string>
+    <string name="sensitive_permissions_cancel">Not now</string>
+</resources>

@@ -1,8 +1,43 @@
-# Android Setup
+# Android setup
 
-ZeroClaw provides prebuilt binaries for Android devices.
+ZeroClaw supports two Android deployment modes:
 
-## Supported Architectures
+| Mode | Use it when |
+|---|---|
+| **ZeroClaw Android APK (experimental)** | You want the agent to run as a standalone app with opt-in Accessibility, screenshot/vision, UI actions, Android device APIs, and a floating chat overlay. |
+| **Termux binary** | You want a conventional shell-hosted ZeroClaw process without app-level UI control. |
+
+Both modes currently target 64-bit ARM devices.
+
+## ZeroClaw Android APK (experimental)
+
+The source project lives at `apps/android/` in the ZeroClaw repository.
+It packages the Rust gateway, dashboard, Android-native bridge, AccessibilityService, and generic
+Android skill into one APK. The agent and the bridge share an app UID; the typed `android_*` tools
+reach Accessibility and device APIs over an app-private Unix-domain socket.
+
+The installed app and package retain the `zerodroid` name for upgrade compatibility; the bundled
+agent runtime is ZeroClaw from the same repository revision.
+
+The APK is a sideload build, not a Play Store package. Fresh installs keep phone tools, autonomous
+control, LAN access, SSH, boot start, and the overlay off. Accessibility and overlay access still
+require explicit grants in Android Settings.
+
+| Flavor | Minimum Android | Difference |
+|---|---:|---|
+| `full` | Android 12 / API 31 | Includes Google AI Edge/AICore support for on-device Gemini Nano. |
+| `lite` | Android 11 / API 30 | Omits AI Edge; cloud providers and Android-native tools are unchanged. |
+
+Both flavors are arm64-only and use the same application ID, so install one at a time. Follow
+`apps/android/README.md` when building from source, then use
+[Android-native tools](../tools/android.md) for tool configuration and security behavior.
+
+## Termux and standalone binaries
+
+The standalone binary path remains available for shell-hosted deployments that do not need the
+APK's Android-native capability layer.
+
+## Supported architectures
 
 ZeroClaw publishes a prebuilt `aarch64-linux-android` binary for modern 64-bit
 Android devices. The full set of prebuilt release targets (derived from the
@@ -26,10 +61,6 @@ Download from [F-Droid](https://f-droid.org/packages/com.termux/) (recommended) 
 
 ### 2. Download ZeroClaw
 
-<div class="os-tabs-src">
-
-#### sh
-
 ```sh
 # Check your architecture
 uname -m
@@ -41,13 +72,7 @@ curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zero
 tar xzf zeroclaw-aarch64-linux-android.tar.gz
 ```
 
-</div>
-
-### 3. Install and Run
-
-<div class="os-tabs-src">
-
-#### sh
+### 3. Install and run
 
 ```sh
 chmod +x zeroclaw
@@ -60,15 +85,9 @@ zeroclaw --version
 zeroclaw quickstart
 ```
 
-</div>
-
-## Direct Installation via ADB
+## Direct binary installation via ADB
 
 For advanced users who want to run ZeroClaw outside Termux:
-
-<div class="os-tabs-src">
-
-#### sh
 
 ```sh
 # From your computer with ADB
@@ -77,23 +96,17 @@ adb shell chmod +x /data/local/tmp/zeroclaw
 adb shell /data/local/tmp/zeroclaw --version
 ```
 
-</div>
-
 > ⚠️ Running outside Termux requires a rooted device or specific permissions for full functionality.
 
-## Limitations on Android
+## Termux/binary limitations
 
 - **No systemd:** Use Termux's `termux-services` for daemon mode
 - **Storage access:** Requires Termux storage permissions (`termux-setup-storage`)
 - **Network:** Some features may require Android VPN permission for local binding
 
-## Building from Source
+## Building the standalone binary from source
 
 To build for Android yourself:
-
-<div class="os-tabs-src">
-
-#### sh
 
 ```sh
 # Install Android NDK
@@ -109,21 +122,13 @@ cargo build --release --target armv7-linux-androideabi
 cargo build --release --target aarch64-linux-android
 ```
 
-</div>
-
 ## Troubleshooting
 
 ### "Permission denied"
 
-<div class="os-tabs-src">
-
-#### sh
-
 ```sh
 chmod +x zeroclaw
 ```
-
-</div>
 
 ### "not found" or linker errors
 

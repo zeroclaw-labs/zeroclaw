@@ -6,6 +6,11 @@
 use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
 use zeroclaw_api::tool_attribution;
 
+#[cfg(any(target_os = "android", all(test, unix)))]
+use crate::android::{
+    AndroidActionTool, AndroidDeviceTool, AndroidLaunchTool, AndroidScreenshotTool,
+    AndroidUiReadTool,
+};
 use crate::ask_user::AskUserTool;
 use crate::backup_tool::BackupTool;
 use crate::browser::BrowserTool;
@@ -73,6 +78,18 @@ use crate::weather_tool::WeatherTool;
 use crate::web_fetch::WebFetchTool;
 use crate::web_search_tool::WebSearchTool;
 
+// The Android family has no dedicated `ToolKind`; `Plugin` is the
+// established catch-all (see `ScreenshotTool` below).
+#[cfg(any(target_os = "android", all(test, unix)))]
+tool_attribution!(AndroidActionTool, ToolKind::Plugin);
+#[cfg(any(target_os = "android", all(test, unix)))]
+tool_attribution!(AndroidDeviceTool, ToolKind::Plugin);
+#[cfg(any(target_os = "android", all(test, unix)))]
+tool_attribution!(AndroidLaunchTool, ToolKind::Plugin);
+#[cfg(any(target_os = "android", all(test, unix)))]
+tool_attribution!(AndroidScreenshotTool, ToolKind::Plugin);
+#[cfg(any(target_os = "android", all(test, unix)))]
+tool_attribution!(AndroidUiReadTool, ToolKind::Plugin);
 tool_attribution!(AskUserTool, ToolKind::Wait);
 tool_attribution!(BackupTool, ToolKind::Plugin);
 tool_attribution!(BrowserTool, ToolKind::Plugin);

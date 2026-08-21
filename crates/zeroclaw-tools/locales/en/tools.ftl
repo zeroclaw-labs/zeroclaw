@@ -9,6 +9,66 @@
 #
 # Literal { and } in values must be escaped as {"{"}  and  {"}"} respectively.
 
+# Android UI bridge (android_* tools). Only registered when [android]
+# enabled = true and the process is running on Android.
+tool-android-screenshot = Capture the Android screen through the in-app bridge and attach it for visual inspection. Use this to see what is currently on screen before acting.
+tool-android-screenshot-param-max-width = Maximum capture width in pixels; the image is downscaled to fit. Defaults to the configured android.screenshot_max_width.
+tool-android-screenshot-captured = Captured Android screen: { $width }x{ $height }, { $kb } KB, saved to { $path }
+tool-android-screenshot-error-missing-png = The Android bridge returned no image data for the screenshot.
+tool-android-screenshot-error-too-large = The Android bridge returned an oversized screenshot ({ $bytes } base64 bytes, maximum { $max }).
+tool-android-screenshot-error-decode = Could not decode the screenshot returned by the Android bridge: { $error }
+tool-android-screenshot-error-write = Could not write the screenshot to { $path }: { $error }
+
+tool-android-ui-read = Read the Android screen's accessibility tree: visible text, content descriptions, resource IDs, and precomputed tap coordinates for every interactive element. Use this to locate what to tap before calling android_action.
+tool-android-ui-read-param-max-depth = Maximum accessibility-tree depth to walk. Defaults to 15.
+tool-android-ui-read-foreground = Foreground app: { $package }
+tool-android-ui-read-dialog = System dialog present (kind: { $kind }); buttons: { $buttons }
+tool-android-ui-read-node-count = { $count } interactive or labelled nodes:
+tool-android-ui-read-truncated = Output truncated after { $shown } of { $total } nodes to stay within the size limit.
+
+tool-android-action = Control the Android UI: tap, swipe, scroll, type text, press a hardware key, or answer a system dialog. Changes device state, so calls are subject to operator approval.
+tool-android-action-param-action = Which UI action to perform.
+tool-android-action-param-x = X coordinate for tap, or an optional scroll anchor.
+tool-android-action-param-y = Y coordinate for tap, or an optional scroll anchor.
+tool-android-action-param-x1 = Swipe start X coordinate.
+tool-android-action-param-y1 = Swipe start Y coordinate.
+tool-android-action-param-x2 = Swipe end X coordinate.
+tool-android-action-param-y2 = Swipe end Y coordinate.
+tool-android-action-param-duration = Swipe duration in milliseconds. Defaults to 300.
+tool-android-action-param-direction = Scroll direction.
+tool-android-action-param-text = Text to type for the 'text' action, or the visible label to tap for the 'tap' action.
+tool-android-action-param-key = Hardware or navigation key to press.
+tool-android-action-param-button = System-dialog button label to click, such as 'Allow'.
+tool-android-action-did-tap-xy = Tapped ({ $x }, { $y }).
+tool-android-action-did-tap-text = Tapped the element labelled "{ $text }".
+tool-android-action-did-swipe = Swiped from ({ $x1 }, { $y1 }) to ({ $x2 }, { $y2 }).
+tool-android-action-did-scroll = Scrolled { $direction }.
+tool-android-action-did-text = Typed { $chars } characters into the focused field.
+tool-android-action-did-key = Pressed the { $key } key.
+tool-android-action-did-dialog = Clicked the "{ $button }" dialog button.
+tool-android-action-error-missing-int = The '{ $param }' parameter is required and must be an integer.
+tool-android-action-error-missing-str = The '{ $param }' parameter is required and must be a non-empty string.
+tool-android-action-error-coord-range = The '{ $param }' coordinate { $value } is out of range (0 to { $max }).
+tool-android-action-error-enum = '{ $value }' is not a valid { $param }. Choose one of: { $allowed }.
+tool-android-action-error-text-too-long = Text is too long ({ $bytes } bytes, maximum { $max }).
+
+tool-android-launch = Launch an Android app by package name, optionally targeting a specific activity.
+tool-android-launch-param-package = Application package name, such as 'com.android.settings'.
+tool-android-launch-param-activity = Optional fully-qualified activity to launch within the package.
+tool-android-launch-launched = Launched { $package }.
+tool-android-launch-error-missing-package = The 'package' parameter is required.
+tool-android-launch-error-bad-package = '{ $package }' is not a valid Android package name.
+
+tool-android-error-connect = Could not reach the Android UI bridge at { $path }: { $error }. Check that the Android app is running and that its accessibility service is enabled.
+tool-android-error-connect-timeout = Timed out connecting to the Android UI bridge at { $path }.
+tool-android-error-read = Failed reading the Android UI bridge response: { $error }
+tool-android-error-timeout = The Android UI bridge did not respond within { $secs } seconds.
+tool-android-error-empty-response = The Android UI bridge closed the connection without responding.
+tool-android-error-bad-response = The Android UI bridge returned a malformed response: { $error }
+tool-android-error-request-too-large = Request is too large for the Android UI bridge ({ $bytes } bytes, maximum { $max }).
+tool-android-error-response-too-large = The Android UI bridge response exceeded the { $max } byte limit.
+tool-android-error-bridge = Android UI bridge error [{ $code }]: { $message }
+
 tool-backup = Create, list, verify, and restore workspace backups
 
 tool-browser = Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions.
@@ -191,3 +251,13 @@ tool-web-search-tool = Search the web for information. Returns relevant search r
 tool-workspace = Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions.
 
 tool-weather = Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0-3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required.
+
+tool-android-action-param-expect-package = Package name the caller believes is on screen (for example com.android.settings). When set, the action is refused if a different app is foreground, so a tap never lands in an app that drifted forward.
+tool-android-error-wrong-foreground = Refused: expected { $expected } to be on screen but { $actual } is foreground. Take a screenshot and re-orient before acting.
+
+tool-android-device = Read a device fact from the Android phone: attached sensors, last known location, or telephony/carrier state. Reads only; it never changes the device or touches the screen.
+tool-android-device-param-what = Which fact to read: sensors, location, or telephony.
+tool-android-device-error-missing-what = android_device needs 'what' (sensors, location, or telephony).
+tool-android-device-error-bad-what = Unsupported device fact '{ $what }'. Supported: { $supported }.
+tool-android-device-error-refused = Could not read { $what }: { $reason }
+tool-android-device-read = Read Android { $what }.
