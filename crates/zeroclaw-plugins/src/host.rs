@@ -464,7 +464,7 @@ fn validate_manifest_shape(
     // The `[egress]` declaration is signature-covered content, so a malformed
     // pattern is a malformed package: reject it at discovery and at install
     // rather than silently dropping the entry. This validates the *declaration*
-    // only — it still grants nothing (ADR-013), and the grammar it validates
+    // only — it still grants nothing, and the grammar it validates
     // against is the same one the operator's grant is validated against.
     zeroclaw_infra::net_guard::normalize_egress_patterns(
         &manifest.egress.hosts,

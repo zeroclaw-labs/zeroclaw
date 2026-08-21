@@ -1,4 +1,4 @@
-//! End-to-end proof of the plugin egress boundary (ADR-013 gate G2).
+//! End-to-end proof of the plugin egress boundary.
 //!
 //! Every test here drives a **real WASM component** through a **real
 //! `wasi:http` call** into ZeroClaw's hooks. Nothing is stubbed: the deny path
@@ -79,9 +79,13 @@ fn policy(hosts: &[&str], allow_private: &[&str]) -> EgressHostService {
     let hosts: Vec<String> = hosts.iter().map(|h| (*h).to_string()).collect();
     let allow_private: Vec<String> = allow_private.iter().map(|h| (*h).to_string()).collect();
     EgressHostService::new(EgressPolicyResolver::new(move |_| {
-        // No NAT64 prefixes and the shipped default connection ceiling: this
-        // slice varies only the destination grant.
-        EgressPolicy::new(&hosts, &allow_private, &[], 16)
+        // No NAT64 prefixes, and a ceiling deliberately far above what any one
+        // probe needs: every test here shares one instance identity, and
+        // connection accounting is process-wide, so a tight ceiling would make
+        // these tests contend with each other under a parallel runner. The
+        // budget is proved in `egress`'s unit tests, not here; this slice
+        // varies only the destination grant.
+        EgressPolicy::new(&hosts, &allow_private, &[], 256)
     }))
 }
 

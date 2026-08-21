@@ -118,7 +118,7 @@ impl PluginStoreSpec {
     /// This grants the *surface*, never the *reach*. Without a service from
     /// [`Self::with_egress_policy`] the store still links `wasi:http` and still
     /// answers `http_enabled()`, but every request the guest issues is denied
-    /// (ADR-013). Keeping the linker attached rather than dropping it is what
+    /// Keeping the linker attached rather than dropping it is what
     /// keeps store construction and the store/linker coherence check stable
     /// while the answer to "may this instance reach the network" moves to the
     /// host-owned egress boundary.

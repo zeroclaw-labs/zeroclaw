@@ -1,5 +1,5 @@
 //! Minimal tool component that performs real `wasi:http` egress, used by the
-//! host's plugin egress-policy integration tests (ADR-013 gate G2).
+//! host's plugin egress-policy integration tests.
 //!
 //! `execute` takes `{"url": "...", "follow": <bool>}` and issues **one**
 //! outbound request. When `follow` is set and the first response carries a

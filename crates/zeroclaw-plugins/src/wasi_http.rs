@@ -1,4 +1,4 @@
-//! ZeroClaw's `wasi:http` outbound handler for plugin stores (ADR-013).
+//! ZeroClaw's `wasi:http` outbound handler for plugin stores.
 //!
 //! A plugin granted `http_client` gets the `wasi:http` linker, but the linker is
 //! not the authority. This module replaces wasmtime's default [`WasiHttpHooks`]
@@ -98,6 +98,58 @@ fn record_denial(id: &PluginInstanceId, host: &str, reason: &str) {
     );
 }
 
+/// Split a request authority into the one endpoint that must be authorized,
+/// dialed, and named on the wire.
+///
+/// `Authority` is looser than it looks, and its accessors disagree in two ways
+/// that would otherwise let a single request describe two different endpoints:
+///
+/// * `port_u16()` answers `None` both for an absent port and for a port that is
+///   present but not a `u16`. `example.com:99999` passes the URI character
+///   validation an authority actually gets, so a guest can reach the second
+///   case; treating it as the first authorizes and dials the scheme default
+///   while the peer is told `example.com:99999`.
+/// * `host()` drops userinfo, while `as_str()` — the value that fills the
+///   `Host` header — keeps it. `user@example.com` would be authorized and
+///   dialed as `example.com` and announced as `user@example.com`.
+///
+/// Both are refused as malformed URIs, and only a genuinely absent port takes
+/// the scheme default. Refusing userinfo outright is the tighter of the two
+/// sound contracts and gives up nothing real: userinfo is deprecated in
+/// `http`/`https` URIs (RFC 3986 §3.2.1), a `Host` header may not carry it
+/// (RFC 9110 §7.2), and wasmtime's own default hooks already fail these
+/// requests — they hand the whole authority, userinfo and all, to
+/// `TcpStream::connect`, which cannot resolve it. This makes that accidental
+/// failure explicit rather than loosening it.
+fn authority_endpoint(
+    authority: &hyper::http::uri::Authority,
+    use_tls: bool,
+) -> Result<(String, u16), ErrorCode> {
+    let text = authority.as_str();
+    if text.contains('@') {
+        return Err(ErrorCode::HttpRequestUriInvalid);
+    }
+    // Whatever `host()` did not claim is the port, separator included.
+    let host = authority.host();
+    let Some(rest) = text.strip_prefix(host) else {
+        return Err(ErrorCode::HttpRequestUriInvalid);
+    };
+    let port = match rest.strip_prefix(':') {
+        Some(digits) => digits
+            .parse::<u16>()
+            .map_err(|_| ErrorCode::HttpRequestUriInvalid)?,
+        None if rest.is_empty() => {
+            if use_tls {
+                443
+            } else {
+                80
+            }
+        }
+        None => return Err(ErrorCode::HttpRequestUriInvalid),
+    };
+    Ok((host.to_string(), port))
+}
+
 /// ZeroClaw's replacement for wasmtime's default `wasi:http` hooks.
 ///
 /// One per plugin store. `egress: None` is the deny-by-default state.
@@ -123,10 +175,14 @@ impl WasiHttpHooks for PluginEgressHooks {
                 ErrorCode::HttpRequestUriInvalid,
             ))));
         };
-        let host = authority.host().to_string();
-        let port = authority
-            .port_u16()
-            .unwrap_or(if config.use_tls { 443 } else { 80 });
+        // One endpoint for the grant check, the dial, and the `Host` header.
+        // An authority that cannot name exactly one is a malformed URI, and is
+        // reported as such rather than as a policy denial: nothing about the
+        // host's network is disclosed by telling a guest its own URI is bad.
+        let (host, port) = match authority_endpoint(&authority, config.use_tls) {
+            Ok(endpoint) => endpoint,
+            Err(error) => return Ok(HostFutureIncomingResponse::ready(Ok(Err(error)))),
+        };
 
         // Deny by default, before anything is spawned and before any name is
         // looked up: a store that links `wasi:http` without a host-owned egress
@@ -194,6 +250,12 @@ async fn send(
 ) -> Result<IncomingResponse, ErrorCode> {
     use http_body_util::BodyExt;
 
+    // The authority is safe to name on the wire because [`authority_endpoint`]
+    // already refused every form whose `as_str()` describes something other
+    // than the endpoint this request was authorized for and will be dialed at.
+    // A `Host` header the guest set itself is left alone, exactly as the
+    // default send path leaves it: the grant, the pin, and TLS identity all
+    // come from the URI regardless of what the guest claims here.
     if !request.headers().contains_key(HOST)
         && let Some(authority) = request.uri().authority()
         && let Ok(value) = hyper::header::HeaderValue::from_str(authority.as_str())
@@ -218,7 +280,17 @@ async fn send(
     // this future until the connection worker takes it, so returning early —
     // or the guest dropping the request, which aborts this future — drops the
     // token and releases the lease.
-    let deadline = Instant::now() + config.connect_timeout;
+    //
+    // `connect_timeout` is the guest's number — `wasi:http`'s
+    // `request-options.set-connect-timeout` reaches this field unclamped — so
+    // the deadline is computed with `checked_add` rather than `+`. A duration
+    // the monotonic clock cannot represent is not a budget the host can
+    // enforce, and it must not become a panic in a host function on a guest's
+    // say-so. A nonsense timeout gets the timeout error it asked for, closed
+    // and immediate.
+    let Some(deadline) = Instant::now().checked_add(config.connect_timeout) else {
+        return Err(ErrorCode::ConnectionTimeout);
+    };
 
     // ── authorize ────────────────────────────────────────────────
     // The shared boundary checks the effective grant and the operator's
@@ -453,9 +525,10 @@ mod tests {
     /// refused on the same masked path, not reported as a distinct condition.
     #[test]
     fn a_malformed_request_host_is_denied_without_resolving() {
-        let service = EgressHostService::new(EgressPolicyResolver::new(|_| {
-            EgressPolicy::new(&["example.com".to_string()], &[], &[], 4)
-        }));
+        let service =
+            EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(
+                |_| EgressPolicy::new(&["example.com".to_string()], &[], &[], 4),
+            ));
         let mut hooks = hooks(Some(service));
         let response = hooks
             .send_request(request("http://exa_mple.com/"), config())
@@ -466,11 +539,104 @@ mod tests {
         ));
     }
 
+    fn authority(text: &str) -> hyper::http::uri::Authority {
+        text.parse().expect("a valid fixture authority")
+    }
+
+    /// The endpoint contract: one authority names exactly one host and port, or
+    /// it is not a usable authority.
+    ///
+    /// The port cases are the reason this helper exists. `port_u16()` cannot
+    /// tell "no port" from "a port that is not a `u16`", and the URI validation
+    /// an authority actually receives lets the second through, so the old
+    /// `unwrap_or(default)` authorized and dialed the scheme default for an
+    /// authority the peer would be told was something else.
+    #[test]
+    fn an_authority_names_one_endpoint_or_none() {
+        assert_eq!(
+            authority_endpoint(&authority("example.com:8443"), false).unwrap(),
+            ("example.com".to_string(), 8443),
+            "an explicit in-range port is honoured over the scheme default"
+        );
+        assert_eq!(
+            authority_endpoint(&authority("example.com"), false).unwrap(),
+            ("example.com".to_string(), 80)
+        );
+        assert_eq!(
+            authority_endpoint(&authority("example.com"), true).unwrap(),
+            ("example.com".to_string(), 443),
+            "only an absent port takes the scheme default"
+        );
+        assert_eq!(
+            authority_endpoint(&authority("[::1]:8443"), false).unwrap(),
+            ("[::1]".to_string(), 8443),
+            "an IPv6 literal keeps its brackets and loses only the port"
+        );
+        assert_eq!(
+            authority_endpoint(&authority("[::1]"), true).unwrap(),
+            ("[::1]".to_string(), 443),
+            "the colons inside an IPv6 literal are not an explicit port"
+        );
+
+        for rejected in [
+            // Out of `u16` range, and accepted by authority validation.
+            "example.com:99999",
+            "example.com:65536",
+            // Present but not numeric, and present but empty.
+            "example.com:http",
+            "example.com:",
+            // Userinfo: `host()` drops it, `as_str()` keeps it, so the
+            // authorized endpoint and the wire `Host` value would disagree.
+            "user@example.com",
+            "user:pass@example.com:8443",
+        ] {
+            assert!(
+                matches!(
+                    authority_endpoint(&authority(rejected), false),
+                    Err(ErrorCode::HttpRequestUriInvalid)
+                ),
+                "{rejected:?} names no single endpoint and must be refused"
+            );
+        }
+    }
+
+    /// The same contract through the hook the guest actually calls: an
+    /// out-of-range port is refused outright rather than quietly redirected to
+    /// the scheme default, and the refusal is a URI error rather than a policy
+    /// denial — the guest's own URI is the only thing it discloses.
+    #[test]
+    fn an_out_of_range_port_is_refused_instead_of_defaulted() {
+        let service =
+            EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(
+                // The scheme default this would have fallen back to is granted,
+                // so a regression here reaches the network rather than failing.
+                |_| EgressPolicy::new(&["example.com".to_string()], &[], &[], 4),
+            ));
+        let mut hooks = hooks(Some(service));
+        for uri in [
+            "http://example.com:99999/",
+            "http://user@example.com/",
+            "http://user:pass@example.com:8443/",
+        ] {
+            let response = hooks
+                .send_request(request(uri), config())
+                .expect("a malformed URI is a guest-visible error, never a trap");
+            assert!(
+                matches!(denial(response), ErrorCode::HttpRequestUriInvalid),
+                "{uri} must be refused as a malformed URI"
+            );
+        }
+    }
+
     /// A loopback grant with the private carveout and a one-connection ceiling.
     /// The tight ceiling is the point: a slot that leaks on a failed dial makes
     /// the next authorization fail, so the budget is observable.
+    ///
+    /// Accounting is private to the caller. Connection counts are otherwise
+    /// process-wide, and a one-slot ceiling shared with whatever else the test
+    /// binary is running concurrently would not be observable at all.
     fn loopback_service() -> EgressHostService {
-        EgressHostService::new(EgressPolicyResolver::new(|_| {
+        EgressHostService::with_private_connection_accounting(EgressPolicyResolver::new(|_| {
             EgressPolicy::new(
                 &["127.0.0.1".to_string()],
                 &["127.0.0.1".to_string()],
@@ -478,6 +644,40 @@ mod tests {
                 1,
             )
         }))
+    }
+
+    /// The connect budget arrives from the guest: `wasi:http`'s
+    /// `request-options.set-connect-timeout` reaches `connect_timeout`
+    /// unclamped, and `WasiHttpHooks::send_request` accepts whatever
+    /// `OutgoingRequestConfig` it is handed. A duration the monotonic clock
+    /// cannot represent must therefore fail closed here rather than panic
+    /// inside a host function.
+    ///
+    /// The guest's own ceiling is `Duration::from_nanos(u64::MAX)` — about 585
+    /// years, which today's targets *can* represent — so this is a defense of
+    /// the hook boundary and of platforms whose clock epoch leaves less room,
+    /// not a reproduction of a wasm module that panics the host on demand.
+    #[tokio::test]
+    async fn an_unrepresentable_connect_budget_fails_closed_instead_of_panicking() {
+        let mut hooks = hooks(Some(loopback_service()));
+        let config = OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: Duration::MAX,
+            first_byte_timeout: Duration::from_secs(1),
+            between_bytes_timeout: Duration::from_secs(1),
+        };
+
+        let response = hooks
+            .send_request(request("http://127.0.0.1:1/"), config)
+            .expect("a nonsense timeout is a guest-visible error, never a trap");
+        let HostFutureIncomingResponse::Pending(handle) = response else {
+            panic!("a granted destination is dialed asynchronously");
+        };
+        let outcome = handle.await.expect("the send task must not trap");
+        assert!(
+            matches!(outcome, Err(ErrorCode::ConnectionTimeout)),
+            "an unrepresentable connect budget must fail closed, got: {outcome:?}"
+        );
     }
 
     /// A peer that completes the TCP handshake and then sends nothing.

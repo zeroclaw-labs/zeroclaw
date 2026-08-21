@@ -604,14 +604,19 @@ fn plugin_egress_policy(
 }
 
 /// The one host-owned egress authority shared by every plugin instance in a
-/// registry (ADR-013).
+/// registry.
 ///
 /// It resolves a *view* of canonical config at the moment each request is made
 /// rather than snapshotting one here, so an operator edit takes effect without
-/// re-instantiating the guest. Sharing the one service across the registry is
-/// also what makes the per-instance connection budget span an instance's
-/// stores. The live handle is preferred; one-shot callers that have none fall
-/// back to the documented `root_config` snapshot.
+/// re-instantiating the guest. The live handle is preferred; one-shot callers
+/// that have none fall back to the documented `root_config` snapshot.
+///
+/// A fresh service is built per registry, and that is deliberately fine: the
+/// per-instance connection budget does *not* live in the service. It lives in
+/// `zeroclaw_plugins::egress`'s process-wide registry, keyed by canonical
+/// instance identity, so the agent loop, the gateway, the channels
+/// orchestrator, and the delegate tool spend one ceiling between them rather
+/// than one each.
 ///
 /// Egress and config resolve the **same** `[[plugins.entries]]` row: both key on
 /// the instance's `config_entry_key()` (the opaque `zpi1_` instance key), never

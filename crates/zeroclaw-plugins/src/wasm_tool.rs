@@ -20,7 +20,7 @@ pub struct WasmTool {
     scope: PluginInstanceScope,
     config: PluginConfigResolver,
     limits: PluginLimits,
-    /// Host-owned egress authority for this instance (ADR-013). `None` is
+    /// Host-owned egress authority for this instance. `None` is
     /// deny-by-default: the store still links `wasi:http` when the scope grants
     /// `HttpClient`, but every outbound request is refused. Held as the shared
     /// service rather than a resolved allowlist so an operator's config edit
