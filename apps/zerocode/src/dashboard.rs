@@ -1225,11 +1225,13 @@ impl Dashboard {
 
         let mut lines = Vec::new();
         if let Some(obj) = h.as_object() {
+            let label_width = health_status_label_width();
+
             // Overall status
             if let Some(uptime) = obj.get("uptime_seconds").and_then(|v| v.as_u64()) {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-uptime")),
+                        status_label("zc-dashboard-label-uptime", label_width),
                         theme::dim_style(),
                     ),
                     Span::styled(format_uptime(uptime), theme::body_style()),
@@ -1238,7 +1240,7 @@ impl Dashboard {
             if let Some(pid) = obj.get("pid").and_then(|v| v.as_u64()) {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-pid")),
+                        status_label("zc-dashboard-label-pid", label_width),
                         theme::dim_style(),
                     ),
                     Span::styled(pid.to_string(), theme::body_style()),
@@ -2924,10 +2926,32 @@ const OVERVIEW_STATUS_LABEL_KEYS: &[&str] = &[
     "zc-dashboard-label-daemon-cpu",
 ];
 
+const HEALTH_STATUS_LABEL_KEYS: &[&str] = &["zc-dashboard-label-uptime", "zc-dashboard-label-pid"];
+
 fn overview_status_label_width() -> usize {
-    OVERVIEW_STATUS_LABEL_KEYS
-        .iter()
-        .map(|key| crate::display_width::display_width(&crate::i18n::t(key)))
+    status_label_width(
+        OVERVIEW_STATUS_LABEL_KEYS
+            .iter()
+            .map(|key| crate::i18n::t(key)),
+    )
+}
+
+fn health_status_label_width() -> usize {
+    status_label_width(
+        HEALTH_STATUS_LABEL_KEYS
+            .iter()
+            .map(|key| crate::i18n::t(key)),
+    )
+}
+
+fn status_label_width<I, S>(labels: I) -> usize
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    labels
+        .into_iter()
+        .map(|label| crate::display_width::display_width(label.as_ref()))
         .max()
         .unwrap_or(0)
         .saturating_add(1)
@@ -3467,6 +3491,21 @@ mod tests {
 
         assert_eq!(crate::display_width::display_width(&padded), 16);
         assert!(padded.ends_with(' '));
+    }
+
+    #[test]
+    fn status_label_width_handles_translated_labels_longer_than_default() {
+        let width = status_label_width(["Disponibilité", "PID"]);
+
+        assert_eq!(width, 14);
+        assert_eq!(
+            crate::display_width::display_width(&padded_status_label("Disponibilité", width)),
+            width
+        );
+        assert_eq!(
+            crate::display_width::display_width(&padded_status_label("PID", width)),
+            width
+        );
     }
 
     #[test]
