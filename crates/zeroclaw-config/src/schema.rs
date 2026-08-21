@@ -2697,6 +2697,49 @@ pub struct GeminiCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Grok Build CLI (subprocess wrapper) ──
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.grok_cli"]
+pub struct GrokCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Path to the `grok` CLI binary. Falls back to `grok` (PATH lookup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    /// Required absolute working directory for the `grok` subprocess and ACP
+    /// session boundary. The directory must exist when the provider is built.
+    /// Project-scoped Grok config is resolved relative to this path.
+    pub working_directory: String,
+    /// Extra environment variable names inherited by the `grok`
+    /// subprocess. Values are resolved from the ZeroClaw process environment
+    /// at spawn time. The default is empty so unrelated daemon secrets remain
+    /// blocked. `XAI_API_KEY` is the sole supported provider-owned name and
+    /// enables API-key authentication when explicitly listed and non-empty;
+    /// other `XAI_*` and all `GROK_*` names are rejected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_class = "legacy_env_path"]
+    pub env_passthrough: Vec<String>,
+    /// Extra global Grok long flags inserted before `agent stdio`. Known
+    /// options may put their value in the next token; other value-taking
+    /// options use `--flag=value`. Positional and short arguments are rejected.
+    /// ZeroClaw defaults to `--sandbox strict`, `--permission-mode dontAsk`,
+    /// and an empty built-in tool set. Providing the corresponding flags here
+    /// is an explicit per-alias opt-in to relax those defaults. ACP transport,
+    /// prompt/model/session, cwd, debug-file, and update-policy flags are
+    /// reserved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// Maximum cumulative stdout bytes accepted from `grok agent stdio` for
+    /// one ACP request. When unset, ZeroClaw uses 4 MiB. Values must be
+    /// between 1 MiB and 64 MiB; the provider rejects invalid values when it
+    /// is constructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_acp_stdout_bytes: Option<usize>,
+}
+
 // ── LMStudio (local default) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3329,6 +3372,7 @@ impl_default_family_endpoint! {
     BaichuanModelProviderConfig,
     GeminiModelProviderConfig,
     GeminiCliModelProviderConfig,
+    GrokCliModelProviderConfig,
     LmstudioModelProviderConfig,
     LlamacppModelProviderConfig,
     SglangModelProviderConfig,
@@ -14293,6 +14337,86 @@ pub enum StreamMode {
     MultiMessage,
 }
 
+/// Matrix streaming mode for progressive response delivery.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum MatrixStreamMode {
+    /// No streaming -- send the complete response as a single message (default).
+    #[default]
+    Off,
+    /// Update a draft message with every flush interval.
+    Partial,
+    /// Stream progress into one sliding draft and send the final response as a separate message.
+    #[serde(rename = "single_message")]
+    SingleMessage,
+    /// Send the response as multiple separate messages at paragraph boundaries.
+    #[serde(rename = "multi_message")]
+    MultiMessage,
+}
+
+/// Matrix single-message reasoning visibility.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum StreamReasoningMode {
+    /// Do not emit reasoning-derived progress into the Matrix draft.
+    Off,
+    /// Emit liveness-only reasoning status ticks without raw reasoning text.
+    #[default]
+    Status,
+    /// Emit raw provider reasoning text into the Matrix progress draft.
+    Full,
+}
+
+/// Base policy for Matrix single-message tool argument progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum StreamToolArgumentBase {
+    /// Do not display any arguments unless a per-tool rule includes them.
+    None,
+    /// Use ZeroClaw's conservative per-tool recommendations.
+    #[default]
+    Safe,
+    /// Display every argument except runtime-internal fields, after leak scrubbing.
+    All,
+}
+
+/// One entry in `MatrixConfig::stream_tool_arguments`.
+///
+/// A list may contain at most one defaults entry plus independent per-tool
+/// rules. Entry order is not significant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(untagged, deny_unknown_fields)]
+pub enum StreamToolArgumentEntry {
+    /// Override inherited settings for tools without a matching rule.
+    Defaults {
+        default_base: StreamToolArgumentBase,
+        /// Override the inherited per-value character cap. `0` disables it.
+        #[serde(default)]
+        argument_chars: Option<usize>,
+    },
+    /// Override or adjust inherited settings for one exact tool name.
+    Tool {
+        tool: String,
+        #[serde(default)]
+        base: Option<StreamToolArgumentBase>,
+        #[serde(default)]
+        include: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+        /// Override the inherited per-value character cap. `0` disables it.
+        #[serde(default)]
+        argument_chars: Option<usize>,
+    },
+}
+
 /// Where a channel registers its skill slash commands. `global` (default)
 /// registers application-wide - the commands work everywhere the bot is, but
 /// Discord takes up to ~1h to propagate changes. `guild` registers to each
@@ -14336,6 +14460,20 @@ fn default_channel_approval_timeout_secs() -> u64 {
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
+}
+
+fn default_matrix_stream_draft_lines() -> usize {
+    10
+}
+
+pub const DEFAULT_STREAM_TOOL_ARGUMENT_CHARS: usize = 60;
+/// Smallest serialized Matrix message-content budget accepted by the
+/// single-message delivery path. This leaves room for a non-empty body, the
+/// JSON envelope, formatted Markdown, and an edit/reply relation.
+pub const MATRIX_MIN_MESSAGE_MAX_BYTES: usize = 512;
+
+fn default_matrix_message_max_bytes() -> usize {
+    48_000
 }
 
 /// Telegram bot channel configuration.
@@ -14489,7 +14627,13 @@ pub enum DiscordReactionScope {
 }
 
 /// Discord bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.discord"]
 #[allow(clippy::struct_excessive_bools)]
@@ -14632,6 +14776,17 @@ pub struct DiscordConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl Default for DiscordConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree. Every field here
+    /// either declares a serde default or is an `Option`, which is what
+    /// makes the empty object total.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every DiscordConfig field declares a serde default or is Option")
+    }
+}
+
 impl DiscordConfig {
     /// Validate this alias's bot-token placeholder and enabled-state rules.
     /// Mirrors `TelegramConfig::validate_bot_token`.
@@ -14659,7 +14814,13 @@ pub const DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 0;
 pub const MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 50;
 
 /// Slack bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.slack"]
 #[allow(clippy::struct_excessive_bools)]
@@ -14722,10 +14883,8 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub strict_mention_in_thread: bool,
-    /// Maximum number of prior messages prepended when ZeroClaw first
-    /// encounters a Slack thread. `0` disables automatic thread-context
-    /// hydration. When omitted, defaults to 0, so hydration is opt-in.
-    /// Maximum: 50.
+    /// Prior thread messages to hydrate on the first bot interaction. `0`
+    /// disables hydration. Maximum: 50.
     #[tab(Advanced)]
     #[serde(default)]
     pub thread_context_max_messages: Option<usize>,
@@ -14779,6 +14938,17 @@ pub struct SlackConfig {
 
 fn default_slack_draft_update_interval_ms() -> u64 {
     1200
+}
+
+impl Default for SlackConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree. Every field here
+    /// either declares a serde default or is an `Option`, which is what
+    /// makes the empty object total.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every SlackConfig field declares a serde default or is Option")
+    }
 }
 
 impl ChannelConfig for SlackConfig {
@@ -15103,7 +15273,13 @@ impl ChannelConfig for IMessageConfig {
 }
 
 /// Matrix channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.matrix"]
 pub struct MatrixConfig {
@@ -15146,12 +15322,14 @@ pub struct MatrixConfig {
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// Streaming mode for progressive response delivery.
-    /// `"off"` (default): single message. `"partial"`: edit-in-place draft.
+    /// `"off"` (default): single final message. `"partial"`: edit-in-place draft.
+    /// `"single_message"`: progress draft plus separate final message.
     /// `"multi_message"`: paragraph-split delivery.
     #[tab(Behavior)]
     #[serde(default)]
-    pub stream_mode: StreamMode,
-    /// Minimum interval (ms) between draft message edits in Partial mode.
+    pub stream_mode: MatrixStreamMode,
+    /// Minimum interval (ms) between Matrix draft edits in Partial mode and
+    /// thinking/reasoning progress edits in SingleMessage mode.
     #[tab(Behavior)]
     #[serde(default = "default_matrix_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
@@ -15159,6 +15337,45 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
+    /// Maximum number of progress lines kept in the Matrix single-message
+    /// streaming draft. Set to 0 to remove the line-count limit; all lines
+    /// still compete within one byte-bounded Matrix draft event.
+    #[tab(Behavior)]
+    #[serde(default = "default_matrix_stream_draft_lines")]
+    pub stream_draft_lines: usize,
+    /// Serialized Matrix event-content byte budget for single-message
+    /// streaming draft edits and the separate final response. The rendered
+    /// Markdown body, generated HTML, and reply/edit relation all count
+    /// toward this limit. Oversized progress drops complete oldest entries;
+    /// the separate final response retains a UTF-8-safe prefix. Values below
+    /// 512 use that minimum, which leaves room for a non-empty serialized event.
+    #[tab(Behavior)]
+    #[serde(default = "default_matrix_message_max_bytes")]
+    pub message_max_bytes: usize,
+    /// Delete the Matrix single-message progress draft before sending the final
+    /// response. When false, durable progress remains as a visible transcript;
+    /// placeholder-only drafts are still removed before the final response.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub stream_draft_delete: bool,
+    /// Matrix single-message reasoning visibility. `"off"` suppresses
+    /// reasoning-derived draft updates, `"status"` emits liveness ticks without
+    /// raw reasoning text, and `"full"` emits raw provider reasoning text into
+    /// the progress draft.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_reasoning: StreamReasoningMode,
+    /// Tool arguments shown in Matrix single-message progress lines. Missing or
+    /// empty means the conservative `safe` defaults. Use one
+    /// `{ default_base = "none" | "safe" | "all" }` entry for inherited
+    /// settings, then exact-name tool entries with optional `base`, `include`,
+    /// `exclude`, and `argument_chars` adjustments. `argument_chars` limits
+    /// each displayed value and defaults to 60; `0` disables that limit.
+    /// Unknown tools resolve to no arguments under `safe`; every selected value
+    /// is leak-scrubbed before display.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_tool_arguments: Vec<StreamToolArgumentEntry>,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
     #[tab(Behavior)]
@@ -15214,6 +15431,98 @@ pub struct MatrixConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl Default for MatrixConfig {
+    /// Built by deserializing an object supplying only `homeserver`, the one
+    /// field with no serde default - a Matrix channel must always name a
+    /// homeserver, so it stays required rather than gaining one. Every other
+    /// field either declares a serde default or is an `Option`, so this is
+    /// the minimal object that makes the deserialize total; those defaults
+    /// stay the only source of truth for everything but `homeserver`.
+    fn default() -> Self {
+        serde_json::from_str(r#"{"homeserver":""}"#)
+            .expect("every other MatrixConfig field declares a serde default or is Option")
+    }
+}
+
+fn validate_stream_tool_argument_names<'a>(
+    entry_path: &str,
+    field_name: &str,
+    fields: &'a [String],
+) -> Result<std::collections::HashSet<&'a str>> {
+    let mut names = std::collections::HashSet::new();
+    for (field_index, field) in fields.iter().enumerate() {
+        if field.is_empty() || field.trim() != field {
+            anyhow::bail!(
+                "{entry_path}.{field_name}[{field_index}] must be a non-empty exact argument name without surrounding whitespace"
+            );
+        }
+        if !names.insert(field.as_str()) {
+            anyhow::bail!("{entry_path}.{field_name} contains duplicate argument '{field}'");
+        }
+    }
+    Ok(names)
+}
+
+impl MatrixConfig {
+    /// Effective UTF-8 body budget for Matrix single-message streaming.
+    ///
+    /// A serialized Matrix event has fixed JSON, message, and relation
+    /// overhead in addition to UTF-8 source text. Keeping this floor avoids
+    /// accepting a budget that cannot contain even a one-scalar event.
+    pub fn effective_message_max_bytes(&self) -> usize {
+        self.message_max_bytes.max(MATRIX_MIN_MESSAGE_MAX_BYTES)
+    }
+
+    /// Validate the order-independent tool argument display policy.
+    pub fn validate_stream_tool_arguments(&self) -> Result<()> {
+        let mut saw_defaults = false;
+        let mut tools = std::collections::HashSet::new();
+
+        for (index, entry) in self.stream_tool_arguments.iter().enumerate() {
+            let entry_path = format!("stream_tool_arguments[{index}]");
+            match entry {
+                StreamToolArgumentEntry::Defaults { .. } => {
+                    if saw_defaults {
+                        anyhow::bail!(
+                            "{entry_path}.default_base duplicates the list's default_base entry"
+                        );
+                    }
+                    saw_defaults = true;
+                }
+                StreamToolArgumentEntry::Tool {
+                    tool,
+                    include,
+                    exclude,
+                    ..
+                } => {
+                    if tool.is_empty() || tool.trim() != tool {
+                        anyhow::bail!(
+                            "{entry_path}.tool must be a non-empty exact tool name without surrounding whitespace"
+                        );
+                    }
+                    if !tools.insert(tool.as_str()) {
+                        anyhow::bail!("{entry_path}.tool duplicates the rule for tool '{tool}'");
+                    }
+
+                    let included =
+                        validate_stream_tool_argument_names(&entry_path, "include", include)?;
+                    let excluded =
+                        validate_stream_tool_argument_names(&entry_path, "exclude", exclude)?;
+                    for field in &excluded {
+                        if included.contains(*field) {
+                            anyhow::bail!(
+                                "{entry_path} includes and excludes the same argument '{field}'"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl ChannelConfig for MatrixConfig {
     fn name() -> &'static str {
         "Matrix"
@@ -15223,7 +15532,14 @@ impl ChannelConfig for MatrixConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+/// Signal channel configuration.
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.signal"]
 pub struct SignalConfig {
@@ -15287,6 +15603,20 @@ pub struct SignalConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+}
+
+impl Default for SignalConfig {
+    /// Built by deserializing an object supplying only `http_url` and
+    /// `account`, the two fields with no serde default - a Signal channel
+    /// must always name its daemon and account, so they stay required
+    /// rather than gaining one. Every other field either declares a serde
+    /// default or is an `Option`, so this is the minimal object that makes
+    /// the deserialize total; those defaults stay the only source of truth
+    /// for everything but `http_url` and `account`.
+    fn default() -> Self {
+        serde_json::from_str(r#"{"http_url":"","account":""}"#)
+            .expect("every other SignalConfig field declares a serde default or is Option")
+    }
 }
 
 impl SignalConfig {
@@ -16405,7 +16735,13 @@ pub enum LarkReceiveMode {
 
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.lark"]
 pub struct LarkConfig {
@@ -16502,6 +16838,20 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+}
+
+impl Default for LarkConfig {
+    /// Built by deserializing an object supplying only `app_id` and
+    /// `app_secret`, the two fields with no serde default - a Lark channel
+    /// must always name its app credentials, so they stay required rather
+    /// than gaining one. Every other field either declares a serde default
+    /// or is an `Option`, so this is the minimal object that makes the
+    /// deserialize total; those defaults stay the only source of truth for
+    /// everything but `app_id` and `app_secret`.
+    fn default() -> Self {
+        serde_json::from_str(r#"{"app_id":"","app_secret":""}"#)
+            .expect("every other LarkConfig field declares a serde default or is Option")
+    }
 }
 
 impl ChannelConfig for LarkConfig {
@@ -20593,6 +20943,12 @@ impl Config {
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
             )?;
+        }
+
+        for (alias, matrix) in &self.channels.matrix {
+            matrix.validate_stream_tool_arguments().with_context(|| {
+                format!("invalid channels.matrix.{alias}.stream_tool_arguments")
+            })?;
         }
 
         for (alias, slack) in &self.channels.slack {
@@ -26762,6 +27118,32 @@ auto_save = true
         assert!(parsed.temperature_override.is_none());
     }
 
+    #[::core::prelude::v1::test]
+    fn grok_cli_alias_requires_working_directory() {
+        let error = toml::from_str::<GrokCliModelProviderConfig>("model = \"grok-4.5\"")
+            .expect_err("missing ACP session boundary must fail");
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn grok_cli_alias_deserializes_explicit_working_directory() {
+        let parsed: GrokCliModelProviderConfig = toml::from_str(
+            r#"
+                model = "grok-4.5"
+                working_directory = "/srv/zeroclaw/workspace"
+                env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+                max_acp_stdout_bytes = 8388608
+            "#,
+        )
+        .expect("explicit Grok ACP cwd");
+        assert_eq!(parsed.working_directory, "/srv/zeroclaw/workspace");
+        assert_eq!(
+            parsed.env_passthrough,
+            ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+        );
+        assert_eq!(parsed.max_acp_stdout_bytes, Some(8_388_608));
+    }
+
     #[test]
     async fn channels_default() {
         let c = ChannelsConfig::default();
@@ -28435,6 +28817,19 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn telegram_config_rejects_matrix_single_message_stream_mode() {
+        let err = toml::from_str::<TelegramConfig>(
+            r#"
+bot_token = "tok"
+stream_mode = "single_message"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("single_message"));
+    }
+
+    #[test]
     async fn discord_config_serde() {
         let dc = DiscordConfig {
             enabled: true,
@@ -28535,9 +28930,14 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             device_id: Some("DEVICE123".into()),
             allowed_rooms: vec!["!room123:matrix.org".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28570,9 +28970,14 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             device_id: None,
             allowed_rooms: vec!["!abc:synapse.local".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28587,6 +28992,50 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.homeserver, "https://synapse.local:8448");
         assert_eq!(parsed.allowed_rooms.len(), 1);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_defaults_to_zero() {
+        let parsed: SlackConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.thread_context_max_messages, None);
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_deserializes_explicit_value() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":7}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(7));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 7);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_allows_zero_to_disable_backfill() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":0}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(0));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_rejects_values_above_slack_fetch_limit() {
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            SlackConfig {
+                thread_context_max_messages: Some(51),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("values above the Slack fetch limit must be rejected")
+            .to_string();
+        assert!(
+            err.contains("channels.slack.default.thread_context_max_messages"),
+            "unexpected validation error: {err}",
+        );
     }
 
     #[test]
@@ -28707,9 +29156,14 @@ allowed_users = ["@u:matrix.org"]
                     device_id: None,
                     allowed_rooms: vec!["!r:m".into()],
                     interrupt_on_new_message: false,
-                    stream_mode: StreamMode::default(),
+                    stream_mode: MatrixStreamMode::default(),
                     draft_update_interval_ms: 1500,
                     multi_message_delay_ms: 800,
+                    stream_draft_lines: 10,
+                    message_max_bytes: 48_000,
+                    stream_draft_delete: true,
+                    stream_reasoning: StreamReasoningMode::Status,
+                    stream_tool_arguments: vec![],
                     recovery_key: None,
                     mention_only: false,
                     password: None,
@@ -28858,50 +29312,6 @@ allowed_users = ["U111"]
         assert_eq!(parsed.thread_replies, Some(false));
         assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
-    }
-
-    #[test]
-    async fn slack_thread_context_max_messages_defaults_to_zero() {
-        let parsed: SlackConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.thread_context_max_messages, None);
-        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
-    }
-
-    #[test]
-    async fn slack_thread_context_max_messages_deserializes_explicit_value() {
-        let parsed: SlackConfig =
-            serde_json::from_str(r#"{"thread_context_max_messages":7}"#).unwrap();
-        assert_eq!(parsed.thread_context_max_messages, Some(7));
-        assert_eq!(parsed.effective_thread_context_max_messages(), 7);
-    }
-
-    #[test]
-    async fn slack_thread_context_max_messages_allows_zero_to_disable_backfill() {
-        let parsed: SlackConfig =
-            serde_json::from_str(r#"{"thread_context_max_messages":0}"#).unwrap();
-        assert_eq!(parsed.thread_context_max_messages, Some(0));
-        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
-    }
-
-    #[test]
-    async fn slack_thread_context_max_messages_rejects_values_above_slack_fetch_limit() {
-        let mut config = Config::default();
-        config.channels.slack.insert(
-            "default".to_string(),
-            SlackConfig {
-                thread_context_max_messages: Some(51),
-                ..Default::default()
-            },
-        );
-
-        let err = config
-            .validate()
-            .expect_err("values above the Slack fetch limit must be rejected")
-            .to_string();
-        assert!(
-            err.contains("channels.slack.default.thread_context_max_messages"),
-            "unexpected validation error: {err}",
-        );
     }
 
     #[test]
@@ -34300,9 +34710,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34334,9 +34749,26 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::Safe,
+                    argument_chars: Some(80),
+                },
+                StreamToolArgumentEntry::Tool {
+                    tool: "delegate".into(),
+                    base: Some(StreamToolArgumentBase::None),
+                    include: vec!["agent".into(), "background".into()],
+                    exclude: vec![],
+                    argument_chars: Some(0),
+                },
+            ],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34361,9 +34793,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34389,9 +34826,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34428,9 +34870,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
-                stream_mode: StreamMode::default(),
+                stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 recovery_key: None,
                 mention_only: false,
                 password: None,
@@ -34466,9 +34913,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
-                stream_mode: StreamMode::default(),
+                stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 recovery_key: None,
                 mention_only: false,
                 password: None,
@@ -34509,9 +34961,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
-                stream_mode: StreamMode::default(),
+                stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 mention_only: false,
                 recovery_key: None,
                 password: None,
@@ -34620,9 +35077,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34659,9 +35121,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34694,9 +35161,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34724,9 +35196,26 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::Safe,
+                    argument_chars: Some(80),
+                },
+                StreamToolArgumentEntry::Tool {
+                    tool: "delegate".into(),
+                    base: Some(StreamToolArgumentBase::None),
+                    include: vec!["agent".into(), "background".into()],
+                    exclude: vec![],
+                    argument_chars: Some(0),
+                },
+            ],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34769,6 +35258,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let stream = by_name["channels.matrix.stream_mode"];
         assert!(stream.is_enum());
         assert!(stream.enum_variants.is_some());
+        let reasoning = by_name["channels.matrix.stream_reasoning"];
+        assert!(reasoning.is_enum());
+        assert_eq!(reasoning.display_value, "status");
+        let tool_arguments = by_name["channels.matrix.stream_tool_arguments"];
+        assert_eq!(tool_arguments.kind, crate::traits::PropKind::ObjectArray);
 
         // Secret field — masked
         let token = by_name["channels.matrix.access_token"];
@@ -34937,11 +35431,125 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mx.get_prop("channels.matrix.user_id").unwrap(),
             "@bot:m.org"
         );
+        assert_eq!(
+            mx.get_prop("channels.matrix.stream_reasoning").unwrap(),
+            "status"
+        );
         assert_eq!(mx.get_prop("channels.matrix.device_id").unwrap(), "<unset>");
         // Secrets return masked value
         assert_eq!(
             mx.get_prop("channels.matrix.access_token").unwrap(),
             "**** (encrypted)"
+        );
+    }
+
+    #[test]
+    async fn matrix_stream_tool_arguments_deserialize_from_compact_toml() {
+        let matrix: MatrixConfig = toml::from_str(
+            r#"
+homeserver = "https://matrix.example"
+stream_tool_arguments = [
+    { default_base = "safe", argument_chars = 120 },
+    { tool = "delegate", base = "none", include = ["agent", "background", "prompt"], argument_chars = 0 },
+    { tool = "mock_tool", base = "all", exclude = ["token"] },
+]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(matrix.stream_tool_arguments.len(), 3);
+        assert_eq!(
+            matrix.stream_tool_arguments[0],
+            StreamToolArgumentEntry::Defaults {
+                default_base: StreamToolArgumentBase::Safe,
+                argument_chars: Some(120),
+            }
+        );
+        assert!(matrix.validate_stream_tool_arguments().is_ok());
+    }
+
+    #[::core::prelude::v1::test]
+    fn matrix_message_budget_clamps_values_below_one_unicode_scalar() {
+        for message_max_bytes in 0..MATRIX_MIN_MESSAGE_MAX_BYTES {
+            let matrix = MatrixConfig {
+                message_max_bytes,
+                ..Default::default()
+            };
+            assert_eq!(
+                matrix.effective_message_max_bytes(),
+                MATRIX_MIN_MESSAGE_MAX_BYTES
+            );
+        }
+
+        let matrix = MatrixConfig {
+            message_max_bytes: MATRIX_MIN_MESSAGE_MAX_BYTES + 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            matrix.effective_message_max_bytes(),
+            MATRIX_MIN_MESSAGE_MAX_BYTES + 1
+        );
+    }
+
+    #[test]
+    async fn matrix_stream_tool_arguments_reject_ambiguous_rules() {
+        let matrix = MatrixConfig {
+            stream_tool_arguments: vec![
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::Safe,
+                    argument_chars: None,
+                },
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::None,
+                    argument_chars: Some(0),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            matrix
+                .validate_stream_tool_arguments()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicates")
+        );
+
+        let matrix = MatrixConfig {
+            stream_tool_arguments: vec![StreamToolArgumentEntry::Tool {
+                tool: "delegate".into(),
+                base: None,
+                include: vec!["prompt".into()],
+                exclude: vec!["prompt".into()],
+                argument_chars: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            matrix
+                .validate_stream_tool_arguments()
+                .unwrap_err()
+                .to_string()
+                .contains("includes and excludes")
+        );
+    }
+
+    #[test]
+    async fn matrix_stream_tool_arguments_round_trip_through_configurable_prop() {
+        let mut matrix = MatrixConfig::default();
+        matrix
+            .set_prop(
+                "channels.matrix.stream_tool_arguments",
+                r#"[{"default_base":"none"},{"tool":"shell","base":"all","exclude":["command"]}]"#,
+            )
+            .unwrap();
+
+        assert_eq!(matrix.stream_tool_arguments.len(), 2);
+        assert!(matrix.validate_stream_tool_arguments().is_ok());
+        assert!(
+            matrix
+                .get_prop("channels.matrix.stream_tool_arguments")
+                .unwrap()
+                .contains("shell")
         );
     }
 
@@ -35010,11 +35618,23 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = test_matrix_config();
         mx.set_prop("channels.matrix.stream_mode", "partial")
             .unwrap();
-        assert_eq!(mx.stream_mode, StreamMode::Partial);
+        assert_eq!(mx.stream_mode, MatrixStreamMode::Partial);
+
+        mx.set_prop("channels.matrix.stream_mode", "single_message")
+            .unwrap();
+        assert_eq!(mx.stream_mode, MatrixStreamMode::SingleMessage);
 
         mx.set_prop("channels.matrix.stream_mode", "multi_message")
             .unwrap();
-        assert_eq!(mx.stream_mode, StreamMode::MultiMessage);
+        assert_eq!(mx.stream_mode, MatrixStreamMode::MultiMessage);
+
+        mx.set_prop("channels.matrix.stream_reasoning", "off")
+            .unwrap();
+        assert_eq!(mx.stream_reasoning, StreamReasoningMode::Off);
+
+        mx.set_prop("channels.matrix.stream_reasoning", "full")
+            .unwrap();
+        assert_eq!(mx.stream_reasoning, StreamReasoningMode::Full);
     }
 
     #[test]
@@ -35022,6 +35642,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = test_matrix_config();
         let err = mx
             .set_prop("channels.matrix.stream_mode", "invalid")
+            .unwrap_err();
+        assert!(err.to_string().contains("expected one of"));
+
+        let err = mx
+            .set_prop("channels.matrix.stream_reasoning", "raw")
             .unwrap_err();
         assert!(err.to_string().contains("expected one of"));
     }
@@ -35533,7 +36158,17 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let variants = (stream_field.enum_variants.unwrap())();
         assert!(variants.contains(&"off".to_string()));
         assert!(variants.contains(&"partial".to_string()));
+        assert!(variants.contains(&"single_message".to_string()));
         assert!(variants.contains(&"multi_message".to_string()));
+    }
+
+    #[test]
+    async fn shared_stream_mode_excludes_matrix_single_message_variant() {
+        let shared = serde_json::from_str::<StreamMode>(r#""single_message""#);
+        assert!(shared.is_err());
+
+        let matrix = serde_json::from_str::<MatrixStreamMode>(r#""single_message""#).unwrap();
+        assert_eq!(matrix, MatrixStreamMode::SingleMessage);
     }
 
     #[test]
@@ -36491,6 +37126,26 @@ model = "gpt-4o"
             !initialized.contains(&"channels.matrix"),
             "init_defaults should not report channels.matrix when entry already exists"
         );
+    }
+
+    #[test]
+    async fn create_map_key_inserts_matrix_streaming_defaults() {
+        let mut config = Config::default();
+        config
+            .create_map_key("channels.matrix", "default")
+            .expect("create_map_key should insert a default matrix entry");
+
+        let matrix = config
+            .channels
+            .matrix
+            .get("default")
+            .expect("matrix default alias should exist");
+        assert_eq!(matrix.stream_mode, MatrixStreamMode::Off);
+        assert_eq!(matrix.draft_update_interval_ms, 1500);
+        assert_eq!(matrix.multi_message_delay_ms, 800);
+        assert_eq!(matrix.stream_draft_lines, 10);
+        assert_eq!(matrix.message_max_bytes, 48_000);
+        assert!(matrix.stream_draft_delete);
     }
 
     #[test]
@@ -37489,6 +38144,10 @@ allowed_users = []
 
         let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 300);
+
+        let lark: LarkConfig =
+            serde_json::from_str(r#"{"app_id":"cli_1","app_secret":"secret"}"#).unwrap();
+        assert_eq!(lark.approval_timeout_secs, 300);
     }
 
     /// The test above proves the SERDE path. It says nothing about the RUST
@@ -37606,6 +38265,216 @@ allowed_users = []
         );
     }
 
+    /// Sibling to `whatsapp_rust_default_waits_rather_than_denying`, for the
+    /// other five channel configs that carried the same split: a derived
+    /// `Default` zeroed `approval_timeout_secs` while serde supplied 300, so
+    /// a config built in Rust rather than parsed from a file denied every
+    /// approval instantly.
+    #[test]
+    async fn channel_rust_default_waits_rather_than_denying() {
+        assert_eq!(
+            DiscordConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            SlackConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            MatrixConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            SignalConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            LarkConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+    }
+
+    /// Sibling to `whatsapp_rust_default_matches_serde_default`, pinning the
+    /// whole struct rather than the one field for the other five channel
+    /// configs, so a field added later with a serde default but no matching
+    /// Rust default fails here instead of reaching an operator.
+    #[test]
+    async fn channel_rust_default_matches_serde_default() {
+        assert_eq!(
+            serde_json::to_value(DiscordConfig::default()).unwrap(),
+            serde_json::to_value(serde_json::from_str::<DiscordConfig>("{}").unwrap()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(SlackConfig::default()).unwrap(),
+            serde_json::to_value(serde_json::from_str::<SlackConfig>("{}").unwrap()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(MatrixConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<MatrixConfig>(r#"{"homeserver":""}"#).unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(SignalConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<SignalConfig>(r#"{"http_url":"","account":""}"#).unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(LarkConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<LarkConfig>(r#"{"app_id":"","app_secret":""}"#).unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    /// Sibling to `whatsapp_explicit_zero_timeout_is_preserved`: an operator
+    /// who deliberately writes `approval_timeout_secs = 0` keeps that zero.
+    /// The fix above changes what an UNSET field means, and must not take
+    /// away the ability to refuse every gated tool deliberately.
+    #[test]
+    async fn channel_explicit_zero_timeout_is_preserved() {
+        let discord: DiscordConfig =
+            serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(discord.approval_timeout_secs, 0);
+
+        let slack: SlackConfig = serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(slack.approval_timeout_secs, 0);
+
+        let matrix: MatrixConfig = serde_json::from_str(
+            r#"{"homeserver":"https://matrix.example.com","approval_timeout_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(matrix.approval_timeout_secs, 0);
+
+        let signal: SignalConfig = serde_json::from_str(
+            r#"{"http_url":"http://localhost","account":"+1","approval_timeout_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(signal.approval_timeout_secs, 0);
+
+        let lark: LarkConfig = serde_json::from_str(
+            r#"{"app_id":"cli_1","app_secret":"secret","approval_timeout_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(lark.approval_timeout_secs, 0);
+    }
+
+    /// Generates the sibling of
+    /// `whatsapp_alias_created_through_the_map_key_surface_reloads_waiting`
+    /// for the other five channel configs, rather than hand-duplicating the
+    /// lifecycle five times: create an alias through the supported map-key
+    /// surface, save, reload, with `approval_timeout_secs` omitted
+    /// throughout - the case that broke. `$setup` fills in whatever fields
+    /// a given channel type requires beyond `enabled` so the persisted
+    /// alias round-trips; it never touches `approval_timeout_secs`.
+    macro_rules! channel_alias_reloads_waiting_test {
+        ($test_name:ident, $section:literal, $field:ident, |$cfg:ident| $setup:block) => {
+            #[test]
+            async fn $test_name() {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config_path = tmp.path().join("config.toml");
+                std::fs::write(
+                    &config_path,
+                    format!(
+                        "schema_version = {}\n",
+                        crate::migration::CURRENT_SCHEMA_VERSION
+                    ),
+                )
+                .unwrap();
+
+                let mut config = Config {
+                    config_path: config_path.clone(),
+                    ..Default::default()
+                };
+
+                let created = config
+                    .create_map_key($section, "shop")
+                    .expect(concat!($section, " must be a map-keyed section"));
+                assert!(
+                    created,
+                    "a fresh alias must be created, not silently reused"
+                );
+
+                {
+                    let $cfg = config.channels.$field.get_mut("shop").unwrap();
+                    $setup
+                }
+
+                config.mark_dirty(&format!("{}.shop", $section));
+
+                config.save_dirty().await.unwrap();
+
+                let written = std::fs::read_to_string(&config_path).unwrap();
+                assert!(
+                    !written.contains("approval_timeout_secs = 0"),
+                    "creating an alias must not persist an already-elapsed approval deadline; \
+                     got:\n{written}"
+                );
+
+                let reparsed: Config = toml::from_str(&written).unwrap();
+                let shop = reparsed
+                    .channels
+                    .$field
+                    .get("shop")
+                    .expect("the created alias must survive save and reload");
+                assert_eq!(
+                    shop.approval_timeout_secs,
+                    default_channel_approval_timeout_secs(),
+                    "an alias whose approval_timeout_secs was never set must reload waiting \
+                     the documented timeout, not denying at once"
+                );
+            }
+        };
+    }
+
+    channel_alias_reloads_waiting_test!(
+        discord_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.discord",
+        discord,
+        |_cfg| {}
+    );
+    channel_alias_reloads_waiting_test!(
+        slack_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.slack",
+        slack,
+        |_cfg| {}
+    );
+    // Matrix requires `homeserver`; set it before saving so the alias
+    // round-trips, same as an operator filling in a required field through
+    // the dashboard would. `approval_timeout_secs` stays untouched.
+    channel_alias_reloads_waiting_test!(
+        matrix_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.matrix",
+        matrix,
+        |cfg| {
+            cfg.homeserver = "https://matrix.example.com".to_string();
+        }
+    );
+    // Signal requires `http_url` and `account`; same reasoning as Matrix.
+    channel_alias_reloads_waiting_test!(
+        signal_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.signal",
+        signal,
+        |cfg| {
+            cfg.http_url = "http://127.0.0.1:8686".to_string();
+            cfg.account = "+15555550123".to_string();
+        }
+    );
+    // Lark requires `app_id` and `app_secret`; same reasoning as Matrix.
+    channel_alias_reloads_waiting_test!(
+        lark_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.lark",
+        lark,
+        |cfg| {
+            cfg.app_id = "cli_test".to_string();
+            cfg.app_secret = "secret_test".to_string();
+        }
+    );
+
     #[test]
     async fn channel_approval_timeout_secs_explicit_override() {
         let discord: DiscordConfig =
@@ -37631,6 +38500,12 @@ allowed_users = []
         let whatsapp: WhatsAppConfig =
             serde_json::from_str(r#"{"approval_timeout_secs":180}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 180);
+
+        let lark: LarkConfig = serde_json::from_str(
+            r#"{"app_id":"cli_1","app_secret":"secret","approval_timeout_secs":75}"#,
+        )
+        .unwrap();
+        assert_eq!(lark.approval_timeout_secs, 75);
     }
 
     // ── Multi-agent cross-reference validators ─────────────────────

@@ -2,7 +2,7 @@
 //! streaming/non-streaming chat dispatch.
 
 use super::context::TurnCtx;
-use super::events::{ProgressEvent, StreamDelta, send_progress};
+use super::events::{ProgressEvent, StreamDelta, send_progress, thinking_status_text};
 use super::outcome::{
     StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
     StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
@@ -16,6 +16,7 @@ use crate::observability::ObserverEvent;
 use crate::tools::ToolSpec;
 use anyhow::Result;
 use std::time::{Duration, Instant};
+use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::dispatch::{AcceptedRoute, RejectedAttempt};
 use zeroclaw_providers::{ChatMessage, ChatRequest, ChatResponse, ModelProvider, ProviderDispatch};
 
@@ -41,12 +42,10 @@ pub(crate) async fn announce_llm_request(
 ) -> Instant {
     // ── Progress: LLM thinking ────────────────────────────
     send_progress(ctx.on_delta, ProgressEvent::WaitingOnModel).await;
-    if let Some(tx) = ctx.on_delta {
-        let phase = if iteration == 0 {
-            "\u{1f914} Thinking...\n".to_string()
-        } else {
-            format!("\u{1f914} Thinking (round {})...\n", iteration + 1)
-        };
+    if ctx.draft_reasoning == StreamReasoningMode::Status
+        && let Some(tx) = ctx.on_delta
+    {
+        let phase = thinking_status_text(iteration);
         let _ = tx.send(StreamDelta::Status(phase)).await;
     }
 
@@ -181,6 +180,7 @@ pub(crate) async fn call_provider(
                         ctx.on_delta,
                         ctx.event_tx,
                         ctx.strict_tool_parsing,
+                        ctx.draft_reasoning,
                     )
                     .await
                     {
@@ -378,11 +378,12 @@ pub(crate) async fn call_provider(
 #[cfg(test)]
 mod payload_capture_tests {
     use super::super::context::TurnCtx;
+    use super::super::events::{ProgressEvent, StreamDelta, thinking_status_text};
     use super::announce_llm_request;
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
-    use zeroclaw_config::schema::PacingConfig;
+    use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
     use zeroclaw_log::LogConfig;
     use zeroclaw_providers::{ChatMessage, ModelProvider};
 
@@ -414,6 +415,15 @@ mod payload_capture_tests {
     }
 
     fn test_ctx<'a>(observer: &'a NoopObserver, pacing: &'a PacingConfig) -> TurnCtx<'a> {
+        test_ctx_with_delta(observer, pacing, None, StreamReasoningMode::Status)
+    }
+
+    fn test_ctx_with_delta<'a>(
+        observer: &'a NoopObserver,
+        pacing: &'a PacingConfig,
+        on_delta: Option<&'a tokio::sync::mpsc::Sender<StreamDelta>>,
+        draft_reasoning: StreamReasoningMode,
+    ) -> TurnCtx<'a> {
         TurnCtx {
             parent_agent_alias: None,
             observer,
@@ -424,16 +434,53 @@ mod payload_capture_tests {
             channel_name: "test",
             channel_reply_target: None,
             cancellation_token: None,
-            on_delta: None,
+            on_delta,
             event_tx: None,
             hooks: None,
             dedup_exempt_tools: &[],
             pacing,
             strict_tool_parsing: false,
             channel: None,
+            draft_reasoning,
             agent_alias: None,
             turn_id: "trace-req-test",
         }
+    }
+
+    #[tokio::test]
+    async fn announce_llm_request_only_emits_thinking_status_in_status_mode() {
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let provider = StubProvider;
+        let history = vec![ChatMessage::user("hello")];
+
+        for mode in [StreamReasoningMode::Off, StreamReasoningMode::Full] {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
+            let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), mode);
+            let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 0).await;
+            drop(tx);
+            assert!(matches!(
+                rx.recv().await,
+                Some(StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel))
+            ));
+            assert!(
+                rx.recv().await.is_none(),
+                "{mode:?} must not emit static thinking"
+            );
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<StreamDelta>(4);
+        let ctx = test_ctx_with_delta(&observer, &pacing, Some(&tx), StreamReasoningMode::Status);
+        let _ = announce_llm_request(&ctx, &history, &provider, "stub", "stub-model", 3).await;
+        drop(tx);
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamDelta::Lifecycle(ProgressEvent::WaitingOnModel))
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(StreamDelta::Status(text)) if text == thinking_status_text(3)
+        ));
     }
 
     async fn next_llm_request(
@@ -787,6 +834,7 @@ mod streaming_fallback_tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
@@ -842,6 +890,7 @@ mod streaming_fallback_tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
@@ -906,6 +955,7 @@ mod streaming_fallback_tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
@@ -968,6 +1018,7 @@ mod streaming_fallback_tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
