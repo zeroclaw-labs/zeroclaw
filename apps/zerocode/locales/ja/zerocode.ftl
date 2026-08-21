@@ -334,6 +334,7 @@ zc-quickstart-status-created = `{ $alias }` を作成しました。デーモン
 zc-quickstart-status-errors = { $count } 件のエラー — セレクターを修正して再送信してください
 zc-quickstart-status-first-error = { $where }{ $field }: { $message }{ $more }
 zc-quickstart-status-more-errors = { " " }(+{ $count } 件)
+zc-quickstart-status-more-warnings = { " " }（さらに { $count } 件の警告）
 zc-quickstart-status-can-create = すべての必須セレクター ✓。`{ $chord }` を押して作成します。
 zc-quickstart-status-hint = ↑/↓ で移動、Enter で開きます。必須セレクターがすべて ✓ になると `{ $chord }` が有効になります。
 zc-quickstart-missing-model-provider = 作成する前にモデルプロバイダーを選択してください。

@@ -804,6 +804,126 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn socket_quickstart_apply_persists_anthropic_setup_token() {
+        // Config persistence and TOML serialization use more stack than the
+        // default Rust test thread on some platforms. The daemon's normal
+        // worker stack is not constrained by that harness default; give this
+        // real transport test a deterministic test-only stack instead.
+        std::thread::Builder::new()
+            .name("quickstart-local-rpc-test".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(async {
+                        use crate::rpc::types::{QuickstartApplyParams, QuickstartApplyResult};
+                        use zeroclaw_config::presets::{
+                            AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice,
+                            SelectorChoice,
+                        };
+
+                        let tmp = tempfile::tempdir().unwrap();
+                        let ctx = test_ctx(tmp.path());
+                        std::fs::create_dir_all(
+                            ctx.config
+                                .read()
+                                .agent_workspace_dir("quickstart_bot")
+                                .join("SOUL.md"),
+                        )
+                        .unwrap();
+                        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+                        let cancel = CancellationToken::new();
+                        let server_ctx = Arc::clone(&ctx);
+                        let server_cancel = cancel.clone();
+                        let handle = zeroclaw_spawn::spawn!(async move {
+                            run_local_listener(server_ctx, server_cancel, test_client_count(), None)
+                                .await
+                        });
+                        wait_for_socket(&sock_path).await;
+
+                        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+                        let submission = BuilderSubmission {
+                            model_provider: SelectorChoice::Fresh(ModelProviderChoice {
+                                provider_type: "anthropic".into(),
+                                alias: "subscription".into(),
+                                model: "claude-sonnet-4-5".into(),
+                                fields: std::collections::HashMap::from([
+                                    ("auth_mode".to_string(), "setup_token".to_string()),
+                                    ("api_key".to_string(), "synthetic-setup-token".to_string()),
+                                ]),
+                            }),
+                            risk_profile: SelectorChoice::Fresh("balanced".into()),
+                            runtime_profile: SelectorChoice::Fresh("balanced".into()),
+                            memory: SelectorChoice::Fresh(MemoryChoice::Sqlite),
+                            channels: vec![],
+                            peer_groups: vec![],
+                            agent: AgentIdentity {
+                                name: "quickstart_bot".into(),
+                                system_prompt: "You are helpful.".into(),
+                                personality_file: None,
+                                personality_files: vec![
+                                    zeroclaw_config::presets::QuickstartPersonalityFile {
+                                        filename: "SOUL.md".into(),
+                                        content: "synthetic personality".into(),
+                                    },
+                                ],
+                            },
+                        };
+                        let params = QuickstartApplyParams { submission };
+                        writer
+                            .write_all(rpc_request(Method::QuickstartApply, &params, 2).as_bytes())
+                            .await
+                            .unwrap();
+                        let (_frame, result): (_, QuickstartApplyResult) =
+                            read_result(&mut reader).await;
+                        let QuickstartApplyResult::Applied { warnings, .. } = result else {
+                            panic!("local RPC Quickstart must report applied success");
+                        };
+                        assert_eq!(warnings.len(), 1);
+                        assert_eq!(warnings[0].field, "personality_files");
+
+                        let config = ctx.config.read().clone();
+                        let entry = config
+                            .providers
+                            .models
+                            .find("anthropic", "subscription")
+                            .expect("local RPC must persist the requested alias");
+                        assert!(entry.api_key.is_none(), "setup token must not enter config");
+                        let profile = zeroclaw_providers::auth::AuthService::from_config(&config)
+                            .get_profile("anthropic", Some("subscription"))
+                            .await
+                            .unwrap()
+                            .expect("local RPC must store the same-alias profile");
+                        assert_eq!(profile.token.as_deref(), Some("synthetic-setup-token"));
+
+                        // A daemon reload reconstructs Config from disk, not
+                        // from this handler's in-memory clone. Confirm the
+                        // persisted OAuth alias remains resolvable after that
+                        // boundary.
+                        let mut reloaded: zeroclaw_config::schema::Config =
+                            toml::from_str(&std::fs::read_to_string(&config.config_path).unwrap())
+                                .unwrap();
+                        reloaded.config_path = config.config_path.clone();
+                        zeroclaw_providers::create_model_provider_from_ref(
+                            &reloaded,
+                            "anthropic.subscription",
+                        )
+                        .expect("reloaded local-RPC config must resolve the OAuth alias");
+
+                        cancel.cancel();
+                        drop(writer);
+                        let _ = handle.await;
+                    });
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn socket_rejects_before_initialize() {
         let tmp = tempfile::tempdir().unwrap();

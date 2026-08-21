@@ -578,6 +578,41 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_setup_token_recovery_is_available_in_every_builtin_locale() {
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for key in [
+                "cli-quickstart-error-anthropic-setup-token-required",
+                "cli-quickstart-error-anthropic-setup-token-store",
+            ] {
+                let value = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{key} must format in {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key} in {locale} must provide a user-visible error"
+                );
+            }
+
+            let hint = format_ftl_message(
+                source,
+                locale,
+                "cli-quickstart-auth-anthropic-skip-hint",
+                &[("alias", "subscription")],
+            )
+            .unwrap_or_else(|| panic!("Anthropic recovery hint must format in {locale}"));
+            assert!(
+                hint.contains("zeroclaw auth setup-token"),
+                "Anthropic recovery hint in {locale} must retain its executable command: {hint:?}"
+            );
+        }
+    }
+
+    #[test]
     fn doctor_ctxwin_write_failed_formats_in_english_and_japanese() {
         let cases = [(
             "cli-doctor-ctxwin-write-failed",

@@ -4616,30 +4616,24 @@ impl RpcDispatcher {
 
     async fn handle_quickstart_apply(&self, params: &Value) -> RpcResult {
         let req: QuickstartApplyParams = parse_params(params)?;
-        // Serializes with every other config-mutating handler for the whole
-        // clone-apply-save-swap below, so the install on success can't race
-        // a concurrent config write (see `ctx.config_write_lock`).
-        let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        // Clone out of the lock to satisfy `&mut Config`. On success
-        // install the mutated snapshot, mirroring the gateway's
-        // `handle_apply`. `apply_with_surface` already ran `save_dirty` on
-        // the clone, so `save_and_swap_config` performs no second disk
-        // write (empty dirty set short-circuits) — just the guarded swap.
-        let mut working = self.ctx.config.read().clone();
-        let result = crate::quickstart::apply_with_surface(
-            req.submission,
-            &mut working,
-            crate::quickstart::Surface::Tui,
-        )
-        .await;
+        let quickstart_config = crate::quickstart::QuickstartConfigState::from_parts(
+            Arc::clone(&self.ctx.config),
+            Arc::clone(&self.ctx.config_write_lock),
+            Arc::clone(&self.ctx.quickstart_reload_admission),
+        );
+        let result = quickstart_config
+            .apply_and_admit_reload(req.submission, crate::quickstart::Surface::Tui)
+            .await;
         let body = match result {
-            Ok(agent) => {
-                self.save_and_swap_config(working, &config_write_guard)
-                    .await?;
+            Ok(outcome) => {
                 let reload_signalled = self.signal_daemon_reload();
+                if !reload_signalled {
+                    quickstart_config.cancel_reload_admission();
+                }
                 QuickstartApplyResult::Applied {
-                    agent,
+                    agent: outcome.agent,
                     daemon_restarted: reload_signalled,
+                    warnings: outcome.warnings,
                 }
             }
             Err(errors) => QuickstartApplyResult::Errors { errors },
@@ -6330,7 +6324,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quickstart_apply_shuts_down_gateway_before_daemon_reload() {
+    async fn quickstart_apply_persists_anthropic_setup_token_before_daemon_reload() {
         use zeroclaw_config::presets::{
             AgentIdentity, BuilderSubmission, MemoryChoice, ModelProviderChoice, SelectorChoice,
         };
@@ -6355,17 +6349,21 @@ mod tests {
             Some(reload_tx),
         );
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
-        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-quickstart-reload:pid=1".into());
+        let dispatcher = RpcDispatcher::new(
+            Arc::clone(&ctx),
+            tx,
+            "test-peer-quickstart-reload:pid=1".into(),
+        );
 
         let submission = BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
                 provider_type: "anthropic".into(),
-                alias: "anthropic".into(),
+                alias: "subscription".into(),
                 model: "claude-sonnet-4-5".into(),
-                fields: std::collections::HashMap::from([(
-                    "api_key".to_string(),
-                    "sk-test".to_string(),
-                )]),
+                fields: std::collections::HashMap::from([
+                    ("auth_mode".to_string(), "setup_token".to_string()),
+                    ("api_key".to_string(), "sk-ant-oat01-test-token".to_string()),
+                ]),
             }),
             risk_profile: SelectorChoice::Fresh("balanced".into()),
             runtime_profile: SelectorChoice::Fresh("balanced".into()),
@@ -6381,7 +6379,7 @@ mod tests {
         };
 
         let result = dispatcher
-            .handle_quickstart_apply(&json!({ "submission": submission }))
+            .handle_quickstart_apply(&json!({ "submission": submission.clone() }))
             .await
             .expect("quickstart/apply should accept reload-capable contexts");
         assert_eq!(
@@ -6389,6 +6387,31 @@ mod tests {
             "quickstart/apply result: {result:#?}"
         );
         assert_eq!(result["daemon_restarted"], true);
+        let mut second_submission = submission.clone();
+        second_submission.agent.name = "quickstart_bot_two".into();
+        let rejected = dispatcher
+            .handle_quickstart_apply(&json!({ "submission": second_submission }))
+            .await
+            .expect("a pending reload is a valid quickstart response");
+        assert_eq!(rejected["kind"], "errors");
+        assert_eq!(rejected["errors"][0]["field"], "reload");
+        let persisted = ctx.config.read().clone();
+        let entry = persisted
+            .providers
+            .models
+            .find("anthropic", "subscription")
+            .expect("TUI apply must create the requested alias");
+        assert_eq!(entry.api_key, None, "setup token must not enter config");
+        let profile = zeroclaw_providers::auth::AuthService::from_config(&persisted)
+            .get_profile("anthropic", Some("subscription"))
+            .await
+            .expect("read persisted auth profile")
+            .expect("TUI apply must store the same-alias profile");
+        assert_eq!(profile.token.as_deref(), Some("sk-ant-oat01-test-token"));
+        assert!(
+            !persisted.agents.contains_key("quickstart_bot_two"),
+            "rejected queued RPC apply must not mutate the outgoing daemon config"
+        );
 
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
@@ -9967,6 +9990,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -10010,6 +10034,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,
@@ -10110,6 +10135,7 @@ mod tests {
                 zeroclaw_config::schema::Config::default(),
             )),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            quickstart_reload_admission: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             sessions: Arc::clone(&sessions),
             session_backend: None,
             memory: None,

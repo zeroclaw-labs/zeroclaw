@@ -11,6 +11,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use zeroclaw_api::tool::ToolSpec;
 
+use crate::auth::AuthService;
+use crate::auth::anthropic_token::{AnthropicAuthKind, detect_auth_kind};
+use crate::auth::profiles::AuthProfileKind;
+
 /// Anthropic's API documentation lists 1.0 as the default sampling temperature.
 const TEMPERATURE_DEFAULT: f64 = 1.0;
 /// Anthropic's public API endpoint. Overrideable via `model_providers.<name>.base_url`.
@@ -80,6 +84,7 @@ pub struct AnthropicModelProvider {
     /// `[providers.models.anthropic.<alias>]` config-key alias.
     alias: String,
     credential: Option<String>,
+    auth_service: Option<AuthService>,
     base_url: String,
     max_tokens: u32,
     timeout_secs: u64,
@@ -90,6 +95,51 @@ pub struct AnthropicModelProvider {
     /// paths that rebuild the provider per call (e.g. the per-iteration
     /// vision route) start it empty each time.
     schema_cache: zeroclaw_api::schema::SchemaCleanCache,
+}
+
+impl Clone for AnthropicModelProvider {
+    fn clone(&self) -> Self {
+        Self {
+            alias: self.alias.clone(),
+            credential: self.credential.clone(),
+            auth_service: self.auth_service.clone(),
+            base_url: self.base_url.clone(),
+            max_tokens: self.max_tokens,
+            timeout_secs: self.timeout_secs,
+            // The memo is bounded, provider-instance-local optimization state,
+            // not provider configuration. A clone starts with an empty cache.
+            schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedAnthropicCredential {
+    token: String,
+    auth_kind: AnthropicAuthKind,
+}
+
+/// Owned request data prepared before asynchronous credential resolution.
+///
+/// Keeping this independent from the credential lets OAuth streams resolve a
+/// profile when polled without cloning the original conversation and tools.
+struct PreparedStreamRequest {
+    model: String,
+    max_tokens: u32,
+    system: Option<SystemPrompt>,
+    messages: Vec<NativeMessage>,
+    temperature: Option<f64>,
+    tools: Option<Vec<NativeToolSpec>>,
+    tool_choice: Option<serde_json::Value>,
+    thinking: Option<NativeThinkingConfig>,
+}
+
+/// Request-scoped transport values that are safe to move into a stream.
+struct StreamTransport {
+    alias: String,
+    client: Client,
+    url: String,
+    phase_timeout: std::time::Duration,
 }
 
 #[cfg(test)]
@@ -436,6 +486,7 @@ struct NativeContentIn {
 pub struct AnthropicBuilder {
     alias: String,
     credential: Option<String>,
+    auth_service: Option<AuthService>,
     base_url: Option<String>,
     max_tokens: Option<u32>,
     timeout_secs: Option<u64>,
@@ -450,6 +501,15 @@ impl AnthropicBuilder {
             .map(str::trim)
             .filter(|k| !k.is_empty())
             .map(ToString::to_string);
+        self
+    }
+
+    /// Resolve the stored Anthropic auth profile named after this provider's
+    /// alias at request time.
+    /// This is intentionally separate from `credential`: aliases with no
+    /// explicit OAuth mode must never consult the profile store.
+    pub fn auth_profile(mut self, auth_service: AuthService) -> Self {
+        self.auth_service = Some(auth_service);
         self
     }
 
@@ -478,6 +538,7 @@ impl AnthropicBuilder {
         AnthropicModelProvider {
             alias: self.alias,
             credential: self.credential,
+            auth_service: self.auth_service,
             base_url: self.base_url.unwrap_or_else(|| BASE_URL.to_string()),
             max_tokens: self
                 .max_tokens
@@ -497,6 +558,7 @@ impl AnthropicModelProvider {
         AnthropicBuilder {
             alias: alias.to_string(),
             credential: None,
+            auth_service: None,
             base_url: None,
             max_tokens: None,
             timeout_secs: None,
@@ -507,33 +569,94 @@ impl AnthropicModelProvider {
         token.starts_with("sk-ant-oat01-")
     }
 
+    fn legacy_auth_kind(token: &str) -> AnthropicAuthKind {
+        if Self::is_setup_token(token) {
+            AnthropicAuthKind::Authorization
+        } else {
+            // Static credentials preserve the legacy API-key wire contract.
+            // Token-shape inference is reserved for stored OAuth profiles,
+            // whose metadata can explicitly select Authorization.
+            AnthropicAuthKind::ApiKey
+        }
+    }
+
+    fn missing_credentials_error() -> anyhow::Error {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"missing": "credentials"})),
+            "anthropic: no credentials configured"
+        );
+        anyhow::Error::msg(
+            "Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" and store a token in the same-named Anthropic auth profile.",
+        )
+    }
+
+    async fn resolve_credential(&self) -> anyhow::Result<ResolvedAnthropicCredential> {
+        if let Some(token) = self.credential.as_deref() {
+            return Ok(ResolvedAnthropicCredential {
+                token: token.to_string(),
+                auth_kind: Self::legacy_auth_kind(token),
+            });
+        }
+
+        let Some(auth_service) = &self.auth_service else {
+            return Err(Self::missing_credentials_error());
+        };
+        Self::resolve_profile_credential(auth_service, &self.alias).await
+    }
+
+    async fn resolve_profile_credential(
+        auth_service: &AuthService,
+        profile_name: &str,
+    ) -> anyhow::Result<ResolvedAnthropicCredential> {
+        let profile = auth_service
+            .get_profile("anthropic", Some(profile_name))
+            .await?
+            .ok_or_else(Self::missing_credentials_error)?;
+        // Anthropic's alias-bound OAuth contract currently supports the
+        // setup-token profile shape only. Generic OAuth token sets require an
+        // expiry and refresh owner, which this provider does not define.
+        let token = match profile.kind {
+            AuthProfileKind::Token => profile.token,
+            AuthProfileKind::OAuth => {
+                anyhow::bail!("Anthropic OAuth aliases require a stored setup-token profile")
+            }
+        }
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+        .ok_or_else(Self::missing_credentials_error)?;
+        let auth_kind = match profile.metadata.get("auth_kind") {
+            // Stored profiles predate `auth_kind` metadata. Retain their
+            // token-shape fallback; static `api_key` credentials deliberately
+            // use the separate legacy path above.
+            None => detect_auth_kind(&token, None),
+            Some(value) => AnthropicAuthKind::from_metadata_value(value).ok_or_else(|| {
+                anyhow::Error::msg("Anthropic profile has unsupported auth_kind metadata")
+            })?,
+        };
+
+        Ok(ResolvedAnthropicCredential { token, auth_kind })
+    }
+
     fn apply_auth(
         &self,
         request: reqwest::RequestBuilder,
-        credential: &str,
+        credential: &ResolvedAnthropicCredential,
     ) -> reqwest::RequestBuilder {
-        let is_setup = Self::is_setup_token(credential);
-        let len = credential.len();
-        let head: String = credential.chars().take(8).collect();
-        let tail: String = credential
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if is_setup { "Authorization" } else { "x-api-key" }, "credential_len": len, "credential_head": head, "credential_tail": tail})), "Anthropic auth header applied");
-        if is_setup {
+        let authorization = credential.auth_kind == AnthropicAuthKind::Authorization;
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if authorization { "Authorization" } else { "x-api-key" }})), "Anthropic auth header applied");
+        if authorization {
             request
-                .header("Authorization", format!("Bearer {credential}"))
+                .header("Authorization", format!("Bearer {}", credential.token))
                 .header(
                     "anthropic-beta",
                     "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
                 )
                 .header("anthropic-dangerous-direct-browser-access", "true")
         } else {
-            request.header("x-api-key", credential)
+            request.header("x-api-key", &credential.token)
         }
     }
 
@@ -1931,6 +2054,11 @@ impl AnthropicModelProvider {
         )
     }
 
+    /// Serialize an owned request body for an asynchronous HTTP boundary.
+    fn serialize_request(request: &NativeChatRequest) -> anyhow::Result<Vec<u8>> {
+        serde_json::to_vec(request).context("Failed to serialize NativeChatRequest to JSON")
+    }
+
     /// Streaming requests have no whole-request deadline. Header acquisition
     /// and buffered error bodies are bounded separately, while successful SSE
     /// bodies use the shared byte-idle timeout.
@@ -1943,14 +2071,6 @@ impl AnthropicModelProvider {
             "model_provider.anthropic",
         );
         builder.build()
-    }
-
-    /// Build a streaming request body from a `NativeChatRequest`.
-    fn build_streaming_request(request: &NativeChatRequest) -> anyhow::Result<serde_json::Value> {
-        let mut body = serde_json::to_value(request)
-            .context("Failed to serialize NativeChatRequest to JSON")?;
-        body["stream"] = serde_json::Value::Bool(true);
-        Ok(body)
     }
 
     /// Parse Anthropic SSE lines from `response` and send `StreamEvent`s to `tx`.
@@ -2254,21 +2374,10 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
-                "anthropic: no credentials configured"
-            );
-            anyhow::Error::msg(
-                "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
-            )
-        })?;
+        let credential = self.resolve_credential().await?;
 
         let system = system_prompt.map(|s| SystemPrompt::String(s.to_string()));
-        let system = if Self::is_setup_token(credential) {
+        let system = if credential.auth_kind == AnthropicAuthKind::Authorization {
             Self::apply_oauth_system_prompt(system)
         } else {
             system
@@ -2305,7 +2414,7 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&request);
 
-        request = self.apply_auth(request, credential);
+        request = self.apply_auth(request, &credential);
 
         let response = request.send().await?;
 
@@ -2324,18 +2433,7 @@ impl ModelProvider for AnthropicModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"missing": "credentials"})),
-                "anthropic: no credentials configured"
-            );
-            anyhow::Error::msg(
-                "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
-            )
-        })?;
+        let credential = self.resolve_credential().await?;
 
         let (system_prompt, mut messages) = Self::convert_messages(request.messages);
 
@@ -2359,7 +2457,7 @@ impl ModelProvider for AnthropicModelProvider {
         };
 
         // For OAuth tokens, prepend Claude Code identity to system prompt
-        let system_prompt = if Self::is_setup_token(credential) {
+        let system_prompt = if credential.auth_kind == AnthropicAuthKind::Authorization {
             Self::apply_oauth_system_prompt(system_prompt)
         } else {
             system_prompt
@@ -2405,7 +2503,7 @@ impl ModelProvider for AnthropicModelProvider {
             .header("content-type", "application/json")
             .json(&native_request);
 
-        let response = self.apply_auth(req, credential).send().await?;
+        let response = self.apply_auth(req, &credential).send().await?;
         if !response.status().is_success() {
             return Err(super::api_error("Anthropic", response).await);
         }
@@ -2484,12 +2582,13 @@ impl ModelProvider for AnthropicModelProvider {
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
-        if let Some(credential) = self.credential.as_ref() {
+        if self.credential.is_some() || self.auth_service.is_some() {
+            let credential = self.resolve_credential().await?;
             let mut request = self
                 .http_client()
                 .post(format!("{}/v1/messages", self.base_url))
                 .header("anthropic-version", "2023-06-01");
-            request = self.apply_auth(request, credential);
+            request = self.apply_auth(request, &credential);
             // Send a minimal request; the goal is TLS + HTTP/2 setup, not a valid response.
             // Anthropic has no lightweight GET endpoint, so we accept any non-network error.
             let _ = request.send().await?;
@@ -2518,104 +2617,113 @@ impl ModelProvider for AnthropicModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
-        if !options.enabled {
-            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
-        }
+        self.stream_chat_impl(request, model, temperature, options)
+    }
+}
 
-        let credential = match self.credential.as_ref() {
-            Some(c) => c.clone(),
-            None => {
-                return stream::once(async {
-                    Err(StreamError::ModelProvider(
-                        "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
-                            .to_string(),
-                    ))
-                })
-                .boxed();
-            }
-        };
-
-        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+impl AnthropicModelProvider {
+    fn prepare_stream_request(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+    ) -> PreparedStreamRequest {
+        let (system, mut messages) = Self::convert_messages(request.messages);
         if Self::should_cache_conversation(request.messages) {
             Self::apply_cache_to_last_message(&mut messages);
         }
-
         let tool_choice_override = zeroclaw_api::TOOL_CHOICE_OVERRIDE
             .try_with(Clone::clone)
             .ok()
             .flatten();
-        let native_tools = self.convert_tools(request.tools);
-        let tools_count = native_tools.as_ref().map_or(0, Vec::len);
-        let tool_choice = if native_tools.is_some() {
-            tool_choice_override.map(|tc| serde_json::json!({ "type": tc }))
-        } else {
-            None
-        };
-
-        let system_prompt = if Self::is_setup_token(&credential) {
-            Self::apply_oauth_system_prompt(system_prompt)
-        } else {
-            system_prompt
-        };
-
-        let (effective_temperature, thinking_config, effective_max_tokens) =
+        let tools = self.convert_tools(request.tools);
+        let tool_choice = tools
+            .as_ref()
+            .and_then(|_| tool_choice_override.map(|choice| serde_json::json!({ "type": choice })));
+        let (temperature, thinking, max_tokens) =
             self.resolve_thinking(request.thinking, temperature, model);
+        PreparedStreamRequest {
+            model: model.to_string(),
+            max_tokens,
+            system,
+            messages,
+            temperature,
+            tools,
+            tool_choice,
+            thinking,
+        }
+    }
 
-        if thinking_config.is_some() {
+    fn stream_transport(&self) -> Result<StreamTransport, reqwest::Error> {
+        Ok(StreamTransport {
+            alias: self.alias.clone(),
+            client: self.streaming_http_client()?,
+            url: format!("{}/v1/messages", self.base_url),
+            phase_timeout: std::time::Duration::from_secs(self.timeout_secs),
+        })
+    }
+
+    fn stream_prepared(
+        mut prepared: PreparedStreamRequest,
+        credential: ResolvedAnthropicCredential,
+        transport: StreamTransport,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        let is_oauth = credential.auth_kind == AnthropicAuthKind::Authorization;
+        if is_oauth {
+            prepared.system = Self::apply_oauth_system_prompt(prepared.system);
+        }
+        let tools_count = prepared.tools.as_ref().map_or(0, Vec::len);
+
+        if prepared.thinking.is_some() {
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({
                         "provider": "anthropic",
-                        "alias": &self.alias,
+                        "alias": &transport.alias,
                         "request_api": "messages",
-                        "model": model,
+                        "model": &prepared.model,
                         "stream": false,
                         "tools_count": tools_count,
-                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "tool_choice": prepared.tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
                     })),
                 "native thinking enabled; using non-streaming fallback to preserve signed thinking blocks"
             );
             let native_request = NativeChatRequest {
-                model: model.to_string(),
-                max_tokens: effective_max_tokens,
-                system: system_prompt,
-                messages,
-                temperature: effective_temperature,
-                tools: native_tools,
-                tool_choice,
+                model: prepared.model,
+                max_tokens: prepared.max_tokens,
+                system: prepared.system,
+                messages: prepared.messages,
+                temperature: prepared.temperature,
+                tools: prepared.tools,
+                tool_choice: prepared.tool_choice,
                 stream: None,
-                thinking: thinking_config,
+                thinking: prepared.thinking,
             };
-            // Serialize eagerly so the request body is owned and `'static`
-            // across the async boundary.
-            let body = serde_json::to_value(&native_request)
+            let body = Self::serialize_request(&native_request)
                 .expect("NativeChatRequest should serialize to JSON");
-            let client = self.http_client();
-            let url = format!("{}/v1/messages", self.base_url);
-            let is_oauth = Self::is_setup_token(&credential);
-
             return stream::once(async move {
-                let mut req = client
-                    .post(&url)
+                let mut req = transport
+                    .client
+                    .post(&transport.url)
                     .header("anthropic-version", "2023-06-01")
                     .header("content-type", "application/json")
-                    .json(&body);
+                    .body(body);
                 if is_oauth {
                     req = req
-                        .header("Authorization", format!("Bearer {credential}"))
+                        .header("Authorization", format!("Bearer {}", credential.token))
                         .header(
                             "anthropic-beta",
                             "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
                         )
                         .header("anthropic-dangerous-direct-browser-access", "true");
                 } else {
-                    req = req.header("x-api-key", &credential);
+                    req = req.header("x-api-key", &credential.token);
                 }
                 let response = req
                     .send()
                     .await
-                    .map_err(|e| StreamError::Http(e.to_string()))?;
+                    .map_err(|error| StreamError::Http(error.to_string()))?;
                 if !response.status().is_success() {
                     let status = response.status();
                     let body = response
@@ -2624,36 +2732,38 @@ impl ModelProvider for AnthropicModelProvider {
                         .unwrap_or_else(|_| format!("HTTP error: {status}"));
                     return Err(StreamError::ModelProvider(format!("{status}: {body}")));
                 }
-                let parsed: NativeChatResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| StreamError::ModelProvider(format!("response decode: {e}")))?;
+                let parsed: NativeChatResponse = response.json().await.map_err(|error| {
+                    StreamError::ModelProvider(format!("response decode: {error}"))
+                })?;
                 Ok(Self::parse_native_response(parsed))
             })
             .flat_map(|result| match result {
-                Ok(resp) => {
-                    let mut events: Vec<StreamResult<StreamEvent>> = Vec::new();
-                    if let Some(rc) = resp.reasoning_content {
+                Ok(response) => {
+                    let mut events = Vec::new();
+                    if let Some(reasoning) = response.reasoning_content {
                         events.push(Ok(StreamEvent::TextDelta(StreamChunk {
                             delta: String::new(),
-                            reasoning: Some(rc),
+                            reasoning: Some(reasoning),
                             is_final: false,
                             token_count: 0,
                         })));
                     }
-                    if let Some(text) = resp.text.filter(|t| !t.is_empty()) {
+                    if let Some(text) = response.text.filter(|text| !text.is_empty()) {
                         events.push(Ok(StreamEvent::TextDelta(StreamChunk::delta(text))));
                     }
-                    for tc in resp.tool_calls {
-                        events.push(Ok(StreamEvent::ToolCall(tc)));
-                    }
-                    if let Some(usage) = resp.usage {
+                    events.extend(
+                        response
+                            .tool_calls
+                            .into_iter()
+                            .map(|call| Ok(StreamEvent::ToolCall(call))),
+                    );
+                    if let Some(usage) = response.usage {
                         events.push(Ok(StreamEvent::Usage(usage)));
                     }
                     events.push(Ok(StreamEvent::Final));
                     stream::iter(events)
                 }
-                Err(e) => stream::iter(vec![Err(e)]),
+                Err(error) => stream::iter(vec![Err(error)]),
             })
             .boxed();
         }
@@ -2664,53 +2774,40 @@ impl ModelProvider for AnthropicModelProvider {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_attrs(::serde_json::json!({
                         "provider": "anthropic",
-                        "alias": &self.alias,
+                        "alias": &transport.alias,
                         "request_api": "messages",
-                        "model": model,
+                        "model": &prepared.model,
                         "stream": true,
-                        "max_tokens": effective_max_tokens,
+                        "max_tokens": prepared.max_tokens,
                         "tools_count": tools_count,
-                        "tool_choice": tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
+                        "tool_choice": prepared.tool_choice.as_ref().and_then(|value| value.get("type")).and_then(|value| value.as_str()),
                         "thinking_enabled": false,
                     })),
                 "anthropic streaming provider request prepared"
             );
         }
         let native_request = NativeChatRequest {
-            model: model.to_string(),
-            max_tokens: effective_max_tokens,
-            system: system_prompt,
-            messages,
-            temperature: effective_temperature,
-            tools: native_tools,
-            tool_choice,
+            model: prepared.model,
+            max_tokens: prepared.max_tokens,
+            system: prepared.system,
+            messages: prepared.messages,
+            temperature: prepared.temperature,
+            tools: prepared.tools,
+            tool_choice: prepared.tool_choice,
             stream: Some(true),
-            thinking: thinking_config,
+            thinking: prepared.thinking,
         };
-
-        let body = match Self::build_streaming_request(&native_request) {
+        let body = match Self::serialize_request(&native_request) {
             Ok(body) => body,
-            Err(e) => {
-                return stream::once(async move { Err(StreamError::ModelProvider(e.to_string())) })
-                    .boxed();
-            }
-        };
-        let client = match self.streaming_http_client() {
-            Ok(client) => client,
             Err(error) => {
-                let message = format!(
-                    "Failed to build Anthropic streaming client: {}",
-                    super::format_error_chain(&error)
-                );
-                return stream::once(async move { Err(StreamError::Http(message)) }).boxed();
+                return stream::once(
+                    async move { Err(StreamError::ModelProvider(error.to_string())) },
+                )
+                .boxed();
             }
         };
-        let url = format!("{}/v1/messages", self.base_url);
-        let is_oauth = Self::is_setup_token(&credential);
-        let phase_timeout = std::time::Duration::from_secs(self.timeout_secs);
-
+        let phase_timeout = transport.phase_timeout;
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(64);
-
         ::zeroclaw_log::record!(
             DEBUG,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Spawn)
@@ -2721,26 +2818,24 @@ impl ModelProvider for AnthropicModelProvider {
                 })),
             "stream: spawning detached Anthropic SSE parser task"
         );
-
         let parser_handle = ::zeroclaw_spawn::spawn!(async move {
-            let mut req = client
-                .post(&url)
+            let mut req = transport
+                .client
+                .post(&transport.url)
                 .header("anthropic-version", "2023-06-01")
                 .header("content-type", "application/json")
-                .json(&body);
-
+                .body(body);
             if is_oauth {
                 req = req
-                    .header("Authorization", format!("Bearer {credential}"))
+                    .header("Authorization", format!("Bearer {}", credential.token))
                     .header(
                         "anthropic-beta",
                         "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14",
                     )
                     .header("anthropic-dangerous-direct-browser-access", "true");
             } else {
-                req = req.header("x-api-key", &credential);
+                req = req.header("x-api-key", &credential.token);
             }
-
             let response = match tokio::time::timeout(phase_timeout, req.send()).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
@@ -2759,7 +2854,6 @@ impl ModelProvider for AnthropicModelProvider {
                     return;
                 }
             };
-
             if !response.status().is_success() {
                 let status = response.status();
                 let error = match tokio::time::timeout(phase_timeout, response.text()).await {
@@ -2777,7 +2871,6 @@ impl ModelProvider for AnthropicModelProvider {
                     .await;
                 return;
             }
-
             Self::parse_anthropic_sse(response, &tx).await;
         });
 
@@ -2789,6 +2882,61 @@ impl ModelProvider for AnthropicModelProvider {
         stream::unfold((rx, guard), |(mut rx, guard)| async move {
             rx.recv().await.map(|event| (event, (rx, guard)))
         })
+        .boxed()
+    }
+
+    fn stream_chat_impl(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, StreamResult<StreamEvent>> {
+        if !options.enabled {
+            return stream::once(async { Ok(StreamEvent::Final) }).boxed();
+        }
+
+        let prepared = self.prepare_stream_request(request, model, temperature);
+        let transport = match self.stream_transport() {
+            Ok(transport) => transport,
+            Err(error) => {
+                let message = format!(
+                    "Failed to build Anthropic streaming client: {}",
+                    super::format_error_chain(&error)
+                );
+                return stream::once(async move { Err(StreamError::Http(message)) }).boxed();
+            }
+        };
+        if let Some(credential) = self.credential.as_deref() {
+            return Self::stream_prepared(
+                prepared,
+                ResolvedAnthropicCredential {
+                    token: credential.to_string(),
+                    auth_kind: Self::legacy_auth_kind(credential),
+                },
+                transport,
+            );
+        }
+        let Some(auth_service) = self.auth_service.clone() else {
+            return stream::once(async {
+                Err(StreamError::ModelProvider(
+                    Self::missing_credentials_error().to_string(),
+                ))
+            })
+            .boxed();
+        };
+        let profile_name = self.alias.clone();
+        stream::once(async move {
+            let credential = Self::resolve_profile_credential(&auth_service, &profile_name).await;
+            match credential {
+                Ok(credential) => Self::stream_prepared(prepared, credential, transport),
+                Err(error) => {
+                    stream::once(async move { Err(StreamError::ModelProvider(error.to_string())) })
+                        .boxed()
+                }
+            }
+        })
+        .flatten()
         .boxed()
     }
 }
@@ -3437,7 +3585,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let err = result.unwrap_err().to_string();
         assert_eq!(
             err,
-            "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+            "Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" and store a token in the same-named Anthropic auth profile."
         );
     }
 
@@ -3454,7 +3602,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+            "Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" and store a token in the same-named Anthropic auth profile."
         );
     }
 
@@ -3480,7 +3628,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(first.is_err(), "expected error without credential");
         assert_eq!(
             first.unwrap_err().to_string(),
-            "ModelProvider error: Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+            "ModelProvider error: Anthropic credentials not set. Set api_key or configure auth_mode = \"oauth\" and store a token in the same-named Anthropic auth profile."
         );
     }
 
@@ -3492,6 +3640,482 @@ data: {\"type\":\"message_stop\"}\n\n";
         assert!(!AnthropicModelProvider::is_setup_token("sk-ant-api-key"));
     }
 
+    #[tokio::test]
+    async fn oauth_mode_resolves_profile_and_preserves_auth_kind_metadata() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("store profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service.clone())
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve profile");
+        assert_eq!(credential.token, "profile-token");
+        assert_eq!(credential.auth_kind, AnthropicAuthKind::Authorization);
+        let request = provider
+            .apply_auth(
+                provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/models"),
+                &credential,
+            )
+            .build()
+            .expect("profile-auth request should build");
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer profile-token")
+        );
+        assert!(request.headers().get("x-api-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn stored_profile_without_auth_kind_retains_jwt_bearer_fallback() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "header.payload.signature",
+                std::collections::HashMap::new(),
+                true,
+            )
+            .await
+            .expect("store legacy profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve legacy profile");
+        assert_eq!(credential.auth_kind, AnthropicAuthKind::Authorization);
+    }
+
+    #[tokio::test]
+    async fn metadata_less_stored_setup_token_uses_authorization_header() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "sk-ant-oat01-legacy-token",
+                std::collections::HashMap::new(),
+                false,
+            )
+            .await
+            .expect("store legacy setup-token profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve metadata-less setup-token profile");
+        let request = provider
+            .apply_auth(
+                provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/messages"),
+                &credential,
+            )
+            .build()
+            .expect("request should build");
+
+        assert_eq!(
+            request
+                .headers()
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer sk-ant-oat01-legacy-token")
+        );
+        assert!(request.headers().get("x-api-key").is_none());
+    }
+
+    #[tokio::test]
+    async fn stored_profile_with_invalid_auth_kind_fails_closed() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "not-a-real-header-kind".to_string(),
+                )]),
+                false,
+            )
+            .await
+            .expect("store profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service)
+            .build();
+        let error = provider
+            .resolve_credential()
+            .await
+            .expect_err("invalid stored metadata must not fall back to token inference");
+        assert!(error.to_string().contains("unsupported auth_kind metadata"));
+    }
+
+    #[tokio::test]
+    async fn static_alias_ignores_available_anthropic_profile() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::new(),
+                true,
+            )
+            .await
+            .expect("store profile");
+
+        let provider = AnthropicModelProvider::builder("legacy")
+            .credential(Some("sk-ant-oat01-legacy-token"))
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve legacy key");
+        assert_eq!(credential.token, "sk-ant-oat01-legacy-token");
+        assert_eq!(credential.auth_kind, AnthropicAuthKind::Authorization);
+    }
+
+    #[tokio::test]
+    async fn oauth_mode_without_same_named_profile_fails_despite_active_profile() {
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode, Config};
+
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        AuthService::new(state_dir.path(), false)
+            .store_model_provider_token(
+                "anthropic",
+                "other",
+                "other-profile-token",
+                std::collections::HashMap::new(),
+                true,
+            )
+            .await
+            .expect("store active nonmatching profile");
+        let mut config = Config::default();
+        config.providers.models.anthropic.insert(
+            "subscription".to_string(),
+            AnthropicModelProviderConfig {
+                base: Default::default(),
+                auth_mode: Some(AuthMode::OAuth),
+            },
+        );
+        let options = crate::ModelProviderRuntimeOptions {
+            zeroclaw_dir: Some(state_dir.path().to_path_buf()),
+            secrets_encrypt: false,
+            ..Default::default()
+        };
+        let provider = crate::create_model_provider_for_alias_with_url(
+            &config,
+            "anthropic",
+            "subscription",
+            None,
+            None,
+            &options,
+        )
+        .expect("factory should build OAuth alias");
+        let error = provider
+            .chat_with_system(None, "hello", "claude-opus-4-6", None)
+            .await
+            .expect_err("missing profile must fail");
+        assert!(error.to_string().contains("credentials not set"));
+    }
+
+    #[tokio::test]
+    async fn oauth_alias_resolves_stored_profile_for_messages_request() {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        AuthService::new(state_dir.path(), false)
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("store profile");
+        AuthService::new(state_dir.path(), false)
+            .store_model_provider_token(
+                "anthropic",
+                "other",
+                "other-profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("make nonmatching profile active");
+        let captured = Arc::new(Mutex::new(None));
+        let captured_request = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(
+                move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                    let captured_request = captured_request.clone();
+                    async move {
+                        *captured_request.lock().expect("capture lock") = Some((headers, body));
+                        Json(serde_json::json!({
+                            "content": [{"type": "text", "text": "ok"}],
+                            "usage": {"input_tokens": 1, "output_tokens": 1}
+                        }))
+                    }
+                },
+            ),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve mock");
+        });
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(AuthService::new(state_dir.path(), false))
+            .base_url(&format!("http://{address}"))
+            .build();
+        assert_eq!(
+            provider
+                .chat_with_system(None, "hello", "claude-opus-4-6", None)
+                .await
+                .expect("profile-backed request should succeed"),
+            "ok"
+        );
+        server.abort();
+        let (headers, body) = captured
+            .lock()
+            .expect("capture lock")
+            .take()
+            .expect("request captured");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer profile-token")
+        );
+        assert!(headers.get("x-api-key").is_none());
+        assert!(body["system"].to_string().contains("Claude Code"));
+    }
+
+    #[tokio::test]
+    async fn oauth_profile_stream_resolves_at_poll_time_without_static_credentials() {
+        use axum::{Json, Router, http::HeaderMap, routing::post};
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        let auth_service = AuthService::new(state_dir.path(), false);
+
+        let captured = Arc::new(Mutex::new(None));
+        let captured_request = captured.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move |headers: HeaderMap, Json(body): Json<serde_json::Value>| {
+                let captured_request = captured_request.clone();
+                async move {
+                    *captured_request.lock().expect("capture lock") = Some((headers, body));
+                    (
+                        [("content-type", "text/event-stream")],
+                        concat!(
+                            "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"streamed\"}}\n\n",
+                            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}\n\n",
+                            "data: {\"type\":\"message_stop\"}\n\n"
+                        ),
+                    )
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock server");
+        let address = listener.local_addr().expect("mock address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("serve mock");
+        });
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(auth_service.clone())
+            .base_url(&format!("http://{address}"))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let stream = provider.stream_chat(
+            ProviderChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            },
+            "claude-opus-4-6",
+            None,
+            StreamOptions::new(true),
+        );
+        auth_service
+            .store_model_provider_token(
+                "anthropic",
+                "subscription",
+                "profile-token",
+                std::collections::HashMap::from([(
+                    "auth_kind".to_string(),
+                    "authorization".to_string(),
+                )]),
+                true,
+            )
+            .await
+            .expect("store profile after stream creation");
+        let events = stream.collect::<Vec<_>>().await;
+        server.abort();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Ok(StreamEvent::TextDelta(chunk)) if chunk.delta == "streamed"
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Ok(StreamEvent::Final)))
+        );
+        let (headers, body) = captured
+            .lock()
+            .expect("capture lock")
+            .take()
+            .expect("OAuth stream request captured");
+        assert_eq!(
+            headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer profile-token")
+        );
+        assert!(headers.get("x-api-key").is_none());
+        assert!(body["system"].to_string().contains("Claude Code"));
+    }
+
+    #[test]
+    fn oauth_factory_allows_profile_backed_fallback_but_rejects_api_key_conflicts() {
+        use crate::ModelProviderRuntimeOptions;
+        use crate::factory::FamilyProviderFactory;
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode};
+
+        let config = AnthropicModelProviderConfig {
+            base: Default::default(),
+            auth_mode: Some(AuthMode::OAuth),
+        };
+        assert!(config.fallback_auth_ready(None, &ModelProviderRuntimeOptions::default()));
+        let error = config
+            .create_provider(
+                "subscription",
+                Some("inline-key"),
+                None,
+                &ModelProviderRuntimeOptions::default(),
+            )
+            .err()
+            .expect("OAuth plus api_key must not construct a provider");
+        assert!(error.to_string().contains("must not be combined"));
+    }
+
+    #[test]
+    fn oauth_factory_accepts_only_the_official_anthropic_endpoint() {
+        use crate::ModelProviderRuntimeOptions;
+        use crate::factory::FamilyProviderFactory;
+        use zeroclaw_config::schema::{AnthropicModelProviderConfig, AuthMode};
+
+        let config = AnthropicModelProviderConfig {
+            base: Default::default(),
+            auth_mode: Some(AuthMode::OAuth),
+        };
+        let options = ModelProviderRuntimeOptions::default();
+        config
+            .create_provider(
+                "subscription",
+                None,
+                Some("https://api.anthropic.com"),
+                &options,
+            )
+            .expect("official Anthropic endpoint must be accepted");
+        for endpoint in ["http://api.anthropic.com", "https://proxy.example"] {
+            let error = match config.create_provider("subscription", None, Some(endpoint), &options)
+            {
+                Ok(_) => {
+                    panic!("OAuth aliases must not send setup tokens to a nonofficial endpoint")
+                }
+                Err(error) => error,
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("official https://api.anthropic.com")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_mode_rejects_generic_token_sets_without_lifecycle_owner() {
+        let state_dir = tempfile::tempdir().expect("temporary state directory");
+        crate::auth::profiles::AuthProfilesStore::new(state_dir.path(), false)
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile::new_oauth(
+                    "anthropic",
+                    "subscription",
+                    crate::auth::profiles::TokenSet {
+                        access_token: "synthetic-access-token".to_string(),
+                        refresh_token: None,
+                        id_token: None,
+                        expires_at: None,
+                        token_type: Some("Bearer".to_string()),
+                        scope: None,
+                    },
+                ),
+                false,
+            )
+            .await
+            .expect("store generic OAuth profile");
+
+        let provider = AnthropicModelProvider::builder("subscription")
+            .auth_profile(AuthService::new(state_dir.path(), false))
+            .build();
+        let error = provider
+            .resolve_credential()
+            .await
+            .expect_err("Anthropic OAuth aliases must reject unsupported token sets");
+        assert!(error.to_string().contains("stored setup-token profile"));
+    }
+
     #[test]
     fn apply_auth_uses_bearer_and_beta_for_setup_tokens() {
         let model_provider = AnthropicModelProvider::builder("test").build();
@@ -3500,7 +4124,10 @@ data: {\"type\":\"message_stop\"}\n\n";
                 model_provider
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
-                "sk-ant-oat01-test-token",
+                &ResolvedAnthropicCredential {
+                    token: "sk-ant-oat01-test-token".to_string(),
+                    auth_kind: AnthropicAuthKind::Authorization,
+                },
             )
             .build()
             .expect("request should build");
@@ -3537,7 +4164,10 @@ data: {\"type\":\"message_stop\"}\n\n";
                 model_provider
                     .http_client()
                     .get("https://api.anthropic.com/v1/models"),
-                "sk-ant-api-key",
+                &ResolvedAnthropicCredential {
+                    token: "sk-ant-api-key".to_string(),
+                    auth_kind: AnthropicAuthKind::ApiKey,
+                },
             )
             .build()
             .expect("request should build");
@@ -3551,6 +4181,35 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(request.headers().get("authorization").is_none());
         assert!(request.headers().get("anthropic-beta").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_dotted_api_key_uses_x_api_key() {
+        let provider = AnthropicModelProvider::builder("legacy")
+            .credential(Some("a.b.c"))
+            .build();
+        let credential = provider
+            .resolve_credential()
+            .await
+            .expect("resolve static credential");
+        assert_eq!(credential.auth_kind, AnthropicAuthKind::ApiKey);
+        let request = provider
+            .apply_auth(
+                provider
+                    .http_client()
+                    .get("https://api.anthropic.com/v1/messages"),
+                &credential,
+            )
+            .build()
+            .expect("request should build");
+        assert_eq!(
+            request
+                .headers()
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("a.b.c")
+        );
+        assert!(request.headers().get("authorization").is_none());
     }
 
     #[tokio::test]
@@ -4330,6 +4989,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let model_provider = AnthropicModelProvider {
             alias: "test".to_string(),
             credential: Some("test-key".to_string()),
+            auth_service: None,
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
             timeout_secs: 120,
@@ -5120,6 +5780,7 @@ data: {\"type\":\"message_stop\"}\n\n";
         let model_provider = AnthropicModelProvider {
             alias: "test".to_string(),
             credential: Some("test-key".to_string()),
+            auth_service: None,
             base_url: format!("http://{addr}"),
             max_tokens: 4096,
             timeout_secs: 120,

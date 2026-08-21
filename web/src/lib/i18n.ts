@@ -844,6 +844,8 @@ const translations: Record<Locale, Record<string, string>> = {
     'quickstart.peers_suffix': "peers",
     'quickstart.personality_files_none': "none — agent uses bootstrap defaults",
     'quickstart.personality_files_title': "Personality files",
+    'quickstart.warnings_title': "Quickstart completed with warnings",
+    'quickstart.open_created_agent': "Open created agent",
     'quickstart.pick_channel_type': "— pick a channel type —",
     'quickstart.pick_provider': "— pick a provider —",
     'quickstart.provider_type': "Provider type",
