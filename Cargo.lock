@@ -14029,6 +14029,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-dist"
+version = "0.8.5"
+
+[[package]]
 name = "zeroclaw-egress-plugin-fixture"
 version = "0.0.0"
 dependencies = [
