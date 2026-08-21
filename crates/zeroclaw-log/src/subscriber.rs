@@ -52,7 +52,7 @@ pub fn install_global_subscriber(
         .with(fmt_layer);
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-    install_log_bridge();
+    crate::log_bridge::install();
 }
 
 #[doc(hidden)]
@@ -60,33 +60,7 @@ pub fn try_install_capture_subscriber() {
     use tracing_subscriber::Registry;
     let subscriber = Registry::default().with(LogCaptureLayer);
     let _ = tracing::subscriber::set_global_default(subscriber);
-    install_log_bridge();
-}
-
-/// Route records emitted through the `log` facade into `tracing`.
-///
-/// Dependencies log through `log`, not `tracing` — `whatsapp-rust` and
-/// friends. Installing a `tracing` subscriber does nothing for them: `log`
-/// keeps its own global logger slot, and while that slot is empty every
-/// `log::warn!` in the dependency tree is discarded at the macro's own
-/// max-level check. Those records reached neither stderr nor the JSONL
-/// trace, so a transport failure inside a dependency left no evidence at
-/// any verbosity.
-///
-/// `LogTracer` fills that slot and re-dispatches each record as a `tracing`
-/// event against the current subscriber, so bridged records go through the
-/// same `EnvFilter` directives, the same `LogCaptureLayer` persistence and
-/// the same alias-prefixed stderr formatting as native `record!` emissions.
-/// It sets the `log` max level to `Trace` on purpose: `log`-side filtering
-/// would silently pre-empt the `RUST_LOG` directives, so the tracing filters
-/// stay the single place that decides.
-///
-/// Idempotent. `log` permits exactly one global logger per process, so a
-/// second call — a re-entrant setup, or the next test in a shared test
-/// binary — returns `Err` and is deliberately discarded, mirroring how
-/// `try_install_capture_subscriber` treats a repeated `set_global_default`.
-fn install_log_bridge() {
-    let _ = tracing_log::LogTracer::init();
+    crate::log_bridge::install();
 }
 
 /// Field formatter that renders event fields exactly like the default
@@ -454,6 +428,145 @@ mod tests {
         );
     }
 
+    /// Message shapes lifted from `whatsapp-rust` at the revision this
+    /// workspace pins (`cbcdd2a`): `src/pair_code.rs` logs the configured
+    /// phone number and the generated pair code at `INFO`, `src/message.rs`
+    /// logs JIDs, and the transport logs a genuinely useful failure with no
+    /// identifier in it at all.
+    const PAIR_PHONE: &str = "972501234567";
+    const PAIR_CODE: &str = "3K7XW2QZ";
+    /// A pair code that drew no digits out of the Crockford alphabet — about
+    /// one code in twenty. A digits-only rule would leak it.
+    const PAIR_CODE_ALL_LETTERS: &str = "ZXKWQTRV";
+    const PEER_JID: &str = "972501234567@s.whatsapp.net";
+    const TRANSPORT_FAILURE: &str = "websocket read failed: connection reset by peer";
+
+    /// The credential boundary, exercised through the real sinks rather than
+    /// the fmt probe: the global `LogCaptureLayer`, `writer::record_event`'s
+    /// rolling JSONL persistence, and the broadcast hook, wired exactly as
+    /// the daemon wires them.
+    ///
+    /// A bare `LogTracer` would hand every third-party `log` message to those
+    /// sinks as ordinary event text, so `whatsapp-rust`'s `INFO` pair-code and
+    /// phone-number lines would land in `runtime-trace.jsonl` and on the live
+    /// stream — bypassing the `LoginEvent::PairCode` -> `ephemeral_attrs`
+    /// boundary and `record_event`'s guarantee that pairing credentials are
+    /// never persisted. The scrubbing bridge must keep those markers out of
+    /// both sinks while the useful transport failure still arrives with its
+    /// severity and its originating target intact.
+    #[test]
+    fn dependency_records_reach_the_sinks_without_pairing_credentials() {
+        let _writer_guard = crate::writer::WRITER_TEST_LOCK.lock();
+        let _hook_guard = crate::broadcast::HOOK_TEST_LOCK.lock();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = crate::config::LogConfig {
+            log_persistence: "rolling".into(),
+            log_persistence_max_entries: 1000,
+            ..crate::config::LogConfig::default()
+        };
+        crate::writer::init_from_config(&cfg, tmp.path());
+
+        let (tx, mut rx) = tokio::sync::broadcast::channel(256);
+        crate::broadcast::set_broadcast_hook(tx);
+
+        // Real entry point: installs the capture layer *and* the bridge.
+        crate::try_install_capture_subscriber();
+
+        let subscriber = tracing_subscriber::registry().with(LogCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            log::info!(
+                target: "Client/PairCode",
+                "Starting pair code authentication for phone: {PAIR_PHONE}"
+            );
+            log::info!(
+                target: "Client/PairCode",
+                "Stage 1 complete, waiting for phone confirmation. Code: {PAIR_CODE}"
+            );
+            log::info!(
+                target: "Client/PairCode",
+                "Stage 1 complete, waiting for phone confirmation. Code: {PAIR_CODE_ALL_LETTERS}"
+            );
+            log::warn!(
+                target: "whatsapp_rust::message",
+                "Failed to parse message info (from={PEER_JID}): bad MAC"
+            );
+            log::warn!(
+                target: "whatsapp_rust::socket",
+                "{TRANSPORT_FAILURE}"
+            );
+        });
+
+        let mut broadcast = Vec::new();
+        while let Ok(value) = rx.try_recv() {
+            broadcast.push(value.to_string());
+        }
+        crate::broadcast::clear_broadcast_hook();
+
+        crate::writer::flush_for_test().unwrap();
+        let persisted =
+            std::fs::read_to_string(crate::writer::runtime_trace_path().unwrap()).unwrap();
+
+        for (sink, body) in [
+            ("persisted runtime-trace.jsonl", persisted.as_str()),
+            ("live broadcast", broadcast.concat().as_str()),
+        ] {
+            for (what, marker) in [
+                ("phone number", PAIR_PHONE),
+                ("pair code", PAIR_CODE),
+                ("all-letter pair code", PAIR_CODE_ALL_LETTERS),
+                ("peer JID", PEER_JID),
+            ] {
+                assert!(
+                    !body.contains(marker),
+                    "third-party {what} must not reach the {sink}: {body}"
+                );
+            }
+        }
+
+        // The useful failure survives, with severity and provenance.
+        let failure = persisted
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|value| {
+                value["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains(TRANSPORT_FAILURE))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the dependency's transport failure must still be persisted \
+                     verbatim: {persisted}"
+                )
+            });
+        assert_eq!(
+            failure["severity_text"], "WARN",
+            "the failure must keep its severity: {failure}"
+        );
+        assert_eq!(
+            failure["attributes"]["log.target"], "whatsapp_rust::socket",
+            "the failure must keep the dependency's own target so RUST_LOG \
+             directives still address it: {failure}"
+        );
+        assert!(
+            broadcast
+                .iter()
+                .any(|frame| frame.contains(TRANSPORT_FAILURE)),
+            "the failure must also reach the live broadcast: {broadcast:?}"
+        );
+
+        // The redacted lines are still visible as records — the operator sees
+        // that pairing happened, just not the credential.
+        assert!(
+            persisted.contains("Starting pair code authentication for phone:"),
+            "a scrubbed record must stay visible, not be dropped: {persisted}"
+        );
+        assert!(
+            persisted.contains(crate::log_bridge::REDACTED),
+            "the scrubbed payload must be marked, not silently elided: {persisted}"
+        );
+    }
+
     /// Regression for dependency logs vanishing without a trace: transports
     /// like `whatsapp-rust` emit through the `log` facade, not `tracing`.
     /// Installing a `tracing` subscriber leaves `log`'s own global logger
@@ -461,7 +574,7 @@ mod tests {
     /// max-level check — reaching neither stderr nor the JSONL trace at any
     /// verbosity. Installing this crate's subscriber machinery must be
     /// enough on its own for a bare `log::warn!` to arrive as a tracing
-    /// event; removing the `LogTracer` init makes this test go silent.
+    /// event; removing the bridge install makes this test go silent.
     #[test]
     fn log_facade_records_reach_the_subscriber() {
         // Real entry point: installs the capture layer *and* the bridge.
@@ -489,7 +602,7 @@ mod tests {
             .unwrap_or_else(|| {
                 panic!(
                     "a `log` record must reach the tracing subscriber; without the \
-                     LogTracer bridge it is dropped at the log facade: {out:?}"
+                     bridge it is dropped at the log facade: {out:?}"
                 )
             });
         assert!(
