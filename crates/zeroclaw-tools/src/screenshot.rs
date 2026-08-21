@@ -16,7 +16,7 @@ const MAX_BASE64_BYTES: usize = 2_097_152;
 /// macOS: `screencapture`
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
 /// Android: none of those exist and an app UID may not run them, so the capture is delegated to
-/// the accessibility bridge when one is wired in (see [`ScreenshotTool::with_android_bridge`]).
+/// the accessibility bridge when one is wired in (see `with_android_bridge`).
 pub struct ScreenshotTool {
     security: Arc<SecurityPolicy>,
     /// Present only on Android, where the subprocess path cannot work at all.
