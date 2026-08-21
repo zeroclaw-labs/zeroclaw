@@ -3988,11 +3988,6 @@ impl Channel for TelegramChannel {
                 }
             }
 
-            // Refresh authorization policy from disk before polling for updates,
-            // so admission checks (allowed_groups, peer allowlist) see the
-            // latest config before any message is admitted.
-            self.refresh_runtime_config().await;
-
             let url = self.api_url("getUpdates");
             let body = serde_json::json!({
                 "offset": offset,
@@ -4033,6 +4028,10 @@ impl Channel for TelegramChannel {
                     continue;
                 }
             };
+
+            // Recheck authorization policy after long-poll returns, so edits
+            // made during the poll are visible for the first admitted update.
+            self.refresh_runtime_config().await;
 
             let ok = data
                 .get("ok")
@@ -8385,9 +8384,15 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Main loop poll (timeout=30): return the ambient group message.
+        // Main loop poll 1 (offset=0): return the ambient group message.
+        let main_poll_body_1 = serde_json::json!({
+            "offset": 0,
+            "timeout": 30,
+            "allowed_updates": ["message", "callback_query"]
+        });
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(&main_poll_body_1))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true,
                 "result": [{
@@ -8399,6 +8404,22 @@ mod tests {
                         "text": "ambient conversation about lunch"
                     }
                 }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Main loop poll 2+ (offset=2): return empty to stop the loop.
+        let main_poll_body_2 = serde_json::json!({
+            "offset": 2,
+            "timeout": 30,
+            "allowed_updates": ["message", "callback_query"]
+        });
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(&main_poll_body_2))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": []
             })))
             .mount(&mock_server)
             .await;
@@ -8485,9 +8506,15 @@ mod tests {
             .mount(&mock_server)
             .await;
 
-        // Main loop poll (timeout=30): return the ambient group message.
+        // Main loop poll 1 (offset=0): return the ambient group message.
+        let main_poll_body_1 = serde_json::json!({
+            "offset": 0,
+            "timeout": 30,
+            "allowed_updates": ["message", "callback_query"]
+        });
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(&main_poll_body_1))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true,
                 "result": [{
@@ -8499,6 +8526,22 @@ mod tests {
                         "text": "ambient conversation"
                     }
                 }]
+            })))
+            .mount(&mock_server)
+            .await;
+
+        // Main loop poll 2+ (offset=2): return empty to stop the loop.
+        let main_poll_body_2 = serde_json::json!({
+            "offset": 2,
+            "timeout": 30,
+            "allowed_updates": ["message", "callback_query"]
+        });
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .and(body_json(&main_poll_body_2))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": []
             })))
             .mount(&mock_server)
             .await;
@@ -8650,12 +8693,12 @@ mod tests {
         assert!(msg.content.contains("zeroclaw_bot"));
     }
 
-    /// Factory/config-backed assertion: proves that `allowed_groups` from the
-    /// config schema reaches the `allowed_groups_resolver` closure that
-    /// `collect_configured_channels` wires into `TelegramChannel`, and that the
-    /// resolver reads live from the shared config handle (no-cache contract).
+    /// Resolver closure pattern test: verifies the `allowed_groups_resolver`
+    /// closure shape used by `collect_configured_channels` (orchestrator/mod.rs
+    /// 8458-8466) correctly reads `allowed_groups` live from a shared
+    /// `Arc<RwLock<Config>>` — the no-cache contract from AGENTS.md.
     #[test]
-    fn factory_allowed_groups_resolver_reads_config_field() {
+    fn resolver_closure_reads_allowed_groups_live() {
         use zeroclaw_config::schema::TelegramConfig;
 
         let mut config = Config::default();
@@ -8670,8 +8713,8 @@ mod tests {
         );
         let cfg_arc = Arc::new(RwLock::new(config.clone()));
 
-        // Mirror the resolver closure that collect_configured_channels
-        // constructs (orchestrator/mod.rs 8458-8466): capture config_arc and
+        // Construct the exact resolver closure pattern used by the production
+        // factory (orchestrator/mod.rs 8458-8466): capture config_arc and
         // alias, read allowed_groups live at call-time.
         let alias = "home".to_string();
         let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
