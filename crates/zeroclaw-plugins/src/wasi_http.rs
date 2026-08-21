@@ -64,6 +64,34 @@ fn denied() -> ErrorCode {
     ErrorCode::InternalError(Some(DENIED_MESSAGE.to_string()))
 }
 
+/// Test helper: submit a throwaway outbound request through `hooks` and report
+/// whether it was refused with the masked egress denial, synchronously and
+/// without spawning. Shared so any adapter can pin its store's fail-closed
+/// posture without rebuilding the request machinery; the deny-by-default answer
+/// refuses before a task is spawned, so this stays offline.
+#[cfg(test)]
+pub(crate) fn request_is_denied(hooks: &mut PluginEgressHooks, uri: &str) -> bool {
+    use http_body_util::BodyExt;
+    let body = http_body_util::Empty::<hyper::body::Bytes>::new()
+        .map_err(|_| unreachable!("an empty body cannot fail"))
+        .boxed_unsync();
+    let request = hyper::Request::builder()
+        .uri(uri)
+        .body(body)
+        .expect("valid fixture request");
+    let config = OutgoingRequestConfig {
+        use_tls: false,
+        connect_timeout: std::time::Duration::from_secs(1),
+        first_byte_timeout: std::time::Duration::from_secs(1),
+        between_bytes_timeout: std::time::Duration::from_secs(1),
+    };
+    matches!(
+        hooks.send_request(request, config),
+        Ok(HostFutureIncomingResponse::Ready(Ok(Err(ErrorCode::InternalError(Some(ref message))))))
+            if message == DENIED_MESSAGE
+    )
+}
+
 /// A destination that could not be resolved. Distinct from [`denied`] on
 /// purpose: a name that does not resolve is not a policy decision, and reporting
 /// it as one would tell a guest that every unreachable host is blocked. Mirrors

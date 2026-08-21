@@ -78,6 +78,26 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
     Ok(linker)
 }
 
+/// The store specification [`WasmChannel::from_wasm`] builds for a channel
+/// plugin.
+///
+/// A channel links the outbound `wasi:http` surface when its scope was granted
+/// `http_client` (`with_granted_http`), but it is deliberately handed no egress
+/// service. The live, alias-aware egress wiring for channels lands with the
+/// channel activation work; until then channel HTTP is fail-closed. The store
+/// still answers `http_enabled()`, yet every request is refused because its
+/// egress policy is `None`. Pinned by
+/// `channel_http_is_deny_all_until_an_egress_service_is_wired`.
+fn channel_store_spec(
+    scope: crate::instance::PluginInstanceScope,
+    inbound: InboundQueue,
+    limits: crate::component::PluginLimits,
+) -> PluginStoreSpec {
+    PluginStoreSpec::new(scope, limits)
+        .with_granted_http()
+        .with_inbound(inbound)
+}
+
 impl WasmChannel {
     pub async fn from_wasm(
         endpoint: PluginChannelEndpoint,
@@ -88,11 +108,11 @@ impl WasmChannel {
         let config = config.resolve(endpoint.scope())?;
         let component = load_component(wasm_path)?;
         let inbound = InboundQueue::default();
-        let mut store = crate::component::new_store(
-            PluginStoreSpec::new(endpoint.scope().clone(), limits)
-                .with_granted_http()
-                .with_inbound(inbound.clone()),
-        );
+        let mut store = crate::component::new_store(channel_store_spec(
+            endpoint.scope().clone(),
+            inbound.clone(),
+            limits,
+        ));
         let http = store.data().http_enabled();
         let linker = build_linker(http)?;
         crate::component::ensure_http_coherent(&store, http)?;
@@ -864,5 +884,44 @@ mod tests {
         assert_eq!(drained.id, "evt-1");
         assert_eq!(drained.content, "inbound sms");
         assert_eq!(queue.pending(), 0, "draining empties the shared queue");
+    }
+
+    /// REGRESSION (channel egress, fail-closed): the store a channel plugin runs
+    /// in links the outbound `wasi:http` surface when the scope holds
+    /// `http_client`, but it is handed no egress service, so every outbound
+    /// request is denied before the network. The live, alias-aware egress wiring
+    /// for channels is deferred to the channel activation work; until it lands,
+    /// channel HTTP is deny-all. Pinning that fail-closed posture makes wiring an
+    /// egress service later a deliberate, test-visible change rather than a
+    /// silent one.
+    #[test]
+    fn channel_http_is_deny_all_until_an_egress_service_is_wired() {
+        let scope = crate::instance::test_scope(
+            PluginCapability::Channel,
+            "main",
+            [crate::PluginPermission::HttpClient],
+        );
+        let mut store = crate::component::new_store(channel_store_spec(
+            scope,
+            crate::component::InboundQueue::default(),
+            crate::component::test_limits(0),
+        ));
+
+        // The surface is linked: the scope granted `http_client`.
+        assert!(
+            store.data().http_enabled(),
+            "a channel granted http_client links the wasi:http surface"
+        );
+
+        // But no egress service is attached, so the request is refused before it
+        // can reach the network.
+        let hooks = store
+            .data_mut()
+            .egress_hooks_mut()
+            .expect("the http surface is present");
+        assert!(
+            crate::wasi_http::request_is_denied(hooks, "https://api.example.com/"),
+            "channel HTTP must be denied until a channel egress service is wired"
+        );
     }
 }

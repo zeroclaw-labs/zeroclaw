@@ -235,6 +235,15 @@ impl PluginState {
     pub(crate) fn inbound(&self) -> &InboundQueue {
         &self.inbound
     }
+
+    /// The store's outbound-HTTP egress hooks, when the HTTP surface is
+    /// attached. Test-facing so an adapter can pin the egress posture of the
+    /// store it builds — in particular that a store links `wasi:http` yet
+    /// refuses every request because it was handed no egress service.
+    #[cfg(test)]
+    pub(crate) fn egress_hooks_mut(&mut self) -> Option<&mut PluginEgressHooks> {
+        self.http.as_mut().map(|surface| &mut surface.hooks)
+    }
 }
 
 impl WasiView for PluginState {
