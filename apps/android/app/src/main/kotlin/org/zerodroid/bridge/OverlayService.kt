@@ -325,14 +325,12 @@ class OverlayService : Service() {
             runCatching { backdropView?.let { windowManager.removeView(it) } }
             panelVisible = false
         } else {
-            backdropView?.let { windowManager.addView(it, backdropParams) }
             panelParams.x = bubbleParams.x + dpToPx(56)
             panelParams.y = bubbleParams.y
-            panelView?.let { windowManager.addView(it, panelParams) }
             panelVisible = true
-            if (overlayHidden) {
-                panelView?.visibility = View.INVISIBLE
-                backdropView?.visibility = View.INVISIBLE
+            if (!overlayHidden) {
+                backdropView?.let { windowManager.addView(it, backdropParams) }
+                panelView?.let { windowManager.addView(it, panelParams) }
             }
         }
     }
@@ -473,10 +471,14 @@ class OverlayService : Service() {
         main.removeCallbacks(restoreRunnable)
         if (!overlayHidden) {
             overlayHidden = true
-            bubbleView?.visibility = View.INVISIBLE
+            // INVISIBLE is not enough for AccessibilityService: the overlay can remain
+            // rootInActiveWindow and make every read/action look as though zerodroid itself is the
+            // target. Detach the windows so Android promotes the resumed app underneath; the same
+            // View instances (including the response text) are reattached after the hide window.
+            runCatching { bubbleView?.let { windowManager.removeView(it) } }
             if (panelVisible) {
-                panelView?.visibility = View.INVISIBLE
-                backdropView?.visibility = View.INVISIBLE
+                runCatching { panelView?.let { windowManager.removeView(it) } }
+                runCatching { backdropView?.let { windowManager.removeView(it) } }
             }
         }
         main.postDelayed(restoreRunnable, effective)
@@ -485,10 +487,10 @@ class OverlayService : Service() {
     private fun restoreOverlay() {
         if (overlayHidden) {
             overlayHidden = false
-            bubbleView?.visibility = View.VISIBLE
+            runCatching { bubbleView?.let { windowManager.addView(it, bubbleParams) } }
             if (panelVisible) {
-                panelView?.visibility = View.VISIBLE
-                backdropView?.visibility = View.VISIBLE
+                runCatching { backdropView?.let { windowManager.addView(it, backdropParams) } }
+                runCatching { panelView?.let { windowManager.addView(it, panelParams) } }
             }
         }
     }

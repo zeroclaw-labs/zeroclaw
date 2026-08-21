@@ -66,11 +66,16 @@ class UiAccessibilityService : AccessibilityService() {
             val action = intent.getStringExtra("action") ?: return
 
             when (action) {
-                "read" -> sendResult(resultReceiver, readScreen(intent.getIntExtra("max_depth", 15)))
-                "foreground" -> sendResult(resultReceiver, foreground())
+                // A focusable overlay becomes rootInActiveWindow even though the app underneath
+                // remains the resumed activity. Detach the overlay before every observation so
+                // reads and foreground preflights resolve the app the owner is actually driving.
+                "read" -> deferOverlay(resultReceiver, HIDE_OBSERVATION_MS) {
+                    readScreen(intent.getIntExtra("max_depth", 15))
+                }
+                "foreground" -> deferOverlay(resultReceiver, HIDE_OBSERVATION_MS) { foreground() }
                 // Coordinate gestures inject at screen points; hide the floating bubble first so it
                 // can't intercept the tap (mirrors cellclaw AppControlTool's requestHide(500)).
-                "tap" -> deferGesture(resultReceiver, HIDE_GESTURE_MS) {
+                "tap" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
                     guardedMutation(intent) {
                         handleTap(
                             intent.getIntExtra("x", Int.MIN_VALUE),
@@ -79,7 +84,7 @@ class UiAccessibilityService : AccessibilityService() {
                         )
                     }
                 }
-                "swipe" -> deferGesture(resultReceiver, HIDE_GESTURE_MS) {
+                "swipe" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
                     guardedMutation(intent) {
                         handleSwipe(
                             intent.getIntExtra("x1", 0), intent.getIntExtra("y1", 0),
@@ -88,7 +93,7 @@ class UiAccessibilityService : AccessibilityService() {
                         )
                     }
                 }
-                "scroll" -> deferGesture(resultReceiver, HIDE_GESTURE_MS) {
+                "scroll" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
                     guardedMutation(intent) {
                         handleScroll(
                             intent.getStringExtra("direction") ?: "forward",
@@ -97,15 +102,17 @@ class UiAccessibilityService : AccessibilityService() {
                         )
                     }
                 }
-                "text" -> sendResult(resultReceiver, guardedMutation(intent) {
-                    handleType(intent.getStringExtra("text") ?: "")
-                })
-                "key" -> sendResult(resultReceiver, guardedMutation(intent) {
-                    handleKey(intent.getStringExtra("key") ?: "")
-                })
-                "dialog" -> sendResult(resultReceiver, guardedMutation(intent, systemDialog = true) {
-                    handleSystemDialog(intent.getStringExtra("button") ?: "")
-                })
+                "text" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
+                    guardedMutation(intent) { handleType(intent.getStringExtra("text") ?: "") }
+                }
+                "key" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
+                    guardedMutation(intent) { handleKey(intent.getStringExtra("key") ?: "") }
+                }
+                "dialog" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
+                    guardedMutation(intent, systemDialog = true) {
+                        handleSystemDialog(intent.getStringExtra("button") ?: "")
+                    }
+                }
                 // Hide the bubble so it never lands in the capture (mirrors cellclaw
                 // ScreenCaptureTool's requestHide(800)); answered async from the screenshot callback.
                 "screenshot" -> deferScreenshot(resultReceiver, intent.getIntExtra("max_width", 540))
@@ -119,11 +126,11 @@ class UiAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Run a coordinate gesture with the floating bubble hidden. When no bubble is showing this is a
-     * straight synchronous call (no added latency); otherwise the bubble is asked to hide, and the
-     * gesture is dispatched after a short settle so the hidden window is composited out first.
+     * Run a screen-dependent operation with the floating bubble hidden. When no bubble is showing
+     * this is a straight synchronous call (no added latency); otherwise the bubble is detached and
+     * the operation runs after a short settle so Android promotes the underlying app's window.
      */
-    private fun deferGesture(receiver: ResultReceiver?, hideMs: Long, action: () -> JSONObject) {
+    private fun deferOverlay(receiver: ResultReceiver?, hideMs: Long, action: () -> JSONObject) {
         if (!OverlayVisibilityController.isActive()) { sendResult(receiver, action()); return }
         OverlayVisibilityController.requestHide(hideMs)
         mainHandler.postDelayed({ sendResult(receiver, action()) }, SETTLE_MS)
@@ -603,6 +610,7 @@ class UiAccessibilityService : AccessibilityService() {
         // tap/swipe) and the settle delay that lets the hidden window composite out first.
         private const val HIDE_SCREENSHOT_MS = 800L
         private const val HIDE_GESTURE_MS = 500L
+        private const val HIDE_OBSERVATION_MS = 500L
         private const val SETTLE_MS = 150L
 
         // Long enough that the target app has consumed the paste before we hand the user

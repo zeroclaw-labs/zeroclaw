@@ -7,9 +7,9 @@ import android.os.Looper
  * Coordinates the floating-bubble overlay's visibility across the app.
  *
  * The a11y service ([UiAccessibilityService]) calls [requestHide] immediately before a screenshot
- * or a coordinate gesture, so the bubble neither appears in captured images nor intercepts the
- * injected tap. [OverlayService] registers a [Listener]; it flips its windows INVISIBLE for the
- * requested duration and auto-restores.
+ * or another screen-dependent operation, so the bubble neither appears in captured images nor
+ * becomes the active accessibility window. [OverlayService] registers a [Listener]; it detaches
+ * its windows for the requested duration and auto-restores them.
  *
  * Ported from CellClaw's OverlayVisibilityController; see `apps/android/NOTICE`. Two deliberate
  * changes:
@@ -41,7 +41,7 @@ object OverlayVisibilityController {
     /**
      * Ask the overlay to hide for [durationMs] ms, then restore. No-op when no bubble is showing.
      * Safe to call from any thread: view mutation is marshalled to the main thread. When already on
-     * the main thread the listener runs synchronously, so the bubble is INVISIBLE before the caller
+     * the main thread the listener runs synchronously, so the bubble is detached before the caller
      * proceeds to capture/dispatch.
      */
     fun requestHide(durationMs: Long = 400) {
