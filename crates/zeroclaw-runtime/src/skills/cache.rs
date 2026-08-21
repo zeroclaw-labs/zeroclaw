@@ -377,8 +377,28 @@ mod tests {
         let skills_dir = tmp.path().join("skills");
         write(&skills_dir, "alpha", "body\n");
 
+        // Equal-length payloads that differ only inside the sniffed prefix, so
+        // the reload can come from nothing but the prefix bytes flipping from
+        // benign content to a shell shebang. `hash_file_prefix` also folds the
+        // file length into the fingerprint, so a length change alone would bust
+        // the cache and this test would pass even if the prefix were ignored.
+        let benign = b"plain data, nothing executable in this file\n";
+        let mut script = b"#!/bin/sh\necho hi\n".to_vec();
+        while script.len() < benign.len() {
+            script.push(b'#'); // filler comment bytes, still within the 128-byte prefix
+        }
+        assert_eq!(
+            benign.len(),
+            script.len(),
+            "fixtures must be equal length so only the prefix content differs"
+        );
+        assert!(
+            script.len() <= crate::skills::audit::SHEBANG_SNIFF_BYTES,
+            "both payloads must fit inside the sniffed prefix window"
+        );
+
         let asset = skills_dir.join("alpha/payload");
-        std::fs::write(&asset, b"plain data, nothing executable here\n").unwrap();
+        std::fs::write(&asset, benign).unwrap();
 
         let calls = AtomicUsize::new(0);
         let load = || {
@@ -392,7 +412,7 @@ mod tests {
         cached_load_in(&local_cache, &skills_dir, false, "test", load);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        std::fs::write(&asset, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::write(&asset, &script).unwrap();
 
         cached_load_in(&local_cache, &skills_dir, false, "test", load);
         assert_eq!(
