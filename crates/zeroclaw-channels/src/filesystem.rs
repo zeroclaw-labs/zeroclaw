@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::FilesystemConfig;
 use zeroclaw_runtime::sop::audit::SopAuditLogger;
-use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in;
+use zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in_driven;
 use zeroclaw_runtime::sop::engine::SopEngine;
 use zeroclaw_runtime::sop::types::{FilesystemEventKind, SopTriggerSource};
 
@@ -27,6 +27,7 @@ pub struct FilesystemChannel {
     alias: String,
     engine: Arc<Mutex<SopEngine>>,
     audit: Arc<SopAuditLogger>,
+    driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 }
 
 /// Construction parameters for [`FilesystemChannel`].
@@ -35,6 +36,7 @@ pub struct FilesystemChannelConfig {
     pub alias: String,
     pub engine: Arc<Mutex<SopEngine>>,
     pub audit: Arc<SopAuditLogger>,
+    pub driver_sink: Option<zeroclaw_runtime::sop::SopDriverSink>,
 }
 
 impl FilesystemChannel {
@@ -44,6 +46,7 @@ impl FilesystemChannel {
             alias: cfg.alias,
             engine: cfg.engine,
             audit: cfg.audit,
+            driver_sink: cfg.driver_sink,
         }
     }
 
@@ -158,9 +161,10 @@ impl FilesystemChannel {
                 "Filesystem channel: dispatching '' ''"
             );
 
-            dispatch_untrusted_fan_in(
+            dispatch_untrusted_fan_in_driven(
                 &self.engine,
                 &self.audit,
+                self.driver_sink.as_ref(),
                 SopTriggerSource::Filesystem,
                 Some(&path_str),
                 Some(&payload.to_string()),
@@ -882,6 +886,7 @@ mod tests {
         };
         let memory = Arc::new(zeroclaw_memory::NoneMemory::new("fs-proof"));
         let channel = FilesystemChannel::new(FilesystemChannelConfig {
+            driver_sink: None,
             config,
             alias: "fs-proof".into(),
             engine: Arc::new(Mutex::new(SopEngine::new(Default::default()))),

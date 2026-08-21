@@ -1042,6 +1042,7 @@ mod tests {
         SopRun {
             run_id: "r1".into(),
             sop_name: "g".into(),
+            initiating_agent: None,
             trigger_event: SopEvent {
                 source: SopTriggerSource::Manual,
                 topic: None,

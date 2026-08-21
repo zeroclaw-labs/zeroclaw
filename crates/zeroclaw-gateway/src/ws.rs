@@ -296,6 +296,7 @@ where
                     &config,
                     std::sync::Arc::clone(engine),
                     state.sop_audit.clone(),
+                    state.sop_driver_handles.as_ref(),
                     &outcome,
                 );
                 serde_json::json!({

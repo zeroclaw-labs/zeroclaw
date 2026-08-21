@@ -4254,6 +4254,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
             let startup_feedback_enabled = !cli.verbose;
+            // Cron drivers a generation aborted that had not stopped by the time
+            // its teardown returned. Held across the reload boundary so the next
+            // generation adopts them instead of the process losing track of a
+            // task that is still doing work under superseded config.
+            let mut carried_sop_drivers: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             loop {
                 if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
                     let mut stderr = std::io::stderr().lock();
@@ -4289,20 +4294,57 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 // EPIC A1 + SOP cron: drive periodic maintenance and cron
                 // triggers against the shared engine for this daemon iteration.
+                // The generation-owned driver supervisor: exists whenever the
+                // SOP engine does, whether or not the maintenance tick runs.
+                let sop_driver_supervisor = if sop_engine.is_some() {
+                    Some(SopDriverSupervisor::new(std::mem::take(
+                        &mut carried_sop_drivers,
+                    )))
+                } else {
+                    let carried = std::mem::take(&mut carried_sop_drivers);
+                    if !carried.is_empty() {
+                        // No generation to adopt them: re-aborted and reported
+                        // rather than silently dropped. Production drops the
+                        // reaper's handle; the reaper owns the drivers.
+                        drop(reap_orphaned_sop_drivers(carried));
+                    }
+                    None
+                };
                 let sop_maintenance = spawn_sop_maintenance(
+                    &current_config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     current_config.sop.maintenance_interval_secs,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            current_config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            supervisor.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
 
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let sop_dh = sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone());
                     move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_handles = sop_dh.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway(
                                 &host,
@@ -4314,6 +4356,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                sop_driver_handles,
                                 ready_tx,
                             ))
                             .await
@@ -4324,10 +4367,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let sop_ds = sop_driver_sink.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let sop_driver_sink = sop_ds.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_channels::orchestrator::start_channels(
                                 config,
@@ -4335,6 +4380,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 cancel,
                                 sop_engine,
                                 sop_audit,
+                                sop_driver_sink,
                             ))
                             .await
                         })
@@ -4345,15 +4391,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_mqtt(Box::new({
                     let engine = sop_engine.clone();
                     let audit = sop_audit.clone();
+                    let driver_sink = sop_driver_sink.clone();
                     move |mqtt_config| {
                         let engine = engine.clone();
                         let audit = audit.clone();
+                        let driver_sink = driver_sink.clone();
                         Box::pin(async move {
                             if let (Some(engine), Some(audit)) = (engine, audit) {
                                 zeroclaw_channels::orchestrator::mqtt::run_mqtt_sop_listener(
                                     &mqtt_config,
                                     engine,
                                     audit,
+                                    driver_sink,
                                 )
                                 .await
                             } else {
@@ -4413,7 +4462,13 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 // Pass the shared SOP engine through the registry so
                 // RpcContext (RPC/TUI agent sessions) can share it.
-                registry.set_sop_engine(sop_engine, sop_audit);
+                registry.set_sop_engine(
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
+                );
 
                 let exit = Box::pin(daemon::run(
                     current_config.clone(),
@@ -4424,8 +4479,19 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     startup_feedback_enabled,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+                // Before the loop re-reads config and builds a fresh SOP
+                // engine: in-flight cron drivers hold this generation's config
+                // and engine, so they must not straddle the rebuild.
+                if let Some(maintenance) = sop_maintenance {
+                    // Producer first: no new driver can register while the
+                    // supervisor's drain runs.
+                    maintenance.stop().await;
+                }
+                if let Some(supervisor) = sop_driver_supervisor {
+                    // Anything still running is carried into the next
+                    // generation rather than detached, so a driver that has not
+                    // yet reached an await point stays owned and observable.
+                    carried_sop_drivers = supervisor.shutdown().await;
                 }
                 let exit = exit?;
                 match exit {
@@ -5062,17 +5128,51 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     (None, None)
                 };
                 // EPIC A1 + SOP cron: same tick as the full daemon path.
+                let sop_driver_supervisor = sop_engine
+                    .as_ref()
+                    .map(|_| SopDriverSupervisor::new(Vec::new()));
                 let sop_maintenance = spawn_sop_maintenance(
+                    &config,
                     sop_engine.as_ref(),
                     sop_audit.as_ref(),
                     config.sop.maintenance_interval_secs,
+                    sop_driver_supervisor
+                        .as_ref()
+                        .map(|supervisor| supervisor.drivers.clone()),
                 );
+                // Channel-ingress half of the supervisor: the sink registers
+                // every driver it spawns in the generation's supervisor set.
+                let sop_driver_sink = match (sop_driver_supervisor.as_ref(), sop_engine.as_ref()) {
+                    (Some(supervisor), Some(engine)) => {
+                        Some(zeroclaw_runtime::sop::SopDriverSink::new(
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            sop_audit.clone(),
+                            supervisor.drivers.clone(),
+                        ))
+                    }
+                    _ => None,
+                };
+
                 let result = Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                    config,
+                    None,
+                    cancel,
+                    sop_engine,
+                    sop_audit,
+                    sop_driver_sink,
                 ))
                 .await;
-                if let Some(handle) = sop_maintenance {
-                    handle.abort();
+                // `channel start` runs one configuration generation and exits,
+                // but drivers still hold the engine; drain them before the
+                // process tears the subsystem down.
+                if let Some(maintenance) = sop_maintenance {
+                    maintenance.stop().await;
+                }
+                if let Some(supervisor) = sop_driver_supervisor {
+                    // No next generation on this path: the process exits after
+                    // `channel start` returns, which ends any straggler.
+                    drop(supervisor.shutdown().await);
                 }
                 result
             }
@@ -7963,39 +8063,94 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
     }
 }
 
+/// Abort SOP cron drivers that no generation will adopt, and keep joining them.
+///
+/// `abort` only requests cancellation, so a driver that reaches no await point
+/// keeps running under the superseded config. Dropping its `JoinHandle` would
+/// detach that task, losing the last way to observe work still in flight — so a
+/// reaper owns the handles and joins them instead.
+///
+/// Returns the reaper's handle (`None` when nothing was still running) so a test
+/// can observe that ownership was retained rather than merely claimed.
+#[cfg(feature = "agent-runtime")]
+fn reap_orphaned_sop_drivers(
+    carried: Vec<tokio::task::JoinHandle<()>>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let orphaned = carried
+        .iter()
+        .filter(|driver| !driver.is_finished())
+        .count();
+    for driver in &carried {
+        driver.abort();
+    }
+    if orphaned == 0 {
+        return None;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+        "SOP cron driver(s) from a previous generation are still running, but this \
+         configuration runs no SOP maintenance to own them; re-aborted and handed to a \
+         reaper that joins them"
+    );
+    Some(::zeroclaw_spawn::spawn!(async move {
+        for driver in carried {
+            let _ = driver.await;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({"orphaned": orphaned})),
+            "orphaned SOP cron driver(s) from a superseded generation have stopped"
+        );
+    }))
+}
+
 /// Spawn the periodic SOP maintenance tick (EPIC A1 + SOP cron): on each interval it
 /// fires fail-closed approval timeouts, reaps expired concurrency-claim leases,
 /// prunes terminal runs past the retention policy, and dispatches cached cron
 /// SOP triggers. Returns `None` (no task) when the tick is disabled
 /// (`interval_secs == 0`) or no SOP engine is configured. The caller owns the
-/// returned handle and aborts it when the foreground daemon/channel run exits.
-/// The tick itself self-approves nothing - timeout handling follows
+/// returned handle and shuts it down when the foreground daemon/channel run
+/// exits. The tick itself self-approves nothing - timeout handling follows
 /// `approval_timeout_action` (default `escalate`, fail-closed).
 #[cfg(feature = "agent-runtime")]
 fn spawn_sop_maintenance(
+    config: &Config,
     sop_engine: Option<&std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     interval_secs: u64,
-) -> Option<tokio::task::JoinHandle<()>> {
+    // The generation's supervisor set: the tick registers every driver it
+    // starts here, and the supervisor — not this ticker — owns the drain.
+    drivers: Option<SopDriverSet>,
+) -> Option<SopMaintenance> {
     if interval_secs == 0 {
         return None;
     }
     let engine = sop_engine.cloned()?;
+    let drivers = drivers?;
     let audit = sop_audit.cloned();
+    let config = config.clone();
     let cron_cache = audit
         .as_ref()
         .map(|_| zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine));
-    Some(::zeroclaw_spawn::spawn!(async move {
+    let tick_drivers = drivers;
+    let ticker = ::zeroclaw_spawn::spawn!(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut last_cron_check = chrono::Utc::now();
         loop {
             ticker.tick().await;
             let Some(report) = run_sop_maintenance_tick(
+                &config,
                 &engine,
                 audit.as_ref(),
                 cron_cache.as_ref(),
                 &mut last_cron_check,
+                &tick_drivers,
             )
             .await
             else {
@@ -8017,7 +8172,213 @@ fn spawn_sop_maintenance(
                 );
             }
         }
-    }))
+    });
+    Some(SopMaintenance { ticker })
+}
+
+/// In-flight headless drivers for one daemon generation — cron-started,
+/// channel-started, and approval-resumed alike.
+///
+/// Shared between every producer that registers drivers and the
+/// [`SopDriverSupervisor`] that drains them before the subsystem rebuilds.
+#[cfg(feature = "agent-runtime")]
+type SopDriverSet = zeroclaw_runtime::sop::SopDriverHandles;
+
+/// How long a daemon generation waits for its in-flight cron drivers to finish
+/// before aborting the stragglers. Long enough for a step already in a provider
+/// call to land, short enough that a reload is not held hostage by one.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the shutdown waits for aborted drivers to actually stop. An aborted
+/// task ends at its next await point, so this is a grace for that hop, not a
+/// second drain — a driver still running when it expires is reported rather than
+/// waited on forever, so one wedged task cannot hold a reload open.
+#[cfg(feature = "agent-runtime")]
+const SOP_DRIVER_ABORT_JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One daemon generation's SOP maintenance tick. The drivers the tick starts
+/// register in the generation's [`SopDriverSupervisor`], which owns the drain;
+/// stopping the tick (see [`Self::stop`]) only guarantees no further producer
+/// runs while that drain finalizes the set.
+#[cfg(feature = "agent-runtime")]
+struct SopMaintenance {
+    ticker: tokio::task::JoinHandle<()>,
+}
+
+/// One daemon generation's headless-driver supervisor. Every driver the
+/// generation starts — a cron tick, channel ingress, or an approval resume —
+/// registers in `drivers`, and teardown drains the set before the loop
+/// rebuilds, so no headless work straddles a reload unowned.
+///
+/// Exists whenever the SOP engine exists; the maintenance ticker is one
+/// producer among several, not the owner.
+#[cfg(feature = "agent-runtime")]
+struct SopDriverSupervisor {
+    drivers: SopDriverSet,
+    /// Drivers a previous generation aborted that had not stopped by the time
+    /// its teardown returned.
+    ///
+    /// Cancellation lands at a task's next await point, and a task that reaches
+    /// none cannot be forced. Rather than dropping those handles — which
+    /// detaches the tasks and loses every way to observe them — this generation
+    /// adopts them: [`Self::shutdown`] reports the ones still running and hands
+    /// the rest forward again, so a straggler stays owned and counted until it
+    /// actually ends. They are already aborted, so they are never waited on
+    /// again; a wedged task costs one `is_finished` check per reload, not
+    /// another drain.
+    carried: Vec<tokio::task::JoinHandle<()>>,
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopMaintenance {
+    /// Abort the tick and JOIN it. `abort` only requests cancellation, and a
+    /// tick already inside its body can still spawn and register a driver;
+    /// awaiting the aborted handle is what guarantees no new producer runs
+    /// while the supervisor's drain below finalizes the set.
+    async fn stop(self) {
+        self.ticker.abort();
+        let _ = self.ticker.await;
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+impl SopDriverSupervisor {
+    fn new(carried: Vec<tokio::task::JoinHandle<()>>) -> Self {
+        if !carried.is_empty() {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"carried": carried.len()})),
+                "Adopted SOP driver(s) that a previous generation aborted but that had not \
+                 stopped; this generation tracks them until they do"
+            );
+        }
+        Self {
+            drivers: SopDriverSet::default(),
+            carried,
+        }
+    }
+
+    /// Let in-flight drivers finish under the configuration they started
+    /// with, aborting — and then joining — any that overrun
+    /// [`SOP_DRIVER_DRAIN_TIMEOUT`]. The caller must stop every producer
+    /// (the maintenance tick, via [`SopMaintenance::stop`]) first.
+    ///
+    /// Returns the drivers that were still running when this returned: aborted,
+    /// but not yet stopped, because cancellation only lands at a task's next
+    /// await point and one that reaches none cannot be forced. The next
+    /// generation adopts them (see [`SopMaintenance::carried`]) instead of
+    /// detaching them. **A returned handle means a task from this generation is
+    /// still executing under superseded config, for as long as it takes to
+    /// yield** — the caller cannot assume a clean boundary, only a tracked one.
+    /// Empty on every ordinary shutdown.
+    #[must_use]
+    async fn shutdown(self) -> Vec<tokio::task::JoinHandle<()>> {
+        self.shutdown_with_deadlines(SOP_DRIVER_DRAIN_TIMEOUT, SOP_DRIVER_ABORT_JOIN_TIMEOUT)
+            .await
+    }
+
+    /// [`Self::shutdown`] with the two deadlines supplied, so a test can drive
+    /// the drain-expiry and join-expiry paths without waiting out the
+    /// production ones.
+    async fn shutdown_with_deadlines(
+        self,
+        drain_timeout: std::time::Duration,
+        abort_join_timeout: std::time::Duration,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
+        // Adopted from an earlier generation: already aborted, so they are
+        // re-checked rather than re-waited. Anything still running is handed
+        // forward again below.
+        let mut still_running: Vec<tokio::task::JoinHandle<()>> = self
+            .carried
+            .into_iter()
+            .filter(|driver| !driver.is_finished())
+            .collect();
+        // Borrowed by the drain below, not consumed: it must be able to time
+        // out without dropping the handles, because dropping a `JoinHandle`
+        // detaches its task rather than stopping it — and the abort arm still
+        // has to join them.
+        // Closed, not merely emptied. A producer can outlive the point where
+        // its generation stops accepting work — an RPC connection task can
+        // resolve an approval after the listener stopped accepting — so a
+        // driver can still arrive here. Closing makes that registration fail
+        // instead of landing in a vector this generation will never drain
+        // again.
+        let mut pending = match self.drivers.lock() {
+            Ok(mut drivers) => drivers.close_and_take(),
+            Err(poisoned) => poisoned.into_inner().close_and_take(),
+        };
+        if pending.is_empty() {
+            return still_running;
+        }
+        // A cursor, not an iterator: when the drain deadline fires mid-loop the
+        // abort arm below has to resume where this one stopped. Awaiting a
+        // `JoinHandle` that already resolved panics ("polled after
+        // completion"), so a second pass over the whole vector would turn a
+        // mixed batch — one driver that finished in time, one that did not —
+        // into a shutdown panic instead of a carried-forward straggler.
+        let mut joined_upto = 0usize;
+        let drained = tokio::time::timeout(drain_timeout, async {
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto]).await;
+                joined_upto += 1;
+            }
+        })
+        .await;
+        if drained.is_ok() {
+            return still_running;
+        }
+        // `abort` only *requests* cancellation: the task stops at its next
+        // await point, which is after this call returns. Joining the aborted
+        // handles is what makes the boundary real — without it the next
+        // generation could start while a straggler is still inside a provider
+        // call under the superseded config. The join is bounded in turn, so a
+        // task that reaches no await point cannot wedge the reload; it is
+        // carried forward instead, still aborted and still tracked.
+        // Only the handles the drain did not consume: the ones before the
+        // cursor already resolved, and both aborting and re-awaiting them is
+        // either a no-op or a panic.
+        for driver in &pending[joined_upto..] {
+            driver.abort();
+        }
+        let joined = tokio::time::timeout(abort_join_timeout, async {
+            while joined_upto < pending.len() {
+                let _ = (&mut pending[joined_upto]).await;
+                joined_upto += 1;
+            }
+        })
+        .await;
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "drain_timeout_secs": drain_timeout.as_secs(),
+                    "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                    "joined_after_abort": joined.is_ok(),
+                })),
+            "SOP cron drivers did not finish before the drain deadline; aborted them so the next \
+             daemon generation does not overlap superseded configuration"
+        );
+        still_running.extend(pending.into_iter().filter(|driver| !driver.is_finished()));
+        if !still_running.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "abort_join_timeout_secs": abort_join_timeout.as_secs(),
+                        "still_running": still_running.len(),
+                    })),
+                "SOP cron driver(s) had not stopped when the post-abort join grace expired; they \
+                 keep running under the superseded config until they reach an await point, and \
+                 the next generation starts alongside them. Carried into that generation so they \
+                 stay tracked rather than detached"
+            );
+        }
+        still_running
+    }
 }
 
 #[cfg(feature = "agent-runtime")]
@@ -8043,10 +8404,12 @@ impl SopMaintenanceTickReport {
 
 #[cfg(feature = "agent-runtime")]
 async fn run_sop_maintenance_tick(
+    config: &Config,
     engine: &std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
     audit: Option<&std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
     cron_cache: Option<&zeroclaw_runtime::sop::dispatch::SopCronCache>,
     last_cron_check: &mut chrono::DateTime<chrono::Utc>,
+    drivers: &SopDriverSet,
 ) -> Option<SopMaintenanceTickReport> {
     let maintenance = match engine.lock() {
         Ok(mut e) => e.run_maintenance_tick(),
@@ -8076,8 +8439,25 @@ async fn run_sop_maintenance_tick(
         .await;
         for result in &results {
             match result {
-                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. } => {
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. } => {
                     report.cron_started += 1;
+                    if matches!(
+                        action.as_ref(),
+                        zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                            | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                    ) {
+                        let driver = zeroclaw_runtime::sop::spawn_headless_run_driver(
+                            config.clone(),
+                            std::sync::Arc::clone(engine),
+                            Some(std::sync::Arc::clone(audit)),
+                            action.as_ref().clone(),
+                        );
+                        // Retained so this daemon generation can drain the
+                        // driver before a reload swaps the config and engine it
+                        // captured. Finished handles are dropped on the way in
+                        // so a long-lived daemon does not accumulate them.
+                        zeroclaw_runtime::sop::register_sop_driver(drivers, driver);
+                    }
                 }
                 zeroclaw_runtime::sop::dispatch::DispatchResult::Skipped { .. }
                 | zeroclaw_runtime::sop::dispatch::DispatchResult::Deferred { .. }
@@ -8095,7 +8475,22 @@ async fn run_sop_maintenance_tick(
                 }
             }
         }
-        zeroclaw_runtime::sop::dispatch::process_headless_results(&results);
+        let unhandled = results
+            .iter()
+            .filter(|result| {
+                !matches!(
+                    result,
+                    zeroclaw_runtime::sop::dispatch::DispatchResult::Started { action, .. }
+                        if matches!(
+                            action.as_ref(),
+                            zeroclaw_runtime::sop::SopRunAction::ExecuteStep { .. }
+                                | zeroclaw_runtime::sop::SopRunAction::DeterministicStep { .. }
+                        )
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        zeroclaw_runtime::sop::dispatch::process_headless_results(&unhandled);
     }
 
     Some(report)
@@ -8119,7 +8514,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -9785,22 +10180,106 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// Fixture for the cron-dispatch regressions: a one-step SOP on a
+    /// once-a-minute cron trigger, a mock OpenAI-compatible provider so the
+    /// step's agent turn actually completes, and the engine/audit/cache trio
+    /// the maintenance tick consumes.
+    ///
+    /// `owner` is the SOP's `agent`. `Some("sop-runner")` names the one
+    /// configured agent; `None` leaves the procedure unowned, which the
+    /// headless driver must refuse rather than borrow an identity for.
     #[cfg(feature = "agent-runtime")]
-    async fn sop_maintenance_tick_dispatches_cached_cron_triggers() {
+    struct CronSopHarness {
+        _tmp: tempfile::TempDir,
+        _server: wiremock::MockServer,
+        config: Config,
+        engine: std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>,
+        audit: std::sync::Arc<zeroclaw_runtime::sop::SopAuditLogger>,
+        cache: zeroclaw_runtime::sop::dispatch::SopCronCache,
+        drivers: SopDriverSet,
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    const CRON_SOP_AGENT: &str = "sop-runner";
+
+    #[cfg(feature = "agent-runtime")]
+    async fn cron_sop_harness(owner: Option<&str>) -> CronSopHarness {
+        cron_sop_harness_with(owner, false).await
+    }
+
+    /// `calls_tool`: the model asks for one tool before answering, so a test can
+    /// assert on what the step recorded having run.
+    #[cfg(feature = "agent-runtime")]
+    async fn cron_sop_harness_with(owner: Option<&str>, calls_tool: bool) -> CronSopHarness {
         use std::sync::{Arc, Mutex};
-        use zeroclaw_config::schema::{MemoryConfig, SopConfig};
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, MemoryConfig, RiskProfileConfig, SopConfig,
+        };
         use zeroclaw_memory::traits::Memory;
         use zeroclaw_runtime::sop::{
             Sop, SopEngine, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
         };
+
+        let server = wiremock::MockServer::start().await;
+        if calls_tool {
+            // Consumed by the first request only, so the follow-up falls through
+            // to the plain answer mounted below.
+            wiremock::Mock::given(wiremock::matchers::method("POST"))
+                .and(wiremock::matchers::path("/chat/completions"))
+                .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({
+                        "id": "chatcmpl-tool",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "test-model",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": serde_json::Value::Null,
+                                "tool_calls": [{
+                                    "id": "call-1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "audit_probe",
+                                        "arguments": "{}",
+                                    },
+                                }],
+                            },
+                            "finish_reason": "tool_calls",
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                    }),
+                ))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "test-model",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "step one done"},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                })),
+            )
+            .mount(&server)
+            .await;
 
         let mut engine = SopEngine::new(SopConfig::default());
         engine.set_sops_for_test(vec![Sop {
             name: "cron-sop".into(),
             description: "cron regression".into(),
             version: "0.1.0".into(),
-            execution_mode: SopExecutionMode::Supervised,
+            execution_mode: SopExecutionMode::Auto,
             priority: SopPriority::Normal,
             triggers: vec![SopTrigger::Cron {
                 expression: "* * * * *".into(),
@@ -9821,7 +10300,7 @@ mod tests {
             deterministic: false,
             admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
             max_pending_approvals: 0,
-            agent: None,
+            agent: owner.map(str::to_string),
         }]);
         let engine = Arc::new(Mutex::new(engine));
 
@@ -9835,14 +10314,799 @@ mod tests {
         let audit = Arc::new(zeroclaw_runtime::sop::SopAuditLogger::new(memory));
         let cache = zeroclaw_runtime::sop::dispatch::SopCronCache::from_engine(&engine);
 
+        let mut providers = zeroclaw_config::providers::Providers::default();
+        {
+            let base = providers
+                .models
+                .ensure("custom", "default")
+                .expect("`custom` slot must exist on ModelProviders");
+            base.api_key = Some("test-key".into());
+            base.model = Some("test-model".into());
+            base.uri = Some(server.uri());
+        }
+        let mut agents = std::collections::HashMap::new();
+        agents.insert(
+            CRON_SOP_AGENT.to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                model_provider: "custom.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        let mut risk_profiles = std::collections::HashMap::new();
+        risk_profiles.insert("default".to_string(), RiskProfileConfig::default());
+        let mut config = Config {
+            data_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            providers,
+            agents,
+            risk_profiles,
+            ..Config::default()
+        };
+        config.reliability.provider_retries = 0;
+        config.reliability.scheduler_retries = 0;
+
+        CronSopHarness {
+            _tmp: tmp,
+            _server: server,
+            config,
+            engine,
+            audit,
+            cache,
+            drivers: SopDriverSet::default(),
+        }
+    }
+
+    /// Wait for the cron-started run to leave the active set, then return the
+    /// retained terminal run.
+    #[cfg(feature = "agent-runtime")]
+    async fn await_terminal_cron_run(
+        harness: &CronSopHarness,
+    ) -> zeroclaw_runtime::sop::types::SopRun {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("cron-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cron-started SOP should be driven to a retained terminal run")
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_drives_cached_cron_triggers() {
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
         let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
-        let report =
-            run_sop_maintenance_tick(&engine, Some(&audit), Some(&cache), &mut last_cron_check)
-                .await
-                .expect("maintenance tick should complete");
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
 
         assert_eq!(report.cron_started, 1);
-        assert_eq!(engine.lock().unwrap().active_runs().len(), 1);
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the tick must retain its driver so the daemon generation can drain it"
+        );
+
+        let run = await_terminal_cron_run(&harness).await;
+        // The point of the regression: the cron path must run the step through
+        // the resolved agent and SUCCEED, not merely stop being stranded.
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "cron-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
+        );
+    }
+
+    /// An unattended run is the one whose record cannot be reconstructed from a
+    /// conversation afterwards: nobody watched it, and there is no session to
+    /// read back. The headless driver recorded `tool_calls: []` regardless of
+    /// what the step actually ran, so the stored record did not merely omit the
+    /// calls, it asserted there had been none.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn headless_step_records_the_tool_calls_it_made() {
+        let harness = cron_sop_harness_with(Some(CRON_SOP_AGENT), true).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+
+        let run = await_terminal_cron_run(&harness).await;
+        let step = run
+            .step_results
+            .first()
+            .expect("the cron run executed its step");
+
+        assert!(
+            !step.tool_calls.is_empty(),
+            "a headless step must record the calls it made, got {:?}",
+            step.tool_calls
+        );
+        assert_eq!(
+            step.tool_calls[0].tool, "audit_probe",
+            "the recorded call must name the tool the step actually requested"
+        );
+    }
+
+    /// With the maintenance tick disabled entirely, the generation's driver
+    /// supervisor must still exist and drive channel-started work: a file
+    /// event through the production filesystem adapter starts an auto-mode
+    /// SOP whose driver registers in the supervisor's set and completes under
+    /// the SOP's own agent. Guards the conditional sink construction and the
+    /// adapter wiring, which a dispatch-helper regression cannot see.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn filesystem_adapter_drives_a_run_with_maintenance_disabled() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        let watch = tempfile::tempdir().expect("watch dir");
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "fs-sop".into(),
+                description: "maintenance-disabled adapter regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Filesystem {
+                    path: watch.path().to_string_lossy().into_owned(),
+                    events: vec![],
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+            }]);
+        }
+
+        // No maintenance tick exists anywhere in this test: the supervisor's
+        // set stands alone, exactly as when `maintenance_interval_secs == 0`.
+        let supervisor_set = zeroclaw_runtime::sop::SopDriverHandles::default();
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            supervisor_set.clone(),
+        );
+        let channel = zeroclaw_channels::filesystem::FilesystemChannel::new(
+            zeroclaw_channels::filesystem::FilesystemChannelConfig {
+                config: zeroclaw_config::schema::FilesystemConfig {
+                    enabled: true,
+                    paths: vec![watch.path().to_string_lossy().into_owned()],
+                    events: vec!["created".into(), "modified".into()],
+                    debounce_ms: 50,
+                    ..Default::default()
+                },
+                alias: "fswatch".into(),
+                engine: std::sync::Arc::clone(&harness.engine),
+                audit: std::sync::Arc::clone(&harness.audit),
+                driver_sink: Some(sink),
+            },
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let listener = ::zeroclaw_spawn::spawn!(async move {
+            use zeroclaw_api::channel::Channel;
+            let _ = channel.listen(tx).await;
+        });
+        // Give the watcher a beat to arm before the event lands.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        std::fs::write(watch.path().join("event.txt"), "review please").expect("write event");
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if let Some(run) = engine.finished_runs(Some("fs-sop")).first() {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a file event must start and finish a run with no maintenance tick");
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "{:?}",
+            run.step_results
+        );
+        assert!(
+            !supervisor_set.lock().unwrap().is_empty(),
+            "the driver must register in the supervisor set"
+        );
+        listener.abort();
+    }
+
+    /// The channel half of the same gap: a channel-triggered auto SOP was
+    /// admitted by the shared ingress and then stranded, because no caller of
+    /// the ingress owned a driver for the run it had just started. With the
+    /// ingress carrying a `SopDriverSink`, the started run must be handed a
+    /// supervised driver and reach a retained terminal state under the SOP's
+    /// own agent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn channel_ingress_drives_started_run_to_terminal() {
+        use zeroclaw_runtime::sop::{
+            Sop, SopExecutionMode, SopPriority, SopStep, SopStepKind, SopTrigger,
+        };
+
+        let harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+
+        // Same machinery as the cron regressions (agent, provider mock, audit,
+        // driver set) — only the trigger source changes.
+        {
+            let mut engine = harness.engine.lock().unwrap();
+            engine.set_sops_for_test(vec![Sop {
+                name: "channel-sop".into(),
+                description: "channel ingress regression".into(),
+                version: "0.1.0".into(),
+                execution_mode: SopExecutionMode::Auto,
+                priority: SopPriority::Normal,
+                triggers: vec![SopTrigger::Channel {
+                    channel: "telegram".into(),
+                    alias: None,
+                    condition: None,
+                }],
+                steps: vec![SopStep {
+                    number: 1,
+                    title: "Step one".into(),
+                    body: "Do step one".into(),
+                    suggested_tools: vec![],
+                    requires_confirmation: false,
+                    kind: SopStepKind::default(),
+                    schema: None,
+                    ..SopStep::default()
+                }],
+                cooldown_secs: 0,
+                max_concurrent: 2,
+                location: None,
+                deterministic: false,
+                admission_policy: zeroclaw_runtime::sop::types::SopAdmissionPolicy::Parallel,
+                max_pending_approvals: 0,
+                agent: Some(CRON_SOP_AGENT.to_string()),
+            }]);
+        }
+
+        let sink = zeroclaw_runtime::sop::SopDriverSink::new(
+            harness.config.clone(),
+            std::sync::Arc::clone(&harness.engine),
+            Some(std::sync::Arc::clone(&harness.audit)),
+            harness.drivers.clone(),
+        );
+
+        let results = zeroclaw_runtime::sop::dispatch::dispatch_untrusted_fan_in_driven(
+            &harness.engine,
+            &harness.audit,
+            Some(&sink),
+            zeroclaw_runtime::sop::types::SopTriggerSource::Channel,
+            Some("telegram.main:message"),
+            Some("review please"),
+            None,
+        )
+        .await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "exactly one SOP should match, got {results:?}"
+        );
+        assert!(
+            matches!(
+                &results[0],
+                zeroclaw_runtime::sop::dispatch::DispatchResult::Started { .. }
+            ),
+            "the channel event should start the SOP, got {:?}",
+            results[0]
+        );
+        assert_eq!(
+            harness.drivers.lock().unwrap().len(),
+            1,
+            "the ingress must register the started run's driver in the shared set"
+        );
+
+        let run = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                {
+                    let engine = harness.engine.lock().unwrap();
+                    if engine.active_runs().is_empty()
+                        && let Some(run) = engine.finished_runs(Some("channel-sop")).first()
+                    {
+                        return (*run).clone();
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("channel-started SOP should be driven to a retained terminal run");
+
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Completed,
+            "channel-started run should reach Completed, got {:?} ({:?})",
+            run.status,
+            run.step_results
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the driven step should be recorded on the run");
+        assert_eq!(
+            step.status,
+            zeroclaw_runtime::sop::types::SopStepStatus::Completed
+        );
+        assert_eq!(
+            step.effective_agent.as_deref(),
+            Some(CRON_SOP_AGENT),
+            "the step must be attributed to the SOP's own agent"
+        );
+        assert!(
+            step.output.contains("step one done"),
+            "step output should carry the agent turn's result, got {:?}",
+            step.output
+        );
+    }
+
+    /// A cron SOP with no owning agent must fail closed. Before this, the
+    /// headless driver fell back to the alphabetically first configured agent,
+    /// running an unattended procedure under an unrelated agent's provider,
+    /// workspace, tools, and risk profile.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_unowned_cron_sop() {
+        let harness = cron_sop_harness(None).await;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "an unowned headless SOP must fail, not borrow another agent"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("no owning agent"),
+            "the failure should name the missing owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains(CRON_SOP_AGENT),
+            "the refusal must not fall back to the one configured agent, got {:?}",
+            step.output
+        );
+    }
+
+    /// Disabling an agent withdraws it from service. An unattended cron SOP is
+    /// the one run with nobody watching, so a disabled owner must stop it
+    /// rather than quietly keep executing under the agent the operator turned
+    /// off.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_tick_refuses_a_disabled_owner() {
+        let mut harness = cron_sop_harness(Some(CRON_SOP_AGENT)).await;
+        harness
+            .config
+            .agents
+            .get_mut(CRON_SOP_AGENT)
+            .expect("harness configures the owning agent")
+            .enabled = false;
+
+        let mut last_cron_check = chrono::Utc::now() - chrono::Duration::minutes(2);
+        let report = run_sop_maintenance_tick(
+            &harness.config,
+            &harness.engine,
+            Some(&harness.audit),
+            Some(&harness.cache),
+            &mut last_cron_check,
+            &harness.drivers,
+        )
+        .await
+        .expect("maintenance tick should complete");
+        assert_eq!(report.cron_started, 1);
+
+        let run = await_terminal_cron_run(&harness).await;
+        assert_eq!(
+            run.status,
+            zeroclaw_runtime::sop::types::SopRunStatus::Failed,
+            "a SOP owned by a disabled agent must fail closed"
+        );
+        let step = run
+            .step_results
+            .first()
+            .expect("the refused step should be recorded on the run");
+        assert_eq!(
+            step.effective_agent, None,
+            "a refused step must not be attributed to any agent"
+        );
+        assert!(
+            step.output.contains("disabled"),
+            "the failure should name the disabled owner, got {:?}",
+            step.output
+        );
+        assert!(
+            !step.output.contains("step one done"),
+            "the step must not have run under the disabled agent, got {:?}",
+            step.output
+        );
+    }
+
+    /// `abort` only requests cancellation. Shutdown must join the handles it
+    /// aborts, or the replacement generation can start while a straggler is
+    /// still running under the superseded config — the overlap this teardown
+    /// exists to prevent.
+    #[tokio::test]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_joins_the_drivers_it_aborts() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Flips its flag when the driver task's future is dropped, which is
+        /// what actually happens when an aborted task stops.
+        struct StoppedFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for StoppedFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let driver_flag = std::sync::Arc::clone(&stopped);
+        // Outlasts the drain deadline: shutdown has to abort it.
+        let driver = ::zeroclaw_spawn::spawn!(async move {
+            let _flag = StoppedFlag(driver_flag);
+            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+        });
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::register_sop_driver(&drivers, driver));
+
+        // Short deadlines so the drain-expiry path runs without waiting out the
+        // production ones; the logic under test is identical.
+        let carried = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "shutdown returned while an aborted driver was still running"
+        );
+        assert!(
+            carried.is_empty(),
+            "a driver that stopped on abort has nothing to carry forward"
+        );
+    }
+
+    /// A generation that adopts no drivers must still own the ones it inherited.
+    /// The flag is the point: if the reaper returned without joining — or if the
+    /// handles were dropped, which detaches the tasks — it would still be false
+    /// when the reaper finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn orphaned_sop_drivers_are_reaped_rather_than_detached() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let finished = std::sync::Arc::new(AtomicBool::new(false));
+        let start_flag = std::sync::Arc::clone(&started);
+        let flag = std::sync::Arc::clone(&finished);
+        // Blocking, so `abort` cannot stop it once it is polled: exactly the
+        // driver whose handle must not be dropped.
+        let driver = ::zeroclaw_spawn::spawn!(async move {
+            start_flag.store(true, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            flag.store(true, Ordering::SeqCst);
+        });
+        // Wait for the first poll. `abort` on a task the runtime has not polled
+        // yet cancels it outright, which under load would leave the driver never
+        // having run at all — a race in the test, not in the reaper.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the driver must begin before it is reaped");
+
+        let reaper = reap_orphaned_sop_drivers(vec![driver])
+            .expect("a driver still running must be reaped, not dropped");
+        tokio::time::timeout(std::time::Duration::from_secs(5), reaper)
+            .await
+            .expect("the reaper must finish once its drivers stop")
+            .expect("the reaper task itself must not fail");
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "the reaper must join its drivers before finishing"
+        );
+    }
+
+    /// Nothing to own: every carried driver already stopped, so there is no
+    /// reaper to spawn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn finished_drivers_need_no_reaper() {
+        let driver = ::zeroclaw_spawn::spawn!(async {});
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !driver.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+
+        assert!(
+            reap_orphaned_sop_drivers(vec![driver]).is_none(),
+            "a batch with nothing running must not spawn a reaper"
+        );
+    }
+
+    /// The drain and the post-abort join are two passes over the SAME handles.
+    /// When the drain deadline lands mid-batch — one driver already joined, one
+    /// still running — the second pass must resume at the cursor rather than
+    /// re-await a handle that already resolved: polling a completed
+    /// `JoinHandle` panics, which would turn an ordinary slow driver into a
+    /// shutdown panic whenever a sibling finished in time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_survives_a_mixed_completion_batch() {
+        // Ordered deliberately: the first resolves at once, so the drain
+        // consumes its handle before the deadline; the second reaches no await
+        // point and outlives both deadlines.
+        // Briefly pending rather than instantly complete: registration prunes
+        // finished handles, so a zero-await task would be pruned by the next
+        // registration and this test would lose the mixed batch it exists for.
+        let quick = ::zeroclaw_spawn::spawn!(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        let stuck = ::zeroclaw_spawn::spawn!(async {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::register_sop_driver(&drivers, quick));
+        assert!(zeroclaw_runtime::sop::register_sop_driver(&drivers, stuck));
+        let carried = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.len(),
+            1,
+            "only the driver that outlived the grace is carried; the one the drain \
+             already joined must not be awaited a second time"
+        );
+    }
+
+    /// The other half of the contract: a driver that reaches no await point
+    /// cannot be cancelled on demand, and the join grace exists so one cannot
+    /// wedge a reload. It must then be carried into the next generation rather
+    /// than dropped — dropping a `JoinHandle` detaches the task, losing the
+    /// last way to observe work still running under superseded config.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_maintenance_shutdown_carries_a_driver_that_outlives_its_abort() {
+        // Blocking, not `tokio::time::sleep`: abort lands at the next await
+        // point, and this task deliberately reaches none while the grace runs.
+        let driver = ::zeroclaw_spawn::spawn!(async {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+        });
+        let drivers = SopDriverSet::default();
+        assert!(zeroclaw_runtime::sop::register_sop_driver(&drivers, driver));
+
+        let started = std::time::Instant::now();
+        let carried = SopDriverSupervisor {
+            drivers,
+            carried: Vec::new(),
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            carried.len(),
+            1,
+            "a driver still running when the join grace expired must be carried, not detached"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the join grace must bound the wait rather than block on the task"
+        );
+
+        // The next generation adopts it: already aborted, so it is re-checked
+        // and handed on again without a second drain.
+        let adopted_at = std::time::Instant::now();
+        let still_carried = SopDriverSupervisor {
+            drivers: SopDriverSet::default(),
+            carried,
+        }
+        .shutdown_with_deadlines(
+            std::time::Duration::from_millis(50),
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert_eq!(
+            still_carried.len(),
+            1,
+            "an adopted driver that is still running stays carried"
+        );
+        assert!(
+            adopted_at.elapsed() < std::time::Duration::from_millis(500),
+            "adopting an already-aborted driver must not re-drain it"
+        );
+    }
+
+    /// A producer can outlive the point where its generation stops taking work:
+    /// the RPC listener stops accepting while its existing connection tasks keep
+    /// running, so one of them can resolve an approval after the drain has
+    /// already taken the set. The drain therefore CLOSES the set rather than
+    /// merely emptying it — a driver arriving afterwards is refused and aborted,
+    /// instead of being pushed into a vector this generation will never drain
+    /// again and running on under superseded config and permissions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[cfg(feature = "agent-runtime")]
+    async fn sop_driver_registered_after_the_drain_is_refused_and_aborted() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct StoppedFlag(std::sync::Arc<AtomicBool>);
+        impl Drop for StoppedFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let drivers = SopDriverSet::default();
+        let carried = SopDriverSupervisor {
+            drivers: std::sync::Arc::clone(&drivers),
+            carried: Vec::new(),
+        }
+        .shutdown()
+        .await;
+        assert!(
+            carried.is_empty(),
+            "a generation with no drivers drains clean"
+        );
+        assert!(
+            drivers.lock().unwrap().is_closed(),
+            "the drain must close the set so late producers cannot join it"
+        );
+
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let stopped = std::sync::Arc::new(AtomicBool::new(false));
+        let start_flag = std::sync::Arc::clone(&started);
+        let late_flag = std::sync::Arc::clone(&stopped);
+        // Never finishes on its own: only the refusal's abort can stop it, so
+        // the flag below distinguishes "refused and cancelled" from "refused and
+        // silently detached", which would leave the task running unobserved.
+        let late = ::zeroclaw_spawn::spawn!(async move {
+            let _flag = StoppedFlag(late_flag);
+            start_flag.store(true, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+        });
+        // Wait until the task is actually executing. Aborting one that has never
+        // been polled drops the future before its body runs, so the drop guard
+        // would never exist and this test would pass or fail on scheduling luck
+        // rather than on the cancellation it means to prove.
+        let start_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !started.load(Ordering::SeqCst) && std::time::Instant::now() < start_deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            started.load(Ordering::SeqCst),
+            "the late driver must be running before the refusal, or the abort proves nothing"
+        );
+
+        let registered = zeroclaw_runtime::sop::register_sop_driver(&drivers, late);
+
+        assert!(
+            !registered,
+            "a driver produced after its generation drained must be refused"
+        );
+        assert!(
+            drivers.lock().unwrap().is_empty(),
+            "the refused driver must not land in the drained set"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !stopped.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            stopped.load(Ordering::SeqCst),
+            "the refused driver must be aborted, not detached to run on unobserved"
+        );
     }
 
     #[test]

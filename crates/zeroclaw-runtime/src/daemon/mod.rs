@@ -644,7 +644,7 @@ pub async fn run(
     let need_rpc_ctx = registry.has_socket_start() || registry.has_wss_start();
 
     // Extract shared SOP engine from registry for RpcContext.
-    let (sop_engine, sop_audit) = registry.take_sop_engine();
+    let (sop_engine, sop_audit, sop_driver_handles) = registry.take_sop_engine();
 
     let rpc_ctx = if need_rpc_ctx {
         use crate::rpc::context::RpcContext;
@@ -764,6 +764,7 @@ pub async fn run(
             acp_session_store,
             sop_engine,
             sop_audit,
+            sop_driver_handles,
             hooks,
         }))
     } else {

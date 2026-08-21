@@ -126,6 +126,7 @@ fn test_state(config: Config) -> AppState {
         tui_registry: None,
         sop_engine: None,
         sop_audit: None,
+        sop_driver_handles: None,
     }
 }
 

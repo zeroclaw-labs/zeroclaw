@@ -68,7 +68,17 @@ pub struct DaemonRegistry {
     /// RpcContext so RPC/TUI agent sessions share the same engine.
     sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+    sop_driver_handles: Option<crate::sop::SopDriverHandles>,
 }
+
+/// The SOP wiring one daemon generation hands from `main` into the RPC
+/// context: the shared engine, the audit logger, and the generation's
+/// driver supervisor set.
+type SopWiring = (
+    Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    Option<Arc<crate::sop::SopAuditLogger>>,
+    Option<crate::sop::SopDriverHandles>,
+);
 
 impl DaemonRegistry {
     /// Create an empty registry. Missing starters are treated as unwired
@@ -150,19 +160,20 @@ impl DaemonRegistry {
         &mut self,
         sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
         sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
+        sop_driver_handles: Option<crate::sop::SopDriverHandles>,
     ) -> &mut Self {
         self.sop_engine = sop_engine;
         self.sop_audit = sop_audit;
+        self.sop_driver_handles = sop_driver_handles;
         self
     }
 
-    pub(crate) fn take_sop_engine(
-        &mut self,
-    ) -> (
-        Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
-        Option<Arc<crate::sop::SopAuditLogger>>,
-    ) {
-        (self.sop_engine.take(), self.sop_audit.take())
+    pub(crate) fn take_sop_engine(&mut self) -> SopWiring {
+        (
+            self.sop_engine.take(),
+            self.sop_audit.take(),
+            self.sop_driver_handles.take(),
+        )
     }
 }
 

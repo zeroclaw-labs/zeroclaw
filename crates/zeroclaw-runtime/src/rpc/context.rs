@@ -163,6 +163,10 @@ pub struct RpcContext {
     /// Shared SOP engine from the daemon (for RPC/TUI agent sessions).
     /// `None` when standalone — sessions build their own.
     pub sop_engine: Option<Arc<std::sync::Mutex<crate::sop::SopEngine>>>,
+    /// The daemon generation's driver supervisor set. Approval surfaces
+    /// register resumed headless drivers here so reload drains them instead
+    /// of letting them run detached under superseded configuration.
+    pub sop_driver_handles: Option<crate::sop::SopDriverHandles>,
     pub sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
 
     /// Lifecycle hook runner. `None` when hooks are disabled in config.
@@ -191,6 +195,7 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new(&tui_dir)),
             acp_session_store: AcpSessionStore::new(data_dir.as_path()).ok().map(Arc::new),
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
         })
@@ -212,6 +217,7 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
         })
@@ -237,6 +243,7 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
         })
@@ -262,6 +269,7 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: Some(sop_engine),
+            sop_driver_handles: Some(crate::sop::SopDriverHandles::default()),
             sop_audit: None,
             hooks: None,
         })
@@ -287,6 +295,7 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
         })
@@ -312,6 +321,7 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
         })
@@ -338,6 +348,7 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
         })
@@ -364,6 +375,7 @@ impl RpcContext {
             tui_registry: Arc::new(TuiRegistry::new_unsigned()),
             acp_session_store: None,
             sop_engine: None,
+            sop_driver_handles: None,
             sop_audit: None,
             hooks: None,
         })
