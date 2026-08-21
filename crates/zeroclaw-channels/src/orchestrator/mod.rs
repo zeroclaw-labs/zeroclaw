@@ -27067,7 +27067,9 @@ This is an example JSON object for profile settings."#;
         drop(rx);
     }
 
-    #[tokio::test]
+    // Paused time so the assertion is on the deadline itself rather than on a
+    // real sleep racing a real tick.
+    #[tokio::test(start_paused = true)]
     async fn supervised_listener_waits_one_interval_before_its_second_observation() {
         // `tokio::time::interval` fires its first tick immediately, which would
         // double up on the pre-listen observation. The heartbeat's first tick
