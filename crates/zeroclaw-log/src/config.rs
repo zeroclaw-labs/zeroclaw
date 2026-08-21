@@ -19,6 +19,10 @@ pub struct LogConfig {
     pub log_persistence_retention_max_files: usize,
     /// Max age (days) of rotated archives in `rotating` mode. `0` disables.
     pub log_persistence_retention_max_age_days: u64,
+    /// Rotate the active file once it holds this many non-empty JSONL lines,
+    /// in `rotating` mode. `0` disables entry-count rotation. `rolling` mode
+    /// remaps `log_persistence_max_entries` into this field at resolve time.
+    pub log_persistence_max_entries_per_segment: usize,
     pub log_tool_io: String,
     pub log_tool_io_truncate_bytes: usize,
     pub log_tool_io_denylist: Vec<String>,
@@ -35,6 +39,7 @@ impl Default for LogConfig {
             log_persistence_rotate_daily: true,
             log_persistence_retention_max_files: 7,
             log_persistence_retention_max_age_days: 0,
+            log_persistence_max_entries_per_segment: 0,
             log_tool_io: "redacted".into(),
             log_tool_io_truncate_bytes: 40960,
             log_tool_io_denylist: Vec::new(),
@@ -142,6 +147,12 @@ pub struct ResolvedPolicy {
     pub retention_max_files: usize,
     /// Max age (days) of rotated archives in `Rotating` mode. `0` disables.
     pub retention_max_age_days: u64,
+    /// Rotate the active file once it holds this many non-empty JSONL lines.
+    /// `0` disables entry-count rotation. Set from
+    /// `log_persistence_max_entries_per_segment`, except when `storage` was
+    /// remapped from `rolling`, where it takes `max_entries` instead — see
+    /// [`ResolvedPolicy::from_config`].
+    pub max_entries_per_segment: usize,
     pub tool_io: ToolIoPolicy,
     pub tool_io_truncate_bytes: usize,
     pub tool_io_denylist: Vec<String>,
@@ -150,14 +161,26 @@ pub struct ResolvedPolicy {
 
 impl ResolvedPolicy {
     pub fn from_config(config: &LogConfig, workspace_dir: &Path) -> Self {
+        let storage = StoragePolicy::from_raw(&config.log_persistence);
+        let max_entries = config.log_persistence_max_entries.max(1);
+        // `rolling` has no independent runtime behaviour: it is folded into
+        // `Rotating` with entry-count rotation set from its own
+        // `max_entries` cap, so the writer never runs the O(file size)
+        // rewrite path for a policy string of "rolling" alone.
+        let (storage, max_entries_per_segment) = if storage == StoragePolicy::Rolling {
+            (StoragePolicy::Rotating, max_entries)
+        } else {
+            (storage, config.log_persistence_max_entries_per_segment)
+        };
         Self {
-            storage: StoragePolicy::from_raw(&config.log_persistence),
+            storage,
             path: resolve_path(&config.log_persistence_path, workspace_dir),
-            max_entries: config.log_persistence_max_entries.max(1),
+            max_entries,
             max_bytes: config.log_persistence_max_bytes,
             rotate_daily: config.log_persistence_rotate_daily,
             retention_max_files: config.log_persistence_retention_max_files,
             retention_max_age_days: config.log_persistence_retention_max_age_days,
+            max_entries_per_segment,
             tool_io: ToolIoPolicy::from_raw(&config.log_tool_io),
             tool_io_truncate_bytes: config.log_tool_io_truncate_bytes,
             tool_io_denylist: config.log_tool_io_denylist.clone(),
@@ -275,5 +298,29 @@ mod tests {
         assert_eq!(p.storage, StoragePolicy::Full);
         assert_eq!(p.tool_io, ToolIoPolicy::Off);
         assert_eq!(p.tool_io_truncate_bytes, 123);
+    }
+
+    #[test]
+    fn resolved_policy_remaps_rolling_to_rotating_with_entry_count_cap() {
+        let mut c = make_config();
+        c.log_persistence = "rolling".to_string();
+        c.log_persistence_max_entries = 500;
+        let p = ResolvedPolicy::from_config(&c, std::path::Path::new("/"));
+        assert_eq!(
+            p.storage,
+            StoragePolicy::Rotating,
+            "rolling has no independent writer behaviour; it must resolve to Rotating"
+        );
+        assert_eq!(p.max_entries_per_segment, 500);
+    }
+
+    #[test]
+    fn resolved_policy_uses_own_field_for_rotating_entry_count_cap() {
+        let mut c = make_config();
+        c.log_persistence = "rotating".to_string();
+        c.log_persistence_max_entries_per_segment = 42;
+        let p = ResolvedPolicy::from_config(&c, std::path::Path::new("/"));
+        assert_eq!(p.storage, StoragePolicy::Rotating);
+        assert_eq!(p.max_entries_per_segment, 42);
     }
 }
