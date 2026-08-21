@@ -14627,7 +14627,13 @@ pub enum DiscordReactionScope {
 }
 
 /// Discord bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.discord"]
 #[allow(clippy::struct_excessive_bools)]
@@ -14770,6 +14776,17 @@ pub struct DiscordConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl Default for DiscordConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree. Every field here
+    /// either declares a serde default or is an `Option`, which is what
+    /// makes the empty object total.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every DiscordConfig field declares a serde default or is Option")
+    }
+}
+
 impl DiscordConfig {
     /// Validate this alias's bot-token placeholder and enabled-state rules.
     /// Mirrors `TelegramConfig::validate_bot_token`.
@@ -14797,7 +14814,13 @@ pub const DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 0;
 pub const MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 50;
 
 /// Slack bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.slack"]
 #[allow(clippy::struct_excessive_bools)]
@@ -14915,6 +14938,17 @@ pub struct SlackConfig {
 
 fn default_slack_draft_update_interval_ms() -> u64 {
     1200
+}
+
+impl Default for SlackConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree. Every field here
+    /// either declares a serde default or is an `Option`, which is what
+    /// makes the empty object total.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every SlackConfig field declares a serde default or is Option")
+    }
 }
 
 impl ChannelConfig for SlackConfig {
@@ -15239,6 +15273,12 @@ impl ChannelConfig for IMessageConfig {
 }
 
 /// Matrix channel configuration.
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.matrix"]
@@ -15392,33 +15432,15 @@ pub struct MatrixConfig {
 }
 
 impl Default for MatrixConfig {
+    /// Built by deserializing an object supplying only `homeserver`, the one
+    /// field with no serde default - a Matrix channel must always name a
+    /// homeserver, so it stays required rather than gaining one. Every other
+    /// field either declares a serde default or is an `Option`, so this is
+    /// the minimal object that makes the deserialize total; those defaults
+    /// stay the only source of truth for everything but `homeserver`.
     fn default() -> Self {
-        Self {
-            enabled: false,
-            homeserver: String::new(),
-            access_token: None,
-            user_id: None,
-            device_id: None,
-            allowed_rooms: Vec::new(),
-            interrupt_on_new_message: false,
-            stream_mode: MatrixStreamMode::default(),
-            draft_update_interval_ms: default_matrix_draft_update_interval_ms(),
-            multi_message_delay_ms: default_multi_message_delay_ms(),
-            stream_draft_lines: default_matrix_stream_draft_lines(),
-            message_max_bytes: default_matrix_message_max_bytes(),
-            stream_draft_delete: default_true(),
-            stream_reasoning: StreamReasoningMode::default(),
-            stream_tool_arguments: Vec::new(),
-            mention_only: false,
-            recovery_key: None,
-            password: None,
-            approval_timeout_secs: default_channel_approval_timeout_secs(),
-            reply_in_thread: default_true(),
-            ack_reactions: None,
-            excluded_tools: Vec::new(),
-            reply_min_interval_secs: 0,
-            reply_queue_depth_max: 0,
-        }
+        serde_json::from_str(r#"{"homeserver":""}"#)
+            .expect("every other MatrixConfig field declares a serde default or is Option")
     }
 }
 
@@ -15510,7 +15532,14 @@ impl ChannelConfig for MatrixConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+/// Signal channel configuration.
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.signal"]
 pub struct SignalConfig {
@@ -15574,6 +15603,20 @@ pub struct SignalConfig {
     /// newest send is dropped and a `WARN` is logged.
     #[serde(default)]
     pub reply_queue_depth_max: u16,
+}
+
+impl Default for SignalConfig {
+    /// Built by deserializing an object supplying only `http_url` and
+    /// `account`, the two fields with no serde default - a Signal channel
+    /// must always name its daemon and account, so they stay required
+    /// rather than gaining one. Every other field either declares a serde
+    /// default or is an `Option`, so this is the minimal object that makes
+    /// the deserialize total; those defaults stay the only source of truth
+    /// for everything but `http_url` and `account`.
+    fn default() -> Self {
+        serde_json::from_str(r#"{"http_url":"","account":""}"#)
+            .expect("every other SignalConfig field declares a serde default or is Option")
+    }
 }
 
 impl SignalConfig {
@@ -16692,7 +16735,13 @@ pub enum LarkReceiveMode {
 
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.lark"]
 pub struct LarkConfig {
@@ -16789,6 +16838,20 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+}
+
+impl Default for LarkConfig {
+    /// Built by deserializing an object supplying only `app_id` and
+    /// `app_secret`, the two fields with no serde default - a Lark channel
+    /// must always name its app credentials, so they stay required rather
+    /// than gaining one. Every other field either declares a serde default
+    /// or is an `Option`, so this is the minimal object that makes the
+    /// deserialize total; those defaults stay the only source of truth for
+    /// everything but `app_id` and `app_secret`.
+    fn default() -> Self {
+        serde_json::from_str(r#"{"app_id":"","app_secret":""}"#)
+            .expect("every other LarkConfig field declares a serde default or is Option")
+    }
 }
 
 impl ChannelConfig for LarkConfig {
@@ -38081,6 +38144,10 @@ allowed_users = []
 
         let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 300);
+
+        let lark: LarkConfig =
+            serde_json::from_str(r#"{"app_id":"cli_1","app_secret":"secret"}"#).unwrap();
+        assert_eq!(lark.approval_timeout_secs, 300);
     }
 
     /// The test above proves the SERDE path. It says nothing about the RUST
@@ -38198,6 +38265,216 @@ allowed_users = []
         );
     }
 
+    /// Sibling to `whatsapp_rust_default_waits_rather_than_denying`, for the
+    /// other five channel configs that carried the same split: a derived
+    /// `Default` zeroed `approval_timeout_secs` while serde supplied 300, so
+    /// a config built in Rust rather than parsed from a file denied every
+    /// approval instantly.
+    #[test]
+    async fn channel_rust_default_waits_rather_than_denying() {
+        assert_eq!(
+            DiscordConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            SlackConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            MatrixConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            SignalConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            LarkConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+    }
+
+    /// Sibling to `whatsapp_rust_default_matches_serde_default`, pinning the
+    /// whole struct rather than the one field for the other five channel
+    /// configs, so a field added later with a serde default but no matching
+    /// Rust default fails here instead of reaching an operator.
+    #[test]
+    async fn channel_rust_default_matches_serde_default() {
+        assert_eq!(
+            serde_json::to_value(DiscordConfig::default()).unwrap(),
+            serde_json::to_value(serde_json::from_str::<DiscordConfig>("{}").unwrap()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(SlackConfig::default()).unwrap(),
+            serde_json::to_value(serde_json::from_str::<SlackConfig>("{}").unwrap()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(MatrixConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<MatrixConfig>(r#"{"homeserver":""}"#).unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(SignalConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<SignalConfig>(r#"{"http_url":"","account":""}"#).unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(LarkConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<LarkConfig>(r#"{"app_id":"","app_secret":""}"#).unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    /// Sibling to `whatsapp_explicit_zero_timeout_is_preserved`: an operator
+    /// who deliberately writes `approval_timeout_secs = 0` keeps that zero.
+    /// The fix above changes what an UNSET field means, and must not take
+    /// away the ability to refuse every gated tool deliberately.
+    #[test]
+    async fn channel_explicit_zero_timeout_is_preserved() {
+        let discord: DiscordConfig =
+            serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(discord.approval_timeout_secs, 0);
+
+        let slack: SlackConfig = serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(slack.approval_timeout_secs, 0);
+
+        let matrix: MatrixConfig = serde_json::from_str(
+            r#"{"homeserver":"https://matrix.example.com","approval_timeout_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(matrix.approval_timeout_secs, 0);
+
+        let signal: SignalConfig = serde_json::from_str(
+            r#"{"http_url":"http://localhost","account":"+1","approval_timeout_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(signal.approval_timeout_secs, 0);
+
+        let lark: LarkConfig = serde_json::from_str(
+            r#"{"app_id":"cli_1","app_secret":"secret","approval_timeout_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(lark.approval_timeout_secs, 0);
+    }
+
+    /// Generates the sibling of
+    /// `whatsapp_alias_created_through_the_map_key_surface_reloads_waiting`
+    /// for the other five channel configs, rather than hand-duplicating the
+    /// lifecycle five times: create an alias through the supported map-key
+    /// surface, save, reload, with `approval_timeout_secs` omitted
+    /// throughout - the case that broke. `$setup` fills in whatever fields
+    /// a given channel type requires beyond `enabled` so the persisted
+    /// alias round-trips; it never touches `approval_timeout_secs`.
+    macro_rules! channel_alias_reloads_waiting_test {
+        ($test_name:ident, $section:literal, $field:ident, |$cfg:ident| $setup:block) => {
+            #[test]
+            async fn $test_name() {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config_path = tmp.path().join("config.toml");
+                std::fs::write(
+                    &config_path,
+                    format!(
+                        "schema_version = {}\n",
+                        crate::migration::CURRENT_SCHEMA_VERSION
+                    ),
+                )
+                .unwrap();
+
+                let mut config = Config {
+                    config_path: config_path.clone(),
+                    ..Default::default()
+                };
+
+                let created = config
+                    .create_map_key($section, "shop")
+                    .expect(concat!($section, " must be a map-keyed section"));
+                assert!(
+                    created,
+                    "a fresh alias must be created, not silently reused"
+                );
+
+                {
+                    let $cfg = config.channels.$field.get_mut("shop").unwrap();
+                    $setup
+                }
+
+                config.mark_dirty(&format!("{}.shop", $section));
+
+                config.save_dirty().await.unwrap();
+
+                let written = std::fs::read_to_string(&config_path).unwrap();
+                assert!(
+                    !written.contains("approval_timeout_secs = 0"),
+                    "creating an alias must not persist an already-elapsed approval deadline; \
+                     got:\n{written}"
+                );
+
+                let reparsed: Config = toml::from_str(&written).unwrap();
+                let shop = reparsed
+                    .channels
+                    .$field
+                    .get("shop")
+                    .expect("the created alias must survive save and reload");
+                assert_eq!(
+                    shop.approval_timeout_secs,
+                    default_channel_approval_timeout_secs(),
+                    "an alias whose approval_timeout_secs was never set must reload waiting \
+                     the documented timeout, not denying at once"
+                );
+            }
+        };
+    }
+
+    channel_alias_reloads_waiting_test!(
+        discord_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.discord",
+        discord,
+        |_cfg| {}
+    );
+    channel_alias_reloads_waiting_test!(
+        slack_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.slack",
+        slack,
+        |_cfg| {}
+    );
+    // Matrix requires `homeserver`; set it before saving so the alias
+    // round-trips, same as an operator filling in a required field through
+    // the dashboard would. `approval_timeout_secs` stays untouched.
+    channel_alias_reloads_waiting_test!(
+        matrix_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.matrix",
+        matrix,
+        |cfg| {
+            cfg.homeserver = "https://matrix.example.com".to_string();
+        }
+    );
+    // Signal requires `http_url` and `account`; same reasoning as Matrix.
+    channel_alias_reloads_waiting_test!(
+        signal_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.signal",
+        signal,
+        |cfg| {
+            cfg.http_url = "http://127.0.0.1:8686".to_string();
+            cfg.account = "+15555550123".to_string();
+        }
+    );
+    // Lark requires `app_id` and `app_secret`; same reasoning as Matrix.
+    channel_alias_reloads_waiting_test!(
+        lark_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.lark",
+        lark,
+        |cfg| {
+            cfg.app_id = "cli_test".to_string();
+            cfg.app_secret = "secret_test".to_string();
+        }
+    );
+
     #[test]
     async fn channel_approval_timeout_secs_explicit_override() {
         let discord: DiscordConfig =
@@ -38223,6 +38500,12 @@ allowed_users = []
         let whatsapp: WhatsAppConfig =
             serde_json::from_str(r#"{"approval_timeout_secs":180}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 180);
+
+        let lark: LarkConfig = serde_json::from_str(
+            r#"{"app_id":"cli_1","app_secret":"secret","approval_timeout_secs":75}"#,
+        )
+        .unwrap();
+        assert_eq!(lark.approval_timeout_secs, 75);
     }
 
     // ── Multi-agent cross-reference validators ─────────────────────
