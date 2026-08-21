@@ -1961,10 +1961,8 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             // Daemon origin (agent::memory_inject): Conversation entries are
             // excluded for scheduled origins. `heartbeat_memory` stays for
             // the post-run auto-save consolidation below.
-            let prompt = match &session_context {
-                Some(sc) => format!("{sc}\n\n{task_prompt}"),
-                None => task_prompt,
-            };
+            let prompt =
+                heartbeat_turn_prompt(session_context.as_deref(), &task_prompt, delivery.as_ref());
             let temp: Option<f64> = config
                 .model_provider_for_agent(&agent_alias)
                 .and_then(|e| e.temperature);
@@ -2183,6 +2181,37 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             sleep_mins = base_interval;
         }
     }
+}
+
+/// The full prompt an autonomous heartbeat turn receives: the optional session
+/// context, the origin-marked task, then the delivery contract.
+///
+/// The contract is **appended, never prepended**. Heartbeat delivery is
+/// resolved from config (auto-detecting a channel when unset), so unlike cron
+/// this turn usually IS broadcast, and the model has to know that before it
+/// writes an internal-sounding worklog. Prepending would also move the
+/// `[Heartbeat Task` marker off the front of the string, which
+/// `zeroclaw_memory::should_skip_autosave_content` tests position-dependently.
+///
+/// `delivery` is the *same* resolved `Option<(channel, target)>` that gates the
+/// real `deliver_announcement` call in the worker, so the contract cannot
+/// promise a send the worker will not perform. Passing it in rather than
+/// re-deriving it is what makes that impossible rather than merely true today;
+/// `heartbeat_contract_tracks_the_value_that_gates_the_real_send` pins it.
+#[must_use]
+fn heartbeat_turn_prompt(
+    session_context: Option<&str>,
+    task_prompt: &str,
+    delivery: Option<&(String, String)>,
+) -> String {
+    let prompt = match session_context {
+        Some(sc) => format!("{sc}\n\n{task_prompt}"),
+        None => task_prompt.to_string(),
+    };
+    format!(
+        "{prompt}\n\n{}",
+        crate::cron::scheduler::delivery_contract(delivery.map(|(channel, _)| channel.as_str()))
+    )
 }
 
 /// Resolve delivery target: explicit config > auto-detect first configured channel.
@@ -3198,6 +3227,138 @@ mod tests {
             },
         );
         assert!(has_supervised_channels(&config));
+    }
+
+    /// The heartbeat prompt must carry three things at once: the origin marker
+    /// autosave filtering keys on, the operator's task, and the delivery
+    /// contract — with the marker still at the front of the string.
+    #[test]
+    fn heartbeat_turn_prompt_states_the_contract_without_displacing_the_origin_marker() {
+        let task_prompt = "[Heartbeat Task | high] check the build";
+        let delivery = ("discord".to_string(), "99".to_string());
+
+        let prompt = heartbeat_turn_prompt(None, task_prompt, Some(&delivery));
+
+        assert!(
+            prompt.starts_with("[Heartbeat Task |"),
+            "origin marker must stay at the front: should_skip_autosave_content \
+             is a position-dependent prefix test, got: {prompt}"
+        );
+        assert!(prompt.contains("check the build"), "the task survives");
+        assert!(
+            prompt.contains("discord"),
+            "names the resolved destination, got: {prompt}"
+        );
+        assert!(
+            prompt.contains("NO_REPLY"),
+            "names the suppression sentinel, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn heartbeat_turn_prompt_without_delivery_says_the_reply_reaches_nobody() {
+        let prompt = heartbeat_turn_prompt(None, "[Heartbeat Task | low] tidy up", None);
+        assert!(
+            prompt.contains("not delivered"),
+            "must state plainly that nobody receives it, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("NO_REPLY"),
+            "must not offer a sentinel that does nothing on a non-delivering \
+             path, got: {prompt}"
+        );
+    }
+
+    /// Session context is prepended by the worker before the contract is
+    /// appended. Only the append is this function's contract; the context
+    /// displacing the `[Heartbeat Task` marker is pre-existing behavior of the
+    /// `load_session_context` path (and the reason autosave suppression misses
+    /// those turns) — deliberately not pinned here, so fixing it does not have
+    /// to fight a test asserting the broken shape is correct.
+    #[test]
+    fn heartbeat_turn_prompt_keeps_session_context_and_still_appends_the_contract() {
+        let delivery = ("slack".to_string(), "C123".to_string());
+        let prompt = heartbeat_turn_prompt(
+            Some("[Memory context] earlier messages"),
+            "[Heartbeat Task | high] check the build",
+            Some(&delivery),
+        );
+
+        assert!(prompt.contains("earlier messages"), "context survives");
+        assert!(prompt.contains("check the build"), "task survives");
+        assert!(
+            prompt
+                .trim_end()
+                .ends_with(&crate::cron::scheduler::delivery_contract(Some("slack"))),
+            "contract is appended last, got: {prompt}"
+        );
+    }
+
+    /// The contract the model reads must agree with the value that actually
+    /// gates the send.
+    ///
+    /// The worker calls `deliver_announcement` only under
+    /// `if let Some((channel, target)) = &delivery`, and hands that same
+    /// binding to `heartbeat_turn_prompt`. This pins the half that could still
+    /// drift — `Some`/`None` mapping to the delivering/non-delivering form —
+    /// which is precisely the defect that existed on the cron side, where the
+    /// prompt promised delivery for states the send refused. The config→
+    /// `Option` half is covered by the `resolve_delivery_*` tests above.
+    #[test]
+    fn heartbeat_contract_tracks_the_value_that_gates_the_real_send() {
+        let gating: Option<(String, String)> = Some(("discord".to_string(), "99".to_string()));
+        let prompt = heartbeat_turn_prompt(None, "[Heartbeat Task | high] t", gating.as_ref());
+        assert!(
+            prompt.contains("is sent to the discord channel"),
+            "a gating value that WILL deliver must promise delivery, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("not delivered to anyone"),
+            "must not also claim it reaches nobody, got: {prompt}"
+        );
+
+        let gating: Option<(String, String)> = None;
+        let prompt = heartbeat_turn_prompt(None, "[Heartbeat Task | high] t", gating.as_ref());
+        assert!(
+            prompt.contains("not delivered to anyone"),
+            "a gating value that will NOT deliver must not promise delivery, got: {prompt}"
+        );
+
+        // And the real config path yields that non-delivering value when
+        // heartbeat delivery is unconfigured.
+        assert_eq!(
+            resolve_heartbeat_delivery(&Config::default()).unwrap(),
+            None
+        );
+    }
+
+    /// Every sentinel the heartbeat prompt instructs the model to use must be
+    /// classified the way the prompt says by the function the worker actually
+    /// consults before delivering.
+    #[test]
+    fn the_sentinels_the_heartbeat_prompt_names_are_the_ones_the_worker_honors() {
+        use crate::cron::scheduler::announce_delivery_decision;
+
+        let delivery = ("discord".to_string(), "99".to_string());
+        let prompt = heartbeat_turn_prompt(None, "[Heartbeat Task | high] t", Some(&delivery));
+
+        assert!(prompt.contains("answer with exactly NO_REPLY and"));
+        assert!(
+            !announce_delivery_decision("NO_REPLY").should_deliver(),
+            "the bare sentinel the prompt names must suppress the send"
+        );
+
+        assert!(prompt.contains("NO_REPLY[FAIL]"));
+        assert!(
+            announce_delivery_decision("NO_REPLY[FAIL]: disk full").should_deliver(),
+            "the prompt promises FAIL reaches an operator"
+        );
+
+        assert!(prompt.contains("NO_REPLY[REFUSE]"));
+        assert!(
+            announce_delivery_decision("NO_REPLY[REFUSE]: not permitted").should_deliver(),
+            "the prompt promises REFUSE reaches an operator"
+        );
     }
 
     #[test]
