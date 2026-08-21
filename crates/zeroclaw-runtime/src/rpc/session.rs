@@ -11,6 +11,15 @@ use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_infra::session_queue::SessionActorQueue;
 use zeroclaw_providers::ModelProvider;
 
+/// Error returned by [`SessionStore::lock_model_provider_update_with_timeout`].
+#[derive(Debug)]
+pub(crate) enum WaitForProviderUpdateError {
+    /// The session no longer exists.
+    SessionNotFound,
+    /// The update lock was not released within the requested timeout.
+    Timeout,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
@@ -176,6 +185,57 @@ impl SessionStore {
         Arc::clone(&self.model_provider_update_waiting)
     }
 
+    /// Lock the provider generation for a prompt, waiting at most `timeout`.
+    ///
+    /// The caller must hold the returned guard through the turn boundary (and,
+    /// today, through the whole turn). That closes both sides of the ordering
+    /// race: a config transaction that already owns the lock finishes publishing
+    /// its provider/resolver/generation first, while a transaction that starts
+    /// after this call cannot publish a new live config between the prompt's
+    /// generation check and `sync_config_generation()`.
+    ///
+    /// Returns `Err` if the session no longer exists, or if the lock is not
+    /// released within `timeout`.  The caller should surface the timeout as a
+    /// retryable error rather than proceeding with a potentially stale resolver.
+    pub(crate) async fn lock_model_provider_update_with_timeout(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, WaitForProviderUpdateError> {
+        let lock = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| Arc::clone(&session.model_provider_update))
+            .ok_or(WaitForProviderUpdateError::SessionNotFound)?;
+
+        #[cfg(test)]
+        let acquire = {
+            let waiting = Arc::clone(&self.model_provider_update_waiting);
+            let mut lock = Box::pin(lock.lock_owned());
+            let mut notified = false;
+            std::future::poll_fn(
+                move |cx| match std::future::Future::poll(lock.as_mut(), cx) {
+                    std::task::Poll::Pending => {
+                        if !notified {
+                            waiting.notify_one();
+                            notified = true;
+                        }
+                        std::task::Poll::Pending
+                    }
+                    std::task::Poll::Ready(guard) => std::task::Poll::Ready(guard),
+                },
+            )
+        };
+        #[cfg(not(test))]
+        let acquire = lock.lock_owned();
+
+        tokio::time::timeout(timeout, acquire)
+            .await
+            .map_err(|_| WaitForProviderUpdateError::Timeout)
+    }
+
     pub async fn touch(&self, id: &str) {
         if let Some(s) = self.sessions.lock().await.get_mut(id) {
             s.last_active = Instant::now();
@@ -235,13 +295,26 @@ impl SessionStore {
     /// Swap a freshly built `ModelProvider` box (and its name) onto the
     /// session's agent. Called by the dispatcher after it constructs the
     /// box from config, keeping model_provider-build logic out of the store.
+    /// The route resolver is installed in the SAME state transition as the
+    /// provider box: it holds the hint→route table bound to that provider set,
+    /// so leaving the old resolver would resolve routed hints through the
+    /// previous provider while the new box serves the call.
+    /// `config_generation` is the `Arc<Config>` the caller built this provider
+    /// box and resolver FROM. It is published onto the agent in the same state
+    /// transition, so a later explicit `model_switch` rebuilds dispatch from
+    /// that generation rather than the agent's construction-time snapshot, and
+    /// `context_limits_for_route` reports capacity and budget from it too.
+    /// Passing a generation the box was not built from reintroduces the
+    /// mixed-generation split this parameter exists to close.
     pub async fn apply_model_provider(
         &self,
         id: &str,
         model_provider: Box<dyn ModelProvider>,
         model_provider_name: String,
         model_name: String,
+        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
         tool_dispatcher: Box<dyn ToolDispatcher>,
+        config_generation: Arc<zeroclaw_config::schema::Config>,
     ) -> bool {
         let agent = {
             let sessions = self.sessions.lock().await;
@@ -254,8 +327,29 @@ impl SessionStore {
         guard.set_model_provider(model_provider);
         guard.set_model_provider_name(model_provider_name);
         guard.set_model_name(model_name);
+        guard.set_model_route_resolver(model_route_resolver);
         guard.set_tool_dispatcher(tool_dispatcher);
+        guard.set_config_generation(config_generation);
         true
+    }
+
+    /// Rewrite a session's in-memory `model_provider` override to a new
+    /// reference. `SessionOverrides` is transient session state rather than
+    /// config, so a provider alias rename does not reach it through the
+    /// config cascade. Without this migration the override would keep naming
+    /// an alias that no longer exists, and the next resolution would fall
+    /// back to compatibility values or fail while rebuilding the old
+    /// reference. Called from the live-refresh publication step while that
+    /// session's `model_provider_update` guard is held.
+    pub async fn migrate_model_provider_override(&self, id: &str, new_ref: String) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        match sessions.get_mut(id) {
+            Some(session) => {
+                session.overrides.model_provider = Some(new_ref);
+                true
+            }
+            None => false,
+        }
     }
 
     pub async fn get_overrides(&self, id: &str) -> Option<SessionOverrides> {

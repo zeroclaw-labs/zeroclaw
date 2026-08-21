@@ -37,7 +37,7 @@ pub async fn maybe_run_skill_review(
     multimodal: &MultimodalConfig,
     pacing: &PacingConfig,
     max_tool_result_chars: usize,
-    max_context_tokens: usize,
+    context_token_budget: usize,
     cancellation_token: Option<&CancellationToken>,
     agent_alias: Option<&str>,
 ) {
@@ -80,12 +80,14 @@ pub async fn maybe_run_skill_review(
     let result = SKILL_REVIEW_ACTIVE
         .scope((), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution::resolve(
                     crate::agent::loop_::ResolvedModelAccess {
                         model_provider: provider,
                         provider_name,
                         model: model_name,
+                        dispatch_model: model_name,
                         temperature: Some(0.3),
                     },
                     crate::agent::loop_::ResolvedIo {
@@ -111,7 +113,21 @@ pub async fn maybe_run_skill_review(
                         parallel_tools: false,
                         // sequential for the mutation-capable fork
                         max_tool_result_chars,
-                        context_token_budget: max_context_tokens,
+                        context_limits: full_config.zip(agent_alias).map_or_else(
+                            || {
+                                zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                                    context_token_budget,
+                                )
+                            },
+                            |(config, alias)| {
+                                config.resolved_context_limits_for_route(
+                                    alias,
+                                    provider_name,
+                                    model_name,
+                                )
+                            },
+                        ),
+                        context_limits_resolver: None,
                         knobs: &crate::agent::loop_::LoopKnobs::default(),
                     },
                 ),

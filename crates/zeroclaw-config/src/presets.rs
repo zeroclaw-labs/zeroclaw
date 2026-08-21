@@ -658,7 +658,7 @@ mod tests {
         assert!(resolved.resolved.strict_tool_parsing);
         assert_eq!(resolved.resolved.max_tool_iterations, 4);
         assert_eq!(resolved.resolved.max_history_messages, 20);
-        assert_eq!(resolved.resolved.max_context_tokens, 8_000);
+        assert_eq!(resolved.resolved.max_context_tokens, Some(8_000));
         assert!(resolved.resolved.compact_context);
         assert!(!resolved.resolved.parallel_tools);
         assert_eq!(resolved.resolved.max_system_prompt_chars, 4_000);

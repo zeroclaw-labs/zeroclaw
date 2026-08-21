@@ -45,6 +45,7 @@ pub use traits::{
 use reliable::{ReliableModelProvider, ReliableModelProviderEntry};
 use serde::Deserialize;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 const MAX_API_ERROR_CHARS: usize = 500;
 const MINIMAX_INTL_BASE_URL: &str = "https://api.minimax.io/v1";
@@ -1735,8 +1736,48 @@ pub fn create_routed_model_provider_with_options(
     default_model: &str,
     options: &ModelProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn ModelProvider>> {
-    if model_routes.is_empty() {
-        return create_resilient_model_provider_from_ref_with_model_override(
+    create_routed_model_provider_with_options_and_resolver(
+        config,
+        primary_name,
+        api_key,
+        api_url,
+        reliability,
+        model_routes,
+        default_model,
+        options,
+    )
+    .map(|(provider, _)| provider)
+}
+
+/// Build the routed provider together with the exact immutable route resolver
+/// it uses. Agent turn metadata can therefore resolve the serving profile and
+/// model without maintaining a second hint table.
+pub fn create_routed_model_provider_with_options_and_resolver(
+    config: &zeroclaw_config::schema::Config,
+    primary_name: &str,
+    api_key: Option<&str>,
+    api_url: Option<&str>,
+    reliability: &zeroclaw_config::schema::ReliabilityConfig,
+    model_routes: &[zeroclaw_config::schema::ModelRouteConfig],
+    default_model: &str,
+    options: &ModelProviderRuntimeOptions,
+) -> anyhow::Result<(Box<dyn ModelProvider>, Arc<router::ModelRouteResolver>)> {
+    // Config map editing creates a default route entry and then fills its
+    // required fields through separate writes. Such a staged entry is not yet
+    // a routing fact: omit it from the materialized provider/resolver until all
+    // three identity fields are present. `Config::validate` remains the
+    // canonical persisted-config gate and still rejects incomplete routes.
+    let materialized_routes: Vec<_> = model_routes
+        .iter()
+        .filter(|route| {
+            !route.hint.trim().is_empty()
+                && !route.model_provider.trim().is_empty()
+                && !route.model.trim().is_empty()
+        })
+        .collect();
+
+    if materialized_routes.is_empty() {
+        let provider = create_resilient_model_provider_from_ref_with_model_override(
             config,
             primary_name,
             api_key,
@@ -1744,12 +1785,18 @@ pub fn create_routed_model_provider_with_options(
             reliability,
             options,
             Some(default_model),
-        );
+        )?;
+        let resolver = Arc::new(router::ModelRouteResolver::new(
+            Vec::new(),
+            primary_name.to_string(),
+            default_model.to_string(),
+        ));
+        return Ok((provider, resolver));
     }
 
     // Collect unique model_provider names needed
     let mut needed: Vec<String> = vec![primary_name.to_string()];
-    for route in model_routes {
+    for route in &materialized_routes {
         if !needed.iter().any(|n| n == &route.model_provider) {
             needed.push(route.model_provider.clone());
         }
@@ -1762,7 +1809,7 @@ pub fn create_routed_model_provider_with_options(
     let mut model_providers: Vec<(String, Box<dyn ModelProvider>)> = Vec::new();
     for name in &needed {
         let is_primary = name == primary_name;
-        let routed_credential = model_routes
+        let routed_credential = materialized_routes
             .iter()
             .find(|r| &r.model_provider == name)
             .and_then(|r| {
@@ -1811,7 +1858,7 @@ pub fn create_routed_model_provider_with_options(
     }
 
     // Build route table
-    let routes: Vec<(String, router::Route)> = model_routes
+    let routes: Vec<(String, router::Route)> = materialized_routes
         .iter()
         .map(|r| {
             (
@@ -1824,12 +1871,14 @@ pub fn create_routed_model_provider_with_options(
         })
         .collect();
 
-    Ok(Box::new(router::RouterModelProvider::new(
+    let router = router::RouterModelProvider::new(
         primary_name,
         model_providers,
         routes,
         default_model.to_string(),
-    )))
+    );
+    let resolver = router.route_resolver();
+    Ok((Box::new(router), resolver))
 }
 
 /// Information about a supported model model_provider for display purposes.
@@ -4117,6 +4166,41 @@ mod tests {
         };
         config.agents.insert("test_agent".to_string(), agent);
         config
+    }
+
+    #[test]
+    fn routed_model_provider_omits_incomplete_staged_routes() {
+        let config = config_with_openai_alias();
+        let reliability = zeroclaw_config::schema::ReliabilityConfig::default();
+        let routes = [
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "staged".into(),
+                model_provider: String::new(),
+                model: String::new(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "ready".into(),
+                model_provider: "openai.alias".into(),
+                model: "gpt-4o".into(),
+                api_key: None,
+            },
+        ];
+
+        let (_, resolver) = create_routed_model_provider_with_options_and_resolver(
+            &config,
+            "openai.alias",
+            Some("fallback-key"),
+            None,
+            &reliability,
+            &routes,
+            "gpt-4o",
+            &ModelProviderRuntimeOptions::default(),
+        )
+        .expect("an incomplete staged route must not poison ready routes");
+
+        assert!(!resolver.has_hint("staged"));
+        assert!(resolver.has_hint("ready"));
     }
 
     #[test]

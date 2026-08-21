@@ -43,8 +43,8 @@ pub use knobs::{LoopKnobs, MaxIterationBehavior};
 pub(crate) use max_iter::finish_after_max_iterations;
 pub(crate) use outcome::StreamCancelledAfterOutput;
 pub use outcome::{
-    ModelSwitchCallback, ModelSwitchRequested, ToolLoopCancelled, is_model_switch_requested,
-    is_tool_loop_cancelled,
+    ModelSwitchCallback, ModelSwitchRequested, ServedRoute, ServedRouteSink, ToolLoopCancelled,
+    is_model_switch_requested, is_tool_loop_cancelled,
 };
 pub(crate) use outcome::{current_model_switch_state, scope_model_switch_state};
 pub use outcome::{
@@ -91,6 +91,17 @@ use zeroclaw_providers::{ChatMessage, ModelProvider};
 
 /// Maximum malformed internal tool-protocol retries before returning a safe fallback.
 pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
+
+/// Resolve capacity + proactive-trim budget for one `(provider, model)` route.
+///
+/// The turn engine's SINGLE authority for per-call limits. Daemon-backed agents
+/// hand in a closure that reads the shared live `Config`, so a config reload
+/// between turns is observed; configless (test) paths omit it and the loop
+/// falls back to the route pair resolved at the turn boundary. Keeping one
+/// resolver here prevents the loop from recomputing half the pair from a
+/// construction-time config snapshot.
+pub type ContextLimitsResolver =
+    Arc<dyn Fn(&str, &str) -> zeroclaw_config::schema::ResolvedContextLimits + Send + Sync>;
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
@@ -227,6 +238,12 @@ pub struct ToolLoop<'a> {
     /// the acting authority and its parent. `None` for ordinary turns.
     pub parent_agent_alias: Option<&'a str>,
     pub turn_id: &'a str,
+    /// Optional sink the caller reads after the loop to learn the route that
+    /// actually served the final LLM call (provider/model + resolved limits).
+    /// Written every dispatching iteration, so a per-call vision switch is
+    /// captured even when the provider returns no usage. `None` on paths that
+    /// do not publish a terminal snapshot (tests, nested sub-turns).
+    pub served_route_sink: Option<ServedRouteSink>,
     /// Handle the live SOP driver uses to re-assemble a nested step's execution
     /// context when the step delegates to a different agent (see
     /// [`SopStepReassembly`]). `None` on every path that cannot reach `Config`
@@ -278,6 +295,35 @@ async fn enforce_reported_budget(
     } else {
         *history = result.history;
     }
+}
+
+/// Resolve the capacity/budget pair for the route that serves a single call.
+///
+/// Preference order:
+/// 1. `resolver` — the live authority (reads the shared `Config`), so a config
+///    reload between turns and any per-call route change both resolve against
+///    current values rather than a construction-time snapshot.
+/// 2. `config` snapshot — legacy path for callers that carry a `Config` but no
+///    resolver (kept so behavior is unchanged where no live handle exists).
+/// 3. `fallback` — the route pair resolved at the turn boundary, used on
+///    configless (test) paths.
+fn resolve_context_limits_for_call(
+    resolver: Option<&ContextLimitsResolver>,
+    config: Option<&zeroclaw_config::schema::Config>,
+    agent_alias: Option<&str>,
+    provider_name: &str,
+    model: &str,
+    fallback: zeroclaw_config::schema::ResolvedContextLimits,
+) -> zeroclaw_config::schema::ResolvedContextLimits {
+    if let Some(resolver) = resolver {
+        return resolver(provider_name, model);
+    }
+    config
+        .zip(agent_alias)
+        .map(|(config, agent_alias)| {
+            config.resolved_context_limits_for_route(agent_alias, provider_name, model)
+        })
+        .unwrap_or(fallback)
 }
 
 /// Per-invocation turn state: owns the provider-visible transcript and
@@ -404,6 +450,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         agent_alias,
         parent_agent_alias,
         turn_id,
+        served_route_sink,
         sop_reassembly,
     } = p;
     let ResolvedAgentExecution {
@@ -412,6 +459,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 model_provider,
                 provider_name,
                 model,
+                dispatch_model,
                 temperature,
             },
         tools_registry,
@@ -430,11 +478,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         strict_tool_parsing,
         parallel_tools,
         max_tool_result_chars,
-        context_token_budget,
+        context_limits,
+        context_limits_resolver,
         receipt_generator,
         knobs,
     } = exec;
-
     let mut turn_state = TurnState::new(raw_history, raw_canonical);
 
     turn_state.sync_pending();
@@ -537,10 +585,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // Shared-ref context for the turn step functions. Every `&mut` the loop
     // owns stays a loop local passed as an explicit argument (RUN_SHEET
     // `turn.context.TurnCtx`).
-    let ctx = TurnCtx {
+    let base_ctx = TurnCtx {
         observer,
         provider_name,
         model,
+        context_limits,
         temperature,
         approval,
         channel_name,
@@ -565,6 +614,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     // steps drain across several iterations.
     let mut sop_exec_cache: std::collections::HashMap<String, OwnedAgentExecution> =
         std::collections::HashMap::new();
+
+    // Proactive trimming fires whenever the serving route (provider, model) OR
+    // its budget changes, not only on iteration 0. A later iteration can switch
+    // routes — e.g. a tool adds an image and iteration N moves to a smaller
+    // vision route — and history must be trimmed to the NEW route's budget
+    // before dispatch. An unchanged route re-trims nothing (the key matches).
+    let mut last_trim_key: Option<(String, String, usize)> = None;
 
     for iteration in 0..max_iterations {
         for steering_message in drain_steering_messages(&mut steering) {
@@ -614,15 +670,104 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         preflight_history_maintenance(turn_state.history);
 
-        if iteration == 0 && context_token_budget > 0 {
+        // Check if model switch was requested via model_switch tool before
+        // constructing this iteration's provider route.
+        if let Some(ref callback) = model_switch_callback
+            && let Ok(guard) = callback.lock()
+            && let Some((new_model_provider, new_model)) = guard.as_ref()
+            && (new_model_provider != provider_name || new_model != model)
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Migrate)
+                    .with_category(::zeroclaw_log::EventCategory::Provider),
+                &format!(
+                    "Model switch detected: {} {} -> {} {}",
+                    provider_name, model, new_model_provider, new_model
+                )
+            );
+            return Err(ModelSwitchRequested {
+                model_provider: new_model_provider.clone(),
+                model: new_model.clone(),
+            }
+            .into());
+        }
+
+        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
+            config,
+            model_provider,
+            turn_state.history,
+            multimodal_config,
+            provider_name,
+            model,
+            dispatch_model,
+        )?;
+
+        let (
+            active_model_provider,
+            active_model_provider_name,
+            active_model,
+            active_dispatch_model,
+        ): (&dyn ModelProvider, &str, &str, &str) =
+            if let Some(ref resolved) = vision_model_provider_box {
+                (
+                    resolved.provider.as_ref(),
+                    resolved.provider_name.as_str(),
+                    resolved.model.as_str(),
+                    resolved.model.as_str(),
+                )
+            } else {
+                (model_provider, provider_name, model, dispatch_model)
+            };
+        let active_context_limits = resolve_context_limits_for_call(
+            context_limits_resolver.as_ref(),
+            config,
+            agent_alias,
+            active_model_provider_name,
+            active_model,
+            context_limits,
+        );
+        let context_token_budget = active_context_limits.context_token_budget;
+        let ctx = base_ctx.for_route(
+            active_model_provider_name,
+            active_model,
+            active_context_limits,
+        );
+
+        // Record the route about to serve this iteration's call. The last write
+        // is the final serving route, so a terminal snapshot is authoritative
+        // even when the provider returns no usage. `reported_usage` is
+        // provisionally `false` and backfilled after the call once we know
+        // whether this call emitted a usage-bearing per-call frame.
+        if let Some(sink) = served_route_sink.as_ref() {
+            *sink.lock().expect("served-route sink lock") = Some(outcome::ServedRoute {
+                provider_name: active_model_provider_name.to_string(),
+                model: active_model.to_string(),
+                context_limits: active_context_limits,
+                reported_usage: false,
+            });
+        }
+
+        // Trim when this call's serving route or budget differs from the last
+        // route we trimmed for. iteration 0 always trims (key starts `None`);
+        // an unchanged route on later iterations does not re-trim.
+        let trim_key = (
+            active_model_provider_name.to_string(),
+            active_model.to_string(),
+            context_token_budget,
+        );
+        let route_or_budget_changed = last_trim_key.as_ref() != Some(&trim_key);
+
+        if route_or_budget_changed && context_token_budget > 0 {
+            last_trim_key = Some(trim_key);
             let system_floor =
                 crate::agent::history::estimate_system_floor_tokens(turn_state.history);
             if system_floor >= context_token_budget {
                 let __zc_floor_span = ::zeroclaw_log::info_span!(
                     target: "zeroclaw_log_internal_scope",
                     "zeroclaw_scope",
-                    model = %model,
-                    model_provider = %provider_name,
+                    model = %active_model,
+                    model_provider = %active_model_provider_name,
                 );
                 let _zc_floor_guard = __zc_floor_span.entered();
                 ::zeroclaw_log::record!(
@@ -647,8 +792,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
                         target: "zeroclaw_log_internal_scope",
                         "zeroclaw_scope",
-                        model = %model,
-                        model_provider = %provider_name,
+                        model = %active_model,
+                        model_provider = %active_model_provider_name,
                     );
                     let _zc_trim_guard = __zc_trim_span.entered();
                     ::zeroclaw_log::record!(
@@ -700,28 +845,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
 
-        // Check if model switch was requested via model_switch tool
-        if let Some(ref callback) = model_switch_callback
-            && let Ok(guard) = callback.lock()
-            && let Some((new_model_provider, new_model)) = guard.as_ref()
-            && (new_model_provider != provider_name || new_model != model)
-        {
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Migrate)
-                    .with_category(::zeroclaw_log::EventCategory::Provider),
-                &format!(
-                    "Model switch detected: {} {} -> {} {}",
-                    provider_name, model, new_model_provider, new_model
-                )
-            );
-            return Err(ModelSwitchRequested {
-                model_provider: new_model_provider.clone(),
-                model: new_model.clone(),
-            }
-            .into());
-        }
-
         let mut iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
             model,
@@ -730,28 +853,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             activated_tools,
         )?;
 
-        let (vision_model_provider_box, degrade_strip_images) = resolve_vision_provider(
-            config,
-            model_provider,
-            turn_state.history,
-            multimodal_config,
-            provider_name,
-            model,
-        )?;
-
-        let (active_model_provider, active_model_provider_name, active_model): (
-            &dyn ModelProvider,
-            &str,
-            &str,
-        ) = if let Some(ref resolved) = vision_model_provider_box {
-            (
-                resolved.provider.as_ref(),
-                resolved.provider_name.as_str(),
-                resolved.model.as_str(),
-            )
-        } else {
-            (model_provider, provider_name, model)
-        };
         let prepared_messages = prepare_messages_for_iteration(
             turn_state.history,
             multimodal_config,
@@ -777,6 +878,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        // The wire selector for `call_provider`: routed providers may need a
+        // `hint:<name>` selector distinct from the resolved `model` used for
+        // attribution above, so this cannot just reuse `provider_request_model`.
+        let provider_dispatch_model = hook_selected_model
+            .as_deref()
+            .unwrap_or(active_dispatch_model);
         // Only direct Agent turns scope the complete prompt variants. Preserve
         // the channel loop's existing hook/protocol behavior rather than
         // silently widening this delegation-focused repair into channel prompt
@@ -889,7 +996,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } = call_provider(
             &ctx,
             active_model_provider,
-            provider_request_model,
+            provider_dispatch_model,
             &provider_request_messages,
             request_tools,
             should_consume_provider_stream,
@@ -996,7 +1103,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     event_tx.as_ref(),
                     on_delta.as_ref(),
                     observer,
-                    context_token_budget,
+                    ctx.context_limits,
                 )
                 .await;
                 if recovered {
@@ -1062,8 +1169,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(serde_json::json!({
                         "channel": channel_name,
-                        "model_provider": provider_name,
-                        "model": model,
+                        "model_provider": active_model_provider_name,
+                        "model": active_model,
                         "trace_id": turn_id,
                         "error": "malformed internal tool protocol omitted from channel output",
                     })),
@@ -1124,6 +1231,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await;
 
+        // Backfill the final served route only after protocol classification
+        // accepts the response. Accepted usage emits the per-call frame above;
+        // an accepted usage-less response needs the terminal context snapshot.
+        if let Some(sink) = served_route_sink.as_ref()
+            && let Some(served) = sink.lock().expect("served-route sink lock").as_mut()
+        {
+            served.reported_usage = ctx.event_tx.is_some() && response_usage.is_some();
+        }
+
         // A provider transport success is only a candidate. Commit (or clear)
         // presentation state after parsing has accepted the response, so a
         // malformed fallback completion cannot leak a stale recovery notice.
@@ -1149,7 +1265,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     .with_category(::zeroclaw_log::EventCategory::Agent)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({
-                        "model": model,
+                        "model": active_model,
                         "iteration": iteration + 1,
                         "text": scrub_credentials(&display_text),
                         "trace_id": turn_id,
@@ -1181,7 +1297,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 enforce_reported_budget(
                     turn_state.history,
                     reported as usize,
-                    context_token_budget,
+                    ctx.context_limits.context_token_budget,
                     event_tx.as_ref(),
                     observer,
                 )
@@ -1374,7 +1490,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &loop_ignore_tools,
             max_tool_result_chars,
             collected_receipts,
-            model,
+            active_model,
             iteration,
             turn_id,
         )?;
@@ -1386,7 +1502,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 pacing,
                 &mut consecutive_identical_outputs,
                 &mut last_tool_output_hash,
-                model,
+                active_model,
                 iteration,
                 turn_id,
             )?;
@@ -1415,6 +1531,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 model_provider,
                 provider_name,
                 model,
+                dispatch_model,
                 temperature,
                 tools_registry,
                 observer,
@@ -1432,7 +1549,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 strict_tool_parsing,
                 parallel_tools,
                 max_tool_result_chars,
-                context_token_budget,
+                context_limits,
                 receipt_generator,
                 knobs,
                 channel_name,
@@ -1458,7 +1575,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             enforce_reported_budget(
                 turn_state.history,
                 reported as usize,
-                context_token_budget,
+                ctx.context_limits.context_token_budget,
                 event_tx.as_ref(),
                 observer,
             )
@@ -1471,6 +1588,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_state.history,
         provider_name,
         model,
+        dispatch_model,
         temperature,
         pacing,
         cancellation_token.as_ref(),
@@ -1774,7 +1892,7 @@ pub(crate) async fn assemble_owned_execution(
                 "SOP step agent '{alias}' has no resolved model provider"
             ))
         })?;
-    let (model_provider, provider_name, model) =
+    let (model_provider, provider_name, model, _model_route_resolver) =
         crate::agent::agent::build_session_model_provider(config, &provider_ref, None)?;
     // The step agent's own configured temperature — the same source the
     // headless driver reads for `crate::agent::run`.
@@ -1863,6 +1981,7 @@ async fn drive_live_sop_actions(
     model_provider: &dyn ModelProvider,
     provider_name: &str,
     model: &str,
+    dispatch_model: &str,
     temperature: Option<f64>,
     tools_registry: &[Box<dyn crate::tools::Tool>],
     observer: &dyn crate::observability::Observer,
@@ -1892,7 +2011,7 @@ async fn drive_live_sop_actions(
     strict_tool_parsing: bool,
     parallel_tools: bool,
     max_tool_result_chars: usize,
-    context_token_budget: usize,
+    context_limits: zeroclaw_config::schema::ResolvedContextLimits,
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     knobs: &LoopKnobs,
     channel_name: &str,
@@ -2023,6 +2142,7 @@ async fn drive_live_sop_actions(
                             eff_model_provider,
                             eff_provider_name,
                             eff_model,
+                            eff_dispatch_model,
                             eff_registry,
                             eff_approval,
                             eff_activated,
@@ -2030,6 +2150,7 @@ async fn drive_live_sop_actions(
                             Some(o) => (
                                 o.model_provider.as_ref(),
                                 o.provider_name.as_str(),
+                                o.model.as_str(),
                                 o.model.as_str(),
                                 o.tools_registry.as_slice(),
                                 Some(&o.approval),
@@ -2039,6 +2160,7 @@ async fn drive_live_sop_actions(
                                 model_provider,
                                 provider_name,
                                 model,
+                                dispatch_model,
                                 tools_registry,
                                 approval,
                                 activated_tools,
@@ -2056,7 +2178,7 @@ async fn drive_live_sop_actions(
                             eff_strict_tool_parsing,
                             eff_parallel_tools,
                             eff_max_tool_result_chars,
-                            eff_context_token_budget,
+                            eff_context_limits,
                             eff_dedup_exempt_tools,
                             eff_pacing,
                         ) = match owned {
@@ -2066,7 +2188,7 @@ async fn drive_live_sop_actions(
                                 o.agent.resolved.strict_tool_parsing,
                                 o.agent.resolved.parallel_tools,
                                 o.agent.resolved.max_tool_result_chars,
-                                o.agent.resolved.effective_context_budget(),
+                                o.agent.resolved.context_limits(),
                                 o.agent.resolved.tool_call_dedup_exempt.as_slice(),
                                 &sop_reassembly
                                     .expect("owned implies a reassembly handle")
@@ -2079,7 +2201,7 @@ async fn drive_live_sop_actions(
                                 strict_tool_parsing,
                                 parallel_tools,
                                 max_tool_result_chars,
-                                context_token_budget,
+                                context_limits,
                                 dedup_exempt_tools,
                                 pacing,
                             ),
@@ -2161,6 +2283,7 @@ async fn drive_live_sop_actions(
                                             model_provider: eff_model_provider,
                                             provider_name: eff_provider_name,
                                             model: eff_model,
+                                            dispatch_model: eff_dispatch_model,
                                             temperature: eff_temperature,
                                         },
                                         ResolvedIo {
@@ -2201,7 +2324,8 @@ async fn drive_live_sop_actions(
                                             strict_tool_parsing: eff_strict_tool_parsing,
                                             parallel_tools: eff_parallel_tools,
                                             max_tool_result_chars: eff_max_tool_result_chars,
-                                            context_token_budget: eff_context_token_budget,
+                                            context_limits: eff_context_limits,
+                                            context_limits_resolver: None,
                                             knobs,
                                         },
                                     ),
@@ -2248,6 +2372,7 @@ async fn drive_live_sop_actions(
                                         parent_agent_alias
                                     },
                                     turn_id: &nested_turn_id,
+                                    served_route_sink: None,
                                     sop_reassembly,
                                 })),
                             )
@@ -2583,6 +2708,560 @@ mod reported_budget_tests {
         enforce_reported_budget(&mut history, usize::MAX, 0, None, &NoopObserver).await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
         assert_eq!(after, before, "zero budget disables enforcement");
+    }
+}
+
+#[cfg(test)]
+mod active_route_context_tests {
+    use super::*;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex;
+    use zeroclaw_api::observability_traits::{ObserverEvent, ObserverMetric};
+    use zeroclaw_config::schema::{
+        AliasedAgentConfig, Config, CustomModelProviderConfig, ModelProviderConfig,
+        RuntimeProfileConfig,
+    };
+    use zeroclaw_providers::{ChatResponse, traits::TokenUsage};
+
+    #[derive(Default)]
+    struct RouteObserver {
+        responses: Mutex<Vec<(String, String)>>,
+    }
+
+    impl crate::observability::Observer for RouteObserver {
+        fn record_event(&self, event: &ObserverEvent) {
+            if let ObserverEvent::LlmResponse {
+                model_provider,
+                model,
+                ..
+            } = event
+            {
+                self.responses
+                    .lock()
+                    .expect("response lock")
+                    .push((model_provider.clone(), model.clone()));
+            }
+        }
+
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+
+        fn name(&self) -> &str {
+            "route-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn route_config() -> Config {
+        let providers = [
+            ("text", "text-model", 200_000),
+            ("vision", "vision-model", 8_000),
+        ]
+        .into_iter()
+        .map(|(alias, model, context_window)| {
+            (
+                alias.to_string(),
+                CustomModelProviderConfig {
+                    base: ModelProviderConfig {
+                        model: Some(model.to_string()),
+                        context_window: Some(context_window),
+                        ..ModelProviderConfig::default()
+                    },
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
+
+        let mut config = Config::default();
+        config.providers.models.custom = providers;
+        config.runtime_profiles.insert(
+            "ratio".to_string(),
+            RuntimeProfileConfig {
+                context_compact_ratio: Some(0.9),
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "coder".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                runtime_profile: "ratio".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn selected_call_route_drives_trim_usage_and_response_attribution() {
+        let config = route_config();
+        let text_limits =
+            config.resolved_context_limits_for_route("coder", "custom.text", "text-model");
+        let vision_limits = resolve_context_limits_for_call(
+            None,
+            Some(&config),
+            Some("coder"),
+            "custom.vision",
+            "vision-model",
+            text_limits,
+        );
+        assert_eq!(text_limits.context_token_budget, 180_000);
+        assert_eq!(vision_limits.model_context_window, 8_000);
+        assert_eq!(vision_limits.context_token_budget, 7_200);
+
+        let large = "x".repeat(20_000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("old question {large}")),
+            ChatMessage::assistant(format!("old answer {large}")),
+            ChatMessage::user("inspect [IMAGE:/tmp/image.png]"),
+        ];
+        let tokens_before = crate::agent::history::estimate_history_tokens(&history);
+        assert!(tokens_before < text_limits.context_token_budget);
+        let trim =
+            TurnState::new(&mut history, None).trim_to_budget(vision_limits.context_token_budget);
+        assert!(
+            trim.trimmed,
+            "the selected vision route must trim history that the text route would retain"
+        );
+        assert!(trim.tokens_after <= vision_limits.context_token_budget);
+
+        let observer = RouteObserver::default();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(4);
+        let base_ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "custom.text",
+            model: "text-model",
+            context_limits: text_limits,
+            temperature: None,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&event_tx),
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id: "vision-route-context",
+            agent_alias: Some("coder"),
+            parent_agent_alias: None,
+        };
+        let call_ctx = base_ctx.for_route("custom.vision", "vision-model", vision_limits);
+        let response = ChatResponse {
+            text: Some("done".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(TokenUsage {
+                input_tokens: Some(6_000),
+                output_tokens: Some(100),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
+        };
+        let specs = IterationToolSpecs {
+            tool_specs: Vec::new(),
+            known_tool_names: HashSet::new(),
+            use_native_tools: false,
+        };
+        let interpreted = interpret_chat_response(
+            &call_ctx,
+            "custom.vision",
+            "vision-model",
+            response,
+            &history,
+            &specs,
+            false,
+            0,
+            false,
+        )
+        .await;
+        record_accepted_chat_response(
+            &call_ctx,
+            "custom.vision",
+            "vision-model",
+            &interpreted.response_text,
+            &interpreted.native_tool_calls,
+            interpreted.tool_calls.len(),
+            interpreted.usage.as_ref(),
+            &history,
+            Instant::now(),
+            0,
+        )
+        .await;
+
+        match event_rx.try_recv().expect("usage event") {
+            TurnEvent::Usage {
+                context_token_budget,
+                model_context_window,
+                ..
+            } => {
+                assert_eq!(context_token_budget, Some(7_200));
+                assert_eq!(model_context_window, Some(8_000));
+            }
+            other => panic!("expected Usage, got {other:?}"),
+        }
+        assert_eq!(
+            observer.responses.lock().expect("response lock").as_slice(),
+            &[("custom.vision".to_string(), "vision-model".to_string())]
+        );
+    }
+
+    // B1: the loop resolves per-call limits through the live resolver, not the
+    // construction-time snapshot. A resolver reading a shared, mutable config
+    // must reflect a post-construction reload on the very next resolution, and
+    // must take precedence over any snapshot `config` argument.
+    #[tokio::test]
+    async fn context_limits_for_call_uses_live_resolver_over_snapshot() {
+        // Snapshot config: text route configured with a 200k window.
+        let snapshot = route_config();
+        let snapshot_limits =
+            snapshot.resolved_context_limits_for_route("coder", "custom.text", "text-model");
+        assert_eq!(snapshot_limits.model_context_window, 200_000);
+        assert_eq!(snapshot_limits.context_token_budget, 180_000);
+
+        // Live config behind a shared handle, resolved through the closure the
+        // daemon-backed agent installs.
+        let live = Arc::new(parking_lot::RwLock::new(route_config()));
+        let live_for_resolver = Arc::clone(&live);
+        let resolver: ContextLimitsResolver = Arc::new(move |provider_ref, model| {
+            live_for_resolver
+                .read()
+                .resolved_context_limits_for_route("coder", provider_ref, model)
+        });
+
+        // Before reload: resolver present overrides the snapshot argument, and
+        // agrees with it because both start from the same config.
+        let before = resolve_context_limits_for_call(
+            Some(&resolver),
+            Some(&snapshot),
+            Some("coder"),
+            "custom.text",
+            "text-model",
+            snapshot_limits,
+        );
+        assert_eq!(before.model_context_window, 200_000);
+        assert_eq!(before.context_token_budget, 180_000);
+
+        // Operator shrinks the text model's window to 40k in the live config
+        // AFTER the agent (and its snapshot) were built.
+        live.write()
+            .providers
+            .models
+            .custom
+            .get_mut("text")
+            .expect("text provider")
+            .base
+            .context_window = Some(40_000);
+
+        // The next resolution reflects the reload: 40k window, budget = 40k*0.9.
+        // The stale 200k snapshot is NOT consulted because the resolver wins.
+        let after = resolve_context_limits_for_call(
+            Some(&resolver),
+            Some(&snapshot),
+            Some("coder"),
+            "custom.text",
+            "text-model",
+            snapshot_limits,
+        );
+        assert_eq!(
+            after.model_context_window, 40_000,
+            "live reload must be observed on the next per-call resolution"
+        );
+        assert_eq!(after.context_token_budget, 36_000);
+        assert_eq!(
+            snapshot_limits.model_context_window, 200_000,
+            "the snapshot pair is unchanged; the resolver, not the snapshot, is authoritative"
+        );
+    }
+
+    // B3: proactive trimming must fire on the iteration that SWITCHES routes,
+    // not only iteration 0. A first text-model call returns a tool call; the
+    // tool injects an image marker; iteration 2 routes to a small vision model.
+    // The vision route's budget must trim history that the large text budget
+    // retained — before the vision provider is dispatched. Driving the real
+    // `run_tool_call_loop` (rather than calling `trim_to_budget` by hand) is
+    // what exercises the per-iteration gate.
+    #[tokio::test]
+    async fn tool_image_switches_route_and_retrims_before_vision_dispatch() {
+        use crate::agent::loop_::{
+            ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs, ToolLoop,
+        };
+        use axum::{Json, Router, routing::post};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use zeroclaw_api::tool::{Tool, ToolResult};
+        use zeroclaw_providers::ToolCall;
+
+        // Mock vision endpoint: always replies with a small plain-text answer.
+        async fn vision_reply(Json(_body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "choices": [{"message": {"content": "vision saw the image"}}]
+            }))
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind vision provider");
+        let addr = listener.local_addr().expect("vision provider address");
+        let app = Router::new().route("/v1/chat/completions", post(vision_reply));
+        let _server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.expect("vision serves");
+        });
+
+        // A tempfile PNG the injected marker points at, so image preparation
+        // has a real file to load.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let image_path = temp.path().join("shot.png");
+        std::fs::write(
+            &image_path,
+            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+        )
+        .expect("write png");
+
+        // Config: a 200k text route (ratio 0.9 -> 180k budget) and an 8k vision
+        // route (ratio 0.9 -> 7.2k budget) served by the mock endpoint.
+        let config: Config = toml::from_str(&format!(
+            r#"
+schema_version = 3
+[providers.models.custom.text]
+model = "text-model"
+context_window = 200000
+[providers.models.custom.vision]
+uri = "http://{addr}/v1"
+model = "vision-model"
+context_window = 8000
+[runtime_profiles.ratio]
+context_compact_ratio = 0.9
+[agents.coder]
+enabled = true
+runtime_profile = "ratio"
+model_provider = "custom.text"
+[multimodal]
+vision_model_provider = "custom.vision"
+"#
+        ))
+        .expect("config parses");
+
+        // Text primary: iteration 0 emits a native tool call; iteration 1 (after
+        // the tool injects an image and the route switches to vision) ends the
+        // turn. `ProviderCapabilities::default()` has `vision = false`, so the
+        // image marker forces the vision route.
+        struct TextPrimary {
+            calls: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ModelProvider for TextPrimary {
+            fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                // Native tool calling so the structured `tool_calls` below are
+                // honored; vision stays false so an image marker forces routing.
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    native_tool_calling: true,
+                    ..Default::default()
+                }
+            }
+            async fn chat_with_system(
+                &self,
+                _s: Option<&str>,
+                _m: &str,
+                _model: &str,
+                _t: Option<f64>,
+            ) -> Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(
+                &self,
+                _request: zeroclaw_api::model_provider::ChatRequest<'_>,
+                _model: &str,
+                _t: Option<f64>,
+            ) -> Result<ChatResponse> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(ChatResponse {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "c1".into(),
+                            name: "attach_image".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        }],
+                        usage: None,
+                        reasoning_content: None,
+                    })
+                } else {
+                    Ok(ChatResponse {
+                        text: Some("text follow-up".into()),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                        reasoning_content: None,
+                    })
+                }
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for TextPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "text-primary"
+            }
+        }
+
+        // Tool whose result carries an image marker, forcing the vision route on
+        // the next iteration.
+        struct AttachImage {
+            path: String,
+        }
+        #[async_trait::async_trait]
+        impl Tool for AttachImage {
+            fn name(&self) -> &str {
+                "attach_image"
+            }
+            fn description(&self) -> &str {
+                "attaches an image"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+                Ok(ToolResult::ok(format!("here it is [IMAGE:{}]", self.path)))
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for AttachImage {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Tool(zeroclaw_api::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str {
+                "attach_image"
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let text_provider = TextPrimary {
+            calls: Arc::clone(&calls),
+        };
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(AttachImage {
+            path: image_path.display().to_string(),
+        })];
+        let observer = crate::observability::NoopObserver;
+        let approval = crate::approval::ApprovalManager::for_non_interactive(
+            &zeroclaw_config::schema::RiskProfileConfig {
+                // Auto-approve so the image-injecting tool actually runs; without
+                // this the non-interactive gate denies the unknown tool and no
+                // image marker is produced, so the vision route never engages.
+                auto_approve: vec!["*".to_string()],
+                ..Default::default()
+            },
+        );
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let knobs = crate::agent::loop_::LoopKnobs::default();
+        let multimodal = config.multimodal.clone();
+
+        // Large history the 200k text budget keeps but the 7.2k vision budget
+        // must trim. Present from the start so, if the gate trimmed on the text
+        // route, the text budget (180k) would NOT drop it; only the vision
+        // switch (7.2k) does.
+        let big = "x".repeat(20_000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("old q {big}")),
+            ChatMessage::assistant(format!("old a {big}")),
+            ChatMessage::user("please attach the image"),
+        ];
+        let text_limits =
+            config.resolved_context_limits_for_route("coder", "custom.text", "text-model");
+        assert_eq!(text_limits.context_token_budget, 180_000);
+        let seed_tokens = crate::agent::history::estimate_history_tokens(&history);
+        assert!(
+            seed_tokens < text_limits.context_token_budget,
+            "seed history must fit the text budget so any trim is attributable to the vision switch"
+        );
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(16);
+        let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        let turn_id = "b3-two-iteration";
+
+        let _ = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            served_route_sink: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution::resolve(
+                ResolvedModelAccess {
+                    model_provider: &text_provider,
+                    provider_name: "custom.text",
+                    model: "text-model",
+                    dispatch_model: "text-model",
+                    temperature: None,
+                },
+                ResolvedIo {
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: Some(&approval),
+                    multimodal_config: &multimodal,
+                    config: Some(&config),
+                    hooks: None,
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    receipt_generator: None,
+                },
+                ResolvedRuntimeKnobs {
+                    max_tool_iterations: 3,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    pacing: &pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 100_000,
+                    context_limits: text_limits,
+                    context_limits_resolver: None,
+                    knobs: &knobs,
+                },
+            ),
+            history: &mut history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: Some(&mut image_cache),
+            memory: None,
+            ingress: zeroclaw_api::ingress::IngressContext::agent_direct(),
+            agent_alias: Some("coder"),
+            turn_id,
+        })
+        .await;
+
+        // A HistoryTrimmed event must have fired: proactive trimming ran when
+        // the route switched to the 7.2k vision budget on the second iteration.
+        let mut trimmed = false;
+        while let Ok(ev) = event_rx.try_recv() {
+            if matches!(ev, TurnEvent::HistoryTrimmed { .. }) {
+                trimmed = true;
+            }
+        }
+        assert!(
+            trimmed,
+            "switching to the smaller vision route must trigger proactive trimming \
+             before dispatch, even though it happens after iteration 0"
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) >= 1,
+            "the text primary must have been called at least once"
+        );
     }
 }
 
@@ -3257,6 +3936,7 @@ mod sop_step_reassembly_tests {
             parent_provider,
             "mock",
             "mock-model",
+            "mock-model",
             None,
             parent_tools,
             observer,
@@ -3274,7 +3954,12 @@ mod sop_step_reassembly_tests {
             false,
             false,
             30_000,
-            100_000,
+            zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 100_000,
+                context_token_budget: 100_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
             None,
             &LoopKnobs::default(),
             "cli",

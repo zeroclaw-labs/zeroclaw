@@ -461,12 +461,14 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
     let turn_id = uuid::Uuid::new_v4().to_string();
     let result = crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
         parent_agent_alias: None,
+        served_route_sink: None,
         sop_reassembly: None,
         exec: crate::agent::loop_::ResolvedAgentExecution {
             model_access: crate::agent::loop_::ResolvedModelAccess {
                 model_provider: &provider,
                 provider_name: "mock",
                 model: "mock-model",
+                dispatch_model: "mock-model",
                 temperature: None,
             },
             tools_registry: &tools_registry,
@@ -485,7 +487,13 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
             strict_tool_parsing: false,
             parallel_tools: false,
             max_tool_result_chars: 30_000,
-            context_token_budget: 100_000,
+            context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: 100_000,
+                context_token_budget: 100_000,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::Configured,
+            },
+            context_limits_resolver: None,
             receipt_generator: None,
             knobs: &crate::agent::loop_::LoopKnobs::default(),
         },
@@ -658,7 +666,8 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         _workspace: workspace,
     };
 
-    let handle: tools::PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let handle: tools::PerToolChannelHandle =
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
     agent.channel_handles.ask_user = Some(Arc::clone(&handle));
     agent.channel_handles().register_channel(
         "edit-channel",
@@ -855,12 +864,14 @@ async fn safety_net_task_locals_probe_per_entry_path() {
         crate::agent::loop_::scope_session_key(Some("session-1".into()), async {
             crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
                 parent_agent_alias: None,
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: crate::agent::loop_::ResolvedAgentExecution {
                     model_access: crate::agent::loop_::ResolvedModelAccess {
                         model_provider: &provider,
                         provider_name: "mock",
                         model: "mock-model",
+                        dispatch_model: "mock-model",
                         temperature: None,
                     },
                     tools_registry: &tools_registry,
@@ -879,7 +890,13 @@ async fn safety_net_task_locals_probe_per_entry_path() {
                     strict_tool_parsing: false,
                     parallel_tools: false,
                     max_tool_result_chars: 30_000,
-                    context_token_budget: 100_000,
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits {
+                        model_context_window: 100_000,
+                        context_token_budget: 100_000,
+                        model_context_window_source:
+                            zeroclaw_config::schema::ModelContextWindowSource::Configured,
+                    },
+                    context_limits_resolver: None,
                     receipt_generator: None,
                     knobs: &crate::agent::loop_::LoopKnobs::default(),
                 },
@@ -1147,7 +1164,8 @@ async fn safety_net_turn_survives_in_loop_history_pruning() {
     let filler = "x".repeat(400);
     let runtime = zeroclaw_config::schema::ResolvedRuntime {
         // ~40 seeded messages × (100 tokens content + 4 framing) ≫ 500.
-        max_context_tokens: 500,
+        // Explicit absolute budget keeps proactive trimming at 500.
+        max_context_tokens: Some(500),
         ..zeroclaw_config::schema::ResolvedRuntime::default()
     };
 
@@ -1844,7 +1862,7 @@ fn approval_agent(
     let mut agent = builder.build().expect("agent builder should succeed");
     if let Some(ch) = channel {
         let handle: tools::PerToolChannelHandle =
-            Arc::new(parking_lot::RwLock::new(HashMap::new()));
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()));
         agent.channel_handles.ask_user = Some(handle);
         agent.channel_handles().register_channel("acp", ch);
     }

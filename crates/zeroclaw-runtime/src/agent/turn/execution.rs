@@ -3,12 +3,12 @@
 use std::sync::{Arc, Mutex};
 
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
-use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
+use zeroclaw_config::schema::{MultimodalConfig, PacingConfig, ResolvedContextLimits};
 use zeroclaw_providers::{
     ModelProvider, ProviderDispatch, ReliableRejectedCompletionUsage, multimodal,
 };
 
-use super::{LoopKnobs, ModelSwitchCallback};
+use super::{ContextLimitsResolver, LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
 use crate::approval::ApprovalManager;
 use crate::hooks::HookRunner;
@@ -21,8 +21,13 @@ use crate::tools::{ActivatedToolSet, Tool};
 /// unchanged after destructuring.
 pub struct ResolvedModelAccess<'a> {
     pub model_provider: &'a dyn ModelProvider,
+    /// Provider profile that actually serves this request.
     pub provider_name: &'a str,
+    /// Model that actually serves this request.
     pub model: &'a str,
+    /// Selector sent to `model_provider`. Routed providers may require a
+    /// `hint:<name>` selector even though `model` records the resolved model.
+    pub dispatch_model: &'a str,
     pub temperature: Option<f64>,
 }
 
@@ -52,7 +57,7 @@ impl ResolvedModelAccess<'_> {
         let dispatcher = ProviderDispatch::from_ref(self.model_provider);
         let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
         let result = scope
-            .scope(dispatcher.chat(request, self.model, self.temperature))
+            .scope(dispatcher.chat(request, self.dispatch_model, self.temperature))
             .await;
         let accounting = scope.take();
 
@@ -163,8 +168,15 @@ pub struct ResolvedAgentExecution<'a> {
     pub parallel_tools: bool,
     /// Truncation limit for tool outputs.
     pub max_tool_result_chars: usize,
-    /// History-pruning token threshold.
-    pub context_token_budget: usize,
+    /// Capacity and proactive-trim budget resolved together for the selected
+    /// route at the turn boundary.
+    pub context_limits: ResolvedContextLimits,
+    /// The turn engine's single authority for per-call `(provider, model)`
+    /// limits. Daemon-backed agents pass a closure reading the shared live
+    /// `Config`; configless (test) paths leave it `None` and the loop uses
+    /// `context_limits`. Prevents recomputing capacity from a stale config
+    /// snapshot when the active route or live config changes mid-turn.
+    pub context_limits_resolver: Option<ContextLimitsResolver>,
     /// Tool-receipt tracer; `None` when receipts are off.
     pub receipt_generator: Option<&'a ReceiptGenerator>,
     /// Fine-grained loop behavior flags.
@@ -200,7 +212,9 @@ pub struct ResolvedRuntimeKnobs<'a> {
     pub strict_tool_parsing: bool,
     pub parallel_tools: bool,
     pub max_tool_result_chars: usize,
-    pub context_token_budget: usize,
+    pub context_limits: ResolvedContextLimits,
+    /// Single live limits authority; see [`ResolvedAgentExecution::context_limits_resolver`].
+    pub context_limits_resolver: Option<ContextLimitsResolver>,
     pub knobs: &'a LoopKnobs,
 }
 
@@ -228,7 +242,8 @@ impl<'a> ResolvedAgentExecution<'a> {
             strict_tool_parsing: runtime.strict_tool_parsing,
             parallel_tools: runtime.parallel_tools,
             max_tool_result_chars: runtime.max_tool_result_chars,
-            context_token_budget: runtime.context_token_budget,
+            context_limits: runtime.context_limits,
+            context_limits_resolver: runtime.context_limits_resolver,
             receipt_generator: io.receipt_generator,
             knobs: runtime.knobs,
         }
@@ -387,6 +402,7 @@ mod run_model_query_tests {
             model_provider: provider,
             provider_name: "custom",
             model: "test-model",
+            dispatch_model: "test-model",
             temperature: None,
         }
     }
@@ -396,6 +412,7 @@ mod run_model_query_tests {
             model_provider: provider,
             provider_name: "custom",
             model: "test-model",
+            dispatch_model: "test-model",
             temperature: None,
         }
     }
@@ -472,6 +489,7 @@ mod run_model_query_tests {
                     model_provider: &reliable,
                     provider_name: "reliable",
                     model: "test-model",
+                    dispatch_model: "test-model",
                     temperature: None,
                 }
                 .run_model_query(ChatRequest {
@@ -519,6 +537,7 @@ mod run_model_query_tests {
                     model_provider: &reliable,
                     provider_name: "reliable",
                     model: "test-model",
+                    dispatch_model: "test-model",
                     temperature: None,
                 }
                 .run_model_query(ChatRequest {

@@ -982,6 +982,54 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
     event.get("source").and_then(serde_json::Value::as_str) == Some("observability")
 }
 
+fn resolve_done_context_limits(
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    active_limits: zeroclaw_config::schema::ResolvedContextLimits,
+) -> (u64, Option<u64>) {
+    (
+        usage_budget.unwrap_or(active_limits.context_token_budget as u64),
+        usage_model_window.or_else(|| {
+            active_limits
+                .configured_model_context_window()
+                .map(|tokens| tokens as u64)
+        }),
+    )
+}
+
+/// Terminal-frame budget/window for the `done` event.
+///
+/// `final_limits` is the route that actually served the LAST call, carried out
+/// of the turn loop. When present it is AUTHORITATIVE and overrides the
+/// usage-derived values, which can be stale: an earlier usage-bearing route
+/// before a final no-usage call (e.g. a vision reply without token usage) would
+/// otherwise leave the frame on the earlier route's numbers. Only when no call
+/// was served this turn (a cache hit) does `final_limits` become `None`, and the
+/// frame falls back to the usage values, then to `fallback_limits`.
+fn done_frame_context_limits(
+    final_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+    usage_budget: Option<u64>,
+    usage_model_window: Option<u64>,
+    fallback_limits: Option<zeroclaw_config::schema::ResolvedContextLimits>,
+) -> (u64, Option<u64>) {
+    match final_limits {
+        Some(limits) => (
+            limits.context_token_budget as u64,
+            limits.configured_model_context_window().map(|t| t as u64),
+        ),
+        None => resolve_done_context_limits(
+            usage_budget,
+            usage_model_window,
+            fallback_limits.unwrap_or(zeroclaw_config::schema::ResolvedContextLimits {
+                model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+                context_token_budget: 0,
+                model_context_window_source:
+                    zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+            }),
+        ),
+    }
+}
+
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
@@ -1022,14 +1070,11 @@ async fn process_chat_message(
         ))
     });
 
-    // Resolve context budget for this agent. Wire field is named
-    // `max_context_tokens` and must track the runtime-profile budget
-    // (same source Zerocode's context meter uses), not the provider
-    // model-window helper which falls back to 32_000 when unset.
-    let max_context_tokens = {
-        let cfg = state.config.read();
-        cfg.effective_max_context_tokens(&turn_alias) as u64
-    };
+    // Filled from the usage event produced by the active provider/model route.
+    // They intentionally are not snapshotted before the turn because a model
+    // switch can change both values while the session remains alive.
+    let mut max_context_tokens = None;
+    let mut model_context_window = None;
 
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
@@ -1248,7 +1293,11 @@ async fn process_chat_message(
                             cached_input_tokens: _,
                             output_tokens,
                             cost_usd: _,
+                            context_token_budget,
+                            model_context_window: usage_model_context_window,
                         } => {
+                            max_context_tokens = context_token_budget;
+                            model_context_window = usage_model_context_window;
                             if let Some(it) = input_tokens {
                                 total_input_tokens = Some(total_input_tokens.unwrap_or(0) + it);
                                 last_input_tokens = Some(it);
@@ -1465,18 +1514,41 @@ async fn process_chat_message(
                 .filter(|usage| usage.input_tokens > 0 || usage.output_tokens > 0)
                 .map(|usage| usage.cost_usd);
 
-            let done = serde_json::json!({
+            let active_provider = outcome.provider_name.clone();
+            let active_model = outcome.model.clone();
+            // The route that actually served the FINAL call is authoritative for
+            // the terminal frame (see `done_frame_context_limits`). Resolve from
+            // the final route only when no call was served (e.g. a cache hit).
+            let fallback_limits = outcome
+                .final_context_limits
+                .is_none()
+                .then(|| agent.context_limits_for_route(&active_provider, &active_model));
+            let (max_context_tokens, model_context_window) = done_frame_context_limits(
+                outcome.final_context_limits,
+                max_context_tokens,
+                model_context_window,
+                fallback_limits,
+            );
+            let mut done = serde_json::json!({
                 "type": "done",
                 "full_response": outcome.response,
                 "input_tokens": total_input_tokens,
                 "output_tokens": total_output_tokens,
                 "tokens_used": total_tokens,
                 "cost_usd": cost_usd,
-                "model": turn_model,
-                "provider": provider_label,
+                "model": active_model,
+                "provider": active_provider,
                 "max_context_tokens": max_context_tokens,
                 "last_input_tokens": last_input_tokens,
             });
+            // Omit `model_context_window` when capacity is unresolved so the done
+            // frame matches the RPC `ContextUsage` contract (which skips the
+            // field on `None`) instead of emitting a JSON `null`.
+            if let Some(window) = model_context_window
+                && let Some(map) = done.as_object_mut()
+            {
+                map.insert("model_context_window".into(), window.into());
+            }
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
             // Set session state to idle
@@ -1631,6 +1703,90 @@ mod tests {
                 .unwrap_or_default()
                 .contains(diagnostic),
             "WebSocket delivery must not fall back to the diagnostic when Fluent supplies text"
+        );
+    }
+
+    #[test]
+    fn done_context_limits_prefer_active_usage_route() {
+        let stale_startup_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(Some(7_200), Some(8_000), stale_startup_limits),
+            (7_200, Some(8_000)),
+            "the done frame must report the route that produced the usage event"
+        );
+    }
+
+    #[test]
+    fn done_context_limits_fall_back_to_agent_active_route_without_usage() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 0,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (0, Some(8_000)),
+        );
+    }
+
+    #[test]
+    fn done_context_limits_omit_unknown_compatibility_capacity() {
+        let active_limits = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: zeroclaw_config::schema::UNCONFIGURED_CONTEXT_WINDOW_FALLBACK,
+            context_token_budget: 16_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::CompatibilityFallback,
+        };
+        assert_eq!(
+            resolve_done_context_limits(None, None, active_limits),
+            (16_000, None),
+        );
+    }
+
+    // B4: the final served route overrides stale usage values in the terminal
+    // frame. A route switch after an earlier usage-bearing call (a no-usage
+    // vision reply) must report the FINAL route, not the earlier one.
+    #[test]
+    fn done_frame_prefers_final_served_route_over_stale_usage() {
+        let final_vision = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 8_000,
+            context_token_budget: 7_200,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // Earlier usage-bearing text route left 180k/200k on the wire trackers.
+        assert_eq!(
+            done_frame_context_limits(Some(final_vision), Some(180_000), Some(200_000), None),
+            (7_200, Some(8_000)),
+            "a final no-usage vision route must override the earlier text route's usage numbers"
+        );
+    }
+
+    // B4: with no served call (cache hit), the frame falls back to usage values,
+    // then to the resolved fallback route — preserving legacy behavior.
+    #[test]
+    fn done_frame_falls_back_when_no_call_served() {
+        let fallback = zeroclaw_config::schema::ResolvedContextLimits {
+            model_context_window: 200_000,
+            context_token_budget: 180_000,
+            model_context_window_source:
+                zeroclaw_config::schema::ModelContextWindowSource::Configured,
+        };
+        // No final route, no usage: fall back to the resolved route.
+        assert_eq!(
+            done_frame_context_limits(None, None, None, Some(fallback)),
+            (180_000, Some(200_000)),
+        );
+        // No final route but usage present: usage wins (legacy path).
+        assert_eq!(
+            done_frame_context_limits(None, Some(7_200), Some(8_000), Some(fallback)),
+            (7_200, Some(8_000)),
         );
     }
 

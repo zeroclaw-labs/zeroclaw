@@ -677,7 +677,9 @@ impl DelegateTool {
         credential: Option<&str>,
     ) -> anyhow::Result<(Box<dyn ModelProvider>, String, String)> {
         if let Some(config) = self.root_config.as_deref() {
-            return crate::agent::agent::build_session_model_provider(config, model_provider, None);
+            let (provider, provider_name, model_name, _resolver) =
+                crate::agent::agent::build_session_model_provider(config, model_provider, None)?;
+            return Ok((provider, provider_name, model_name));
         }
         let provider = zeroclaw_providers::create_model_provider_with_options(
             provider_type,
@@ -933,8 +935,14 @@ impl DelegateTool {
             if profile.max_tool_iterations > 0 {
                 resolved.max_tool_iterations = profile.max_tool_iterations;
             }
-            if let Some(max_context_tokens) = profile.max_context_tokens {
-                resolved.max_context_tokens = max_context_tokens;
+            if profile.max_context_tokens.is_some() {
+                resolved.max_context_tokens = profile.max_context_tokens;
+            }
+            if let Some(ratio) = profile
+                .context_compact_ratio
+                .filter(|r| *r > 0.0 && *r <= 1.0)
+            {
+                resolved.context_compact_ratio = Some(ratio);
             }
             if let Some(parallel_tools) = profile.parallel_tools {
                 resolved.parallel_tools = parallel_tools;
@@ -2765,12 +2773,14 @@ impl DelegateTool {
         let execution = tokio::time::timeout(
             Duration::from_secs(agentic_timeout_secs),
             run_tool_call_loop(ToolLoop {
+                served_route_sink: None,
                 sop_reassembly: None,
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
                         model_provider,
-                        provider_name: provider_type,
+                        provider_name: agent_config.model_provider.as_str(),
                         model,
+                        dispatch_model: model,
                         temperature: effective_temperature,
                     },
                     ResolvedIo {
@@ -2802,9 +2812,19 @@ impl DelegateTool {
                         strict_tool_parsing: loop_runtime.strict_tool_parsing,
                         parallel_tools: loop_runtime.parallel_tools,
                         max_tool_result_chars: loop_runtime.max_tool_result_chars,
-                        // Keep delegate subagent context pruning aligned with top-level
-                        // agents instead of preserving the old disabled-by-zero path.
-                        context_token_budget: loop_runtime.max_context_tokens,
+                        // Resolve from the target's provider alias and model, not the
+                        // delegating agent's route.
+                        context_limits: self.root_config.as_deref().map_or_else(
+                            || loop_runtime.context_limits(),
+                            |config| {
+                                config.resolved_context_limits_for_route(
+                                    agent_name,
+                                    &agent_config.model_provider,
+                                    model,
+                                )
+                            },
+                        ),
+                        context_limits_resolver: None,
                         knobs: &loop_knobs,
                     },
                 ),

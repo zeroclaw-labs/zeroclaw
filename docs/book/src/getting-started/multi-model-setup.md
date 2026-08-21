@@ -93,7 +93,7 @@ This profile composes existing primitives:
 
 - `compact_context` keeps startup context small.
 - `strict_tool_parsing` treats XML/JSON-looking fallback text as assistant text unless the provider returns native tool calls.
-- `max_tool_iterations`, `max_context_tokens`, `max_system_prompt_chars`, and `max_tool_result_chars` bound runaway loops and oversized prompt/tool context.
+- `max_tool_iterations`, `max_system_prompt_chars`, and `max_tool_result_chars` bound runaway loops and oversized prompt/tool context. `max_context_tokens` remains the absolute proactive-trim budget; set `context_compact_ratio` explicitly to opt into a model-relative threshold. Every positive effective threshold is capped by the selected model's configured context capacity; `max_context_tokens = 0` remains the proactive-trimming disable sentinel.
 - `max_actions_per_hour`, `max_cost_per_day_cents`, and the timeout/delegation fields keep local runs on the same budget shape as the built-in preset.
 - `parallel_tools = false` and `keep_tool_context_turns = 1` keep local runs sequential and limit retained tool context.
 
