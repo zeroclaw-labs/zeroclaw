@@ -12,6 +12,13 @@ const SCREENSHOT_TIMEOUT_SECS: u64 = 15;
 /// Maximum base64 payload size to return (2 MB of base64 ≈ 1.5 MB image).
 const MAX_BASE64_BYTES: usize = 2_097_152;
 
+/// Native desktop capture spawns a process and writes into the workspace, so it retains the
+/// existing mutating-autonomy gate. An Android bridge capture is a read-only observation through
+/// an already-authorized AccessibilityService and must remain available in read-only profiles.
+fn requires_action_permission(android_bridge_available: bool) -> bool {
+    !android_bridge_available
+}
+
 /// Tool for capturing screenshots using platform-native commands.
 /// macOS: `screencapture`
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
@@ -323,7 +330,12 @@ impl Tool for ScreenshotTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.security.can_act() {
+        #[cfg(all(unix, target_os = "android"))]
+        let bridge_backed = self.android_bridge.is_some();
+        #[cfg(not(all(unix, target_os = "android")))]
+        let bridge_backed = false;
+
+        if requires_action_permission(bridge_backed) && !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -359,6 +371,12 @@ mod tests {
         let tool = ScreenshotTool::new(test_security());
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("screenshot"));
+    }
+
+    #[test]
+    fn bridge_capture_does_not_require_mutating_autonomy() {
+        assert!(!requires_action_permission(true));
+        assert!(requires_action_permission(false));
     }
 
     #[test]
