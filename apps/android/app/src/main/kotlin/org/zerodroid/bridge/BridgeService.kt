@@ -12,6 +12,11 @@ import android.os.Build
 import android.os.IBinder
 import java.io.File
 
+internal object BridgeForegroundPolicy {
+    fun serviceType(apiLevel: Int): Int =
+        if (apiLevel >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
+}
+
 /**
  * Foreground service that runs the whole on-device stack:
  *  - the rust zeroclaw gateway as a supervised child process (the agent + its HTTP/WS gateway), and
@@ -19,7 +24,8 @@ import java.io.File
  *
  * The APK holds the Android permissions; the bridge exposes them to the agent over loopback.
  * foregroundServiceType = specialUse (a persistent local agent server) — NOT dataSync, which the
- * platform time-limits on API 34+. connectedDevice is added so BLE/USB device work is legitimate.
+ * platform time-limits on API 34+. BLE/USB APIs retain their own runtime permissions; the agent
+ * supervisor itself is not a connected-device session and must not require one before startup.
  */
 class BridgeService : Service() {
 
@@ -210,9 +216,7 @@ class BridgeService : Service() {
     }
 
     private fun goForeground(status: String) {
-        val type = if (Build.VERSION.SDK_INT >= 34)
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-        else 0
+        val type = BridgeForegroundPolicy.serviceType(Build.VERSION.SDK_INT)
         if (Build.VERSION.SDK_INT >= 34) startForeground(NOTI_ID, notification(status), type)
         else startForeground(NOTI_ID, notification(status))
     }
