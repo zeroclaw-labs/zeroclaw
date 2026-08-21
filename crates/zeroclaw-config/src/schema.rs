@@ -14667,6 +14667,21 @@ pub struct DiscordConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub channel_ids: Vec<String>,
+    /// Discord role IDs whose holders may use this channel, in addition to the
+    /// individually listed peers. A member is authorized when their user ID is
+    /// in the resolved peer allowlist **or** they hold any role listed here;
+    /// the two are additive, so neither can revoke the other.
+    ///
+    /// Role IDs only. Discord's gateway payloads carry `member.roles` as IDs,
+    /// never names, so a role rename cannot silently change who is admitted.
+    ///
+    /// Empty (default) preserves the user-ID-only behavior. Roles are only
+    /// available on guild events; DMs carry no member object, so a DM is
+    /// authorized by the peer allowlist alone. There is no wildcard: use `"*"`
+    /// in the peer allowlist if you intend to admit everyone.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub allowed_role_ids: Vec<String>,
     /// When true, the channel opens a sidecar `discord.db` SQLite memory
     /// backend, archives every non-bot message it sees, and registers the
     /// `discord_search` tool against it. Default: false. Folded in from
@@ -28836,6 +28851,7 @@ stream_mode = "single_message"
             bot_token: "discord-token".into(),
             guild_ids: vec!["12345".into()],
             channel_ids: vec![],
+            allowed_role_ids: Vec::new(),
             archive: false,
             listen_to_bots: false,
             interrupt_on_new_message: false,
@@ -28867,6 +28883,7 @@ stream_mode = "single_message"
             bot_token: "tok".into(),
             guild_ids: Vec::new(),
             channel_ids: vec![],
+            allowed_role_ids: Vec::new(),
             archive: false,
             listen_to_bots: false,
             interrupt_on_new_message: false,
@@ -29336,6 +29353,39 @@ guild_id = "123"
 "#;
         let parsed: DiscordConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(parsed.bot_token, "tok");
+    }
+
+    /// The value documented in `docs/book/src/channels/discord.md` must survive
+    /// a full write-then-read cycle. Role IDs are snowflakes that look like
+    /// integers, so the risk this pins down is a numeric round-trip silently
+    /// reshaping them; the existing tests only ever construct the field empty
+    /// or inject roles straight into the channel.
+    #[test]
+    async fn discord_config_allowed_role_ids_survives_toml_round_trip() {
+        let toml_str = r#"
+bot_token = "tok"
+allowed_role_ids = ["1472160206116094017", "9"]
+"#;
+        let parsed: DiscordConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.allowed_role_ids, vec!["1472160206116094017", "9"]);
+
+        let reserialized = toml::to_string(&parsed).unwrap();
+        let reparsed: DiscordConfig = toml::from_str(&reserialized).unwrap();
+        assert_eq!(
+            reparsed.allowed_role_ids, parsed.allowed_role_ids,
+            "allowed_role_ids must survive serialize -> deserialize; got {reserialized}"
+        );
+    }
+
+    /// Omitting the field keeps user-ID-only gating: the additive role grant
+    /// must never appear from nowhere on an existing config.
+    #[test]
+    async fn discord_config_without_allowed_role_ids_defaults_empty() {
+        let toml_str = r#"
+bot_token = "tok"
+"#;
+        let parsed: DiscordConfig = toml::from_str(toml_str).unwrap();
+        assert!(parsed.allowed_role_ids.is_empty());
     }
 
     #[test]

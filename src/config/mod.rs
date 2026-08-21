@@ -113,6 +113,7 @@ mod tests {
             bot_token: "token".into(),
             guild_ids: vec!["123".into()],
             channel_ids: vec![],
+            allowed_role_ids: vec![],
             archive: false,
             listen_to_bots: false,
             interrupt_on_new_message: false,

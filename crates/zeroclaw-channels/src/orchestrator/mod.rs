@@ -8959,6 +8959,7 @@ fn build_channel_by_id(
                     dc.mention_only,
                 )
                 .with_channel_ids(dc.channel_ids.clone())
+                .with_allowed_role_ids(dc.allowed_role_ids.clone())
                 .with_workspace_dir(workspace_dir)
                 .with_streaming(
                     dc.stream_mode,
@@ -10119,6 +10120,7 @@ fn collect_configured_channels(
             dc.mention_only,
         )
         .with_channel_ids(dc.channel_ids.clone())
+        .with_allowed_role_ids(dc.allowed_role_ids.clone())
         .with_workspace_dir(config.channel_workspace_dir(&format!("discord.{alias}")))
         .with_streaming(
             dc.stream_mode,
@@ -12827,6 +12829,7 @@ pub async fn deliver_announcement(
                 dc.mention_only,
             )
             .with_channel_ids(dc.channel_ids.clone())
+            .with_allowed_role_ids(dc.allowed_role_ids.clone())
             .with_workspace_dir(config.channel_workspace_dir(channel));
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }

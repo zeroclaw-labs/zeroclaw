@@ -80,6 +80,40 @@ can see. To scope it down:
 To find an ID, enable **Developer Mode** in Discord (User Settings -> Advanced),
 then right-click a server or channel and **Copy ID**.
 
+## Authorizing a whole role
+
+Listing every member individually does not scale, and the list drifts every time
+someone joins or leaves the team. `allowed_role_ids` authorizes anyone holding a
+given Discord role:
+
+```toml
+[channels.discord.community]
+allowed_role_ids = ["1472160206116094017"]   # e.g. a "Maintainer" role
+```
+
+This is **additive** to the peer allowlist: a member is authorized when their
+user ID is listed **or** they hold a listed role. Neither can revoke the other,
+so you can grant a role broadly and still name individuals who have no role.
+
+Both lists empty still denies everyone, as before.
+
+Some details worth knowing:
+
+- **Role IDs, not names.** Discord's gateway payloads carry `member.roles` as
+  IDs, so renaming a role cannot silently change who is admitted. Copy the ID
+  from Server Settings -> Roles with Developer Mode on.
+- **Guild events only.** DMs carry no member object and no roles, so a direct
+  message is authorized by the peer allowlist alone.
+- **No wildcard.** `"*"` is meaningful in the peer allowlist and is not
+  supported here; there should be exactly one way to spell "everyone".
+- **Roles replace only the identity check.** `guild_ids` and `channel_ids` still
+  apply to role-authorized members.
+
+Discord's own **Server Settings -> Integrations -> _app_ -> Command Permissions**
+can additionally restrict a slash command to a role. That hides the command in
+the picker, while `allowed_role_ids` is what the runtime enforces. It also
+covers @-mentions, which command permissions do not.
+
 ## Threads and context
 
 {{#thread-context channel="Discord"}}
