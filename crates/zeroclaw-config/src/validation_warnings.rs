@@ -6,6 +6,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Stable code for the withheld `vi_verify` capability notice.
+///
+/// Named here because two channels report this one fact and an operator has to
+/// be able to tell that they are the same fact: `Config::collect_warnings()`
+/// raises the structured warning, and the runtime traces it at each config
+/// application (`warn_verifiable_intent_withheld` in `src/main.rs`).
+///
+/// The prose deliberately differs per surface — the [`ValidationWarning`]
+/// message is the stable English contract for API consumers, `zeroclaw doctor`
+/// renders a localized line through Fluent, and the trace carries an operator
+/// log sentence. The code is what ties them together, which is why it is shared
+/// and the wording is not.
+pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withheld";
+
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
@@ -44,6 +58,13 @@ use serde::{Deserialize, Serialize};
 /// - `proxy_conflicts_with_dns_pinned_tools`: the configured proxy scope
 ///   selects `http_request` and/or `web_fetch`, whose validated DNS answers
 ///   require direct transport and therefore make the selected tool fail.
+/// - `verifiable_intent_tool_withheld`: `verifiable_intent.enabled` is set, but
+///   the `vi_verify` tool is withheld from the model-visible registry until a
+///   credential chain verifier exists, so enabling the section does not enable
+///   credential verification. The runtime also traces this at config load, and
+///   that trace has no sink under `observability.log_persistence = "none"`;
+///   this warning is the channel that survives, since `zeroclaw doctor` and the
+///   config API read the structured list rather than the log.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
