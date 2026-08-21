@@ -912,6 +912,8 @@ turn-interrupted-by-user = [interrupted by user]
 # on this path, so the wording names the channel, not a user.
 turn-cancelled-client-rpc = [turn cancelled via client]
 turn-stream-interrupted = [stream interrupted]
+turn-failed = [turn failed]
+turn-failed-attachment-omitted = [attachment omitted: the provider rejected it on the failed turn]
 # Trailing notice appended (and streamed as a final chunk) when the resilient
 # provider wrapper served the turn with a different model or provider than the
 # one requested, so silent model downgrades stay visible on direct-turn
