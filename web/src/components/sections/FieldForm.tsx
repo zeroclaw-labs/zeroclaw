@@ -241,6 +241,13 @@ function humanizeFieldLabel(path: string): string {
 
 function setupFieldPriority(entry: ListResponseEntry): number {
   const leaf = entry.path.split(".").pop() ?? "";
+  // MCP server fields: transport first (drives command/url requirement),
+  // then the connection endpoint fields, then extras.
+  if (/^mcp\.servers\.[^.]+\./.test(entry.path)) {
+    const order = ["transport", "command", "url", "headers", "env"];
+    const idx = order.indexOf(leaf);
+    if (idx >= 0) return idx;
+  }
   if (/^providers\.models\.[^.]+\.[^.]+\./.test(entry.path)) {
     const order = ["model", "api_key", "requires_openai_auth", "uri"];
     const idx = order.indexOf(leaf);
@@ -497,9 +504,14 @@ function isRequiredField(typeHint: string): boolean {
 // `McpTransport::required_leaf` (the same relationship `validate_mcp_config`
 // enforces). The form reads what the backend hands it, so a transport variant
 // added backend-side classifies correctly with no change here. When the metadata
-// is absent (a backend predating it) the map is null and required-ness is left
-// UNCLASSIFIED rather than re-encoding the enum, so the generic `Option<...>`
-// rule stays in charge.
+// is absent (a backend predating it), the form falls back to a hardcoded map
+// matching `McpTransport::required_leaf()` so the badge is still correct.
+const FALLBACK_REQUIRED_BY_TRANSPORT: Record<string, string> = {
+  stdio: "command",
+  http: "url",
+  sse: "url",
+};
+
 function mcpFieldRequired(
   path: string,
   transport: string | null | undefined,
@@ -507,14 +519,15 @@ function mcpFieldRequired(
 ): boolean | null {
   const leaf = path.match(/^mcp\.servers\.[^.]+\.([^.]+)$/)?.[1];
   if (leaf !== "command" && leaf !== "url") return null;
-  // Backend predates the x-required-by-transport metadata: do not assert
-  // required-ness rather than guessing it from a hand-kept map.
-  if (!requiredByTransport) return null;
   // Empty / unset transport defaults to stdio (the schema default).
   const t = (transport ?? "").trim().toLowerCase() || "stdio";
-  const requiredLeaf = requiredByTransport[t];
-  // Unknown transport (a variant the metadata has no rule for): do not assert
-  // required-ness, so a new variant cannot be silently misclassified.
+  // Prefer backend-emitted metadata; fall back to the hardcoded map that
+  // mirrors `McpTransport::required_leaf()` so the badge is correct even on
+  // older backends lacking the schema extension.
+  const requiredLeaf =
+    requiredByTransport?.[t] ?? FALLBACK_REQUIRED_BY_TRANSPORT[t];
+  // Unknown transport (a variant neither the metadata nor fallback knows): do
+  // not assert required-ness, so a new variant cannot be silently misclassified.
   if (!requiredLeaf) return null;
   return leaf === requiredLeaf;
 }
@@ -2458,6 +2471,21 @@ function ObjectArrayEditor({
     return [];
   }, [value]);
 
+  // Sort element props so transport comes first for MCP servers — it drives
+  // which of command/url is required.
+  const sortedProps = useMemo(() => {
+    if (!elementProps) return null;
+    const order = ["transport", "command", "url", "headers", "env"];
+    return [...elementProps].sort((a, b) => {
+      const ai = order.indexOf(a.key);
+      const bi = order.indexOf(b.key);
+      if (ai !== -1 && bi !== -1) return ai - bi;
+      if (ai !== -1) return -1;
+      if (bi !== -1) return 1;
+      return 0;
+    });
+  }, [elementProps]);
+
   const writeRows = (next: Record<string, unknown>[]) => {
     onChange(JSON.stringify(next));
   };
@@ -2475,8 +2503,8 @@ function ObjectArrayEditor({
     // Seed required-string keys with empty strings so the row renders an
     // empty input rather than nothing.
     const seed: Record<string, unknown> = {};
-    if (elementProps) {
-      for (const p of elementProps) {
+    if (sortedProps) {
+      for (const p of sortedProps) {
         if (p.kind === "string" && !p.optional) seed[p.key] = "";
       }
     }
@@ -2485,7 +2513,7 @@ function ObjectArrayEditor({
 
   // Schema not loaded or unresolvable: degrade to a raw JSON textarea so
   // the field is still editable. Visually distinct so users see why.
-  if (!elementProps || elementProps.length === 0) {
+  if (!sortedProps || sortedProps.length === 0) {
     return (
       <div className="space-y-1.5">
         <p className="text-xs" style={{ color: "var(--pc-text-muted)" }}>
@@ -2560,7 +2588,7 @@ function ObjectArrayEditor({
                   <Trash2 className="h-4 w-4" />
                 </button>
               </div>
-              {elementProps.map((p) => (
+              {sortedProps.map((p) => (
                 <ObjectArrayField
                   key={p.key}
                   meta={p}
