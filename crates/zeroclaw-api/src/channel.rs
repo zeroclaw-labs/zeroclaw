@@ -631,6 +631,27 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         true
     }
 
+    /// Listener health as the channel itself last observed it.
+    ///
+    /// `health_check` is an *active* probe: implementations reach the remote
+    /// service to answer it, and some of them send a real message or open a
+    /// broker connection to do so. That makes it safe to call on demand — from
+    /// `channel doctor` — and unsafe to call on a timer, so a recurring caller
+    /// must not use it.
+    ///
+    /// This is the recurring-safe counterpart. It is synchronous and returns
+    /// state the channel recorded while it was already talking to the service,
+    /// so reading it performs no I/O and cannot block, send, or connect:
+    ///
+    /// - `None` — the channel offers no signal. This is the default, and the
+    ///   caller should fall back to whatever it knew before asking.
+    /// - `Some(true)` — the channel's last exchange with the service succeeded.
+    /// - `Some(false)` — the channel is running but its exchanges are failing,
+    ///   so a live `listen()` is not evidence that the channel works.
+    fn listener_health(&self) -> Option<bool> {
+        None
+    }
+
     /// Send a discrete-choice prompt with options.
     ///
     /// Each `(callback_id, label)` pair represents one choice. Whether

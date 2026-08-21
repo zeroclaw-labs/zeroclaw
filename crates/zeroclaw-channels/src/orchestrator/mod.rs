@@ -4631,14 +4631,20 @@ fn spawn_supervised_listener(
 /// and re-clearing `last_error` on every tick erases a real failure within one
 /// heartbeat interval.
 ///
-/// So ask the channel instead. `Channel::health_check` defaults to `true`, so a
-/// channel that does not override it is recorded exactly as before; one that
-/// does gets to say it is not connected.
-async fn mark_listener_health(ch: &dyn Channel, component: &str) {
-    if ch.health_check().await {
-        zeroclaw_runtime::health::mark_component_ok(component);
-    } else {
+/// So ask the channel for what it already recorded. `Channel::listener_health`
+/// is synchronous and reads observed state, so this runs no I/O: it cannot send
+/// a message, dial a broker, or delay listener startup and cancellation. The
+/// active `Channel::health_check` probe is deliberately not used here — several
+/// implementations post a real message or open a connection to answer it, which
+/// is fine on demand and not fine on a 30-second timer.
+///
+/// A channel with no signal to give (`None`, the default) is recorded exactly as
+/// it was before this existed.
+fn mark_listener_health(ch: &dyn Channel, component: &str) {
+    if ch.listener_health() == Some(false) {
         zeroclaw_runtime::health::mark_component_error(component, "channel reported unhealthy");
+    } else {
+        zeroclaw_runtime::health::mark_component_ok(component);
     }
 }
 
@@ -4669,8 +4675,13 @@ fn spawn_supervised_listener_with_health_interval(
             let max_backoff = max_backoff_secs.max(backoff);
 
             loop {
-                mark_listener_health(&*ch, &component).await;
-                let mut health = tokio::time::interval(health_interval);
+                mark_listener_health(&*ch, &component);
+                // First tick one interval out, not immediately: the observation
+                // above already covers this instant.
+                let mut health = tokio::time::interval_at(
+                    tokio::time::Instant::now() + health_interval,
+                    health_interval,
+                );
                 health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let result = {
                     let listen_future = ch.listen(tx.clone());
@@ -4680,7 +4691,7 @@ fn spawn_supervised_listener_with_health_interval(
                         tokio::select! {
                             () = cancel.cancelled() => return,
                             _ = health.tick() => {
-                                mark_listener_health(&*ch, &component).await;
+                                mark_listener_health(&*ch, &component);
                             }
                             result = &mut listen_future => break result,
                         }
@@ -26762,15 +26773,35 @@ This is an example JSON object for profile settings."#;
         err: Mutex<Option<anyhow::Error>>,
     }
 
-    /// A channel whose listener stays alive while every API call fails — the
-    /// reported shape where Telegram long-polls a bad bot token and absorbs
-    /// the 404 without ever returning from `listen`.
-    struct NeverConnectsChannel {
+    /// A channel whose listener stays alive for as long as the supervisor
+    /// watches it — the reported shape where Telegram long-polls a bad bot
+    /// token and absorbs the 404 without ever returning from `listen`.
+    ///
+    /// It counts both ways the supervisor could ask about health, so a test can
+    /// assert on which one it actually used: `observations` counts passive
+    /// `listener_health` reads, and `probes` counts active `health_check` calls
+    /// — the ones that, on real channels, post a message or open a connection.
+    struct ObservedChannel {
         name: String,
+        report: Option<bool>,
+        observations: Arc<AtomicUsize>,
+        probes: Arc<AtomicUsize>,
         calls: Arc<AtomicUsize>,
     }
 
-    impl ::zeroclaw_api::attribution::Attributable for NeverConnectsChannel {
+    impl ObservedChannel {
+        fn reporting(name: String, report: Option<bool>) -> Self {
+            Self {
+                name,
+                report,
+                observations: Arc::new(AtomicUsize::new(0)),
+                probes: Arc::new(AtomicUsize::new(0)),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ObservedChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
                 ::zeroclaw_api::attribution::ChannelKind::Webhook,
@@ -26782,7 +26813,7 @@ This is an example JSON object for profile settings."#;
     }
 
     #[async_trait::async_trait]
-    impl Channel for NeverConnectsChannel {
+    impl Channel for ObservedChannel {
         fn name(&self) -> &str {
             &self.name
         }
@@ -26800,8 +26831,14 @@ This is an example JSON object for profile settings."#;
             Ok(())
         }
 
+        fn listener_health(&self) -> Option<bool> {
+            self.observations.fetch_add(1, Ordering::SeqCst);
+            self.report
+        }
+
         async fn health_check(&self) -> bool {
-            false
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            true
         }
     }
 
@@ -26935,13 +26972,12 @@ This is an example JSON object for profile settings."#;
         // A live listener is not evidence of a working channel. A bad bot
         // token leaves Telegram long-polling and swallowing 404s forever, and
         // the supervisor used to keep stamping `ok` on every heartbeat.
-        let calls = Arc::new(AtomicUsize::new(0));
         let channel_name = format!("test-never-connects-{}", uuid::Uuid::new_v4());
         let component_name = format!("channel:{channel_name}");
-        let channel: Arc<dyn Channel> = Arc::new(NeverConnectsChannel {
-            name: channel_name,
-            calls: Arc::clone(&calls),
-        });
+        let inner = Arc::new(ObservedChannel::reporting(channel_name, Some(false)));
+        let calls = Arc::clone(&inner.calls);
+        let probes = Arc::clone(&inner.probes);
+        let channel: Arc<dyn Channel> = inner;
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
         let cancel = tokio_util::sync::CancellationToken::new();
@@ -26972,6 +27008,97 @@ This is an example JSON object for profile settings."#;
         let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
         assert!(join.is_ok(), "listener should stop on cancel");
         assert!(calls.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "an unhealthy report must come from recorded state, not a probe"
+        );
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_health_observation_never_probes_the_channel() {
+        // `health_check` is an on-demand diagnostic, and implementations answer
+        // it by talking to the service: WeCom posts a real webhook message,
+        // Slack runs `auth.test` and opens a socket-mode URL, AMQP dials the
+        // broker. None of that may run on a 30-second heartbeat, so the
+        // supervisor must never reach it.
+        let channel_name = format!("test-passive-observation-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let inner = Arc::new(ObservedChannel::reporting(channel_name, Some(true)));
+        let probes = Arc::clone(&inner.probes);
+        let observations = Arc::clone(&inner.observations);
+        let channel: Arc<dyn Channel> = inner;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            0,
+            "the heartbeat must not call health_check"
+        );
+        assert!(
+            observations.load(Ordering::SeqCst) >= 2,
+            "the heartbeat should have observed passively at least twice by now; got {}",
+            observations.load(Ordering::SeqCst)
+        );
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_eq!(
+            component["status"], "ok",
+            "a channel reporting itself healthy stays ok; got {component}"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_waits_one_interval_before_its_second_observation() {
+        // `tokio::time::interval` fires its first tick immediately, which would
+        // double up on the pre-listen observation. The heartbeat's first tick
+        // belongs one interval out.
+        let channel_name = format!("test-observation-cadence-{}", uuid::Uuid::new_v4());
+        let inner = Arc::new(ObservedChannel::reporting(channel_name, Some(true)));
+        let observations = Arc::clone(&inner.observations);
+        let channel: Arc<dyn Channel> = inner;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(500),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            observations.load(Ordering::SeqCst),
+            1,
+            "only the pre-listen observation should have run inside one interval"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
         drop(rx);
     }
 

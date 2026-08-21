@@ -553,6 +553,11 @@ pub struct TelegramChannel {
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
+    /// Outcome of the most recent `getUpdates` exchange, or `None` before the
+    /// first one. Read by `listener_health` so a supervisor can tell a
+    /// connected channel from one that is long-polling a rejecting endpoint,
+    /// without issuing a probe of its own.
+    poll_health: Mutex<Option<bool>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
     api_base: String,
@@ -651,6 +656,7 @@ impl TelegramChannel {
             mention_only,
             bot_username: Mutex::new(None),
             bot_id: Mutex::new(None),
+            poll_health: Mutex::new(None),
             api_base: TELEGRAM_OFFICIAL_API_BASE_URL.to_string(),
             transcription: None,
             transcription_manager: None,
@@ -1389,6 +1395,16 @@ impl TelegramChannel {
                 None
             }
         }
+    }
+
+    /// Record the outcome of one `getUpdates` exchange.
+    ///
+    /// The poll loop already knows whether the Bot API accepted the call; a bad
+    /// token 404s on every attempt while the loop keeps retrying, so `listen()`
+    /// never returns and liveness alone says nothing. Keeping the last outcome
+    /// here lets `listener_health` answer that question without a second call.
+    fn record_poll_health(&self, ok: bool) {
+        *self.poll_health.lock() = Some(ok);
     }
 
     fn is_telegram_username_char(ch: char) -> bool {
@@ -3735,6 +3751,7 @@ impl Channel for TelegramChannel {
                             ),
                         "startup probe error; retrying in 5s"
                     );
+                    self.record_poll_health(false);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
                 Ok(resp) => {
@@ -3750,6 +3767,7 @@ impl Channel for TelegramChannel {
                                 .with_attrs(::serde_json::json!({"e": e.to_string()})),
                                 "startup probe parse error: ; retrying in 5s"
                             );
+                            self.record_poll_health(false);
                             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         }
                         Ok(data) => {
@@ -3771,9 +3789,11 @@ impl Channel for TelegramChannel {
                                         }
                                     }
                                 }
+                                self.record_poll_health(true);
                                 break; // Probe succeeded; enter the long-poll loop.
                             }
 
+                            self.record_poll_health(false);
                             let error_code = data
                                 .get("error_code")
                                 .and_then(serde_json::Value::as_i64)
@@ -3836,6 +3856,7 @@ impl Channel for TelegramChannel {
                             ),
                         "poll error"
                     );
+                    self.record_poll_health(false);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -3853,6 +3874,7 @@ impl Channel for TelegramChannel {
                             ),
                         "parse error"
                     );
+                    self.record_poll_health(false);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     continue;
                 }
@@ -3862,6 +3884,7 @@ impl Channel for TelegramChannel {
                 .get("ok")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(true);
+            self.record_poll_health(ok);
             if !ok {
                 let error_code = data
                     .get("error_code")
@@ -4046,6 +4069,10 @@ Ensure only one `zeroclaw` process is using this bot token."
                 }
             }
         }
+    }
+
+    fn listener_health(&self) -> Option<bool> {
+        *self.poll_health.lock()
     }
 
     async fn health_check(&self) -> bool {
@@ -4863,6 +4890,90 @@ mod tests {
         assert_eq!(
             ch.api_url("getMe"),
             "https://api.telegram.org/bot123:ABC/getMe"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_health_reports_false_while_get_updates_is_rejected() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The reported failure: an invalid bot token 404s every `getUpdates`,
+        // the poll loop absorbs it and retries, and `listen()` never returns.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 404,
+                "description": "Not Found"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        assert_eq!(
+            channel.listener_health(),
+            None,
+            "nothing observed yet, so the channel has no signal to give"
+        );
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let _ = tokio::time::timeout(Duration::from_millis(500), channel.listen(tx)).await;
+
+        assert_eq!(
+            channel.listener_health(),
+            Some(false),
+            "a rejected poll must be visible without a second API call"
+        );
+    }
+
+    #[tokio::test]
+    async fn listener_health_reports_true_once_get_updates_succeeds() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        // The delay keeps the long-poll loop from spinning for the whole test.
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/getUpdates$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "ok": true, "result": [] }))
+                    .set_delay(Duration::from_millis(200)),
+            )
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri());
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let _ = tokio::time::timeout(Duration::from_millis(600), channel.listen(tx)).await;
+
+        assert_eq!(
+            channel.listener_health(),
+            Some(true),
+            "a channel whose polls are accepted reports itself connected"
         );
     }
 
