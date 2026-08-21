@@ -177,6 +177,9 @@ fn live_agent_config(tmp: &TempDir, plugins_root: &std::path::Path, instance_key
     );
 
     config.plugins.enabled = true;
+    // The fixture is a package-bound tool instance, which the activation plan
+    // admits only under auto-discovery.
+    config.plugins.auto_discover = true;
     config.plugins.plugins_dir = plugins_root.display().to_string();
     config.plugins.entries = vec![PluginEntryConfig {
         name: instance_key.to_string(),

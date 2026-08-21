@@ -148,7 +148,7 @@ not yet reachable from a running daemon:
 |------------|--------------|----------------|
 | `tool` | `WasmTool` | Registered end to end; discovered tool plugins appear in the agent's tool set |
 | `skill` | markdown loader | Registered end to end; skills load namespaced as `plugin:<plugin>/<skill>` |
-| `channel` | `WasmChannel`, complete and unit-covered | Orchestrator registration and the per-vendor host listener are the remaining seam |
+| `channel` | `WasmChannel`, complete and unit-covered | Alias-owned construction and runtime config resolution landed ([#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146)); the per-vendor host listener that drains each transport into the channel's `inbound` queue is a follow-up |
 | `memory` | `WasmMemory`, implements the full `Memory` trait | The runtime does not yet construct it as a configurable backend |
 | `observer` | none | `PluginCapability::Observer` is reserved; no WIT world or adapter exists yet |
 
@@ -167,6 +167,9 @@ defaults, which reads back as `plugins.enabled = false` with no warning
 # turn the system on
 zeroclaw config set plugins.enabled true
 
+# load auto-discovered tool and skill plugins at runtime (default: false)
+zeroclaw config set plugins.auto_discover true
+
 # where plugins are discovered (default: ~/.zeroclaw/plugins)
 zeroclaw config set plugins.plugins_dir /srv/zeroclaw/plugins
 
@@ -178,15 +181,28 @@ zeroclaw config set plugins.limits.call_fuel 1000000000
 zeroclaw config set plugins.limits.max_memory_mb 256
 ```
 
+`plugins.enabled = true` turns the plugin host on, but auto-discovered tool and
+skill capabilities load only when `plugins.auto_discover = true` as well. That
+flag is `false` by default (fail-closed), so `enabled = true` on its own gives
+you the channels you declare under `[channels.plugin.<alias>]` and no plugin
+tools or skills: a tool or skill package can list and `info` cleanly yet
+contribute nothing at runtime. Explicit channel bindings are operator-named
+rather than auto-discovered, so they do not need `auto_discover`; the flag gates
+only auto-discovered tools and skills.
+
 Per-instance settings live under `plugins.entries`, keyed by a versioned
 `zpi1_…` string derived from the host-owned package, capability, and binding
 identity. Installation prints and seeds the keys for the package's default
 tool binding; `zeroclaw plugin info <package>` prints that tool key again. Those
-automatic surfaces are tool-only. Alias-owned channel construction must derive,
-display, and seed the key from its actual configured alias rather than inventing
-a package-name binding. That production path is not present in this slice; it is
-tracked in [#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its
-accepted successor. Full-identity keys let different packages and capability
+automatic surfaces are tool-only. Alias-owned channel construction derives the
+key from its actual configured alias rather than inventing a package-name
+binding. That runtime path landed in
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146): a daemon now
+constructs an explicitly declared `[channels.plugin.<alias>]` instance and
+resolves its typed config from that alias. Automatic `plugin info` key display
+and install-time seeding for channel instances remain manual until the grant
+ceremony in [#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584).
+Full-identity keys let different packages and capability
 worlds safely reuse aliases such as `main` without sharing credentials. The
 canonical operator values are a secret-marked string map and
 remain encrypted at rest (`enc2:…`). A plugin that requests `config_read`
@@ -230,6 +246,10 @@ The sandbox bounds what a loaded plugin can do; the signature policy bounds
 what loads at all. Both are operator decisions, and they compose:
 
 - `plugins.enabled` false (the default): no plugin code runs, ever.
+- `plugins.auto_discover` false (the default): auto-discovered tool and skill
+  capabilities do not load. `plugins.enabled = true` alone activates only the
+  channels you declare under `[channels.plugin.<alias>]`; tools and skills load
+  only when `auto_discover = true` as well.
 - Signature `strict`: only components whose manifest carries a valid Ed25519
   signature from a key in your trusted set load.
 - Loaded plugin: bounded by fuel, memory ceilings, no-preopen WASI, and the

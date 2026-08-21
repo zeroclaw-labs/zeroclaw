@@ -418,6 +418,21 @@ jobs:
       - name: Run runtime live-config plugin regression
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib live_agent_plugin_tool_observes_config_reload_after_construction
+      # Feature-gated admission proofs. These only compile under plugins-wasm, so
+      # the default-feature workspace Test job never runs them: the activation
+      # plan (plugin_runtime), the shared instance ceiling, the auto_discover
+      # default-false gate, the repeated-construction determinism, and the
+      # pre-construction collision refusal. Filters are passed after `--` because
+      # `cargo test` accepts only one positional TESTNAME; the harness ORs them.
+      - name: Run runtime plugin admission regressions
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: 'cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib -- plugin_runtime:: tools::tests::shared_ceiling tools::tests::repeated_loader tools::tests::auto_discover tools::tests::colliding_plugin'
+      # Cross-crate activation proof. This lives in the root `zeroclaw` package
+      # rather than the line above because it drives `zeroclaw-runtime`, which
+      # `zeroclaw-plugins` cannot depend on without inverting the crate graph.
+      - name: Run channel plugin activation e2e
+        if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
+        run: cargo test --locked --features plugins-wasm-cranelift --test plugin_channel_runtime_e2e
 
   msrv:
     name: MSRV (declared floor)

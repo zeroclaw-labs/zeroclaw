@@ -47,7 +47,12 @@ one.
 5. **Register tools.** Surviving tool plugins are wrapped as agent tools and
    appended after the built-ins. Tool dispatch resolves names first-match, so a
    plugin tool that collides with a built-in name is never selected; give plugin
-   tools unique names.
+   tools unique names. Tool and skill plugins are *auto-discovered*, so this
+   enumeration happens only when `[plugins] auto_discover = true` (default
+   `false`, fail-closed): with `enabled = true` but `auto_discover = false`, no
+   plugin tools or skills load, though channels you declare under
+   `[channels.plugin.<alias>]` still activate. The skill loader applies the same
+   `auto_discover` gate.
 
 The signature stage is the one most easily misconfigured, so it is worth
 understanding on its own.
@@ -106,6 +111,10 @@ config surface (zerocode, the gateway, or the CLI):
 # Master switch. Nothing loads while this is false.
 zeroclaw config set plugins.enabled true
 
+# Load auto-discovered tool and skill plugins at runtime (default: false).
+# Without this, `enabled = true` activates only explicitly-declared channels.
+zeroclaw config set plugins.auto_discover true
+
 # Where plugins are discovered (default: ~/.zeroclaw/plugins).
 zeroclaw config set plugins.plugins_dir ~/.zeroclaw/plugins
 
@@ -117,8 +126,11 @@ zeroclaw config set plugins.security.trusted_publisher_keys '["a1b2c3d4e5f6..."]
 ```
 
 A host meant to load third-party plugins should set `enabled = true`,
-`signature_mode = "strict"`, and list only the publisher keys you trust. A host
-that runs only plugins you build yourself can leave `signature_mode` at its
+`signature_mode = "strict"`, and list only the publisher keys you trust. To load
+auto-discovered tool and skill plugins as well, also set `auto_discover = true`;
+it is `false` by default, so `enabled = true` alone activates only the channels
+you declare under `[channels.plugin.<alias>]` and no plugin tools or skills. A
+host that runs only plugins you build yourself can leave `signature_mode` at its
 `disabled` default during development and tighten it before the host is shared.
 
 ## What a plugin still cannot do

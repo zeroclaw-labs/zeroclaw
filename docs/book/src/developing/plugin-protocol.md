@@ -122,10 +122,13 @@ Tool plugins are discovered and registered end to end: the runtime walks
 The channel host adapter (`WasmChannel`, its `wasi:http` gating, `configure`
 jail, and host-fed `inbound` queue) is complete and unit-covered, and
 `PluginHost::channel_plugin_details()` exposes the wasm-backed channel plugins
-to register. Wiring those into the live orchestrator (the discovery-to-channel
-loop in the runtime, plus a per-vendor host listener that drains its transport
-into each channel's `inbound` queue) is the remaining seam and lands with the
-runtime channel-registration change, not this host slice. The memory bridge
+to register. The runtime now resolves an explicitly declared
+`[channels.plugin.<alias>]` binding, constructs its `WasmChannel`, and registers
+it from the configured alias; that alias-aware construction and runtime config
+resolution landed in
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146). The remaining
+follow-up is the per-vendor host listener that drains each transport into the
+channel's `inbound` queue. The memory bridge
 (`WasmMemory`) is in the same position one step earlier: the adapter implements
 the full `Memory` trait against the `memory-plugin` world, but the host does not
 yet expose a memory counterpart to `channel_plugin_details()` and the runtime
@@ -583,10 +586,14 @@ Operator values currently enter through generic string-map storage: edit
 has seeded its default-binding entry. `zeroclaw plugin info <package>` prints
 the same tool key for migration and later edits. These automatic print and seed
 surfaces are tool-only. A channel key depends on its configured alias, which
-install and info do not own; the alias-aware production path in
-[#8852](https://github.com/zeroclaw-labs/zeroclaw/pull/8852), or its accepted
-successor, must derive, display, and seed that key before a channel-only package
-can complete this migration. Schema-driven forms and inline field help are not
+install and info do not own. The alias-aware construction that resolves a
+channel's typed config from that configured alias landed in
+[#10146](https://github.com/zeroclaw-labs/zeroclaw/pull/10146); automatic
+display and install-time seeding of the channel key remain manual until the
+grant ceremony in
+[#9584](https://github.com/zeroclaw-labs/zeroclaw/pull/9584), so a channel-only
+package still cannot complete this migration through install and info alone.
+Schema-driven forms and inline field help are not
 implemented yet. The current surfaces are:
 
 - **The CLI** handles plugin lifecycle with `list`, `search`, `install`,

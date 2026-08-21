@@ -1,0 +1,24 @@
+# Canonical on-disk manifest for the channel component fixture.
+#
+# The activation end-to-end test installs this file verbatim as a package's
+# `manifest.toml`, so it doubles as a worked example of the manifest an
+# operator would receive with a real channel plugin.
+name = "channel-fixture"
+version = "0.0.0"
+description = "Channel component fixture used by the plugin activation tests."
+wasm_path = "channel-fixture.wasm"
+capabilities = ["channel"]
+permissions = ["config_read"]
+
+# The guest refuses to configure unless it receives exactly `{"retry_count":5}`,
+# which is what makes the end-to-end test prove that operator values reached a
+# real component through the typed resolver rather than being dropped.
+[config_schema]
+"$schema" = "https://json-schema.org/draft/2020-12/schema"
+type = "object"
+required = ["retry_count"]
+additionalProperties = false
+
+[config_schema.properties.retry_count]
+type = "integer"
+minimum = 1
