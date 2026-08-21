@@ -15,7 +15,9 @@ Do not configure both selectors in the same channel unless you intentionally wan
 
 ## Cloud API mode
 
-Cloud API mode is the Meta Business Platform integration. It requires a Meta Business account, a WhatsApp Business app, a phone number ID, a verify token, and an access token. It is the right mode for business deployments that receive messages through Meta webhooks.
+Cloud API mode is the Meta Business Platform integration. It requires a Meta Business account, a WhatsApp Business app, a phone number ID, a verify token, an access token, and an app secret. It is the right mode for business deployments that receive messages through Meta webhooks.
+
+Inbound webhooks are signature-verified against `app_secret`, and verification is mandatory. With no app secret configured the gateway cannot verify a request, so it answers `401` and processes nothing. Set `app_secret` before pointing Meta at the callback URL.
 
 The gateway must be reachable by Meta for inbound webhooks. Configure a tunnel under the top-level `[tunnel]` section (`tunnel_provider` and the related provider blocks, see the [config reference](../reference/config.md#tunnel)), or front the gateway with your own reverse proxy when developing locally.
 
@@ -64,6 +66,61 @@ session_path = "/var/lib/zeroclaw/wa.db"
 # Only operate in these two groups; all other groups are dropped.
 allowed_groups = ["120363012345678901@g.us", "120363098765432109"]
 ```
+
+## Tool approval over chat (`approval_timeout_secs`)
+
+When a tool needs approval (it is in `always_ask`, or the risk profile does not
+auto-approve it), the agent posts the request into the chat the message came from
+and waits for a reply. Answer with the token from the prompt:
+
+```
+a1b2c3 yes
+a1b2c3 no
+a1b2c3 always
+```
+
+`approval_timeout_secs` bounds that wait. **The default is 300 seconds, and `0`
+denies immediately** rather than disabling approval, so a zero is a way to refuse
+every gated tool, not a way to wait forever. On timeout the request is denied and
+the token is discarded, so a late reply cannot approve a call nobody is waiting
+on any more.
+
+**Who may answer.** The token is a correlator, not a password: it travels in
+plaintext into the chat, so in a group every member can read it.
+
+**The two modes differ, and the difference is a security boundary rather than an
+implementation detail.**
+
+In **Web mode**, a reply is honoured only when it comes from the same chat the
+prompt was posted into **and** from a peer this alias is authorized to take
+instructions from. A reply that fails either check is logged and ignored, and
+the request stays open so the operator can still answer it. In a group the
+prompt says so, because otherwise there is no way to tell why a bystander's
+reply did nothing.
+
+The authorized peers are the ones the canonical resolver returns for this
+alias, which is the peer group whose `channel` points at it:
+
+```toml
+[peer_groups.whatsapp_default]
+channel = "whatsapp.personal"   # this alias only; bare "whatsapp" covers every alias
+external_peers = ["+15550100"]
+```
+
+There is no `allowed_numbers` field to set. That was the v2 spelling, and
+migration folds it into a peer group like the one above, so a v2 config keeps
+working and a v3 config has nowhere to put the old key.
+
+See [Peer groups](./peer-groups.md) for the full field list and the identifier
+shape each channel matches against.
+
+In **Cloud API mode**, neither check is applied. Its pending entry is a bare
+responder keyed by the token, with no chat and no identity recorded alongside
+it, so the webhook treats possession of the token as authority. In a group that
+means any member who can read the prompt can answer it, including from a
+different chat. Until that path is hardened, a Cloud-mode approval is proof
+that someone possessed the token and nothing more. It authenticates neither the
+chat nor the responder, so prefer Web mode wherever either matters.
 
 ## Configuration surfaces
 

@@ -63,9 +63,9 @@ When attachments are present the body alternatives are wrapped in an outer `mult
 
 ## Attachment handling
 
-Inbound attachments are stored under `<workspace>/attachments/<conversation>/`. The agent gets file paths in its context and can read them via the `file_read` tool.
+Inbound attachments are stored under `<workspace>/attachments/<conversation>/`. The agent gets file paths in its context and can read them via the `file_read` tool. Filenames are taken from the `Content-Disposition` header first, falling back to the `Content-Type` `name` parameter.
 
-Outbound attachments are resolved from the workspace path provided by the agent and sent as MIME parts. Filenames are taken from the `Content-Disposition` header first, falling back to the `Content-Type` `name` parameter.
+Outbound attachments are sent from the bytes supplied with each attachment. The Email channel treats the attachment filename as display metadata, not as a local path. Integrations that intentionally send a local file must validate or constrain the path and load it explicitly with `MediaAttachment::from_file` before sending.
 
 ## Rate and volume limits
 

@@ -65,8 +65,6 @@ pub use crate::twitter::TwitterChannel;
 pub use crate::voice_call::VoiceCallChannel;
 #[cfg(feature = "voice-wake")]
 pub use crate::voice_wake::VoiceWakeChannel;
-#[cfg(feature = "channel-wati")]
-pub use crate::wati::WatiChannel;
 #[cfg(feature = "channel-webhook")]
 pub use crate::webhook::WebhookChannel;
 #[cfg(feature = "channel-wechat")]
@@ -120,10 +118,10 @@ use zeroclaw_memory::{self, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider, ProviderDispatch};
 use zeroclaw_runtime::agent::loop_::{
-    LoopKnobs, ProgressEvent, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess,
-    ResolvedRuntimeKnobs, StreamDelta, ToolLoop, append_pinned_mcp_section,
-    apply_text_tool_prompt_policy, build_tool_instructions_for_names, is_model_switch_requested,
-    run_tool_call_loop, scope_session_key, scope_thread_id, scrub_credentials,
+    LoopKnobs, ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    ToolLoop, append_pinned_mcp_section, apply_text_tool_prompt_policy,
+    build_tool_instructions_for_names, is_model_switch_requested, run_tool_call_loop,
+    scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -145,7 +143,7 @@ static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
 /// for real-time threaded notifications.
 struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
-    tx: tokio::sync::mpsc::Sender<String>,
+    tx: Option<tokio::sync::mpsc::Sender<String>>,
     tools_used: AtomicBool,
 }
 
@@ -158,6 +156,10 @@ impl Observer for ChannelNotifyObserver {
         } = event
         {
             self.tools_used.store(true, Ordering::Relaxed);
+            let Some(tx) = self.tx.as_ref() else {
+                self.inner.record_event(event);
+                return;
+            };
             let detail = match arguments {
                 Some(args) if !args.is_empty() => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
@@ -180,7 +182,7 @@ impl Observer for ChannelNotifyObserver {
                 }
                 _ => String::new(),
             };
-            let _ = self.tx.try_send(format!("\u{1F527} `{tool}`{detail}"));
+            let _ = tx.try_send(format!("\u{1F527} `{tool}`{detail}"));
         }
         self.inner.record_event(event);
     }
@@ -233,6 +235,18 @@ const CHANNEL_MESSAGE_TIMEOUT_SCALE_CAP: u64 = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
+// matrix-sdk typing notices expire after four seconds and suppress resends for
+// the first three seconds. Refresh between those boundaries while the
+// single-message draft is still not visible.
+const MATRIX_SINGLE_MESSAGE_TYPING_REFRESH_INTERVAL_MS: u64 = 3_500;
+const _: () = assert!(
+    MATRIX_SINGLE_MESSAGE_TYPING_REFRESH_INTERVAL_MS > 3_000
+        && MATRIX_SINGLE_MESSAGE_TYPING_REFRESH_INTERVAL_MS < 4_000,
+    "Matrix typing refresh must clear matrix-sdk's resend gate before notice expiry"
+);
+// Typing is best-effort auxiliary feedback. Never let a stalled stop request
+// delay the first visible single-message draft indefinitely.
+const MATRIX_SINGLE_MESSAGE_TYPING_CLEANUP_TIMEOUT_MS: u64 = 100;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
@@ -303,6 +317,32 @@ fn channel_runtime_cli_string(key: &str) -> String {
 
 fn channel_runtime_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
     zeroclaw_runtime::i18n::get_required_cli_string_with_args(key, args)
+}
+
+fn append_provider_fallback_footer(
+    mut response: String,
+    fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+) -> String {
+    let Some(fallback) = fallback else {
+        return response;
+    };
+    let requested_family = fallback.requested_provider.split(':').next().unwrap_or("");
+    let actual_family = fallback.actual_provider.split(':').next().unwrap_or("");
+    let same_family = requested_family == actual_family
+        || requested_family.starts_with(actual_family)
+        || actual_family.starts_with(requested_family);
+    if !same_family {
+        response.push_str("\n\n---\n");
+        response.push_str(&channel_runtime_cli_string_with_args(
+            "channel-runtime-fallback-footer",
+            &[
+                ("requested", fallback.requested_provider.as_str()),
+                ("actual", fallback.actual_provider.as_str()),
+                ("model", fallback.actual_model.as_str()),
+            ],
+        ));
+    }
+    response
 }
 
 fn channel_runtime_scope_label(scope: OverrideScope) -> String {
@@ -647,34 +687,66 @@ fn is_stop_command(content: &str) -> bool {
     base.eq_ignore_ascii_case("/stop")
 }
 
+fn stop_reply_message(msg: &ChannelMessage, reply: impl Into<String>) -> SendMessage {
+    SendMessage::reply_to(msg, reply)
+}
+
+/// Every XML-ish element name that opens a tool-CALL envelope, longest first so
+/// a prefix scan reads `<tool_call …>` as itself rather than as the shorter
+/// `<tool …>`.
+///
+/// Canonical for the channel boundary. [`strip_tool_call_tags`] builds its
+/// complete `<name>` / `</name>` pairs from this list and
+/// [`truncate_at_unclosed_scratchpad_open`] derives its partial-prefix
+/// inventory from it, so a dialect added here cannot be stripped from a
+/// delivered message but left visible in a draft frame.
+const TOOL_CALL_TAG_NAMES: [&str; 7] = [
+    "function_calls",
+    "function_call",
+    "tool_call",
+    "tool-call",
+    "toolcall",
+    "invoke",
+    "tool",
+];
+
+/// The result envelope's element name. Kept apart from the call names because
+/// the two are stripped under different conditions: the call pass is skipped
+/// for an answer that is genuine `<tool_call>` documentation, while results are
+/// stripped unconditionally.
+const TOOL_RESULT_TAG_NAME: &str = "tool_result";
+
+/// Every protocol element name, call and result alike, longest first.
+fn tool_protocol_tag_names() -> impl Iterator<Item = &'static str> {
+    // `tool_result` sorts before the bare `tool` for the same longest-first
+    // reason the call list is ordered.
+    TOOL_CALL_TAG_NAMES
+        .into_iter()
+        .take(TOOL_CALL_TAG_NAMES.len() - 1)
+        .chain(std::iter::once(TOOL_RESULT_TAG_NAME))
+        .chain(std::iter::once("tool"))
+}
+
 pub(crate) fn strip_tool_call_tags(message: &str) -> String {
-    const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
-        "<function_calls>",
-        "<function_call>",
-        "<tool_call>",
-        "<toolcall>",
-        "<tool-call>",
-        "<tool>",
-        "<invoke>",
-    ];
+    static TOOL_CALL_TAG_PAIRS: std::sync::LazyLock<Vec<(String, String)>> =
+        std::sync::LazyLock::new(|| {
+            TOOL_CALL_TAG_NAMES
+                .iter()
+                .map(|name| (format!("<{name}>"), format!("</{name}>")))
+                .collect()
+        });
 
-    fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    fn find_first_tag<'a>(
+        haystack: &str,
+        tags: &'a [(String, String)],
+    ) -> Option<(usize, &'a str, &'a str)> {
         tags.iter()
-            .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
-            .min_by_key(|(idx, _)| *idx)
-    }
-
-    fn matching_close_tag(open_tag: &str) -> Option<&'static str> {
-        match open_tag {
-            "<function_calls>" => Some("</function_calls>"),
-            "<function_call>" => Some("</function_call>"),
-            "<tool_call>" => Some("</tool_call>"),
-            "<toolcall>" => Some("</toolcall>"),
-            "<tool-call>" => Some("</tool-call>"),
-            "<tool>" => Some("</tool>"),
-            "<invoke>" => Some("</invoke>"),
-            _ => None,
-        }
+            .filter_map(|(open, close)| {
+                haystack
+                    .find(open.as_str())
+                    .map(|idx| (idx, open.as_str(), close.as_str()))
+            })
+            .min_by_key(|(idx, _, _)| *idx)
     }
 
     fn extract_first_json_end(input: &str) -> Option<usize> {
@@ -763,15 +835,12 @@ pub(crate) fn strip_tool_call_tags(message: &str) -> String {
     let mut kept_segments = Vec::new();
     let mut remaining = message;
 
-    while let Some((start, open_tag)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
+    while let Some((start, open_tag, close_tag)) = find_first_tag(remaining, &TOOL_CALL_TAG_PAIRS) {
         let before = &remaining[..start];
         if !before.is_empty() {
             kept_segments.push(before.to_string());
         }
 
-        let Some(close_tag) = matching_close_tag(open_tag) else {
-            break;
-        };
         let after_open = &remaining[start + open_tag.len()..];
 
         if let Some(close_idx) = after_open.find(close_tag) {
@@ -2019,7 +2088,36 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
     format!("{base_prompt}\n\n{refreshed_skills}")
 }
 
-fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
+fn rendered_skills_prompt_mode(
+    prompt: &str,
+) -> Option<zeroclaw_config::schema::SkillsPromptInjectionMode> {
+    const SKILLS_HEADER: &str = "## Available Skills\n\n";
+    const SKILLS_END: &str = "</available_skills>";
+
+    let start = prompt.find(SKILLS_HEADER)?;
+    let rel_end = prompt[start..].find(SKILLS_END)?;
+    let section = &prompt[start..start + rel_end + SKILLS_END.len()];
+    let preamble = section.split_once("<available_skills>")?.0;
+
+    if preamble.contains("Skill summaries are preloaded below") {
+        Some(zeroclaw_config::schema::SkillsPromptInjectionMode::Compact)
+    } else if preamble.contains("Skill instructions and tool metadata are preloaded below") {
+        Some(zeroclaw_config::schema::SkillsPromptInjectionMode::Full)
+    } else {
+        None
+    }
+}
+
+fn refreshed_skills_system_prompt(
+    ctx: &ChannelRuntimeContext,
+    base_prompt: &str,
+    read_skill_available: bool,
+) -> String {
+    let skills_prompt_mode = zeroclaw_runtime::skills::skills_prompt_mode_with_loader_fallback(
+        ctx.prompt_config
+            .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
+        read_skill_available,
+    );
     let refreshed_skills = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
         &zeroclaw_runtime::skills::load_skills_for_agent(
             ctx.workspace_dir.as_ref(),
@@ -2027,10 +2125,105 @@ fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
             ctx.agent_alias.as_ref(),
         ),
         ctx.workspace_dir.as_ref(),
+        skills_prompt_mode,
+    );
+    replace_available_skills_section(base_prompt, &refreshed_skills)
+}
+
+fn system_prompt_for_channel_turn(
+    ctx: &ChannelRuntimeContext,
+    base_prompt: &str,
+    refresh_skills: bool,
+    read_skill_available: bool,
+) -> String {
+    let desired_mode = zeroclaw_runtime::skills::skills_prompt_mode_with_loader_fallback(
         ctx.prompt_config
             .effective_skills_prompt_mode(ctx.agent_alias.as_str()),
+        read_skill_available,
     );
-    replace_available_skills_section(ctx.system_prompt.as_str(), &refreshed_skills)
+    let cached_mode_changed = rendered_skills_prompt_mode(base_prompt)
+        .is_some_and(|cached_mode| cached_mode != desired_mode);
+
+    if refresh_skills || cached_mode_changed {
+        refreshed_skills_system_prompt(ctx, base_prompt, read_skill_available)
+    } else {
+        base_prompt.to_string()
+    }
+}
+
+fn read_skill_available_for_channel_turn(
+    model_provider: &dyn ModelProvider,
+    strict_tool_parsing: bool,
+    tools_registry: &[Box<dyn Tool>],
+    excluded_tools: &[String],
+    system_prompt: &str,
+) -> bool {
+    let callable_protocol = model_provider.supports_native_tools()
+        || (!strict_tool_parsing && text_tool_prompt_advertises(system_prompt, "read_skill"));
+
+    callable_protocol
+        && tools_registry
+            .iter()
+            .any(|tool| tool.name() == "read_skill")
+        && !excluded_tools
+            .iter()
+            .any(|excluded| excluded == "read_skill")
+}
+
+fn text_tool_prompt_advertises(system_prompt: &str, tool_name: &str) -> bool {
+    const PROTOCOL_HEADER: &str = "## Tool Use Protocol\n\n";
+    const TOOLS_HEADER: &str = "### Available Tools\n\n";
+
+    let Some(protocol_start) = system_prompt.rfind(PROTOCOL_HEADER) else {
+        return false;
+    };
+    let protocol = &system_prompt[protocol_start + PROTOCOL_HEADER.len()..];
+    let Some(tools_start) = protocol.find(TOOLS_HEADER) else {
+        return false;
+    };
+    let tools = &protocol[tools_start + TOOLS_HEADER.len()..];
+    let tools = tools
+        .split_once("\n## ")
+        .map_or(tools, |(tools, _next_section)| tools);
+    let expected_prefix = format!("**{tool_name}**:");
+
+    tools.lines().any(|line| line.starts_with(&expected_prefix))
+}
+
+fn refresh_channel_history_skills(
+    ctx: &ChannelRuntimeContext,
+    history: &mut [ChatMessage],
+    read_skill_available: bool,
+) {
+    let Some(system_message) = history
+        .first_mut()
+        .filter(|message| message.role == "system")
+    else {
+        return;
+    };
+    system_message.content = system_prompt_for_channel_turn(
+        ctx,
+        system_message.content.as_str(),
+        false,
+        read_skill_available,
+    );
+}
+
+fn effective_non_cli_tool_names<'a>(
+    tools_registry: &'a [Box<dyn Tool>],
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+) -> HashSet<&'a str> {
+    tools_registry
+        .iter()
+        .map(|tool| tool.name())
+        .filter(|name| {
+            risk_profile.level == AutonomyLevel::Full
+                || !risk_profile
+                    .excluded_tools
+                    .iter()
+                    .any(|excluded| excluded == *name)
+        })
+        .collect()
 }
 
 fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
@@ -2197,6 +2390,16 @@ fn should_rollback_failed_user_turn(error: &anyhow::Error) -> bool {
     }
 
     zeroclaw_providers::reliable::is_non_retryable(error)
+}
+
+/// Select the user-facing channel failure after preserving the typed terminal
+/// cause. Substring-based transient hints remain a fallback only: an earlier
+/// transport failure in an aggregate must not mask the final terminal cause.
+fn channel_user_error_message(error: &anyhow::Error, safe_error: &str) -> String {
+    zeroclaw_runtime::agent::terminal_completion_error_message(error, None)
+        .map(|message| format!("⚠️ Error: {message}"))
+        .or_else(|| zeroclaw_providers::reliable::transient_error_hint(error).map(str::to_string))
+        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"))
 }
 
 fn is_context_window_overflow_error(err: &anyhow::Error) -> bool {
@@ -2974,23 +3177,7 @@ async fn handle_runtime_command_if_needed(
         ),
     };
 
-    if let Err(err) = channel
-        .send(&{
-            let mut sm = SendMessage::new(response, &msg.reply_target)
-                .in_thread(msg.thread_ts.clone())
-                .in_reply_to(Some(msg.id.clone()));
-            if let Some(ref subj) = msg.subject {
-                let reply_subject = if subj.to_lowercase().starts_with("re:") {
-                    subj.clone()
-                } else {
-                    format!("Re: {}", subj)
-                };
-                sm = sm.subject(reply_subject);
-            }
-            sm
-        })
-        .await
-    {
+    if let Err(err) = channel.send(&SendMessage::reply_to(msg, response)).await {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -3170,12 +3357,10 @@ impl AssistantChannelOutcome {
     fn history_marker(&self) -> String {
         match self {
             Self::Reply(text) => text.clone(),
-            Self::NoReply {
-                reason: Some(reason),
-                ..
-            } if !reason.trim().is_empty() => {
-                format!("[No reply sent: {}]", reason.trim())
-            }
+            // Classifier reasons are model-produced, potentially derived from
+            // untrusted inbound text, and are replayed to the classifier with
+            // conversation history. Keep this marker structural so a reason
+            // never crosses that history boundary.
             Self::NoReply { .. } => "[No reply sent]".to_string(),
         }
     }
@@ -3405,6 +3590,334 @@ fn strip_think_tags_inline(s: &str) -> String {
         }
     }
     result.trim().to_string()
+}
+
+/// Drop the tail from the first scratchpad envelope that has opened but not
+/// closed.
+///
+/// Streaming needs this and final delivery does not: the final response is a
+/// complete turn, whereas a draft is rendered from whatever tokens have
+/// arrived, and the closing tag can be hundreds of tokens away. Showing the
+/// open envelope in the meantime is precisely the leak this guards against.
+/// Nothing is lost — the next delta re-renders from the full accumulation.
+///
+/// A *closed* block is stepped over rather than cut at. On the paths that
+/// strip closed blocks first there is nothing left to step over, so this costs
+/// nothing there; it is what makes the function safe to run on the branch that
+/// deliberately preserves a complete `<tool_call>` example, where cutting at
+/// the first opener would delete the very thing the branch exists to keep.
+fn truncate_at_unclosed_scratchpad_open(s: &str) -> String {
+    let mut cut = s.len();
+    let mut from = 0;
+    while let Some(offset) = s[from..].find('<') {
+        let open_at = from + offset;
+        let Some(name) = protocol_tag_name_at(&s[open_at..]) else {
+            // Not a protocol opener: step past this `<` and keep scanning, so
+            // ordinary markup or prose does not end the search early.
+            from = open_at + 1;
+            continue;
+        };
+        let closer = format!("</{name}>");
+        match s[open_at..].find(&closer) {
+            // Complete block: resume after it, so a later opener is still
+            // evaluated on its own merits.
+            Some(close_at) => from = open_at + close_at + closer.len(),
+            // Nothing closes this one, so it is still mid-emission.
+            None => {
+                cut = open_at;
+                break;
+            }
+        }
+    }
+
+    let head = &s[..cut];
+    // The opening tag is itself delivered in fragments, so the tail can be a
+    // strict prefix of an opener ("…\n<tool_res") that matches no complete name
+    // yet. Cutting only on the complete literal renders that fragment to the
+    // user for one frame — the leak this function exists to prevent. The
+    // fragment is restored by the next delta if it turns out to be prose.
+    let partial = head
+        .rfind('<')
+        .filter(|&pos| is_partial_protocol_tag_open(&head[pos..]))
+        .unwrap_or(head.len());
+    head[..partial].trim_end().to_string()
+}
+
+/// The protocol element name opening at the start of `rest`, if any.
+///
+/// Longest match wins, so `<tool_call>` is never read as the shorter `<tool>`
+/// and mistakenly hunted for a `</tool>` that will never arrive. The name must
+/// be followed by a character that actually terminates an element name, so
+/// prose like `<toolkit>` is not mistaken for protocol.
+fn protocol_tag_name_at(rest: &str) -> Option<&'static str> {
+    tool_protocol_tag_names().find(|name| {
+        let Some(after) = rest.get(1..1 + name.len()) else {
+            return false;
+        };
+        if !after.eq_ignore_ascii_case(name) {
+            return false;
+        }
+        rest[1 + name.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| c == '>' || c == '/' || c.is_whitespace())
+    })
+}
+
+/// Whether `rest` is a still-incomplete opener — a strict prefix of some
+/// protocol element name, with nothing after it yet to say otherwise.
+fn is_partial_protocol_tag_open(rest: &str) -> bool {
+    let Some(typed) = rest.strip_prefix('<') else {
+        return false;
+    };
+    tool_protocol_tag_names().any(|name| {
+        name.len() >= typed.len()
+            && name
+                .get(..typed.len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(typed))
+    })
+}
+
+/// Sanitize a streaming draft partial before it is shown to the user.
+///
+/// Draft text is model output mid-flight, so it can carry scratchpad that the
+/// delivered response never keeps: reasoning traces, and — because native
+/// tool-call providers interleave narration with protocol — raw
+/// `<tool_call>` / `<tool_result>` envelopes. Final replies are cleaned by
+/// [`sanitize_channel_response_for_format_with_leak_detection`], but drafts
+/// never reach it: `update_draft` posts straight to the channel transport, so
+/// a leaked envelope stays on screen until the final edit replaces it, and
+/// remains visible indefinitely if the turn fails first.
+///
+/// This is the assistant-output boundary for partial text, and it keeps the
+/// final sanitizer's preservation contract rather than a looser one: an
+/// answer that *is* documentation for `<tool_call>` keeps its tags here
+/// exactly as it keeps them through final delivery, while `<tool_result>`
+/// envelopes and reasoning go in both places. Placing the filter here rather
+/// than in a channel transport is deliberate — transports also carry
+/// attachment captions, announcements, and operator text, none of which are
+/// assistant scratchpad.
+fn sanitize_streaming_draft_text(s: &str, known_tool_names: &HashSet<String>) -> String {
+    let cleaned = strip_think_tags_inline(s);
+
+    // Same classifier the delivered message is judged by, for the same reason:
+    // XML tags are only one of the shapes protocol arrives in. A provider with
+    // `strict_tool_parsing` enabled forwards deltas without passing them
+    // through the runtime's `StreamTextGuard`, so a bare or fenced protocol
+    // JSON body reaches this boundary exactly as the model emitted it. The
+    // classifier is partial-aware where it matters — an envelope whose JSON has
+    // not finished arriving fails to parse and is caught as malformed — and it
+    // exempts genuine protocol documentation, so an answer *about* tool calls
+    // is not blanked.
+    //
+    // Blanking a frame is the safe direction: an accumulation that momentarily
+    // classifies as protocol and later resolves to prose is re-rendered whole
+    // by the next delta, whereas a leaked envelope stays on screen until the
+    // final edit, or forever if the turn fails first.
+    if should_suppress_top_level_tool_protocol_response(cleaned.trim(), known_tool_names) {
+        return String::new();
+    }
+
+    // Mirror the final sanitizer's guards exactly rather than inventing a
+    // looser draft contract: there, the tool-CALL pass is skipped for genuine
+    // protocol examples while the tool-RESULT pass runs unconditionally.
+    // Preserving more here than final delivery preserves would put content on
+    // screen that the delivered message then strips — a leak window in the
+    // one direction this fix exists to close.
+    let cleaned = if starts_with_visible_tool_call_tag_example(&cleaned) {
+        // Preserving the example does not license showing a half-emitted
+        // result envelope: `strip_tool_result_content` removes the closed
+        // ones, and truncation removes an opener that has no closer yet.
+        // Skipping truncation here would leave a raw partial payload on
+        // screen, which is the same leak this function exists to close.
+        strip_tool_result_content(&cleaned)
+    } else {
+        let cleaned = strip_tool_call_tags(&cleaned);
+        strip_tool_result_content(&cleaned)
+    };
+
+    // Embedded protocol, as opposed to a whole-response envelope: narration
+    // followed by a fenced or bare JSON payload. Both passes only act on
+    // complete blocks, which is why the truncations below still have work to do.
+    let cleaned = strip_fenced_tool_protocol_artifacts(&cleaned, known_tool_names);
+    let cleaned = strip_isolated_tool_json_artifacts(&cleaned, known_tool_names);
+
+    let cleaned = truncate_at_unclosed_protocol_fence(&cleaned, known_tool_names);
+    let cleaned = truncate_at_incomplete_protocol_json(&cleaned);
+    truncate_at_unclosed_scratchpad_open(&cleaned)
+}
+
+/// Drop the tail from a JSON value that has started, already reads as tool
+/// protocol, and has not finished arriving.
+///
+/// This is the JSON counterpart to [`truncate_at_unclosed_scratchpad_open`],
+/// and it exists for the same reason: the completed-payload passes cannot
+/// classify a value they cannot parse, so without it the first frames of a
+/// protocol envelope render verbatim — `{"tool_call_id":"call_1",` on screen
+/// while the rest is still coming.
+///
+/// Complete values are stepped over rather than cut at, so narration followed
+/// by finished JSON is judged by the completed-payload passes as before. Only
+/// the unfinished tail is held back, and only when the parser recognizes it as
+/// protocol, so an ordinary JSON answer still streams as it arrives.
+fn truncate_at_incomplete_protocol_json(s: &str) -> String {
+    let mut from = 0;
+    while let Some(rel) = s[from..].find(['{', '[']) {
+        let at = from + rel;
+        let tail = &s[at..];
+        let mut stream = serde_json::Deserializer::from_str(tail).into_iter::<serde_json::Value>();
+        match stream.next() {
+            Some(Ok(_)) if stream.byte_offset() > 0 => from = at + stream.byte_offset(),
+            // Nothing completes from here, so this is the unfinished tail and
+            // everything after it belongs to the same value.
+            _ => {
+                return if zeroclaw_tool_call_parser::looks_like_incomplete_tool_protocol_json(tail)
+                {
+                    s[..at].trim_end().to_string()
+                } else {
+                    s.to_string()
+                };
+            }
+        }
+    }
+    s.to_string()
+}
+
+/// Drop the tail from a fenced block that has opened, already reads as tool
+/// protocol, and has not closed yet.
+///
+/// The completed-block passes cannot help here: a fence is only recognized once
+/// its closing ``` arrives, which for a protocol payload can be the rest of the
+/// turn. Waiting renders the payload meanwhile.
+///
+/// The cut is conditional on the partial body *already* classifying as
+/// protocol, so an ordinary fenced code block still streams line by line as the
+/// user expects; only a block that has shown its protocol shape is held back.
+fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<String>) -> String {
+    let mut cursor = 0usize;
+    while let Some(rel_open) = s[cursor..].find("```") {
+        let open_start = cursor + rel_open;
+        let after_ticks = open_start + 3;
+        let Some(line_end_rel) = s[after_ticks..].find('\n') else {
+            // The language tag itself is still arriving; nothing to judge yet.
+            return s.to_string();
+        };
+        let body_start = after_ticks + line_end_rel + 1;
+        match s[body_start..].find("```") {
+            Some(close_rel) => cursor = body_start + close_rel + 3,
+            None => {
+                let body = s[body_start..].trim();
+                return if should_suppress_top_level_tool_protocol_response(body, known_tool_names) {
+                    s[..open_start].trim_end().to_string()
+                } else {
+                    s.to_string()
+                };
+            }
+        }
+    }
+    s.to_string()
+}
+
+/// Pump draft deltas to the channel transport, sanitizing every partial on the
+/// way out.
+///
+/// Extracted from the streaming spawn so the boundary can be exercised through
+/// the values actually handed to `update_draft` and `update_draft_progress`. A
+/// test that calls [`sanitize_streaming_draft_text`] directly proves only that
+/// the helper is correct, and would stay green if this wiring were removed;
+/// the leak this guards against is a transport call carrying raw text, so that
+/// is what the regression needs to observe.
+///
+/// Status deltas are sanitized per delta because they replace the progress
+/// line outright, whereas text deltas are accumulated first: the sanitizer
+/// needs the whole partial to tell a closed envelope from one still arriving.
+///
+/// `known_tool_names` comes from the same registry the final sanitizer reads,
+/// so both boundaries judge a protocol payload by the same tool inventory.
+async fn run_draft_updater(
+    channel: Arc<dyn Channel>,
+    reply_target: String,
+    draft_id: String,
+    known_tool_names: HashSet<String>,
+    mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
+) {
+    use zeroclaw_runtime::agent::loop_::StreamDelta;
+    let mut accumulated = String::new();
+    while let Some(event) = rx.recv().await {
+        match event {
+            // A lifecycle event is a typed signal, not assistant text, so it
+            // carries nothing to sanitize and passes straight through.
+            StreamDelta::Lifecycle(event) => {
+                if let Err(e) = channel
+                    .update_draft_lifecycle(&reply_target, &draft_id, event)
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Draft lifecycle update failed"
+                    );
+                }
+            }
+            StreamDelta::Status(text) => {
+                let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
+                if let Err(e) = channel
+                    .update_draft_progress(&reply_target, &draft_id, &visible)
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Draft progress update failed"
+                    );
+                }
+            }
+            // Structured tool events remain visible to ordinary draft
+            // consumers through the runtime's conservative legacy renderer.
+            // Matrix has its own disclosure policy in
+            // `run_matrix_single_message_draft_updater`.
+            event @ (StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. }) => {
+                if let Some(text) = event.legacy_status() {
+                    let visible = sanitize_streaming_draft_text(&text, &known_tool_names);
+                    if let Err(e) = channel
+                        .update_draft_progress(&reply_target, &draft_id, &visible)
+                        .await
+                    {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                            "Draft progress update failed"
+                        );
+                    }
+                }
+            }
+            // Provider reasoning is opt-in at each channel surface. The
+            // generic draft path has no such presentation policy, so it must
+            // not disclose it merely because the runtime now carries it.
+            StreamDelta::Reasoning(_) => {}
+            StreamDelta::Text(text) => {
+                accumulated.push_str(&text);
+                let visible = sanitize_streaming_draft_text(&accumulated, &known_tool_names);
+                if let Err(e) = channel
+                    .update_draft(&reply_target, &draft_id, &visible)
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Draft update failed"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn starts_with_visible_tool_call_tag_example(response: &str) -> bool {
@@ -4329,6 +4842,10 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+fn scrub_typing_error(error: &anyhow::Error) -> String {
+    zeroclaw_runtime::security::scrub(&error.to_string())
+}
+
 fn spawn_scoped_typing_task(
     channel: Arc<dyn Channel>,
     recipient: String,
@@ -4345,7 +4862,7 @@ fn spawn_scoped_typing_task(
                 () = stop_signal.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(e) = channel.start_typing(&recipient).await {
-                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "failed to start typing");
+                        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})), "failed to start typing");
                     }
                 }
             }
@@ -4355,11 +4872,268 @@ fn spawn_scoped_typing_task(
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
                 "failed to stop typing"
             );
         }
     })
+}
+
+/// Matrix `single_message` drafts are externally visible. This carries typing
+/// from accepted input through pre-delivery work and stops it before the draft.
+/// A proper general lifecycle still requires event-subsystem ownership.
+struct MatrixSingleMessageTypingScope {
+    cancellation: CancellationToken,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MatrixSingleMessageTypingScope {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
+}
+
+fn start_matrix_single_message_typing_scope(
+    channel: Arc<dyn Channel>,
+    recipient: String,
+) -> MatrixSingleMessageTypingScope {
+    start_matrix_single_message_typing_scope_with_interval(
+        channel,
+        recipient,
+        Duration::from_millis(MATRIX_SINGLE_MESSAGE_TYPING_REFRESH_INTERVAL_MS),
+    )
+}
+
+fn start_matrix_single_message_typing_scope_with_interval(
+    channel: Arc<dyn Channel>,
+    recipient: String,
+    refresh_interval: Duration,
+) -> MatrixSingleMessageTypingScope {
+    let cancellation = CancellationToken::new();
+    let handle = spawn_matrix_single_message_typing_task(
+        channel,
+        recipient,
+        refresh_interval,
+        cancellation.clone(),
+    );
+    MatrixSingleMessageTypingScope {
+        cancellation,
+        handle: Some(handle),
+    }
+}
+
+fn spawn_matrix_single_message_typing_task(
+    channel: Arc<dyn Channel>,
+    recipient: String,
+    refresh_interval: Duration,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    zeroclaw_spawn::spawn!(async move {
+        let mut interval = tokio::time::interval(refresh_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        interval.tick().await;
+        let cancelled_before_start = tokio::select! {
+            () = cancellation.cancelled() => true,
+            result = channel.start_typing(&recipient) => {
+                if let Err(e) = result {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note
+                        )
+                        .with_attrs(::serde_json::json!({
+                            "error": scrub_typing_error(&e)
+                        })),
+                        "failed to start typing"
+                    );
+                }
+                false
+            }
+        };
+        if !cancelled_before_start {
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        if let Err(e) = channel.start_typing(&recipient).await {
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "error": scrub_typing_error(&e)
+                                })),
+                                "failed to refresh typing"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        match tokio::time::timeout(
+            Duration::from_millis(MATRIX_SINGLE_MESSAGE_TYPING_CLEANUP_TIMEOUT_MS),
+            channel.stop_typing(&recipient),
+        )
+        .await
+        {
+            Ok(Err(e)) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"error": scrub_typing_error(&e)})),
+                    "failed to stop typing"
+                );
+            }
+            Err(_) => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "timed out stopping typing"
+                );
+            }
+            Ok(Ok(())) => {}
+        }
+    })
+}
+
+async fn stop_matrix_single_message_typing_scope(mut scope: MatrixSingleMessageTypingScope) {
+    scope.cancellation.cancel();
+    if let Some(mut handle) = scope.handle.take() {
+        match tokio::time::timeout(
+            Duration::from_millis(MATRIX_SINGLE_MESSAGE_TYPING_CLEANUP_TIMEOUT_MS),
+            &mut handle,
+        )
+        .await
+        {
+            Ok(result) => log_worker_join_result(result),
+            Err(_) => handle.abort(),
+        }
+    }
+}
+
+struct ScopedTypingTask {
+    cancellation_token: CancellationToken,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+struct ScopedTypingController {
+    channel: Arc<dyn Channel>,
+    recipient: String,
+    task: tokio::sync::Mutex<Option<ScopedTypingTask>>,
+}
+
+impl ScopedTypingController {
+    fn new(channel: Arc<dyn Channel>, recipient: String) -> Self {
+        Self {
+            channel,
+            recipient,
+            task: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    async fn resume(&self) {
+        let mut task = self.task.lock().await;
+        if task.is_some() {
+            return;
+        }
+
+        let cancellation_token = CancellationToken::new();
+        let handle = spawn_scoped_typing_task(
+            Arc::clone(&self.channel),
+            self.recipient.clone(),
+            cancellation_token.clone(),
+        );
+        *task = Some(ScopedTypingTask {
+            cancellation_token,
+            handle,
+        });
+    }
+
+    async fn pause(&self) {
+        let task = self.task.lock().await.take();
+        if let Some(task) = task {
+            task.cancellation_token.cancel();
+            log_worker_join_result(task.handle.await);
+        }
+    }
+}
+
+struct ApprovalTypingChannel {
+    inner: Arc<dyn Channel>,
+    typing: Arc<ScopedTypingController>,
+}
+
+impl ApprovalTypingChannel {
+    fn new(inner: Arc<dyn Channel>, typing: Arc<ScopedTypingController>) -> Self {
+        Self { inner, typing }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for ApprovalTypingChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        self.inner.role()
+    }
+
+    fn alias(&self) -> &str {
+        self.inner.alias()
+    }
+}
+
+// `ToolLoop::channel` is consumed only by the approval gate. Approval-gated
+// calls are forced sequential by `should_execute_tools_in_parallel`, so this
+// deliberately narrow wrapper forwards the required Channel methods plus the
+// approval boundary instead of acting as a general channel facade.
+#[async_trait::async_trait]
+impl Channel for ApprovalTypingChannel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.inner.send(message).await
+    }
+
+    async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        self.inner.listen(tx).await
+    }
+
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::ChannelApprovalResponse>> {
+        Ok(self
+            .request_approval_attributed(recipient, request)
+            .await?
+            .map(|response| response.response))
+    }
+
+    async fn request_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &zeroclaw_api::channel::ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+        self.typing.pause().await;
+        let response = self
+            .inner
+            .request_approval_attributed(recipient, request)
+            .await;
+        if response.as_ref().is_ok_and(|response| {
+            response.as_ref().is_some_and(|response| {
+                matches!(
+                    response.response,
+                    zeroclaw_api::channel::ChannelApprovalResponse::Approve
+                        | zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
+                )
+            })
+        }) {
+            self.typing.resume().await;
+        }
+        response
+    }
 }
 
 async fn process_channel_message(
@@ -4392,6 +5166,718 @@ async fn process_channel_message(
     .await;
 }
 
+/// Resolve whether this inbound message uses Matrix `single_message`
+/// streaming. This is the only Matrix-specific branch the orchestrator needs:
+/// the channel still owns draft rendering, while the orchestrator avoids
+/// sending duplicate standalone tool-notification messages.
+fn matrix_single_message_streaming_enabled_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    matrix_config_for_message(config, msg).is_some_and(|config| {
+        config.stream_mode == zeroclaw_config::schema::MatrixStreamMode::SingleMessage
+    })
+}
+
+fn matrix_config_for_message<'a>(
+    config: &'a zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Option<&'a zeroclaw_config::schema::MatrixConfig> {
+    if msg.channel != "matrix" {
+        return None;
+    }
+    config.channels.matrix.get(msg.channel_alias.as_ref()?)
+}
+
+fn matrix_single_message_streaming_enabled(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    matrix_single_message_streaming_enabled_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn matrix_stream_reasoning_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_config::schema::StreamReasoningMode {
+    matrix_config_for_message(config, msg).map_or(
+        zeroclaw_config::schema::StreamReasoningMode::default(),
+        |config| config.stream_reasoning,
+    )
+}
+
+fn matrix_stream_reasoning(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> zeroclaw_config::schema::StreamReasoningMode {
+    matrix_stream_reasoning_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn matrix_draft_update_interval_ms_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> u64 {
+    let default_interval = zeroclaw_config::schema::MatrixConfig::default()
+        .draft_update_interval_ms
+        .max(50);
+    matrix_config_for_message(config, msg).map_or(default_interval, |config| {
+        config.draft_update_interval_ms.max(50)
+    })
+}
+
+fn matrix_draft_update_interval_ms(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> u64 {
+    matrix_draft_update_interval_ms_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn matrix_stream_draft_lines_for_config(
+    config: &zeroclaw_config::schema::Config,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    let default_lines = zeroclaw_config::schema::MatrixConfig::default().stream_draft_lines;
+    matrix_config_for_message(config, msg).map_or(default_lines, |config| config.stream_draft_lines)
+}
+
+fn matrix_stream_draft_lines(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> usize {
+    matrix_stream_draft_lines_for_config(ctx.prompt_config.as_ref(), msg)
+}
+
+fn single_message_pending_has_prefix(text: &str, prefix: &str) -> bool {
+    text.strip_prefix(prefix)
+        .is_some_and(|rest| !rest.is_empty())
+}
+
+fn single_message_pending_thinking_round(text: &str) -> Option<usize> {
+    zeroclaw_runtime::agent::loop_::thinking_status_round(text)
+}
+
+fn single_message_pending_is_thinking_status(text: &str) -> bool {
+    single_message_pending_thinking_round(text).is_some()
+}
+
+fn single_message_pending_is_reasoning(text: &str) -> bool {
+    single_message_pending_has_prefix(text, zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+        && !single_message_pending_is_thinking_status(text)
+}
+
+fn single_message_pending_visible_lines(text: &str) -> usize {
+    if single_message_pending_is_reasoning(text) {
+        text.trim_end_matches(&['\r', '\n'][..])
+            .split('\n')
+            .count()
+            .max(1)
+    } else {
+        1
+    }
+}
+
+fn trim_pending_visible_lines_from_front(text: &str, remove_lines: usize) -> String {
+    if remove_lines == 0 {
+        return text.to_string();
+    }
+
+    let rendered = text.trim_end_matches(&['\r', '\n'][..]);
+    let total = single_message_pending_visible_lines(rendered);
+    if remove_lines >= total {
+        return String::new();
+    }
+
+    let retained = rendered
+        .split('\n')
+        .skip(remove_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if single_message_pending_is_reasoning(text)
+        && !retained.starts_with(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+    {
+        format!(
+            "{}{retained}",
+            zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX
+        )
+    } else {
+        retained
+    }
+}
+
+fn trim_matrix_single_message_pending(pending: &mut Vec<String>, max_lines: usize) {
+    if max_lines == 0 {
+        return;
+    }
+    let mut total_lines = pending
+        .iter()
+        .map(|line| single_message_pending_visible_lines(line))
+        .sum::<usize>();
+    while total_lines > max_lines {
+        let remove_lines = total_lines - max_lines;
+        let line_count = single_message_pending_visible_lines(&pending[0]);
+        if remove_lines >= line_count {
+            pending.remove(0);
+            total_lines = total_lines.saturating_sub(line_count);
+        } else {
+            pending[0] = trim_pending_visible_lines_from_front(&pending[0], remove_lines);
+            break;
+        }
+    }
+}
+
+fn push_matrix_single_message_pending(pending: &mut Vec<String>, text: String, max_lines: usize) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(incoming_round) = single_message_pending_thinking_round(&text)
+        && let Some(existing) = pending.last_mut()
+        && single_message_pending_is_thinking_status(existing)
+    {
+        if incoming_round >= single_message_pending_thinking_round(existing).unwrap_or(0) {
+            *existing = text;
+        }
+        trim_matrix_single_message_pending(pending, max_lines);
+        return;
+    }
+
+    if let Some(fragment) = text.strip_prefix(zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX)
+        && let Some(existing) = pending.last_mut()
+        && single_message_pending_is_reasoning(existing)
+    {
+        existing.push_str(fragment);
+        trim_matrix_single_message_pending(pending, max_lines);
+        return;
+    }
+
+    pending.push(text);
+    trim_matrix_single_message_pending(pending, max_lines);
+}
+
+const RUNTIME_ONLY_TOOL_ARGUMENTS: &[&str] = &["approved", "__config"];
+
+/// Matrix's canonical safe-display policy for native standard tools. Extensions
+/// and unresolved events never use this table, even when their public name collides.
+///
+/// A schema-annotation alternative could mark displayable properties in each
+/// provider-facing `ToolSpec` and recursively traverse nested schemas. It is
+/// deliberately deferred: provider compatibility for custom schema keywords is
+/// not established, nested-path configuration broadens this feature, and safe
+/// mode intentionally omits composite values. A follow-up PR may introduce
+/// that general metadata model above this Matrix-local policy.
+const MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
+    (&["shell"], &["command"]),
+    (&["file_read"], &["path", "offset", "limit", "encoding"]),
+    (&["file_write"], &["path", "encoding"]),
+    (&["file_edit"], &["path"]),
+    (&["glob_search"], &["pattern"]),
+    (
+        &["content_search"],
+        &[
+            "pattern",
+            "path",
+            "output_mode",
+            "include",
+            "case_sensitive",
+            "max_results",
+        ],
+    ),
+    (&["git_operations"], &["action", "path", "branch"]),
+    (&["cron_add"], &["name", "job_type"]),
+    (&["cron_remove", "cron_run", "cron_update"], &[]),
+    (&["cron_runs"], &["limit"]),
+    (&["schedule"], &["action", "expression", "delay", "run_at"]),
+    (&["send_message_to_peer", "send_via"], &[]),
+    (&["ask_user"], &["timeout_secs"]),
+    (
+        &["escalate_to_human"],
+        &["urgency", "wait_for_response", "timeout_secs"],
+    ),
+    (&["reaction"], &["action", "emoji"]),
+    (&["poll"], &["duration_minutes", "multi_select"]),
+    (
+        &["channel_room"],
+        &["action", "name", "visibility", "encryption"],
+    ),
+    (&["sessions_list"], &["limit"]),
+    (&["sessions_history"], &["limit"]),
+    (&["sessions_send"], &[]),
+    (&["memory_store"], &["category"]),
+    (&["memory_recall"], &["query", "limit"]),
+    (&["memory_forget"], &[]),
+    (
+        &["memory_export"],
+        &["namespace", "category", "since", "until"],
+    ),
+    (&["memory_purge"], &["namespace"]),
+    (
+        &["model_routing_config"],
+        &["action", "model_provider", "model"],
+    ),
+    (&["model_switch"], &["action", "model_provider", "model"]),
+    (&["proxy_config"], &["action", "scope"]),
+    (&["browser"], &["action"]),
+    (&["http_request"], &["method"]),
+    (&["web_search_tool"], &["query"]),
+    (&["image_info"], &["path"]),
+    (&["canvas"], &["action"]),
+    (&["backup"], &[]),
+    (
+        &[
+            "cron_list",
+            "spawn_subagent",
+            "sessions_current",
+            "browser_open",
+            "web_fetch",
+            "screenshot",
+            "weather",
+            "pushover",
+            "calculator",
+        ],
+        &[],
+    ),
+];
+
+// These are configured or feature-gated standard tools. They are part of the
+// same presentation policy, but the default registry used by the drift test
+// intentionally does not construct them.
+const MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS: &[(&[&str], &[&str])] = &[
+    (
+        &["delegate"],
+        &["action", "agent", "background", "timeout_ms"],
+    ),
+    (&["sessions_reset", "sessions_delete"], &[]),
+    (&["read_skill", "skill_view"], &["name"]),
+    (&["skills_list"], &["source"]),
+    (&["skill_manage"], &["action", "name"]),
+    (
+        &["sop_execute", "sop_advance", "sop_approve", "sop_status"],
+        &["action"],
+    ),
+    (&["sop_workshop"], &["action", "name"]),
+    (&["sop_list"], &[]),
+    (&["browser_delegate", "text_browser"], &["action"]),
+    (&["tool_search"], &["query", "max_results"]),
+    (
+        &["file_upload", "file_upload_bundle", "file_download"],
+        &["path"],
+    ),
+    (&["security_ops"], &["action"]),
+    (&["data_management"], &[]),
+    (&["image_gen"], &["model", "size", "quality"]),
+    (
+        &[
+            "cloud_ops",
+            "cloud_patterns",
+            "project_intel",
+            "report_template",
+        ],
+        &["action", "provider", "path", "name", "format"],
+    ),
+    (
+        &[
+            "notion",
+            "jira",
+            "microsoft365",
+            "google_workspace",
+            "linkedin",
+            "composio",
+        ],
+        &["action"],
+    ),
+    (&["email_search"], &["folder", "limit"]),
+    (&["email_read"], &["folder"]),
+    (&["discord_search"], &["limit"]),
+    (&["hardware_board_info"], &["board"]),
+    (
+        &["hardware_memory_map", "hardware_memory_read"],
+        &["board", "address", "length"],
+    ),
+    (&["mcp_resources", "mcp_prompts"], &["action"]),
+    (
+        &[
+            "execute_pipeline",
+            "knowledge",
+            "llm_task",
+            "vi_verify",
+            "claude_code",
+            "claude_code_runner",
+            "codex_cli",
+            "gemini_cli",
+            "opencode_cli",
+        ],
+        &[],
+    ),
+];
+
+fn matrix_safe_tool_arguments(tool: &str) -> Option<&'static [&'static str]> {
+    MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS
+        .iter()
+        .chain(MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS)
+        .find_map(|(tools, arguments)| tools.contains(&tool).then_some(*arguments))
+}
+
+fn matrix_tool_progress(
+    event: &zeroclaw_runtime::agent::loop_::StreamDelta,
+    config: &Config,
+    matrix_alias: &str,
+) -> Option<String> {
+    let settings = config
+        .channels
+        .matrix
+        .get(matrix_alias)
+        .map_or(&[][..], |matrix| matrix.stream_tool_arguments.as_slice());
+    match event {
+        zeroclaw_runtime::agent::loop_::StreamDelta::ToolStart {
+            tool,
+            arguments,
+            tool_provenance,
+        } => {
+            let subject = matrix_tool_subject(tool, arguments, *tool_provenance, settings);
+            Some(format!("\u{23f3} {subject}\n"))
+        }
+        zeroclaw_runtime::agent::loop_::StreamDelta::ToolComplete {
+            tool,
+            arguments,
+            tool_provenance,
+            secs,
+            success,
+            error,
+        } => {
+            let subject = matrix_tool_subject(tool, arguments, *tool_provenance, settings);
+            if *success {
+                Some(format!("\u{2705} {subject} ({secs}s)\n"))
+            } else if let Some(error) = error {
+                Some(format!(
+                    "\u{274c} {subject} ({secs}s): {}\n",
+                    truncate_with_ellipsis(&matrix_scrub_display(error), 200)
+                ))
+            } else {
+                Some(format!("\u{274c} {subject} ({secs}s)\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn matrix_tool_subject(
+    tool: &str,
+    arguments: &serde_json::Value,
+    tool_provenance: Option<zeroclaw_api::attribution::ToolProvenance>,
+    settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
+) -> String {
+    // Tool lookup can fail, leaving a parser/model-supplied name without a
+    // trusted registry identity. Scrub and flatten every name at the Matrix
+    // presentation boundary; the draft transport performs Markdown/HTML
+    // escaping exactly once when it inserts the complete progress entry.
+    let display_tool = matrix_scrub_display(tool);
+    matrix_tool_argument_hint(tool, arguments, tool_provenance, settings).map_or_else(
+        || display_tool.clone(),
+        |hint| format!("{display_tool}: {hint}"),
+    )
+}
+
+fn matrix_tool_argument_hint(
+    tool: &str,
+    arguments: &serde_json::Value,
+    tool_provenance: Option<zeroclaw_api::attribution::ToolProvenance>,
+    settings: &[zeroclaw_config::schema::StreamToolArgumentEntry],
+) -> Option<String> {
+    use zeroclaw_config::schema::{
+        DEFAULT_STREAM_TOOL_ARGUMENT_CHARS, StreamToolArgumentBase, StreamToolArgumentEntry,
+    };
+
+    let serde_json::Value::Object(map) = arguments else {
+        return None;
+    };
+    let (default_base, default_chars) = settings
+        .iter()
+        .find_map(|entry| match entry {
+            StreamToolArgumentEntry::Defaults {
+                default_base,
+                argument_chars,
+            } => Some((
+                *default_base,
+                argument_chars.unwrap_or(DEFAULT_STREAM_TOOL_ARGUMENT_CHARS),
+            )),
+            StreamToolArgumentEntry::Tool { .. } => None,
+        })
+        .unwrap_or((
+            StreamToolArgumentBase::Safe,
+            DEFAULT_STREAM_TOOL_ARGUMENT_CHARS,
+        ));
+    let rule = settings.iter().find_map(|entry| match entry {
+        StreamToolArgumentEntry::Tool {
+            tool: rule_tool,
+            base,
+            include,
+            exclude,
+            argument_chars,
+        } if rule_tool == tool => Some((base, include, exclude, argument_chars)),
+        _ => None,
+    });
+    let (base, include, exclude, max_chars) = rule.map_or(
+        (default_base, &[][..], &[][..], default_chars),
+        |(base, include, exclude, argument_chars)| {
+            (
+                base.unwrap_or(default_base),
+                include.as_slice(),
+                exclude.as_slice(),
+                argument_chars.unwrap_or(default_chars),
+            )
+        },
+    );
+    let mut keys: Vec<(&str, bool)> = match base {
+        StreamToolArgumentBase::None => Vec::new(),
+        StreamToolArgumentBase::Safe => {
+            if matrix_safe_display_tool(tool_provenance) {
+                matrix_safe_tool_arguments(tool).unwrap_or_default()
+            } else {
+                &[]
+            }
+        }
+        .iter()
+        .copied()
+        .filter(|key| map.get(*key).is_some_and(matrix_is_scalar))
+        .map(|key| (key, false))
+        .collect(),
+        StreamToolArgumentBase::All => map.keys().map(|key| (key.as_str(), true)).collect(),
+    };
+    for key in include {
+        if map.contains_key(key) {
+            if let Some(existing) = keys.iter_mut().find(|(name, _)| *name == key) {
+                existing.1 = true;
+            } else {
+                keys.push((key, true));
+            }
+        }
+    }
+    keys.retain(|(key, _)| {
+        !exclude.iter().any(|excluded| excluded == key)
+            && !RUNTIME_ONLY_TOOL_ARGUMENTS.contains(key)
+    });
+    let parts: Vec<String> = keys
+        .into_iter()
+        .filter_map(|(key, explicit)| {
+            matrix_render_argument(key, map.get(key)?, max_chars, explicit)
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Matrix owns this disclosure policy. Only a resolved native tool may use its
+/// reviewed safe argument list; extensions and unresolved names are name-only.
+fn matrix_safe_display_tool(
+    tool_provenance: Option<zeroclaw_api::attribution::ToolProvenance>,
+) -> bool {
+    matches!(
+        tool_provenance,
+        Some(zeroclaw_api::attribution::ToolProvenance::Native)
+    )
+}
+
+fn matrix_render_argument(
+    key: &str,
+    value: &serde_json::Value,
+    max_chars: usize,
+    explicit: bool,
+) -> Option<String> {
+    if value.is_null() || (!explicit && !matrix_is_scalar(value)) {
+        return None;
+    }
+    let rendered = if zeroclaw_runtime::agent::is_credential_key(key) {
+        "[redacted]".to_string()
+    } else {
+        // The shared structured redactor owns credential policy, including key
+        // classification. Fix any newly discovered structured credential leak
+        // there rather than adding a Matrix-only exception.
+        let value = zeroclaw_runtime::agent::scrub_credentials_value(value.clone());
+        let rendered = match &value {
+            serde_json::Value::String(value) => value.clone(),
+            serde_json::Value::Bool(_) | serde_json::Value::Number(_) => value.to_string(),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                serde_json::to_string(&value).unwrap_or_else(|_| value.to_string())
+            }
+            serde_json::Value::Null => return None,
+        };
+        matrix_scrub_structured_display(&rendered)
+    };
+    if rendered.is_empty() {
+        None
+    } else if max_chars == 0 {
+        Some(format!("{key}={rendered}"))
+    } else {
+        Some(format!(
+            "{key}={}",
+            truncate_with_ellipsis(&rendered, max_chars)
+        ))
+    }
+}
+
+fn matrix_is_scalar(value: &serde_json::Value) -> bool {
+    matches!(
+        value,
+        serde_json::Value::String(_) | serde_json::Value::Bool(_) | serde_json::Value::Number(_)
+    )
+}
+
+fn matrix_normalize_display(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn matrix_scrub_display(value: &str) -> String {
+    matrix_normalize_display(&scrub_credentials(&zeroclaw_runtime::security::scrub(
+        value,
+    )))
+}
+
+fn matrix_scrub_structured_display(value: &str) -> String {
+    matrix_normalize_display(&zeroclaw_runtime::security::scrub(value))
+}
+
+fn matrix_scrub_progress_text(value: &str) -> String {
+    scrub_credentials(&zeroclaw_runtime::security::scrub(
+        &strip_think_tags_inline(value),
+    ))
+}
+
+fn matrix_progress_text(
+    event: &zeroclaw_runtime::agent::loop_::StreamDelta,
+    config: &Config,
+    matrix_alias: &str,
+) -> Option<String> {
+    use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
+
+    let text = match event {
+        StreamDelta::Status(text) => Some(matrix_scrub_progress_text(text)),
+        StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
+            matrix_tool_progress(event, config, matrix_alias)
+        }
+        StreamDelta::Reasoning(text) => Some(matrix_scrub_progress_text(&format!(
+            "{REASONING_FULL_PREFIX}{text}"
+        ))),
+        StreamDelta::Text(_) | StreamDelta::Lifecycle(_) => None,
+    }?;
+
+    // Every dynamic component has its own presentation/structured redaction,
+    // but the completed line is the Matrix progress egress boundary. Keep one
+    // canonical detector pass here after assembly, before buffering or
+    // transport encoding, so a future dynamic field cannot bypass the guard.
+    // Do not apply `scrub_credentials` again: structured-value redaction is
+    // the shared authority for serialized tool arguments.
+    Some(zeroclaw_runtime::security::scrub(&text))
+}
+
+async fn run_matrix_single_message_draft_updater(
+    mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::StreamDelta>,
+    channel: Arc<dyn Channel>,
+    reply_target: String,
+    draft_id: String,
+    interval_ms: u64,
+    stream_draft_lines: usize,
+    matrix_config: Arc<Config>,
+    matrix_alias: String,
+) {
+    let interval = Duration::from_millis(interval_ms.max(50));
+    let (flush_tx, mut flush_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+
+    let mut pending = Vec::<String>::new();
+    let mut rx_open = true;
+    let mut flush_in_flight = false;
+
+    macro_rules! queue_progress {
+        ($event:expr) => {
+            if let Some(text) = matrix_progress_text(&$event, &matrix_config, &matrix_alias) {
+                push_matrix_single_message_pending(&mut pending, text, stream_draft_lines);
+            }
+        };
+    }
+
+    macro_rules! drain_ready {
+        () => {
+            loop {
+                match rx.try_recv() {
+                    Ok(event) => queue_progress!(event),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        rx_open = false;
+                        break;
+                    }
+                }
+            }
+        };
+    }
+
+    macro_rules! start_flush {
+        () => {
+            if !flush_in_flight && !pending.is_empty() {
+                let batch = std::mem::take(&mut pending);
+                let channel = Arc::clone(&channel);
+                let reply_target = reply_target.clone();
+                let draft_id = draft_id.clone();
+                let flush_tx = flush_tx.clone();
+                flush_in_flight = true;
+                zeroclaw_spawn::spawn!(async move {
+                    let result = channel
+                        .update_draft_progress_batch(&reply_target, &draft_id, &batch)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = flush_tx.send(result.err()).await;
+                });
+            }
+        };
+    }
+
+    loop {
+        if !rx_open && !flush_in_flight {
+            start_flush!();
+            if pending.is_empty() && !flush_in_flight {
+                break;
+            }
+        }
+
+        tokio::select! {
+            maybe_event = rx.recv(), if rx_open => {
+                match maybe_event {
+                    Some(event) => {
+                        queue_progress!(event);
+                        drain_ready!();
+                    }
+                    None => {
+                        rx_open = false;
+                    }
+                }
+            }
+            _ = ticker.tick(), if !flush_in_flight && !pending.is_empty() => {
+                start_flush!();
+            }
+            maybe_error = flush_rx.recv(), if flush_in_flight => {
+                flush_in_flight = false;
+                if let Some(Some(error)) = maybe_error {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note
+                        )
+                        .with_attrs(::serde_json::json!({"error": error})),
+                        "Coalesced draft progress update failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Resolve the effective `ack_reactions` value for a channel message.
+///
+/// Per-channel overrides (e.g. `[channels.lark.work].ack_reactions`)
+/// take precedence over the global `[channels].ack_reactions` setting.
+/// This mirrors the resolution performed during channel construction
+/// (see `with_ack_reactions`), so the orchestrator's reaction gates
+/// agree with the channel's own internal gate.
 fn resolve_channel_ack_reactions(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -4890,20 +6376,29 @@ async fn process_channel_message_body(
         memory_sessions.push(Some(history_key.clone()));
     }
 
-    let base_system_prompt = if had_prior_history {
-        ctx.system_prompt.as_str().to_string()
-    } else {
-        refreshed_new_session_system_prompt(ctx.as_ref())
-    };
     let per_turn_excluded_tools: &[String] =
         if msg.channel == "cli" || ctx.autonomy_level == AutonomyLevel::Full {
             &[]
         } else {
             ctx.non_cli_excluded_tools.as_ref()
         };
+    let read_skill_available = read_skill_available_for_channel_turn(
+        active_model_provider.as_ref(),
+        ctx.agent_cfg.resolved.strict_tool_parsing,
+        ctx.tools_registry.as_ref(),
+        per_turn_excluded_tools,
+        ctx.system_prompt.as_str(),
+    );
+    let base_system_prompt = system_prompt_for_channel_turn(
+        ctx.as_ref(),
+        ctx.system_prompt.as_str(),
+        !had_prior_history,
+        read_skill_available,
+    );
     let per_turn_native_tool_specs_present =
         ::zeroclaw_runtime::agent::loop_::native_tool_specs_present_for_turn(
             active_model_provider.as_ref(),
+            route.model.as_str(),
             ctx.tools_registry.as_ref(),
             per_turn_excluded_tools,
             ctx.activated_tools.as_ref(),
@@ -4945,6 +6440,16 @@ async fn process_channel_message_body(
         let raw_content = last_turn.content.clone();
         last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
     }
+
+    let matrix_single_message_streaming =
+        matrix_single_message_streaming_enabled(ctx.as_ref(), &msg);
+    let mut matrix_single_message_typing_scope = if matrix_single_message_streaming {
+        target_channel.as_ref().map(|channel| {
+            start_matrix_single_message_typing_scope(Arc::clone(channel), msg.reply_target.clone())
+        })
+    } else {
+        None
+    };
 
     // ── Reply-intent precheck ────────────────────────────────────────
     let direct_message = target_channel
@@ -5090,6 +6595,9 @@ async fn process_channel_message_body(
     };
 
     if let AssistantChannelOutcome::NoReply { kind, reason } = reply_intent {
+        if let Some(scope) = matrix_single_message_typing_scope.take() {
+            stop_matrix_single_message_typing_scope(scope).await;
+        }
         reconcile_early_ack(
             ctx.as_ref(),
             &msg,
@@ -5136,8 +6644,8 @@ async fn process_channel_message_body(
         // The persisted history marker must reflect what actually reached the
         // sender: a delivered notice claims delivery by carrying the exact
         // delivered text, while a failed send or the no-notice case fall back
-        // to the reason-only form and never claim the notice went out. The
-        // raw classifier reason stays out of the visible marker either way;
+        // to the structural no-reply form and never claim the notice went out.
+        // The raw classifier reason stays out of the visible marker either way;
         // it is only logged (below, and structurally in the event that
         // follows).
         let history_response = match &notice_outcome {
@@ -5205,8 +6713,16 @@ async fn process_channel_message_body(
     // Partial mode: send an initial draft message for progressive editing.
     let draft_message_id = if use_draft_streaming {
         if let Some(channel) = target_channel.as_ref() {
+            if matrix_single_message_streaming
+                && let Some(scope) = matrix_single_message_typing_scope.take()
+            {
+                stop_matrix_single_message_typing_scope(scope).await;
+            }
             match channel
-                .send_draft(&SendMessage::reply_to(&msg, "..."))
+                .send_draft(&SendMessage::reply_to(
+                    &msg,
+                    zeroclaw_runtime::agent::loop_::DRAFT_PLACEHOLDER,
+                ))
                 .await
             {
                 Ok(id) => id,
@@ -5230,7 +6746,7 @@ async fn process_channel_message_body(
     // Spawn the appropriate handler for the delta channel.
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
-        if let (Some(mut rx), Some(draft_id_ref), Some(channel_ref)) = (
+        if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) = (
             delta_rx,
             draft_message_id.as_deref(),
             target_channel.as_ref(),
@@ -5238,65 +6754,36 @@ async fn process_channel_message_body(
             let channel = Arc::clone(channel_ref);
             let reply_target = msg.reply_target.clone();
             let draft_id = draft_id_ref.to_string();
-            Some(zeroclaw_spawn::spawn!(async move {
-                use zeroclaw_runtime::agent::loop_::StreamDelta;
-                let mut accumulated = String::new();
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        StreamDelta::Lifecycle(event) => {
-                            if let Err(e) = channel
-                                .update_draft_lifecycle(&reply_target, &draft_id, event)
-                                .await
-                            {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Draft lifecycle update failed"
-                                );
-                            }
-                        }
-                        StreamDelta::Status(text) => {
-                            let visible = strip_think_tags_inline(&text);
-                            if let Err(e) = channel
-                                .update_draft_progress(&reply_target, &draft_id, &visible)
-                                .await
-                            {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Draft progress update failed"
-                                );
-                            }
-                        }
-                        StreamDelta::Text(text) => {
-                            accumulated.push_str(&text);
-                            let visible = strip_think_tags_inline(&accumulated);
-                            if let Err(e) = channel
-                                .update_draft(&reply_target, &draft_id, &visible)
-                                .await
-                            {
-                                ::zeroclaw_log::record!(
-                                    DEBUG,
-                                    ::zeroclaw_log::Event::new(
-                                        module_path!(),
-                                        ::zeroclaw_log::Action::Note
-                                    )
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                    "Draft update failed"
-                                );
-                            }
-                        }
-                    }
-                }
-            }))
+            if matrix_single_message_streaming {
+                let interval_ms = matrix_draft_update_interval_ms(ctx.as_ref(), &msg);
+                let stream_draft_lines = matrix_stream_draft_lines(ctx.as_ref(), &msg);
+                let matrix_config = Arc::clone(&ctx.prompt_config);
+                let matrix_alias = msg.channel_alias.clone().unwrap_or_default();
+                Some(zeroclaw_spawn::spawn!(async move {
+                    run_matrix_single_message_draft_updater(
+                        rx,
+                        channel,
+                        reply_target,
+                        draft_id,
+                        interval_ms,
+                        stream_draft_lines,
+                        matrix_config,
+                        matrix_alias,
+                    )
+                    .await;
+                }))
+            } else {
+                // Same registry the final sanitizer reads, resolved once per
+                // turn rather than per delta.
+                let known_tool_names: HashSet<String> = ctx
+                    .tools_registry
+                    .iter()
+                    .map(|tool| tool.name().to_ascii_lowercase())
+                    .collect();
+                Some(zeroclaw_spawn::spawn!(async move {
+                    run_draft_updater(channel, reply_target, draft_id, known_tool_names, rx).await;
+                }))
+            }
         } else {
             None
         }
@@ -5304,76 +6791,90 @@ async fn process_channel_message_body(
         None
     };
 
-    // Give draft-capable channels a stable lifecycle signal before model work
-    // begins. Channel implementations decide how to render or rate-limit it.
+    // Give draft-capable channels stable lifecycle signals before model work.
+    // Matrix single-message keeps its transcript path and ignores these typed
+    // chrome events; other channels decide how to render or rate-limit them.
     if let Some(tx) = delta_tx.as_ref() {
         let _ = tx
-            .send(StreamDelta::Lifecycle(ProgressEvent::Received))
+            .send(zeroclaw_runtime::agent::loop_::StreamDelta::Lifecycle(
+                zeroclaw_runtime::agent::loop_::ProgressEvent::Received,
+            ))
             .await;
         let _ = tx
-            .send(StreamDelta::Lifecycle(ProgressEvent::Planning))
+            .send(zeroclaw_runtime::agent::loop_::StreamDelta::Lifecycle(
+                zeroclaw_runtime::agent::loop_::ProgressEvent::Planning,
+            ))
             .await;
     }
 
-    // Skip typing only for Partial mode — the draft message itself provides
-    // visual feedback. MultiMessage and Off both keep typing active.
+    // Preserve the existing typing task placement and lifecycle for all other
+    // modes. Matrix single-message has already completed its short typing
+    // scope before its first visible draft delivery.
     let is_partial_draft = target_channel
         .as_ref()
-        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming());
-    let typing_cancellation = if is_partial_draft {
+        .is_some_and(|ch| ch.supports_draft_updates() && !ch.supports_multi_message_streaming())
+        || matrix_single_message_streaming;
+    let typing_controller = if is_partial_draft {
         None
     } else {
-        target_channel.as_ref().map(|_| CancellationToken::new())
+        target_channel.as_ref().map(|channel| {
+            Arc::new(ScopedTypingController::new(
+                Arc::clone(channel),
+                msg.reply_target.clone(),
+            ))
+        })
     };
-    let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
-        (Some(channel), Some(token)) => Some(spawn_scoped_typing_task(
-            Arc::clone(channel),
-            msg.reply_target.clone(),
-            token.clone(),
-        )),
-        _ => None,
-    };
+    if let Some(typing) = typing_controller.as_ref() {
+        typing.resume().await;
+    }
+    let approval_channel: Option<Arc<dyn Channel>> =
+        match (target_channel.as_ref(), typing_controller.as_ref()) {
+            (Some(channel), Some(typing)) => Some(Arc::new(ApprovalTypingChannel::new(
+                Arc::clone(channel),
+                Arc::clone(typing),
+            ))),
+            (Some(channel), None) => Some(Arc::clone(channel)),
+            (None, _) => None,
+        };
 
-    // Wrap observer to forward tool events as live thread messages
+    // Wrap observer to forward tool events as live thread messages.
     // Bounded so a slow downstream channel cannot grow this queue
     // without bound. See `ChannelNotifyObserver::record_event` for the
     // drop-on-full contract.
-    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<String>(128);
+    let (notify_tx, notify_task) = if matrix_single_message_streaming {
+        (None, None)
+    } else {
+        let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<String>(128);
+        let notify_channel = target_channel.clone();
+        let notify_reply_target = msg.reply_target.clone();
+        let notify_thread_root = followup_thread_id(&msg);
+        let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
+            Some(zeroclaw_spawn::spawn!(async move {
+                while notify_rx.recv().await.is_some() {}
+            }))
+        } else {
+            Some(zeroclaw_spawn::spawn!(async move {
+                let thread_ts = notify_thread_root;
+                while let Some(text) = notify_rx.recv().await {
+                    if let Some(ref ch) = notify_channel {
+                        let _ = ch
+                            .send(
+                                &SendMessage::new(&text, &notify_reply_target)
+                                    .in_thread(thread_ts.clone()),
+                            )
+                            .await;
+                    }
+                }
+            }))
+        };
+        (Some(notify_tx), notify_task)
+    };
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
         tools_used: AtomicBool::new(false),
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
-    let notify_channel = target_channel.clone();
-    let notify_reply_target = msg.reply_target.clone();
-    let notify_thread_root = followup_thread_id(&msg);
-    // Tool-call notifications go out as SEPARATE messages below, which is right
-    // for chat channels (Discord/Telegram threads) but wrong for partial-draft
-    // channels like the git forge, where every message is a PERMANENT comment on
-    // a third-party issue/PR: each tool call became its own comment (issue spam),
-    // duplicating the progress the draft stream already folds into the single
-    // edited comment. Partial-draft channels drain-and-drop here; their draft
-    // stream remains the (single-message) tool-activity surface.
-    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || is_partial_draft {
-        Some(zeroclaw_spawn::spawn!(async move {
-            while notify_rx.recv().await.is_some() {}
-        }))
-    } else {
-        Some(zeroclaw_spawn::spawn!(async move {
-            let thread_ts = notify_thread_root;
-            while let Some(text) = notify_rx.recv().await {
-                if let Some(ref ch) = notify_channel {
-                    let _ = ch
-                        .send(
-                            &SendMessage::new(&text, &notify_reply_target)
-                                .in_thread(thread_ts.clone()),
-                        )
-                        .await;
-                }
-            }
-        }))
-    };
 
     enum LlmExecutionResult {
         Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
@@ -5419,7 +6920,10 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
-    let loop_knobs = LoopKnobs::default();
+    let mut loop_knobs = LoopKnobs::default();
+    if matrix_single_message_streaming {
+        loop_knobs.draft_reasoning = matrix_stream_reasoning(ctx.as_ref(), &msg);
+    }
     let turn_id = uuid::Uuid::new_v4().to_string();
     // Bracket the channel turn so lifecycle events
     // reach observers (and, via the broadcast hook, /api/events and
@@ -5492,7 +6996,7 @@ async fn process_channel_message_body(
                 cancellation_token: Some(cancellation_token.clone()),
                 on_delta: delta_tx.clone(),
                 shared_budget: None,
-                channel: target_channel.as_deref(),
+                channel: approval_channel.as_deref(),
                 // Collector is meaningful only when the generator is active.
                 // Pass None when receipts are disabled so the call site
                 // reflects that coupling explicitly.
@@ -5625,6 +7129,21 @@ async fn process_channel_message_body(
                             &runtime_defaults,
                         );
 
+                        let read_skill_available = read_skill_available_for_channel_turn(
+                            active_model_provider.as_ref(),
+                            ctx.agent_cfg.resolved.strict_tool_parsing,
+                            ctx.tools_registry.as_ref(),
+                            excluded_tools,
+                            history
+                                .first()
+                                .map_or("", |message| message.content.as_str()),
+                        );
+                        refresh_channel_history_skills(
+                            ctx.as_ref(),
+                            &mut history,
+                            read_skill_available,
+                        );
+
                         continue;
                     }
                     Err(err) => {
@@ -5654,7 +7173,9 @@ async fn process_channel_message_body(
         && let Some(tx) = delta_tx.as_ref()
     {
         let _ = tx
-            .send(StreamDelta::Lifecycle(ProgressEvent::FinalizingResponse))
+            .send(zeroclaw_runtime::agent::loop_::StreamDelta::Lifecycle(
+                zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse,
+            ))
             .await;
     }
 
@@ -5712,11 +7233,11 @@ async fn process_channel_message_body(
         "LLM call completed"
     );
 
-    if let Some(token) = typing_cancellation.as_ref() {
-        token.cancel();
+    if let Some(scope) = matrix_single_message_typing_scope.take() {
+        stop_matrix_single_message_typing_scope(scope).await;
     }
-    if let Some(handle) = typing_task {
-        log_worker_join_result(handle.await);
+    if let Some(typing) = typing_controller.as_ref() {
+        typing.pause().await;
     }
 
     let reaction_done_emoji = match &llm_result {
@@ -5834,26 +7355,10 @@ async fn process_channel_message_body(
                 &msg.reply_target,
             );
 
-            // Append a footer when the response was served by a different model_provider family.
-            // Intra-family fallbacks (e.g. minimax → minimax-cn) are suppressed.
-            if let Some(fb) = fallback_info.as_ref() {
-                let req_base = fb.requested_provider.split(':').next().unwrap_or("");
-                let act_base = fb.actual_provider.split(':').next().unwrap_or("");
-                let same_family = req_base == act_base
-                    || req_base.starts_with(act_base)
-                    || act_base.starts_with(req_base);
-                if !same_family {
-                    delivered_response.push_str("\n\n---\n");
-                    delivered_response.push_str(&channel_runtime_cli_string_with_args(
-                        "channel-runtime-fallback-footer",
-                        &[
-                            ("requested", fb.requested_provider.as_str()),
-                            ("actual", fb.actual_provider.as_str()),
-                            ("model", fb.actual_model.as_str()),
-                        ],
-                    ));
-                }
-            }
+            // The runtime commits this candidate only after semantic acceptance.
+            // This renderer must therefore receive only the final accepted route.
+            delivered_response =
+                append_provider_fallback_footer(delivered_response, fallback_info.as_ref());
 
             ::zeroclaw_log::record!(
                 INFO,
@@ -6018,16 +7523,16 @@ async fn process_channel_message_body(
                     } else if force_voice_override {
                         send_msg = send_msg.force_voice();
                     }
-                    channel.send(&send_msg).await.is_ok()
+                    channel.send_final(&send_msg).await.is_ok()
                 } else if let Some(ref draft_id) = draft_message_id {
                     // Same channel with draft. For force-voice routing: cancel the
-                    // draft placeholder and deliver via send() so force_voice
+                    // draft placeholder and deliver via send_final() so force_voice
                     // reaches the channel's voice path (finalize_draft has no
                     // force_voice concept).
                     if force_voice_override {
                         let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
                         channel
-                            .send(
+                            .send_final(
                                 &SendMessage::new(&delivered_response, &delivery_recipient)
                                     .force_voice()
                                     .in_thread(msg.thread_ts.clone()),
@@ -6061,7 +7566,7 @@ async fn process_channel_message_body(
                                 if suppress {
                                     fallback = fallback.suppress_voice();
                                 }
-                                channel.send(&fallback).await.is_ok()
+                                channel.send_final(&fallback).await.is_ok()
                             }
                         }
                     }
@@ -6075,7 +7580,7 @@ async fn process_channel_message_body(
                     } else if force_voice_override {
                         send_msg = send_msg.force_voice();
                     }
-                    match channel.send(&send_msg).await {
+                    match channel.send_final(&send_msg).await {
                         Ok(()) => true,
                         Err(e) => {
                             ::zeroclaw_log::record!(
@@ -6188,17 +7693,14 @@ async fn process_channel_message_body(
                         let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
                     let _ = channel
-                        .send(
-                            &SendMessage::new(error_text, &msg.reply_target)
-                                .suppress_voice()
-                                .in_thread(msg.thread_ts.clone()),
-                        )
+                        .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
                         .await;
                 }
             } else {
+                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
                 eprintln!(
-                    "  ❌ LLM error after {}ms: {e}",
-                    started_at.elapsed().as_millis()
+                    "  ❌ LLM error after {}ms: {safe_error}",
+                    started_at.elapsed().as_millis(),
                 );
 
                 // Evict cached model_provider on auth errors so the next request
@@ -6224,7 +7726,6 @@ async fn process_channel_message_body(
                         );
                     }
                 }
-                let safe_error = zeroclaw_providers::sanitize_api_error(&e.to_string());
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -6254,9 +7755,7 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
-                    let user_msg = zeroclaw_providers::reliable::transient_error_hint(&e)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| format!("⚠️ Error: {safe_error}"));
+                    let user_msg = channel_user_error_message(&e, &safe_error);
                     // Cancel any in-progress draft (don't finalize it with the
                     // error text, which would trigger TTS on the error message)
                     // then deliver the error as a plain suppressed send.
@@ -6264,11 +7763,7 @@ async fn process_channel_message_body(
                         let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                     }
                     let _ = channel
-                        .send(
-                            &SendMessage::new(user_msg, &msg.reply_target)
-                                .suppress_voice()
-                                .in_thread(msg.thread_ts.clone()),
-                        )
+                        .send(&SendMessage::reply_to(&msg, user_msg).suppress_voice())
                         .await;
                 }
             }
@@ -6316,11 +7811,7 @@ async fn process_channel_message_body(
                     let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
                 }
                 let _ = channel
-                    .send(
-                        &SendMessage::new(error_text, &msg.reply_target)
-                            .suppress_voice()
-                            .in_thread(msg.thread_ts.clone()),
-                    )
+                    .send(&SendMessage::reply_to(&msg, error_text).suppress_voice())
                     .await;
             }
         }
@@ -7002,12 +8493,9 @@ async fn run_message_dispatch_loop(
             };
             let channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
             if let Some(channel) = channel {
-                let reply_target = msg.reply_target.clone();
-                let thread_ts = msg.thread_ts.clone();
+                let send_msg = stop_reply_message(&msg, reply);
                 zeroclaw_spawn::spawn!(async move {
-                    let _ = channel
-                        .send(&SendMessage::new(reply, &reply_target).in_thread(thread_ts))
-                        .await;
+                    let _ = channel.send(&send_msg).await;
                 });
             } else {
                 ::zeroclaw_log::record!(
@@ -7390,7 +8878,7 @@ impl std::fmt::Display for UnknownChannelId {
             f,
             "Unknown channel '{channel_id}'. Supported: telegram, discord, slack, mattermost, \
             signal, matrix, whatsapp, qq, lark, feishu, dingtalk, wecom, wecom_ws, nextcloud_talk, \
-            wati, linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
+            linq, email, gmail_push, git, irc, twitter, mochat, imessage, line, voice-call"
         )
     }
 }
@@ -7897,32 +9385,6 @@ fn build_channel_by_id(
         #[cfg(not(feature = "channel-nextcloud"))]
         "nextcloud_talk" | "nextcloud-talk" => {
             anyhow::bail!("Nextcloud Talk channel requires the `channel-nextcloud` feature");
-        }
-        #[cfg(feature = "channel-wati")]
-        "wati" => {
-            let wati_cfg = config
-                .channels
-                .wati
-                .get("default")
-                .context("WATI channel is not configured")?;
-            let alias = "default".to_string();
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                let cfg_arc = config_arc.clone();
-                let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("wati", &alias))
-            };
-            Ok(Arc::new(WatiChannel::new_with_proxy(
-                wati_cfg.api_token.clone(),
-                wati_cfg.api_url.clone(),
-                wati_cfg.tenant_id.clone(),
-                alias,
-                peer_resolver,
-                wati_cfg.proxy_url.clone(),
-            )))
-        }
-        #[cfg(not(feature = "channel-wati"))]
-        "wati" => {
-            anyhow::bail!("WATI channel requires the `channel-wati` feature");
         }
         #[cfg(feature = "channel-linq")]
         "linq" => {
@@ -9173,46 +10635,6 @@ fn collect_configured_channels(
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
             "Linq channel is configured but this build was compiled without \
              `channel-linq`; skipping Linq."
-        );
-    }
-
-    #[cfg(feature = "channel-wati")]
-    for (alias, wati_cfg) in &config.channels.wati {
-        if !active_channel_aliases.contains(&format!("wati.{alias}")) {
-            continue;
-        }
-        if !wati_cfg.enabled {
-            continue;
-        }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("wati", &alias))
-        };
-        let wati_channel = WatiChannel::new_with_proxy(
-            wati_cfg.api_token.clone(),
-            wati_cfg.api_url.clone(),
-            wati_cfg.tenant_id.clone(),
-            alias.clone(),
-            peer_resolver,
-            wati_cfg.proxy_url.clone(),
-        )
-        .with_transcription(config.transcription.clone());
-        channels.push(ConfiguredChannel {
-            display_name: "WATI",
-            alias: Some(alias.clone()),
-            channel: Arc::new(wati_channel),
-        });
-    }
-
-    #[cfg(not(feature = "channel-wati"))]
-    if !config.channels.wati.is_empty() {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            "WATI channel is configured but this build was compiled without \
-             `channel-wati`; skipping WATI."
         );
     }
 
@@ -10864,8 +12286,8 @@ pub async fn start_channels(
                 tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
             }
         }
-        let effective_tool_names: HashSet<&str> =
-            tools_registry.iter().map(|tool| tool.name()).collect();
+        let effective_tool_names =
+            effective_non_cli_tool_names(tools_registry.as_ref(), &risk_profile);
         tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
 
         let bootstrap_max_chars = if agent.resolved.compact_context {
@@ -10895,6 +12317,7 @@ pub async fn start_channels(
             agent.resolved.max_system_prompt_chars,
             true,
             config.channels.show_tool_calls,
+            runtime.shell_profile().as_ref(),
         );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -11817,7 +13240,7 @@ fn concurrent_persist_lock_serialization() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     // Production code no longer calls this directly (the ScopedToolRegistry::assemble
     // seam applies it internally now); two tests below still exercise it directly to
@@ -11840,6 +13263,92 @@ mod tests {
     const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    /// Runs a channel-dispatch test on an explicit stack because its async
+    /// future can exceed the default test-thread stack on hosted CI.
+    pub(crate) fn run_channel_dispatch_test<F, MakeFuture>(make_future: MakeFuture)
+    where
+        F: std::future::Future<Output = ()> + 'static,
+        MakeFuture: FnOnce() -> F + Send + 'static,
+    {
+        let handle = std::thread::Builder::new()
+            .name("zeroclaw-channel-dispatch-test".into())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build channel dispatch test runtime");
+                runtime.block_on(make_future());
+            })
+            .expect("spawn channel dispatch test thread");
+        if let Err(payload) = handle.join() {
+            std::panic::resume_unwind(payload);
+        }
+    }
+
+    struct CountingObserver {
+        events: Arc<AtomicUsize>,
+    }
+
+    impl Observer for CountingObserver {
+        fn record_event(&self, _event: &ObserverEvent) {
+            self.events.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn record_metric(&self, _metric: &ObserverMetric) {}
+
+        fn flush(&self) {}
+
+        fn name(&self) -> &str {
+            "counting-observer"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    #[test]
+    fn accepted_provider_fallback_footer_is_rendered_once_and_primary_has_none() {
+        let fallback = zeroclaw_providers::reliable::ProviderFallbackInfo {
+            requested_provider: "openai.primary".to_string(),
+            requested_model: "model-a".to_string(),
+            actual_provider: "anthropic.backup".to_string(),
+            actual_model: "model-b".to_string(),
+        };
+        let delivered =
+            append_provider_fallback_footer("final response".to_string(), Some(&fallback));
+        assert!(delivered.starts_with("final response\n\n---\n"));
+        assert!(delivered.contains("openai.primary"));
+        assert!(delivered.contains("anthropic.backup"));
+        assert_eq!(delivered.matches("---").count(), 1);
+        assert_eq!(
+            append_provider_fallback_footer("primary final".to_string(), None),
+            "primary final"
+        );
+    }
+
+    #[test]
+    fn channel_terminal_cause_precedes_transient_hint_from_earlier_attempt() {
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("earlier attempt returned HTTP 503 unavailable");
+
+        let delivered = channel_user_error_message(&error, "safe fallback");
+
+        assert_eq!(
+            delivered,
+            format!(
+                "⚠️ Error: {}",
+                zeroclaw_runtime::agent::semantic_empty_terminal_completion_message(None)
+            )
+        );
+        assert!(
+            !delivered.contains("temporarily unavailable"),
+            "an aggregate's earlier transient hint must not mask terminal completion failure"
+        );
+    }
 
     #[test]
     fn load_cached_model_preview_reads_from_data_dir_not_install_root() {
@@ -11932,6 +13441,772 @@ mod tests {
         assert!(
             msg.contains("zeroclaw quickstart"),
             "expected `zeroclaw quickstart` reference, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_streaming_resolves_from_matrix_alias_only() {
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "single".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                stream_tool_arguments: vec![
+                    zeroclaw_config::schema::StreamToolArgumentEntry::Defaults {
+                        default_base: zeroclaw_config::schema::StreamToolArgumentBase::None,
+                        argument_chars: Some(240),
+                    },
+                ],
+                ..Default::default()
+            },
+        );
+        config.channels.matrix.insert(
+            "partial".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::Partial,
+                ..Default::default()
+            },
+        );
+
+        let single_msg = ChannelMessage {
+            channel: "matrix".to_string(),
+            channel_alias: Some("single".to_string()),
+            ..Default::default()
+        };
+        let partial_msg = ChannelMessage {
+            channel: "matrix".to_string(),
+            channel_alias: Some("partial".to_string()),
+            ..Default::default()
+        };
+        let unknown_alias_msg = ChannelMessage {
+            channel: "matrix".to_string(),
+            channel_alias: Some("missing".to_string()),
+            ..Default::default()
+        };
+        let slack_msg = ChannelMessage {
+            channel: "slack".to_string(),
+            channel_alias: Some("single".to_string()),
+            ..Default::default()
+        };
+
+        assert!(matrix_single_message_streaming_enabled_for_config(
+            &config,
+            &single_msg
+        ));
+        assert!(!matrix_single_message_streaming_enabled_for_config(
+            &config,
+            &partial_msg
+        ));
+        assert!(!matrix_single_message_streaming_enabled_for_config(
+            &config,
+            &unknown_alias_msg
+        ));
+        assert!(!matrix_single_message_streaming_enabled_for_config(
+            &config, &slack_msg
+        ));
+        let single_policy = config
+            .channels
+            .matrix
+            .get("single")
+            .expect("configured Matrix alias")
+            .stream_tool_arguments
+            .as_slice();
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "delegate",
+                &serde_json::json!({"agent": "ops"}),
+                Some(zeroclaw_api::attribution::ToolProvenance::Native),
+                single_policy
+            ),
+            None,
+            "the configured base=none policy must be resolved only by Matrix rendering"
+        );
+    }
+
+    #[test]
+    fn matrix_tool_argument_policy_keeps_safe_defaults_and_honors_explicit_opt_in() {
+        use zeroclaw_config::schema::{
+            StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
+        };
+
+        let arguments = serde_json::json!({
+            "action": "start",
+            "agent": "sysadmin",
+            "background": true,
+            "task_id": "task-7",
+            "timeout_ms": 30_000,
+            "prompt": "inspect secrets",
+            "metadata": { "room": "private" },
+            "token": "should-never-leak",
+        });
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "delegate",
+                &arguments,
+                Some(zeroclaw_api::attribution::ToolProvenance::Native),
+                &[],
+            )
+            .as_deref(),
+            Some("action=start, agent=sysadmin, background=true, timeout_ms=30000"),
+        );
+
+        let policy = vec![Entry::Tool {
+            tool: "delegate".to_string(),
+            base: Some(Base::None),
+            include: vec![
+                "prompt".to_string(),
+                "metadata".to_string(),
+                "token".to_string(),
+            ],
+            exclude: Vec::new(),
+            argument_chars: Some(0),
+        }];
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "delegate",
+                &arguments,
+                Some(zeroclaw_api::attribution::ToolProvenance::Native),
+                &policy,
+            )
+            .as_deref(),
+            Some("prompt=inspect secrets, metadata={\"room\":\"private\"}, token=[redacted]"),
+        );
+    }
+
+    #[test]
+    fn matrix_tool_argument_policy_keeps_unknown_tools_name_only_by_default() {
+        let arguments = serde_json::json!({"path": "/private", "count": 3});
+        assert_eq!(
+            matrix_tool_argument_hint("mcp-private", &arguments, None, &[],),
+            None
+        );
+    }
+
+    #[test]
+    fn matrix_safe_policy_keeps_extension_and_unresolved_name_collisions_name_only() {
+        use zeroclaw_api::attribution::ToolProvenance;
+        use zeroclaw_config::schema::{
+            StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
+        };
+
+        let arguments = serde_json::json!({"action": "navigate"});
+        assert_eq!(
+            matrix_tool_argument_hint("browser", &arguments, Some(ToolProvenance::Extension), &[],),
+            None,
+            "an extension named like a standard tool stays name-only in safe mode"
+        );
+        assert_eq!(
+            matrix_tool_argument_hint("browser", &arguments, Some(ToolProvenance::Native), &[],)
+                .as_deref(),
+            Some("action=navigate"),
+            "the canonical standard tool keeps its reviewed safe field"
+        );
+        assert_eq!(
+            matrix_tool_argument_hint("browser", &arguments, None, &[]),
+            None,
+            "an unresolved tool named like a standard tool stays name-only"
+        );
+        let explicit_policy = [Entry::Tool {
+            tool: "browser".to_string(),
+            base: Some(Base::None),
+            include: vec!["action".to_string()],
+            exclude: Vec::new(),
+            argument_chars: None,
+        }];
+        assert_eq!(
+            matrix_tool_argument_hint(
+                "browser",
+                &arguments,
+                Some(ToolProvenance::Extension),
+                &explicit_policy,
+            )
+            .as_deref(),
+            Some("action=navigate"),
+            "an operator can explicitly disclose extension fields"
+        );
+    }
+
+    #[test]
+    fn matrix_safe_policy_fields_match_active_standard_tool_schemas() {
+        let temp = TempDir::new().expect("temporary workspace");
+        let config = Arc::new(Config::default());
+        let security = Arc::new(SecurityPolicy::default());
+        let registry = tools::all_tools(
+            Arc::clone(&config),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NoopMemory),
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            temp.path(),
+            &HashMap::new(),
+            None,
+            config.as_ref(),
+            None,
+            false,
+            None,
+        );
+        let schemas: HashMap<String, Arc<serde_json::Value>> = registry
+            .tools
+            .iter()
+            .map(|tool| {
+                let spec = tool.spec();
+                (spec.name, spec.parameters)
+            })
+            .collect();
+        let mut checked_tools = 0;
+        let mut policy_tools = HashSet::new();
+        let mut absent_required_tools = Vec::new();
+
+        for (groups, required) in [
+            (MATRIX_REQUIRED_SAFE_TOOL_ARGUMENTS, true),
+            (MATRIX_OPTIONAL_SAFE_TOOL_ARGUMENTS, false),
+        ] {
+            for (tools, fields) in groups {
+                for tool in *tools {
+                    assert!(
+                        policy_tools.insert(*tool),
+                        "Matrix safe policy lists tool {tool:?} more than once"
+                    );
+                    let Some(schema) = schemas.get(*tool) else {
+                        if required {
+                            absent_required_tools.push(*tool);
+                        }
+                        continue;
+                    };
+                    checked_tools += 1;
+                    let properties = schema
+                        .get("properties")
+                        .and_then(serde_json::Value::as_object)
+                        .unwrap_or_else(|| panic!("{tool} must expose an object parameter schema"));
+                    for field in *fields {
+                        assert!(
+                            properties.contains_key(*field),
+                            "Matrix safe policy references missing field {field:?} for tool {tool:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked_tools >= 20,
+            "the standard registry unexpectedly exposed only {checked_tools} safe-policy tools"
+        );
+        assert!(
+            absent_required_tools.is_empty(),
+            "required Matrix safe policy tools absent from the standard registry: {absent_required_tools:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_tool_progress_uses_the_same_subject_for_start_and_completion() {
+        use zeroclaw_api::attribution::ToolProvenance;
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let config = Config::default();
+        let arguments = serde_json::json!({"agent": "sysadmin", "prompt": "private"});
+        let start = matrix_tool_progress(
+            &StreamDelta::ToolStart {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments.clone()),
+                tool_provenance: Some(ToolProvenance::Native),
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool start renders");
+        let completion = matrix_tool_progress(
+            &StreamDelta::ToolComplete {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments),
+                tool_provenance: Some(ToolProvenance::Native),
+                secs: 4,
+                success: true,
+                error: None,
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool completion renders");
+
+        assert_eq!(start, "⏳ delegate: agent=sysadmin\n");
+        assert_eq!(completion, "✅ delegate: agent=sysadmin (4s)\n");
+    }
+
+    #[test]
+    fn matrix_tool_progress_recursively_redacts_explicit_composite_arguments() {
+        use zeroclaw_api::attribution::ToolProvenance;
+        use zeroclaw_config::schema::{
+            MatrixConfig, StreamToolArgumentBase as Base, StreamToolArgumentEntry as Entry,
+        };
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        const CANONICAL_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+
+        let mut config = Config::default();
+        config.channels.matrix.insert(
+            "single".to_string(),
+            MatrixConfig {
+                stream_tool_arguments: vec![Entry::Tool {
+                    tool: "delegate".to_string(),
+                    base: Some(Base::None),
+                    include: vec![
+                        "metadata".to_string(),
+                        "cookie".to_string(),
+                        "user-key".to_string(),
+                    ],
+                    exclude: Vec::new(),
+                    argument_chars: Some(0),
+                }],
+                ..Default::default()
+            },
+        );
+        let arguments = serde_json::json!({
+            "cookie": "short-cookie",
+            "user-key": "short-user-key",
+            "metadata": {
+                "password": "short",
+                "private_key": "tiny",
+                "numeric_token": 1234,
+                "credentials": {"value": "nested"},
+                "opaque": CANONICAL_TOKEN
+            }
+        });
+        let start = matrix_tool_progress(
+            &StreamDelta::ToolStart {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments.clone()),
+                tool_provenance: Some(ToolProvenance::Extension),
+            },
+            &config,
+            "single",
+        )
+        .expect("tool start renders");
+        let completion = matrix_tool_progress(
+            &StreamDelta::ToolComplete {
+                tool: "delegate".to_string(),
+                arguments: Arc::new(arguments),
+                tool_provenance: Some(ToolProvenance::Extension),
+                secs: 4,
+                success: true,
+                error: None,
+            },
+            &config,
+            "single",
+        )
+        .expect("tool completion renders");
+
+        for progress in [&start, &completion] {
+            assert!(
+                progress.contains("metadata={")
+                    && progress.contains("\"password\":\"[REDACTED]\"")
+                    && progress.contains("\"private_key\":\"[REDACTED]\"")
+                    && progress.contains("\"numeric_token\":\"[REDACTED]\"")
+                    && progress.contains("\"credentials\":\"[REDACTED]\"")
+                    && progress.contains("cookie=[redacted]")
+                    && progress.contains("user-key=[redacted]"),
+                "nested password must be redacted: {progress}"
+            );
+            assert!(
+                !progress.contains("short"),
+                "nested password must not reach Matrix: {progress}"
+            );
+            assert!(
+                !progress.contains("tiny"),
+                "nested private key must not reach Matrix: {progress}"
+            );
+            assert!(
+                !progress.contains("1234") && !progress.contains("nested"),
+                "credential-shaped values must not reach Matrix: {progress}"
+            );
+            assert!(
+                !progress.contains("short-cookie") && !progress.contains("short-user-key"),
+                "selected top-level credential values must not reach Matrix: {progress}"
+            );
+            assert!(
+                !progress.contains(CANONICAL_TOKEN),
+                "canonical token must not reach Matrix: {progress}"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_tool_progress_treats_carried_extension_or_missing_provenance_as_untrusted() {
+        use zeroclaw_api::attribution::ToolProvenance;
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let config = Config::default();
+        let arguments = serde_json::json!({"action": "navigate"});
+        for tool_provenance in [Some(ToolProvenance::Extension), None] {
+            let start = matrix_tool_progress(
+                &StreamDelta::ToolStart {
+                    tool: "browser".to_string(),
+                    arguments: Arc::new(arguments.clone()),
+                    tool_provenance,
+                },
+                &config,
+                "missing",
+            )
+            .expect("tool start renders");
+            let completion = matrix_tool_progress(
+                &StreamDelta::ToolComplete {
+                    tool: "browser".to_string(),
+                    arguments: Arc::new(arguments.clone()),
+                    tool_provenance,
+                    secs: 4,
+                    success: true,
+                    error: None,
+                },
+                &config,
+                "missing",
+            )
+            .expect("tool completion renders");
+            assert_eq!(
+                start, "⏳ browser\n",
+                "extension and unresolved tools must not reveal native safe arguments"
+            );
+            assert_eq!(
+                completion, "✅ browser (4s)\n",
+                "completion must preserve the same name-only default"
+            );
+        }
+    }
+
+    #[test]
+    fn matrix_tool_progress_scrubs_and_flattens_unresolved_tool_names() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        const CANONICAL_TOKEN: &str = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+
+        let config = Config::default();
+        let tool = format!("unknown\r\n{CANONICAL_TOKEN}\t<div>**bold**</div>");
+        let arguments = Arc::new(serde_json::json!({"ignored": "value"}));
+        let start = matrix_tool_progress(
+            &StreamDelta::ToolStart {
+                tool: tool.clone(),
+                arguments: Arc::clone(&arguments),
+                tool_provenance: None,
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool start renders");
+        let completion = matrix_tool_progress(
+            &StreamDelta::ToolComplete {
+                tool,
+                arguments,
+                tool_provenance: None,
+                secs: 4,
+                success: true,
+                error: None,
+            },
+            &config,
+            "missing",
+        )
+        .expect("tool completion renders");
+
+        let start_subject = start
+            .strip_prefix("⏳ ")
+            .and_then(|value| value.strip_suffix('\n'))
+            .expect("start subject is framed");
+        let completion_subject = completion
+            .strip_prefix("✅ ")
+            .and_then(|value| value.strip_suffix(" (4s)\n"))
+            .expect("completion subject is framed");
+
+        assert_eq!(start_subject, completion_subject);
+        assert!(!start_subject.contains(CANONICAL_TOKEN));
+        assert!(!start_subject.chars().any(char::is_control));
+        assert!(start_subject.contains("[REDACTED"));
+        assert!(start_subject.contains("<div>**bold**</div>"));
+        assert!(!start_subject.contains("\\<div") && !start_subject.contains("\\*\\*bold"));
+    }
+
+    #[test]
+    fn matrix_status_progress_scrubs_standalone_secret_patterns() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let token = "ghp_abcdefghijklmnopqrstuvwxyz1234567890";
+        let progress = matrix_progress_text(
+            &StreamDelta::Status(format!("Cancelled by hook: {token}")),
+            &Config::default(),
+            "missing",
+        )
+        .expect("status renders");
+
+        assert!(!progress.contains(token));
+        assert!(progress.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn matrix_tool_progress_scrubs_secret_pattern_assembled_across_components() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        // Neither component alone is a complete PEM span. The final Matrix
+        // egress scrub must therefore see their assembled progress line.
+        let progress = matrix_progress_text(
+            &StreamDelta::ToolComplete {
+                tool: "-----BEGIN PRIVATE KEY-----".to_string(),
+                arguments: Arc::new(serde_json::json!({})),
+                tool_provenance: None,
+                secs: 0,
+                success: false,
+                error: Some("-----END PRIVATE KEY-----".to_string()),
+            },
+            &Config::default(),
+            "missing",
+        )
+        .expect("tool completion renders");
+
+        assert!(!progress.contains("-----BEGIN PRIVATE KEY-----"));
+        assert!(!progress.contains("-----END PRIVATE KEY-----"));
+        assert!(progress.contains("[REDACTED"));
+    }
+
+    #[test]
+    fn matrix_single_message_pending_splits_reasoning_after_tool_progress() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        for idx in 0..10 {
+            let fragment = if idx == 0 {
+                format!("{REASONING_FULL_PREFIX}Thinking (round 2) r{idx}")
+            } else {
+                format!("{REASONING_FULL_PREFIX} r{idx}")
+            };
+            push_matrix_single_message_pending(&mut pending, fragment, 3);
+            push_matrix_single_message_pending(&mut pending, format!("tool-{idx}\n"), 3);
+        }
+
+        assert!(
+            pending.len() <= 3,
+            "bounded pending buffer should honor stream_draft_lines, got {pending:?}"
+        );
+        assert!(
+            pending.iter().all(|line| !line.contains("r7 r8")),
+            "reasoning after tool progress must start a new entry, got {pending:?}"
+        );
+        assert!(
+            !pending.iter().any(|line| line == "tool-0\n"),
+            "old non-reasoning progress should be trimmed first: {pending:?}"
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_keeps_separator_between_reasoning_entries() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}before tool"),
+            2,
+        );
+        push_matrix_single_message_pending(&mut pending, "tool call".to_string(), 2);
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}after tool"),
+            2,
+        );
+
+        assert_eq!(
+            pending,
+            vec![
+                "tool call".to_string(),
+                format!("{REASONING_FULL_PREFIX}after tool")
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_keeps_complete_reasoning_until_matrix_event_fitting() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        let max_bytes = format!("{REASONING_FULL_PREFIX}abcd").len();
+        push_matrix_single_message_pending(&mut pending, format!("{REASONING_FULL_PREFIX}abcd"), 3);
+        push_matrix_single_message_pending(&mut pending, format!("{REASONING_FULL_PREFIX}efgh"), 3);
+
+        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}abcdefgh")]);
+        assert!(pending.iter().any(|line| line.len() > max_bytes));
+    }
+
+    #[test]
+    fn matrix_single_message_pending_limit_counts_visible_lines_not_events() {
+        use zeroclaw_runtime::agent::loop_::REASONING_FULL_PREFIX;
+
+        let mut pending = Vec::new();
+        push_matrix_single_message_pending(
+            &mut pending,
+            format!("{REASONING_FULL_PREFIX}one\ntwo\nthree"),
+            2,
+        );
+
+        assert_eq!(pending, vec![format!("{REASONING_FULL_PREFIX}two\nthree")]);
+
+        push_matrix_single_message_pending(&mut pending, "tool line\nwith detail\n".to_string(), 2);
+
+        assert_eq!(
+            pending,
+            vec![
+                format!("{REASONING_FULL_PREFIX}three"),
+                "tool line\nwith detail\n".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn matrix_single_message_pending_does_not_downgrade_thinking_round() {
+        use zeroclaw_runtime::agent::loop_::thinking_status_text;
+
+        let mut pending = Vec::new();
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(1), 3);
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(0), 3);
+
+        assert_eq!(pending, vec![thinking_status_text(1)]);
+
+        push_matrix_single_message_pending(&mut pending, "tool\n".to_string(), 3);
+
+        push_matrix_single_message_pending(&mut pending, thinking_status_text(2), 3);
+
+        assert_eq!(
+            pending,
+            vec![
+                thinking_status_text(1),
+                "tool\n".to_string(),
+                thinking_status_text(2)
+            ]
+        );
+    }
+
+    struct SlowBatchChannel {
+        batches: Arc<tokio::sync::Mutex<Vec<Vec<String>>>>,
+        delay: Duration,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SlowBatchChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Matrix,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "slow-batch"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SlowBatchChannel {
+        fn name(&self) -> &str {
+            "slow-batch"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_draft_progress_batch(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            texts: &[String],
+        ) -> anyhow::Result<()> {
+            tokio::time::sleep(self.delay).await;
+            self.batches.lock().await.push(texts.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_progress_coalesces_slow_flush() {
+        use zeroclaw_runtime::agent::loop_::{REASONING_FULL_PREFIX, StreamDelta};
+
+        let batches = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let channel: Arc<dyn Channel> = Arc::new(SlowBatchChannel {
+            batches: Arc::clone(&batches),
+            delay: Duration::from_millis(150),
+        });
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let updater = zeroclaw_spawn::spawn!(run_matrix_single_message_draft_updater(
+            rx,
+            channel,
+            "room".to_string(),
+            "draft".to_string(),
+            50,
+            5,
+            Arc::new(Config::default()),
+            "test".to_string(),
+        ));
+
+        for idx in 0..20 {
+            tx.send(StreamDelta::Reasoning(format!(" pre{idx}")))
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        for idx in 0..80 {
+            tx.send(StreamDelta::Text(format!("answer-{idx}")))
+                .await
+                .unwrap();
+            tx.send(StreamDelta::Reasoning(format!(" post{idx}")))
+                .await
+                .unwrap();
+            tx.send(StreamDelta::Status(format!("tool-{idx}\n")))
+                .await
+                .unwrap();
+        }
+        drop(tx);
+
+        tokio::time::timeout(Duration::from_secs(3), updater)
+            .await
+            .expect("single-message updater should finish")
+            .expect("single-message updater task should not panic");
+
+        let batches = batches.lock().await.clone();
+        assert!(
+            (2..=4).contains(&batches.len()),
+            "slow flush should coalesce many deltas into a few batch edits, got {batches:?}"
+        );
+        assert!(
+            batches.iter().all(|batch| batch.len() <= 5),
+            "batch staging should be bounded by stream_draft_lines, got {batches:?}"
+        );
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .filter(|line| line.starts_with(REASONING_FULL_PREFIX))
+                .count()
+                > batches.len(),
+            "interleaved tool progress should keep reasoning split into multiple entries, got {batches:?}"
+        );
+        assert!(
+            batches
+                .iter()
+                .flatten()
+                .any(|line| line.starts_with("tool-")),
+            "latest tool progress should remain available as a boundary line, got {batches:?}"
+        );
+        assert!(
+            !batches
+                .iter()
+                .flatten()
+                .any(|line| line.starts_with("answer-")),
+            "single-message progress updater must ignore assistant Text deltas: {batches:?}"
         );
     }
 
@@ -13963,14 +16238,178 @@ api_key = "anthropic-key"
         }
     }
 
+    #[cfg(feature = "channel-email")]
+    struct TransientErrorModelProvider;
+
+    #[cfg(feature = "channel-email")]
+    #[async_trait::async_trait]
+    impl ModelProvider for TransientErrorModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("503 service unavailable")
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("503 service unavailable")
+        }
+    }
+
+    #[cfg(feature = "channel-email")]
+    impl ::zeroclaw_api::attribution::Attributable for TransientErrorModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "TransientErrorModelProvider"
+        }
+    }
+
+    const TEST_PROVIDER_QUERY_SECRET: &str = "abc,def'ghi(jkl)";
+
+    struct QuerySecretErrorModelProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for QuerySecretErrorModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!(
+                "Custom API error (400 Bad Request): error sending request for url \
+                 (https://generativelanguage.googleapis.com/v1beta/models/test:generateContent\
+                 ?access_token={TEST_PROVIDER_QUERY_SECRET})"
+            )
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for QuerySecretErrorModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "QuerySecretErrorModelProvider"
+        }
+    }
+
     #[derive(Default)]
     struct RecordingChannel {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
+        final_send_calls: AtomicUsize,
         start_typing_calls: AtomicUsize,
         stop_typing_calls: AtomicUsize,
         reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
         reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
         finalized_gate_prompts: tokio::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[derive(Default)]
+    struct ThreadingRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<SendMessage>>,
+    }
+
+    #[cfg(feature = "channel-email")]
+    impl ::zeroclaw_api::attribution::Attributable for ThreadingRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Email,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[async_trait::async_trait]
+    impl Channel for ThreadingRecordingChannel {
+        fn name(&self) -> &str {
+            "email"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages.lock().await.push(message.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "channel-email")]
+    fn email_wire(message: &SendMessage) -> String {
+        let channel = EmailChannel::new(
+            crate::email_channel::EmailConfig {
+                from_address: "bot@example.invalid".to_string(),
+                ..crate::email_channel::EmailConfig::default()
+            },
+            "test",
+            Arc::new(Vec::new),
+        );
+        String::from_utf8_lossy(&channel.build_email_message(message).unwrap().formatted())
+            .into_owned()
+    }
+
+    enum PendingApprovalOutcome {
+        Response(Option<zeroclaw_api::channel::AttributedApprovalResponse>),
+        Error,
+    }
+
+    struct PendingApprovalChannel {
+        outcome: PendingApprovalOutcome,
+        start_typing_calls: AtomicUsize,
+        stop_typing_calls: AtomicUsize,
+        approval_started: tokio::sync::Notify,
+        approval_release: tokio::sync::Notify,
+    }
+
+    impl PendingApprovalChannel {
+        fn new(outcome: PendingApprovalOutcome) -> Self {
+            Self {
+                outcome,
+                start_typing_calls: AtomicUsize::new(0),
+                stop_typing_calls: AtomicUsize::new(0),
+                approval_started: tokio::sync::Notify::new(),
+                approval_release: tokio::sync::Notify::new(),
+            }
+        }
     }
 
     #[derive(Default)]
@@ -13984,29 +16423,77 @@ api_key = "anthropic-key"
     }
 
     struct DraftRecordingChannel {
+        channel_name: &'static str,
+        supports_multi_message_streaming: bool,
         finalize_should_fail: bool,
         fallback_send_should_fail: bool,
+        final_send_calls: AtomicUsize,
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         draft_messages: tokio::sync::Mutex<Vec<String>>,
         progress_messages: tokio::sync::Mutex<Vec<String>>,
-        lifecycle_events: tokio::sync::Mutex<Vec<ProgressEvent>>,
+        lifecycle_events: tokio::sync::Mutex<Vec<zeroclaw_runtime::agent::loop_::ProgressEvent>>,
         finalized_messages: tokio::sync::Mutex<Vec<String>>,
         cancelled_drafts: tokio::sync::Mutex<Vec<String>>,
+        delivery_events: tokio::sync::Mutex<Vec<&'static str>>,
+        stall_start_typing: bool,
+        stall_stop_typing: bool,
+        /// Text handed to `update_draft`, in order, so a test can assert on
+        /// what the transport actually received rather than on a sanitizer it
+        /// called itself. Progress text lands in `progress_messages`.
+        draft_updates: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    struct ExpiringTypingChannel {
+        expiry: Duration,
+        start_delay: Duration,
+        expires_at: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+        start_calls: AtomicUsize,
+        lapsed_refreshes: AtomicUsize,
+        stop_calls: AtomicUsize,
     }
 
     impl DraftRecordingChannel {
         fn new(finalize_should_fail: bool, fallback_send_should_fail: bool) -> Self {
             Self {
+                channel_name: "test-channel",
+                supports_multi_message_streaming: false,
                 finalize_should_fail,
                 fallback_send_should_fail,
+                final_send_calls: AtomicUsize::new(0),
                 sent_messages: tokio::sync::Mutex::new(Vec::new()),
                 draft_messages: tokio::sync::Mutex::new(Vec::new()),
                 progress_messages: tokio::sync::Mutex::new(Vec::new()),
                 lifecycle_events: tokio::sync::Mutex::new(Vec::new()),
                 finalized_messages: tokio::sync::Mutex::new(Vec::new()),
                 cancelled_drafts: tokio::sync::Mutex::new(Vec::new()),
+                delivery_events: tokio::sync::Mutex::new(Vec::new()),
+                stall_start_typing: false,
+                stall_stop_typing: false,
+                draft_updates: tokio::sync::Mutex::new(Vec::new()),
             }
         }
+
+        fn matrix(stream_mode: zeroclaw_config::schema::MatrixStreamMode) -> Self {
+            Self {
+                channel_name: "matrix",
+                supports_multi_message_streaming: stream_mode
+                    == zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+                ..Self::new(false, false)
+            }
+        }
+    }
+
+    async fn wait_for_draft_recording_event(channel: &DraftRecordingChannel, event: &'static str) {
+        tokio::time::timeout(Duration::from_millis(100), async {
+            loop {
+                if channel.delivery_events.lock().await.contains(&event) {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {event}"));
     }
 
     #[derive(Default)]
@@ -14163,6 +16650,18 @@ api_key = "anthropic-key"
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for PendingApprovalChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "approval-test"
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for FailingSendChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -14193,6 +16692,55 @@ api_key = "anthropic-key"
         }
         fn alias(&self) -> &str {
             "test"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ExpiringTypingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Matrix,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "expiring-typing"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ExpiringTypingChannel {
+        fn name(&self) -> &str {
+            "matrix"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            let now = tokio::time::Instant::now();
+            let mut expires_at = self.expires_at.lock().await;
+            if expires_at.is_some_and(|deadline| deadline <= now) {
+                self.lapsed_refreshes.fetch_add(1, Ordering::SeqCst);
+            }
+            *expires_at = Some(now + self.expiry);
+            drop(expires_at);
+            tokio::time::sleep(self.start_delay).await;
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.stop_calls.fetch_add(1, Ordering::SeqCst);
+            *self.expires_at.lock().await = None;
+            Ok(())
         }
     }
 
@@ -14241,7 +16789,7 @@ api_key = "anthropic-key"
     #[async_trait::async_trait]
     impl Channel for DraftRecordingChannel {
         fn name(&self) -> &str {
-            "test-channel"
+            self.channel_name
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
@@ -14255,6 +16803,11 @@ api_key = "anthropic-key"
             Ok(())
         }
 
+        async fn send_final(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.final_send_calls.fetch_add(1, Ordering::SeqCst);
+            self.send(message).await
+        }
+
         async fn listen(
             &self,
             _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
@@ -14266,7 +16819,22 @@ api_key = "anthropic-key"
             true
         }
 
+        fn supports_multi_message_streaming(&self) -> bool {
+            self.supports_multi_message_streaming
+        }
+
+        async fn update_draft(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.draft_updates.lock().await.push(text.to_string());
+            Ok(())
+        }
+
         async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
+            self.delivery_events.lock().await.push("draft");
             self.draft_messages
                 .lock()
                 .await
@@ -14274,23 +16842,19 @@ api_key = "anthropic-key"
             Ok(Some("draft-1".to_string()))
         }
 
-        async fn update_draft_progress(
-            &self,
-            _recipient: &str,
-            _message_id: &str,
-            text: &str,
-        ) -> anyhow::Result<()> {
-            self.progress_messages.lock().await.push(text.to_string());
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.delivery_events.lock().await.push("typing-start");
+            if self.stall_start_typing {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
 
-        async fn update_draft_lifecycle(
-            &self,
-            _recipient: &str,
-            _message_id: &str,
-            event: ProgressEvent,
-        ) -> anyhow::Result<()> {
-            self.lifecycle_events.lock().await.push(event);
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.delivery_events.lock().await.push("typing-stop");
+            if self.stall_stop_typing {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
 
@@ -14316,6 +16880,26 @@ api_key = "anthropic-key"
                 .lock()
                 .await
                 .push(format!("{recipient}:{message_id}"));
+            Ok(())
+        }
+
+        async fn update_draft_progress(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.progress_messages.lock().await.push(text.to_string());
+            Ok(())
+        }
+
+        async fn update_draft_lifecycle(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+            event: zeroclaw_runtime::agent::loop_::ProgressEvent,
+        ) -> anyhow::Result<()> {
+            self.lifecycle_events.lock().await.push(event);
             Ok(())
         }
     }
@@ -14347,6 +16931,11 @@ api_key = "anthropic-key"
                 .await
                 .push(format!("{}:{}", message.recipient, message.content));
             Ok(())
+        }
+
+        async fn send_final(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.final_send_calls.fetch_add(1, Ordering::SeqCst);
+            self.send(message).await
         }
 
         async fn listen(
@@ -14407,6 +16996,47 @@ api_key = "anthropic-key"
         }
     }
 
+    #[async_trait::async_trait]
+    impl Channel for PendingApprovalChannel {
+        fn name(&self) -> &str {
+            "approval-test"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.start_typing_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn request_approval_attributed(
+            &self,
+            _recipient: &str,
+            _request: &zeroclaw_api::channel::ChannelApprovalRequest,
+        ) -> anyhow::Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
+            self.approval_started.notify_one();
+            self.approval_release.notified().await;
+            match &self.outcome {
+                PendingApprovalOutcome::Response(response) => Ok(response.clone()),
+                PendingApprovalOutcome::Error => anyhow::bail!("synthetic approval failure"),
+            }
+        }
+    }
+
     fn test_runtime_ctx_with_config_agent_and_provider_ref(
         channel: Arc<dyn Channel>,
         model_provider: Arc<dyn ModelProvider>,
@@ -14426,29 +17056,9 @@ api_key = "anthropic-key"
         )
     }
 
-    fn test_runtime_ctx_with_observer(
-        channel: Arc<dyn Channel>,
-        model_provider: Arc<dyn ModelProvider>,
-        prompt_config: zeroclaw_config::schema::Config,
-        agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
-        model_provider_ref: &str,
-        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
-        observer: Arc<dyn Observer>,
-    ) -> Arc<ChannelRuntimeContext> {
-        test_runtime_ctx_with_observer_and_tools(
-            channel,
-            model_provider,
-            prompt_config,
-            agent_cfg,
-            model_provider_ref,
-            hooks,
-            observer,
-            vec![],
-        )
-    }
-
-    /// `test_runtime_ctx_with_observer` plus a populated tool registry, so a
-    /// turn can actually execute a tool instead of resolving an unknown name.
+    /// Test context with executable tools. The explicit Full profile keeps the
+    /// lifecycle test focused on the real post-tool transition rather than an
+    /// approval-path short circuit.
     #[allow(clippy::too_many_arguments)]
     fn test_runtime_ctx_with_observer_and_tools(
         channel: Arc<dyn Channel>,
@@ -14460,9 +17070,6 @@ api_key = "anthropic-key"
         observer: Arc<dyn Observer>,
         tools: Vec<Box<dyn Tool>>,
     ) -> Arc<ChannelRuntimeContext> {
-        // Auto-approve the registered tools so the turn actually executes them
-        // instead of short-circuiting on a denial, which would skip the
-        // tool-phase lifecycle emissions entirely.
         let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
             level: zeroclaw_config::autonomy::AutonomyLevel::Full,
             auto_approve: tools.iter().map(|tool| tool.name().to_string()).collect(),
@@ -14548,6 +17155,114 @@ api_key = "anthropic-key"
         })
     }
 
+    #[cfg(feature = "channel-matrix")]
+    pub(crate) async fn process_message_with_dummy_provider(
+        channel: Arc<dyn Channel>,
+        msg: zeroclaw_api::channel::ChannelMessage,
+        prompt_config: zeroclaw_config::schema::Config,
+    ) {
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            prompt_config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+    }
+
+    fn test_runtime_ctx_with_observer(
+        channel: Arc<dyn Channel>,
+        model_provider: Arc<dyn ModelProvider>,
+        prompt_config: zeroclaw_config::schema::Config,
+        agent_cfg: zeroclaw_config::schema::AliasedAgentConfig,
+        model_provider_ref: &str,
+        hooks: Option<Arc<zeroclaw_runtime::hooks::HookRunner>>,
+        observer: Arc<dyn Observer>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider,
+            model_provider_ref: Arc::new(model_provider_ref.to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(agent_cfg),
+            memory: Arc::new(NoopMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(NoopMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
+            observer,
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+            scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config: Arc::new(prompt_config),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+            persist_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sop_engine: None,
+            sop_audit: None,
+        })
+    }
+
     type MessageSentEvents = Arc<tokio::sync::Mutex<Vec<(String, String, String)>>>;
 
     fn recording_message_sent_runner()
@@ -14578,6 +17293,204 @@ api_key = "anthropic-key"
     }
 
     #[tokio::test]
+    async fn successful_draft_turn_ends_with_finalizing_lifecycle() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert_eq!(
+            events.last(),
+            Some(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a completed turn must end on FinalizingResponse, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_draft_turn_does_not_emit_finalizing_lifecycle() {
+        let token = CancellationToken::new();
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(CancelMidTurnModelProvider {
+                token: token.clone(),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a cancelled turn must not emit FinalizingResponse, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_draft_turn_does_not_emit_finalizing_lifecycle() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a failed turn must not emit FinalizingResponse, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_emits_running_tool_and_post_tool_planning() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            Arc::new(ToolCallingModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(MockPriceTool)],
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        let progress = channel_impl.progress_messages.lock().await.clone();
+        let running_tool = events
+            .iter()
+            .position(|event| {
+                *event == zeroclaw_runtime::agent::loop_::ProgressEvent::RunningTool
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "a tool-calling turn must emit RunningTool, got lifecycle={events:?} progress={progress:?}"
+                )
+            });
+        assert!(
+            events[..running_tool]
+                .contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::WaitingOnModel),
+            "the model wait must precede the tool run, got {events:?}"
+        );
+        assert!(
+            events[running_tool + 1..]
+                .contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::Planning),
+            "the post-tool hand-back must re-enter Planning, got {events:?}"
+        );
+        assert_eq!(
+            events.last(),
+            Some(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a completed turn must end on FinalizingResponse, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_cancellation_cancels_the_draft() {
+        let token = CancellationToken::new();
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(CancelMidTurnModelProvider {
+                token: token.clone(),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a cancelled turn must cancel its draft so terminal cleanup runs"
+        );
+        assert!(
+            channel_impl.finalized_messages.lock().await.is_empty(),
+            "a cancelled turn must not finalize a draft"
+        );
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a cancelled turn must not emit FinalizingResponse, got {events:?}"
+        );
+        assert_eq!(
+            events.first(),
+            Some(&zeroclaw_runtime::agent::loop_::ProgressEvent::Received),
+            "the turn must still have announced receipt, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_turn_error_cancels_the_draft() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut msg = message_sent_hook_test_message();
+        msg.content = "trigger format error".to_string();
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        assert!(
+            !channel_impl.cancelled_drafts.lock().await.is_empty(),
+            "a failed turn must cancel its draft so a shown lifecycle state is cleared"
+        );
+        let events = channel_impl.lifecycle_events.lock().await.clone();
+        assert!(
+            !events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::FinalizingResponse),
+            "a failed turn must not emit FinalizingResponse, got {events:?}"
+        );
+        assert!(
+            events.contains(&zeroclaw_runtime::agent::loop_::ProgressEvent::WaitingOnModel),
+            "the failure happened at the provider, so the model wait must have been shown: {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn process_channel_message_fires_message_sent_hook_after_reply_delivery() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -14601,6 +17514,11 @@ api_key = "anthropic-key"
 
         let sent_messages = channel_impl.sent_messages.lock().await;
         assert_eq!(sent_messages.as_slice(), ["chat-42:ok"]);
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            1,
+            "a no-draft assistant response must use the final-response send path"
+        );
 
         let events = hook_events.lock().await;
         assert_eq!(
@@ -14818,6 +17736,81 @@ api_key = "anthropic-key"
         assert!(starts[0].2.is_some(), "brackets must carry a turn_id");
     }
 
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn provider_query_secret_is_absent_from_channel_error_log_and_reply() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(QuerySecretErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let mut msg = message_sent_hook_test_message();
+        msg.id = "msg-query-secret-error".to_string();
+        msg.sender = "query-secret-sender".to_string();
+
+        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        let reply = sent_messages
+            .last()
+            .expect("provider failure must send an error reply");
+        assert!(
+            !reply.contains(TEST_PROVIDER_QUERY_SECRET),
+            "channel reply leaked provider query secret: {reply}"
+        );
+        assert!(
+            reply.contains("generativelanguage.googleapis.com/v1beta/models/test:generateContent"),
+            "sanitized reply should preserve the useful endpoint: {reply}"
+        );
+        drop(sent_messages);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut error_event = None;
+        while std::time::Instant::now() < deadline {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(value))
+                    if value.get("message").and_then(|v| v.as_str())
+                        == Some("channel_message_error")
+                        && value.pointer("/attributes/sender").and_then(|v| v.as_str())
+                            == Some("query-secret-sender") =>
+                {
+                    error_event = Some(value);
+                    break;
+                }
+                Ok(Ok(_))
+                | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_)))
+                | Err(_) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+            }
+        }
+
+        let event = error_event.expect("channel_message_error log must be emitted");
+        let logged_error = event
+            .pointer("/attributes/error")
+            .and_then(|value| value.as_str())
+            .expect("channel_message_error must carry the sanitized error attribute");
+        assert!(
+            !logged_error.contains(TEST_PROVIDER_QUERY_SECRET),
+            "structured log leaked provider query secret: {event}"
+        );
+        assert!(
+            logged_error
+                .contains("generativelanguage.googleapis.com/v1beta/models/test:generateContent"),
+            "structured log should preserve the useful endpoint: {event}"
+        );
+    }
+
     /// A turn cancelled mid-flight (interrupt-on-new-message) must still
     /// close its bracket — the ZeroHome-critical guarantee that a cancelled
     /// turn cannot wedge an "agent in flight" indicator with an unmatched
@@ -14930,183 +17923,6 @@ api_key = "anthropic-key"
     }
 
     #[tokio::test]
-    async fn process_channel_message_emits_stable_lifecycle_progress() {
-        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
-            channel,
-            Arc::new(DummyModelProvider),
-            zeroclaw_config::schema::Config::default(),
-            zeroclaw_config::schema::AliasedAgentConfig::default(),
-            "test-provider",
-            None,
-        );
-
-        process_channel_message(
-            runtime_ctx,
-            message_sent_hook_test_message(),
-            CancellationToken::new(),
-        )
-        .await;
-
-        assert_eq!(
-            channel_impl.lifecycle_events.lock().await.as_slice(),
-            [
-                ProgressEvent::Received,
-                ProgressEvent::Planning,
-                ProgressEvent::WaitingOnModel,
-                ProgressEvent::FinalizingResponse,
-            ]
-        );
-        // Negative control for the cancellation/error regressions below: a
-        // successful turn finalizes and must never cancel its draft. Without
-        // this, a `cancel_draft` called unconditionally would make those two
-        // tests pass vacuously.
-        assert!(
-            channel_impl.cancelled_drafts.lock().await.is_empty(),
-            "a successful turn must not cancel its draft"
-        );
-        assert!(
-            !channel_impl.finalized_messages.lock().await.is_empty(),
-            "a successful turn must finalize its draft"
-        );
-    }
-
-    /// A turn that actually calls a tool must surface `RunningTool` and the
-    /// post-tool `Planning` hand-back at their real emitters, not only in the
-    /// enumeration and locale tables. Without a tool in the loop the six-state
-    /// contract is only half exercised.
-    #[tokio::test]
-    async fn process_channel_message_emits_running_tool_and_post_tool_planning() {
-        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
-            channel,
-            Arc::new(ToolCallingModelProvider),
-            zeroclaw_config::schema::Config::default(),
-            zeroclaw_config::schema::AliasedAgentConfig::default(),
-            "test-provider",
-            None,
-            Arc::new(NoopObserver),
-            vec![Box::new(MockPriceTool)],
-        );
-
-        process_channel_message(
-            runtime_ctx,
-            message_sent_hook_test_message(),
-            CancellationToken::new(),
-        )
-        .await;
-
-        let events = channel_impl.lifecycle_events.lock().await.clone();
-        let progress = channel_impl.progress_messages.lock().await.clone();
-        let running_tool = events
-            .iter()
-            .position(|event| *event == ProgressEvent::RunningTool)
-            .unwrap_or_else(|| {
-                panic!(
-                    "a tool-calling turn must emit RunningTool, got lifecycle={events:?} progress={progress:?}"
-                )
-            });
-        assert!(
-            events[..running_tool].contains(&ProgressEvent::WaitingOnModel),
-            "the model wait must precede the tool run, got {events:?}"
-        );
-        assert!(
-            events[running_tool + 1..].contains(&ProgressEvent::Planning),
-            "the post-tool hand-back must re-enter Planning, got {events:?}"
-        );
-        assert_eq!(
-            events.last(),
-            Some(&ProgressEvent::FinalizingResponse),
-            "a completed turn must end on FinalizingResponse, got {events:?}"
-        );
-    }
-
-    /// Cancellation mid-turn must reach the channel's draft cancellation so the
-    /// Slack side can clear its turn-bound Assistant status, and must not
-    /// finalize a draft for a turn that never produced an answer.
-    #[tokio::test]
-    async fn process_channel_message_cancellation_cancels_the_draft() {
-        let token = CancellationToken::new();
-        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
-            channel,
-            Arc::new(CancelMidTurnModelProvider {
-                token: token.clone(),
-            }),
-            zeroclaw_config::schema::Config::default(),
-            zeroclaw_config::schema::AliasedAgentConfig::default(),
-            "test-provider",
-            None,
-        );
-
-        process_channel_message(runtime_ctx, message_sent_hook_test_message(), token).await;
-
-        assert!(
-            !channel_impl.cancelled_drafts.lock().await.is_empty(),
-            "a cancelled turn must cancel its draft so terminal cleanup runs"
-        );
-        assert!(
-            channel_impl.finalized_messages.lock().await.is_empty(),
-            "a cancelled turn must not finalize a draft"
-        );
-        // A turn that never produced an answer must not claim it is finalizing
-        // one, and the states it did show must be the real pre-model ones.
-        let events = channel_impl.lifecycle_events.lock().await.clone();
-        assert!(
-            !events.contains(&ProgressEvent::FinalizingResponse),
-            "a cancelled turn must not emit FinalizingResponse, got {events:?}"
-        );
-        assert_eq!(
-            events.first(),
-            Some(&ProgressEvent::Received),
-            "the turn must still have announced receipt, got {events:?}"
-        );
-    }
-
-    /// A provider/turn error must also reach draft cancellation. This is the
-    /// error-path counterpart of the cancellation regression: both exits are
-    /// what clear a lifecycle state that was already shown to the user.
-    #[tokio::test]
-    async fn process_channel_message_turn_error_cancels_the_draft() {
-        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
-        let channel: Arc<dyn Channel> = channel_impl.clone();
-
-        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
-            channel,
-            Arc::new(FormatErrorModelProvider),
-            zeroclaw_config::schema::Config::default(),
-            zeroclaw_config::schema::AliasedAgentConfig::default(),
-            "test-provider",
-            None,
-        );
-
-        let mut msg = message_sent_hook_test_message();
-        msg.content = "trigger format error".to_string();
-
-        process_channel_message(runtime_ctx, msg, CancellationToken::new()).await;
-
-        assert!(
-            !channel_impl.cancelled_drafts.lock().await.is_empty(),
-            "a failed turn must cancel its draft so a shown lifecycle state is cleared"
-        );
-        let events = channel_impl.lifecycle_events.lock().await.clone();
-        assert!(
-            !events.contains(&ProgressEvent::FinalizingResponse),
-            "a failed turn must not emit FinalizingResponse, got {events:?}"
-        );
-        assert!(
-            events.contains(&ProgressEvent::WaitingOnModel),
-            "the failure happened at the provider, so the model wait must have been shown: {events:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn process_channel_message_fires_message_sent_hook_after_draft_fallback_send() {
         let channel_impl = Arc::new(DraftRecordingChannel::new(true, false));
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -15136,6 +17952,11 @@ api_key = "anthropic-key"
         assert_eq!(
             channel_impl.sent_messages.lock().await.as_slice(),
             ["chat-42:ok"]
+        );
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            1,
+            "a failed draft finalization must preserve final-response policy on fallback"
         );
         assert_eq!(
             hook_events.lock().await.as_slice(),
@@ -16496,9 +19317,6 @@ BTC is currently around $65,000 based on latest tool output."#
         fn name(&self) -> &str {
             "fingerprint-test-runtime"
         }
-        fn has_shell_access(&self) -> bool {
-            true
-        }
         fn has_filesystem_access(&self) -> bool {
             true
         }
@@ -16507,6 +19325,9 @@ BTC is currently around $65,000 based on latest tool output."#
         }
         fn supports_long_running(&self) -> bool {
             false
+        }
+        fn shell_dialect(&self) -> platform::ShellDialect {
+            platform::ShellDialect::Posix
         }
         fn build_shell_command(
             &self,
@@ -16553,6 +19374,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
         let assembled = assemble_channel_agent_tools(
@@ -20034,6 +22856,377 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[tokio::test]
+    async fn matrix_single_message_typing_stops_before_draft_delivery() {
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "single".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+                ..Default::default()
+            },
+        );
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "typing-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-typing".to_string(),
+                content: "hello".to_string(),
+                channel: "matrix".into(),
+                channel_alias: Some("single".to_string()),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let delivery_events = channel_impl.delivery_events.lock().await;
+        let typing_stop = delivery_events
+            .iter()
+            .position(|event| *event == "typing-stop")
+            .expect("single-message cleanup must stop typing");
+        let draft = delivery_events
+            .iter()
+            .position(|event| *event == "draft")
+            .expect("single-message mode must create a draft");
+        assert!(
+            typing_stop < draft,
+            "typing cleanup must complete before draft delivery"
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_typing_refreshes_before_notice_expiry() {
+        let channel_impl = Arc::new(ExpiringTypingChannel {
+            expiry: Duration::from_millis(70),
+            start_delay: Duration::from_millis(30),
+            expires_at: tokio::sync::Mutex::new(None),
+            start_calls: AtomicUsize::new(0),
+            lapsed_refreshes: AtomicUsize::new(0),
+            stop_calls: AtomicUsize::new(0),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let scope = start_matrix_single_message_typing_scope_with_interval(
+            channel,
+            "chat-typing".to_string(),
+            Duration::from_millis(50),
+        );
+
+        tokio::time::sleep(Duration::from_millis(230)).await;
+
+        assert!(
+            channel_impl.start_calls.load(Ordering::SeqCst) >= 4,
+            "typing must be refreshed while pre-delivery work is still running"
+        );
+        assert_eq!(
+            channel_impl.lapsed_refreshes.load(Ordering::SeqCst),
+            0,
+            "refresh scheduling must include the initial typing request latency"
+        );
+        assert!(
+            channel_impl
+                .expires_at
+                .lock()
+                .await
+                .is_some_and(|expires_at| expires_at > tokio::time::Instant::now()),
+            "periodic refresh must keep an expiring typing notice active"
+        );
+
+        stop_matrix_single_message_typing_scope(scope).await;
+        assert_eq!(channel_impl.stop_calls.load(Ordering::SeqCst), 1);
+        assert!(channel_impl.expires_at.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_typing_scope_drop_stops_refresh_task() {
+        let channel_impl = Arc::new(ExpiringTypingChannel {
+            expiry: Duration::from_millis(70),
+            start_delay: Duration::ZERO,
+            expires_at: tokio::sync::Mutex::new(None),
+            start_calls: AtomicUsize::new(0),
+            lapsed_refreshes: AtomicUsize::new(0),
+            stop_calls: AtomicUsize::new(0),
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let scope = start_matrix_single_message_typing_scope_with_interval(
+            channel,
+            "chat-typing".to_string(),
+            Duration::from_millis(20),
+        );
+        tokio::time::sleep(Duration::from_millis(35)).await;
+
+        drop(scope);
+        tokio::time::timeout(Duration::from_millis(200), async {
+            while channel_impl.stop_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the scope must stop typing");
+
+        let starts_after_cleanup = channel_impl.start_calls.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(
+            channel_impl.start_calls.load(Ordering::SeqCst),
+            starts_after_cleanup,
+            "dropping the scope must terminate the refresh task"
+        );
+        assert_eq!(channel_impl.stop_calls.load(Ordering::SeqCst), 1);
+        assert!(channel_impl.expires_at.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_stalled_initial_typing_does_not_block_draft_delivery() {
+        let channel_impl = Arc::new(DraftRecordingChannel {
+            stall_start_typing: true,
+            ..DraftRecordingChannel::matrix(
+                zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+            )
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let scope = start_matrix_single_message_typing_scope_with_interval(
+            channel.clone(),
+            "chat-typing".to_string(),
+            Duration::from_secs(1),
+        );
+        wait_for_draft_recording_event(channel_impl.as_ref(), "typing-start").await;
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            stop_matrix_single_message_typing_scope(scope),
+        )
+        .await
+        .expect("cancelling a stalled initial typing request must not block delivery");
+        channel
+            .send_draft(&SendMessage::new("draft", "chat-typing"))
+            .await
+            .expect("draft delivery must proceed after stalled initial typing is cancelled");
+
+        assert_eq!(
+            *channel_impl.delivery_events.lock().await,
+            ["typing-start", "typing-stop", "draft"]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_single_message_stalled_typing_cleanup_does_not_block_draft_delivery() {
+        let channel_impl = Arc::new(DraftRecordingChannel {
+            stall_stop_typing: true,
+            ..DraftRecordingChannel::matrix(
+                zeroclaw_config::schema::MatrixStreamMode::SingleMessage,
+            )
+        });
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let scope = start_matrix_single_message_typing_scope_with_interval(
+            channel.clone(),
+            "chat-typing".to_string(),
+            Duration::from_secs(1),
+        );
+        wait_for_draft_recording_event(channel_impl.as_ref(), "typing-start").await;
+
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            stop_matrix_single_message_typing_scope(scope),
+        )
+        .await
+        .expect("stalled typing cleanup must not block delivery indefinitely");
+        channel
+            .send_draft(&SendMessage::new("draft", "chat-typing"))
+            .await
+            .expect("draft delivery must proceed after typing cleanup times out");
+
+        assert_eq!(
+            *channel_impl.delivery_events.lock().await,
+            ["typing-start", "typing-stop", "draft"]
+        );
+    }
+
+    #[tokio::test]
+    async fn matrix_multi_message_preserves_draft_before_typing_lifecycle() {
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.matrix.insert(
+            "multi".to_string(),
+            zeroclaw_config::schema::MatrixConfig {
+                stream_mode: zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+                ..Default::default()
+            },
+        );
+        let runtime_ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_millis(20),
+            }),
+            config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "multi-typing-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-typing".to_string(),
+                content: "hello".to_string(),
+                channel: "matrix".into(),
+                channel_alias: Some("multi".to_string()),
+                timestamp: 1,
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let events = channel_impl.delivery_events.lock().await;
+        assert_eq!(events.first(), Some(&"draft"));
+        assert!(events.contains(&"typing-start"));
+        assert!(events.contains(&"typing-stop"));
+    }
+
+    #[test]
+    fn typing_error_log_attributes_are_scrubbed() {
+        let token = "AKIAIOSFODNN7EXAMPLE";
+        let error = anyhow::Error::msg(format!("typing failed with {token}"));
+        let scrubbed = scrub_typing_error(&error);
+
+        assert!(!scrubbed.contains(token));
+    }
+
+    #[tokio::test]
+    async fn approval_wait_pauses_typing_and_only_approval_resumes_it() {
+        use zeroclaw_api::channel::{
+            ApprovalSource, AttributedApprovalResponse, ChannelApprovalRequest,
+            ChannelApprovalResponse,
+        };
+
+        let cases = [
+            (
+                PendingApprovalOutcome::Response(Some(AttributedApprovalResponse::operator(
+                    ChannelApprovalResponse::Approve,
+                ))),
+                true,
+                false,
+            ),
+            (
+                PendingApprovalOutcome::Response(Some(AttributedApprovalResponse::operator(
+                    ChannelApprovalResponse::AlwaysApprove,
+                ))),
+                true,
+                false,
+            ),
+            (
+                PendingApprovalOutcome::Response(Some(AttributedApprovalResponse::operator(
+                    ChannelApprovalResponse::Deny,
+                ))),
+                false,
+                false,
+            ),
+            (
+                PendingApprovalOutcome::Response(Some(AttributedApprovalResponse::from_runtime(
+                    ChannelApprovalResponse::Deny,
+                    ApprovalSource::TimedOut,
+                ))),
+                false,
+                false,
+            ),
+            (PendingApprovalOutcome::Response(None), false, false),
+            (PendingApprovalOutcome::Error, false, true),
+        ];
+
+        for (outcome, should_resume, should_error) in cases {
+            let channel_impl = Arc::new(PendingApprovalChannel::new(outcome));
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let typing = Arc::new(ScopedTypingController::new(
+                Arc::clone(&channel),
+                "approval-chat".to_string(),
+            ));
+            typing.resume().await;
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while channel_impl.start_typing_calls.load(Ordering::SeqCst) < 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("initial typing should start");
+
+            let wrapped = Arc::new(ApprovalTypingChannel::new(
+                Arc::clone(&channel),
+                Arc::clone(&typing),
+            ));
+            let approval_task = zeroclaw_spawn::spawn!(async move {
+                wrapped
+                    .request_approval_attributed(
+                        "approval-chat",
+                        &ChannelApprovalRequest {
+                            tool_name: "shell".to_string(),
+                            arguments_summary: "command".to_string(),
+                            raw_arguments: None,
+                        },
+                    )
+                    .await
+            });
+
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                channel_impl.approval_started.notified(),
+            )
+            .await
+            .expect("approval request should start");
+            assert_eq!(
+                channel_impl.stop_typing_calls.load(Ordering::SeqCst),
+                1,
+                "typing must stop before the approval wait begins"
+            );
+            assert_eq!(
+                channel_impl.start_typing_calls.load(Ordering::SeqCst),
+                1,
+                "typing must remain paused while approval is pending"
+            );
+
+            channel_impl.approval_release.notify_one();
+            let approval_result = approval_task.await.unwrap();
+            assert_eq!(approval_result.is_err(), should_error);
+
+            if should_resume {
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while channel_impl.start_typing_calls.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("approved work should resume typing");
+            } else {
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    channel_impl.start_typing_calls.load(Ordering::SeqCst),
+                    1,
+                    "denied or timed-out work must not resume typing"
+                );
+            }
+
+            typing.pause().await;
+        }
+    }
+
+    #[tokio::test]
     async fn process_channel_message_adds_and_swaps_reactions() {
         let channel_impl = Arc::new(RecordingChannel::default());
         let channel: Arc<dyn Channel> = channel_impl.clone();
@@ -20784,7 +23977,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
     // Companion to the delivered-notice case above: when the notice send
     // fails, the persisted history marker must NOT claim the notice was
-    // delivered. It must fall back to the reason-only no-reply form instead
+    // delivered. It must fall back to the structural no-reply form instead
     // of silently recording success.
     #[tokio::test]
     async fn process_channel_message_no_reply_refused_marker_does_not_claim_delivery_on_send_failure()
@@ -20844,6 +24037,11 @@ BTC is currently around $65,000 based on latest tool output."#
             "a failed notice send must fall back to the no-reply marker form, got: {}",
             marker.content
         );
+        assert!(
+            !marker.content.contains("prompt injection attempt"),
+            "a failed notice send must not persist the raw classifier reason, got: {}",
+            marker.content
+        );
     }
 
     #[tokio::test]
@@ -20892,6 +24090,11 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             marker.content.starts_with("[No reply sent"),
             "an input-only channel must retain the internal no-reply marker, got: {}",
+            marker.content
+        );
+        assert!(
+            !marker.content.contains("prompt injection attempt"),
+            "an input-only channel must not persist the raw classifier reason, got: {}",
             marker.content
         );
     }
@@ -21148,6 +24351,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
         if expose_text_protocol {
             let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
@@ -21168,6 +24372,90 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(!prompt.contains("## Tool Use Protocol"));
         assert!(!prompt.contains("<tool_call>"));
         assert!(!prompt.contains("mcp__example"));
+    }
+
+    #[test]
+    fn channel_read_skill_availability_requires_callable_tool_protocol() {
+        let provider = HistoryCaptureModelProvider::default();
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedMockTool("read_skill"))];
+        let text_tool_prompt = "## Tool Use Protocol\n\n\
+            <tool_call></tool_call>\n\n\
+            ### Available Tools\n\n\
+            **read_skill**: Read a skill";
+
+        assert!(read_skill_available_for_channel_turn(
+            &provider,
+            false,
+            &tools_registry,
+            &[],
+            text_tool_prompt,
+        ));
+        assert!(!read_skill_available_for_channel_turn(
+            &provider,
+            false,
+            &tools_registry,
+            &[],
+            "",
+        ));
+        assert!(!read_skill_available_for_channel_turn(
+            &provider,
+            false,
+            &tools_registry,
+            &[],
+            "## Workspace\n\nMentions ## Tool Use Protocol and **read_skill** in ordinary prose.",
+        ));
+        assert!(!read_skill_available_for_channel_turn(
+            &provider,
+            false,
+            &tools_registry,
+            &["read_skill".to_string()],
+            text_tool_prompt,
+        ));
+        assert!(!read_skill_available_for_channel_turn(
+            &provider,
+            true,
+            &tools_registry,
+            &[],
+            text_tool_prompt,
+        ));
+    }
+
+    #[test]
+    fn rendered_skills_prompt_mode_ignores_skill_body_text() {
+        let prompt = "## Available Skills\n\n\
+            Skill instructions and tool metadata are preloaded below.\n\n\
+            <available_skills>\n\
+            <skill>Skill summaries are preloaded below to keep context compact.</skill>\n\
+            </available_skills>";
+
+        assert_eq!(
+            rendered_skills_prompt_mode(prompt),
+            Some(zeroclaw_config::schema::SkillsPromptInjectionMode::Full)
+        );
+    }
+
+    #[test]
+    fn effective_non_cli_tool_names_respects_exclusions() {
+        let tools_registry: Vec<Box<dyn Tool>> = vec![
+            Box::new(NamedMockTool("read_skill")),
+            Box::new(NamedMockTool("file_read")),
+        ];
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            excluded_tools: vec!["read_skill".to_string()],
+            ..Default::default()
+        };
+
+        let effective = effective_non_cli_tool_names(&tools_registry, &risk_profile);
+        assert!(!effective.contains("read_skill"));
+        assert!(effective.contains("file_read"));
+
+        let full_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: AutonomyLevel::Full,
+            excluded_tools: vec!["read_skill".to_string()],
+            ..Default::default()
+        };
+        let effective_full = effective_non_cli_tool_names(&tools_registry, &full_profile);
+        assert!(effective_full.contains("read_skill"));
     }
 
     #[test]
@@ -21273,7 +24561,7 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_skills_include_instructions_and_tools() {
+    fn prompt_helpers_default_mode_preserves_instructions_with_compact_loader() {
         let ws = make_workspace();
         let skills = vec![zeroclaw_runtime::skills::Skill {
             name: "code-review".into(),
@@ -21294,10 +24582,28 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 
-        let prompt = build_system_prompt(ws.path(), "model", &[], &skills, None, None);
+        let prompt = build_system_prompt(
+            ws.path(),
+            "model",
+            &[("read_skill", "Load skill instructions by name")],
+            &skills,
+            None,
+            None,
+        );
+        let prompt_with_tool_calls =
+            zeroclaw_runtime::agent::system_prompt::build_system_prompt_with_tool_calls(
+                ws.path(),
+                "model",
+                &[("read_skill", "Load skill instructions by name")],
+                &skills,
+                None,
+                None,
+                true,
+            );
 
         assert!(prompt.contains("<available_skills>"), "missing skills XML");
         assert!(prompt.contains("<name>code-review</name>"));
@@ -21312,7 +24618,12 @@ BTC is currently around $65,000 based on latest tool output."#
         // Registered tools (shell kind) appear under <callable_tools> with prefixed names
         assert!(prompt.contains("<callable_tools"));
         assert!(prompt.contains("<name>code-review__lint</name>"));
-        assert!(!prompt.contains("loaded on demand"));
+        assert!(prompt_with_tool_calls.contains("<instructions>"));
+        assert!(
+            prompt_with_tool_calls.contains(
+                "<instruction>Always run cargo test before final response.</instruction>"
+            )
+        );
     }
 
     #[test]
@@ -21337,13 +24648,14 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 
         let prompt = build_system_prompt_with_mode(
             ws.path(),
             "model",
-            &[],
+            &[("read_skill", "Load skill instructions by name")],
             &skills,
             None,
             None,
@@ -21390,6 +24702,7 @@ BTC is currently around $65,000 based on latest tool output."#
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }];
 
@@ -21497,6 +24810,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -21530,6 +24844,7 @@ BTC is currently around $65,000 based on latest tool output."#
             0,
             false,
             false,
+            None,
         );
 
         assert!(
@@ -21614,7 +24929,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
-            tx,
+            tx: Some(tx),
             tools_used: AtomicBool::new(false),
         };
 
@@ -21646,7 +24961,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(128);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
-            tx,
+            tx: Some(tx),
             tools_used: AtomicBool::new(false),
         };
 
@@ -21687,12 +25002,39 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[test]
+    fn channel_notify_observer_without_sender_marks_tools_without_emitting() {
+        let events = Arc::new(AtomicUsize::new(0));
+        let observer = ChannelNotifyObserver {
+            inner: Arc::new(CountingObserver {
+                events: Arc::clone(&events),
+            }),
+            tx: None,
+            tools_used: AtomicBool::new(false),
+        };
+
+        observer.record_event(
+            &zeroclaw_runtime::observability::traits::ObserverEvent::ToolCallStart {
+                parent_agent_alias: None,
+                tool: "file_read".to_string(),
+                tool_call_id: None,
+                arguments: Some(r#"{"path":"/a"}"#.to_string()),
+                channel: None,
+                agent_alias: None,
+                turn_id: None,
+            },
+        );
+
+        assert!(observer.tools_used.load(Ordering::Relaxed));
+        assert_eq!(events.load(Ordering::Relaxed), 1);
+    }
+
     #[tokio::test]
     async fn channel_notify_observer_drops_on_full_channel() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(1);
         let observer = ChannelNotifyObserver {
             inner: Arc::new(NoopObserver),
-            tx,
+            tx: Some(tx),
             tools_used: AtomicBool::new(false),
         };
 
@@ -22615,6 +25957,178 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    #[cfg(feature = "channel-email")]
+    fn threaded_email_message(content: &str) -> ChannelMessage {
+        ChannelMessage {
+            id: "current@example.invalid".to_string(),
+            sender: "sender@example.invalid".to_string(),
+            reply_target: "sender@example.invalid".to_string(),
+            channel: "email".to_string(),
+            channel_alias: Some("test".to_string()),
+            content: content.to_string(),
+            subject: Some("Thread subject".to_string()),
+            references: vec![
+                "root@example.invalid".to_string(),
+                "parent@example.invalid".to_string(),
+            ],
+            ..ChannelMessage::default()
+        }
+    }
+
+    #[cfg(feature = "channel-email")]
+    fn assert_full_email_reply_chain(message: &SendMessage) {
+        assert_eq!(
+            message.in_reply_to.as_deref(),
+            Some("current@example.invalid")
+        );
+        assert_eq!(
+            message.references,
+            [
+                "root@example.invalid",
+                "parent@example.invalid",
+                "current@example.invalid"
+            ]
+        );
+        let wire = email_wire(message);
+        let unfolded_wire = wire.replace("\r\n ", " ");
+        assert!(
+            wire.contains("In-Reply-To: <current@example.invalid>"),
+            "runtime response lost its immediate parent on the wire:\n{wire}"
+        );
+        assert!(
+            unfolded_wire.contains(
+                "References: <root@example.invalid> <parent@example.invalid> <current@example.invalid>"
+            ),
+            "runtime response lost its References ancestry on the wire:\n{wire}"
+        );
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[tokio::test]
+    async fn runtime_command_email_reply_preserves_full_references_chain() {
+        let channel_impl = Arc::new(ThreadingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(DummyModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        let handled = handle_runtime_command_if_needed(
+            ctx.as_ref(),
+            &threaded_email_message("/new"),
+            Some(&(channel_impl.clone() as Arc<dyn Channel>)),
+        )
+        .await;
+
+        assert!(handled);
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_full_email_reply_chain(&sent[0]);
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[tokio::test]
+    async fn llm_error_email_reply_preserves_full_references_chain() {
+        let channel_impl = Arc::new(ThreadingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(FormatErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+
+        process_channel_message(
+            ctx,
+            threaded_email_message("trigger format error"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_full_email_reply_chain(&sent[0]);
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[tokio::test]
+    async fn transient_error_email_reply_preserves_full_references_chain() {
+        let channel_impl = Arc::new(ThreadingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(TransientErrorModelProvider),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("test owns the only runtime context handle")
+            .reliability = Arc::new(zeroclaw_config::schema::ReliabilityConfig {
+            provider_retries: 0,
+            provider_backoff_ms: 0,
+            ..zeroclaw_config::schema::ReliabilityConfig::default()
+        });
+
+        process_channel_message(
+            ctx,
+            threaded_email_message("trigger transient error"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_full_email_reply_chain(&sent[0]);
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[tokio::test]
+    async fn timeout_email_reply_preserves_full_references_chain() {
+        let channel_impl = Arc::new(ThreadingRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(SlowModelProvider {
+                delay: Duration::from_secs(1),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        Arc::get_mut(&mut ctx)
+            .expect("test owns the only runtime context handle")
+            .message_timeout_secs = 0;
+
+        process_channel_message(
+            ctx,
+            threaded_email_message("trigger timeout"),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert_full_email_reply_chain(&sent[0]);
+    }
+
+    #[cfg(feature = "channel-email")]
+    #[test]
+    fn stop_email_reply_preserves_full_references_chain() {
+        let message = threaded_email_message("/stop");
+        let reply = stop_reply_message(&message, "stop requested");
+
+        assert_full_email_reply_chain(&reply);
+    }
+
     #[tokio::test]
     async fn dispatch_agent_scope_rejects_when_no_peer_groups_configured() {
         // Default config (no peer_groups) — every sender must be denied.
@@ -23319,14 +26833,15 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(calls[1][3].1.contains("follow up"));
     }
 
-    #[tokio::test]
-    async fn process_channel_message_refreshes_available_skills_after_new_session() {
+    async fn assert_process_channel_message_refreshes_available_skills_after_new_session() {
         let workspace = make_workspace();
         let mut config = Config {
             data_dir: workspace.path().to_path_buf(),
             ..Default::default()
         };
         config.skills.open_skills_enabled = false;
+        config.skills.prompt_injection_mode =
+            zeroclaw_config::schema::SkillsPromptInjectionMode::Compact;
 
         let initial_skills =
             zeroclaw_runtime::skills::load_skills_with_config(workspace.path(), &config);
@@ -23371,7 +26886,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 ),
             ),
             tools_registry: Arc::new(
-                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(NamedMockTool("read_skill")),
+                ]),
             ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(initial_system_prompt),
@@ -23406,7 +26923,7 @@ BTC is currently around $65,000 based on latest tool output."#
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
             hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
+            non_cli_excluded_tools: Arc::new(vec!["read_skill".to_string()]),
             autonomy_level: AutonomyLevel::default(),
             tool_call_dedup_exempt: Arc::new(Vec::new()),
             model_routes: Arc::new(Vec::new()),
@@ -23460,7 +26977,7 @@ BTC is currently around $65,000 based on latest tool output."#
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: refresh-test\ndescription: Refresh the available skills section\n---\n# Refresh Test\nExpose this skill after /new.\n",
+            "---\nname: refresh-test\ndescription: Refresh the available skills section\n---\n# Refresh Test\nExpose this skill on fresh sessions.\n",
         )
         .unwrap();
         let refreshed_skills =
@@ -23468,10 +26985,64 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(refreshed_skills.len(), 1);
         assert_eq!(refreshed_skills[0].name, "refresh-test");
         assert!(
-            refreshed_new_session_system_prompt(runtime_ctx.as_ref())
-                .contains("<name>refresh-test</name>"),
+            refreshed_skills_system_prompt(
+                runtime_ctx.as_ref(),
+                runtime_ctx.system_prompt.as_str(),
+                false,
+            )
+            .contains("<name>refresh-test</name>"),
             "fresh-session prompt should pick up skills added after startup"
         );
+        assert!(
+            refreshed_skills_system_prompt(
+                runtime_ctx.as_ref(),
+                runtime_ctx.system_prompt.as_str(),
+                false,
+            )
+            .contains("Expose this skill on fresh sessions."),
+            "fresh-session prompt should inline instructions when read_skill is unavailable"
+        );
+
+        let cached_compact_prompt = refreshed_skills_system_prompt(
+            runtime_ctx.as_ref(),
+            runtime_ctx.system_prompt.as_str(),
+            true,
+        );
+        assert!(cached_compact_prompt.contains("read_skill(name)"));
+        assert!(!cached_compact_prompt.contains("Expose this skill on fresh sessions."));
+        let mut provider_transition_history = vec![ChatMessage::system(cached_compact_prompt)];
+        refresh_channel_history_skills(
+            runtime_ctx.as_ref(),
+            &mut provider_transition_history,
+            false,
+        );
+        let provider_transition_prompt = &provider_transition_history[0].content;
+        assert!(
+            provider_transition_prompt.contains("Expose this skill on fresh sessions."),
+            "an established session must inline instructions when its active provider loses the loader protocol"
+        );
+        assert!(!provider_transition_prompt.contains("read_skill(name)"));
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-fresh-sender".to_string(),
+                sender: "bob".to_string(),
+                reply_target: "chat-refresh".to_string(),
+                content: "first turn".to_string(),
+                channel: "telegram".into(),
+                channel_alias: None,
+                timestamp: 2,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+
+                ..Default::default()
+            },
+            CancellationToken::new(),
+        )
+        .await;
 
         Box::pin(process_channel_message(
             runtime_ctx.clone(),
@@ -23482,7 +27053,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 content: "/new".to_string(),
                 channel: "telegram".into(),
                 channel_alias: None,
-                timestamp: 2,
+                timestamp: 3,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
@@ -23525,7 +27096,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 content: "hello again".to_string(),
                 channel: "telegram".into(),
                 channel_alias: None,
-                timestamp: 3,
+                timestamp: 4,
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
@@ -23542,20 +27113,37 @@ BTC is currently around $65,000 based on latest tool output."#
                 .calls
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            assert_eq!(calls.len(), 2);
+            assert_eq!(calls.len(), 3);
             assert_eq!(calls[0][0].0, "system");
             assert_eq!(calls[1][0].0, "system");
+            assert_eq!(calls[2][0].0, "system");
             assert!(
                 !calls[0][0].1.contains("<name>refresh-test</name>"),
                 "pre-/new prompt should not advertise a skill that did not exist yet"
             );
             assert!(
                 calls[1][0].1.contains("<available_skills>"),
-                "post-/new prompt should contain the refreshed skills block"
+                "fresh-sender prompt should contain the refreshed skills block"
             );
             assert!(
                 calls[1][0].1.contains("<name>refresh-test</name>"),
+                "fresh-sender prompt should include skills discovered after startup"
+            );
+            assert!(
+                calls[1][0]
+                    .1
+                    .contains("Expose this skill on fresh sessions."),
+                "fresh-sender prompt should inline instructions without read_skill"
+            );
+            assert!(
+                calls[2][0].1.contains("<name>refresh-test</name>"),
                 "post-/new prompt should include skills discovered after the reset"
+            );
+            assert!(
+                calls[2][0]
+                    .1
+                    .contains("Expose this skill on fresh sessions."),
+                "post-/new prompt should inline instructions without read_skill"
             );
         }
 
@@ -23567,6 +27155,13 @@ BTC is currently around $65,000 based on latest tool output."#
                 .iter()
                 .any(|message| message.contains(&new_session_reply))
         );
+    }
+
+    #[test]
+    fn process_channel_message_refreshes_available_skills_after_new_session() {
+        run_channel_dispatch_test(|| {
+            Box::pin(assert_process_channel_message_refreshes_available_skills_after_new_session())
+        });
     }
 
     #[tokio::test]
@@ -24339,6 +27934,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 }],
                 subject: None,
                 internal_sop_event: None,
+                references: Vec::new(),
             },
             CancellationToken::new(),
         )
@@ -26189,6 +29785,7 @@ This is an example JSON object for profile settings."#;
                 }],
                 subject: None,
                 internal_sop_event: None,
+                references: Vec::new(),
             },
             CancellationToken::new(),
         )
@@ -28702,6 +32299,460 @@ Done."#;
         assert_eq!(
             strip_think_tags_inline("<think>hidden</think>  Answer  "),
             "Answer"
+        );
+    }
+
+    // ── Streaming draft scratchpad sanitization ───────────────────────────
+    //
+    // Drafts bypass `sanitize_channel_response_for_format_with_leak_detection`
+    // entirely (`update_draft` posts straight to the transport), so these pin
+    // the draft boundary to the same preservation contract as final delivery.
+
+    /// An empty tool registry, which is what the parity assertions against
+    /// `sanitize_channel_response(text, &[])` require: both boundaries must be
+    /// judging the same inventory for the comparison to mean anything.
+    fn no_tools() -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// The reported leak: a `<tool_result>` envelope reaching the user. Both
+    /// the closed form and the still-streaming open form must go.
+    #[test]
+    fn streaming_draft_strips_tool_result_envelopes() {
+        assert_eq!(
+            sanitize_streaming_draft_text(
+                "Before.\n<tool_result name=\"shell\">{\"ok\":true}</tool_result>\nAfter.",
+                &no_tools()
+            ),
+            "Before.\n\nAfter."
+        );
+        // Mid-emission: the closing tag has not arrived yet, so the tail is
+        // dropped rather than shown.
+        assert_eq!(
+            sanitize_streaming_draft_text(
+                "Result summary:\n<tool_result>\n{\"status\": \"ok\",",
+                &no_tools()
+            ),
+            "Result summary:"
+        );
+    }
+
+    /// False-positive guard: a response that IS protocol documentation must
+    /// survive the draft path byte-for-byte, exactly as
+    /// `sanitize_channel_response_preserves_tool_call_tag_example` pins it for
+    /// final delivery.
+    #[test]
+    fn streaming_draft_preserves_tool_protocol_example() {
+        let example = "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>\nThis is an example, not an invocation.";
+        assert_eq!(sanitize_streaming_draft_text(example, &no_tools()), example);
+    }
+
+    /// Parity guard: the draft path must not preserve MORE than final
+    /// delivery does. `strip_tool_result_content` is unguarded in the shared
+    /// sanitizer, so a `<tool_result>` envelope goes even inside an otherwise
+    /// preserved protocol example — otherwise the draft would display content
+    /// the delivered message strips moments later.
+    #[test]
+    fn streaming_draft_strips_tool_result_even_inside_a_preserved_example() {
+        let text = "<tool_call>{\"name\":\"shell\"}</tool_call>\nThis is an example, not an invocation.\n<tool_result>{\"secret\":1}</tool_result>";
+        let draft = sanitize_streaming_draft_text(text, &no_tools());
+        assert!(
+            !draft.contains("tool_result") && !draft.contains("secret"),
+            "tool_result must be stripped even in an example: {draft:?}"
+        );
+        assert!(
+            draft.contains("This is an example, not an invocation."),
+            "the example prose must survive: {draft:?}"
+        );
+
+        // Same input through the shared final sanitizer: the two boundaries
+        // must agree on what survives.
+        let final_text = sanitize_channel_response(text, &[]);
+        assert_eq!(
+            draft.contains("tool_result"),
+            final_text.contains("tool_result"),
+            "draft and final must agree on tool_result handling"
+        );
+    }
+
+    /// `<thinking>` is not `<think>`: the old transport-level filter matched
+    /// on a `starts_with("<think")` prefix and ate unrelated tags.
+    #[test]
+    fn streaming_draft_does_not_treat_thinking_tag_as_scratchpad() {
+        let text = "<thinking-cap>worn</thinking-cap> Answer.";
+        assert_eq!(sanitize_streaming_draft_text(text, &no_tools()), text);
+    }
+
+    /// Clean text must pass through with its interior shape intact; only the
+    /// outer trim that `strip_think_tags_inline` already applied is expected.
+    #[test]
+    fn streaming_draft_leaves_clean_text_untouched() {
+        let text = "A normal reply.\nWith two lines.\n\n  indented continuation";
+        assert_eq!(sanitize_streaming_draft_text(text, &no_tools()), text);
+        // Prose that merely mentions the tag name is not an envelope.
+        let prose = "Use the `tool_result` field.";
+        assert_eq!(sanitize_streaming_draft_text(prose, &no_tools()), prose);
+    }
+
+    /// Composed regression over the streaming loop rather than a single
+    /// string: replay the accumulation `draft_updater` performs and assert no
+    /// intermediate frame ever renders a scratchpad envelope. A per-call test
+    /// alone would miss a leak that is only visible mid-stream, which is
+    /// exactly how the reported artifact reached the user.
+    #[test]
+    fn streaming_draft_never_renders_scratchpad_in_any_frame() {
+        let deltas = [
+            "Checking the price",
+            " now.\n<tool_res",
+            "ult name=\"price\">",
+            "{\"btc\": 64000}",
+            "</tool_result>\n",
+            "BTC is $64,000.",
+        ];
+        let mut accumulated = String::new();
+        let mut frames = Vec::new();
+        for delta in deltas {
+            accumulated.push_str(delta);
+            frames.push(sanitize_streaming_draft_text(&accumulated, &no_tools()));
+        }
+
+        for (i, frame) in frames.iter().enumerate() {
+            assert!(
+                !frame.contains("<tool_res") && !frame.contains("btc"),
+                "frame {i} leaked scratchpad: {frame:?}"
+            );
+        }
+        assert_eq!(
+            frames.last().unwrap(),
+            "Checking the price now.\n\nBTC is $64,000."
+        );
+    }
+
+    /// The preserved-example branch and a half-emitted result envelope in the
+    /// same stream. Preserving a complete `<tool_call>` documentation block
+    /// must not buy the model a window in which a partial `<tool_result>`
+    /// payload is visible, so this replays the accumulation frame by frame
+    /// rather than sanitizing the finished string: the leak exists only while
+    /// the closing tag has not arrived, which a single-string test cannot see.
+    #[test]
+    fn streaming_draft_preserved_example_never_shows_a_partial_result_tail() {
+        let deltas = [
+            "<tool_call>{\"name\":\"shell\"}",
+            "</tool_call>\nThis is an example, not an invocation.",
+            "\n<tool_result>{\"secret\":1",
+            "}</tool_result>\nDone.",
+        ];
+        let mut accumulated = String::new();
+        let mut frames = Vec::new();
+        for delta in deltas {
+            accumulated.push_str(delta);
+            frames.push(sanitize_streaming_draft_text(&accumulated, &no_tools()));
+        }
+
+        for (i, frame) in frames.iter().enumerate() {
+            assert!(
+                !frame.contains("secret") && !frame.contains("<tool_result"),
+                "frame {i} leaked a result envelope: {frame:?}"
+            );
+        }
+
+        // Once the example is complete it must stay visible, including across
+        // the frames where the result envelope is still arriving.
+        for (i, frame) in frames.iter().enumerate().skip(1) {
+            assert!(
+                frame.contains("This is an example, not an invocation."),
+                "frame {i} dropped the preserved example: {frame:?}"
+            );
+            assert!(
+                frame.contains("<tool_call>"),
+                "frame {i} dropped the preserved tool_call tags: {frame:?}"
+            );
+        }
+
+        assert!(
+            frames.last().unwrap().contains("Done."),
+            "the closing prose must survive: {:?}",
+            frames.last().unwrap()
+        );
+    }
+
+    /// Production-boundary proof for draft sanitization. Drives
+    /// [`run_draft_updater`], the code the streaming spawn actually runs, and
+    /// asserts on the strings handed to `update_draft` and
+    /// `update_draft_progress`. Unlike the per-frame tests above, this one
+    /// fails if the sanitizer call is ever dropped from the wiring.
+    #[tokio::test]
+    async fn draft_updater_never_hands_scratchpad_to_the_transport() {
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        // Queue every delta up front, then close the sender and drain inline.
+        // The capacity exceeds the number of deltas, so nothing blocks and the
+        // updater needs no concurrent task: it returns once the channel is
+        // closed and empty.
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::loop_::DraftEvent>(32);
+
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        for delta in [
+            "Looking that up",
+            " now.\n<tool_res",
+            "ult name=\"price\">",
+            "{\"btc\": 64000}",
+            "</tool_result>\n",
+            "BTC is $64,000.",
+        ] {
+            tx.send(StreamDelta::Text(delta.to_string())).await.unwrap();
+        }
+        tx.send(StreamDelta::Status(
+            "<think>deciding</think>Working on it.".to_string(),
+        ))
+        .await
+        .unwrap();
+        drop(tx);
+
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            rx,
+        )
+        .await;
+
+        let drafts = channel_impl.draft_updates.lock().await;
+        assert!(!drafts.is_empty(), "the transport must have been called");
+        for (i, text) in drafts.iter().enumerate() {
+            assert!(
+                !text.contains("<tool_res") && !text.contains("btc"),
+                "draft update {i} carried scratchpad to the transport: {text:?}"
+            );
+        }
+        assert_eq!(
+            drafts.last().unwrap(),
+            "Looking that up now.\n\nBTC is $64,000."
+        );
+        drop(drafts);
+
+        let progress = channel_impl.progress_messages.lock().await;
+        assert_eq!(
+            progress.as_slice(),
+            ["Working on it.".to_string()],
+            "status text must reach the transport already stripped of reasoning"
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_updater_uses_legacy_tool_status_and_ignores_reasoning() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::ToolStart {
+            tool: "shell".to_string(),
+            arguments: Arc::new(serde_json::json!({"command": "pwd"})),
+            tool_provenance: None,
+        })
+        .await
+        .unwrap();
+        tx.send(StreamDelta::Reasoning("private reasoning".to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::ToolComplete {
+            tool: "shell".to_string(),
+            arguments: Arc::new(serde_json::json!({"command": "pwd"})),
+            tool_provenance: None,
+            secs: 2,
+            success: true,
+            error: None,
+        })
+        .await
+        .unwrap();
+        drop(tx);
+
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            rx,
+        )
+        .await;
+
+        assert_eq!(
+            channel_impl.progress_messages.lock().await.as_slice(),
+            ["⏳ shell: pwd".to_string(), "✅ shell (2s)".to_string()],
+            "ordinary draft channels preserve the established structured-tool presentation"
+        );
+    }
+
+    /// Production-boundary regression for an alternate XML dialect arriving
+    /// split across deltas. The complete-tag stripper has always known seven
+    /// opening forms; the partial guard once knew two, so a frame ending in
+    /// `<invo` or `<function_` reached the transport verbatim. Both inventories
+    /// now come from one list, so every dialect is covered at both stages.
+    #[tokio::test]
+    async fn draft_updater_holds_back_split_alternate_protocol_prefixes() {
+        for (dialect, deltas) in [
+            (
+                "invoke",
+                [
+                    "Checking that",
+                    " now.\n<invo",
+                    "ke>{\"name\":\"shell\",\"secret\":1}",
+                    "</invoke>\nAll set.",
+                ],
+            ),
+            (
+                "function_call",
+                [
+                    "Checking that",
+                    " now.\n<function_",
+                    "call>{\"name\":\"shell\",\"secret\":1}",
+                    "</function_call>\nAll set.",
+                ],
+            ),
+            (
+                "tool-call",
+                [
+                    "Checking that",
+                    " now.\n<tool-",
+                    "call>{\"name\":\"shell\",\"secret\":1}",
+                    "</tool-call>\nAll set.",
+                ],
+            ),
+        ] {
+            let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::loop_::DraftEvent>(32);
+            use zeroclaw_runtime::agent::loop_::StreamDelta;
+            for delta in deltas {
+                tx.send(StreamDelta::Text(delta.to_string())).await.unwrap();
+            }
+            drop(tx);
+
+            run_draft_updater(
+                channel,
+                "chat-1".to_string(),
+                "draft-1".to_string(),
+                no_tools(),
+                rx,
+            )
+            .await;
+
+            let drafts = channel_impl.draft_updates.lock().await;
+            assert!(
+                !drafts.is_empty(),
+                "{dialect}: the transport must be called"
+            );
+            for (i, text) in drafts.iter().enumerate() {
+                assert!(
+                    !text.contains('<') && !text.contains("secret"),
+                    "{dialect}: draft update {i} carried a protocol opener: {text:?}"
+                );
+            }
+            assert_eq!(
+                drafts.last().unwrap(),
+                "Checking that now.\n\nAll set.",
+                "{dialect}: the surrounding prose must survive"
+            );
+        }
+    }
+
+    /// Production-boundary regression for the strict-parsing path. With
+    /// `strict_tool_parsing` enabled the runtime forwards deltas without the
+    /// `StreamTextGuard`, so a protocol JSON body — bare or fenced, complete or
+    /// still arriving — reaches this boundary exactly as emitted. The final
+    /// sanitizer suppresses these through the parser's classifier; the draft
+    /// boundary now asks the same classifier.
+    #[tokio::test]
+    async fn draft_updater_suppresses_strict_mode_protocol_json() {
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+
+        for (label, deltas) in [
+            (
+                "bare malformed result",
+                vec![
+                    "{\"tool_call_id\":\"call_1\",",
+                    "\"content\":\"s3cret-output\"",
+                ],
+            ),
+            (
+                "fenced protocol payload",
+                vec![
+                    "Here you go.\n```json\n",
+                    "{\"tool_calls\":[{\"call_id\":\"c1\",\"name\":\"shell\",",
+                    "\"arguments\":{\"command\":\"cat /etc/s3cret\"}}]",
+                ],
+            ),
+        ] {
+            let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let (tx, rx) =
+                tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::loop_::DraftEvent>(32);
+            use zeroclaw_runtime::agent::loop_::StreamDelta;
+            for delta in &deltas {
+                tx.send(StreamDelta::Text((*delta).to_string()))
+                    .await
+                    .unwrap();
+            }
+            drop(tx);
+
+            run_draft_updater(
+                channel,
+                "chat-1".to_string(),
+                "draft-1".to_string(),
+                known.clone(),
+                rx,
+            )
+            .await;
+
+            let drafts = channel_impl.draft_updates.lock().await;
+            for (i, text) in drafts.iter().enumerate() {
+                assert!(
+                    !text.contains("s3cret") && !text.contains("tool_call_id"),
+                    "{label}: draft update {i} carried protocol JSON: {text:?}"
+                );
+            }
+        }
+    }
+
+    /// The counterweight to the two suppression tests above: a genuine answer
+    /// *about* tool protocol, and an ordinary fenced code block, must still
+    /// stream. Suppressing everything JSON-shaped would be an easy way to pass
+    /// the leak tests and a bad way to answer a question.
+    #[tokio::test]
+    async fn draft_updater_still_streams_examples_and_ordinary_code_fences() {
+        let known: HashSet<String> = ["shell".to_string()].into_iter().collect();
+        let channel_impl = Arc::new(DraftRecordingChannel::new(false, false));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_runtime::agent::loop_::DraftEvent>(32);
+
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+        for delta in [
+            "Here is how a config looks:\n```json\n",
+            "{\"retries\": 3,\n",
+            "\"timeout_ms\": 500}\n```\n",
+            "Adjust the values to taste.",
+        ] {
+            tx.send(StreamDelta::Text(delta.to_string())).await.unwrap();
+        }
+        drop(tx);
+
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            known,
+            rx,
+        )
+        .await;
+
+        let drafts = channel_impl.draft_updates.lock().await;
+        let last = drafts.last().expect("the transport must have been called");
+        assert!(
+            last.contains("\"retries\": 3") && last.contains("Adjust the values to taste."),
+            "an ordinary JSON code fence must survive the draft path: {last:?}"
         );
     }
 

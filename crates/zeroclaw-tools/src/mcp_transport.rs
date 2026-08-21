@@ -25,6 +25,12 @@ const MAX_LINE_BYTES: usize = 4 * 1024 * 1024; // 4 MB
 /// long enough to stay negligible against idle transports.
 const STDIO_CHILD_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Courtesy window granted to a stdio MCP server to exit on its own after its
+/// stdin is closed (EOF), before the reaper escalates to `start_kill`. A server
+/// that shuts down on EOF exits near-instantly; this only bounds how long a
+/// server that ignores EOF delays teardown before being signalled.
+const STDIO_CLOSE_GRACE: Duration = Duration::from_secs(2);
+
 /// Timeout for init/list operations.
 const RECV_TIMEOUT_SECS: u64 = 30;
 
@@ -554,20 +560,24 @@ impl StdioTransport {
     }
 
     async fn reap_conn(conn: StdioConn, server_name: &str) -> Result<()> {
-        // Stop the background tasks so they release their `Arc<Mutex<Child>>`
-        // clone and cannot race the reaping `wait`. We abort via `&self`
-        // handles (JoinHandle::abort) rather than moving the handles out, since
-        // `StdioConn`'s `Drop` impl also aborts them on scope exit.
-        conn.reader.abort();
-        conn.exit_watcher.abort();
-
+        // Clone the shared handles needed after the connection is gone.
         let child = Arc::clone(&conn.child);
+        let child_exited = Arc::clone(&conn.child_exited);
+        // Dropping the connection runs `StdioConn::Drop`, which aborts the
+        // background tasks (releasing their `Arc<Mutex<Child>>` clones so they
+        // cannot race the reaping `wait`) AND drops the sole `ChildStdin`. That
+        // closes the server's stdin, delivering EOF so a server that shuts down
+        // on EOF can exit on its own before any signal. (`AsyncWriteExt::shutdown`
+        // is a no-op on `ChildStdin` in tokio: it returns `Ready(Ok(()))`
+        // without closing the fd; only dropping the handle closes the pipe.)
+        drop(conn);
+
         let mut child = child.lock().await;
-        if child
-            .try_wait()
-            .with_context(|| format!("failed to inspect MCP server `{server_name}` child"))?
-            .is_none()
-        {
+        // Give the server a bounded courtesy window to exit on the EOF it just
+        // saw. A server that honors EOF exits near-instantly, so this only adds
+        // latency when a server ignores EOF and must be signalled regardless.
+        // Escalate to a signal only if the child is still running afterward.
+        if timeout(STDIO_CLOSE_GRACE, child.wait()).await.is_err() {
             child
                 .start_kill()
                 .with_context(|| format!("failed to kill MCP server `{server_name}` child"))?;
@@ -577,7 +587,7 @@ impl StdioTransport {
                 .with_context(|| format!("failed to reap MCP server `{server_name}` child"))?;
         }
         // The direct child is now gone regardless of stdout pipe state.
-        conn.child_exited.store(true, Ordering::Release);
+        child_exited.store(true, Ordering::Release);
         Ok(())
     }
 }
@@ -1964,6 +1974,46 @@ mod tests {
         SharedMcpTransportConn::close(transport.as_ref())
             .await
             .expect("close transport");
+    }
+
+    /// `close()` must deliver stdin EOF and let a well-behaved server exit on
+    /// its own before escalating to a signal. The stub reads stdin to EOF, then
+    /// writes a marker and exits 0; a force-kill that landed before EOF would
+    /// SIGKILL the shell before the marker write, so the marker's presence
+    /// proves the graceful path ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdio_close_delivers_eof_before_killing_the_server() {
+        let marker =
+            std::env::temp_dir().join(format!("zeroclaw_stdio_eof_marker_{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let config = McpServerConfig {
+            name: "stdio-graceful-eof".into(),
+            transport: McpTransport::Stdio,
+            command: "/bin/sh".into(),
+            // The marker path is passed positionally (`$1`), never interpolated
+            // into the script, so it is safe under a TMPDIR with spaces.
+            args: vec![
+                "-c".into(),
+                "cat >/dev/null; printf done > \"$1\"".into(),
+                "sh".into(),
+                marker.to_string_lossy().into_owned(),
+            ],
+            ..Default::default()
+        };
+        let transport = StdioTransport::new(&config).expect("build transport");
+
+        SharedMcpTransportConn::close(&transport)
+            .await
+            .expect("close transport");
+
+        assert!(
+            marker.exists(),
+            "close() did not deliver stdin EOF before killing: the server was \
+             signalled before it could observe EOF and write its marker"
+        );
+        let _ = std::fs::remove_file(&marker);
     }
 
     /// When the direct child exits but a descendant keeps the inherited stdout

@@ -8,6 +8,7 @@ use zeroclaw_config::presets::{
     SelectorChoice, recommended_runtime_preset, risk_preset, runtime_preset,
 };
 use zeroclaw_config::schema::{Config, WireApi};
+use zeroclaw_config::traits::AliasSource;
 
 /// Which surface invoked the Quickstart. Stamped on every event in
 /// the apply path so SSE/dashboard consumers can filter by origin
@@ -526,12 +527,7 @@ pub fn snapshot_state(cfg: &Config) -> QuickstartState {
         default_runtime_profile: recommended_runtime_preset(None)
             .map(|preset| preset.preset_name.to_string())
             .unwrap_or_default(),
-        model_providers: cfg
-            .providers
-            .models
-            .iter_entries()
-            .map(|(family, alias, _)| format!("{family}.{alias}"))
-            .collect(),
+        model_providers: cfg.resolve_alias_source(AliasSource::ModelProviders),
         channels: collect_aliased_refs(&cfg.channels),
         unassigned_channels: collect_aliased_refs(&cfg.channels)
             .into_iter()
@@ -693,7 +689,14 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
                 codex_auth_preselected,
             )
         }
-        FieldSection::Channel => (format!("channels.{type_key}"), CHANNEL_ESSENTIALS, false),
+        FieldSection::Channel => {
+            let essentials = if type_key == "webhook" {
+                WEBHOOK_CHANNEL_ESSENTIALS
+            } else {
+                CHANNEL_ESSENTIALS
+            };
+            (format!("channels.{type_key}"), essentials, false)
+        }
         FieldSection::PeerGroup => ("peer_groups".to_string(), PEER_GROUP_ESSENTIALS, false),
     };
 
@@ -717,7 +720,9 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
         if !essentials.contains(&field_path) {
             continue;
         }
-        let default = if info.is_secret {
+        let default = if section_path == "channels.webhook" && field_path == "port" {
+            Some(zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT.to_string())
+        } else if info.is_secret {
             None
         } else {
             let raw = info.display_value.trim();
@@ -771,6 +776,14 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
 /// without.
 const MODEL_PROVIDER_ESSENTIALS: &[&str] = &["model", QUICKSTART_AUTH_MODE_FIELD, "api_key", "uri"];
 const CHANNEL_ESSENTIALS: &[&str] = &["bot_token", "token", "webhook_url", "allowed_users"];
+const WEBHOOK_CHANNEL_ESSENTIALS: &[&str] = &[
+    "bot_token",
+    "token",
+    "webhook_url",
+    "allowed_users",
+    "port",
+    "secret",
+];
 const PEER_GROUP_ESSENTIALS: &[&str] = &["channel", "external_peers", "agents", "ignore"];
 
 const QUICKSTART_AUTH_MODE_FIELD: &str = "auth_mode";
@@ -1525,6 +1538,23 @@ fn apply_channels(
                     ));
                     continue;
                 }
+                if config_channel_type == "webhook"
+                    && entry
+                        .fields
+                        .get("secret")
+                        .and_then(|value| usable_quickstart_value(value))
+                        .is_none()
+                {
+                    errors.push(QuickstartError::for_surface(
+                        ctx,
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.secret"),
+                        "webhook secret is required",
+                        "cli-quickstart-error-webhook-secret-required",
+                        &[],
+                    ));
+                    continue;
+                }
                 let mut staged = config.clone();
                 if let Err(err) =
                     staged.create_map_key(&format!("channels.{config_channel_type}"), alias)
@@ -1537,6 +1567,24 @@ fn apply_channels(
                     continue;
                 }
                 let prefix = format!("channels.{config_channel_type}.{alias}");
+                if config_channel_type == "webhook"
+                    && entry
+                        .fields
+                        .get("port")
+                        .and_then(|value| usable_quickstart_value(value))
+                        .is_none()
+                    && let Err(err) = staged.set_prop_persistent(
+                        &format!("{prefix}.port"),
+                        &zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT.to_string(),
+                    )
+                {
+                    errors.push(QuickstartError::new(
+                        QuickstartStep::Channels,
+                        format!("channels[{idx}].fields.port"),
+                        err.to_string(),
+                    ));
+                    continue;
+                }
                 let mut fields: Vec<_> = entry
                     .fields
                     .iter()
@@ -2220,6 +2268,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn snapshot_state_sorts_configured_model_provider_refs() {
+        let mut cfg = Config::default();
+        cfg.create_map_key("providers.models.openai", "zeta")
+            .unwrap();
+        cfg.create_map_key("providers.models.anthropic", "omega")
+            .unwrap();
+        cfg.create_map_key("providers.models.anthropic", "alpha")
+            .unwrap();
+
+        let snapshot = snapshot_state(&cfg);
+
+        assert_eq!(
+            snapshot.model_providers,
+            vec![
+                "anthropic.alpha".to_string(),
+                "anthropic.omega".to_string(),
+                "openai.zeta".to_string(),
+            ]
+        );
+    }
+
     fn fresh_submission(agent_name: &str) -> BuilderSubmission {
         BuilderSubmission {
             model_provider: SelectorChoice::Fresh(ModelProviderChoice {
@@ -2706,6 +2776,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn webhook_channel_quickstart_fields_include_port_and_secret() {
+        let rows = super::field_shape(super::FieldSection::Channel, "webhook");
+        let port = rows
+            .iter()
+            .find(|row| row.key == "port")
+            .expect("webhook port row");
+        assert_eq!(port.default.as_deref(), Some("8090"));
+        assert!(port.required);
+        assert!(!port.is_secret);
+
+        let secret = rows
+            .iter()
+            .find(|row| row.key == "secret")
+            .expect("webhook secret row");
+        assert!(secret.required);
+        assert!(secret.is_secret);
+        assert_eq!(secret.default, None);
+    }
+
+    #[test]
+    fn non_webhook_channel_quickstart_fields_exclude_webhook_requirements() {
+        for channel_type in ["irc", "lark"] {
+            let rows = super::field_shape(super::FieldSection::Channel, channel_type);
+            assert!(
+                rows.iter()
+                    .all(|row| row.key != "port" && row.key != "secret"),
+                "{channel_type} must not inherit webhook-only fields; got {rows:?}"
+            );
+        }
+    }
+
     async fn apply_to_temp(submission: BuilderSubmission) -> (tempfile::TempDir, Config) {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
@@ -2846,6 +2948,90 @@ mod tests {
             "123:ABC"
         );
         assert!(reloaded.channels.telegram["ops"].enabled);
+    }
+
+    #[tokio::test]
+    async fn webhook_channel_quickstart_fields_persist() {
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("port", "9191"), ("secret", "shared-secret")],
+        ))];
+
+        let (dir, _) = apply_to_temp(submission).await;
+        let reloaded = reload(&dir);
+        let webhook = &reloaded.channels.webhook["inbound"];
+        assert_eq!(webhook.port, 9191);
+        assert!(webhook.enabled);
+
+        let stored_secret = webhook.secret.as_deref().expect("persisted webhook secret");
+        assert!(zeroclaw_config::secrets::SecretStore::is_encrypted(
+            stored_secret
+        ));
+        let store = zeroclaw_config::secrets::SecretStore::new(dir.path(), true);
+        assert_eq!(store.decrypt(stored_secret).unwrap(), "shared-secret");
+    }
+
+    #[test]
+    fn webhook_channel_defaults_port_and_rejects_unusable_secret() {
+        for value in [
+            None,
+            Some(""),
+            Some("   "),
+            Some(zeroclaw_config::traits::UNSET_DISPLAY),
+        ] {
+            let mut cfg = Config::default();
+            let fields = value.map_or_else(Vec::new, |value| vec![("secret", value)]);
+            let channels = vec![SelectorChoice::Fresh(fresh_channel(
+                "webhook", "inbound", &fields,
+            ))];
+            let mut errors = Vec::new();
+
+            let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+            assert!(refs.is_empty());
+            assert!(errors.iter().any(|error| {
+                error.field == "channels[0].fields.secret" && error.message.contains("required")
+            }));
+            assert!(!cfg.channels.webhook.contains_key("inbound"));
+        }
+
+        let mut cfg = Config::default();
+        let channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "shared-secret")],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply errors: {errors:?}");
+        assert_eq!(refs, ["webhook.inbound"]);
+        assert_eq!(
+            cfg.channels.webhook["inbound"].port,
+            zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
+        );
+    }
+
+    #[test]
+    fn webhook_channel_cli_reports_webhook_secret_error() {
+        let cfg = Config::default();
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "")],
+        ))];
+
+        let errors = validate_only_with_surface(&submission, &cfg, Surface::Cli)
+            .expect_err("empty webhook secret must be rejected");
+
+        assert!(errors.iter().any(|error| {
+            error.field == "channels[0].fields.secret"
+                && error.message == "Webhook shared secret is required"
+        }));
     }
 
     #[test]

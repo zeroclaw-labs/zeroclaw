@@ -1,13 +1,18 @@
-//! Non-fatal validation warnings — config that loads and validates
-//! successfully (i.e. `Config::validate()` returns `Ok(())`) but will fail
-//! at agent runtime because of a logical inconsistency the schema can't
-//! enforce structurally.
+//! Non-fatal validation warnings for config that loads and validates
+//! successfully (i.e. `Config::validate()` returns `Ok(())`) but needs user
+//! attention. Warnings may identify a runtime inconsistency, an inert setting,
+//! a risky trust-boundary choice, or a supported configuration that is being
+//! deprecated.
 
 use serde::{Deserialize, Serialize};
 
 /// One non-fatal validation issue surfaced after a successful save.
 ///
 /// Stable codes (extend as new warnings are added):
+/// - `codex_cli_extra_args_security_boundary`: `codex_cli.extra_args` contains
+///   a known Codex CLI argument that can change sandbox, approval, policy,
+///   workspace, feature, trust, or executable-integration boundaries. The
+///   argument remains allowed.
 /// - `memory_semantic_search_without_embedder`: `memory.search_mode` requests
 ///   vector search on sqlite memory, but no effective embedder is configured.
 /// - `whatsapp_chat_policy_inert`: a WhatsApp Web `dm_policy` / `group_policy` /
@@ -36,12 +41,16 @@ use serde::{Deserialize, Serialize};
 ///   has no runtime consumer — the context compressor was removed —
 ///   so it currently has no effect. One warning per non-default field (see
 ///   `collect_context_compression_ignored_warnings` in `schema.rs`).
+/// - `proxy_conflicts_with_dns_pinned_tools`: the configured proxy scope
+///   selects `http_request` and/or `web_fetch`, whose validated DNS answers
+///   require direct transport and therefore make the selected tool fail.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
     /// Stable machine-readable identifier for the warning class.
     pub code: String,
-    /// Human-readable description suitable for direct display.
+    /// Stable English fallback for logs and consumers without a localization catalog.
+    /// User-facing surfaces should localize from `code` and use this only for unknown codes.
     pub message: String,
     /// Dotted property path the warning concerns
     /// (e.g. `"agents.researcher.model_provider"`).

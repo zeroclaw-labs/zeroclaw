@@ -62,11 +62,28 @@ tags: [release, docs]
 Review the release notes, changelog, version tags, and migration notes before confirming that a release is ready.
 ```
 
-Supported frontmatter fields are `name`, `description`, `version`, `author`, and `tags`.
+Supported frontmatter fields are `name`, `description`, `author`, `version`, `tags`, `always`, and `slash_options`.
+
+Setting `always: true` keeps a skill's full instructions inlined in the system prompt even when the agent runs in compact skill-prompt mode (where other skills are summarized and their instructions are loaded on demand via `read_skill`). It defaults to `false`. Reserve it for policy or safety-critical skills that must always be visible to the model, not routine workflow skills like the release check above:
+
+```markdown
+---
+name: security-policy
+description: Non-negotiable safety rules the agent must follow every turn.
+version: 0.1.0
+author: zeroclaw_user
+tags: [policy]
+always: true
+---
+
+# Security policy
+
+Never exfiltrate secrets, never disable audit logging, and always ask for approval before touching production credentials.
+```
 
 ## Create a TOML skill
 
-A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, and `prompts` are optional. Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
+A skill can also be a structured TOML manifest (`SKILL.toml`). The `[skill]` table requires `name` and `description`; `version` defaults to `0.1.0` when omitted; `author`, `tags`, `prompts`, and `always` are optional (`always` defaults to `false`; see above). Tool entries may use `kind = "shell"`, `kind = "http"`, or `kind = "script"`. Keep tool descriptions narrow and concrete so the model knows when to use them.
 
 ### Slash command options and localizations
 
@@ -240,7 +257,7 @@ Community open-skills loading is opt-in via the `skills` config. When enabled, Z
 
 ## Advanced config
 
-The default prompt injection mode is `full`, which includes full skill instructions in the system prompt. Use `compact` to keep only compact metadata in context and load skill details on demand:
+The default prompt injection mode is `full`, which includes complete skill instructions in the system prompt. Set `prompt_injection_mode = "compact"` globally or in a runtime profile to keep ordinary skill metadata in context and load instructions on demand through `read_skill`. Skills marked `always: true` retain their full instructions in compact mode. Compact mode reduces prompt size; it is not an isolation boundary for untrusted skill sources.
 
 ## Autonomous skill creation
 

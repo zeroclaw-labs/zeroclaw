@@ -2,13 +2,13 @@
 
 use crate::PluginCapability;
 use crate::component::PluginLimits;
+use crate::config::PluginConfigResolver;
 use crate::instance::PluginInstanceScope;
 use crate::runtime;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::PathBuf;
-use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+use zeroclaw_api::attribution::{Attributable, Role, ToolKind, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// A tool backed by a WASM plugin function.
@@ -18,13 +18,13 @@ pub struct WasmTool {
     parameters_schema: Value,
     wasm_path: PathBuf,
     scope: PluginInstanceScope,
-    config: HashMap<String, String>,
+    config: PluginConfigResolver,
     limits: PluginLimits,
 }
 
 impl Attributable for WasmTool {
     fn role(&self) -> Role {
-        Role::Tool(ToolKind::Plugin)
+        Role::Tool(ToolKind::WasmPlugin)
     }
 
     fn alias(&self) -> &str {
@@ -33,6 +33,10 @@ impl Attributable for WasmTool {
         // binding identity remains on the host-issued scope and is emitted by
         // component logging under distinct plugin attributes.
         &self.name
+    }
+
+    fn tool_provenance(&self) -> ToolProvenance {
+        ToolProvenance::Extension
     }
 }
 
@@ -43,10 +47,11 @@ impl WasmTool {
         parameters_schema: Value,
         wasm_path: PathBuf,
         scope: PluginInstanceScope,
-        config: HashMap<String, String>,
+        config: PluginConfigResolver,
         limits: PluginLimits,
     ) -> anyhow::Result<Self> {
         scope.require_capability(PluginCapability::Tool)?;
+        config.resolve(&scope)?;
         Ok(Self {
             name,
             description,
@@ -65,10 +70,11 @@ impl WasmTool {
     pub fn from_wasm(
         wasm_path: PathBuf,
         scope: PluginInstanceScope,
-        config: HashMap<String, String>,
+        config: PluginConfigResolver,
         limits: PluginLimits,
     ) -> anyhow::Result<Self> {
         scope.require_capability(PluginCapability::Tool)?;
+        config.resolve(&scope)?;
         let probe = {
             let wasm_path = wasm_path.clone();
             let scope = scope.clone();
@@ -128,17 +134,37 @@ impl Tool for WasmTool {
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_vec(&args)?;
+        let config = self.config.resolve(&self.scope)?;
         let mut plugin = runtime::create_plugin(&self.wasm_path, &self.scope, self.limits).await?;
-        runtime::call_execute(&mut plugin, &args_json, &self.config).await
+        runtime::call_execute(&mut plugin, &args_json, &config).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 
     fn tool_scope() -> PluginInstanceScope {
         crate::instance::test_scope(PluginCapability::Tool, "redaction-primary", [])
+    }
+
+    fn config_resolver() -> PluginConfigResolver {
+        PluginConfigResolver::new(|scope| {
+            let manifest = crate::PluginManifest {
+                name: scope.id().package().to_string(),
+                version: "0.0.0".to_string(),
+                description: None,
+                author: None,
+                wasm_path: Some("fixture.wasm".to_string()),
+                capabilities: vec![scope.id().capability()],
+                permissions: vec![],
+                config_schema: None,
+                signature: None,
+                publisher_key: None,
+            };
+            crate::config::resolve_plugin_config(&manifest, scope, None)
+        })
     }
 
     #[test]
@@ -150,13 +176,14 @@ mod tests {
             schema.clone(),
             PathBuf::from("/tmp/plugin.wasm"),
             tool_scope(),
-            HashMap::new(),
+            config_resolver(),
             crate::component::test_limits(1_000),
         )
         .expect("tool scope matches adapter");
         assert_eq!(tool.name(), "redact");
         assert_eq!(tool.description(), "does things");
         assert_eq!(tool.parameters_schema(), schema);
+        assert_eq!(tool.role(), Role::Tool(ToolKind::WasmPlugin));
         assert_eq!(tool.alias(), "redact");
         assert_eq!(tool.scope.id().package(), "fixture");
         assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
@@ -172,7 +199,27 @@ mod tests {
             serde_json::json!({}),
             PathBuf::from("/tmp/plugin.wasm"),
             scope,
-            HashMap::new(),
+            config_resolver(),
+            crate::component::test_limits(0),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_rejects_invalid_config() {
+        let config = PluginConfigResolver::new(|_| {
+            Err(crate::error::PluginError::InvalidConfig(
+                "invalid-constructor-config".to_string(),
+            ))
+        });
+        let result = WasmTool::new(
+            "my_tool".to_string(),
+            "does things".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/tmp/plugin.wasm"),
+            tool_scope(),
+            config,
             crate::component::test_limits(0),
         );
 
@@ -184,10 +231,29 @@ mod tests {
         let result = WasmTool::from_wasm(
             PathBuf::from("/path/that/must/not/exist.wasm"),
             tool_scope(),
-            HashMap::new(),
+            config_resolver(),
             crate::component::test_limits(0),
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_wasm_validates_config_before_loading_guest_code() {
+        let config = PluginConfigResolver::new(|_| {
+            Err(crate::error::PluginError::InvalidConfig(
+                "invalid-before-load".to_string(),
+            ))
+        });
+        let error = WasmTool::from_wasm(
+            PathBuf::from("/path/that/must/not/exist.wasm"),
+            tool_scope(),
+            config,
+            crate::component::test_limits(0),
+        )
+        .err()
+        .expect("invalid config must reject registration");
+
+        assert!(error.to_string().contains("invalid-before-load"));
     }
 }

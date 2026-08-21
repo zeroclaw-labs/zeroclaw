@@ -10,8 +10,11 @@ pub mod docs;
 pub mod flake;
 pub mod install_sh;
 pub mod packaging;
+pub mod runtime_locales;
 pub mod setup_bat;
 pub mod spec;
+pub mod tools_ftl;
+pub mod zerocode_themes;
 
 use container::ContainerSurface;
 use spec::Selection as Sel;
@@ -46,6 +49,16 @@ fn registry() -> Vec<Surface> {
             name: "install-docs",
             file: "docs/book/src/_snippets/install.md",
             render: docs::render_file,
+        },
+        Surface {
+            name: "runtime-locales",
+            file: "crates/zeroclaw-runtime/src/generated_locales.rs",
+            render: runtime_locales::render_file,
+        },
+        Surface {
+            name: "tools-en-ftl",
+            file: "crates/zeroclaw-tools/locales/en/tools.ftl",
+            render: tools_ftl::render_file,
         },
         Surface {
             name: "readme-unix-fast",
@@ -88,9 +101,19 @@ fn registry() -> Vec<Surface> {
             render: |root, cur| render_docker_arg(root, cur),
         },
         Surface {
+            name: "dockerfile-alpine",
+            file: "Dockerfile.alpine",
+            render: |root, cur| render_docker_arg(root, cur),
+        },
+        Surface {
             name: "pkgbuild",
             file: "dist/aur/PKGBUILD",
             render: |root, cur| packaging::render_pkgbuild(root, cur),
+        },
+        Surface {
+            name: "aur-srcinfo",
+            file: "dist/aur/.SRCINFO",
+            render: |root, cur| packaging::render_srcinfo(root, cur),
         },
         Surface {
             name: "scoop",
@@ -106,6 +129,11 @@ fn registry() -> Vec<Surface> {
             name: "docker-tags",
             file: "dev/ci/docker-tags.toml",
             render: |root, cur| docker_tags::render_file(root, cur),
+        },
+        Surface {
+            name: "zerocode-themes",
+            file: "apps/zerocode/src/generated_themes.rs",
+            render: zerocode_themes::render_file,
         },
     ]
 }

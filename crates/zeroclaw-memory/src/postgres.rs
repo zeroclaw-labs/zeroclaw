@@ -328,7 +328,7 @@ where
     })?
 }
 
-fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
+pub(super) fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("{field_name} must not be empty");
     }
@@ -351,8 +351,24 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn quote_identifier(value: &str) -> String {
+pub(super) fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
+}
+
+fn recall_time_filter(since: bool, until: bool, first_placeholder: usize) -> String {
+    match (since, until) {
+        (true, true) => format!(
+            " AND m.created_at >= ${first_placeholder}::TIMESTAMPTZ AND m.created_at <= ${}::TIMESTAMPTZ",
+            first_placeholder + 1
+        ),
+        (true, false) => {
+            format!(" AND m.created_at >= ${first_placeholder}::TIMESTAMPTZ")
+        }
+        (false, true) => {
+            format!(" AND m.created_at <= ${first_placeholder}::TIMESTAMPTZ")
+        }
+        (false, false) => String::new(),
+    }
 }
 
 #[async_trait]
@@ -393,14 +409,7 @@ impl Memory for PostgresMemory {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            let time_filter: String = match (since_ref, until_ref) {
-                (Some(_), Some(_)) => {
-                    " AND created_at >= $4::TIMESTAMPTZ AND created_at <= $5::TIMESTAMPTZ".into()
-                }
-                (Some(_), None) => " AND created_at >= $4::TIMESTAMPTZ".into(),
-                (None, Some(_)) => " AND created_at <= $4::TIMESTAMPTZ".into(),
-                (None, None) => String::new(),
-            };
+            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 4);
 
             let stmt = format!(
                 "
@@ -763,14 +772,7 @@ impl Memory for PostgresMemory {
             let since_ref = since_owned.as_deref();
             let until_ref = until_owned.as_deref();
 
-            let time_filter: String = match (since_ref, until_ref) {
-                (Some(_), Some(_)) => {
-                    " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ".into()
-                }
-                (Some(_), None) => " AND m.created_at >= $5::TIMESTAMPTZ".into(),
-                (None, Some(_)) => " AND m.created_at <= $5::TIMESTAMPTZ".into(),
-                (None, None) => String::new(),
-            };
+            let time_filter = recall_time_filter(since_ref.is_some(), until_ref.is_some(), 5);
 
             let stmt = format!(
                 "
@@ -851,6 +853,37 @@ impl ::zeroclaw_api::attribution::Attributable for PostgresMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recall_time_filter_qualifies_alias_and_preserves_placeholder_order() {
+        let cases = [
+            (false, false, 4, ""),
+            (true, false, 4, " AND m.created_at >= $4::TIMESTAMPTZ"),
+            (false, true, 4, " AND m.created_at <= $4::TIMESTAMPTZ"),
+            (
+                true,
+                true,
+                4,
+                " AND m.created_at >= $4::TIMESTAMPTZ AND m.created_at <= $5::TIMESTAMPTZ",
+            ),
+            (false, false, 5, ""),
+            (true, false, 5, " AND m.created_at >= $5::TIMESTAMPTZ"),
+            (false, true, 5, " AND m.created_at <= $5::TIMESTAMPTZ"),
+            (
+                true,
+                true,
+                5,
+                " AND m.created_at >= $5::TIMESTAMPTZ AND m.created_at <= $6::TIMESTAMPTZ",
+            ),
+        ];
+
+        for (since, until, first_placeholder, expected) in cases {
+            assert_eq!(
+                recall_time_filter(since, until, first_placeholder),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn valid_identifiers_pass_validation() {

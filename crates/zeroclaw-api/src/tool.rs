@@ -4,12 +4,18 @@ use serde::{Deserialize, Serialize};
 #[macro_export]
 macro_rules! tool_attribution {
     ($ty:ty, $kind:expr) => {
+        $crate::tool_attribution!($ty, $kind, $crate::attribution::ToolProvenance::Native);
+    };
+    ($ty:ty, $kind:expr, $provenance:expr) => {
         impl $crate::attribution::Attributable for $ty {
             fn role(&self) -> $crate::attribution::Role {
                 $crate::attribution::Role::Tool($kind)
             }
             fn alias(&self) -> &str {
                 <Self as $crate::tool::Tool>::name(self)
+            }
+            fn tool_provenance(&self) -> $crate::attribution::ToolProvenance {
+                $provenance
             }
         }
     };
@@ -345,6 +351,13 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Assemble this tool's spec. The default recomposes it from
+    /// `parameters_schema()` and allocates a fresh `Arc` per call, so tools
+    /// with large stored schemas override it to hand out `Arc::clone`
+    /// instead (see `McpToolWrapper`). Delegating wrappers around a
+    /// `dyn Tool` MUST forward `spec()` to the inner tool — relying on this
+    /// default silently reintroduces a per-iteration deep clone of the
+    /// inner schema and breaks `Arc` identity for downstream sharing.
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.name().to_string(),

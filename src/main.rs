@@ -428,9 +428,10 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
-    HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, SkillBundleCommands, SkillCommands, SopCommands, SopGraphFormat,
+    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, CronDeliveryArgs,
+    GatewayCommands, HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands,
+    ProvidersCommands, ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands,
+    SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -799,12 +800,12 @@ an explicit IANA timezone.
 
 Examples:
   zeroclaw cron list
-  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-  zeroclaw cron add '*/5 * * * *' 'echo ok'
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-  zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+  zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+  zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+  zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
+  zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+  zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
   zeroclaw cron pause TASK_ID
   zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London")]
     Cron {
@@ -2555,6 +2556,19 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         return Ok(false);
     };
 
+    // The alias already exists in the loaded config (e.g. a hyphenated cron
+    // alias the TOML loader accepts and `config get`/`config list` resolve):
+    // leave it alone. `create_map_key` applies the strict new-alias grammar,
+    // which would reject a valid loaded key. Mirror `Config::ensure_map_key_for_path`,
+    // which also skips creation for existing keys so alias validation runs only
+    // when auto-materializing a brand-new alias.
+    if config
+        .get_map_keys(section_path)
+        .is_some_and(|keys| keys.iter().any(|k| k == key))
+    {
+        return Ok(false);
+    }
+
     // Route through the shared `create_map_key_checked` (not raw
     // `create_map_key`) so this CLI path inherits the reserved `default`
     // agent guard from the one place it's defined, rather than re-deriving
@@ -2791,58 +2805,95 @@ fn plugin_host_with_configured_security(
 }
 
 #[cfg(feature = "plugins-wasm")]
-async fn seed_plugin_config_entry(
-    config: &mut crate::config::schema::Config,
+fn installed_plugin_config_entries(
+    host: &zeroclaw::plugins::host::PluginHost,
     plugin_name: &str,
+) -> Result<Vec<(zeroclaw::plugins::PluginCapability, String)>> {
+    let manifest = host
+        .manifest(plugin_name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    if manifest.config_schema.is_none()
+        || !manifest
+            .capabilities
+            .contains(&zeroclaw::plugins::PluginCapability::Tool)
+    {
+        return Ok(Vec::new());
+    }
+
+    // Tool registration currently owns the only package-name runtime binding.
+    // Alias-owned channel bindings must seed their actual instance key when
+    // their production construction path lands; install must not invent one.
+    let scope = zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
+        manifest,
+        zeroclaw::plugins::PluginCapability::Tool,
+        std::iter::empty(),
+    )?;
+    Ok(vec![(
+        zeroclaw::plugins::PluginCapability::Tool,
+        scope.id().config_entry_key()?,
+    )])
+}
+
+/// Seed empty `[[plugins.entries]]` blocks for a freshly installed plugin's
+/// canonical default instance keys. `config set
+/// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
+/// resolution, which only matches entries already present in live config.
+/// Idempotent: existing entries and operator values remain untouched.
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_config_entries(
+    config: &mut crate::config::schema::Config,
+    entries: &[(zeroclaw::plugins::PluginCapability, String)],
 ) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
     let whole_config_degraded = config
         .degraded_security
         .iter()
         .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
     if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seed-skipped",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the \
-                 [plugins] section on disk is malformed. Repair it, add \
-                 `[[plugins.entries]]` with the plugin name, then set values \
-                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
-            )
-        );
+        for (_, instance_key) in entries {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-plugin-config-entry-seed-skipped",
+                    &[("name", instance_key)],
+                    "warning: skipped seeding the plugin config entry: the \
+                     [plugins] section on disk is malformed. Repair it, add \
+                     `[[plugins.entries]]` with the instance key, then set values \
+                     with `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+                )
+            );
+        }
         return Ok(());
     }
-    if plugin_name.is_empty() || plugin_name.contains('.') {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seed-unaddressable",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the plugin \
-                 name cannot be addressed by a dotted config path. Add a \
-                 `[[plugins.entries]]` block to the config file by hand."
-            )
-        );
+
+    let mut created = Vec::new();
+    for (_, instance_key) in entries {
+        if config
+            .create_map_key("plugins.entries", instance_key)
+            .map_err(anyhow::Error::msg)?
+        {
+            config.mark_dirty(&format!("plugins.entries.{instance_key}"));
+            created.push(instance_key);
+        }
+    }
+    if created.is_empty() {
         return Ok(());
     }
-    let created = config
-        .create_map_key("plugins.entries", plugin_name)
-        .map_err(anyhow::Error::msg)?;
-    if !created {
-        return Ok(());
-    }
-    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
     Box::pin(config.save_dirty()).await?;
-    println!(
-        "{}",
-        ta(
-            "cli-plugin-config-entry-seeded",
-            &[("name", plugin_name)],
-            "Seeded config entry. Set plugin config values with \
-             `zeroclaw config set plugins.entries.<name>.config.<key>`."
-        )
-    );
+    for instance_key in created {
+        println!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seeded",
+                &[("name", instance_key)],
+                "Seeded config entry. Set plugin config values with \
+                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+            )
+        );
+    }
     Ok(())
 }
 
@@ -3532,6 +3583,29 @@ async fn async_main(command: clap::Command) -> Result<()> {
         return Ok(());
     }
 
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunLaunchdDaemon,
+        ..
+    } = &cli.command
+    {
+        let config_dir = cli
+            .config_dir
+            .as_deref()
+            .map(std::path::Path::new)
+            .context("launchd runner requires --config-dir")?;
+        return service::run_launchd_daemon(config_dir).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
+        service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+        ..
+    } = &cli.command
+    {
+        return service::run_openrc_log_writer(matches!(stream, ServiceLogStream::Stderr));
+    }
+
     // All other commands need config loaded first
     let mut config = Box::pin(Config::load_or_init()).await?;
     for section in config
@@ -3554,8 +3628,25 @@ async fn async_main(command: clap::Command) -> Result<()> {
             )
         );
     }
+    for section in &config.retired_wati_config_sections {
+        let fallback = format!(
+            "warning: retired WATI channel config section '{section}' is ignored because WATI support was removed. Migrate to '[channels.whatsapp.<alias>]' using the Cloud API or WhatsApp Web, then revoke the unused WATI API token."
+        );
+        eprintln!(
+            "{}",
+            ta(
+                "cli-config-section-retired-wati",
+                &[("section", section)],
+                &fallback,
+            )
+        );
+    }
     #[cfg(feature = "agent-runtime")]
     observability::runtime_trace::init_from_config(&config.observability, &config.data_dir);
+    // Must follow the trace sink init above, or the record has no destination.
+    // The daemon reload arm calls the same helper against its reloaded config.
+    #[cfg(feature = "agent-runtime")]
+    warn_verifiable_intent_withheld(&config);
     #[cfg(feature = "agent-runtime")]
     if config.security.otp.enabled {
         let config_dir = config
@@ -4152,17 +4243,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
             zeroclaw_runtime::restart::record_launch();
 
             // Reload loop. `daemon::run` returns DaemonExit::Shutdown on
-            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload on SIGUSR1
-            // (loop re-reads config from disk and re-runs). The PID stays
-            // the same across reloads — only the in-process subsystems
-            // tear down + re-instantiate.
+            // SIGINT/SIGTERM (loop ends) or DaemonExit::Reload after a
+            // `POST /admin/reload` request (loop re-reads config from disk and
+            // re-runs). The PID stays the same across reloads — only the
+            // in-process subsystems tear down + re-instantiate.
             let mut current_config = config;
             // Nag task for the degraded-security warning, scoped to the
             // current config. Re-evaluated each reload iteration so a repaired
             // config stops the warning and a freshly-degraded one starts it.
             let mut degraded_nag: Option<tokio::task::JoinHandle<()>> =
                 gate_security_posture(&current_config, allow_degraded_security)?;
+            let startup_feedback_enabled = !cli.verbose;
             loop {
+                if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
+                    let mut stderr = std::io::stderr().lock();
+                    let _ = daemon::echo_daemon_starting_to_terminal(&mut stderr);
+                }
+
                 // Per-iteration clones so the subsystem closures (which
                 // `move`-capture) don't consume the outer bindings on the
                 // first iteration; reload would otherwise see a moved value.
@@ -4170,9 +4267,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
-                // SOP loading is gated on `[sop] sops_dir`: unset disables all
-                // SOP runtime behavior, matching the documented rollback path.
-                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
+                // (or empty) by default, so SOP runtime behavior is off until an
+                // operator opts in by setting a directory.
+                let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
@@ -4180,6 +4278,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
+                        &current_config.install_root_dir(),
                         mem,
                         sop_adapters,
                     );
@@ -4200,7 +4299,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
-                    move |host, port, config, tx, reload_controls, tui_registry| {
+                    move |host, port, config, tx, reload_controls, tui_registry, ready_tx| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
@@ -4215,6 +4314,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                ready_tx,
                             ))
                             .await
                         })
@@ -4274,10 +4374,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count| {
+                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(ctx, cancel, client_count)
-                            .await
+                        zeroclaw_runtime::rpc::local::run_local_listener(
+                            ctx,
+                            cancel,
+                            client_count,
+                            ready_tx,
+                        )
+                        .await
                     })
                 }));
 
@@ -4316,6 +4421,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     port,
                     registry,
                     ephemeral,
+                    startup_feedback_enabled,
                 ))
                 .await;
                 if let Some(handle) = sop_maintenance {
@@ -4339,6 +4445,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             &current_config.observability,
                             &current_config.data_dir,
                         );
+                        // A reload applies config the process has not seen, so an
+                        // operator who just enabled the section learns why the tool
+                        // is still absent without having to restart.
+                        #[cfg(feature = "agent-runtime")]
+                        warn_verifiable_intent_withheld(&current_config);
                         if let Some(handle) = degraded_nag.take() {
                             handle.abort();
                         }
@@ -4935,13 +5046,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+                let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
                     let sop_adapters = build_sop_adapters(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
                         &config.data_dir,
+                        &config.install_root_dir(),
                         mem,
                         sop_adapters,
                     );
@@ -6223,6 +6335,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
                     let name = host.install(&source)?;
+                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6231,7 +6344,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -6250,6 +6363,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     let name = host.install(&plugin_dir)?;
+                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6261,7 +6375,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
                 }
                 Ok(())
             }
@@ -6308,6 +6422,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 "Permissions"
                             )
                         );
+                        for (capability, key) in installed_plugin_config_entries(&host, &info.name)?
+                        {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-config-entry-key",
+                                    &[("capability", &format!("{capability:?}")), ("key", &key),],
+                                    "Config entry key"
+                                )
+                            );
+                        }
                         match &info.wasm_path {
                             Some(path) => println!(
                                 "{}",
@@ -7619,6 +7744,27 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
     }
 }
 
+/// Tell the operator that `vi_verify` is withheld from the model-visible
+/// registry while no credential chain verifier exists.
+///
+/// Called once per config application: at process config load, and again when
+/// the daemon reload arm re-reads config from disk. Registry assembly is the
+/// wrong home for it, because that runs on ordinary gateway requests and on
+/// nested SOP and delegation rebuilds. Each call site must sit after its
+/// `runtime_trace::init_from_config`, or the record has no sink.
+#[cfg(feature = "agent-runtime")]
+fn warn_verifiable_intent_withheld(config: &Config) {
+    if !config.verifiable_intent.enabled {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+        "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
+    );
+}
+
 fn gate_security_posture(
     config: &zeroclaw::config::Config,
     allow_degraded: bool,
@@ -7652,8 +7798,8 @@ fn gate_security_posture(
                 &format!(
                     "Running with DEGRADED security: sections ({sections}) were reset to \
                      defaults and `--allow-degraded-security` was set. The posture may be \
-                     weaker than intended — repair {config_path} and reload \
-                     (SIGUSR1 / `zeroclaw admin reload`) as soon as possible."
+                     weaker than intended — repair {config_path} and restart \
+                     the process as soon as possible."
                 )
             );
         }
@@ -7973,7 +8119,7 @@ async fn run_gateway_if_enabled(
     // manually" message, None for tui_registry (no TUI socket), and None
     // for canvas_store so the gateway falls back to its own default.
     let result = Box::pin(gateway::run_gateway(
-        host, port, config, tx, None, None, None, None, None,
+        host, port, config, tx, None, None, None, None, None, None,
     ))
     .await;
     // Self-respawn after the listener is released, if an in-app upgrade
@@ -8188,6 +8334,34 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn openrc_log_writer_cli_maps_only_known_streams() {
+        for (value, expected) in [
+            ("stdout", ServiceLogStream::Stdout),
+            ("stderr", ServiceLogStream::Stderr),
+        ] {
+            let cli = Cli::try_parse_from(["zeroclaw", "service", "run-openrc-log-writer", value])
+                .expect("internal OpenRC logger should parse");
+            assert!(matches!(
+                cli.command,
+                Commands::Service {
+                    service_command: ServiceCommands::RunOpenrcLogWriter { stream },
+                    ..
+                } if stream == expected
+            ));
+        }
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "service",
+                "run-openrc-log-writer",
+                "/tmp/arbitrary.log"
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn probe_config_dir_extracts_global_flag_in_all_forms() {
@@ -9451,6 +9625,39 @@ mod tests {
                 .unwrap_or_default()
                 .is_empty(),
             "the tentatively-created alias must be rolled back, not left dangling",
+        );
+    }
+
+    #[test]
+    fn ensure_map_key_for_prop_path_leaves_existing_hyphenated_alias_alone() {
+        let mut config = Config::default();
+        config.cron.insert(
+            "morning-brief".to_string(),
+            zeroclaw_config::schema::CronJobDecl::default(),
+        );
+
+        let created = ensure_map_key_for_prop_path(&mut config, "cron.morning-brief.name")
+            .expect("an existing loaded alias must never be rejected by the create grammar");
+        assert!(
+            !created,
+            "the existing `morning-brief` alias must not be reported as newly created"
+        );
+        assert!(
+            config
+                .set_prop("cron.morning-brief.name", "Morning brief")
+                .is_ok(),
+            "setting a field on an existing hyphenated cron alias must succeed"
+        );
+        assert_eq!(
+            config.get_prop("cron.morning-brief.name").ok(),
+            Some("Morning brief".to_string())
+        );
+
+        let err = ensure_map_key_for_prop_path(&mut config, "cron.bad-alias.name")
+            .expect_err("creating a NEW hyphenated alias must still be rejected");
+        assert!(
+            err.to_string().contains("invalid character"),
+            "new-alias grammar must be preserved: {err}"
         );
     }
 

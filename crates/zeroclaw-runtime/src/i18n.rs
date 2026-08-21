@@ -11,12 +11,14 @@ static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_FTL_SOURCES: OnceLock<CliFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
-/// The canonical locale registry, embedded from repo-root `locales.toml` at
-/// compile time. Parsed once into a `'static` list so callers (e.g. the RPC
-/// `locales/list` handler) get a long-lived reference with no runtime file I/O.
+/// The canonical locale registry. Repo-root `locales.toml` remains the single
+/// place a locale is added; `cargo generate installers runtime-locales` renders
+/// it into `generated_locales.rs` inside this crate, and CI fails on drift.
+///
+/// This used to be `include_str!("../../../locales.toml")`. That reaches outside
+/// the crate directory, and `cargo package` copies only the package directory,
+/// so the read made this crate unpublishable.
 static AVAILABLE_LOCALES: OnceLock<Vec<LocaleOption>> = OnceLock::new();
-
-const LOCALES_TOML: &str = include_str!("../../../locales.toml");
 
 /// One selectable locale: its `code` (e.g. `ja`) and display `label`
 /// (e.g. `日本語`).
@@ -31,24 +33,13 @@ pub struct LocaleOption {
 pub fn available_locales() -> &'static [LocaleOption] {
     AVAILABLE_LOCALES
         .get_or_init(|| {
-            let table: toml::Value =
-                toml::from_str(LOCALES_TOML).expect("embedded locales.toml is valid TOML");
-            table
-                .get("locale")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| {
-                            let code = e.get("code").and_then(|v| v.as_str())?;
-                            let label = e.get("label").and_then(|v| v.as_str())?;
-                            Some(LocaleOption {
-                                code: code.to_string(),
-                                label: label.to_string(),
-                            })
-                        })
-                        .collect()
+            crate::generated_locales::AVAILABLE_LOCALES
+                .iter()
+                .map(|o| LocaleOption {
+                    code: o.code.to_string(),
+                    label: o.label.to_string(),
                 })
-                .unwrap_or_default()
+                .collect()
         })
         .as_slice()
 }
@@ -111,6 +102,23 @@ pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)])
         builtin: None,
     };
     format_cli_string_with_args(&english, key, args).unwrap_or_else(|| missing_cli_string(key))
+}
+
+/// Render a key from a caller-supplied disk override without changing the
+/// process-global locale. This keeps locale-sensitive boundary tests isolated.
+#[cfg(test)]
+pub(crate) fn get_disk_override_cli_string_for_test(
+    locale: &str,
+    disk_ftl: &str,
+    key: &str,
+    args: &[(&str, &str)],
+) -> String {
+    let sources = CliFtlSources {
+        locale: locale.to_string(),
+        disk: Some(disk_ftl.to_string()),
+        builtin: builtin_cli_ftl_source(locale),
+    };
+    format_cli_string_with_args(&sources, key, args).unwrap_or_else(|| missing_cli_string(key))
 }
 
 fn missing_cli_string(key: &str) -> String {
@@ -599,6 +607,84 @@ mod tests {
     }
 
     #[test]
+    fn channel_approval_group_visibility_warning_is_translated_in_every_locale() {
+        // This warning is what tells an operator why a stranger's reply to a
+        // group approval token will bounce, so a catalogue that omits it ships
+        // the raw `{key}` sentinel into a chat. Assert every shipped catalogue
+        // carries it, and that the four localized ones are actually translated
+        // rather than copied from `en` — a copy would pass a mere
+        // "the key resolves" check while leaving the string un-localized.
+        const KEY: &str = "channel-approval-group-visibility-warning";
+
+        let english = format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", KEY, &[])
+            .unwrap_or_else(|| panic!("{KEY} should format in en"));
+        assert!(
+            !english.trim().is_empty(),
+            "{KEY} must not be empty in en; got {english:?}"
+        );
+
+        for (source, locale) in [
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let value = format_ftl_message(source, locale, KEY, &[])
+                .unwrap_or_else(|| panic!("{KEY} should format in {locale}"));
+            assert!(
+                !value.trim().is_empty(),
+                "{KEY} must not be empty in {locale}; got {value:?}"
+            );
+            assert_ne!(
+                value, english,
+                "{KEY} in {locale} is the English string verbatim, so that catalogue was never translated"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_startup_cli_strings_format_in_all_locales() {
+        let url = "http://127.0.0.1:42617";
+        let path = "/tmp/zeroclaw-test/daemon.sock";
+        let cases = [
+            ("cli-daemon-starting-title", &[][..], &["ZeroClaw"][..]),
+            ("cli-daemon-starting-detail", &[][..], &[][..]),
+            ("cli-daemon-started-title", &[][..], &["ZeroClaw"][..]),
+            (
+                "cli-daemon-started-gateway",
+                &[("url", url)][..],
+                &[url][..],
+            ),
+            (
+                "cli-daemon-started-socket",
+                &[("path", path)][..],
+                &[path][..],
+            ),
+            ("cli-daemon-started-pairing", &[][..], &[][..]),
+            ("cli-daemon-started-stop", &[][..], &["Ctrl+C"][..]),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for &(key, args, expected_parts) in &cases {
+                let value = format_ftl_message(source, locale, key, args)
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for &expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn channel_compile_guidance_cli_strings_format_from_fluent() {
         let cases = [
             (
@@ -641,6 +727,23 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn plugin_config_entry_key_formats_in_every_builtin_locale() {
+        let args = [("capability", "Tool"), ("key", "zpi1_fixture")];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let value = format_ftl_message(source, locale, "cli-plugin-config-entry-key", &args)
+                .unwrap_or_else(|| panic!("plugin config entry key should format in {locale}"));
+            assert!(value.contains("Tool"));
+            assert!(value.contains("zpi1_fixture"));
         }
     }
 

@@ -10,6 +10,7 @@ use crate::observability::{Observer, ObserverEvent};
 use crate::tools::{ActivatedToolSet, Tool};
 use tokio::sync::mpsc::Sender;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
+use zeroclaw_api::attribution::Attributable;
 
 // Items that still live in `loop_` — import via the parent module.
 use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
@@ -36,6 +37,29 @@ fn maybe_plan_event(
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
+}
+
+/// Resolve presentation provenance with the same static-then-activated lookup
+/// order used by execution. Unknown names remain `None` so callers fail closed.
+pub(crate) fn resolved_tool_provenance(
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&Arc<std::sync::Mutex<ActivatedToolSet>>>,
+    name: &str,
+) -> Option<zeroclaw_api::attribution::ToolProvenance> {
+    if let Some(tool) = find_tool(tools_registry, name) {
+        return Some(tool.tool_provenance());
+    }
+
+    activated_tools
+        .map(|activated| match activated.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        })
+        .and_then(|activated| {
+            activated
+                .get_resolved(name)
+                .map(|tool| tool.tool_provenance())
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -543,7 +567,7 @@ pub(crate) async fn execute_tools_sequential(
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolDispatchContext, execute_one_tool};
+    use super::{ToolDispatchContext, execute_one_tool, resolved_tool_provenance};
     use crate::observability::noop::NoopObserver;
     use crate::tools::ActivatedToolSet;
     use async_trait::async_trait;
@@ -575,6 +599,22 @@ mod tests {
         fn alias(&self) -> &str {
             "test-counting-tool"
         }
+    }
+
+    #[test]
+    fn resolved_provenance_uses_activated_mcp_tool() {
+        let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tool: Arc<dyn Tool> = Arc::new(CountingTool::new("mcp__browser", invocations));
+        activated
+            .lock()
+            .unwrap()
+            .activate("mcp__browser".into(), tool);
+
+        assert_eq!(
+            resolved_tool_provenance(&[], Some(&activated), "mcp__browser"),
+            Some(zeroclaw_api::attribution::ToolProvenance::Extension)
+        );
     }
 
     #[async_trait]
@@ -643,7 +683,9 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
-                tools_registry: &[], // no static tools - force activated-tools path
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ), // no static tools - force activated-tools path
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 model_switch_callback: None,
@@ -699,7 +741,9 @@ mod tests {
             serde_json::json!({}),
             Some("call-1"),
             ToolDispatchContext {
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ),
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
                 model_switch_callback: None,

@@ -11,6 +11,7 @@ zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true
 zeroclaw-infra.workspace = true
 zeroclaw-config.workspace = true
+zeroclaw-commands.workspace = true
 zeroclaw-log.workspace = true
 zeroclaw-providers.workspace = true
 zeroclaw-memory.workspace = true
@@ -28,6 +29,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 chrono-tz = "0.10"
 console = "0.16"
 cron = "0.15"
+# Raw-mode terminal secret input (cli_input::SecretInput). Blocking
+# `event::read()` only — no EventStream, so default features suffice.
+crossterm = "0.29"
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
@@ -37,7 +41,7 @@ hmac = "0.12"
 hostname = "0.4.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 indicatif = "0.18"
-lru = "0.16"
+lru = "0.18.2"
 mime_guess = "2"
 nanohtml2text = "0.2"
 parking_lot = "0.12"
@@ -107,6 +111,13 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-
 
 browser-native = []
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
+# Adds the Cranelift JIT to the plugin host so a `.wasm` component can be
+# compiled on the host instead of requiring a precompiled `.cwasm`. Production
+# builds get this through the root crate's feature of the same name; the runtime
+# crate declares it so the live-Agent plugin regression can be compiled and run
+# against a real component (`WasmTool::from_wasm` refuses to register a tool it
+# cannot load, so a runtime-only backend has no plugin tool to execute).
+plugins-wasm-cranelift = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift"]
 webauthn = []
 sandbox-bubblewrap = []
 # Exposes the test-only `ScopedToolRegistry::from_raw_for_test` constructor to

@@ -121,6 +121,7 @@ pub mod method {
     pub const SOPS_GET: &str = "sops/get";
     pub const SOPS_GRAPH: &str = "sops/graph";
     pub const SOPS_RUN: &str = "sops/run";
+    pub const SOPS_RUNS: &str = "sops/runs";
     pub const SOPS_RUN_OVERLAY: &str = "sops/run-overlay";
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
@@ -472,14 +473,49 @@ impl fmt::Display for DaemonInitializeTimeout {
 impl std::error::Error for DaemonInitializeTimeout {}
 
 #[derive(Debug)]
-struct InitializeResponse {
+pub(crate) struct InitializeResponse {
     server_version: String,
     server_pid: Option<u32>,
     tui_id: Option<String>,
     tui_sig: Option<String>,
+    pub(crate) commands: Vec<crate::wire::CommandDescriptor>,
 }
 
-fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
+/// One-release fallback for daemons from the pre-catalogue 0.8.x line, which
+/// share the current package and protocol versions but omit `commands`.
+///
+/// These descriptors preserve the shared tokens ZeroCode accepted before the
+/// RPC catalogue existed. New daemons remain authoritative, including when
+/// they explicitly advertise an empty catalogue.
+fn legacy_tui_command_descriptors() -> Vec<crate::wire::CommandDescriptor> {
+    vec![
+        crate::wire::CommandDescriptor {
+            id: "help".into(),
+            name: "help".into(),
+            aliases: Vec::new(),
+        },
+        crate::wire::CommandDescriptor {
+            id: "new".into(),
+            name: "new".into(),
+            aliases: vec!["new-session".into()],
+        },
+        crate::wire::CommandDescriptor {
+            id: "model".into(),
+            name: "model".into(),
+            aliases: Vec::new(),
+        },
+    ]
+}
+
+fn parse_initialize_commands(resp: &Value) -> Result<Vec<crate::wire::CommandDescriptor>> {
+    match resp.get("commands") {
+        Some(commands) => serde_json::from_value(commands.clone())
+            .context("invalid command descriptors in initialize response"),
+        None => Ok(legacy_tui_command_descriptors()),
+    }
+}
+
+pub(crate) fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
     let server_version = resp
         .get("server_version")
         .and_then(Value::as_str)
@@ -500,6 +536,7 @@ fn parse_initialize_response(resp: &Value) -> Result<InitializeResponse> {
             .get("tui_sig")
             .and_then(Value::as_str)
             .map(String::from),
+        commands: parse_initialize_commands(resp)?,
     })
 }
 
@@ -594,6 +631,9 @@ pub struct RpcClient {
     pub tui_sig: Option<String>,
     /// Transport protocol of this connection.
     transport: Transport,
+    /// Shared TUI command metadata received from the daemon's canonical
+    /// command catalogue during initialization.
+    commands: Vec<crate::wire::CommandDescriptor>,
 }
 
 impl RpcClient {
@@ -709,7 +749,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -726,6 +765,7 @@ impl RpcClient {
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Local,
+            commands: init.commands,
         })
     }
 
@@ -858,7 +898,6 @@ impl RpcClient {
                 return Err(e);
             }
         };
-
         let bcast_rx = notif_tx.subscribe();
         let (update_tx, _update_rx) = mpsc::channel::<SessionUpdate>(64);
         let router_task = spawn_notification_router(bcast_rx, update_tx);
@@ -875,6 +914,7 @@ impl RpcClient {
             tui_id: init.tui_id,
             tui_sig: init.tui_sig,
             transport: Transport::Wss,
+            commands: init.commands,
         })
     }
 
@@ -1345,6 +1385,28 @@ impl RpcClient {
             .ok_or_else(|| anyhow::Error::msg("sops/run: response missing run_id"))
     }
 
+    /// List run summaries, optionally filtered to one SOP by name. The
+    /// daemon returns `{ "runs": [SopRunSummary...] }`.
+    ///
+    /// Forward compatibility is bounded, not total. `#[serde(default)]` on
+    /// [`SopRunSummaryView`] tolerates fields a newer daemon omits, and
+    /// `#[serde(other)]` on [`SopRunStatusView`] folds an unrecognized status
+    /// string to `Unknown` instead of failing the row. Anything else — a
+    /// field whose JSON type changed, a `runs` value that is not an array, or
+    /// a missing `runs` key — still fails closed with an error, which the
+    /// pane surfaces as a stale-poll indication rather than silently
+    /// rendering an empty list.
+    pub async fn sops_runs(&self, sop: Option<&str>) -> Result<Vec<SopRunSummaryView>> {
+        let value: Value = self
+            .call(method::SOPS_RUNS, serde_json::json!({ "sop": sop }))
+            .await?;
+        let runs = value
+            .get("runs")
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg("sops/runs: response missing runs"))?;
+        serde_json::from_value(runs).map_err(Into::into)
+    }
+
     pub async fn sops_save(&self, sop: Value) -> Result<Value> {
         self.call(method::SOPS_SAVE, serde_json::json!({ "sop": sop }))
             .await
@@ -1523,7 +1585,12 @@ impl RpcClient {
     }
 
     pub async fn doctor_run(&self) -> Result<DoctorRunResult> {
-        self.call(method::DOCTOR_RUN, serde_json::json!({})).await
+        self.call_with_timeout(
+            method::DOCTOR_RUN,
+            serde_json::json!({}),
+            std::time::Duration::from_secs(30),
+        )
+        .await
     }
 
     pub async fn cost_query(&self, agent: Option<&str>) -> Result<CostSummaryResult> {
@@ -1664,6 +1731,10 @@ impl RpcClient {
         self.tui_sig.as_deref()
     }
 
+    pub fn commands(&self) -> &[crate::wire::CommandDescriptor] {
+        &self.commands
+    }
+
     /// List all connected TUI sessions from the daemon registry.
     pub async fn tui_list(&self) -> Result<TuiListResult> {
         self.call(method::TUI_LIST, serde_json::json!({})).await
@@ -1705,6 +1776,7 @@ impl RpcClient {
             tui_id: None,
             tui_sig: None,
             transport: Transport::Local,
+            commands: Vec::new(),
         }
     }
 
@@ -1745,6 +1817,40 @@ mod initialize_version_tests {
         assert_eq!(parsed.server_pid, Some(42));
         assert_eq!(parsed.tui_id.as_deref(), Some("tui_1"));
         assert_eq!(parsed.tui_sig.as_deref(), Some("sig_1"));
+        assert_eq!(parsed.commands, legacy_tui_command_descriptors());
+    }
+
+    #[test]
+    fn initialize_response_parses_command_descriptors() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": [{
+                "id": "new",
+                "name": "new",
+                "aliases": ["new-session"]
+            }]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            parsed.commands,
+            vec![crate::wire::CommandDescriptor {
+                id: "new".into(),
+                name: "new".into(),
+                aliases: vec!["new-session".into()],
+            }]
+        );
+    }
+
+    #[test]
+    fn initialize_response_preserves_present_empty_command_catalogue() {
+        let parsed = parse_initialize_response(&json!({
+            "server_version": env!("CARGO_PKG_VERSION"),
+            "commands": []
+        }))
+        .unwrap();
+
+        assert!(parsed.commands.is_empty());
     }
 
     #[test]
@@ -1979,6 +2085,12 @@ pub struct SkillFrontmatter {
     pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub category: Option<String>,
+    /// Keeps this skill's instructions inlined in the system prompt even in
+    /// compact skill-prompt mode. Not editable from this TUI mirror, but must
+    /// be carried through the load→edit→save round-trip so editing a skill
+    /// here doesn't silently reset it to `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub always: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2002,6 +2114,34 @@ pub struct SkillsWriteResult {}
 
 #[derive(Debug, serde::Deserialize)]
 pub struct SkillsDeleteResult {}
+
+#[cfg(test)]
+mod skill_frontmatter_tests {
+    use super::*;
+
+    #[test]
+    fn always_true_survives_deserialize_then_serialize_round_trip() {
+        let value = serde_json::json!({
+            "name": "security-policy",
+            "description": "Critical safety rules",
+            "always": true,
+        });
+
+        let frontmatter: SkillFrontmatter = serde_json::from_value(value).unwrap();
+        assert!(
+            frontmatter.always,
+            "always: true in the wire payload must deserialize into the mirror struct"
+        );
+
+        let reserialized = serde_json::to_value(&frontmatter).unwrap();
+        assert_eq!(
+            reserialized.get("always"),
+            Some(&serde_json::Value::Bool(true)),
+            "always must round-trip through re-serialization, not be silently dropped \
+             on the TUI's load -> edit -> save path"
+        );
+    }
+}
 
 // ── Quickstart types ─────────────────────────────────────────────
 //
@@ -2481,6 +2621,56 @@ pub struct TriggerSourceRegistryView {
     pub channels: Vec<ChannelTriggerKindView>,
     #[serde(default)]
     pub operators: Vec<ConditionOpSpecView>,
+}
+
+/// Run status as serialized by the runtime's `SopRunStatus`. Unknown
+/// variants from a newer daemon fold into [`SopRunStatusView::Unknown`]
+/// so an older zerocode keeps rendering rather than dropping the run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SopRunStatusView {
+    #[default]
+    Pending,
+    Running,
+    WaitingApproval,
+    PausedCheckpoint,
+    Completed,
+    Failed,
+    Cancelled,
+    #[serde(other)]
+    Unknown,
+}
+
+impl SopRunStatusView {
+    /// True while the run is parked on an operator decision (approval gate
+    /// or deterministic checkpoint).
+    pub fn needs_input(self) -> bool {
+        matches!(self, Self::WaitingApproval | Self::PausedCheckpoint)
+    }
+
+    /// True once the run has reached a terminal state.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+}
+
+/// One run row from `sops/runs`; mirrors the runtime `SopRunSummary`.
+/// Every field defaults so a field added daemon-side never breaks an
+/// older zerocode.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct SopRunSummaryView {
+    pub run_id: String,
+    pub sop_name: String,
+    pub status: SopRunStatusView,
+    pub current_step: u32,
+    pub total_steps: u32,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub trigger_source: String,
+    /// True while the run is live in the engine's active set rather than
+    /// a retained terminal record.
+    pub active: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3372,6 +3562,149 @@ mod sop_method_tests {
             .unwrap()
             .unwrap();
         assert_eq!(view.nodes.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sops_runs_sends_filter_and_parses_summaries() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.sops_runs(Some("deploy")).await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_runs must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/runs");
+        assert_eq!(req["params"]["sop"], "deploy");
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &id,
+            Some(json!({
+                "runs": [
+                    {
+                        "run_id": "run-1",
+                        "sop_name": "deploy",
+                        "status": "waiting_approval",
+                        "current_step": 2,
+                        "total_steps": 5,
+                        "started_at": "2026-08-02T00:00:00Z",
+                        "completed_at": null,
+                        "trigger_source": "manual",
+                        "active": true
+                    },
+                    {
+                        "run_id": "run-0",
+                        "sop_name": "deploy",
+                        "status": "some_future_status",
+                        "current_step": 5,
+                        "total_steps": 5,
+                        "started_at": "2026-08-01T00:00:00Z",
+                        "completed_at": "2026-08-01T00:05:00Z",
+                        "trigger_source": "cron",
+                        "active": false,
+                        "some_future_field": {"nested": true}
+                    }
+                ]
+            })),
+            None,
+        );
+
+        let runs = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_runs must resolve after the response is dispatched")
+            .unwrap()
+            .unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].status, SopRunStatusView::WaitingApproval);
+        assert!(runs[0].status.needs_input());
+        assert!(runs[0].active);
+        assert_eq!(
+            runs[1].status,
+            SopRunStatusView::Unknown,
+            "a status from a newer daemon must fold to Unknown, not fail the whole list"
+        );
+        assert!(!runs[1].status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn sops_runs_unfiltered_sends_null_and_requires_runs_key() {
+        let (rpc, mut write_rx) = make_rpc();
+        let client = RpcClient::with_rpc(rpc.clone());
+
+        let task = tokio::spawn(async move { client.sops_runs(None).await });
+
+        let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+            .await
+            .expect("client.sops_runs must send a wire request")
+            .unwrap();
+        let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(req["method"], "sops/runs");
+        assert_eq!(req["params"]["sop"], serde_json::Value::Null);
+
+        let id = req["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(&id, Some(json!({"not_runs": []})), None);
+
+        let err = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("client.sops_runs must resolve after the response is dispatched")
+            .unwrap()
+            .expect_err("a response without `runs` must error, not silently return empty");
+        assert!(err.to_string().contains("missing runs"));
+    }
+
+    #[tokio::test]
+    async fn sops_runs_tolerates_omissions_but_still_fails_closed_on_bad_shapes() {
+        // The three cases the doc comment on `sops_runs` promises to tolerate
+        // and to reject. A regression here means the compatibility claim on
+        // the method has drifted from what serde actually does.
+        async fn call_with(runs: serde_json::Value) -> anyhow::Result<Vec<SopRunSummaryView>> {
+            let (rpc, mut write_rx) = make_rpc();
+            let client = RpcClient::with_rpc(rpc.clone());
+            let task = tokio::spawn(async move { client.sops_runs(None).await });
+            let line = tokio::time::timeout(std::time::Duration::from_secs(2), write_rx.recv())
+                .await
+                .expect("client.sops_runs must send a wire request")
+                .unwrap();
+            let req: serde_json::Value = serde_json::from_str(&line).unwrap();
+            let id = req["id"].as_str().unwrap().to_string();
+            rpc.dispatch_response(&id, Some(json!({ "runs": runs })), None);
+            tokio::time::timeout(std::time::Duration::from_secs(2), task)
+                .await
+                .expect("client.sops_runs must resolve after the response is dispatched")
+                .unwrap()
+        }
+
+        // Tolerated: every field omitted, plus an unknown status string.
+        let runs = call_with(json!([{ "status": "invented_by_a_newer_daemon" }]))
+            .await
+            .expect("omitted fields and an unknown status must deserialize, not fail the list");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, SopRunStatusView::Unknown);
+        assert_eq!(runs[0].run_id, "");
+        assert!(!runs[0].active);
+
+        // Fails closed: a field whose JSON type changed.
+        let err = call_with(json!([{ "run_id": "r1", "current_step": "not-a-number" }]))
+            .await
+            .expect_err("an incompatible field type must fail closed, not default silently");
+        assert!(
+            err.to_string().contains("current_step")
+                || err.to_string().contains("invalid type")
+                || err.to_string().contains("expected"),
+            "error should name the type problem, got: {err}"
+        );
+
+        // Fails closed: `runs` present but not an array.
+        let err = call_with(json!({ "unexpected": "container" }))
+            .await
+            .expect_err("a malformed runs container must fail closed");
+        assert!(
+            err.to_string().contains("invalid type") || err.to_string().contains("expected"),
+            "error should name the container problem, got: {err}"
+        );
     }
 
     #[tokio::test]

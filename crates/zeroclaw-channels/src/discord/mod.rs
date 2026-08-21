@@ -3353,7 +3353,11 @@ impl Channel for DiscordChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode != zeroclaw_config::schema::StreamMode::Off
+        matches!(
+            self.stream_mode,
+            zeroclaw_config::schema::StreamMode::Partial
+                | zeroclaw_config::schema::StreamMode::MultiMessage
+        )
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
@@ -4438,6 +4442,7 @@ mod tests {
             cancellation_token: None,
             attachments: Vec::new(),
             in_reply_to: None,
+            references: Vec::new(),
             force_voice: false,
             suppress_voice: false,
         };
@@ -4456,6 +4461,7 @@ mod tests {
             tools: vec![],
             prompts: vec![],
             slash_options: Vec::new(),
+            always: false,
             location: None,
         }
     }

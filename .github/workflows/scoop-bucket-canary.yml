@@ -1,0 +1,68 @@
+name: Scoop Bucket Canary
+
+# Rehearses the Scoop publish path against the current stable release without
+# touching the bucket.
+#
+# SCOOP_BUCKET_TOKEN is account-bound, so it expires and it silently loses
+# write when the owning identity's collaborator grant changes. Historically the
+# only thing that exercised it was the `scoop` job in Release Stable, which runs
+# after `publish`, so a dead credential was discovered once the release had
+# already been cut and announced and the bucket then had to be updated by hand.
+# Running the rehearsal weekly surfaces a dead credential between releases,
+# while there is still time to rotate it.
+#
+# This detects credential rot; it is not what keeps the bucket correct. A
+# bucket-side Excavator backstop is proposed in zeroclaw-labs/scoop-zeroclaw#1,
+# but it is not operational until that workflow lands, receives write
+# permission, and passes a maintainer smoke test. Until then, recover a failed
+# publish by rotating the credential and rerunning the publisher.
+
+on:
+  schedule:
+    # Mondays, early UTC: a failure lands at the start of the week rather than
+    # in the middle of a release.
+    - cron: "23 7 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: scoop-canary-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  latest-release:
+    name: Resolve Current Release
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Resolve latest stable release tag
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          tag="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq '.tagName')"
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::latest release is not a stable vX.Y.Z tag: ${tag}"
+            exit 1
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "Rehearsing the Scoop publish path against ${tag}." >> "$GITHUB_STEP_SUMMARY"
+
+  rehearse:
+    name: Rehearse Scoop Publish
+    needs: latest-release
+    uses: ./.github/workflows/pub-scoop.yml
+    with:
+      release_tag: ${{ needs.latest-release.outputs.tag }}
+      dry_run: true
+      credential_canary: true
+    secrets:
+      SCOOP_BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}

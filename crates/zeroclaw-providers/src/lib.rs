@@ -12,6 +12,7 @@ pub mod dispatch;
 pub mod factory;
 pub mod gemini;
 pub mod gemini_cli;
+pub mod grok_cli;
 // glm.rs excluded — not compiled in upstream (dead code with known issues)
 pub mod kilocli;
 pub mod model_pin;
@@ -30,7 +31,8 @@ pub mod telnyx;
 pub mod traits;
 pub mod vision_override;
 
-pub use dispatch::{ProviderDispatch, ProviderDispatchRef};
+pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
+pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
 
 mod request_payload;
 
@@ -614,7 +616,10 @@ pub struct ModelProviderRuntimeOptions {
     /// model served by a vision-capable family as non-vision. Mapped from
     /// `ModelProviderConfig::vision`.
     pub vision: Option<bool>,
-    /// Passed verbatim as `chat_template_kwargs` to the llamacpp provider.
+    /// Forwarded verbatim as a top-level `chat_template_kwargs` object in the
+    /// request body for OpenAI-compatible providers (folded into `extra_body`
+    /// by `apply_compat_options`). Consumed by chat-template-aware backends
+    /// such as vLLM, SGLang, and llama.cpp.
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
@@ -790,11 +795,55 @@ fn token_end(input: &str, from: usize) -> usize {
     end
 }
 
+/// Remove complete query strings from HTTP(S) URLs embedded in error text.
+///
+/// Query-value punctuation cannot safely identify where a credential ends:
+/// commas, apostrophes, and parentheses are all legal query data. Treat the
+/// URL's entire non-whitespace query tail as sensitive instead. This also
+/// covers credential parameter names that the sanitizer does not know about.
+fn scrub_url_queries(input: &str) -> String {
+    let lowercase = input.to_ascii_lowercase();
+    let mut scrubbed = String::with_capacity(input.len());
+    let mut cursor = 0;
+
+    while cursor < input.len() {
+        let remaining = &input[cursor..];
+        let remaining_lowercase = &lowercase[cursor..];
+        let next_http = remaining_lowercase.find("http://");
+        let next_https = remaining_lowercase.find("https://");
+        let Some(relative_url_start) = (match (next_http, next_https) {
+            (Some(http), Some(https)) => Some(http.min(https)),
+            (Some(http), None) => Some(http),
+            (None, Some(https)) => Some(https),
+            (None, None) => None,
+        }) else {
+            scrubbed.push_str(remaining);
+            break;
+        };
+        let url_start = cursor + relative_url_start;
+        scrubbed.push_str(&input[cursor..url_start]);
+
+        let url_tail = &input[url_start..];
+        let url_end = url_start + url_tail.find(char::is_whitespace).unwrap_or(url_tail.len());
+        let url_token = &input[url_start..url_end];
+        if let Some(query_start) = url_token.find('?') {
+            scrubbed.push_str(&url_token[..query_start]);
+        } else {
+            scrubbed.push_str(url_token);
+        }
+        cursor = url_end;
+    }
+
+    scrubbed
+}
+
 /// Scrub known secret-like token prefixes from model_provider error strings.
 /// Redacts tokens with prefixes like `sk-`, `xoxb-`, `xoxp-`, `ghp_`, `gho_`,
-/// `ghu_`, and `github_pat_`.
+/// `ghu_`, `github_pat_`, and Google/Gemini `AIza` keys. Complete query strings
+/// are removed from embedded HTTP(S) URLs because query parameters may carry
+/// credentials under provider-specific names.
 pub fn scrub_secret_patterns(input: &str) -> String {
-    const PREFIXES: [&str; 7] = [
+    const PREFIXES: [&str; 8] = [
         "sk-",
         "xoxb-",
         "xoxp-",
@@ -802,9 +851,10 @@ pub fn scrub_secret_patterns(input: &str) -> String {
         "gho_",
         "ghu_",
         "github_pat_",
+        "AIza",
     ];
 
-    let mut scrubbed = input.to_string();
+    let mut scrubbed = scrub_url_queries(input);
 
     for prefix in PREFIXES {
         let mut search_from = 0;
@@ -843,6 +893,96 @@ pub fn sanitize_api_error(input: &str) -> String {
     format!("{}...", &scrubbed[..end])
 }
 
+/// Whether `message` mentions tools as a standalone word rather than as a
+/// fragment of a larger identifier.
+///
+/// Hyphens and underscores count as word characters so model names and
+/// identifiers such as `tool-model`, `toolformer-v2`, `multi_tool` or
+/// `toolkit` are not mistaken for the endpoint reporting a tools conflict.
+/// Only a bare `tool` / `tools` token matches.
+fn mentions_tools_token(message: &str) -> bool {
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || c == '-' || c == '_';
+    let bytes = message.as_bytes();
+    let mut search_from = 0usize;
+
+    while let Some(found) = message[search_from..].find("tool") {
+        let start = search_from + found;
+        let mut end = start + "tool".len();
+        // Accept the plural form as part of the same token.
+        if message[end..].starts_with('s') {
+            end += 1;
+        }
+
+        let preceded_by_word_char = message[..start]
+            .chars()
+            .next_back()
+            .is_some_and(&is_word_char);
+        let followed_by_word_char = bytes
+            .get(end)
+            .map(|byte| *byte as char)
+            .is_some_and(&is_word_char);
+
+        if !preceded_by_word_char && !followed_by_word_char {
+            return true;
+        }
+        search_from = start + "tool".len();
+    }
+
+    false
+}
+
+/// Whether an endpoint explicitly rejected combining function tools with
+/// `reasoning_effort`.
+///
+/// This predicate is intentionally narrow: callers may retry once with
+/// `reasoning_effort: "none"` only when the endpoint itself reports this exact
+/// capability mismatch. Other reasoning or tool errors must propagate
+/// unchanged.
+pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, body: &str) -> bool {
+    if !matches!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+
+    let (message, parameter) = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(value) => {
+            let message = value
+                .pointer("/error/message")
+                .or_else(|| value.get("message"))
+                .or_else(|| value.get("detail"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let parameter = value
+                .pointer("/error/param")
+                .or_else(|| value.get("param"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            (message, parameter)
+        }
+        Err(_) => (body.to_ascii_lowercase(), String::new()),
+    };
+    let mentions_reasoning_effort = parameter == "reasoning_effort"
+        || message.contains("reasoning_effort")
+        || message.contains("reasoning effort");
+    let mentions_tools = mentions_tools_token(&message);
+    let reports_incompatibility = [
+        "not supported",
+        "unsupported",
+        "cannot be used",
+        "can't be used",
+        "incompatible",
+        "not allowed",
+    ]
+    .iter()
+    .any(|hint| message.contains(hint));
+
+    mentions_reasoning_effort && mentions_tools && reports_incompatibility
+}
+
 /// Format an error including its full source chain and sanitize the result.
 pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut formatted = String::new();
@@ -862,7 +1002,17 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
         .text()
         .await
         .unwrap_or_else(|_| "<failed to read model_provider error body>".to_string());
-    let sanitized = sanitize_api_error(&body);
+    api_error_from_parts(model_provider, status, &body)
+}
+
+/// Build a sanitized model_provider error after a caller has already consumed
+/// the response body to classify a narrowly bounded fallback.
+pub(crate) fn api_error_from_parts(
+    model_provider: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+) -> anyhow::Error {
+    let sanitized = sanitize_api_error(body);
     ::zeroclaw_log::record!(
         ERROR,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -879,9 +1029,10 @@ pub async fn api_error(model_provider: &str, response: reqwest::Response) -> any
     ))
 }
 
-/// Resolve API key for a model_provider from config and environment variables.
-/// Return the typed-alias `api_key` field, trimmed. Env-var overrides land on
-/// the field at config-load via the `ZEROCLAW_*` schema-mirror grammar.
+/// Resolve API key for a model_provider from the typed alias config/override.
+/// Env-var bridges land on the alias field at config-load via the
+/// `ZEROCLAW_*` schema-mirror grammar; this constructor boundary deliberately
+/// does not read provider-specific global variables.
 fn resolve_model_provider_credential(
     _name: &str,
     credential_override: Option<&str>,
@@ -1064,6 +1215,8 @@ pub fn canonicalize_v2_model_provider_name(name: &str) -> &str {
         "volcengine" | "ark" | "doubao-cn" => "doubao",
         // Gemini CLI is its own typed slot (subprocess runtime).
         "gemini-cli" => "gemini_cli",
+        // Grok Build CLI is its own typed slot (subprocess runtime).
+        "grok-cli" | "grokcli" => "grok_cli",
         // Stepfun-intl folds with a different uri at the schema layer.
         "stepfun-intl" | "step-intl" => "stepfun",
         // Anthropic special folds.
@@ -1097,22 +1250,16 @@ fn is_legacy_kimi_code_alias(name: &str) -> bool {
     matches!(name, "kimi-code" | "kimi_coding" | "kimi_for_coding")
 }
 
-/// Apply the config `vision` capability override to a freshly-constructed
-/// provider. Called at every exit of `create_model_provider_inner`, the single
-/// construction choke point every subsystem funnels through, so the override
-/// lands once and `supports_vision()` stays consistent across the
-/// vision-routing gate, the channel media pipeline, and the model router
-/// without per-family or per-consumer re-derivation.
-fn apply_vision_override(
+/// Mark a freshly constructed provider as a known leaf and apply its optional
+/// config `vision` capability override. Called at every exit of
+/// `create_model_provider_inner`, before Reliable/Router composition.
+fn apply_factory_leaf_metadata(
     provider: Box<dyn ModelProvider>,
     vision: Option<bool>,
 ) -> Box<dyn ModelProvider> {
-    match vision {
-        Some(vision) => Box::new(vision_override::VisionOverrideProvider::new(
-            provider, vision,
-        )),
-        None => provider,
-    }
+    Box::new(vision_override::VisionOverrideProvider::factory_leaf(
+        provider, vision,
+    ))
 }
 
 /// Factory: create model_provider with optional base URL and runtime options.
@@ -1154,7 +1301,7 @@ fn create_model_provider_inner(
     // factory callers that pass the legacy spelling expect a working
     // construction here.
     if matches!(provider_kind, "openai-codex" | "openai_codex" | "codex") {
-        return Ok(apply_vision_override(
+        return Ok(apply_factory_leaf_metadata(
             Box::new(openai_codex::OpenAiCodexModelProvider::new(
                 alias, options, api_key,
             )?),
@@ -1205,7 +1352,7 @@ fn create_model_provider_inner(
             Some(url) => url,
             None => moonshot_code_base_url(),
         };
-        return Ok(apply_vision_override(
+        return Ok(apply_factory_leaf_metadata(
             factory::apply_compat_options(
                 factory::build_kimi_code_compat(alias, key, base_url),
                 options,
@@ -1215,7 +1362,7 @@ fn create_model_provider_inner(
     }
 
     factory::dispatch_family_factory(config, provider_kind, alias, key, resolved_url, options)
-        .map(|provider| apply_vision_override(provider, options.vision))
+        .map(|provider| apply_factory_leaf_metadata(provider, options.vision))
 }
 
 pub fn create_resilient_model_provider_with_options(
@@ -1328,7 +1475,12 @@ fn push_pinned_entries(
     let cooldown_key = format!("{family}.{alias}");
 
     let Some(primary_model) = primary_model else {
-        out.push(ReliableModelProviderEntry::new(family, cooldown_key, built));
+        out.push(ReliableModelProviderEntry::new_with_candidate(
+            family,
+            cooldown_key.clone(),
+            cooldown_key,
+            built,
+        ));
         return;
     };
 
@@ -1748,75 +1900,7 @@ impl ModelProviderCategory {
 /// multi-region, CLI shims).
 #[must_use]
 pub fn default_model_provider_url(name: &str) -> Option<&'static str> {
-    use factory::CompatFamilySpec;
-    use zeroclaw_config::schema::{
-        Ai21ModelProviderConfig, AihubmixModelProviderConfig, AnyscaleModelProviderConfig,
-        ArceeModelProviderConfig, AstraiModelProviderConfig, BaichuanModelProviderConfig,
-        BasetenModelProviderConfig, CerebrasModelProviderConfig, CloudflareModelProviderConfig,
-        CohereModelProviderConfig, DeepinfraModelProviderConfig, DeepseekModelProviderConfig,
-        DoubaoModelProviderConfig, FeatherlessModelProviderConfig, FireworksModelProviderConfig,
-        FriendliModelProviderConfig, GithubModelsModelProviderConfig,
-        HuggingfaceModelProviderConfig, HyperbolicModelProviderConfig,
-        InceptionModelProviderConfig, LambdaAiModelProviderConfig, LeptonModelProviderConfig,
-        LitellmModelProviderConfig, MistralModelProviderConfig, MorphModelProviderConfig,
-        NearaiModelProviderConfig, NebiusModelProviderConfig, NovitaModelProviderConfig,
-        NscaleModelProviderConfig, OpencodeModelProviderConfig, PerplexityModelProviderConfig,
-        RekaModelProviderConfig, SambanovaModelProviderConfig, SglangModelProviderConfig,
-        SiliconflowModelProviderConfig, SyntheticModelProviderConfig, TogetherModelProviderConfig,
-        UpstageModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
-        YiModelProviderConfig,
-    };
-
-    match name {
-        "anthropic" => Some(anthropic::BASE_URL),
-        "openai" => Some(openai::BASE_URL),
-        "openrouter" => Some(openrouter::BASE_URL),
-        "ollama" => Some(ollama::BASE_URL),
-        "telnyx" => Some(telnyx::BASE_URL),
-        "gemini" => Some(gemini::BASE_URL),
-        "vercel" => Some(<VercelModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "cloudflare" => Some(<CloudflareModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "synthetic" => Some(<SyntheticModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "opencode" => Some(<OpencodeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "doubao" => Some(<DoubaoModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "mistral" => Some(<MistralModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "deepseek" => Some(<DeepseekModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "together" => Some(<TogetherModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "fireworks" => Some(<FireworksModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "novita" => Some(<NovitaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "perplexity" => Some(<PerplexityModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "cohere" => Some(<CohereModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "sglang" => Some(<SglangModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "vllm" => Some(<VllmModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "astrai" => Some(<AstraiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "siliconflow" => Some(<SiliconflowModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "aihubmix" => Some(<AihubmixModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "litellm" => Some(<LitellmModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "cerebras" => Some(<CerebrasModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "sambanova" => Some(<SambanovaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "hyperbolic" => Some(<HyperbolicModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "deepinfra" => Some(<DeepinfraModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "huggingface" => Some(<HuggingfaceModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "ai21" => Some(<Ai21ModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "reka" => Some(<RekaModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "baseten" => Some(<BasetenModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "nscale" => Some(<NscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "anyscale" => Some(<AnyscaleModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "nebius" => Some(<NebiusModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "friendli" => Some(<FriendliModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "lepton" => Some(<LeptonModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "morph" => Some(<MorphModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "github_models" => Some(<GithubModelsModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "upstage" => Some(<UpstageModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "featherless" => Some(<FeatherlessModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "arcee" => Some(<ArceeModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "lambda_ai" => Some(<LambdaAiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "inception" => Some(<InceptionModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "nearai" => Some(<NearaiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "baichuan" => Some(<BaichuanModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        "yi" => Some(<YiModelProviderConfig as CompatFamilySpec>::DEFAULT_URL),
-        _ => None,
-    }
+    factory::endpoint_for_family(name).and_then(factory::ProviderEndpoint::fixed_url)
 }
 
 /// Append a section of provider families under one category. DRY builder so the
@@ -1886,6 +1970,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("nearai", "NEAR AI Cloud", false),
             ("vercel", "Vercel AI Gateway", false),
             ("cloudflare", "Cloudflare AI", false),
+            ("atlascloud", "Atlas Cloud", false),
             ("moonshot", "Moonshot", false),
             ("synthetic", "Synthetic", false),
             ("opencode", "OpenCode", false),
@@ -1907,6 +1992,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("cohere", "Cohere", false),
             ("copilot", "GitHub Copilot", false),
             ("gemini_cli", "Gemini CLI", true),
+            ("grok_cli", "Grok Build CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
             ("lmstudio", "LM Studio", true),
@@ -2115,6 +2201,43 @@ mod tests {
     fn resolve_provider_credential_filters_empty_override() {
         assert!(resolve_model_provider_credential("openrouter", Some("   ")).is_none());
         assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn resolve_atlascloud_credential_stays_on_typed_alias_boundary() {
+        let _env_lock = env_lock();
+        let _guard = EnvGuard::set("ATLASCLOUD_API_KEY", Some("  atlas-env-key  "));
+        assert!(resolve_model_provider_credential("atlascloud", None).is_none());
+        assert_eq!(
+            resolve_model_provider_credential("atlascloud", Some("  explicit-key  ")).as_deref(),
+            Some("explicit-key")
+        );
+        assert!(resolve_model_provider_credential("openrouter", None).is_none());
+    }
+
+    #[test]
+    fn atlascloud_uses_canonical_provider_id_only() {
+        assert_eq!(
+            canonicalize_v2_model_provider_name("atlascloud"),
+            "atlascloud"
+        );
+        for alias in ["atlas", "atlas-cloud", "atlas_cloud"] {
+            assert_eq!(canonicalize_v2_model_provider_name(alias), alias);
+        }
+    }
+
+    #[test]
+    fn atlascloud_provider_is_listed_and_constructible() {
+        let providers = list_model_providers();
+        let atlascloud = providers
+            .iter()
+            .find(|provider| provider.name == "atlascloud")
+            .expect("Atlas Cloud provider should be listed");
+        assert_eq!(atlascloud.display_name, "Atlas Cloud");
+        assert!(
+            create_model_provider("atlascloud", Some("provider-test-credential")).is_ok(),
+            "Atlas Cloud should construct through the OpenAI-compatible family factory"
+        );
     }
 
     #[test]
@@ -2457,7 +2580,6 @@ mod tests {
                 !provider.capabilities().vision,
                 "{name}: capabilities().vision must stay consistent with supports_vision()"
             );
-
             // `None` preserves the family default (vision-capable here).
             let provider = create_model_provider_inner(
                 None,
@@ -2472,6 +2594,25 @@ mod tests {
                 provider.supports_vision(),
                 "{name}: no override should keep the family default"
             );
+        }
+    }
+
+    #[test]
+    fn factory_leaves_have_stable_request_identity() {
+        for name in ["llamacpp", "custom:http://localhost:8080/v1"] {
+            for vision in [None, Some(false)] {
+                let options = ModelProviderRuntimeOptions {
+                    vision,
+                    ..Default::default()
+                };
+                let provider =
+                    create_model_provider_inner(None, name, "default", None, None, &options)
+                        .unwrap();
+                assert!(
+                    provider.has_stable_request_identity("model"),
+                    "{name}: factory-created leaves must attest to a stable request identity"
+                );
+            }
         }
     }
 
@@ -2992,6 +3133,15 @@ mod tests {
     fn factory_gemini_cli() {}
 
     #[test]
+    fn factory_grok_cli() {
+        let error = match create_model_provider("grok_cli", None) {
+            Ok(_) => panic!("unscoped grok_cli provider must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[test]
     fn factory_kilocli() {
         assert!(create_model_provider("kilocli", None).is_ok());
     }
@@ -3079,6 +3229,25 @@ mod tests {
     #[test]
     fn default_url_matches_compat_spec_for_new_providers() {
         assert_eq!(
+            default_model_provider_url("groq"),
+            Some("https://api.groq.com/openai/v1")
+        );
+        assert_eq!(
+            default_model_provider_url("nvidia"),
+            Some("https://integrate.api.nvidia.com/v1")
+        );
+        assert_eq!(default_model_provider_url("moonshot"), None);
+        assert_eq!(default_model_provider_url("azure"), None);
+        assert_eq!(default_model_provider_url("openai"), None);
+        assert_eq!(default_model_provider_url("gemini"), None);
+        assert_eq!(default_model_provider_url("copilot"), None);
+        assert_eq!(default_model_provider_url("custom"), None);
+        assert_eq!(default_model_provider_url("gemini_cli"), None);
+        assert_eq!(
+            default_model_provider_url("qianfan"),
+            Some(QIANFAN_BASE_URL)
+        );
+        assert_eq!(
             default_model_provider_url("morph"),
             Some("https://api.morphllm.com/v1")
         );
@@ -3106,6 +3275,32 @@ mod tests {
         assert_eq!(
             default_model_provider_url("inception"),
             Some("https://api.inceptionlabs.ai/v1")
+        );
+    }
+
+    #[test]
+    fn openrouter_context_window_url_uses_the_shared_default() {
+        for uri in [None, Some(""), Some("<unset>")] {
+            let config = zeroclaw_config::schema::ModelProviderConfig {
+                uri: uri.map(str::to_string),
+                ..Default::default()
+            };
+            assert_eq!(
+                openrouter_context_window_url(&config),
+                "https://openrouter.ai/api/v1/models"
+            );
+        }
+    }
+
+    #[test]
+    fn openrouter_context_window_url_preserves_the_configured_uri() {
+        let config = zeroclaw_config::schema::ModelProviderConfig {
+            uri: Some("https://proxy.example.test/openrouter/models".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            openrouter_context_window_url(&config),
+            "https://proxy.example.test/openrouter/models"
         );
     }
 
@@ -3325,6 +3520,13 @@ mod tests {
 
     #[test]
     fn factory_all_canonical_model_providers_create_successfully() {
+        // Canonical family names only — legacy synonyms are collapsed by
+        // `normalize_model_provider_type` in `schema/v2.rs` and never reach
+        // the runtime. `azure` is excluded (typed-config required, see
+        // `listed_model_providers_are_constructible` skip list); `custom` is
+        // excluded (URI required); `grok_cli` is excluded because ACP requires
+        // an explicit absolute working_directory. Dedicated factory tests cover
+        // each required-config family.
         let canonical = [
             "openrouter",
             "anthropic",
@@ -3416,6 +3618,11 @@ mod tests {
             if model_provider.name == "custom" {
                 continue;
             }
+            // Grok ACP deliberately refuses the daemon cwd as an implicit
+            // trust boundary; a typed alias must provide working_directory.
+            if model_provider.name == "grok_cli" {
+                continue;
+            }
             assert!(
                 create_model_provider(model_provider.name, Some("provider-test-credential"))
                     .is_ok(),
@@ -3426,6 +3633,73 @@ mod tests {
     }
 
     // ── API error sanitization ───────────────────────────────
+
+    #[test]
+    fn tool_reasoning_rejection_detection_is_narrow() {
+        let reported = r#"{"error":{"message":"Function tools with reasoning effort are not supported for this model.","param":"reasoning_effort"}}"#;
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            reported
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNAUTHORIZED,
+            reported
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is unsupported"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"function tools are not supported"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported for this model"},"model":"tool-model"}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported for this model"},"request_id":"tool-call-123"}"#
+        ));
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "Function tools with reasoning_effort are incompatible"
+        ));
+    }
+
+    #[test]
+    fn tool_reasoning_rejection_ignores_tool_substrings_in_identifiers() {
+        // A bad-value error that merely names a model containing "tool" must
+        // not be misread as a tools/reasoning capability conflict: retrying
+        // would silently downgrade the operator's configured effort.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value 'xhigh' is unsupported for tool-model","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not allowed for model toolformer-v2","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported for deployment multi_tool_router","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported by toolkit","param":"reasoning_effort"}}"#
+        ));
+
+        // Genuine conflicts still match, including the plural token and
+        // punctuation-adjacent forms.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported when tools are provided","param":"reasoning_effort"}}"#
+        ));
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort cannot be used with \"tools\".","param":"reasoning_effort"}}"#
+        ));
+    }
 
     #[test]
     fn format_error_chain_includes_sources_and_sanitizes_output() {
@@ -3543,6 +3817,56 @@ mod tests {
         let result = sanitize_api_error(&input);
         assert!(std::str::from_utf8(result.as_bytes()).is_ok());
         assert!(!result.contains("sk-abcdef123"));
+    }
+
+    #[test]
+    fn sanitize_scrubs_gemini_key_in_reqwest_url() {
+        let key = "AIzaSyDUMMYKEYFORTESTINGONLY1234567890";
+        let input = format!(
+            "error sending request for url (https://127.0.0.1:1/v1beta/models/x:generateContent?key={key})"
+        );
+        let result = sanitize_api_error(&input);
+        assert!(!result.contains(key), "key leaked: {result}");
+        assert!(result.contains("generateContent"));
+        assert!(!result.contains("?key="));
+    }
+
+    #[test]
+    fn sanitize_scrubs_bare_gemini_key_prefix() {
+        // An `AIza` key that appears outside a query string (e.g. a JSON body)
+        // is still redacted by the prefix rule.
+        let input = r#"{"error":"invalid api key AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"}"#;
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("AIzaSyABCDEF0123456789abcdefGHIJKLmnopqrs"));
+        assert!(result.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn sanitize_removes_complete_url_query_regardless_of_parameter_name() {
+        let input =
+            "GET HTTPS://api.example.com/v1/thing?region=us&access_token=hunter2secret failed";
+        let result = sanitize_api_error(input);
+        assert!(!result.contains("hunter2secret"), "{result}");
+        assert!(!result.contains("region=us"), "{result}");
+        assert!(result.contains("HTTPS://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_removes_query_values_containing_url_punctuation() {
+        let secret = "abc,def'ghi(jkl)";
+        let input = format!("GET https://api.example.com/v1/thing?api_key={secret} failed");
+        let result = sanitize_api_error(&input);
+
+        assert!(!result.contains(secret), "{result}");
+        assert!(!result.contains("def'ghi(jkl)"), "{result}");
+        assert!(result.contains("https://api.example.com/v1/thing"));
+    }
+
+    #[test]
+    fn sanitize_leaves_non_url_key_value_text_unchanged() {
+        let input = "playing monkey=banana in the query";
+        let result = sanitize_api_error(input);
+        assert_eq!(result, input);
     }
 
     #[test]
@@ -4525,6 +4849,75 @@ mod tests {
     }
 
     #[test]
+    fn provider_runtime_options_cross_family_no_leak() {
+        // Two different provider families (openai and anthropic) each with
+        // distinct max_tokens. Each agent resolves only its own provider's
+        // options, so a different provider's max_tokens cannot leak across
+        // agent boundaries.
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, AnthropicModelProviderConfig, Config, ModelProviderConfig,
+            OpenAIModelProviderConfig,
+        };
+
+        let mut config = Config::default();
+
+        // OpenAI alias with max_tokens = 16384.
+        config.providers.models.openai.insert(
+            "gpt".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("fake-openai-key-not-real".to_string()),
+                    max_tokens: Some(16_384),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        // Anthropic alias with a different max_tokens.
+        config.providers.models.anthropic.insert(
+            "sonnet".to_string(),
+            AnthropicModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("claude-sonnet-4".to_string()),
+                    api_key: Some("fake-anthropic-key-not-real".to_string()),
+                    max_tokens: Some(8_192),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+
+        config.agents.insert(
+            "openai_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.gpt".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "anthropic_agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "anthropic.sonnet".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let openai_opts = provider_runtime_options_for_agent(&config, "openai_agent");
+        let anthropic_opts = provider_runtime_options_for_agent(&config, "anthropic_agent");
+
+        assert_eq!(
+            openai_opts.provider_max_tokens,
+            Some(16_384),
+            "openai agent must get its own max_tokens, not the anthropic provider's"
+        );
+        assert_eq!(
+            anthropic_opts.provider_max_tokens,
+            Some(8_192),
+            "anthropic agent must get its own max_tokens, not the openai provider's"
+        );
+    }
+
+    #[test]
     fn resilient_alias_deep_acyclic_fallback_does_not_overflow() {
         use zeroclaw_config::schema::{Config, ModelProviderConfig, OpenAIModelProviderConfig};
 
@@ -4586,13 +4979,9 @@ async fn fetch_openrouter_context_window(
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
     let client = reqwest::Client::new();
-    let url = config
-        .uri
-        .as_deref()
-        .filter(|s| !s.is_empty() && *s != "<unset>")
-        .unwrap_or("https://openrouter.ai/api/v1/models");
+    let url = openrouter_context_window_url(config);
     let resp = client
-        .get(url)
+        .get(url.as_ref())
         .send()
         .await
         .ok()?
@@ -4608,12 +4997,25 @@ async fn fetch_openrouter_context_window(
         .map(|v| v as usize)
 }
 
+fn openrouter_context_window_url(
+    config: &zeroclaw_config::schema::ModelProviderConfig,
+) -> std::borrow::Cow<'_, str> {
+    config
+        .uri
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "<unset>")
+        .map_or_else(
+            || std::borrow::Cow::Owned(openrouter::endpoint_url("models")),
+            std::borrow::Cow::Borrowed,
+        )
+}
+
 async fn fetch_openai_compatible_context_window(
     provider_type: &str,
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
     let client = reqwest::Client::new();
-    let default_uri = crate::factory::get_default_url(provider_type);
+    let default_uri = default_model_provider_url(provider_type);
     let base_url = config
         .uri
         .as_deref()

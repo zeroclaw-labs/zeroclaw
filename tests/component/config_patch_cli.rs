@@ -1,22 +1,39 @@
 //! Regression coverage for `zeroclaw config patch --json` output.
+//!
+//! The CLI/HTTP parity test needs the in-process gateway router, whose
+//! `AppState` and deps only exist under the `gateway` feature. Those items are
+//! gated so the CLI-only tests still compile and run with the feature off.
 
+#[cfg(feature = "gateway")]
 use axum::{Router, routing::patch};
+#[cfg(feature = "gateway")]
 use parking_lot::RwLock;
+#[cfg(feature = "gateway")]
 use std::collections::HashMap;
 use std::process::{Command, Output, Stdio};
+#[cfg(feature = "gateway")]
 use std::sync::Arc;
+#[cfg(feature = "gateway")]
 use std::time::Duration;
+#[cfg(feature = "gateway")]
 use tower::ServiceExt;
+#[cfg(feature = "gateway")]
 use zeroclaw::gateway::{self, AppState};
+#[cfg(feature = "gateway")]
 use zeroclaw_api::attribution::Attributable;
 use zeroclaw_config::schema::Config;
+#[cfg(feature = "gateway")]
 use zeroclaw_memory::NoneMemory;
+#[cfg(feature = "gateway")]
 use zeroclaw_providers::ModelProvider;
+#[cfg(feature = "gateway")]
 use zeroclaw_runtime::security::PairingGuard;
 
+#[cfg(feature = "gateway")]
 #[derive(Default)]
 struct MockModelProvider;
 
+#[cfg(feature = "gateway")]
 #[async_trait::async_trait]
 impl ModelProvider for MockModelProvider {
     async fn chat_with_system(
@@ -30,6 +47,7 @@ impl ModelProvider for MockModelProvider {
     }
 }
 
+#[cfg(feature = "gateway")]
 impl Attributable for MockModelProvider {
     fn role(&self) -> zeroclaw_api::attribution::Role {
         zeroclaw_api::attribution::Role::Provider(zeroclaw_api::attribution::ProviderKind::Model(
@@ -42,6 +60,7 @@ impl Attributable for MockModelProvider {
     }
 }
 
+#[cfg(feature = "gateway")]
 fn test_state(config: Config) -> AppState {
     let memory: Arc<dyn zeroclaw_memory::Memory> =
         Arc::new(NoneMemory::new("config-patch-cli-test"));
@@ -81,8 +100,6 @@ fn test_state(config: Config) -> AppState {
         nextcloud_talk: HashMap::new(),
         #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk_webhook_secret: HashMap::new(),
-        #[cfg(feature = "channel-wati")]
-        wati: HashMap::new(),
         #[cfg(feature = "channel-email")]
         gmail_push: None,
         observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -208,6 +225,7 @@ fn run_cli_patch_success(config_dir: &std::path::Path, patch_doc: &[u8]) -> serd
     serde_json::from_str(&stdout).expect("stdout should be JSON success envelope")
 }
 
+#[cfg(feature = "gateway")]
 async fn run_http_patch(config_dir: &std::path::Path, patch_doc: &[u8]) -> serde_json::Value {
     let config = Config {
         config_path: config_dir.join("config.toml"),
@@ -256,6 +274,7 @@ fn config_patch_json_success_emits_envelope_and_persists_change() {
     assert_eq!(parsed.gateway.host, "127.0.0.2");
 }
 
+#[cfg(feature = "gateway")]
 #[tokio::test]
 async fn config_patch_json_failed_op_matches_http_error_envelope() {
     let patch_doc = br#"[{"op":"replace","path":"/not/a/path","value":"x"}]"#;

@@ -622,36 +622,24 @@ impl MattermostChannel {
             return None;
         }
 
-        if let Some(content_length) = response.content_length()
-            && content_length > MAX_MATTERMOST_AUDIO_BYTES
-        {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(
-                        ::serde_json::json!({"content_length": content_length, "file_id": file_id})
-                    ),
-                "audio file too large ( bytes)"
-            );
-            return None;
-        }
-
-        let bytes = match response.bytes().await {
-            Ok(b) => b,
-            Err(e) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(
-                            ::serde_json::json!({"error": format!("{}", e), "file_id": file_id})
-                        ),
-                    "failed to read audio bytes for"
-                );
-                return None;
-            }
-        };
+        let bytes =
+            match crate::util::read_response_body_limited(response, MAX_MATTERMOST_AUDIO_BYTES)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(
+                                ::serde_json::json!({"error": format!("{}", e), "file_id": file_id})
+                            ),
+                        "failed to read audio bytes for"
+                    );
+                    return None;
+                }
+            };
 
         match manager.transcribe(&bytes, file_name).await {
             Ok(text) => {
@@ -2630,6 +2618,77 @@ mod tests {
 
             let result = ch.try_transcribe_audio_attachment(&post).await;
             assert_eq!(result.as_deref(), Some("[Voice] test transcript"));
+        }
+
+        #[tokio::test]
+        async fn mattermost_audio_rejects_declared_oversize_before_transcription() {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                MAX_MATTERMOST_AUDIO_BYTES + 1
+            )
+            .into_bytes();
+            let (mattermost_url, server) =
+                crate::util::spawn_raw_http_response(response, true).await;
+            let mock_server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(path("/v1/audio/transcriptions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"text": "wrong"})))
+                .expect(0)
+                .mount(&mock_server)
+                .await;
+
+            let ch = MattermostChannel::new(
+                mattermost_url,
+                Some("test_token".to_string()),
+                None,
+                None,
+                Vec::new(),
+                "mattermost_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+                false,
+            )
+            .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
+                enabled: true,
+                api_key: None,
+                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+                model: "whisper-large-v3".to_string(),
+                language: None,
+                initial_prompt: None,
+                max_audio_bytes: None,
+                max_duration_secs: 600,
+                openai: None,
+                deepgram: None,
+                assemblyai: None,
+                google: None,
+                local_whisper: Some(zeroclaw_config::schema::LocalWhisperConfig {
+                    url: format!("{}/v1/audio/transcriptions", mock_server.uri()),
+                    bearer_token: Some("test_token".to_string()),
+                    max_audio_bytes: 25_000_000,
+                    timeout_secs: 300,
+                }),
+                transcribe_non_ptt_audio: false,
+            });
+            let post = json!({
+                "metadata": {
+                    "files": [{
+                        "id": "file1",
+                        "mime_type": "audio/ogg",
+                        "name": "voice.ogg"
+                    }]
+                }
+            });
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                ch.try_transcribe_audio_attachment(&post),
+            )
+            .await
+            .expect("declared oversize must be rejected before reading the body");
+            server.abort();
+
+            assert!(result.is_none());
         }
 
         #[tokio::test]

@@ -10,6 +10,10 @@ publish = false
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-macros.workspace = true
+# ADR-013: `plugins.entries[].egress_hosts` validates against the one shared
+# egress grammar in `zeroclaw_infra::net_guard`. Reimplementing the grammar here
+# would give a security-relevant rule two definitions that can drift apart.
+zeroclaw-infra.workspace = true
 anyhow = "1.0"
 clap = { version = "4.5", optional = true, default-features = false, features = ["std", "derive"] }
 # OnboardUi needs dyn-compat; native AFIT isn't dyn-safe. Already built for api/channels/runtime.
@@ -43,6 +47,12 @@ toml_edit = "0.25"
 url = "2.5"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 webpki-roots = "1.0.6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3.26"

@@ -26,7 +26,6 @@ pub mod api_webauthn;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 pub mod api_webhook;
@@ -53,21 +52,18 @@ use anyhow::{Context, Result};
     feature = "channel-email",
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::body::Bytes;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::extract::Path;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 use axum::response::Response;
@@ -115,7 +111,6 @@ use uuid::Uuid;
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 use zeroclaw_api::channel::{Channel, SendMessage};
@@ -127,8 +122,6 @@ use zeroclaw_channels::gmail_push::GmailPushChannel;
 use zeroclaw_channels::linq::LinqChannel;
 #[cfg(feature = "channel-nextcloud")]
 use zeroclaw_channels::nextcloud_talk::NextcloudTalkChannel;
-#[cfg(feature = "channel-wati")]
-use zeroclaw_channels::wati::WatiChannel;
 #[cfg(feature = "channel-whatsapp-cloud")]
 use zeroclaw_channels::whatsapp::WhatsAppChannel;
 use zeroclaw_config::policy::SecurityPolicy;
@@ -187,11 +180,6 @@ fn linq_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("linq_{}_{}", msg.sender, msg.id)
 }
 
-#[cfg(feature = "channel-wati")]
-fn wati_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    format!("wati_{}_{}", msg.sender, msg.id)
-}
-
 #[cfg(feature = "channel-nextcloud")]
 fn nextcloud_talk_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("nextcloud_talk_{}_{}", msg.sender, msg.id)
@@ -200,7 +188,6 @@ fn nextcloud_talk_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> Str
 #[cfg(any(
     feature = "channel-linq",
     feature = "channel-nextcloud",
-    feature = "channel-wati",
     feature = "channel-whatsapp-cloud"
 ))]
 fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage) -> String {
@@ -208,6 +195,11 @@ fn sender_session_id(channel: &str, msg: &zeroclaw_api::channel::ChannelMessage)
         Some(thread_id) => format!("{channel}_{thread_id}_{}", msg.sender),
         None => format!("{channel}_{}", msg.sender),
     }
+}
+
+#[cfg(feature = "channel-linq")]
+fn linq_channel_ref(alias: &str) -> String {
+    format!("linq.{alias}")
 }
 
 fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
@@ -503,9 +495,6 @@ pub struct AppState {
     /// Nextcloud Talk webhook secrets keyed by alias for signature verification.
     #[cfg(feature = "channel-nextcloud")]
     pub nextcloud_talk_webhook_secret: HashMap<String, Arc<str>>,
-    /// WATI channel instances keyed by config alias.
-    #[cfg(feature = "channel-wati")]
-    pub wati: HashMap<String, Arc<WatiChannel>>,
     /// Gmail Pub/Sub push notification channel
     #[cfg(feature = "channel-email")]
     pub gmail_push: Option<Arc<GmailPushChannel>>,
@@ -591,6 +580,7 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -1108,34 +1098,6 @@ pub async fn run_gateway(
         })
         .collect();
 
-    // WATI channel instances keyed by alias.
-    #[cfg(feature = "channel-wati")]
-    let wati_channel: HashMap<String, Arc<WatiChannel>> = config
-        .channels
-        .wati
-        .iter()
-        .map(|(alias, wati_cfg)| {
-            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-                let cfg_arc = config_state.clone();
-                let alias = alias.clone();
-                Arc::new(move || cfg_arc.read().channel_external_peers("wati", &alias))
-            };
-            (
-                alias.clone(),
-                Arc::new(
-                    WatiChannel::new(
-                        wati_cfg.api_token.clone(),
-                        wati_cfg.api_url.clone(),
-                        wati_cfg.tenant_id.clone(),
-                        alias.clone(),
-                        peer_resolver,
-                    )
-                    .with_transcription(config.transcription.clone()),
-                ),
-            )
-        })
-        .collect();
-
     // Nextcloud Talk channel instances keyed by alias.
     #[cfg(feature = "channel-nextcloud")]
     let nextcloud_talk_channel: HashMap<String, Arc<NextcloudTalkChannel>> = config
@@ -1448,11 +1410,6 @@ pub async fn run_gateway(
     if !linq_channels.is_empty() {
         println!("  POST {pfx}/linq[/<alias>]      — Linq message webhook (iMessage/RCS/SMS)");
     }
-    #[cfg(feature = "channel-wati")]
-    if !wati_channel.is_empty() {
-        println!("  GET  {pfx}/wati[/<alias>]      — WATI webhook verification");
-        println!("  POST {pfx}/wati[/<alias>]      — WATI message webhook");
-    }
     #[cfg(feature = "channel-nextcloud")]
     if !nextcloud_talk_channel.is_empty() {
         println!("  POST {pfx}/nextcloud-talk[/<alias>] — Nextcloud Talk bot webhook");
@@ -1598,8 +1555,6 @@ pub async fn run_gateway(
         nextcloud_talk: nextcloud_talk_channel,
         #[cfg(feature = "channel-nextcloud")]
         nextcloud_talk_webhook_secret,
-        #[cfg(feature = "channel-wati")]
-        wati: wati_channel,
         #[cfg(feature = "channel-email")]
         gmail_push: gmail_push_channel,
         observer: state_observer,
@@ -1986,7 +1941,7 @@ pub async fn run_gateway(
         // ── WebSocket node discovery ──
         .route("/ws/nodes", get(nodes::handle_ws_nodes))
         // ── Static assets (web dashboard) ──
-        .route("/_app/{*path}", get(static_files::handle_static))
+        .merge(static_file_routes())
         // ── SPA fallback: non-API GET requests serve index.html ──
         .fallback(get(static_files::handle_spa_fallback))
         .with_state(state.clone())
@@ -2059,6 +2014,10 @@ pub async fn run_gateway(
         }
         _ => None,
     };
+
+    if let Some(readiness) = readiness {
+        readiness.report_ready(actual_addr);
+    }
 
     if let Some(tls_acceptor) = tls_acceptor {
         // Manual TLS accept loop — serves each connection via hyper.
@@ -2162,6 +2121,12 @@ pub async fn run_gateway(
 
     drop(broadcast_hook_guard);
     Ok(())
+}
+
+fn static_file_routes() -> Router<AppState> {
+    Router::new()
+        .route("/_app/", get(static_files::handle_static))
+        .route("/_app/{*path}", get(static_files::handle_static))
 }
 
 fn format_paircode_recovery_command(_host: &str, port: u16) -> String {
@@ -2499,6 +2464,65 @@ fn needs_quickstart_channel_reply() -> String {
     i18n::get_required_cli_string("channel-needs-quickstart-reply")
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GatewayChatDispatchCapture {
+    message: String,
+    session_id: Option<String>,
+    agent_override: Option<String>,
+}
+
+#[cfg(test)]
+static GATEWAY_CHAT_DISPATCH_CAPTURES: std::sync::Mutex<Vec<GatewayChatDispatchCapture>> =
+    std::sync::Mutex::new(Vec::new());
+
+// The four items below serialize and read the capture buffer, and only the
+// Linq webhook alias tests do either. Their gate has to name that feature as
+// well as `test`, or they are compiled and unused whenever it is off, which
+// `-D warnings` promotes to an error. The buffer itself, and the recording
+// function that fills it, stay on the plain `test` gate because the chat
+// dispatch path writes to them unconditionally.
+#[cfg(all(test, feature = "channel-linq"))]
+static GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(all(test, feature = "channel-linq"))]
+async fn lock_gateway_chat_dispatch_capture_for_test() -> tokio::sync::MutexGuard<'static, ()> {
+    GATEWAY_CHAT_DISPATCH_CAPTURE_TEST_LOCK.lock().await
+}
+
+#[cfg(all(test, feature = "channel-linq"))]
+fn clear_gateway_chat_dispatch_captures_for_test() {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .clear();
+}
+
+#[cfg(all(test, feature = "channel-linq"))]
+fn gateway_chat_dispatch_captures_for_test() -> Vec<GatewayChatDispatchCapture> {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .clone()
+}
+
+#[cfg(test)]
+fn record_gateway_chat_dispatch_for_test(
+    message: &str,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+) {
+    GATEWAY_CHAT_DISPATCH_CAPTURES
+        .lock()
+        .expect("gateway chat dispatch capture mutex poisoned")
+        .push(GatewayChatDispatchCapture {
+            message: message.to_string(),
+            session_id: session_id.map(ToString::to_string),
+            agent_override: agent_override.map(ToString::to_string),
+        });
+}
+
 pub(crate) async fn run_gateway_chat_with_tools(
     state: &AppState,
     message: &str,
@@ -2515,7 +2539,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
     // doesn't go through the cost-tracking scope.
     #[cfg(test)]
     {
-        let _ = (session_id, agent_override);
+        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -2604,12 +2628,6 @@ fn optional_channel_routes() -> Router<AppState> {
     let router = router
         .route("/linq", post(handle_linq_webhook))
         .route("/linq/{alias}", post(handle_linq_webhook_alias));
-    #[cfg(feature = "channel-wati")]
-    let router = router
-        .route("/wati", get(handle_wati_verify))
-        .route("/wati", post(handle_wati_webhook))
-        .route("/wati/{alias}", get(handle_wati_verify_alias))
-        .route("/wati/{alias}", post(handle_wati_webhook_alias));
     #[cfg(feature = "channel-nextcloud")]
     let router = router
         .route("/nextcloud-talk", post(handle_nextcloud_talk_webhook))
@@ -3027,8 +3045,19 @@ async fn process_whatsapp_message(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // ── Security: Verify X-Hub-Signature-256 if app_secret is configured ──
-    if let Some(app_secret) = app_secret {
+    // ── Security: WhatsApp Cloud webhooks MUST be signature-verified ──
+    // Fail closed: with no configured app secret we cannot verify the signature, so the
+    // request is rejected. Previously an absent secret skipped verification entirely,
+    // which let any caller who knew the webhook URL inject messages into the agent.
+    let Some(app_secret) = app_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "whatsapp: no app_secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let signature = headers
             .get("X-Hub-Signature-256")
             .and_then(|v| v.to_str().ok())
@@ -3214,8 +3243,20 @@ async fn process_linq_webhook(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let body_str = String::from_utf8_lossy(&body);
 
-    // ── Security: Verify X-Webhook-Signature if signing_secret is configured ──
-    if let Some(signing_secret) = signing_secret {
+    // ── Security: Linq webhooks MUST be signature-verified ──
+    // Fail closed: with no configured signing secret we cannot verify the signature, so
+    // the request is rejected. Previously an absent secret skipped verification
+    // entirely, which let any caller who knew the webhook URL inject messages into the
+    // agent.
+    let Some(signing_secret) = signing_secret else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "linq: no signing_secret configured; refusing to accept an unverified webhook"
+            })),
+        );
+    };
+    {
         let timestamp = headers
             .get("X-Webhook-Timestamp")
             .and_then(|v| v.to_str().ok())
@@ -3269,10 +3310,36 @@ async fn process_linq_webhook(
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
+    let channel_ref = linq_channel_ref(alias);
+    let (agent_override, has_channel_bindings) = {
+        let config = state.config.read();
+        (
+            config.agent_for_channel(&channel_ref).map(str::to_owned),
+            config
+                .agents
+                .values()
+                .any(|agent| !agent.channels.is_empty()),
+        )
+    };
+    if agent_override.is_none() && has_channel_bindings {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"channel": "linq", "alias": alias})),
+            "Linq webhook ignored because no enabled agent owns the channel alias"
+        );
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "ignored", "reason": "no_agent_for_channel"})),
+        );
+    }
+
     // Process each message
     for msg in &messages {
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "linq", "alias": alias, "sender": msg.sender, "content": msg.content})), "inbound webhook message");
-        let session_id = sender_session_id("linq", msg);
+        let session_id =
+            zeroclaw_api::session_keys::sanitize_session_key(&sender_session_id(&channel_ref, msg));
 
         // Auto-save to memory
         if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
@@ -3293,12 +3360,18 @@ async fn process_linq_webhook(
             state,
             &msg.content,
             Some(&session_id),
-            None,
+            agent_override.as_deref(),
         ))
         .await
         {
             Ok(GatewayChatOutcome { response, .. }) => {
+                #[cfg(test)]
+                {
+                    let _ = response;
+                }
+
                 // Send reply via Linq
+                #[cfg(not(test))]
                 if let Err(e) = linq
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
@@ -3335,190 +3408,6 @@ async fn process_linq_webhook(
                     "Sorry, I couldn't process your message right now.".to_string()
                 };
                 let _ = linq.send(&SendMessage::new(reply, &msg.reply_target)).await;
-            }
-        }
-    }
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
-}
-
-/// GET /wati — WATI webhook verification (bare path, deprecated fallback).
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_verify(
-    State(state): State<AppState>,
-    Query(params): Query<WatiVerifyQuery>,
-) -> Response {
-    handle_wati_verify_impl(state, None, params)
-}
-
-/// GET /wati/{alias} — WATI webhook verification for a specific instance.
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_verify_alias(
-    State(state): State<AppState>,
-    Path(alias): Path<String>,
-    Query(params): Query<WatiVerifyQuery>,
-) -> Response {
-    handle_wati_verify_impl(state, Some(alias), params)
-}
-
-#[cfg(feature = "channel-wati")]
-fn handle_wati_verify_impl(
-    state: AppState,
-    alias: Option<String>,
-    params: WatiVerifyQuery,
-) -> Response {
-    let resolved = api_webhook::resolve(&state.wati, alias.as_deref());
-    if resolved.entry().is_none() {
-        return api_webhook::not_found("wati");
-    }
-
-    // WATI may use Meta-style webhook verification; echo the challenge
-    let resp = if let Some(challenge) = params.challenge {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"channel": "wati"})),
-            "webhook verified successfully"
-        );
-        (StatusCode::OK, challenge).into_response()
-    } else {
-        (StatusCode::BAD_REQUEST, "Missing hub.challenge".to_string()).into_response()
-    };
-    api_webhook::tag_deprecation(resp, resolved, "wati")
-}
-
-#[derive(Debug, serde::Deserialize)]
-pub struct WatiVerifyQuery {
-    #[serde(rename = "hub.challenge")]
-    pub challenge: Option<String>,
-}
-
-/// POST /wati — incoming WATI WhatsApp message webhook (bare path, deprecated).
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> Response {
-    handle_wati_webhook_impl(state, None, body).await
-}
-
-/// POST /wati/{alias} — incoming WATI message webhook for a specific instance.
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_webhook_alias(
-    State(state): State<AppState>,
-    Path(alias): Path<String>,
-    body: Bytes,
-) -> Response {
-    handle_wati_webhook_impl(state, Some(alias), body).await
-}
-
-#[cfg(feature = "channel-wati")]
-async fn handle_wati_webhook_impl(state: AppState, alias: Option<String>, body: Bytes) -> Response {
-    let resolved = api_webhook::resolve(&state.wati, alias.as_deref());
-    let Some((_alias, wati)) = resolved.entry() else {
-        return api_webhook::not_found("wati");
-    };
-    let resp = process_wati_webhook(&state, wati, body).await;
-    api_webhook::tag_deprecation(resp.into_response(), resolved, "wati")
-}
-
-/// Parse and dispatch a WATI webhook payload for one resolved instance.
-#[cfg(feature = "channel-wati")]
-async fn process_wati_webhook(
-    state: &AppState,
-    wati: &Arc<WatiChannel>,
-    body: Bytes,
-) -> (StatusCode, Json<serde_json::Value>) {
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
-    };
-
-    // Detect audio before the synchronous parse
-    let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-    let messages = if matches!(msg_type, "audio" | "voice") {
-        // Build a synthetic ChannelMessage from the audio transcript
-        if let Some(transcript) = wati.try_transcribe_audio(&payload).await {
-            wati.parse_audio_as_message(&payload, transcript)
-        } else {
-            vec![]
-        }
-    } else {
-        wati.parse_webhook_payload(&payload)
-    };
-
-    if messages.is_empty() {
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
-    }
-
-    // Process each message
-    for msg in &messages {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "wati", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
-        let session_id = sender_session_id("wati", msg);
-
-        // Auto-save to memory
-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-            let key = wati_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        // Call the LLM
-        match Box::pin(run_gateway_chat_with_tools(
-            state,
-            &msg.content,
-            Some(&session_id),
-            None,
-        ))
-        .await
-        {
-            Ok(GatewayChatOutcome { response, .. }) => {
-                // Send reply via WATI
-                if let Err(e) = wati
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Failed to send WATI reply"
-                    );
-                }
-            }
-            Err(e) => {
-                let reply = if is_needs_quickstart_err(&e) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "WATI chat refused: gateway has no model configured; \
-                         visit /quickstart"
-                    );
-                    needs_quickstart_channel_reply()
-                } else {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"channel": "wati", "error": format!("{}", e)})
-                            ),
-                        "LLM error"
-                    );
-                    "Sorry, I couldn't process your message right now.".to_string()
-                };
-                let _ = wati.send(&SendMessage::new(reply, &msg.reply_target)).await;
             }
         }
     }
@@ -4191,11 +4080,13 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use axum::http::{HeaderValue, Uri};
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request, Uri};
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
     #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
     use zeroclaw_memory::{Memory, MemoryCategory, MemoryEntry};
@@ -4493,8 +4384,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -4545,6 +4434,23 @@ mod tests {
         state: AppState,
     ) -> axum::response::Response {
         static_files::handle_spa_fallback(State(state), Uri::from_static(path)).await
+    }
+
+    async fn static_route_response(
+        path: &'static str,
+        prefix: Option<&str>,
+        state: AppState,
+    ) -> axum::response::Response {
+        let routes = static_file_routes();
+        let app = match prefix {
+            Some(prefix) => Router::new().nest(prefix, routes),
+            None => routes,
+        }
+        .with_state(state);
+
+        app.oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
     }
 
     /// Pair a device into both the pairing guard and the device registry,
@@ -4795,6 +4701,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_routes_reject_malformed_paths_before_spa_fallback() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut prefixed_state = spa_fallback_state(&tmp);
+        prefixed_state.path_prefix = "/gw".to_string();
+
+        for (path, prefix, state) in [
+            ("/_app/", None, spa_fallback_state(&tmp)),
+            ("/_app//index.html", None, spa_fallback_state(&tmp)),
+            ("/_app/assets/./app.js", None, spa_fallback_state(&tmp)),
+            ("/_app/assets/../secret", None, spa_fallback_state(&tmp)),
+            ("/_app/assets/app.js/", None, spa_fallback_state(&tmp)),
+            ("/gw/_app/", Some("/gw"), prefixed_state),
+        ] {
+            let response = static_route_response(path, prefix, state).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "route path should be rejected: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn static_routes_serve_valid_assets_with_and_without_prefix() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dist_dir = tmp.path().join("web").join("dist");
+        let assets = dist_dir.join("assets");
+        std::fs::create_dir_all(&assets).unwrap();
+        std::fs::write(assets.join("route-test.js"), b"route-ok").unwrap();
+
+        let mut state = spa_fallback_state(&tmp);
+        let unprefixed =
+            static_route_response("/_app/assets/route-test.js", None, state.clone()).await;
+        assert_eq!(unprefixed.status(), StatusCode::OK);
+        assert_eq!(
+            unprefixed.into_body().collect().await.unwrap().to_bytes(),
+            &b"route-ok"[..]
+        );
+
+        state.path_prefix = "/gw".to_string();
+        let prefixed =
+            static_route_response("/gw/_app/assets/route-test.js", Some("/gw"), state).await;
+        assert_eq!(prefixed.status(), StatusCode::OK);
+        assert_eq!(
+            prefixed.into_body().collect().await.unwrap().to_bytes(),
+            &b"route-ok"[..]
+        );
+    }
+
+    #[tokio::test]
     async fn spa_fallback_returns_json_not_html_for_unknown_api_path() {
         let tmp = tempfile::TempDir::new().unwrap();
         let state = spa_fallback_state(&tmp);
@@ -4904,7 +4860,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -4960,7 +4928,19 @@ mod tests {
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -5001,7 +4981,19 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway(
+                "127.0.0.1",
+                0,
+                config,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
         });
 
         match tokio::time::timeout(
@@ -5029,7 +5021,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_gateway_uses_external_shutdown_sender() {
+    async fn daemon_startup_gateway_reports_ready_and_uses_external_shutdown_sender() {
         let port_probe = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = port_probe.local_addr().unwrap().port();
         drop(port_probe);
@@ -5048,6 +5040,10 @@ mod tests {
             shutdown_tx: shutdown_tx.clone(),
             reload_tx,
         };
+        let (ready_tx, mut ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
 
         let handle = zeroclaw_spawn::spawn!(async move {
             run_gateway(
@@ -5060,9 +5056,18 @@ mod tests {
                 None,
                 None,
                 None,
+                Some(readiness),
             )
             .await
         });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            ready_rx.wait_for(Option::is_some).await.unwrap();
+        })
+        .await
+        .expect("gateway should report its successful bind");
+        let ready_addr = *ready_rx.borrow();
+        assert_eq!(ready_addr.unwrap().port(), port);
 
         let addr = format!("127.0.0.1:{port}");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -5088,6 +5093,50 @@ mod tests {
 
         std::net::TcpListener::bind(("127.0.0.1", port))
             .expect("gateway should release the listener after external shutdown");
+    }
+
+    #[tokio::test]
+    async fn daemon_startup_gateway_does_not_report_ready_when_tls_setup_fails() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        config.gateway.tls = Some(zeroclaw_config::schema::GatewayTlsConfig {
+            enabled: true,
+            cert_path: tmp.path().join("missing-cert.pem").display().to_string(),
+            key_path: tmp.path().join("missing-key.pem").display().to_string(),
+            client_auth: None,
+        });
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+
+        let (ready_tx, ready_rx) = tokio::sync::watch::channel(None);
+        let readiness = zeroclaw_runtime::daemon::GatewayReadinessReporter::new(move |addr| {
+            let _ = ready_tx.send(Some(addr));
+        });
+        let result = run_gateway(
+            "127.0.0.1",
+            0,
+            config,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(readiness),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "invalid TLS files should fail gateway setup"
+        );
+        assert!(
+            ready_rx.borrow().is_none(),
+            "failed post-bind setup must not report gateway readiness"
+        );
     }
 
     #[tokio::test]
@@ -5123,8 +5172,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -5212,8 +5259,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
@@ -5888,8 +5933,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -5995,8 +6038,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6117,8 +6158,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer,
@@ -6219,8 +6258,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6340,8 +6377,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6427,8 +6462,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6519,8 +6552,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6618,8 +6649,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6713,8 +6742,6 @@ mod tests {
             linq_signing_secrets: HashMap::new(),
             nextcloud_talk: HashMap::from([(alias.to_string(), channel)]),
             nextcloud_talk_webhook_secret: HashMap::from([(alias.to_string(), Arc::from(secret))]),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -6877,8 +6904,6 @@ mod tests {
             )]),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -7648,7 +7673,9 @@ mod tests {
         serde_json::json!({
             "event_type": "message.received",
             "data": {
-                "sender": { "phone": sender },
+                "chat_id": "chat-789",
+                "from": sender,
+                "is_from_me": false,
                 "message": {
                     "parts": [{ "type": "text", "value": text }]
                 }
@@ -7662,6 +7689,15 @@ mod tests {
     /// secret.
     #[cfg(feature = "channel-linq")]
     fn linq_test_state(alias: &str, signing_secret: Option<&str>) -> AppState {
+        linq_test_state_with_config(alias, signing_secret, Config::default())
+    }
+
+    #[cfg(feature = "channel-linq")]
+    fn linq_test_state_with_config(
+        alias: &str,
+        signing_secret: Option<&str>,
+        config: Config,
+    ) -> AppState {
         let model_provider: Arc<dyn ModelProvider> = Arc::new(MockModelProvider::default());
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
@@ -7682,7 +7718,7 @@ mod tests {
         }
 
         AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -7712,8 +7748,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -7800,8 +7834,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -7847,6 +7879,42 @@ mod tests {
     #[cfg(feature = "channel-linq")]
     #[tokio::test]
     async fn linq_webhook_accepts_valid_message_for_known_alias() {
+        // This test proves alias routing, not signature handling, but inbound
+        // verification is mandatory, so it has to carry a real secret and a valid
+        // signature to reach the routing it is asserting on.
+        let secret = generate_test_secret();
+        let state = linq_test_state("default", Some(&secret));
+        let body = linq_webhook_body("+15551234567", "hello from test");
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("default".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_rejects_when_no_signing_secret_is_configured() {
+        // Fail closed. An alias with no resolved signing secret cannot verify
+        // anything, so the webhook is refused rather than processed unverified.
         let state = linq_test_state("default", None);
         let body = linq_webhook_body("+15551234567", "hello from test");
 
@@ -7859,7 +7927,7 @@ mod tests {
         .await
         .into_response();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[cfg(feature = "channel-linq")]
@@ -7923,6 +7991,131 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_alias_dispatches_to_configured_channel_agent() {
+        use zeroclaw_config::providers::ChannelRef;
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                channels: vec![ChannelRef::new("linq.work")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
+
+        let message = "hello from linq work alias";
+        let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captures = gateway_chat_dispatch_captures_for_test();
+        let capture = captures
+            .iter()
+            .find(|capture| capture.message == message)
+            .expect("Linq webhook should dispatch the inbound message");
+        assert_eq!(capture.agent_override.as_deref(), Some("beta"));
+        let session_id = capture
+            .session_id
+            .as_deref()
+            .expect("Linq dispatch should pass a session id");
+        assert_eq!(session_id, "linq_work__15551234567");
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn linq_webhook_alias_without_enabled_owner_does_not_use_default_agent() {
+        use zeroclaw_config::providers::ChannelRef;
+        use zeroclaw_config::schema::AliasedAgentConfig;
+
+        let _capture_guard = lock_gateway_chat_dispatch_capture_for_test().await;
+        clear_gateway_chat_dispatch_captures_for_test();
+
+        let mut config = Config::default();
+        config.agents.insert(
+            "alpha".to_string(),
+            AliasedAgentConfig {
+                enabled: true,
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            AliasedAgentConfig {
+                enabled: false,
+                channels: vec![ChannelRef::new("linq.work")],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        let secret = generate_test_secret();
+        let state = linq_test_state_with_config("work", Some(&secret), config);
+
+        let message = "do not route me to alpha";
+        let body = linq_webhook_body("+15551234567", message);
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let sig = compute_linq_signature_hex(&secret, &timestamp, &body);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Webhook-Signature",
+            HeaderValue::from_str(&format!("sha256={sig}")).unwrap(),
+        );
+        headers.insert(
+            "X-Webhook-Timestamp",
+            HeaderValue::from_str(&timestamp).unwrap(),
+        );
+
+        let response = Box::pin(handle_linq_webhook_alias(
+            State(state),
+            Path("work".to_string()),
+            headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let captures = gateway_chat_dispatch_captures_for_test();
+        assert!(
+            captures.iter().all(|capture| capture.message != message),
+            "unowned Linq alias must not dispatch through the default agent: {captures:?}"
+        );
+    }
+
     // ── Per-alias webhook routing───────────────────────────────────
 
     /// Baseline `AppState` with no channels configured, for the per-alias
@@ -7962,8 +8155,6 @@ mod tests {
             nextcloud_talk: HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
@@ -8147,6 +8338,27 @@ mod tests {
         ))
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[cfg(feature = "channel-whatsapp-cloud")]
+    #[tokio::test]
+    async fn whatsapp_webhook_rejects_when_no_app_secret_is_configured() {
+        // Fail closed. A configured alias with no app secret cannot verify
+        // X-Hub-Signature-256, so the webhook is refused rather than dispatched
+        // to the agent unverified.
+        let mut state = webhook_baseline_state();
+        state.whatsapp = HashMap::from([("work".to_string(), whatsapp_instance("work", "tok"))]);
+        state.whatsapp_app_secret = HashMap::new();
+
+        let body = br#"{"object":"whatsapp_business_account","entry":[]}"#;
+        let resp = Box::pin(handle_whatsapp_message_alias(
+            State(state),
+            Path("work".to_string()),
+            HeaderMap::new(),
+            Bytes::from_static(body),
+        ))
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// Build an `AppState` whose device registry points at a non-existent

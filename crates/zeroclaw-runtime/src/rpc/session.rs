@@ -56,6 +56,8 @@ pub struct UploadEntry {
 
 pub struct RpcSession {
     pub agent: Arc<Mutex<Agent>>,
+    /// Orders provider refreshes and configuration within this session.
+    model_provider_update: Arc<Mutex<()>>,
     pub created_at: Instant,
     pub last_active: Instant,
     pub agent_alias: String,
@@ -76,6 +78,7 @@ impl RpcSession {
     ) -> Self {
         Self {
             agent: Arc::new(Mutex::new(agent)),
+            model_provider_update: Arc::new(Mutex::new(())),
             created_at: Instant::now(),
             last_active: Instant::now(),
             agent_alias: alias.to_string(),
@@ -97,6 +100,8 @@ impl RpcSession {
 
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, RpcSession>>,
+    #[cfg(test)]
+    model_provider_update_waiting: Arc<tokio::sync::Notify>,
     cancel_tokens: std::sync::Mutex<HashMap<String, (u64, tokio_util::sync::CancellationToken)>>,
     cancel_generation: std::sync::atomic::AtomicU64,
     cancel_causes: std::sync::Mutex<HashMap<String, CancelCause>>,
@@ -108,6 +113,8 @@ impl SessionStore {
     pub fn new(max_sessions: usize, session_queue: Arc<SessionActorQueue>) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            model_provider_update_waiting: Arc::new(tokio::sync::Notify::new()),
             cancel_tokens: std::sync::Mutex::new(HashMap::new()),
             cancel_generation: std::sync::atomic::AtomicU64::new(0),
             cancel_causes: std::sync::Mutex::new(HashMap::new()),
@@ -127,6 +134,46 @@ impl SessionStore {
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
         self.sessions.lock().await.get(id).map(|s| s.agent.clone())
+    }
+
+    pub(crate) async fn lock_model_provider_update(
+        &self,
+        id: &str,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        let lock = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| Arc::clone(&session.model_provider_update))?;
+        #[cfg(test)]
+        {
+            let waiting = Arc::clone(&self.model_provider_update_waiting);
+            let mut lock = Box::pin(lock.lock_owned());
+            let mut notified = false;
+            return Some(
+                std::future::poll_fn(move |cx| {
+                    match std::future::Future::poll(lock.as_mut(), cx) {
+                        std::task::Poll::Pending => {
+                            if !notified {
+                                waiting.notify_one();
+                                notified = true;
+                            }
+                            std::task::Poll::Pending
+                        }
+                        std::task::Poll::Ready(guard) => std::task::Poll::Ready(guard),
+                    }
+                })
+                .await,
+            );
+        }
+        #[cfg(not(test))]
+        Some(lock.lock_owned().await)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_provider_update_waiting(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.model_provider_update_waiting)
     }
 
     pub async fn touch(&self, id: &str) {

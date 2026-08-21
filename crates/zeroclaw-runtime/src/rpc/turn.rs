@@ -23,6 +23,10 @@ pub enum TurnOutcome {
 pub enum TurnError {
     Panicked(String),
     AgentError(String),
+    TerminalCompletion {
+        diagnostic: String,
+        user_message: String,
+    },
 }
 
 impl std::fmt::Display for TurnError {
@@ -30,11 +34,25 @@ impl std::fmt::Display for TurnError {
         match self {
             Self::Panicked(msg) => write!(f, "Turn task panicked: {msg}"),
             Self::AgentError(msg) => write!(f, "Agent turn failed: {msg}"),
+            Self::TerminalCompletion { diagnostic, .. } => {
+                write!(f, "Agent turn failed: {diagnostic}")
+            }
         }
     }
 }
 
 impl std::error::Error for TurnError {}
+
+impl TurnError {
+    /// Localized text is carried only for a client-delivery boundary. Display
+    /// remains the stable diagnostic form used by logs and durable audit rows.
+    pub fn user_message(&self) -> Option<&str> {
+        match self {
+            Self::TerminalCompletion { user_message, .. } => Some(user_message),
+            Self::Panicked(_) | Self::AgentError(_) => None,
+        }
+    }
+}
 
 /// Attribution fields attached to the tracing span for the duration of a turn.
 /// All fields appear on every `record!()` emitted inside the turn.
@@ -158,7 +176,17 @@ fn outcome_from_task_result(
             },
             messages: new_messages,
         }),
-        Err(StreamedTurnError { error, .. }) => Err(TurnError::AgentError(format!("{error}"))),
+        Err(StreamedTurnError { error, .. }) => {
+            if let Some(user_message) =
+                crate::agent::terminal_completion_error_message(&error, None)
+            {
+                return Err(TurnError::TerminalCompletion {
+                    diagnostic: error.to_string(),
+                    user_message,
+                });
+            }
+            Err(TurnError::AgentError(error.to_string()))
+        }
     }
 }
 
@@ -360,6 +388,30 @@ mod tests {
             matches!(outcome, Err(TurnError::AgentError(_))),
             "a genuine agent failure must surface as an error, not a silent \
              cancel"
+        );
+    }
+
+    #[test]
+    fn terminal_completion_keeps_diagnostic_and_delivery_text_separate() {
+        let err = StreamedTurnError {
+            error: anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            ),
+            committed_response: String::new(),
+            new_messages: Vec::new(),
+        };
+
+        let outcome = match outcome_from_task_result(Err(err), String::new()) {
+            Err(error) => error,
+            Ok(_) => panic!("semantic-empty terminal completion must fail"),
+        };
+        assert_eq!(
+            outcome.to_string(),
+            "Agent turn failed: provider completed without final text or tool calls"
+        );
+        assert_eq!(
+            outcome.user_message(),
+            Some("The model provider returned an invalid semantic completion.")
         );
     }
 

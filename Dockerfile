@@ -77,6 +77,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 # 1. Copy manifests to cache dependencies
 COPY Cargo.toml Cargo.lock ./
+# The optional WASM plugin host generates bindings from the repository-owned
+# WIT contract during compilation. Keep this before the dependency prefetch so
+# plugin-enabled builds have the same ABI input in both builder invocations.
+COPY wit/ wit/
 # Copy every workspace-member manifest in one glob — adding or removing a crate
 # no longer requires editing this file.  --parents preserves the
 # crates/<name>/Cargo.toml directory structure.
@@ -87,10 +91,13 @@ COPY --parents crates/*/Cargo.toml ./
 # `zeroclaw_macros::Configurable` unresolved. Copy its real source now so the
 # proc-macro is built from the genuine implementation during the pre-fetch.
 COPY --parents crates/zeroclaw-macros/src/ ./
-# Nested workspace members (e.g. plugin test fixtures) are not matched by the
-# single-level crates/*/Cargo.toml glob above, so copy their manifests
-# explicitly to keep workspace manifest parsing intact during the pre-fetch.
-COPY --parents crates/zeroclaw-plugins/tests/fixtures/channel-fixture/Cargo.toml ./
+# Nested workspace members (test fixture crates) are not matched by the
+# single-level crates/*/Cargo.toml glob above, so match them with their own
+# glob to keep workspace manifest parsing intact during the pre-fetch. A glob
+# rather than explicit paths means adding a fixture member does not require
+# editing this file — cargo fails the workspace load if any member manifest is
+# missing, and every such member lives at crates/*/tests/fixtures/*/.
+COPY --parents crates/*/tests/fixtures/*/Cargo.toml ./
 # apps/tauri: .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # apps/zerocode: TUI app not shipped in the server image; copy only its manifest
@@ -124,8 +131,8 @@ RUN mkdir -p src src/bin benches apps/tauri/src apps/zerocode/src tools/fill-tra
     && mkdir -p crates/zeroclaw-hardware/examples \
     && echo "fn main() {}" > crates/zeroclaw-hardware/examples/esp32_sim.rs \
     && for d in crates/*/; do [ "$d" = "crates/zeroclaw-macros/" ] && continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
-    && mkdir -p crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src \
-    && printf '' > crates/zeroclaw-plugins/tests/fixtures/channel-fixture/src/lib.rs
+    && for d in crates/*/tests/fixtures/*/; do [ -f "${d}Cargo.toml" ] || continue; mkdir -p "${d}src" && printf '' > "${d}src/lib.rs"; done \
+    && printf 'fn main() {}' > crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer/src/main.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
@@ -140,9 +147,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
       export RUST_TARGET=x86_64-unknown-linux-gnu; \
     fi && \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
     fi
 RUN rm -rf src benches crates xtask tools/fill-translations
 
@@ -179,10 +186,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
     else \
       export RUST_TARGET=x86_64-unknown-linux-gnu STRIP=strip; \
     fi && \
-    rm -rf target/"$RUST_TARGET"/release/.fingerprint/zeroclawlabs-* \
-           target/"$RUST_TARGET"/release/deps/zeroclawlabs-* \
-           target/"$RUST_TARGET"/release/incremental/zeroclawlabs-* \
-           target/"$RUST_TARGET"/release/.fingerprint/zeroclaw-* \
+    rm -rf target/"$RUST_TARGET"/release/.fingerprint/zeroclaw-* \
+           target/"$RUST_TARGET"/release/deps/zeroclaw-* \
+           target/"$RUST_TARGET"/release/incremental/zeroclaw-* \
            target/"$RUST_TARGET"/release/deps/zeroclaw_* \
            target/"$RUST_TARGET"/release/incremental/zeroclaw_* \
            target/"$RUST_TARGET"/release/.fingerprint/xtask-* \
@@ -196,9 +202,9 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
            target/release/.fingerprint/zerocode-* \
            target/release/build/zerocode-* && \
     if [ -n "$ZEROCLAW_CARGO_FLAGS" ]; then \
-      cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode $ZEROCLAW_CARGO_FLAGS; \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode $ZEROCLAW_CARGO_FLAGS; \
     else \
-      cargo build --release --locked --target "$RUST_TARGET" -p zeroclawlabs -p zerocode; \
+      cargo build --release --locked --target "$RUST_TARGET" -p zeroclaw -p zerocode; \
     fi && \
     cp target/"$RUST_TARGET"/release/zeroclaw /app/zeroclaw && \
     cp target/"$RUST_TARGET"/release/zerocode /app/zerocode && \

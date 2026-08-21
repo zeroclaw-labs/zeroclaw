@@ -197,12 +197,12 @@ cli-cron-long-about =
 
     例:
     zeroclaw cron list
-    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York --agent
-    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent
-    zeroclaw cron add '*/5 * * * *' 'echo ok'
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-    zeroclaw cron add-every 60000 'Ping heartbeat'
-    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+    zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
+    zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
+    zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause TASK_ID
     zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =
@@ -429,7 +429,7 @@ cli-sop-ws-invalid-approval = sop approval_response には run_id と approve �
 cli-sop-ws-resolve-failed = SOP の解決に失敗しました: {$error}
 cli-sop-ws-engine-lock-poisoned = SOP エンジンロックがポイズンされました
 cli-sop-ws-subsystem-disabled = SOP サブシステムは有効ではありません
-cli-sop-create-hint = {"  "}作成: mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}作成: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します
 cli-sop-loaded-header = 読み込み済みの SOP ({$count}):
 cli-sop-none-to-validate = 検証する SOP が見つかりません。
@@ -479,7 +479,7 @@ cli-cron-added-oneshot = ✅ ワンショットcronジョブ {$id} を追加し�
 cli-cron-added-interval-agent = ✅ インターバルエージェントcronジョブ {$id} を追加しました
 cli-cron-added-interval = ✅ インターバルcronジョブ {$id} を追加しました
 cli-cron-updated = ✅ cronジョブ {$id} を更新しました
-cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory のうち少なくとも1つを指定する必要があります
+cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory、または配信オプション（--channel、--to、--thread、--best-effort、--no-best-effort）のうち少なくとも1つを指定する必要があります
 cli-cron-removed = ✅ cronジョブ {$id} を削除しました
 cli-cron-paused = ⏸️  cronジョブ {$id} を一時停止しました
 cli-cron-resumed = ▶️  cronジョブ {$id} を再開しました
@@ -495,6 +495,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}At    : {$v}
 cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
+cli-cron-delivery = {"  "}配信: {$v}
+cli-cron-delivery-disabled = 無効（出力はどこにも送信されません）
 cli-no-command = コマンドが指定されていません。
 cli-press-enter = 終了するにはEnterキーを押してください...
 cli-quickstart-title = クイックスタート — 1つの動作するエージェントをエンドツーエンドで作成します。
@@ -596,6 +598,7 @@ cli-quickstart-error-channel-bound = チャンネル `{$reference}` は既にエ
 cli-quickstart-error-channel-required = チャンネルタイプとエイリアスが必要です
 cli-quickstart-error-channel-field-not-advertised = チャンネルフィールド `{$field}` は Quickstart では使用できません
 cli-quickstart-error-channel-token-required = Telegram Bot トークンが必要です
+cli-quickstart-error-webhook-secret-required = Webhook 共有シークレットが必要です
 cli-quickstart-error-peer-group-name-required = ピアグループ名が必要です
 cli-quickstart-error-peer-group-channel-required = ピアグループのチャンネル参照が必要です
 cli-quickstart-error-peer-group-unknown-channel = ピアグループ `{$name}` が不明なチャンネル `{$channel}` を参照しています
@@ -714,8 +717,8 @@ cli-plugin-install-resolving = プラグインレジストリから '{$source}' 
 cli-plugin-installed-from = プラグインを {$source} からインストールしました
 cli-plugin-installed-name-version = プラグイン {$name} v{$version} をインストールしました
 cli-plugin-config-entry-seeded = '{$name}' の [[plugins.entries]] を作成しました。プラグイン設定値は `zeroclaw config set plugins.entries.{$name}.config.<key>` で設定してください。
+cli-plugin-config-entry-key = 設定エントリキー ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = 警告: '{$name}' の設定エントリ作成をスキップしました: ディスク上の [plugins] セクションが不正です。修復し、`name = "{$name}"` を含む [[plugins.entries]] ブロックを追加してから、`zeroclaw config set plugins.entries.{$name}.config.<key>` で値を設定してください。
-cli-plugin-config-entry-seed-unaddressable = 警告: '{$name}' の設定エントリ作成をスキップしました: '.' を含むプラグイン名はドット区切りの設定パスで指定できません (`config set` は '.' で分割します)。設定ファイルに `name = "{$name}"` を含む [[plugins.entries]] ブロックを手動で追加してください。
 cli-config-section-degraded = 警告: {$path} の設定セクション `{$section}` は不正なため、この実行ではデフォルト値にリセットされました。そのセクションの値は有効ではありません。`zeroclaw config migrate` を実行して解析エラーを確認し、ファイルを修復してください。
 cli-plugin-removed = プラグイン '{$name}' を削除しました。
 cli-plugin-not-found = プラグイン '{$name}' が見つかりません。
@@ -926,6 +929,13 @@ cli-gateway-restart-hint-process = `zeroclaw daemon` プロセスを再起動し
 
 cli-daemon-gateway-already-running = ZeroClaw ゲートウェイは既に {$host}:{$port} で実行中です。デーモンは自身のゲートウェイを監視しており、同じアドレスで2つ目を開始しません。そのゲートウェイを停止するか、`zeroclaw config set gateway.port <port>` でデーモンを空きポートに向けてから、もう一度デーモンを実行してください。
 cli-daemon-gateway-port-occupied = ゲートウェイアドレス {$host}:{$port} は別のプロセスで既に使用されています。ポートを解放するか、デーモンを空きポートに向けて (`zeroclaw config set gateway.port <port>`)、もう一度デーモンを実行してください。
+cli-daemon-starting-title = 🧠 ZeroClaw デーモンを起動しています…
+cli-daemon-starting-detail = 設定済みのデーモンエンドポイントを準備しています
+cli-daemon-started-title = 🧠 ZeroClaw デーモンの準備ができました
+cli-daemon-started-gateway = ゲートウェイ: {$url}
+cli-daemon-started-socket = ソケット:     {$path}
+cli-daemon-started-pairing = ペアリング: 有効（現在の状態は上のゲートウェイ出力を確認してください）
+cli-daemon-started-stop = Ctrl+C または SIGTERM で停止
 cli-agent-context-bar = ctx: {$used} / {$max}  {$bar}  {$pct}%
 cli-agent-context-bar-unknown = ctx: 不明 / {$max}
 cli-doctor-ctxwin-already-set = {$provider_ref}: 既に context_window = {$ctx} が設定されています
@@ -938,6 +948,13 @@ cli-doctor-ctxwin-saved = config.toml に {$updated} 件の更新を保存しま
 cli-doctor-ctxwin-dry-run = ドライラン完了 — 変更は書き込まれません。--dry-run なしで実行して適用してください。
 cli-doctor-ctxwin-none = 更新は必要ありません。
 cli-doctor-ctxwin-write-failed = {$provider_ref}: context_window の書き込みに失敗しました: {$error}
+cli-doctor-context-window-ok = {$provider_ref}: コンテキストウィンドウ: {$context_window} トークン
+cli-doctor-context-window-zero = {$provider_ref}: context_window が 0 です（無効。モデルの実際のコンテキスト上限を設定してください）
+cli-doctor-context-window-unset = {$provider_ref}: context_window が未設定です — 選択時には {$fallback} トークンのフォールバックを使用します。モデルの実際の上限を大きく下回る可能性があるため、このプロファイルに context_window を設定してください
+
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = モデル調査がタイムアウトしました。一部のプロバイダーカタログに到達できない可能性があります。Doctor を再実行して更新できます。
 
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
@@ -967,6 +984,8 @@ channel-approval-btn-always = 常に
 channel-approval-tap-instruction = 下のボタンをタップしてください：
 channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
 channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
+channel-approval-group-visibility-warning =
+    これはグループチャットのため、ここにいる全員がこのコードと上に表示されたツールの引数を見ることができます。このチャンネルの承認されたピアのみが応答できます。
 channel-telegram-approval-ack-approved = 承認しました
 channel-telegram-approval-ack-always-approved = 常に承認しました
 channel-telegram-approval-ack-denied = 拒否しました
