@@ -320,19 +320,15 @@ async fn enforce_reported_budget(
     // differ slightly from the dispatched prompt near tight budget boundaries.
     next_use_native_tools: bool,
     // The `before_llm_call` hooks the NEXT iteration re-runs on its prepared
-    // messages before dispatch. Previously the projection executed the hook
-    // as an estimation step, which double-invoked stateful hooks. The
-    // decision now uses the durable population (no hook) and the actual
-    // next iteration will run the hook once before dispatch; if that hook
-    // grows the request beyond the budget, the next iteration's own
-    // enforcement will trim further. This keeps the projection
-    // side-effect-free.
-    _hooks: Option<&crate::hooks::HookRunner>,
-    // The model the next iteration starts its hook pass from. Kept for API
-    // compatibility; the durable projection does not re-route on hook-
-    // selected model. The next iteration's native-tool mode is already
-    // resolved via `next_use_native_tools` and `next_schema_tokens`.
-    _model: &str,
+    // messages before dispatch. A growing, filtering, or replacement hook
+    // changes the provider-facing population after a naive prepare-based
+    // projection, so the projection must account for the post-hook population
+    // to decide against the actual next request.
+    hooks: Option<&crate::hooks::HookRunner>,
+    // The model the next iteration starts its hook pass from (`active_model`
+    // at the real `run_before_llm_call` site). The projection only needs a
+    // starting value; a hook-selected model does not re-route the projection.
+    model: &str,
 ) {
     if context_token_budget == 0 {
         return;
@@ -411,22 +407,25 @@ async fn enforce_reported_budget(
     // dropping the newest turn — an outcome that must be surfaced, not silently
     // kept as if the trim succeeded.
     let mut hit_floor = false;
-    // The decision seam is the durable next request (prepared messages
-    // plus next schemas, without transient hook growth). Executing a
-    // modifying `before_llm_call` hook merely to estimate would double-
-    // invoke stateful hooks and is not side-effect-free. The actual next
-    // iteration will run the hook once before dispatch; if that hook
-    // grows the request beyond the budget, the next iteration's own
-    // enforcement will trim further. The emitted accounting stays anchored
-    // to the same durable population.
+    // The decision seam is the actual next request: the real next
+    // iteration re-runs `run_before_llm_call` on the prepared messages
+    // before dispatch, so the projection must include the hook result to
+    // decide against the true provider-facing population. This does run
+    // the hook as an estimation step; a side-effect-free projection
+    // contract is the intended follow-up to avoid double-invocation of
+    // stateful hooks, but for the current pure append-only hooks the
+    // estimation is necessary to make the budget exact and the
+    // `enforce_projection_runs_hooks_so_post_hook_next_request_fits`
+    // regression meaningful (it would otherwise hang waiting for a trim
+    // that never occurs).
     loop {
         tokens_after = projected_provider_facing_tokens(
             &trimmed,
             multimodal_config,
             degrade_strip_images,
             image_cache.as_deref_mut(),
-            None,
-            "",
+            hooks,
+            model,
             tool_schema_tokens,
             ratio,
         )
@@ -454,8 +453,8 @@ async fn enforce_reported_budget(
                 multimodal_config,
                 degrade_strip_images,
                 image_cache.as_deref_mut(),
-                None,
-                "",
+                hooks,
+                model,
                 tool_schema_tokens,
                 ratio,
             )
@@ -465,8 +464,51 @@ async fn enforce_reported_budget(
             }
             let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed);
             if dropped == 0 {
+                hit_floor = true;
                 break;
             }
+        }
+        // If the breadcrumb pushes the retained newest turn over the budget
+        // and no more whole turn can be dropped, carry the floor flag so
+        // the explicit floor is surfaced instead of a successful ordinary
+        // trim that still exceeds the budget.
+        if hit_floor && tokens_after > context_token_budget {
+            let floor_turns = crate::agent::history_trim::count_turns(&trimmed);
+            *history = trimmed;
+            if let Some(tx) = event_tx {
+                let _ = tx
+                    .send(TurnEvent::HistoryTrimmed {
+                        dropped_messages: 0,
+                        kept_turns: floor_turns,
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                        token_budget: Some(context_token_budget as u64),
+                        tokens_before: Some(projected_pre_trim as u64),
+                        tokens_after: Some(tokens_after as u64),
+                        tokens_before_source: Some(
+                            zeroclaw_api::agent::TokenCountSource::Calibrated,
+                        ),
+                        tokens_after_source: Some(
+                            zeroclaw_api::agent::TokenCountSource::Calibrated,
+                        ),
+                    })
+                    .await;
+            }
+            observer.record_event(
+                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                    dropped_messages: 0,
+                    kept_turns: floor_turns,
+                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
+                    token_budget: Some(context_token_budget as u64),
+                    tokens_before: Some(projected_pre_trim as u64),
+                    tokens_after: Some(tokens_after as u64),
+                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                },
+            );
+            return;
         }
         // Recompute the structural counts against the final retained set so the
         // emitted event reflects the re-trim, not just the first raw pass. The
