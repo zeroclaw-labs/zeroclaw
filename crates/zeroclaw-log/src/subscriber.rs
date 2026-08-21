@@ -52,15 +52,26 @@ pub fn install_global_subscriber(
         .with(fmt_layer);
 
     tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-    crate::log_bridge::install();
+    // Fail loudly: the subscriber above is already installed, so a discarded
+    // error here would leave the daemon looking healthy while every
+    // dependency record stays missing.
+    crate::log_bridge::install_or_panic();
 }
 
+/// Test-only subscriber install. Best-effort by design: a test binary calls
+/// this once per test, and both the `tracing` global default and the `log`
+/// logger slot accept exactly one installation per process, so every call
+/// after the first necessarily fails and is deliberately ignored. Production
+/// daemons go through [`install_global_subscriber`], which panics instead.
+///
+/// Not part of the public API despite the `pub`: it is reachable only so
+/// other workspace crates' `#[cfg(test)]` modules can install the pipeline.
 #[doc(hidden)]
 pub fn try_install_capture_subscriber() {
     use tracing_subscriber::Registry;
     let subscriber = Registry::default().with(LogCaptureLayer);
     let _ = tracing::subscriber::set_global_default(subscriber);
-    crate::log_bridge::install();
+    crate::log_bridge::install_best_effort_for_tests();
 }
 
 /// Field formatter that renders event fields exactly like the default
@@ -565,6 +576,34 @@ mod tests {
             persisted.contains(crate::log_bridge::REDACTED),
             "the scrubbed payload must be marked, not silently elided: {persisted}"
         );
+    }
+
+    /// Blocker-2 contract: the production install path is loud when the
+    /// process-global `log` slot is already owned, because a discarded error
+    /// there leaves the tracing subscriber installed and the dependency
+    /// records permanently missing. The test-only path stays tolerant so a
+    /// shared test binary can call it once per test.
+    #[test]
+    fn log_bridge_install_is_loud_in_production_and_tolerant_in_tests() {
+        // Guarantee the slot is occupied regardless of test ordering: either
+        // this call wins it, or an earlier test already did.
+        crate::log_bridge::install_best_effort_for_tests();
+
+        let panicked = std::panic::catch_unwind(crate::log_bridge::install_or_panic);
+        let payload = panicked.expect_err(
+            "the production install path must not silently accept a conflicting logger",
+        );
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(
+            message.contains("another logger already owns the process-global `log` slot"),
+            "the panic must name the conflict so an operator can act on it: {message:?}"
+        );
+
+        // The test-only path swallows the same failure by design.
+        crate::log_bridge::install_best_effort_for_tests();
     }
 
     /// Regression for dependency logs vanishing without a trace: transports

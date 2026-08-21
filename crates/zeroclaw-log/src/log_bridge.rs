@@ -172,17 +172,42 @@ impl log::Log for ScrubbingLogBridge {
 
 /// Install the scrubbing bridge into the process-global `log` slot.
 ///
-/// `log` permits exactly one global logger per process, so a second call —
-/// a re-entrant setup, or the next test in a shared test binary — returns
-/// `Err` and is deliberately discarded, mirroring how
-/// [`crate::try_install_capture_subscriber`] treats a repeated
-/// `set_global_default`.
-pub(crate) fn install() {
-    if log::set_logger(&BRIDGE).is_ok() {
-        // The bridge decides nothing about verbosity, so let every record
-        // reach it and let the tracing filters do the filtering.
-        log::set_max_level(log::LevelFilter::Trace);
+/// Fails when another logger already owns that slot; `log` permits exactly
+/// one per process.
+fn install() -> Result<(), log::SetLoggerError> {
+    log::set_logger(&BRIDGE)?;
+    // The bridge decides nothing about verbosity, so let every record reach
+    // it and let the tracing filters do the filtering.
+    log::set_max_level(log::LevelFilter::Trace);
+    Ok(())
+}
+
+/// Production install: panics when the bridge cannot take the `log` slot.
+///
+/// A silent failure here is worse than a crash. The tracing subscriber is
+/// installed by the time this runs, so discarding the error would leave the
+/// daemon looking healthy while the dependency records this bridge exists to
+/// recover stay missing — the exact invisible-failure mode the bridge was
+/// added to end.
+pub(crate) fn install_or_panic() {
+    if let Err(err) = install() {
+        panic!(
+            "installing the `log` -> tracing bridge failed ({err}): another logger already \
+             owns the process-global `log` slot, so dependency diagnostics would be lost \
+             silently. Remove the competing `log::set_logger` call."
+        );
     }
+}
+
+/// Test-only install: tolerates the slot already being taken.
+///
+/// Test binaries call [`crate::try_install_capture_subscriber`] once per test,
+/// and `log` allows a single logger per process, so every call after the first
+/// necessarily fails. The already-installed logger is this same bridge, so
+/// ignoring the error is correct *here and only here*. Production goes through
+/// [`install_or_panic`].
+pub(crate) fn install_best_effort_for_tests() {
+    let _ = install();
 }
 
 #[cfg(test)]
