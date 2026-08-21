@@ -421,7 +421,7 @@ impl AuthorizedEgress {
 ///
 /// Policy is per service, because a service is built around one resolver.
 /// Connection accounting is not: it comes from the process-wide
-/// [`ConnectionRegistry`], so two services built independently for the same
+/// connection registry, so two services built independently for the same
 /// canonical instance spend one budget rather than one each.
 #[derive(Clone)]
 pub struct EgressHostService {

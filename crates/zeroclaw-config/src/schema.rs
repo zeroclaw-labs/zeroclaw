@@ -25827,6 +25827,23 @@ enabled = true
         assert!(text.contains("not granted by egress_hosts"), "got: {text}");
     }
 
+    #[tokio::test]
+    async fn validate_accepts_wildcard_carveouts_that_are_subsets_of_the_grant() {
+        for carveout in ["*.example.com", "*.lan.example.com"] {
+            let mut config = Config::default();
+            config.plugins.entries = vec![super::PluginEntryConfig {
+                name: "zpi1_eqwild".into(),
+                egress_hosts: vec!["*.example.com".into()],
+                egress_allow_private: vec![carveout.into()],
+                ..Default::default()
+            }];
+            assert!(
+                config.validate().is_ok(),
+                "a carveout of {carveout:?} is a subset of the *.example.com grant and must validate"
+            );
+        }
+    }
+
     /// The allowlist must stay in the plaintext half of the entry: an operator
     /// audits the file, and an encrypted allowlist is not auditable.
     #[test]
