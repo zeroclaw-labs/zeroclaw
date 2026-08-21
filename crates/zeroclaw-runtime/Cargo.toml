@@ -76,6 +76,7 @@ tokio-stream = { version = "0.1.18", default-features = false, features = ["fs",
 tokio-tungstenite = { version = "0.29", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
+toml_edit = "0.25"
 tower = { optional = true, version = "0.5", default-features = false, features = ["util"] }
 tower-http = { optional = true, version = "0.6", default-features = false, features = ["limit", "timeout"] }
 urlencoding = "2.1"

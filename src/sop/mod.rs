@@ -240,6 +240,18 @@ pub fn handle_command(command: crate::SopCommands, config: &crate::config::Confi
             );
             Ok(())
         }
+        crate::SopCommands::Rename { from, to } => {
+            let dir = resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
+            rename_sop_typed(&dir, &from, &to, default_mode)?;
+            println!(
+                "{}",
+                get_required_cli_string_with_args(
+                    "cli-sop-renamed",
+                    &[("from", &from), ("to", &to)]
+                )
+            );
+            Ok(())
+        }
     }
 }
 
@@ -249,6 +261,23 @@ mod tests {
     use crate::sop::types::SopManifest;
     use std::fs;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn rename_confirmation_string_resolves_with_both_names() {
+        // The rename subcommand's only user-facing text. A missing Fluent key
+        // renders as `{cli-sop-renamed}` rather than failing the build, so
+        // assert on the rendered string.
+        let rendered = get_required_cli_string_with_args(
+            "cli-sop-renamed",
+            &[("from", "deploy-prod"), ("to", "deploy-production")],
+        );
+        assert!(
+            !rendered.starts_with('{'),
+            "cli-sop-renamed must exist in the CLI catalogue: {rendered}"
+        );
+        assert!(rendered.contains("deploy-prod"), "{rendered}");
+        assert!(rendered.contains("deploy-production"), "{rendered}");
+    }
 
     #[test]
     fn parse_steps_basic() {
