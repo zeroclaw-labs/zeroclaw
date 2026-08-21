@@ -2810,7 +2810,7 @@ fn plugin_host_with_configured_security(
 /// [`PluginInstanceScope::config_entry_key`][k] — `zpi1_` + Base64URL of the
 /// canonical `(package, capability, binding)` tuple — and it is the *only* key
 /// for that instance's host-owned state: the private `config` map and the
-/// ADR-013 `egress_hosts` grant live in the same row, resolved by the same key.
+/// `egress_hosts` grant live in the same row, resolved by the same key.
 /// Deriving it here rather than at each call site is what keeps that true.
 ///
 /// A row is owed when the instance has host-owned state to hold: a private
@@ -2819,7 +2819,7 @@ fn plugin_host_with_configured_security(
 /// those owns no state and gets no row.
 ///
 /// The network-permission arm widens master's config-only predicate on purpose.
-/// ADR-013's second grant path is the plugin whose destination *is* deployment
+/// The second grant path is the plugin whose destination *is* deployment
 /// configuration — a self-hosted Gitea, a LAN Nextcloud — which its author
 /// cannot declare, so it ships `http_client` with no `[egress]` table and often
 /// no `config_schema`. Without a row there is nowhere to author that grant:
@@ -2879,7 +2879,7 @@ fn installed_plugin_config_entries(
     manifest_config_entries(manifest)
 }
 
-/// The destinations `plugin_name`'s manifest **declares** (ADR-013's `[egress]`
+/// The destinations `plugin_name`'s manifest **declares** (its `[egress]`
 /// table), resolved from the admitted manifest at use time.
 ///
 /// This is the declaration, never a grant: nothing here confers network reach.
@@ -2899,7 +2899,7 @@ fn declared_egress_hosts(
 /// Print the destinations a freshly seeded instance row was granted, one line
 /// each, plus the exact command that edits the grant later.
 ///
-/// ADR-013's grant ceremony: installation is an explicit operator act, and the
+/// The grant ceremony: installation is an explicit operator act, and the
 /// printed, persisted allowlist is its record. `package` is what the operator
 /// recognizes; `instance_key` is the opaque `zpi1_` row the grant actually
 /// lives on, and it reaches the operator inside the printed command rather than
@@ -3019,14 +3019,14 @@ fn report_existing_egress_grant(
     );
 }
 
-/// ADR-013 gate G4's migration diagnostic, on the surface an operator already
+/// The migration diagnostic, on the surface an operator already
 /// runs: for every installed `http_client` plugin, one terse line naming the
 /// destinations it declares that its instance row does not grant — denials
 /// waiting to happen — and the exact command that closes the gap.
 ///
 /// Only declared-but-not-granted is flagged. The reverse (granted but not
 /// declared) is the operator's own authored grant, which is a first-class
-/// ADR-013 path, not a finding.
+/// grant path, not a finding.
 ///
 /// A package whose bindings own no derivable instance key (a channel-only
 /// package, until its alias-aware key path lands) yields no entries and is
@@ -3161,7 +3161,7 @@ async fn seed_plugin_config_entries(
     }
 
     // Rows that already existed — an upgrade, a reinstall, or an
-    // operator-authored row. ADR-013: never auto-extend. Report the difference
+    // operator-authored row. Never auto-extend: report the difference
     // and leave `egress_hosts` exactly as the operator left it.
     for instance_key in existing {
         report_existing_egress_grant(config, package, instance_key, declared_egress);
@@ -10372,8 +10372,9 @@ mod tests {
             .unwrap_or_else(|| panic!("no [[plugins.entries]] row named '{name}' on disk"))
     }
 
-    /// THE unification invariant (typed instance config plus ADR-013): `plugin
-    /// install` seeds the egress grant onto the SAME `zpi1_` instance-key row
+    /// THE unification invariant (typed instance config plus the egress
+    /// grant): `plugin install` seeds the egress grant onto the SAME `zpi1_`
+    /// instance-key row
     /// that carries the instance's private config — one row per instance,
     /// never one row for config and a second keyed by the package name.
     ///
@@ -10457,7 +10458,7 @@ mod tests {
         );
     }
 
-    /// ADR-013 grant ceremony, install half: the declaration seeds the row it
+    /// Grant ceremony, install half: the declaration seeds the row it
     /// just created, and it lands as a PLAINTEXT sibling of the encrypted
     /// `config` map — the allowlist is what the operator audits, so it has to
     /// be readable in the file they audit.
@@ -10550,7 +10551,7 @@ mod tests {
         );
     }
 
-    /// ADR-013 grant ceremony, upgrade half and the security invariant of this
+    /// Grant ceremony, upgrade half and the security invariant of this
     /// stage: an install that finds an EXISTING instance row never extends its
     /// allowlist, however much the new manifest declares. The operator applies
     /// the difference deliberately.
@@ -10719,7 +10720,7 @@ mod tests {
         );
     }
 
-    /// ADR-013's SECOND grant path: the plugin whose destination is deployment
+    /// The SECOND grant path: the plugin whose destination is deployment
     /// configuration (self-hosted Gitea, LAN Nextcloud). Its author cannot
     /// declare the host, so it ships a network permission with no `[egress]`
     /// table and no `config_schema`. It must still get an instance row —

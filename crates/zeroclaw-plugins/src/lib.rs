@@ -60,7 +60,7 @@ pub struct PluginManifest {
     /// Hex-encoded Ed25519 public key of the publisher who signed this manifest.
     #[serde(default)]
     pub publisher_key: Option<String>,
-    /// Destinations this plugin declares it needs (ADR-013).
+    /// Destinations this plugin declares it needs.
     ///
     /// This is a signature-covered **attestation of intent**, never a grant:
     /// nothing here confers network reach. The effective allowlist is the

@@ -1,4 +1,4 @@
-//! ADR-013 grant ceremony: the pure half.
+//! The plugin egress grant ceremony: the pure half.
 //!
 //! The manifest **declares**; the operator's config **grants**. Installation is
 //! the one moment where those two can be reconciled without an operator typing
@@ -95,8 +95,8 @@ impl EgressDeclarationDiff {
     /// The allowlist that grants every declared destination **without revoking
     /// anything already granted**. This is the value the printed apply-command
     /// carries: `config set` replaces the list, and an upgrade prompt that
-    /// silently dropped an operator-authored host (the self-hosted-Gitea case
-    /// ADR-013 calls out) would be worse than the gap it is closing.
+    /// silently dropped an operator-authored host (a self-hosted Gitea, a LAN
+    /// Nextcloud) would be worse than the gap it is closing.
     #[must_use]
     pub fn union(&self) -> Vec<String> {
         let mut out = self.granted.clone();
@@ -136,7 +136,7 @@ pub fn diff_declaration(declared: &[String], granted: &[String]) -> EgressDeclar
 /// Should the upgrade diff be reported at all?
 ///
 /// A manifest that declares nothing produces no diff, even when the entry
-/// grants destinations. Those grants are the ADR's second, first-class grant
+/// grants destinations. Those grants are the second, first-class grant
 /// path — operator-authored, for plugins whose destination *is* instance
 /// configuration (a self-hosted Gitea, a LAN Nextcloud) that no author could
 /// have declared. Reporting them as "no longer declared" on every reinstall
@@ -218,7 +218,7 @@ mod tests {
 
     #[test]
     fn a_manifest_declaring_nothing_never_reports_operator_authored_grants() {
-        // ADR-013's second grant path: the author cannot know a self-hosted
+        // The second grant path: the author cannot know a self-hosted
         // destination, so the operator authors it. Silence, not a diff.
         let diff = diff_declaration(&[], &v(&["gitea.internal.example.com"]));
         assert_eq!(

@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn plugin_egress_grant_ceremony_strings_format_in_every_locale() {
-        // ADR-013's grant ceremony is the one moment an operator is told what
+        // The grant ceremony is the one moment an operator is told what
         // network reach a plugin was granted, and the `{$command}` argument is
         // the literal `zeroclaw config set plugins.entries.<zpi1_key>...`
         // invocation they are expected to run. A catalogue that drops the key
