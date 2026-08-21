@@ -8,11 +8,16 @@ use zeroclaw_config::schema::Config;
 
 pub struct CronListTool {
     config: Arc<Config>,
+    /// Owning agent — jobs belonging to any other agent are not listed.
+    agent_alias: String,
 }
 
 impl CronListTool {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<Config>, agent_alias: impl Into<String>) -> Self {
+        Self {
+            config,
+            agent_alias: agent_alias.into(),
+        }
     }
 }
 
@@ -23,7 +28,7 @@ impl Tool for CronListTool {
     }
 
     fn description(&self) -> &str {
-        "List all scheduled cron jobs"
+        "List the scheduled cron jobs owned by this agent"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -43,7 +48,7 @@ impl Tool for CronListTool {
             });
         }
 
-        match cron::list_jobs(&self.config) {
+        match cron::list_jobs_by_agent(&self.config, &self.agent_alias) {
             Ok(jobs) => Ok(ToolResult {
                 success: true,
                 output: serde_json::to_string_pretty(
@@ -111,7 +116,7 @@ mod tests {
     async fn returns_empty_list_when_no_jobs() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronListTool::new(cfg);
+        let tool = CronListTool::new(cfg, TEST_AGENT);
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(result.success);
@@ -133,7 +138,7 @@ mod tests {
             "echo ok",
         )
         .unwrap();
-        let tool = CronListTool::new(cfg);
+        let tool = CronListTool::new(cfg, TEST_AGENT);
 
         let result = tool.execute(json!({})).await.unwrap();
 
@@ -156,7 +161,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut cfg = (*test_config(&tmp).await).clone();
         cfg.scheduler.enabled = false;
-        let tool = CronListTool::new(Arc::new(cfg));
+        let tool = CronListTool::new(Arc::new(cfg), TEST_AGENT);
 
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
@@ -165,6 +170,47 @@ mod tests {
                 .error
                 .unwrap_or_default()
                 .contains("cron is disabled")
+        );
+    }
+
+    /// A job owned by someone else. An agent job needs no risk profile for its
+    /// owner, which keeps the fixture to the ownership boundary.
+    fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
+        cron::add_agent_job(
+            cfg,
+            "other-agent",
+            Some("secret_job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "read the other agent's inbox",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn lists_only_the_calling_agents_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let theirs = other_agents_job(&cfg);
+        cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo mine").unwrap();
+
+        let tool = CronListTool::new(cfg.clone(), TEST_AGENT);
+        let result = tool.execute(json!({})).await.unwrap();
+
+        assert!(result.success);
+        let rendered = format!("{:?}", result.output);
+        assert!(rendered.contains("echo mine"), "own job must be listed");
+        assert!(
+            !rendered.contains(&theirs.id),
+            "another agent's job must not be listed"
         );
     }
 }

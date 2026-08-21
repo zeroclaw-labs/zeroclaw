@@ -258,7 +258,7 @@ impl ScheduleTool {
     }
 
     fn handle_list(&self) -> Result<ToolResult> {
-        let jobs = cron::list_jobs(&self.config)?;
+        let jobs = cron::list_jobs_by_agent(&self.config, &self.agent_alias)?;
         if jobs.is_empty() {
             return Ok(ToolResult {
                 success: true,
@@ -301,7 +301,7 @@ impl ScheduleTool {
     }
 
     fn handle_get(&self, id: &str) -> Result<ToolResult> {
-        match cron::get_job(&self.config, id) {
+        match cron::get_job_for_agent(&self.config, id, &self.agent_alias) {
             Ok(job) => {
                 let detail = json!({
                     "id": job.id,
@@ -534,6 +534,14 @@ impl ScheduleTool {
     }
 
     fn handle_cancel(&self, id: &str) -> ToolResult {
+        if let Err(error) = cron::get_job_for_agent(&self.config, id, &self.agent_alias) {
+            return ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error.to_string()),
+            };
+        }
+
         match cron::remove_job(&self.config, id) {
             Ok(()) => ToolResult {
                 success: true,
@@ -549,6 +557,17 @@ impl ScheduleTool {
     }
 
     fn handle_pause_resume(&self, id: &str, pause: bool) -> ToolResult {
+        // Authorize before touching the job. Without this an agent that receives
+        // or guesses another agent's id can disable or re-enable it, and the
+        // success reply confirms that the foreign id exists.
+        if let Err(error) = cron::get_job_for_agent(&self.config, id, &self.agent_alias) {
+            return ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(error.to_string()),
+            };
+        }
+
         let operation = if pause {
             cron::pause_job(&self.config, id)
         } else {
@@ -1031,5 +1050,138 @@ mod tests {
             .await
             .unwrap();
         assert!(approved.success, "{:?}", approved.error);
+    }
+
+    #[tokio::test]
+    async fn cannot_see_or_cancel_another_agents_job() {
+        let (_tmp, config, security) = test_setup().await;
+        let theirs = cron::add_agent_job(
+            &config,
+            "other-agent",
+            Some("secret_job".into()),
+            cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "read the other agent's inbox",
+            cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let tool = ScheduleTool::new(security, config.clone(), TEST_AGENT);
+
+        let listed = tool.execute(json!({"action": "list"})).await.unwrap();
+        assert!(
+            !format!("{:?}", listed.output).contains(&theirs.id),
+            "another agent's job must not be listed"
+        );
+
+        let got = tool
+            .execute(json!({"action": "get", "id": theirs.id}))
+            .await
+            .unwrap();
+        assert!(!got.success);
+
+        let cancelled = tool
+            .execute(json!({"action": "cancel", "id": theirs.id}))
+            .await
+            .unwrap();
+        assert!(!cancelled.success);
+        assert!(
+            cron::get_job(&config, &theirs.id).is_ok(),
+            "another agent's job must survive cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn cannot_pause_or_resume_another_agents_job() {
+        let (_tmp, config, security) = test_setup().await;
+        let theirs = cron::add_agent_job(
+            &config,
+            "other-agent",
+            Some("victim_job".into()),
+            cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "deliver the other agent's digest",
+            cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(theirs.enabled, "job under test must start enabled");
+
+        let tool = ScheduleTool::new(security, config.clone(), TEST_AGENT);
+
+        let paused = tool
+            .execute(json!({"action": "pause", "id": theirs.id}))
+            .await
+            .unwrap();
+        assert!(!paused.success, "pausing a foreign job must fail");
+        assert!(
+            cron::get_job(&config, &theirs.id).unwrap().enabled,
+            "another agent's job must stay enabled after a refused pause"
+        );
+
+        // Same in the other direction: disable it as its owner would, then check
+        // that a sibling agent cannot switch it back on.
+        cron::pause_job(&config, &theirs.id).unwrap();
+        let resumed = tool
+            .execute(json!({"action": "resume", "id": theirs.id}))
+            .await
+            .unwrap();
+        assert!(!resumed.success, "resuming a foreign job must fail");
+        assert!(
+            !cron::get_job(&config, &theirs.id).unwrap().enabled,
+            "another agent's job must stay paused after a refused resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn can_pause_and_resume_own_job() {
+        // The scoping must not cost an agent control of its own schedule.
+        let (_tmp, config, security) = test_setup().await;
+        let mine = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            Some("my_job".into()),
+            cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "send my digest",
+            cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let tool = ScheduleTool::new(security, config.clone(), TEST_AGENT);
+
+        let paused = tool
+            .execute(json!({"action": "pause", "id": mine.id}))
+            .await
+            .unwrap();
+        assert!(paused.success, "{:?}", paused.error);
+        assert!(!cron::get_job(&config, &mine.id).unwrap().enabled);
+
+        let resumed = tool
+            .execute(json!({"action": "resume", "id": mine.id}))
+            .await
+            .unwrap();
+        assert!(resumed.success, "{:?}", resumed.error);
+        assert!(cron::get_job(&config, &mine.id).unwrap().enabled);
     }
 }
