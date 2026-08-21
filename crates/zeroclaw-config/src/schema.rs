@@ -52,6 +52,11 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "memory.embeddings",
     "tunnel.custom",
     "transcription.groq",
+    "transcription.openai",
+    "transcription.deepgram",
+    "transcription.assemblyai",
+    "transcription.google",
+    "transcription.local_whisper",
 ];
 
 const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
@@ -31683,6 +31688,32 @@ api_token = "tok"
 
         let error = proxy.validate().unwrap_err().to_string();
         assert!(error.contains("proxy.scope='services'"));
+    }
+
+    #[test]
+    async fn proxy_config_accepts_transcription_service_selectors() {
+        let mut proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            scope: ProxyScope::Services,
+            ..ProxyConfig::default()
+        };
+
+        for selector in [
+            "transcription.groq",
+            "transcription.openai",
+            "transcription.deepgram",
+            "transcription.assemblyai",
+            "transcription.google",
+            "transcription.local_whisper",
+            "transcription.*",
+        ] {
+            proxy.services = vec![selector.to_string()];
+            assert!(
+                proxy.validate().is_ok(),
+                "exact transcription selector `{selector}` should validate"
+            );
+        }
     }
 
     #[test]
