@@ -146,6 +146,12 @@ jobs:
             --log-name cargo-clippy.log
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+      # Calibrate on 20 representative Rust PRs before making this blocking;
+      # log false positives in #10118, then remove continue-on-error.
+      - name: Anti-slop delta (advisory)
+        if: github.event_name != 'push'
+        continue-on-error: true
+        run: bash scripts/ci/anti_slop_delta_gate.sh origin/master
       - name: Rustdoc warnings gate
         # Exclude zeroclaw-desktop: same surface as xtask build_api / docs-deploy.
         # Desktop pulls glib-sys on Linux; the lint runner does not install GTK libs.

@@ -13412,6 +13412,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-anti-slop"
+version = "0.8.4"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.117",
+ "tempfile",
+]
+
+[[package]]
 name = "zeroclaw-api"
 version = "0.8.4"
 dependencies = [
