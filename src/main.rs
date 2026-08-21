@@ -3248,6 +3248,72 @@ async fn seed_plugin_config_entries(
     Ok(())
 }
 
+/// Publish a plugin and seed its config entries as one transaction.
+///
+/// `host.install` either performs a *fresh publish* — copying the package into
+/// the plugins directory and inserting it into the loaded set — or, when the
+/// package is already loaded, fails with `AlreadyLoaded` *before* copying
+/// anything. So the only half-installed window is a fresh publish whose config
+/// seeding then fails: the package is on disk and in the loaded set, yet the
+/// command reports an error and a naive retry would hit `AlreadyLoaded`,
+/// forcing a manual removal.
+///
+/// This closes that window. On any failure after a fresh publish the
+/// just-published package is rolled back with `host.remove` — the same removal
+/// `plugin remove` performs — so the plugins directory and the loaded set are
+/// left clean and a retry is a normal fresh install. The original seeding error
+/// is preserved and returned; if the rollback itself fails, both errors are
+/// surfaced and the package is left in place with a manual-removal instruction,
+/// never silently swallowed.
+///
+/// `announce_installed` prints the call site's own "installed" message once the
+/// publish succeeds, so the two install paths keep their distinct user-facing
+/// text.
+#[cfg(feature = "plugins-wasm")]
+async fn publish_and_seed_plugin(
+    host: &mut zeroclaw::plugins::host::PluginHost,
+    config: &mut crate::config::schema::Config,
+    install_source: &str,
+    announce_installed: impl FnOnce(&str),
+) -> Result<()> {
+    // A fresh publish: the package is now on disk and in the loaded set. An
+    // already-present package fails here, before any copy, so nothing past this
+    // point ever runs against a package this call did not itself publish.
+    let name = host.install(install_source)?;
+
+    let seed_result: Result<()> = async {
+        let config_entries = installed_plugin_config_entries(host, &name)?;
+        let declared = declared_egress_hosts(host, &name);
+        announce_installed(&name);
+        Box::pin(seed_plugin_config_entries(
+            config,
+            &name,
+            &config_entries,
+            &declared,
+        ))
+        .await
+    }
+    .await;
+
+    let Err(seed_err) = seed_result else {
+        return Ok(());
+    };
+
+    // Seeding failed after a fresh publish: undo the publish so the state is
+    // clean and the operator can simply re-run the install.
+    match host.remove(&name) {
+        Ok(()) => Err(seed_err.context(format!(
+            "the plugin package '{name}' was rolled back after its configuration \
+             could not be seeded; re-run the install once the cause above is resolved"
+        ))),
+        Err(rollback_err) => Err(seed_err.context(format!(
+            "the plugin package '{name}' could not be seeded and rolling it back \
+             ALSO failed ({rollback_err}); the package is still installed — remove \
+             it with `zeroclaw plugin remove {name}` before retrying"
+        ))),
+    }
+}
+
 #[derive(Subcommand, Debug)]
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout. With `--path`, returns
@@ -6686,22 +6752,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
-                    let name = host.install(&source)?;
-                    let config_entries = installed_plugin_config_entries(&host, &name)?;
-                    let declared = declared_egress_hosts(&host, &name);
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-installed-from",
-                            &[("source", &source)],
-                            "Plugin installed"
-                        )
-                    );
-                    Box::pin(seed_plugin_config_entries(
+                    Box::pin(publish_and_seed_plugin(
+                        &mut host,
                         &mut config,
-                        &name,
-                        &config_entries,
-                        &declared,
+                        &source,
+                        |_name| {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-installed-from",
+                                    &[("source", &source)],
+                                    "Plugin installed"
+                                )
+                            );
+                        },
                     ))
                     .await?;
                 } else {
@@ -6721,25 +6785,23 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     )
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
-                    let name = host.install(&plugin_dir)?;
-                    let config_entries = installed_plugin_config_entries(&host, &name)?;
-                    let declared = declared_egress_hosts(&host, &name);
-                    println!(
-                        "{}",
-                        ta(
-                            "cli-plugin-installed-name-version",
-                            &[
-                                ("name", &downloaded.manifest().name),
-                                ("version", &downloaded.manifest().version),
-                            ],
-                            "Plugin installed"
-                        )
-                    );
-                    Box::pin(seed_plugin_config_entries(
+                    Box::pin(publish_and_seed_plugin(
+                        &mut host,
                         &mut config,
-                        &name,
-                        &config_entries,
-                        &declared,
+                        &plugin_dir,
+                        |_name| {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-installed-name-version",
+                                    &[
+                                        ("name", &downloaded.manifest().name),
+                                        ("version", &downloaded.manifest().version),
+                                    ],
+                                    "Plugin installed"
+                                )
+                            );
+                        },
                     ))
                     .await?;
                 }
@@ -10995,5 +11057,108 @@ mod tests {
             .expect("the operator must be able to author the grant on the seeded row");
         let (granted, _private) = config.plugins.entry_egress(&instance_key);
         assert_eq!(granted, vec!["gitea.internal.example.com".to_string()]);
+    }
+
+    /// REGRESSION (grant ceremony, rollback half): a fresh `plugin install`
+    /// whose config seeding fails must leave NO package behind. The publish and
+    /// the seed are one transaction, so on a seed failure the just-published
+    /// package is rolled back — the plugins directory and the host's loaded set
+    /// are left clean, and a second install of the same source is a normal
+    /// fresh install rather than an `AlreadyLoaded` dead end forcing a manual
+    /// removal.
+    #[tokio::test]
+    #[cfg(feature = "plugins-wasm")]
+    async fn a_failed_seed_rolls_the_published_package_back_so_retry_is_a_fresh_install() {
+        use zeroclaw::plugins::host::PluginHost;
+
+        // A real installable package: a manifest that owns host state (a
+        // declared destination plus a network permission) so seeding creates a
+        // row, and a stub wasm so the copy step runs.
+        let manifest_toml = "name = \"rollback-probe\"\n\
+             version = \"1.0.0\"\n\
+             wasm_path = \"plugin.wasm\"\n\
+             capabilities = [\"tool\"]\n\
+             permissions = [\"http_client\"]\n\
+             [egress]\n\
+             hosts = [\"api.example.com\"]\n";
+        let source = tempfile::tempdir().expect("source dir");
+        std::fs::write(source.path().join("manifest.toml"), manifest_toml).expect("write manifest");
+        std::fs::write(source.path().join("plugin.wasm"), b"\0asm").expect("write wasm");
+        let source_arg = source
+            .path()
+            .to_str()
+            .expect("utf-8 source path")
+            .to_string();
+
+        let manifest = manifest_from_toml(manifest_toml);
+        let instance_key = expected_instance_key(&manifest);
+
+        let plugins = tempfile::tempdir().expect("plugins dir");
+        let mut host = PluginHost::from_plugins_dir(plugins.path()).expect("host");
+
+        // ── First install: force the seed phase to fail ──
+        // A dirty path that resolves against neither live config nor the on-disk
+        // doc makes `save_dirty` fail deterministically at apply time — in
+        // memory, cross-platform, with no unwritable-filesystem trick.
+        let dir1 = tempfile::tempdir().expect("config dir 1");
+        let mut config1 = config_in_dir(dir1.path());
+        config1.mark_dirty("cost.rates.providers.models.openai.ghost-model.input_per_mtok");
+
+        let err = Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config1,
+            &source_arg,
+            |_name| {},
+        ))
+        .await
+        .expect_err("seeding must fail on the poisoned dirty path");
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("rolled back"),
+            "the failure must report the rollback: {rendered}"
+        );
+        assert!(
+            !rendered.contains("AlreadyLoaded"),
+            "a fresh install that fails to seed must not surface AlreadyLoaded: {rendered}"
+        );
+
+        // The rollback left nothing behind: no directory, no loaded entry.
+        assert!(
+            !plugins.path().join("rollback-probe").exists(),
+            "the published package directory must be removed on seed failure"
+        );
+        assert!(
+            host.get_plugin("rollback-probe").is_none(),
+            "the loaded set must not retain a rolled-back package"
+        );
+
+        // ── Retry with a clean config: a normal fresh install ──
+        let dir2 = tempfile::tempdir().expect("config dir 2");
+        let mut config2 = config_in_dir(dir2.path());
+        Box::pin(publish_and_seed_plugin(
+            &mut host,
+            &mut config2,
+            &source_arg,
+            |_name| {},
+        ))
+        .await
+        .expect("retry of the same source must be a normal fresh install, not AlreadyLoaded");
+
+        assert!(
+            host.get_plugin("rollback-probe").is_some(),
+            "the retry must publish the package"
+        );
+        assert!(
+            plugins.path().join("rollback-probe").exists(),
+            "the retry must leave the package on disk"
+        );
+        assert!(
+            config2
+                .plugins
+                .entries
+                .iter()
+                .any(|e| e.name == instance_key),
+            "the retry must seed the instance-key row"
+        );
     }
 }
