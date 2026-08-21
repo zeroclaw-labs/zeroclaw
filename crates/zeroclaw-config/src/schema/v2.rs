@@ -838,6 +838,46 @@ fn effective_source_identity_matches(
     expected_extras: &[(&'static str, toml::Value)],
     expected_url: Option<&str>,
 ) -> bool {
+    source_identity_matches_inner(
+        aliased_models,
+        family,
+        alias,
+        expected_extras,
+        expected_url,
+        false,
+    )
+}
+
+/// Relaxed variant used only when provenance proves the sole raw producer IS
+/// the reference's own canonical spelling: an operator-selected auth setting
+/// on the materialized alias (`auth_mode = "o_auth"` plus OAuth credential
+/// fields) is configuration on the same source, not a different named
+/// variant, so its presence must not block the rewrite.
+fn source_identity_matches_ignoring_alias_auth(
+    aliased_models: &toml::Table,
+    family: &str,
+    alias: &str,
+    expected_extras: &[(&'static str, toml::Value)],
+    expected_url: Option<&str>,
+) -> bool {
+    source_identity_matches_inner(
+        aliased_models,
+        family,
+        alias,
+        expected_extras,
+        expected_url,
+        true,
+    )
+}
+
+fn source_identity_matches_inner(
+    aliased_models: &toml::Table,
+    family: &str,
+    alias: &str,
+    expected_extras: &[(&'static str, toml::Value)],
+    expected_url: Option<&str>,
+    allow_alias_auth_mode: bool,
+) -> bool {
     let Some(toml::Value::Table(family_table)) = aliased_models.get(family) else {
         return false;
     };
@@ -927,6 +967,10 @@ fn effective_source_identity_matches(
                     // For other families/URIs, allow bare match.
                     continue;
                 }
+            } else if field == "auth_mode" && allow_alias_auth_mode {
+                // Operator-selected auth flow on the canonical source itself:
+                // not a variant marker, so do not fail closed on it.
+                continue;
             } else {
                 return false;
             }
@@ -986,14 +1030,51 @@ fn rewrite_bare_vision_provider_reference(
     if producers.len() != 1 {
         return;
     }
-    if !effective_source_identity_matches(
+    let effective_matches = effective_source_identity_matches(
         aliased_models,
         &canonical_family,
         &canonical_alias,
         &reference_extras,
         reference_url.as_deref(),
-    ) {
-        return;
+    );
+    if !effective_matches {
+        // The strict matcher rejects every identity-bearing alias field the
+        // reference did not name. That is correct for a provider-name variant
+        // (`qwen-code`, `stepfun-intl`, `openai-codex`), but it is too strict
+        // when the sole producer is the reference's own canonical spelling
+        // and the alias carries an operator-selected auth setting: a V2
+        // config like `[providers.models.qwen] auth_mode = "o_auth"`
+        // materializes `qwen.default` with the expected `endpoint = "cn"`
+        // plus that explicit auth field, while the bare `qwen` reference
+        // names only the `cn` endpoint. The alias is still the uniquely
+        // sourced canonical credential — it must be reachable via the dotted
+        // alias rather than staying on the configless path.
+        //
+        // Distinguish the two cases via provenance: only when the sole raw
+        // producer normalizes to exactly the same `(family, alias, extras)`
+        // as the reference (and is spelled identically) can the unmatched
+        // identity field be operator configuration rather than a different
+        // named source. A genuine variant (`qwen-code`, `minimax-oauth`,
+        // `stepfun-intl`, …) normalizes to different extras or a different
+        // raw name and stays fail-closed. Endpoint, URI, and wire-api
+        // identity remain strict even in this relaxed path.
+        let sole_raw = producers.iter().next().expect("len 1");
+        let (prod_family, prod_alias, prod_extras) = normalize_provider_type(sole_raw, "default");
+        let producer_is_reference = sole_raw == reference
+            && prod_family == canonical_family
+            && prod_alias == canonical_alias
+            && prod_extras == reference_extras;
+        if !(producer_is_reference
+            && source_identity_matches_ignoring_alias_auth(
+                aliased_models,
+                &canonical_family,
+                &canonical_alias,
+                &reference_extras,
+                reference_url.as_deref(),
+            ))
+        {
+            return;
+        }
     }
     multimodal.insert(
         "vision_model_provider".to_string(),
