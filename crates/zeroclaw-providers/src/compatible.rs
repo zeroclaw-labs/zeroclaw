@@ -8,6 +8,7 @@ use crate::openai::{NativeToolFunctionSpec, NativeToolSpec};
 use crate::stream_guard::AbortOnDrop;
 use crate::terminal::{
     capture_terminal_policy_slot, default_terminal_policy, publish_terminal_policy,
+    terminal_completion_context_error,
 };
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
@@ -1207,7 +1208,14 @@ fn output_limit_error(
     finish_reason: Option<&str>,
     usage: Option<&zeroclaw_api::model_provider::TokenUsage>,
 ) -> Option<anyhow::Error> {
-    output_limit_failure(finish_reason, usage).map(anyhow::Error::new)
+    output_limit_failure(finish_reason, usage).map(|failure| {
+        terminal_completion_context_error(
+            failure,
+            default_terminal_policy(
+                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+            ),
+        )
+    })
 }
 
 fn preserve_output_limit_cause(
@@ -5265,6 +5273,12 @@ mod tests {
         let error = output_limit_error(Some("length"), None)
             .expect("length must classify as an output limit");
         assert_output_limit_failure(&error, None);
+        let context = crate::terminal::terminal_completion_context(&error)
+            .expect("non-streaming length must retain its terminal policy");
+        assert_eq!(
+            context.policy().recovery(),
+            crate::terminal::TerminalRecoveryDisposition::NextCandidate
+        );
     }
 
     #[tokio::test]
@@ -5450,6 +5464,72 @@ mod tests {
                 .len(),
             1,
             "only the configured next candidate may receive the fallback request"
+        );
+    }
+
+    #[tokio::test]
+    async fn compatible_length_non_streaming_uses_next_reliable_candidate_once() {
+        let (primary, primary_requests, primary_server) =
+            mock_non_streaming_response(serde_json::json!({
+                "choices": [{
+                    "message": {"content": "partial"},
+                    "finish_reason": "length"
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 20}
+            }))
+            .await;
+        let (fallback, fallback_requests, fallback_server) =
+            mock_non_streaming_response(serde_json::json!({
+                "choices": [{"message": {"content": "recovered"}, "finish_reason": "stop"}]
+            }))
+            .await;
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "compatible-primary".to_string(),
+                    Box::new(primary) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "compatible-fallback".to_string(),
+                    Box::new(fallback) as Box<dyn ModelProvider>,
+                ),
+            ],
+            2,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let response = reliable
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "test-model",
+                Some(0.0),
+            )
+            .await
+            .expect("output-limited primary must continue with the next candidate");
+
+        primary_server.abort();
+        fallback_server.abort();
+        assert_eq!(response.text.as_deref(), Some("recovered"));
+        assert_eq!(
+            primary_requests
+                .lock()
+                .expect("primary requests lock")
+                .len(),
+            1,
+            "the output-limited candidate must not be retried"
+        );
+        assert_eq!(
+            fallback_requests
+                .lock()
+                .expect("fallback requests lock")
+                .len(),
+            1,
+            "the configured next candidate receives one request"
         );
     }
 
