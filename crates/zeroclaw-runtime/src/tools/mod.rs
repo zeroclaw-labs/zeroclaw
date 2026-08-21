@@ -116,7 +116,7 @@ pub use zeroclaw_tools::tool_search::ToolSearchTool;
 pub use zeroclaw_tools::weather_tool::WeatherTool;
 pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
-pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+pub use zeroclaw_tools::wrappers::{PathAccessMode, PathGuardedTool, RateLimitedTool};
 
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
@@ -306,17 +306,23 @@ pub fn default_tools_with_runtime(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Read,
             ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                DeliverFileTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Read,
+            ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Write,
             ),
             security.clone(),
         )),
@@ -324,15 +330,24 @@ pub fn default_tools_with_runtime(
             PathGuardedTool::new(
                 FileEditTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Write,
             ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                GlobSearchTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Legacy,
+            ),
             security.clone(),
         )),
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                ContentSearchTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Legacy,
+            ),
             security,
         )),
     ]
@@ -622,17 +637,23 @@ pub fn all_tools_with_runtime(
             PathGuardedTool::new(
                 FileReadTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Read,
             ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                DeliverFileTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Read,
+            ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
             PathGuardedTool::new(
                 FileWriteTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Write,
             ),
             security.clone(),
         )),
@@ -640,15 +661,24 @@ pub fn all_tools_with_runtime(
             PathGuardedTool::new(
                 FileEditTool::new_with_persistence(security.clone(), persistent_writes),
                 security.clone(),
+                PathAccessMode::Write,
             ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(GlobSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                GlobSearchTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Legacy,
+            ),
             security.clone(),
         )),
         Arc::new(RateLimitedTool::new(
-            PathGuardedTool::new(ContentSearchTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                ContentSearchTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Legacy,
+            ),
             security.clone(),
         )),
         Arc::new(CronAddTool::new(
@@ -1171,7 +1201,11 @@ pub fn all_tools_with_runtime(
     // Vision tools are always available
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(RateLimitedTool::new(
-        PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+        PathGuardedTool::new(
+            ImageInfoTool::new(security.clone()),
+            security.clone(),
+            PathAccessMode::Read,
+        ),
         security.clone(),
     )));
 
@@ -2846,6 +2880,94 @@ mod tests {
         assert!(names.contains(&"file_edit"));
         assert!(names.contains(&"glob_search"));
         assert!(names.contains(&"content_search"));
+    }
+
+    #[tokio::test]
+    async fn registered_file_read_wrapper_denies_absolute_workspace_deny_read_target() {
+        // Through the actual registered stack (RateLimitedTool(PathGuardedTool(
+        // FileReadTool))). `FileReadTool` also re-checks `deny_read` internally
+        // at its own read boundary, so this is a defense-in-depth/non-regression
+        // proof for the full pipeline, not proof of the wrapper's own decision
+        // in isolation — see `wrappers::tests::path_guard_read_mode_denies_*`
+        // in `zeroclaw-tools` for that (there, the mock inner tool has no
+        // internal check, so only the wrapper's own logic can produce the
+        // denial).
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("secret.txt"), "top secret").unwrap();
+        std::fs::write(tmp.path().join("public.txt"), "hello").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            forbidden_paths: vec!["secret.txt".to_string()],
+            ..SecurityPolicy::default()
+        });
+        let tools = default_tools(security);
+        let file_read = tools
+            .iter()
+            .find(|t| t.name() == "file_read")
+            .expect("file_read must be registered");
+
+        let denied = file_read
+            .execute(serde_json::json!({"path": tmp.path().join("secret.txt").to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(
+            !denied.success,
+            "a deny_read target must be refused through the registered wrapper"
+        );
+
+        let allowed = file_read
+            .execute(serde_json::json!({"path": tmp.path().join("public.txt").to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(
+            allowed.success,
+            "an unrelated file must still be readable: {:?}",
+            allowed.error
+        );
+    }
+
+    #[tokio::test]
+    async fn registered_glob_search_wrapper_still_finds_files_under_deny_read() {
+        // `glob_search` is registered in `PathAccessMode::Legacy` (its argument
+        // is a glob pattern, not a literal path) but still enforces `deny_read`
+        // internally per matched file — this proves the Legacy wrapper mode
+        // does not itself break that enforcement.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("secret")).unwrap();
+        std::fs::write(tmp.path().join("secret").join("a.txt"), "hidden").unwrap();
+        std::fs::write(tmp.path().join("public.txt"), "hello").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            forbidden_paths: vec!["secret".to_string()],
+            ..SecurityPolicy::default()
+        });
+        let tools = default_tools(security);
+        let glob_search = tools
+            .iter()
+            .find(|t| t.name() == "glob_search")
+            .expect("glob_search must be registered");
+
+        let result = glob_search
+            .execute(serde_json::json!({"pattern": "**/*.txt"}))
+            .await
+            .unwrap();
+        assert!(
+            result.success,
+            "glob_search call must succeed: {:?}",
+            result.error
+        );
+        assert!(
+            !result.output.contains("secret"),
+            "a deny_read directory must not appear in results: {}",
+            result.output
+        );
+        assert!(
+            result.output.contains("public.txt"),
+            "an unrelated file must still be found: {}",
+            result.output
+        );
     }
 
     #[test]

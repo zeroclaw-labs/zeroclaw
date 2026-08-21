@@ -291,7 +291,7 @@ impl Tool for FileWriteTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
+    use crate::wrappers::{PathAccessMode, PathGuardedTool, RateLimitedTool};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -314,7 +314,11 @@ mod tests {
             ..SecurityPolicy::default()
         });
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(FileWriteTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                FileWriteTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Write,
+            ),
             security,
         ))
     }

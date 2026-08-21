@@ -251,7 +251,7 @@ impl Tool for ImageInfoTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
+    use crate::wrappers::{PathAccessMode, PathGuardedTool, RateLimitedTool};
     use std::path::{Component, Path, PathBuf};
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
@@ -315,7 +315,11 @@ mod tests {
 
     fn wrapped_tool_with_security(security: Arc<SecurityPolicy>) -> Box<dyn Tool> {
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                ImageInfoTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Read,
+            ),
             security,
         ))
     }
@@ -679,10 +683,16 @@ mod tests {
         let result = tool.execute(json!({"path": "link.png"})).await.unwrap();
 
         assert!(!result.success, "symlink escape must be blocked");
+        // `PathGuardedTool` now resolves and canonical-checks the target
+        // before the inner tool runs (`PathAccessMode::Read`), so it catches
+        // this symlink escape ahead of `ImageInfoTool`'s own
+        // "outside the allowed readable roots" check — a defense-in-depth
+        // improvement, not a regression, but it changes which layer's
+        // message surfaces.
         let error = result.error.as_deref().unwrap_or("");
         assert!(
-            error.contains("outside the allowed readable roots"),
-            "expected readable-roots error, got: {:?}",
+            error.contains("Path blocked by security policy"),
+            "expected the wrapper's denial, got: {:?}",
             error
         );
         assert!(
@@ -715,13 +725,16 @@ mod tests {
             .unwrap();
 
         assert!(!result.success, "write-only root must not be readable");
+        // As above: the wrapper's own canonical check now denies this ahead
+        // of `ImageInfoTool`'s internal one, so its generic message surfaces
+        // instead of the tool-specific "outside the allowed readable roots".
         assert!(
             result
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("outside the allowed readable roots"),
-            "expected readable-roots error, got: {:?}",
+                .contains("Path blocked by security policy"),
+            "expected the wrapper's denial, got: {:?}",
             result.error
         );
     }

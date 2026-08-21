@@ -193,11 +193,10 @@ impl FileEditTool {
         // An edit reads the target before rewriting it, so write admission
         // alone is not sufficient: a path denied for READS must not have its
         // contents surfaced through the edit path (no-match diagnostics quote
-        // file content). The registered `PathGuardedTool` wrapper does not
-        // cover this — its legacy check admits any absolute path already under
-        // the workspace before a workspace-relative `deny_read` entry is
-        // consulted — so the canonical read policy is applied here, at the
-        // boundary that actually performs the read.
+        // file content). The registered `PathGuardedTool` wrapper checks this
+        // tool in `Write` mode only (see `tools::mod`), so the canonical read
+        // policy is applied here as well, at the boundary that actually
+        // performs the read.
         if !self.security.is_resolved_path_readable(&resolved_target) {
             return Ok(ToolResult {
                 success: false,
@@ -318,7 +317,7 @@ fn no_match_diagnostic(content: &str, old_string: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wrappers::{PathGuardedTool, RateLimitedTool};
+    use crate::wrappers::{PathAccessMode, PathGuardedTool, RateLimitedTool};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -351,7 +350,11 @@ mod tests {
             ..SecurityPolicy::default()
         });
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                FileEditTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Write,
+            ),
             security,
         ))
     }
@@ -1081,7 +1084,11 @@ mod tests {
         profile.sandbox_policy.deny_read = Some(vec![denied.to_string()]);
         let security = Arc::new(SecurityPolicy::from_risk_profile(&profile, &workspace));
         Box::new(RateLimitedTool::new(
-            PathGuardedTool::new(FileEditTool::new(security.clone()), security.clone()),
+            PathGuardedTool::new(
+                FileEditTool::new(security.clone()),
+                security.clone(),
+                PathAccessMode::Write,
+            ),
             security,
         ))
     }
