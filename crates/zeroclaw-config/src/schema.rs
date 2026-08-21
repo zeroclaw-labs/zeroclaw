@@ -13393,6 +13393,15 @@ pub struct CronJobDecl {
     ///   timeout — return a plain error string in either format.
     #[serde(default)]
     pub shell_output_format: CronShellOutputFormat,
+    /// Optional deterministic precondition gate (`[cron.<alias>.pre_hook]`).
+    ///
+    /// When set, the hook command runs locally before the job body on every
+    /// scheduled and manual run. Exit `0` runs the job, exit `10` records a
+    /// clean skip, and any other exit — or a timeout — records a precondition
+    /// failure. Applies to both `shell` and `agent` jobs.
+    #[serde(default)]
+    #[nested]
+    pub pre_hook: Option<CronPreHookDecl>,
 }
 
 impl Default for CronJobDecl {
@@ -13410,6 +13419,7 @@ impl Default for CronJobDecl {
             session_target: None,
             delivery: None,
             shell_output_format: CronShellOutputFormat::default(),
+            pre_hook: None,
         }
     }
 }
@@ -13491,6 +13501,47 @@ impl Default for DeliveryConfigDecl {
             best_effort: true,
         }
     }
+}
+
+/// Deterministic precondition gate for a declarative cron job
+/// (`[cron.<alias>.pre_hook]`).
+///
+/// **Security surface.** This is a config-declared command that the daemon
+/// executes on a timer, so it carries the same trust weight as the job's own
+/// `command` and is gated the same way: every run re-validates it against the
+/// owning agent's allowed-command list, risk gate, path guard, autonomy level,
+/// rate limit, and action budget. The gate never runs with `approved = true`,
+/// so it cannot be used to reach a command the job body itself could not run,
+/// and it is declarable only in `config.toml` — the cron tools that an agent
+/// can call cannot create or edit one.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "cron_pre_hook"]
+pub struct CronPreHookDecl {
+    /// Shell command to run before the job body. Must be non-empty; an empty
+    /// command is rejected when declarative jobs are synced.
+    #[serde(default)]
+    pub command: String,
+    /// Wall-clock budget for the hook, in seconds. Must be at least `1`; the
+    /// hook holds one scheduler concurrency slot until it exits or times out.
+    /// Default: `30`.
+    #[serde(default = "default_cron_pre_hook_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for CronPreHookDecl {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree.
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("every CronPreHookDecl field declares a serde default")
+    }
+}
+
+/// Default wall-clock budget for a cron precondition gate, in seconds.
+pub const DEFAULT_CRON_PRE_HOOK_TIMEOUT_SECS: u64 = 30;
+
+fn default_cron_pre_hook_timeout_secs() -> u64 {
+    DEFAULT_CRON_PRE_HOOK_TIMEOUT_SECS
 }
 
 fn default_job_type_decl() -> String {
