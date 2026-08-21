@@ -863,6 +863,20 @@ async fn send_notice_with_timeout(
     }
 }
 
+/// Outcome of an admission attempt into a conversation lane.
+enum LaneAdmission {
+    /// The turn was appended to its lane.
+    Enqueued,
+    /// The lane's bounded backlog refused the turn; the caller applies the
+    /// busy drop policy.
+    Refused(Box<PendingTurn>),
+    /// The turn was canceled before it could commit into a lane. It is
+    /// returned instead of dropped under the registry lock so its
+    /// registration and permits release outside the lock, and no busy
+    /// notice is owed.
+    Canceled(Box<PendingTurn>),
+}
+
 impl ConversationLaneRegistry {
     fn new(semaphore: Arc<tokio::sync::Semaphore>) -> Arc<Self> {
         Arc::new(Self {
@@ -878,22 +892,36 @@ impl ConversationLaneRegistry {
     /// lane that is retiring: the retiring lane re-checks its queue under the
     /// same lock, so the slot is either picked up or lands in a fresh lane.
     ///
-    /// Returns the slot when the lane refused it — its backlog is full, or
-    /// the runtime is shutting down — so the caller can release the turn's
-    /// registration and apply the drop policy instead of leaking the turn.
-    fn enqueue(
-        self: &Arc<Self>,
-        key: &str,
-        turn: Box<PendingTurn>,
-    ) -> Result<(), Box<PendingTurn>> {
+    /// Returns [`LaneAdmission::Refused`] when the lane refused the slot —
+    /// its backlog is full, or the runtime is shutting down — so the caller
+    /// can release the turn's registration and apply the drop policy instead
+    /// of leaking the turn, and [`LaneAdmission::Canceled`] when the turn was
+    /// canceled before admission and must be dropped without a busy notice.
+    fn enqueue(self: &Arc<Self>, key: &str, turn: Box<PendingTurn>) -> LaneAdmission {
         use tokio::sync::mpsc::error::TrySendError;
         let mut lanes = self.lanes.lock().unwrap_or_else(|e| e.into_inner());
+        // The cancellation check and the append are one atomic step under the
+        // registry lock. A successor that interrupts this turn registers the
+        // cancellation before its own hook and admission, so under this lock
+        // a canceled turn either observes the cancellation here and never
+        // enters a lane, or was already queued before the successor. Checking
+        // outside the lock reopens the window where a canceled turn commits
+        // *behind* a successor that waits on its completion at the head of
+        // the same lane — the completion could then only be marked by a queue
+        // position that never drains: a permanently wedged lane.
+        if turn
+            .registration
+            .as_ref()
+            .is_some_and(|registration| registration.cancellation.is_cancelled())
+        {
+            return LaneAdmission::Canceled(turn);
+        }
         let turn = match lanes.get(key) {
             Some(tx) => match tx.try_send(turn) {
-                Ok(()) => return Ok(()),
+                Ok(()) => return LaneAdmission::Enqueued,
                 // The bounded backlog is the point: a full lane refuses the
                 // turn instead of retaining unbounded pending work.
-                Err(TrySendError::Full(returned)) => return Err(returned),
+                Err(TrySendError::Full(returned)) => return LaneAdmission::Refused(returned),
                 Err(TrySendError::Closed(returned)) => returned,
             },
             None => turn,
@@ -912,16 +940,19 @@ impl ConversationLaneRegistry {
         // lock is held, so the only way this fails is a runtime already
         // shutting down that dropped the freshly spawned runner before its
         // first poll; the turn is returned so the caller releases it.
-        tx.try_send(turn).map_err(|refused| {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"conversation": key})),
-                "conversation lane closed before its first turn was queued"
-            );
-            refused.into_inner()
-        })
+        match tx.try_send(turn) {
+            Ok(()) => LaneAdmission::Enqueued,
+            Err(refused) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"conversation": key})),
+                    "conversation lane closed before its first turn was queued"
+                );
+                LaneAdmission::Refused(refused.into_inner())
+            }
+        }
     }
 
     async fn run_lane(
@@ -1139,22 +1170,24 @@ async fn route_inbound_slot(
     // within the source conversation. Waiting here holds neither an execution
     // permit nor a conversation lane, and never waits on another conversation.
     order.wait_admission().await;
-    if turn
-        .registration
-        .as_ref()
-        .is_some_and(|registration| registration.cancellation.is_cancelled())
-    {
-        return;
-    }
-
-    if let Err(refused) = lanes.enqueue(&routed_key, turn) {
-        send_conversation_busy(
-            &refused.ctx,
-            &refused.msg,
-            "conversation_backlog",
-            &busy_notice_budget,
-            &busy_notice_tasks,
-        );
+    // The final cancellation check lives inside `enqueue`, under the registry
+    // lock: checked here, a cancellation landing between the check and the
+    // append could commit this turn into a lane behind the very successor
+    // that waits on its completion.
+    match lanes.enqueue(&routed_key, turn) {
+        LaneAdmission::Enqueued => {}
+        LaneAdmission::Refused(refused) => {
+            send_conversation_busy(
+                &refused.ctx,
+                &refused.msg,
+                "conversation_backlog",
+                &busy_notice_budget,
+                &busy_notice_tasks,
+            );
+        }
+        // Dropping the turn releases its registration (marking its
+        // completion for any waiting successor) and its admission permit.
+        LaneAdmission::Canceled(canceled) => drop(canceled),
     }
     order.finish();
 }
@@ -1186,25 +1219,46 @@ fn spawn_inbound_routing(
 /// a follow-up extends the window. The forwarder waits for the replacement the
 /// dispatch loop hands over and keeps the reserved position, which is what
 /// makes bucket order equal receive order.
+/// A bucket extension: the debouncer's replacement result receiver together
+/// with the aggregate-admission permit of the follow-up that extended the
+/// window. The permit must live exactly as long as the extension's content is
+/// retained inside the debouncer, so it travels with the receiver instead of
+/// being released at the dispatch loop.
+type DebounceBucketExtension = (
+    tokio::sync::oneshot::Receiver<String>,
+    tokio::sync::OwnedSemaphorePermit,
+);
+
 fn spawn_debounce_forwarder(
     first: tokio::sync::oneshot::Receiver<String>,
 ) -> (
     tokio::sync::oneshot::Receiver<String>,
-    tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<String>>,
+    tokio::sync::mpsc::UnboundedSender<DebounceBucketExtension>,
 ) {
     let (slot_tx, slot_rx) = tokio::sync::oneshot::channel();
     let (updates_tx, mut updates_rx) = tokio::sync::mpsc::unbounded_channel();
 
     zeroclaw_spawn::spawn!(async move {
         let mut pending = first;
+        // Admission permits of every follow-up retained in this bucket. They
+        // are held until the bucket resolves either way — delivery (the
+        // combined content collapses into one turn covered by the first
+        // message's permit) or drop — so retained debounce content spends the
+        // aggregate budget just like queued and active turns, and a sustained
+        // flood is refused at receive time instead of growing the bucket.
+        let mut extension_permits = Vec::new();
         loop {
             match pending.await {
                 Ok(combined) => {
                     let _ = slot_tx.send(combined);
+                    drop(extension_permits);
                     return;
                 }
                 Err(_) => match updates_rx.recv().await {
-                    Some(next) => pending = next,
+                    Some((next, permit)) => {
+                        extension_permits.push(permit);
+                        pending = next;
+                    }
                     // No replacement is coming: the dispatch loop dropped the
                     // bucket, so the reserved slot resolves to "skip".
                     None => return,
@@ -8359,7 +8413,7 @@ async fn run_message_dispatch_loop(
     // lane position reserved by the bucket's first message.
     let mut debounce_buckets: HashMap<
         String,
-        tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Receiver<String>>,
+        tokio::sync::mpsc::UnboundedSender<DebounceBucketExtension>,
     > = HashMap::new();
 
     while let Some(msg) = rx.recv().await {
@@ -8535,14 +8589,18 @@ async fn run_message_dispatch_loop(
                     // A follow-up that extended an open bucket hands the
                     // debouncer's replacement receiver to the lane position
                     // that bucket already owns, so the combined turn keeps the
-                    // place of the sender's first message. Whether the bucket
+                    // place of the sender's first message. Its admission
+                    // permit travels along: the follow-up's content is now
+                    // retained inside the debouncer, so its share of the
+                    // aggregate budget stays held (by the forwarder) until
+                    // the bucket delivers or is dropped. Whether the bucket
                     // was extended or opened comes from the debouncer itself,
                     // decided under its lock: inferring it here from forwarder
                     // liveness would race the window expiry, and a receiver
                     // sent to a forwarder whose bucket just fired would be
                     // dropped unread — silently losing the new message.
-                    let rx = match debounce_buckets.get(&debounce_key) {
-                        Some(bucket) if extended => match bucket.send(rx) {
+                    let (rx, pending_work) = match debounce_buckets.get(&debounce_key) {
+                        Some(bucket) if extended => match bucket.send((rx, pending_work)) {
                             Ok(()) => continue,
                             // An extended bucket always has a live forwarder
                             // (it can only retire after consuming the bucket's
@@ -8564,7 +8622,7 @@ async fn run_message_dispatch_loop(
                                 returned.0
                             }
                         },
-                        _ => rx,
+                        _ => (rx, pending_work),
                     };
 
                     let (content, bucket) = spawn_debounce_forwarder(rx);
@@ -24829,6 +24887,163 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             sent.iter().any(|message| message.ends_with(&stop_sent)),
             "/stop must bypass a saturated ordinary-work budget: {sent:?}"
+        );
+    }
+
+    /// A nonzero debounce window must not become an unbudgeted retention
+    /// path. Every follow-up that extends an open bucket keeps its aggregate
+    /// admission permit for as long as the debouncer retains its content, so
+    /// a sustained one-sender flood exhausts the global budget and is refused
+    /// at receive time instead of growing the bucket without bound; once the
+    /// bucket delivers, the permits return and a fresh bucket runs normally.
+    #[tokio::test(start_paused = true)]
+    async fn debounced_flood_cannot_grow_retained_content_past_aggregate_budget() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let prompt_config = zeroclaw_config::schema::Config {
+            channels: zeroclaw_config::schema::ChannelsConfig {
+                debounce_ms: 200,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(GatedModelProvider {
+                gate: Arc::new(tokio::sync::Semaphore::new(
+                    tokio::sync::Semaphore::MAX_PERMITS / 2,
+                )),
+            }),
+            prompt_config,
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let flood = GLOBAL_PENDING_TURN_LIMIT + 5;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(8);
+        let send_task = zeroclaw_spawn::spawn!(async move {
+            // The whole flood lands inside one open bucket: virtual time
+            // cannot advance while the sender and the dispatch loop stay
+            // runnable, so no window expiry can interleave with the flood.
+            for i in 0..flood {
+                tx.send(shared_topic_message(
+                    "alice",
+                    &format!("m{i}"),
+                    &format!("flood {i} marker"),
+                ))
+                .await
+                .unwrap();
+            }
+            // Let the bucket fire and the combined turn drain, then prove the
+            // budget recovered by running a fresh bucket to completion.
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            tx.send(shared_topic_message(
+                "alice",
+                "recovered",
+                "fresh bucket after the flood",
+            ))
+            .await
+            .unwrap();
+        });
+
+        run_message_dispatch_loop(rx, AgentRouter::single(ctx), 4).await;
+        send_task.await.unwrap();
+
+        let busy =
+            zeroclaw_runtime::i18n::get_required_cli_string("channel-runtime-conversation-busy");
+        let sent = channel_impl.sent_messages.lock().await;
+        let combined_echo = sent
+            .iter()
+            .find(|m| m.contains("flood 0 marker"))
+            .expect("the combined debounced turn must produce a response");
+        let retained = (0..flood)
+            .filter(|i| combined_echo.contains(&format!("flood {i} marker")))
+            .count();
+        let refused = sent.iter().filter(|m| m.ends_with(&busy)).count();
+        assert_eq!(
+            retained, GLOBAL_PENDING_TURN_LIMIT,
+            "an open bucket must retain exactly the aggregate budget: {retained}"
+        );
+        assert!(
+            combined_echo.contains(&format!("flood {} marker", GLOBAL_PENDING_TURN_LIMIT - 1))
+                && !combined_echo.contains(&format!("flood {GLOBAL_PENDING_TURN_LIMIT} marker")),
+            "admission order decides which follow-ups are retained"
+        );
+        assert!(
+            refused >= 1,
+            "the refused overflow must be visible through at least one notice: {sent:?}"
+        );
+        assert!(
+            refused <= flood - GLOBAL_PENDING_TURN_LIMIT,
+            "busy notices may be coalesced, but cannot exceed rejected work: {sent:?}"
+        );
+        assert!(
+            sent.iter()
+                .any(|m| m.contains("fresh bucket after the flood")),
+            "a fresh bucket must run normally once the flood's permits return: {sent:?}"
+        );
+    }
+
+    /// A cancellation that lands while its turn is being admitted must be
+    /// decided atomically with the lane append, under the registry lock. If
+    /// a canceled turn could still commit into a lane, it could land
+    /// *behind* the successor that canceled it — which waits at the head of
+    /// that lane for the canceled turn's completion, wedging the lane
+    /// forever. `enqueue` therefore refuses a canceled turn itself, and the
+    /// dropped turn releases its registration and admission permit.
+    #[tokio::test]
+    async fn canceled_turn_is_never_admitted_to_a_conversation_lane() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let ctx = test_runtime_ctx_with_config_agent_and_provider_ref(
+            channel,
+            Arc::new(GatedModelProvider {
+                gate: Arc::new(tokio::sync::Semaphore::new(0)),
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+        );
+        let lanes = ConversationLaneRegistry::new(Arc::new(tokio::sync::Semaphore::new(4)));
+        let budget = Arc::new(tokio::sync::Semaphore::new(4));
+        let pending_work = Arc::clone(&budget).try_acquire_owned().unwrap();
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let completion = Arc::new(InFlightTaskCompletion::new());
+        let registration = TurnRegistration {
+            scope_key: "scope".into(),
+            task_id: 1,
+            cancellation,
+            completion: Arc::clone(&completion),
+            superseded: None,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let turn = Box::new(PendingTurn {
+            ctx,
+            msg: shared_topic_message("alice", "m1", "canceled during admission"),
+            registration: Some(registration),
+            pending_work,
+        });
+
+        match lanes.enqueue("conversation", turn) {
+            LaneAdmission::Canceled(canceled) => drop(canceled),
+            LaneAdmission::Enqueued => panic!("a canceled turn must never enter a lane"),
+            LaneAdmission::Refused(_) => {
+                panic!("cancellation must not be reported as a busy refusal")
+            }
+        }
+
+        assert!(
+            completion.is_done(),
+            "dropping the refused turn must mark its completion for waiting successors"
+        );
+        assert_eq!(
+            budget.available_permits(),
+            4,
+            "the canceled turn's admission permit must return to the budget"
         );
     }
 
