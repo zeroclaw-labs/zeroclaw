@@ -12,7 +12,7 @@ CellClaw-derived Accessibility and floating-overlay layer in one APK.
   the live gateway state.
 - A full Android 12+ flavor and a lite Android 11+ flavor.
 - Provider and model selection with 19 hosted defaults validated against models.dev.
-- A persistent v0.3 signing certificate, reproducible native-source pin, checksums, and signed
+- A persistent v0.3 signing certificate, traceable native-source commit, checksums, and signed
   artifact verification.
 - Android-compatible encrypted master-key publication, so gateway pairing persists under the app
   SELinux sandbox without weakening atomic no-replace key creation.
@@ -52,4 +52,6 @@ fingerprint against `ZEROCLAW_ANDROID_RELEASE_CERT_SHA256`.
 - Provider tests require a credential supplied by the tester. The APK contains no provider key.
 - The lite flavor compiles and lints at API 30, but still needs a physical Android 11 device or
   emulator sign-off; the physical Android 16 test device validates the full flavor.
+- The source commit is checked, but the local release path does not yet consume a repository-wide
+  Rust toolchain pin, so byte-for-byte native reproducibility is not claimed.
 - No public GitHub release, tag, Play listing, or update feed is created by the build workflow.

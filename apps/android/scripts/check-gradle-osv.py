@@ -19,10 +19,16 @@ OSV_PATH = "/v1/querybatch"
 DEPENDENCY = re.compile(
     r"---\s+([^:\s]+):([^:\s]+):([^\s]+)(?:\s+->\s+([^\s]+))?"
 )
+RUNTIME_CONFIGURATIONS = (
+    "liteDebugRuntimeClasspath",
+    "fullDebugRuntimeClasspath",
+    "liteReleaseRuntimeClasspath",
+    "fullReleaseRuntimeClasspath",
+)
 
 
-def parse_components(report: str) -> dict[str, str]:
-    components: dict[str, str] = {}
+def parse_components(report: str) -> set[tuple[str, str]]:
+    components: set[tuple[str, str]] = set()
     for line in report.splitlines():
         match = DEPENDENCY.search(line)
         if not match:
@@ -30,12 +36,19 @@ def parse_components(report: str) -> dict[str, str]:
         group, artifact, requested, selected = match.groups()
         version = (selected or requested).strip("()")
         if version and version != "project":
-            components[f"{group}:{artifact}"] = version
+            components.add((f"{group}:{artifact}", version))
     return components
 
 
-def query_osv(components: dict[str, str]) -> list[dict]:
-    ordered = sorted(components.items())
+def merge_components(reports: list[str]) -> set[tuple[str, str]]:
+    components: set[tuple[str, str]] = set()
+    for report in reports:
+        components.update(parse_components(report))
+    return components
+
+
+def query_osv(components: set[tuple[str, str]]) -> list[dict]:
+    ordered = sorted(components)
     payload = json.dumps(
         {
             "queries": [
@@ -125,13 +138,11 @@ def main() -> int:
         [path.read_text() for path in args.report]
         if args.report
         else [
-            gradle_report(android_dir, "liteDebugRuntimeClasspath"),
-            gradle_report(android_dir, "fullDebugRuntimeClasspath"),
+            gradle_report(android_dir, configuration)
+            for configuration in RUNTIME_CONFIGURATIONS
         ]
     )
-    components: dict[str, str] = {}
-    for report in reports:
-        components.update(parse_components(report))
+    components = merge_components(reports)
     if not components:
         print("No Maven components found in Gradle reports", file=sys.stderr)
         return 2

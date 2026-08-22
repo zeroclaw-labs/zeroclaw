@@ -20,6 +20,9 @@ supplied separately so `scripts/build-release.sh` can reject an artifact signed 
 
 The release script requires a clean ZeroClaw checkout and builds both the dashboard and Android
 native binary itself. Use Node 24 as declared by the repository's `.nvmrc`.
+It validates the source commit, but the repository does not yet expose one canonical Rust
+build-toolchain pin for the script to consume. Byte-for-byte native reproducibility is therefore
+not claimed.
 
 Build only; this does not publish:
 

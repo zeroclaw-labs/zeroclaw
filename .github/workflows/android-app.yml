@@ -118,14 +118,29 @@ jobs:
       - name: Set up Gradle cache
         uses: gradle/actions/setup-gradle@ed408507eac070d1f99cc633dbcf757c94c7933a # v4
 
+      - name: Reject unsafe generated-source provenance
+        working-directory: apps/android
+        shell: bash
+        run: |
+          if output="$(./gradlew --no-daemon help \
+            -PZEROCLAW_REF='unsafe"ref' \
+            -PZEROCLAW_COMMIT=0000000000000000000000000000000000000000 \
+            --console=plain 2>&1)"; then
+            echo "Gradle accepted a quote in ZEROCLAW_REF" >&2
+            exit 1
+          fi
+          printf '%s\n' "$output"
+          printf '%s\n' "$output" | grep -F \
+            'ZEROCLAW_REF must be 1-128 characters from [A-Za-z0-9._/-]'
+
       - name: Scan resolved Android dependencies with OSV
         run: apps/android/scripts/check-gradle-osv.py
 
       - name: Run full and lite Android matrix
         working-directory: apps/android
         env:
-          ZEROCLAW_REF: ${{ github.ref_name }}
-          ZEROCLAW_COMMIT: ${{ github.sha }}
+          ZEROCLAW_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.ref || github.ref_name }}
+          ZEROCLAW_COMMIT: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
         run: |
           ./gradlew --no-daemon \
             :app:testLiteDebugUnitTest \

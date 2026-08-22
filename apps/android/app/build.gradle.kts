@@ -9,6 +9,16 @@ val releaseKeyAlias = providers.environmentVariable("ZERODROID_RELEASE_KEY_ALIAS
 val releaseKeyPassword = providers.environmentVariable("ZERODROID_RELEASE_KEY_PASSWORD").orNull
 val androidAppVersion = providers.gradleProperty("ZEROCLAW_ANDROID_VERSION").get()
 val androidAppVersionCode = providers.gradleProperty("ZEROCLAW_ANDROID_VERSION_CODE").get().toInt()
+val provenanceValuePattern = Regex("[A-Za-z0-9._/-]{1,128}")
+val validatedProvenanceProperty = { name: String ->
+    val value = providers.gradleProperty(name).getOrElse("unknown")
+    require(provenanceValuePattern.matches(value)) {
+        "$name must be 1-128 characters from [A-Za-z0-9._/-]"
+    }
+    value
+}
+val zeroclawRef = validatedProvenanceProperty("ZEROCLAW_REF")
+val zeroclawCommit = validatedProvenanceProperty("ZEROCLAW_COMMIT")
 val releaseSigningConfigured = listOf(
     releaseStorePath,
     releaseStorePassword,
@@ -35,10 +45,8 @@ android {
         manifestPlaceholders["MAPS_API_KEY"] =
             (project.findProperty("MAPS_API_KEY") as String?) ?: "unset"
         // Provenance of the bundled rust binary — surfaced in-app so the running thing is traceable.
-        buildConfigField("String", "ZEROCLAW_REF",
-            "\"${(project.findProperty("ZEROCLAW_REF") as String?) ?: "unknown"}\"")
-        buildConfigField("String", "ZEROCLAW_COMMIT",
-            "\"${(project.findProperty("ZEROCLAW_COMMIT") as String?) ?: "unknown"}\"")
+        buildConfigField("String", "ZEROCLAW_REF", "\"$zeroclawRef\"")
+        buildConfigField("String", "ZEROCLAW_COMMIT", "\"$zeroclawCommit\"")
         multiDexEnabled = true   // MINA SSHD pushes past the 64K method limit
     }
 
