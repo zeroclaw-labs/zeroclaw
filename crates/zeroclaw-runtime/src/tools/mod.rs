@@ -576,6 +576,27 @@ fn filter_agent_peer_groups(
         .collect()
 }
 
+/// Assemble the shell tool with the sandbox selected for the configured
+/// runtime. This is the single seam that pairs `root_config.runtime.kind`
+/// with the risk profile's sandbox selection; `all_tools_with_runtime` and
+/// integration tests both go through it so a wrong runtime-kind wiring here
+/// cannot pass unnoticed.
+#[must_use]
+pub fn shell_tool_for_runtime(
+    security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+    root_config: &Config,
+) -> ShellTool {
+    let sandbox_cfg = risk_profile.sandbox_config();
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        root_config.runtime.kind,
+        Some(&security.workspace_dir),
+    );
+    ShellTool::new_with_sandbox(security, runtime, sandbox)
+}
+
 #[cfg(feature = "plugins-wasm")]
 fn plugin_config_values(
     config: &Config,
@@ -663,9 +684,14 @@ pub fn all_tools_with_runtime(
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
     let register_coding_cli_tools = has_shell_access && persistent_writes;
-    let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    // `create_sandbox` is runtime-kind aware: under the Docker runtime it returns
+    // the noop sandbox so the runtime owns the only container layer.
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        root_config.runtime.kind,
+        Some(&security.workspace_dir),
+    );
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),

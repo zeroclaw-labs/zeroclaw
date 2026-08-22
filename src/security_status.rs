@@ -74,7 +74,7 @@ pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatus
     let sandbox_config = sandbox_config_from_policy(&resolved.policy);
     let sandbox = zeroclaw_runtime::security::sandbox_posture(
         &sandbox_config,
-        config.runtime.kind.as_wire(),
+        config.runtime.kind,
         Some(&resolved.policy.workspace_dir),
     );
 
@@ -606,6 +606,64 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("public bind without TLS"))
+        );
+    }
+
+    #[test]
+    fn docker_runtime_with_explicit_docker_backend_reports_runtime_containment() {
+        let profile = RiskProfileConfig {
+            sandbox_backend: Some("docker".to_string()),
+            ..RiskProfileConfig::default()
+        };
+        let mut config = config_with_agent("ops", "ops-risk", profile);
+        config.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+
+        let report = build_report(&config, "ops").expect("agent report");
+
+        assert_eq!(report.sandbox.requested_backend, "docker");
+        assert_eq!(report.sandbox.active_backend, "docker-runtime");
+        assert!(
+            !report.sandbox.fallback,
+            "runtime-owned containment must not be reported as a lost fallback"
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("application-layer")),
+            "runtime-owned containment must not be reported as application-layer only: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("fell back")),
+            "unexpected fallback warning: {:?}",
+            report.warnings
+        );
+    }
+
+    #[test]
+    fn docker_runtime_with_auto_backend_never_reports_application_layer_only() {
+        let mut config = config_with_agent("ops", "ops-risk", RiskProfileConfig::default());
+        config.runtime.kind = zeroclaw_config::schema::RuntimeKind::Docker;
+
+        let report = build_report(&config, "ops").expect("agent report");
+
+        // Auto-detection may pick an OS-native backend on some hosts, but on a
+        // Docker runtime the posture must never degrade to "none" (containment
+        // is owned by the runtime container) nor nest a second Docker layer.
+        assert_ne!(report.sandbox.active_backend, "none");
+        assert_ne!(report.sandbox.active_backend, "docker");
+        assert!(!report.sandbox.fallback);
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("application-layer")),
+            "runtime-owned containment must not be reported as application-layer only: {:?}",
+            report.warnings
         );
     }
 
