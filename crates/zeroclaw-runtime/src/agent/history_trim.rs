@@ -210,8 +210,18 @@ pub fn trim_to_reported_budget(
     history: Vec<ChatMessage>,
     budget_tokens: usize,
     reported_input_tokens: usize,
+    // Estimated token count of the exact message population that produced
+    // `reported_input_tokens` (the pre-request `prepared_messages`, before any
+    // assistant/tool-result output for this iteration was appended to
+    // `history`). Scaling the selection target against this measured population
+    // keeps it consistent with the calibration ratio used for `tokens_after`;
+    // re-estimating the larger post-append `history` here would select more
+    // retention than the calibration justifies and let the final history
+    // overrun the budget.
+    reported_population_estimated: usize,
+    tool_schema_tokens: usize,
 ) -> TrimResult {
-    let estimated = estimate_history_tokens(&history);
+    let estimated = reported_population_estimated;
     if budget_tokens == 0 || reported_input_tokens <= budget_tokens || estimated == 0 {
         let total_turns = count_turns(&history);
         return TrimResult {
@@ -224,13 +234,18 @@ pub fn trim_to_reported_budget(
             trimmed: false,
         };
     }
-    let scaled =
+    // Native tool schemas are constant across a trim, so reserve them inside
+    // the scaled total and trim the history portion to what remains: the
+    // retained history plus tools then fits the budget when the reported
+    // count is faithful.
+    let target_total =
         (budget_tokens as u128 * estimated as u128 / reported_input_tokens as u128).max(1) as usize;
+    let scaled = target_total.saturating_sub(tool_schema_tokens).max(1);
     let result = trim_to_recent_turns(history, scaled);
     let ratio = reported_input_tokens as f64 / estimated as f64;
     TrimResult {
         tokens_before: reported_input_tokens,
-        tokens_after: (result.tokens_after as f64 * ratio).round() as usize,
+        tokens_after: ((result.tokens_after + tool_schema_tokens) as f64 * ratio).round() as usize,
         ..result
     }
 }
@@ -243,8 +258,36 @@ fn next_boundary_after(boundaries: &[usize], current: usize) -> usize {
         .unwrap_or(current)
 }
 
-fn count_turns(history: &[ChatMessage]) -> usize {
+pub(crate) fn count_turns(history: &[ChatMessage]) -> usize {
     history.iter().filter(|m| is_turn_boundary(m)).count()
+}
+
+/// Drop the oldest whole turn (after leading system messages and an optional
+/// breadcrumb), preserving the most recent whole turn and the system prefix.
+/// Returns how many messages were dropped — zero when only the newest turn
+/// remains, which the caller treats as the unsatisfiable floor rather than
+/// silently claiming the history fits.
+pub(crate) fn drop_oldest_whole_turn(history: &mut Vec<ChatMessage>) -> usize {
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let crumb = breadcrumb();
+    let crumb_present = history
+        .get(leading_system)
+        .is_some_and(|m| m.role == crumb.role && m.content == crumb.content);
+    let body_start = leading_system + usize::from(crumb_present);
+    let body = &history[body_start..];
+    let boundaries: Vec<usize> = body
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| is_turn_boundary(m))
+        .map(|(i, _)| body_start + i)
+        .collect();
+    if boundaries.len() <= 1 {
+        return 0;
+    }
+    let drop_end = next_boundary_after(&boundaries, boundaries[0]);
+    let dropped = drop_end - body_start;
+    history.drain(body_start..drop_end);
+    dropped
 }
 
 /// Front breadcrumb injected after the system messages so the model SEES that
@@ -256,15 +299,23 @@ pub fn breadcrumb() -> ChatMessage {
 /// Insert the trim breadcrumb after the leading system messages, unless one is
 /// already sitting there.
 pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>) {
-    let system_count = history.iter().take_while(|m| is_system(m)).count();
-    let crumb = breadcrumb();
-    let already_present = history
-        .get(system_count)
-        .is_some_and(|m| m.role == crumb.role && m.content == crumb.content);
-    if already_present {
+    if has_leading_breadcrumb(history) {
         return;
     }
-    history.insert(system_count, crumb);
+    let system_count = history.iter().take_while(|m| is_system(m)).count();
+    history.insert(system_count, breadcrumb());
+}
+
+/// Whether `history` already carries the synthetic trim breadcrumb after its
+/// leading system messages. A population that was itself the product of an
+/// earlier trim keeps its crumb, so accounting must not treat it as a fresh
+/// synthetic message.
+pub fn has_leading_breadcrumb(history: &[ChatMessage]) -> bool {
+    let system_count = history.iter().take_while(|m| is_system(m)).count();
+    let crumb = breadcrumb();
+    history
+        .get(system_count)
+        .is_some_and(|m| m.role == crumb.role && m.content == crumb.content)
 }
 
 /// Insert the trim breadcrumb into structured history after leading system
@@ -914,7 +965,7 @@ mod tests {
         let estimated = estimate_history_tokens(&h);
         let reported = estimated * 4;
         let budget = reported / 2;
-        let r = trim_to_reported_budget(h, budget, reported);
+        let r = trim_to_reported_budget(h, budget, reported, estimated, 0);
         assert!(
             r.trimmed,
             "must trim when provider-reported tokens exceed budget"
@@ -927,7 +978,7 @@ mod tests {
     fn reported_budget_no_trim_when_real_tokens_fit() {
         let h = vec![sys("system"), user("hi"), asst("hello")];
         let estimated = estimate_history_tokens(&h);
-        let r = trim_to_reported_budget(h, estimated * 4, estimated);
+        let r = trim_to_reported_budget(h, estimated * 4, estimated, estimated, 0);
         assert!(!r.trimmed);
     }
 
@@ -944,9 +995,119 @@ mod tests {
         let estimated = estimate_history_tokens(&h);
         let reported = estimated * 5000;
         let budget = reported / 100;
-        let r = trim_to_reported_budget(h, budget, reported);
+        let r = trim_to_reported_budget(h, budget, reported, estimated, 0);
         assert!(r.trimmed, "extreme ratio must still enforce, not no-op");
         assert!(r.history.iter().any(|m| m.content.contains("recent short")));
+    }
+
+    #[test]
+    fn reported_budget_reserves_room_for_large_native_tool_schema() {
+        let big = "x".repeat(2000);
+        let h = vec![
+            sys("system"),
+            user(&format!("turn1 {big}")),
+            asst("a1"),
+            user(&format!("turn2 {big}")),
+            asst("a2"),
+            user("turn3 short"),
+            asst("a3"),
+        ];
+        // A large native tool schema that a provider would serialize into the
+        // request and count in `input_tokens` alongside the messages.
+        let spec = crate::tools::ToolSpec::new(
+            "large_schema_tool",
+            "a tool with a very large parameter schema",
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "payload": {
+                        "type": "string",
+                        "description": "big".repeat(300),
+                    }
+                }
+            }),
+        );
+        let tool_tokens = crate::agent::history::estimate_tool_schema_tokens(&[spec]);
+        assert!(
+            tool_tokens > 0,
+            "a large tool schema must contribute a nonzero token estimate"
+        );
+
+        // Faithful provider: reported == messages + tool schemas.
+        let estimated = estimate_history_tokens(&h) + tool_tokens;
+        let reported = estimated;
+        let budget = reported / 2;
+        assert!(budget > tool_tokens, "budget must leave headroom for tools");
+
+        let r = trim_to_reported_budget(h, budget, reported, estimated, tool_tokens);
+        assert!(
+            r.trimmed,
+            "must trim when reported population exceeds budget"
+        );
+        let kept_total = estimate_history_tokens(&r.history) + tool_tokens;
+        assert!(
+            kept_total <= budget,
+            "retained history plus constant tool schemas must fit the budget (kept {kept_total}, budget {budget})"
+        );
+        assert_eq!(
+            r.tokens_after, kept_total,
+            "tokens_after must cover the full provider population, tool schemas included"
+        );
+        assert!(r.history.iter().any(|m| m.content.contains("turn3 short")));
+    }
+
+    #[test]
+    fn reported_budget_calibrates_selection_against_the_measured_population() {
+        // `reported_population_estimated` describes the population that produced
+        // `reported` — the pre-request transcript. `history` here is the
+        // already-appended transcript (the provider calls back with a larger
+        // estimate after the assistant/tool output was added). The selection
+        // target must scale from the MEASURED population, not from the fresher,
+        // larger post-append estimate, or the retained set would exceed the
+        // budget once calibrated.
+        let big = "x".repeat(2000);
+        // The measured (pre-request) population: several substantial turns so
+        // there is plenty of room to trim toward the budget.
+        let mut measured = vec![sys("system")];
+        for i in 0..8 {
+            measured.push(user(format!("m{i} {big}").as_str()));
+            measured.push(asst(format!("a{i}").as_str()));
+        }
+        let reported = estimate_history_tokens(&measured) * 4;
+        let budget = reported / 2;
+        let measured_population_estimated = estimate_history_tokens(&measured);
+
+        // Post-request append: this iteration's assistant output lands on the
+        // same transcript `trim_to_reported_budget` sees, making it larger than
+        // the measured population — but small enough that the newest whole turn
+        // still fits the post-trim target (no oversized-turn exception).
+        let appended = "y".repeat(400);
+        let mut history = measured;
+        history.push(ChatMessage::assistant(&appended));
+        assert!(
+            estimate_history_tokens(&history) > measured_population_estimated,
+            "the appended output must make the post-append estimate the larger one"
+        );
+
+        let r =
+            trim_to_reported_budget(history, budget, reported, measured_population_estimated, 0);
+        assert!(r.trimmed, "must trim when reported exceeds budget");
+        assert!(
+            r.tokens_after <= budget,
+            "selection must not outpace the calibration ratio: tokens_after {} > budget {budget}",
+            r.tokens_after
+        );
+        // The retained history must also fit the budget under the measured
+        // calibration ratio (the calibration's own check).
+        let kept = estimate_history_tokens(&r.history);
+        let calibrated = (kept as f64 * reported as f64
+            / measured_population_estimated.max(1) as f64)
+            .round() as u64;
+        assert!(
+            calibrated <= budget as u64,
+            "retained history must respect the budget under the measured ratio \
+             (calibrated {calibrated}, budget {budget})"
+        );
     }
 
     #[test]
