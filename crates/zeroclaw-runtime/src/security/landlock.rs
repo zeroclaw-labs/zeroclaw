@@ -159,6 +159,61 @@ impl LandlockSandbox {
             ),
             // some variant of sh requires access to /dev/null
             ("/dev/null", AccessFs::WriteFile | AccessFs::ReadFile, true),
+            // DNS resolution: glibc's resolver (used by getaddrinfo, and thus by
+            // Python/most language runtimes) reads these to resolve hostnames.
+            // All are optional: not every distro/config uses all of them, and a
+            // missing rule here must not turn into a startup failure.
+            ("/etc/resolv.conf", AccessFs::ReadFile.into(), false),
+            ("/etc/nsswitch.conf", AccessFs::ReadFile.into(), false),
+            ("/etc/hosts", AccessFs::ReadFile.into(), false),
+            ("/etc/gai.conf", AccessFs::ReadFile.into(), false),
+            // systemd-resolved: /etc/resolv.conf is commonly a symlink into this
+            // directory, and glibc's nss-resolve module connects to the
+            // `io.systemd.Resolve` varlink socket here. WriteFile is required
+            // because Landlock treats AF_UNIX connect() like a file open with
+            // read+write access rights.
+            (
+                "/run/systemd/resolve",
+                AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
+                false,
+            ),
+            // TLS trust store: OpenSSL/GnuTLS read the CA bundle from here to
+            // verify certificates. Without a rule, any HTTPS request from a
+            // sandboxed child fails with "unable to get local issuer
+            // certificate" even though the socket itself connects fine.
+            //
+            // These are deliberately the certificate subpaths rather than
+            // `/etc/ssl` as a whole: `PathBeneath` is recursive, and `/etc/ssl`
+            // also contains `private/`, the conventional home for server private
+            // keys. Landlock only ever restricts — it cannot grant access DAC
+            // already denies — but there is no reason to hand the sandbox a rule
+            // covering key material it never needs.
+            //
+            // Both the link and its target must be covered: Landlock authorizes
+            // the *resolved* path, and on Arch-family systems the entries under
+            // `/etc/ssl` are symlinks into `/etc/ca-certificates/extracted`
+            // (`/etc/ssl/cert.pem` -> `../ca-certificates/extracted/tls-ca-bundle.pem`),
+            // so a rule covering only the link would authorize nothing. `/etc/pki`
+            // is the RHEL/Fedora layout. Debian's `/usr/share/ca-certificates`
+            // already falls under the `/usr` rule above.
+            //
+            // ReadDir is required alongside ReadFile because OpenSSL's hashed
+            // `capath` lookup (`/etc/ssl/certs`) enumerates the directory.
+            (
+                "/etc/ssl/certs",
+                AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
+            ("/etc/ssl/cert.pem", AccessFs::ReadFile.into(), false),
+            // OpenSSL reads its config at library init; without a rule it falls
+            // back to built-in defaults, which can change verification behaviour.
+            ("/etc/ssl/openssl.cnf", AccessFs::ReadFile.into(), false),
+            (
+                "/etc/ca-certificates",
+                AccessFs::ReadFile | AccessFs::ReadDir,
+                false,
+            ),
+            ("/etc/pki", AccessFs::ReadFile | AccessFs::ReadDir, false),
         ] {
             match PathFd::new(Path::new(allow_path)) {
                 Ok(path_fd) => {
