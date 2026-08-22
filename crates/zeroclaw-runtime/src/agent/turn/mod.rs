@@ -978,14 +978,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
             Err(e) => {
                 if !has_accounted_rejections
-                    && let Some(rejected) = e.chain().find_map(|cause| {
-                        cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
-                    })
+                    && let Some(usage) = execution::rejected_terminal_usage(&e)
                 {
                     crate::agent::cost::record_rejected_tool_loop_cost_usage(
                         ctx.provider_name,
                         ctx.model,
-                        &rejected.usage,
+                        usage,
                     );
                 }
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);

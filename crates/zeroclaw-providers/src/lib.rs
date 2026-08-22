@@ -28,11 +28,17 @@ pub mod reliable;
 pub mod router;
 pub(crate) mod stream_guard;
 pub mod telnyx;
+mod terminal;
 pub mod traits;
 pub mod vision_override;
 
 pub use dispatch::{AccountedChatResponse, ProviderDispatch, ProviderDispatchRef};
 pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyCompletion};
+pub use terminal::{
+    TerminalCompletionContext, TerminalCompletionPolicy, TerminalRecoveryDisposition,
+    TerminalUsageChargeability, billable_terminal_usage, default_terminal_policy,
+    terminal_completion_context,
+};
 
 mod request_payload;
 

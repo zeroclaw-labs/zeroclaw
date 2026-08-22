@@ -236,6 +236,12 @@ impl AccountedChatScope {
         crate::reliable::record_rejected_stream_usage(usage)
     }
 
+    /// Whether the active stream belongs to an exact Reliable candidate that
+    /// may be advanced after a replay-safe terminal failure.
+    pub fn has_pending_reliable_stream_attempt(&self) -> bool {
+        crate::reliable::has_pending_reliable_stream_attempt()
+    }
+
     /// Preserve a semantic-empty stream cause across the exact-entry recovery walk.
     pub fn mark_stream_recovery_semantic_empty(&self) {
         crate::reliable::mark_stream_recovery_semantic_empty();
@@ -350,6 +356,31 @@ impl ProviderDispatch {
         stream::poll_fn(move |cx| {
             let _enter = model_scope.enter();
             inner_stream.as_mut().poll_next(cx)
+        })
+        .boxed()
+    }
+
+    /// Stream chat while preserving provider-owned terminal policy through the
+    /// dispatch boundary without changing the public response schema.
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let inner_stream = self.stream_chat(request, model, temperature, options);
+        drop(scope);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
         })
         .boxed()
     }
@@ -562,6 +593,30 @@ impl<'a> ProviderDispatchRef<'a> {
         stream::poll_fn(move |cx| {
             let _enter = model_scope.enter();
             inner_stream.as_mut().poll_next(cx)
+        })
+        .boxed()
+    }
+
+    /// Borrowed equivalent of [`ProviderDispatch::stream_chat_terminal_aware`].
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let inner_stream = self.stream_chat(request, model, temperature, options);
+        drop(scope);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
         })
         .boxed()
     }

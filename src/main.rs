@@ -7867,8 +7867,9 @@ fn build_sop_adapters(config: &Config) -> zeroclaw_runtime::sop::SopEngineAdapte
                 };
                 let model = entry.model.clone().unwrap_or_else(|| "default".to_string());
                 Some(std::sync::Arc::new(
-                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::new(
+                    zeroclaw_runtime::sop::capability::ProviderLlmAdapter::with_provider_name(
                         std::sync::Arc::from(provider),
+                        provider_type.to_string(),
                         model,
                     ),
                 ) as _)

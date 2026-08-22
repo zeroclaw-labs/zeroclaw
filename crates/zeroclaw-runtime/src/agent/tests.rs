@@ -117,6 +117,60 @@ impl ::zeroclaw_api::attribution::Attributable for FailingModelProvider {
     }
 }
 
+/// Direct provider fixture for failures that carry rejected usage without a
+/// Reliable sidecar. The main turn must account for these exactly once.
+enum DirectTypedFailure {
+    Terminal(zeroclaw_api::model_provider::TerminalCompletionFailure),
+    Semantic(zeroclaw_providers::traits::TokenUsage),
+}
+
+struct DirectTypedFailureProvider {
+    failure: DirectTypedFailure,
+}
+
+#[async_trait]
+impl ModelProvider for DirectTypedFailureProvider {
+    async fn chat_with_system(
+        &self,
+        _system_prompt: Option<&str>,
+        _message: &str,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<String> {
+        anyhow::bail!("unused")
+    }
+
+    async fn chat(
+        &self,
+        _request: ChatRequest<'_>,
+        _model: &str,
+        _temperature: Option<f64>,
+    ) -> Result<ChatResponse> {
+        match &self.failure {
+            DirectTypedFailure::Terminal(failure) => Err(anyhow::Error::new(failure.clone())),
+            DirectTypedFailure::Semantic(usage) => Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalFailure::new(Some(
+                    usage.clone(),
+                )),
+            )),
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for DirectTypedFailureProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+            ),
+        )
+    }
+
+    fn alias(&self) -> &str {
+        "DirectTypedFailureProvider"
+    }
+}
+
 /// A simple echo tool that returns its arguments as output.
 struct EchoTool;
 
@@ -960,6 +1014,55 @@ async fn turn_rejects_think_tag_only_response_and_records_usage() {
     let recorded = *turn_usage.lock();
     assert_eq!(recorded.input_tokens, 10);
     assert_eq!(recorded.output_tokens, 5);
+}
+
+#[tokio::test]
+async fn turn_records_direct_typed_failure_usage_as_rejected() {
+    use crate::agent::cost::{
+        TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+        TurnUsage,
+    };
+
+    let usage = zeroclaw_providers::traits::TokenUsage {
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        cached_input_tokens: None,
+    };
+    let failures = [
+        DirectTypedFailure::Terminal(
+            zeroclaw_api::model_provider::TerminalCompletionFailure::new(
+                zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                Some(usage.clone()),
+            ),
+        ),
+        DirectTypedFailure::Semantic(usage),
+    ];
+
+    for failure in failures {
+        let mut agent = build_agent_with(
+            Box::new(DirectTypedFailureProvider { failure }),
+            vec![],
+            Box::new(NativeToolDispatcher),
+        );
+        let cost_context = ToolLoopCostTrackingContext::usage_only();
+        let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+
+        TOOL_LOOP_TURN_USAGE
+            .scope(
+                Some(Arc::clone(&turn_usage)),
+                TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), agent.turn("hi")),
+            )
+            .await
+            .expect_err("direct typed terminal failure must fail the turn");
+
+        let recorded = *turn_usage.lock();
+        assert_eq!(recorded.input_tokens, 10);
+        assert_eq!(recorded.output_tokens, 5);
+        assert_eq!(
+            recorded.last_input_tokens, 0,
+            "rejected direct usage must not become accepted context fill"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

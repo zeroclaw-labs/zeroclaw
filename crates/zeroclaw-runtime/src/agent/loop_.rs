@@ -4196,7 +4196,7 @@ mod tests {
     #[test]
     fn direct_cli_terminal_completion_projection_localizes_delivery() {
         let error =
-            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+            anyhow::Error::new(crate::agent::turn::outcome::SemanticEmptyTerminalCompletion);
         let diagnostic = error.to_string();
 
         let projected = super::project_cli_terminal_completion_error(error);
