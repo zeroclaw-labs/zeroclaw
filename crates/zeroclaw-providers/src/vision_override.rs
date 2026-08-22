@@ -66,6 +66,31 @@ impl ModelProvider for VisionOverrideProvider {
         capabilities
     }
 
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<super::traits::ProviderCapabilities> {
+        // Forward the async, fallible capability resolution to the inner
+        // provider so a catalog/outage failure surfaces as `Err` (capability
+        // unknown) rather than being swallowed by the warm-then-sync default.
+        // This is what lets a caller at an image gate treat the result as
+        // unknown instead of silently stripping the attachment and dispatching
+        // a text-only request. An explicit `Some(true/false)` override remains
+        // authoritative: it decides the vision outcome itself, so a downstream
+        // catalog/outage failure must not block a decision that is already
+        // known — a `None` override fully delegates to the inner provider and
+        // propagates its error.
+        let mut capabilities = match self.inner.resolve_capabilities_for_model(model).await {
+            Ok(caps) => caps,
+            Err(_) if self.supports_vision.is_some() => self.capabilities(),
+            Err(err) => return Err(err),
+        };
+        if let Some(supports_vision) = self.supports_vision {
+            capabilities.vision = supports_vision;
+        }
+        Ok(capabilities)
+    }
+
     async fn warm_capabilities_metadata(&self) {
         self.inner.warm_capabilities_metadata().await
     }
@@ -426,5 +451,68 @@ mod tests {
         let stable_inner = VisionOverrideProvider::factory_leaf(Box::new(PricedVisionFake), None);
         let stable = VisionOverrideProvider::new(Box::new(stable_inner), false);
         assert!(stable.has_stable_request_identity("model"));
+    }
+
+    /// Build the factory-shaped chain
+    /// `VisionOverrideProvider → ModelPinnedProvider → ReliableModelProvider`
+    /// around a credentialed compatible provider with a `models_dev_key`, given
+    /// an optional explicit vision override.
+    fn build_factory_chain(vision_override: Option<bool>) -> VisionOverrideProvider {
+        let compatible = crate::compatible::OpenAiCompatibleModelProvider::builder("test")
+            .display_name("factory-chain")
+            .base_url("https://example.com/v1")
+            .credential(Some("fake-key"))
+            .auth_style(crate::compatible::AuthStyle::Bearer)
+            .models_dev_key("factory-chain-key")
+            .build();
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "reliable-alias",
+            vec![("compatible".to_string(), Box::new(compatible))],
+            0,
+            100,
+        );
+        let pinned = crate::model_pin::ModelPinnedProvider::builder("pin-alias")
+            .pinned_model("some-model")
+            .inner(Box::new(reliable))
+            .build();
+        VisionOverrideProvider::factory_leaf(Box::new(pinned), vision_override)
+    }
+
+    /// A catalog outage on a credentialed compatible provider must surface as
+    /// `Err` through the entire factory-shaped chain, so an image gate can
+    /// treat the vision decision as unknown instead of silently stripping the
+    /// attachment. The outage is forced through the isolated resolve seam (a
+    /// fresh local cache + failing lifecycle), never the process-global
+    /// `CACHED_CATALOG` — so this test is order-independent.
+    #[tokio::test]
+    async fn factory_chain_forwarding_surfaces_catalog_outage() {
+        use crate::models_dev::ResolveCatalogIsolationGuard;
+        let _guard = ResolveCatalogIsolationGuard::install_with_failing_fetch().await;
+
+        let chain = build_factory_chain(None);
+        let result = chain.resolve_capabilities_for_model("some-model").await;
+        assert!(
+            result.is_err(),
+            "a catalog outbreak must fail the resolve through the whole chain, got {result:?}"
+        );
+    }
+
+    /// An explicit `Some(true)` override is authoritative: even when the inner
+    /// catalog fetch would fail, the known vision decision wins and the chain
+    /// returns `Ok` with `vision == true`.
+    #[tokio::test]
+    async fn factory_chain_explicit_override_is_authoritative_over_outage() {
+        use crate::models_dev::ResolveCatalogIsolationGuard;
+        let _guard = ResolveCatalogIsolationGuard::install_with_failing_fetch().await;
+
+        let chain = build_factory_chain(Some(true));
+        let capabilities = chain
+            .resolve_capabilities_for_model("some-model")
+            .await
+            .expect("an explicit vision override must stay authoritative over a catalog outbreak");
+        assert!(
+            capabilities.vision,
+            "an explicit Some(true) override must win even when the catalog fails"
+        );
     }
 }

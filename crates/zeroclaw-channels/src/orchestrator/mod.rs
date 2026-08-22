@@ -14697,8 +14697,8 @@ api_key = "anthropic-key"
 
     #[tokio::test]
     async fn process_channel_message_keeps_configured_vision_route_on_primary_catalog_unknown() {
-        // 08-13 regression: a primary catalog outage means capability is UNKNOWN,
-        // not "no vision". When a dedicated `vision_model_provider` is configured,
+        // Invariant: a primary catalog outage means capability is UNKNOWN, not
+        // "no vision". When a dedicated `vision_model_provider` is configured,
         // the phase-2 gate must keep it usable: do NOT surface the catalog-outage
         // message or return — record the (non-blocking) warning and carry the image
         // marker forward so the runtime turn's vision route can actually process it.

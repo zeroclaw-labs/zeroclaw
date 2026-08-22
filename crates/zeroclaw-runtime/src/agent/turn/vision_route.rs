@@ -752,9 +752,9 @@ model = "vision-model"
         }
     }
 
-    /// 08-13 regression: when the primary provider's capability resolve fails
-    /// (catalog unknown) but a dedicated `vision_model_provider` is configured,
-    /// the unknown must NOT be read as "no vision" that errors out — the
+    /// Invariant: when the primary provider's capability resolve fails (catalog
+    /// unknown) but a dedicated `vision_model_provider` is configured, the
+    /// unknown must NOT be read as "no vision" that errors out — the
     /// configured vision route stays usable and is returned for the iteration.
     #[tokio::test]
     async fn resolve_vision_provider_routes_to_configured_vision_on_primary_unknown() {
@@ -823,7 +823,7 @@ model = "vision-model"
         server.abort();
     }
 
-    /// 08-13 regression: primary capability unknown + a latest-user image + no
+    /// Invariant: primary capability unknown + a latest-user image + no
     /// configured vision provider must surface the failure rather than reporting
     /// "does not support vision" on the primary (which would be a false negative).
     #[tokio::test]
@@ -853,10 +853,10 @@ model = "vision-model"
         );
     }
 
-    /// 08-13 regression: a carried-over (earlier-user) image with primary
-    /// capability unknown and no vision route must surface the failure — NOT
-    /// strip the image to a text-only degrade (unknown must be distinguished
-    /// from the authoritative no-vision that legitimately degrades).
+    /// Invariant: a carried-over (earlier-user) image with primary capability
+    /// unknown and no vision route must surface the failure — NOT strip the
+    /// image to a text-only degrade (unknown must be distinguished from the
+    /// authoritative no-vision that legitimately degrades).
     #[tokio::test]
     async fn resolve_vision_provider_does_not_strip_on_primary_unknown_carried_over() {
         let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
