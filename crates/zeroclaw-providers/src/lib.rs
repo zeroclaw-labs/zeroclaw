@@ -36,6 +36,35 @@ pub use reliable::{ReliableRejectedCompletionUsage, ReliableSemanticEmptyComplet
 
 mod request_payload;
 
+#[cfg(test)]
+pub(crate) static RUNTIME_PROXY_TEST_LOCK: tokio::sync::Mutex<()> =
+    tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+pub(crate) struct RuntimeProxyTestGuard {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl RuntimeProxyTestGuard {
+    pub(crate) async fn acquire() -> Self {
+        let guard = RUNTIME_PROXY_TEST_LOCK.lock().await;
+        zeroclaw_config::schema::set_runtime_proxy_config(
+            zeroclaw_config::schema::ProxyConfig::default(),
+        );
+        Self { _guard: guard }
+    }
+}
+
+#[cfg(test)]
+impl Drop for RuntimeProxyTestGuard {
+    fn drop(&mut self) {
+        zeroclaw_config::schema::set_runtime_proxy_config(
+            zeroclaw_config::schema::ProxyConfig::default(),
+        );
+    }
+}
+
 #[allow(unused_imports)]
 pub use traits::{
     ChatMessage, ChatRequest, ChatResponse, ConversationMessage, ModelProvider,
