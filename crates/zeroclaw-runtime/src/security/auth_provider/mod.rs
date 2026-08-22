@@ -27,6 +27,10 @@
 //! an empty registry rejects everything — wiring it on is a deliberate, later
 //! step.
 
+pub mod oidc;
+
+pub use oidc::OidcAuthProvider;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
