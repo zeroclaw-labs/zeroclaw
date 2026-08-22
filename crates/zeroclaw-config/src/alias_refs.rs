@@ -364,6 +364,9 @@ fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
         .retain(|r| r.model_provider.trim() != target);
     cfg.embedding_routes
         .retain(|r| r.model_provider.trim() != target);
+    if cfg.eval.live_provider.trim() == target {
+        cfg.eval.live_provider = crate::providers::ModelProviderRef::default();
+    }
 }
 
 fn delete_agent(
@@ -833,6 +836,10 @@ fn rewrite_model_provider_refs(
     if embed_touched {
         dirty.push("embedding_routes".to_string());
     }
+    if cfg.eval.live_provider.trim() == old_target {
+        cfg.eval.live_provider = new_target.as_str().into();
+        dirty.push("eval.live_provider".to_string());
+    }
     dirty
 }
 
@@ -1056,6 +1063,19 @@ fn collect_provider_refs(
                         route.model_provider.as_str(),
                     ));
                 }
+            }
+            // Global `[eval].live_provider`. SOFT/ClearOptional: live mode is
+            // opt-in and an empty value already means "live mode unconfigured",
+            // so deleting the provider clears the field rather than refusing.
+            // `Config::validate()` treats a set-but-dangling value as an error,
+            // so this site must be walked or rename/delete leave the config
+            // failing its own validation.
+            if cfg.eval.live_provider.trim() == target {
+                sites.push(RefSite::soft(
+                    "eval.live_provider".to_string(),
+                    ScrubAction::ClearOptional,
+                    cfg.eval.live_provider.as_str(),
+                ));
             }
         }
         // TTS / transcription preferences are optional scalars (empty = opt-out),
@@ -1339,6 +1359,86 @@ mod tests {
         );
         assert_eq!(report.blockers.len(), 1);
         assert_eq!(report.scrubs.len(), 2);
+    }
+
+    #[test]
+    fn collect_provider_refs_reports_eval_live_provider_site() {
+        // `[eval].live_provider` is validated as a provider alias by
+        // Config::validate, so it must also be discoverable by the reference
+        // graph; otherwise rename/delete leave the config failing validation.
+        let mut cfg = empty_config();
+        cfg.eval.live_provider = "anthropic.default".into();
+
+        let kind = provider_kind("anthropic");
+        let sites = find_all_references(&cfg, &kind, "default");
+        let site = sites
+            .iter()
+            .find(|s| s.path == "eval.live_provider")
+            .unwrap_or_else(|| panic!("eval.live_provider must be a discovered site: {sites:?}"));
+        assert_eq!(site.strength, RefStrength::Soft);
+        assert_eq!(site.action, ScrubAction::ClearOptional);
+        assert_eq!(site.raw_value, "anthropic.default");
+
+        // Anti-vacuity: an unrelated provider is not reported.
+        assert!(
+            find_all_references(&cfg, &provider_kind("openai"), "default")
+                .iter()
+                .all(|s| s.path != "eval.live_provider")
+        );
+    }
+
+    #[test]
+    fn delete_provider_alias_clears_eval_live_provider() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.eval.live_provider = "anthropic.default".into();
+
+        let kind = provider_kind("anthropic");
+        let report = delete_with_cascade(&mut cfg, &kind, "default", CascadePolicy::RefuseOnHard)
+            .expect("a soft eval ref must not block the delete");
+
+        assert!(
+            cfg.eval.live_provider.is_empty(),
+            "deleting the provider must clear eval.live_provider, got {:?}",
+            cfg.eval.live_provider
+        );
+        assert!(
+            report
+                .applied
+                .iter()
+                .any(|s| s.path == "eval.live_provider"),
+            "the scrub must be reported as applied: {:?}",
+            report.applied
+        );
+        assert!(
+            report
+                .dirty_paths()
+                .iter()
+                .any(|p| p == "eval.live_provider"),
+            "the eval field must be marked dirty so the write-back persists: {:?}",
+            report.dirty_paths()
+        );
+        // The post-condition walk sees no dangling reference.
+        assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn rename_provider_alias_rewrites_eval_live_provider() {
+        let mut cfg = cfg_with_provider("openai", "primary");
+        cfg.eval.live_provider = "openai.primary".into();
+
+        let report = rename_with_cascade(&mut cfg, &provider_kind("openai"), "primary", "main")
+            .expect("rename must succeed");
+
+        assert_eq!(
+            cfg.eval.live_provider.as_str(),
+            "openai.main",
+            "rename must rewrite eval.live_provider"
+        );
+        assert!(
+            report.dirty_paths.iter().any(|p| p == "eval.live_provider"),
+            "the eval field must be marked dirty so the rename persists: {:?}",
+            report.dirty_paths
+        );
     }
 
     #[test]
