@@ -11726,6 +11726,12 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
         println!("  ℹ️  Webhook   check via `zeroclaw gateway` then GET /health");
     }
 
+    if !config_arc.read().channels.wecom.is_empty() {
+        println!(
+            "  ℹ️  WeCom     healthy = configuration check only (the webhook API has no message-free probe); delivery is validated on real sends"
+        );
+    }
+
     println!();
     println!("Summary: {healthy} healthy, {unhealthy} unhealthy, {timeout} timed out");
     Ok(())
