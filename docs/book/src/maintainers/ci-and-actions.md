@@ -16,6 +16,7 @@ Composite job with multiple matrix legs:
 - **check-32bit**: `i686-unknown-linux-gnu` with no default features
 - **bench**: benchmarks compile check
 - **test**: the standalone firmware protocol host gate from `scripts/ci/firmware_protocol_gate.sh` and `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on Linux, including the config-write isolation and Fluent coverage (no bare user-facing strings) architecture guards
+- **memory-postgres-test**: `cargo nextest run --locked -p zeroclaw-memory --features memory-postgres`, followed by the crate's serial ignored acceptance tests against an ephemeral PostgreSQL 17 service
 - **parallel-runtime-test**: repeated same-process runtime/channel tests from `scripts/ci/parallel_runtime_test_gate.sh`, run in parallel with the main test job for relevant PR paths and unconditionally on `master` pushes and merge queue runs
 - **security**: `cargo deny check`
 - **nix-eval**: evaluates the NixOS module assertions (`nixos-module-eval` flake check)
@@ -32,6 +33,8 @@ Fresh required CI is normally the shared evidence for the Cargo surfaces it actu
 - stale, cancelled, skipped, or unavailable CI is not fresh evidence.
 
 When a definition or import is feature-gated, compare its `cfg` predicate with every consumer. Validate both the enabled configuration and each relevant disabled configuration: an enabled-feature pass proves the consumer still works, while the workspace-wide no-default-features check catches warning-producing mismatches such as unused private definitions or imports. That pass runs `cargo check` without `--all-targets`, so it never compiles test targets: a helper gated on plain `test` whose only callers sit behind a feature is caught by the default-features/all-targets leg instead. Targeted feature combinations remain necessary when neither required CI configuration exercises the changed predicate.
+
+The PostgreSQL memory job runs all non-ignored `zeroclaw-memory` tests with `memory-postgres` enabled, then runs the crate's ignored tests serially with `ZEROCLAW_TEST_POSTGRES_URL` pointed at its disposable service. To reproduce the database-backed half locally, provide an isolated PostgreSQL database and run `ZEROCLAW_TEST_POSTGRES_URL=postgres://<user>:<password>@127.0.0.1:5432/<database> cargo test --locked -p zeroclaw-memory --features memory-postgres -- --ignored --test-threads=1`. Each acceptance test owns a uniquely named schema and drops only that schema.
 
 ### Scheduled Platform Tests (`platform-tests.yml`)
 

@@ -71,6 +71,7 @@ tag push.
    - `check-32bit`: `i686-unknown-linux-gnu`, no default features.
    - `bench`: benchmarks compile check.
    - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
+   - `memory-postgres-test`: feature-enabled `zeroclaw-memory` tests plus serial database-backed acceptance tests against an ephemeral PostgreSQL 17 service.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
 3. When the PR changes `platform-tests.yml`, that workflow checks formatting,
@@ -141,6 +142,7 @@ flowchart TD
   A -. "workflow changed" .-> P["platform-tests.yml"]
   B --> L["lint\nfmt · clippy"]
   L --> T["test\ncargo nextest --workspace"]
+  L --> PG["memory-postgres-test\nfeature · database acceptance"]
   P --> PF["fmt"]
   PF --> PT["macOS · Windows\nscheduled nextest"]
   L --> BLD["build\nLinux · macOS · Windows"]
@@ -148,7 +150,7 @@ flowchart TD
   L --> C32["check-32bit\ni686-unknown-linux-gnu"]
   L --> BCH["bench\ncompile check"]
   L --> SEC["security\ncargo deny check"]
-  T & BLD & CHK & C32 & BCH & SEC --> G["CI Required Gate"]
+  T & PG & BLD & CHK & C32 & BCH & SEC --> G["CI Required Gate"]
   G -->|red| D["PR stays open"]
   G -->|green| R["Maintainer merges (squash) → master"]
 ```
