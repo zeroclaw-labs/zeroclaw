@@ -1097,6 +1097,23 @@ impl GeminiModelProvider {
         if let Some(instructions) = tool_instructions {
             system_parts.push(instructions);
         }
+        // Gemini rejects a request whose last turn is a model turn. History
+        // trims, session restores, and steering continuations can all leave the
+        // history ending on the model's own output, so drop the trailing model
+        // turns. The last surviving turn must be a user turn, or a bare request
+        // falls back to a user placeholder.
+        while contents
+            .last()
+            .is_some_and(|c| c.role.as_deref() == Some("model"))
+        {
+            contents.pop();
+        }
+        if contents.is_empty() {
+            contents.push(Content {
+                role: Some("user".to_string()),
+                parts: vec![Part::text("[continue]")],
+            });
+        }
         let system_instruction = if system_parts.is_empty() {
             None
         } else {
@@ -2663,7 +2680,6 @@ mod tests {
         let messages = vec![
             ChatMessage::system("You are helpful"),
             ChatMessage::user("Hello [IMAGE:data:image/png;base64,AA==]"),
-            ChatMessage::assistant("I see the image"),
         ];
 
         let (contents, system_instruction) =
@@ -2675,7 +2691,7 @@ mod tests {
             matches!(&system_instruction.parts[0], Part::Text { text } if text == "You are helpful")
         );
 
-        assert_eq!(contents.len(), 2);
+        assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].role.as_deref(), Some("user"));
         assert!(
             contents[0]
@@ -2683,8 +2699,32 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, Part::Inline { .. }))
         );
-        assert_eq!(contents[1].role.as_deref(), Some("model"));
-        assert!(matches!(&contents[1].parts[0], Part::Text { text } if text == "I see the image"));
+    }
+
+    #[test]
+    fn chat_contents_drop_trailing_model_turn() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("I see the image"),
+        ];
+
+        let (contents, _system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, None);
+
+        assert_eq!(contents.len(), 1, "trailing model turn must be dropped");
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn chat_contents_standalone_model_history_falls_back_to_user() {
+        let messages = vec![ChatMessage::assistant("I see the image")];
+
+        let (contents, _system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, None);
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
     }
 
     #[test]

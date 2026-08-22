@@ -572,16 +572,8 @@ pub struct TelegramChannel {
     proxy_url: Option<String>,
     /// Pre-computed tool command specs (name, description) for bot command registration.
     tool_command_specs: Vec<(String, String)>,
-    /// Pending approval requests: callback_data key → oneshot sender.
-    /// `listen()` resolves these when a matching `callback_query` arrives.
-    pending_approvals: Arc<
-        tokio::sync::Mutex<
-            std::collections::HashMap<
-                String,
-                tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
-            >,
-        >,
-    >,
+    /// pending approval requests: callback_data key → pending approval
+    pending_approvals: Arc<tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>>,
     /// Seconds to wait for the operator to tap an inline-keyboard button on a
     /// tool approval prompt before auto-denying. Configurable via
     /// `channels.telegram.approval_timeout_secs`. Default: 120.
@@ -593,6 +585,12 @@ enum EditMessageResult {
     Success,
     NotModified,
     Failed(reqwest::StatusCode),
+}
+
+/// a tool approval awaiting an inline-keyboard tap
+struct PendingApproval {
+    sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
+    tool_name: String,
 }
 
 /// Outcome of attempting to parse a single incoming Telegram update.
@@ -3483,6 +3481,153 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .await
     }
 
+    /// handle a tool-approval `callback_query`: resolve the pending approval,
+    /// dismiss the spinner, and rewrite the prompt with the outcome, dropping
+    /// the buttons
+    /// best-effort rewrite, a stale tap is a no-op
+    async fn handle_approval_callback(&self, cb: &serde_json::Value) {
+        let cb_id = cb
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let cb_data = cb
+            .get("data")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        let Some(rest) = cb_data.strip_prefix("approval:") else {
+            return;
+        };
+        let Some((approval_id, action)) = rest.rsplit_once(':') else {
+            return;
+        };
+
+        let response = match action {
+            "approve" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
+            "always" => Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove),
+            "deny" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
+            other => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"other": other})),
+                    "Unknown approval callback action"
+                );
+                None
+            }
+        };
+
+        // keep the tool name so the prompt can be rewritten below
+        let resolved_tool = if let Some(resp) = response
+            && let Some(pending) = self.pending_approvals.lock().await.remove(approval_id)
+        {
+            let _ = pending.sender.send(resp);
+            Some(pending.tool_name)
+        } else {
+            None
+        };
+
+        // dismiss the client spinner
+        let answer_text = match action {
+            "approve" => format!(
+                "✅ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
+            ),
+            "always" => format!(
+                "✅✅ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-always-approved")
+            ),
+            "deny" => format!(
+                "❌ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-denied")
+            ),
+            _ => format!(
+                "⚠️ {}",
+                i18n::get_required_cli_string("channel-telegram-approval-ack-unknown")
+            ),
+        };
+        let answer_body = serde_json::json!({
+            "callback_query_id": cb_id,
+            "text": answer_text,
+        });
+        if let Err(e) = self
+            .http_client()
+            .post(self.api_url("answerCallbackQuery"))
+            .json(&answer_body)
+            .send()
+            .await
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                "answerCallbackQuery failed"
+            );
+        }
+
+        // rewrite the prompt in place, dropping the keyboard
+        if let Some(tool_name) = resolved_tool {
+            let chat_id = cb
+                .get("message")
+                .and_then(|m| m.get("chat"))
+                .and_then(|c| c.get("id"))
+                .and_then(serde_json::Value::as_i64);
+            let message_id = cb
+                .get("message")
+                .and_then(|m| m.get("message_id"))
+                .and_then(serde_json::Value::as_i64);
+            let user_first_name = cb
+                .get("from")
+                .and_then(|f| f.get("first_name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Operator");
+
+            if let (Some(chat_id), Some(message_id)) = (chat_id, message_id) {
+                let edit_body = serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": format!("{} by {}: {}", answer_text, user_first_name, tool_name),
+                    "reply_markup": {},
+                });
+                match self
+                    .http_client()
+                    .post(self.api_url("editMessageText"))
+                    .json(&edit_body)
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        if let EditMessageResult::Failed(status) =
+                            Self::classify_edit_message_response(resp).await
+                        {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"status": status.to_string()})),
+                                "editMessageText (approval resolution) failed"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
+                            "editMessageText (approval resolution) request failed"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     /// Fixed, bounded delay between retries of a transiently failing update.
     /// The attempt count is diagnostic only: only an explicitly permanent
     /// disposition may advance the Telegram offset.
@@ -3508,89 +3653,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
 
         // ── Handle callback_query (inline keyboard taps) ──
         if let Some(cb) = update.get("callback_query") {
-            let cb_id = cb
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            let cb_data = cb
-                .get("data")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-
-            if let Some(rest) = cb_data.strip_prefix("approval:")
-                && let Some((approval_id, action)) = rest.rsplit_once(':')
-            {
-                let response = match action {
-                    "approve" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Approve),
-                    "always" => Some(zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove),
-                    "deny" => Some(zeroclaw_api::channel::ChannelApprovalResponse::Deny),
-                    other => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"other": other})),
-                            "Unknown approval callback action"
-                        );
-                        None
-                    }
-                };
-
-                if let Some(resp) = response
-                    && let Some(sender) = self.pending_approvals.lock().await.remove(approval_id)
-                {
-                    let _ = sender.send(resp);
-                }
-
-                // Answer the callback query to dismiss the spinner.
-                let answer_text = match action {
-                    "approve" => format!(
-                        "✅ {}",
-                        i18n::get_required_cli_string("channel-telegram-approval-ack-approved")
-                    ),
-                    "always" => format!(
-                        "✅✅ {}",
-                        i18n::get_required_cli_string(
-                            "channel-telegram-approval-ack-always-approved"
-                        )
-                    ),
-                    "deny" => format!(
-                        "❌ {}",
-                        i18n::get_required_cli_string("channel-telegram-approval-ack-denied")
-                    ),
-                    _ => format!(
-                        "⚠️ {}",
-                        i18n::get_required_cli_string("channel-telegram-approval-ack-unknown")
-                    ),
-                };
-                let answer_body = serde_json::json!({
-                    "callback_query_id": cb_id,
-                    "text": answer_text,
-                });
-                if let Err(e) = self
-                    .http_client()
-                    .post(self.api_url("answerCallbackQuery"))
-                    .json(&answer_body)
-                    .send()
-                    .await
-                {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": zeroclaw_runtime::security::scrub(&format!("{}", e))})),
-                        "answerCallbackQuery failed"
-                    );
-                }
-            }
+            self.handle_approval_callback(cb).await;
 
             // A callback_query is terminal for inbound processing: there is
             // no message to deliver downstream, so nothing can be lost by
-            // acknowledging it. The answerCallbackQuery above is a
-            // best-effort UI acknowledgement — it does perform HTTP I/O and
+            // acknowledging it. The spinner dismissal above is best-effort:
+            // it does perform HTTP I/O and
             // its failure is logged, but a failed spinner dismissal must not
             // hold up the offset, since retrying the update would re-run the
             // approval side effect that has already been applied.
@@ -4518,10 +4586,13 @@ Ensure only one `zeroclaw` process is using this bot token."
         // Register the oneshot BEFORE sending the message to avoid a race
         // where the user taps the button before the sender is in the map.
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.pending_approvals
-            .lock()
-            .await
-            .insert(approval_id.clone(), tx);
+        self.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                tool_name: request.tool_name.clone(),
+            },
+        );
 
         let resp = self
             .http_client()
@@ -10014,18 +10085,92 @@ mod tests {
         let approval_id = "test-approval-123".to_string();
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        ch.pending_approvals
-            .lock()
-            .await
-            .insert(approval_id.clone(), tx);
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                tool_name: "shell".to_string(),
+            },
+        );
 
-        // Simulate what listen() does when a callback_query arrives
-        if let Some(sender) = ch.pending_approvals.lock().await.remove(&approval_id) {
-            sender.send(ChannelApprovalResponse::Approve).unwrap();
+        // simulate what listen() does when a callback_query arrives
+        if let Some(pending) = ch.pending_approvals.lock().await.remove(&approval_id) {
+            pending
+                .sender
+                .send(ChannelApprovalResponse::Approve)
+                .unwrap();
         }
 
         let result = rx.await.unwrap();
         assert_eq!(result, ChannelApprovalResponse::Approve);
+    }
+
+    #[tokio::test]
+    async fn approval_callback_edits_message_with_outcome_and_drops_keyboard() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 99 }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri());
+
+        let approval_id = "abc-123".to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.lock().await.insert(
+            approval_id.clone(),
+            PendingApproval {
+                sender: tx,
+                tool_name: "shell".to_string(),
+            },
+        );
+
+        let callback = serde_json::json!({
+            "id": "cb-1",
+            "from": { "first_name": "Alice" },
+            "message": { "message_id": 99, "chat": { "id": 12345 } },
+            "data": format!("approval:{approval_id}:approve"),
+        });
+
+        ch.handle_approval_callback(&callback).await;
+        assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::Approve);
+
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+
+        let edit = &requests[1];
+        assert!(edit.url.path().ends_with("/editMessageText"));
+        let body: serde_json::Value = serde_json::from_slice(&edit.body).unwrap();
+        assert_eq!(body["chat_id"], 12345);
+        assert_eq!(body["message_id"], 99);
+        let approved = i18n::get_required_cli_string("channel-telegram-approval-ack-approved");
+        assert_eq!(body["text"], format!("✅ {approved} by Alice: shell"));
+        assert_eq!(body["reply_markup"], serde_json::json!({}));
     }
 
     #[tokio::test]
