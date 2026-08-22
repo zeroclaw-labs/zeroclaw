@@ -525,8 +525,8 @@ struct ChannelRuntimeContext {
     session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
-    /// `[autonomy]` config; auto-denies tools that would need interactive
-    /// approval since no operator is present on channel runs.
+    /// `[risk_profiles]` config while preserving the initiating channel as a
+    /// backchannel for supervised shell approval.
     approval_manager: Arc<ApprovalManager>,
     activated_tools:
         Option<std::sync::Arc<std::sync::Mutex<zeroclaw_runtime::tools::ActivatedToolSet>>>,
@@ -551,6 +551,37 @@ struct ChannelRuntimeContext {
     persist_locks: Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+}
+
+/// Build the channel turn's non-interactive manager while retaining the
+/// initiating channel as an approval backchannel for supervised shell calls.
+fn channel_approval_manager(
+    risk_profile: &zeroclaw_config::schema::RiskProfileConfig,
+) -> ApprovalManager {
+    ApprovalManager::for_non_interactive_backchannel(risk_profile)
+}
+
+/// Create the approval state and channel for one channel-originated turn.
+/// Mutable `Always` grants stay on this fresh manager; an explicit approval
+/// route wraps the initiating channel so only `inherit-originator` can fall
+/// back to it.
+fn channel_turn_approval(
+    manager: &ApprovalManager,
+    risk_profile: Option<&zeroclaw_config::schema::RiskProfileConfig>,
+    channels_by_name: &HashMap<String, Arc<dyn Channel>>,
+    origin: Option<Arc<dyn Channel>>,
+) -> (ApprovalManager, Option<Arc<dyn Channel>>) {
+    let approval_channel = match risk_profile.and_then(|profile| profile.approval_route.clone()) {
+        Some(route) => {
+            let handles = Arc::new(RwLock::new(channels_by_name.clone()));
+            Some(zeroclaw_runtime::agent::agent::routed_approval_channel(
+                handles, route, origin,
+            ))
+        }
+        None => origin,
+    };
+
+    (manager.for_new_turn(), approval_channel)
 }
 
 /// Acquire the per-conversation-history-key persistence lock so that
@@ -6836,6 +6867,15 @@ async fn process_channel_message_body(
             (Some(channel), None) => Some(Arc::clone(channel)),
             (None, _) => None,
         };
+    let active_risk_profile = ctx
+        .prompt_config
+        .risk_profile_for_agent(ctx.agent_alias.as_str());
+    let (approval_manager, approval_channel) = channel_turn_approval(
+        &ctx.approval_manager,
+        active_risk_profile,
+        ctx.channels_by_name.as_ref(),
+        approval_channel,
+    );
 
     // Wrap observer to forward tool events as live thread messages.
     // Bounded so a slow downstream channel cannot grow this queue
@@ -6966,7 +7006,7 @@ async fn process_channel_message_body(
                         tools_registry: ctx.tools_registry.as_ref(),
                         observer: notify_observer.as_ref() as &dyn Observer,
                         silent: true,
-                        approval: Some(&*ctx.approval_manager),
+                        approval: Some(&approval_manager),
                         multimodal_config: &ctx.multimodal,
                         // Full config for the vision route to resolve the
                         // configured `vision_model_provider`'s alias options - the
@@ -9848,8 +9888,8 @@ fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str)
             .is_some_and(|(channel_type, _)| channel_type == message_base)
 }
 
-/// Active `<type>.<alias>` channel references from enabled agents and SOP
-/// approval routes.
+/// Active `<type>.<alias>` channel references from enabled agents and approval
+/// routes (SOP gates plus risk profiles used by enabled agents).
 ///
 /// When no agent declares channel bindings, collection falls back to legacy
 /// behavior and accepts all enabled channels.
@@ -9860,9 +9900,10 @@ struct ActiveChannelAliases {
     /// Bindings declared by all agents, including disabled owners. Their
     /// presence prevents legacy fallback from activating disabled channels.
     all_known_bindings: HashSet<String>,
-    /// `<type>.<alias>` named by an approval request or escalation route.
-    /// These channels are live to deliver and receive SOP gate replies, but
-    /// they remain absent from the agent ownership map for ordinary traffic.
+    /// `<type>.<alias>` named by an approval request, escalation route, or an
+    /// active agent's risk-profile approval route. These channels are live to
+    /// deliver approval replies, but remain absent from the agent ownership map
+    /// for ordinary traffic.
     approval_route_bindings: HashSet<String>,
 }
 
@@ -9884,11 +9925,28 @@ impl ActiveChannelAliases {
 
     /// Computes the canonical channel-binding view used by collection and
     /// startup checks. Disabled owners never activate channels, while an
-    /// explicit SOP approval route keeps its delivery channel live without
+    /// explicit approval route keeps its delivery channel live without
     /// assigning it to an agent.
     fn compute(config: &Config) -> Self {
         let configured_channel_aliases = config.channels_by_alias();
-        let approval_route_bindings = config
+        let resolve_route_channel_key = |channel_key: &str| {
+            if channel_key.is_empty() {
+                return Vec::new();
+            }
+            if channel_key.contains('.') {
+                return vec![channel_key.to_string()];
+            }
+
+            let enabled_aliases: Vec<_> = configured_channel_aliases
+                .iter()
+                .filter(|channel| channel.enabled && channel.channel_type == channel_key)
+                .collect();
+            match enabled_aliases.as_slice() {
+                [channel] => vec![format!("{}.{}", channel.channel_type, channel.alias)],
+                _ => vec![channel_key.to_string()],
+            }
+        };
+        let sop_route_channel_keys = config
             .sop
             .approval
             .policies
@@ -9902,20 +9960,17 @@ impl ActiveChannelAliases {
             .filter_map(|route| {
                 route.and_then(zeroclaw_runtime::sop::approval::channel_route::parse_approval_route)
             })
-            .flat_map(|(channel_key, _)| {
-                if channel_key.contains('.') {
-                    return vec![channel_key.to_string()];
-                }
-
-                let enabled_aliases: Vec<_> = configured_channel_aliases
-                    .iter()
-                    .filter(|channel| channel.enabled && channel.channel_type == channel_key)
-                    .collect();
-                match enabled_aliases.as_slice() {
-                    [channel] => vec![format!("{}.{}", channel.channel_type, channel.alias)],
-                    _ => vec![channel_key.to_string()],
-                }
-            })
+            .map(|(channel_key, _)| channel_key);
+        let risk_profile_route_channel_keys = config
+            .agents
+            .values()
+            .filter(|agent| agent.enabled)
+            .filter_map(|agent| config.risk_profiles.get(agent.risk_profile.trim()))
+            .filter_map(|profile| profile.approval_route.as_ref())
+            .map(|route| route.approver_channel.as_str());
+        let approval_route_bindings = sop_route_channel_keys
+            .chain(risk_profile_route_channel_keys)
+            .flat_map(resolve_route_channel_key)
             .collect();
 
         Self {
@@ -12601,7 +12656,7 @@ pub async fn start_channels(
             ack_reactions: config.channels.ack_reactions,
             show_tool_calls: config.channels.show_tool_calls,
             session_store: shared_session_store.clone(),
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
+            approval_manager: Arc::new(channel_approval_manager(&risk_profile)),
             activated_tools: ch_activated_handle,
             cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),
@@ -13280,6 +13335,67 @@ pub(crate) mod tests {
         if let Err(payload) = handle.join() {
             std::panic::resume_unwind(payload);
         }
+    }
+
+    #[test]
+    fn channel_approval_manager_prompts_for_supervised_shell() {
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: AutonomyLevel::Supervised,
+            allowed_commands: vec!["rm".to_string()],
+            block_high_risk_commands: false,
+            ..Default::default()
+        };
+        let manager = channel_approval_manager(&risk_profile);
+
+        assert_eq!(
+            manager.approval_requirement("shell"),
+            zeroclaw_runtime::approval::ApprovalRequirement::Prompt
+        );
+        assert!(manager.needs_approval("shell"));
+    }
+
+    #[test]
+    fn channel_turn_approval_freshens_state_and_selects_configured_route() {
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                approver_channel: "ops.default".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let manager = channel_approval_manager(&risk_profile);
+        manager.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "test.txt"}),
+            &zeroclaw_runtime::approval::ApprovalResponse::Always,
+            "origin",
+        );
+        let origin: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+
+        let (fresh, routed) = channel_turn_approval(
+            &manager,
+            Some(&risk_profile),
+            &HashMap::new(),
+            Some(Arc::clone(&origin)),
+        );
+
+        assert!(fresh.needs_approval("file_write"));
+        assert_eq!(
+            fresh.approval_requirement("shell"),
+            zeroclaw_runtime::approval::ApprovalRequirement::Prompt
+        );
+        assert!(fresh.session_allowlist().is_empty());
+        assert_eq!(
+            routed.expect("configured route wrapper").name(),
+            "approval-route"
+        );
+
+        let (_, origin_channel) =
+            channel_turn_approval(&manager, None, &HashMap::new(), Some(Arc::clone(&origin)));
+        assert!(
+            Arc::ptr_eq(&origin_channel.expect("origin approval channel"), &origin),
+            "without approval_route the initiating channel remains the approval surface"
+        );
     }
 
     struct CountingObserver {
@@ -28705,6 +28821,83 @@ This is an example JSON object for profile settings."#;
         assert!(
             channel_map.contains_key("discord.ops"),
             "the approval route's configured channel must be live for adapter delivery"
+        );
+
+        let collected_keys: Vec<String> = channel_map.keys().cloned().collect();
+        let owners = build_owner_by_channel_key(&config, &["worker".to_string()], &collected_keys);
+        assert!(
+            !owners.contains_key("discord.ops"),
+            "approval-route liveness must not create an agent owner"
+        );
+
+        let worker_ctx = router_test_ctx();
+        let router = AgentRouter::multi(
+            HashMap::from([("worker".to_string(), worker_ctx)]),
+            owners,
+            None,
+            None,
+        );
+        assert!(
+            router
+                .resolve(&channel_message("discord", Some("ops")))
+                .is_none(),
+            "ordinary traffic on the approval-only alias must not reach the worker"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
+    fn risk_profile_approval_route_collects_unowned_channel_without_agent_dispatch() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                risk_profile: "supervised".into(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "worker-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "ops-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "supervised".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                    approver_channel: "discord.ops".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+
+        let active = ActiveChannelAliases::compute(&config);
+        assert!(
+            active.contains("discord.ops"),
+            "a risk-profile approval route must activate its unowned alias"
+        );
+
+        let config_arc = Arc::new(RwLock::new(config.clone()));
+        let configured = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let channel_map = configured_channel_map(&configured);
+        assert!(
+            channel_map.contains_key("discord.ops"),
+            "the risk-profile approver must be available in the routed channel registry"
         );
 
         let collected_keys: Vec<String> = channel_map.keys().cloned().collect();

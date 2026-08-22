@@ -215,6 +215,7 @@ pub(crate) async fn resolve_routed_approval(
 pub(crate) struct RoutedApprovalChannel {
     handles: tools::PerToolChannelHandle,
     route: zeroclaw_config::autonomy::ApprovalRoute,
+    origin: Option<Arc<dyn zeroclaw_api::channel::Channel>>,
 }
 
 impl RoutedApprovalChannel {
@@ -222,7 +223,39 @@ impl RoutedApprovalChannel {
         handles: tools::PerToolChannelHandle,
         route: zeroclaw_config::autonomy::ApprovalRoute,
     ) -> Self {
-        Self { handles, route }
+        Self {
+            handles,
+            route,
+            origin: None,
+        }
+    }
+
+    fn with_origin(
+        handles: tools::PerToolChannelHandle,
+        route: zeroclaw_config::autonomy::ApprovalRoute,
+        origin: Arc<dyn zeroclaw_api::channel::Channel>,
+    ) -> Self {
+        Self {
+            handles,
+            route,
+            origin: Some(origin),
+        }
+    }
+}
+
+/// Build the route-aware approval channel used by channel-driven turns.
+///
+/// The returned trait object asks the configured approver first. Only an
+/// explicit `inherit-originator` route policy delegates to `origin`; missing
+/// or unavailable approvers under the default policy remain runtime denials.
+pub fn routed_approval_channel(
+    handles: tools::PerToolChannelHandle,
+    route: zeroclaw_config::autonomy::ApprovalRoute,
+    origin: Option<Arc<dyn zeroclaw_api::channel::Channel>>,
+) -> Arc<dyn zeroclaw_api::channel::Channel> {
+    match origin {
+        Some(origin) => Arc::new(RoutedApprovalChannel::with_origin(handles, route, origin)),
+        None => Arc::new(RoutedApprovalChannel::new(handles, route)),
     }
 }
 
@@ -286,9 +319,12 @@ impl zeroclaw_api::channel::Channel for RoutedApprovalChannel {
                 zeroclaw_api::channel::AttributedApprovalResponse::from_runtime(response, source)
                     .with_decider_opt(decider),
             )),
-            // No originating channel to inherit on this path; let the gate apply
-            // the non-interactive default (auto-deny).
-            RoutedApproval::Fallthrough => Ok(None),
+            RoutedApproval::Fallthrough => match self.origin.as_ref() {
+                Some(origin) => origin.request_approval_attributed(recipient, request).await,
+                // No originating channel to inherit on this path; let the gate
+                // apply the non-interactive default (auto-deny).
+                None => Ok(None),
+            },
         }
     }
 }
@@ -11743,7 +11779,11 @@ mod approval_route_tests {
             name: "ops".into(),
             behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
         }]);
-        let bridge = RoutedApprovalChannel::new(h, route("ops", OnNoApprover::Deny));
+        let origin = Arc::new(StubChannel {
+            name: "origin".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Deny),
+        });
+        let bridge = routed_approval_channel(h, route("ops", OnNoApprover::Deny), Some(origin));
         let out = bridge
             .request_approval_attributed("r", &req())
             .await
@@ -11755,6 +11795,53 @@ mod approval_route_tests {
             Some("ops"),
             "the gate attributes the approval to the deciding channel"
         );
+    }
+
+    #[tokio::test]
+    async fn routed_channel_does_not_reach_origin_for_default_missing_approver() {
+        let origin = Arc::new(StubChannel {
+            name: "origin".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        });
+        let bridge = routed_approval_channel(
+            registry(vec![]),
+            route("ops", OnNoApprover::Deny),
+            Some(origin),
+        );
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("the default route must produce a fail-closed denial");
+
+        assert_eq!(out.response, ChannelApprovalResponse::Deny);
+        assert_eq!(
+            out.source,
+            zeroclaw_api::channel::ApprovalSource::Unavailable
+        );
+        assert!(out.decided_by.is_none());
+    }
+
+    #[tokio::test]
+    async fn routed_channel_inherit_delegates_to_origin() {
+        let origin = Arc::new(StubChannel {
+            name: "origin".into(),
+            behavior: StubBehavior::Answer(ChannelApprovalResponse::Approve),
+        });
+        let bridge = routed_approval_channel(
+            registry(vec![]),
+            route("ops", OnNoApprover::InheritOriginator),
+            Some(origin),
+        );
+        let out = bridge
+            .request_approval_attributed("r", &req())
+            .await
+            .unwrap()
+            .expect("explicit inherit-originator must ask the initiating channel");
+
+        assert_eq!(out.response, ChannelApprovalResponse::Approve);
+        assert_eq!(out.source, zeroclaw_api::channel::ApprovalSource::Operator);
+        assert!(out.decided_by.is_none());
     }
 
     #[tokio::test]

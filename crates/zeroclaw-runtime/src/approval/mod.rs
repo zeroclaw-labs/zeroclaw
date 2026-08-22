@@ -160,6 +160,22 @@ impl ApprovalManager {
         }
     }
 
+    /// Create a fresh turn-scoped manager while preserving this manager's
+    /// policy and interactivity mode. Mutable session state never crosses a
+    /// channel turn: an `Always` grant and its audit entries belong only to
+    /// the turn that received them.
+    pub fn for_new_turn(&self) -> Self {
+        Self {
+            auto_approve: self.auto_approve.clone(),
+            always_ask: self.always_ask.clone(),
+            autonomy_level: self.autonomy_level,
+            non_interactive: self.non_interactive,
+            non_interactive_shell_requires_approval: self.non_interactive_shell_requires_approval,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Returns `true` when this manager operates in non-interactive mode
     /// (i.e. for channel-driven runs where no operator can approve).
     pub fn is_non_interactive(&self) -> bool {
@@ -597,6 +613,37 @@ mod tests {
 
         // shell is in always_ask, so it still needs approval.
         assert!(mgr.needs_approval("shell"));
+    }
+
+    #[test]
+    fn fresh_turn_resets_session_state_but_preserves_policy() {
+        let mgr = ApprovalManager::for_non_interactive_backchannel(&supervised_config());
+        mgr.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "test.txt"}),
+            &ApprovalResponse::Always,
+            "channel",
+        );
+
+        let fresh = mgr.for_new_turn();
+
+        assert!(fresh.is_non_interactive());
+        assert_eq!(
+            fresh.approval_requirement("file_read"),
+            ApprovalRequirement::Approved,
+            "configured auto-approval must survive a fresh turn"
+        );
+        assert_eq!(
+            fresh.approval_requirement("shell"),
+            ApprovalRequirement::Prompt,
+            "configured always-ask policy must survive a fresh turn"
+        );
+        assert!(
+            fresh.needs_approval("file_write"),
+            "an Always grant must not cross into another turn"
+        );
+        assert!(fresh.session_allowlist().is_empty());
+        assert!(fresh.audit_log().is_empty());
     }
 
     #[test]
