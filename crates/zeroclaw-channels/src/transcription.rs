@@ -935,6 +935,14 @@ impl TranscriptionManager {
     /// manager to a specific agent should call
     /// `with_agent_transcription_provider` to set it.
     pub fn new(config: &TranscriptionConfig) -> Result<Self> {
+        Self::from_sections(config, None, String::new())
+    }
+
+    fn from_sections(
+        config: &TranscriptionConfig,
+        typed: Option<&TranscriptionProviders>,
+        agent_transcription_provider: String,
+    ) -> Result<Self> {
         if matches!(config.max_audio_bytes, Some(0)) {
             bail!("transcription.max_audio_bytes must be greater than zero");
         }
@@ -943,6 +951,9 @@ impl TranscriptionManager {
             HashMap::new();
 
         Self::register_legacy_providers(&mut transcription_providers, config);
+        if let Some(typed) = typed {
+            Self::register_typed_providers(&mut transcription_providers, typed);
+        }
 
         if config.enabled && transcription_providers.is_empty() {
             bail!(
@@ -957,45 +968,32 @@ impl TranscriptionManager {
         Ok(Self {
             transcription_providers,
             max_audio_bytes: config.max_audio_bytes,
-            agent_transcription_provider: String::new(),
+            agent_transcription_provider,
         })
     }
 
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
-        if matches!(config.transcription.max_audio_bytes, Some(0)) {
-            bail!("transcription.max_audio_bytes must be greater than zero");
-        }
-
-        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
-            HashMap::new();
-
-        Self::register_legacy_providers(&mut transcription_providers, &config.transcription);
-        Self::register_typed_providers(
-            &mut transcription_providers,
-            &config.providers.transcription,
-        );
-
-        if config.transcription.enabled && transcription_providers.is_empty() {
-            bail!(
-                "Transcription is enabled but no transcription provider registered \
-                 successfully. Configure at least one of: [providers.transcription.<type>.<alias>], \
-                 [transcription] (Groq) with api_key + api_url, [transcription.openai], \
-                 [transcription.deepgram], [transcription.assemblyai], [transcription.google], \
-                 or [transcription.local_whisper]."
-            );
-        }
-
         let agent_transcription_provider = agent_alias
             .or_else(|| config.resolved_runtime_agent_alias())
             .and_then(|alias| config.agents.get(alias))
             .map(|a| a.transcription_provider.as_str().to_string())
             .unwrap_or_default();
 
-        Ok(Self {
-            transcription_providers,
-            max_audio_bytes: config.transcription.max_audio_bytes,
+        Self::from_config_with_provider(config, agent_transcription_provider)
+    }
+
+    /// Build from the canonical runtime config while binding an already
+    /// resolved provider reference. Channel factories use this when routing
+    /// has selected an owner separately from the runtime-default agent.
+    pub(crate) fn from_config_with_provider(
+        config: &Config,
+        agent_transcription_provider: String,
+    ) -> Result<Self> {
+        Self::from_sections(
+            &config.transcription,
+            Some(&config.providers.transcription),
             agent_transcription_provider,
-        })
+        )
     }
 
     fn register_legacy_providers(
