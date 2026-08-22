@@ -108,7 +108,26 @@ jobs:
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
 
+      - name: Guard temporary React Router RSC advisory exception
+        run: |
+          bash scripts/ci/web_rsc_mode_guard.test.sh
+          bash scripts/ci/web_rsc_mode_guard.sh
+
   # ── Post-format required quality gate ─────────────────────────────────────
+
+  npm-dependency-review:
+    name: Check npm advisories
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019 # v4.5.0
+        with:
+          fail-on-severity: high
+          # The guarded Vite SPA does not use the advisory's unstable RSC APIs.
+          # Remove this exception when the remediation tracked by #9383 upgrades React Router.
+          allow-ghsas: GHSA-qwww-vcr4-c8h2
 
   lint:
     name: Lint
@@ -947,6 +966,9 @@ jobs:
       - name: Run permission and catalog regressions
         working-directory: web
         run: npm run test:permissions
+      - name: Run RSC semantic guard
+        working-directory: web
+        run: npm run test:rsc-guard
       - name: Run turn-stream regressions
         working-directory: web
         run: npm run test:contexts
@@ -958,11 +980,15 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, repo-structure, path-changes, npm-dependency-review, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
         run: |
+          if [[ "${{ github.event_name }}" == "pull_request" && "${{ needs.npm-dependency-review.result }}" != "success" ]]; then
+            echo "::error::npm dependency review did not complete successfully"
+            exit 1
+          fi
           if [[ "${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
             echo "::error::One or more CI jobs failed or were cancelled"
             exit 1

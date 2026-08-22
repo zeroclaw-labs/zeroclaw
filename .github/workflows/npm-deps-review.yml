@@ -1,21 +1,19 @@
 name: npm Dependency Review
 
 on:
-  pull_request:
-    branches: [master]
-    paths:
-      - web/package-lock.json
+  schedule:
+    - cron: "17 6 * * *"
 
 permissions:
   contents: read
 
 jobs:
-  review:
-    name: Check npm advisories
+  rsc-exception-expiry:
+    name: Check RSC advisory exception expiry
+    if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/dependency-review-action@3b139cfc5fae8b618d3eae3675e383bb1769c019 # v4.5.0
-        with:
-          fail-on-severity: high
+      - name: Verify the temporary exception remains valid
+        run: bash scripts/ci/web_rsc_mode_guard.sh
