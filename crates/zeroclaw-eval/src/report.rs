@@ -16,9 +16,18 @@ pub struct CaseReport {
 }
 
 impl CaseReport {
-    /// A case passes when it ran without error and every check passed.
+    /// A case passes when it ran without error, produced at least one grade, and
+    /// every grade passed.
+    ///
+    /// The non-empty requirement is deliberate: `[].iter().all(..)` is `true`, so
+    /// without it a case that graded nothing — a fixture whose expectations were
+    /// silently empty — would aggregate to green and the CI gate would report
+    /// success in exactly the situation it exists to catch. A case that
+    /// legitimately asserts nothing must say so (`allow_no_expectations`) and
+    /// still emits a `run_completed` grade, so "zero grades" always means
+    /// "nothing was checked", never "everything checked out".
     pub fn passed(&self) -> bool {
-        self.error.is_none() && self.grades.iter().all(|g| g.passed)
+        self.error.is_none() && !self.grades.is_empty() && self.grades.iter().all(|g| g.passed)
     }
 
     fn checks_passed(&self) -> usize {
@@ -43,6 +52,12 @@ impl SuiteReport {
 
     pub fn all_passed(&self) -> bool {
         self.cases.iter().all(CaseReport::passed)
+    }
+
+    /// Process exit code for a completed run: 0 iff every case passed.
+    /// Kept as a pure function so the CLI gate is testable at its real boundary.
+    pub fn exit_code(&self) -> i32 {
+        if self.all_passed() { 0 } else { 1 }
     }
 
     /// Render a human-readable table. Failing checks are listed beneath their case.
@@ -119,6 +134,7 @@ mod tests {
             check: check.to_string(),
             passed,
             detail: detail.to_string(),
+            category: crate::grader::GradeCategory::Response,
         }
     }
 
@@ -152,8 +168,32 @@ mod tests {
         );
         // A run error fails the case even when every check passed.
         assert!(!case("a", vec![grade("c1", true, "")], Some("trace exhausted")).passed());
-        // No checks and no error passes vacuously.
-        assert!(case("a", vec![], None).passed());
+    }
+
+    #[test]
+    fn case_report_with_no_grades_does_not_pass() {
+        // `[].iter().all(..)` is `true`, so before the non-empty requirement a
+        // case that checked nothing reported green. A gate that scores "nothing
+        // was asserted" as a pass cannot detect the regression it exists for.
+        let vacuous = case("a", vec![], None);
+        assert!(vacuous.grades.is_empty());
+        assert!(
+            !vacuous.passed(),
+            "a case with zero grades must not count as passed"
+        );
+    }
+
+    #[test]
+    fn suite_with_only_a_vacuous_case_does_not_pass() {
+        // Same hole one level up: the aggregate must not report success when the
+        // only case it ran asserted nothing.
+        let suite = SuiteReport {
+            cases: vec![case("vacuous", vec![], None)],
+        };
+        assert_eq!(suite.passed_count(), 0);
+        assert_eq!(suite.failed_count(), 1);
+        assert!(!suite.all_passed());
+        assert_eq!(suite.exit_code(), 1);
     }
 
     #[test]
@@ -168,6 +208,27 @@ mod tests {
         assert_eq!(suite.passed_count(), 1);
         assert_eq!(suite.failed_count(), 2);
         assert!(!suite.all_passed());
+    }
+
+    #[test]
+    fn exit_code_is_zero_when_all_cases_pass() {
+        let suite = SuiteReport {
+            cases: vec![case("ok", vec![grade("c", true, "")], None)],
+        };
+        assert!(suite.all_passed());
+        assert_eq!(suite.exit_code(), 0);
+    }
+
+    #[test]
+    fn exit_code_is_one_when_any_case_fails() {
+        let suite = SuiteReport {
+            cases: vec![
+                case("ok", vec![grade("c", true, "")], None),
+                case("bad", vec![grade("c", false, "")], None),
+            ],
+        };
+        assert!(!suite.all_passed());
+        assert_eq!(suite.exit_code(), 1);
     }
 
     #[test]
@@ -223,5 +284,10 @@ mod tests {
         assert_eq!(json["cases"].as_array().unwrap().len(), 2);
         assert_eq!(json["cases"][0]["name"].as_str(), Some("ok"));
         assert_eq!(json["cases"][0]["passed"].as_bool(), Some(true));
+        // Each grade now carries its category (snake_case) in the JSON report.
+        assert_eq!(
+            json["cases"][0]["grades"][0]["category"].as_str(),
+            Some("response")
+        );
     }
 }

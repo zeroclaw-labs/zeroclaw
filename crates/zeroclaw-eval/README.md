@@ -2,25 +2,34 @@
 
 Agent evaluation harness for ZeroClaw.
 
-**Phase 0 — deterministic replay.** Runs the *real* agent loop against scripted
+**Replay mode (default) — deterministic.** Runs the *real* agent loop against scripted
 LLM responses (an `LlmTrace` fixture) and grades the outcome against declarative
 expectations. Because the model output is fixed, a replay eval is free, fast, and
 fully deterministic: it proves the agent *machinery* (tool parsing, dispatch,
 multi-turn looping) behaves correctly given a known model output. It does **not**
-measure model quality — that is the live mode added in a later phase.
+measure model quality.
+
+**Live mode — real provider.** Runs the same fixtures against the provider named by
+`[eval] live_provider`: real tokens, real network egress, non-deterministic output.
+The tool surface is the `[eval] live_allowed_tools` allowlist, `shell` is hard-denied
+regardless of what a case or the config requests, approvals run through a
+non-interactive backchannel manager that auto-denies anything not allowlisted, and
+each turn is bounded by `[eval] case_timeout_secs`.
 
 ## CLI
 
 ```bash
-# Replay every *.json fixture in the suite directory (defaults to ./evals)
+# Replay every *.json fixture in the suite directory (defaults to ./evals/regression)
 zeroclaw eval run
 
 # Point at an explicit suite, emit machine-readable JSON
-zeroclaw eval run --suite evals --format json
+zeroclaw eval run --suite evals/regression --format json
+
+# Run against the real provider from `[eval] live_provider` (real tokens, real egress)
+zeroclaw eval run --mode live
 ```
 
-Exits non-zero if any case fails, so it can gate CI. `--mode live` is reserved for
-a later phase and currently returns a clear error.
+Exits non-zero if any case fails, so it can gate CI.
 
 ## Case format
 
