@@ -366,6 +366,11 @@ pub async fn run(
     let mut content_area = Rect::default();
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
+    // Replacement daemon spawned by this disconnection episode, held until
+    // the answering daemon is verified to be that child (then detached) or
+    // the child exits early (then reaped). Dropping it on TUI exit
+    // terminates a replacement that never became usable.
+    let mut recovery_daemon: Option<crate::SpawnedDaemon> = None;
     let mut needs_intervention = false;
 
     // The live client handle. Reassigned in place on a successful
@@ -593,8 +598,18 @@ pub async fn run(
             if owns_ephemeral && !ephemeral_respawn_done {
                 ephemeral_respawn_done = true;
                 if let crate::ConnectTarget::LocalSocket(socket) = target {
-                    let _ = crate::spawn_ephemeral_daemon(config_dir, socket);
+                    recovery_daemon = crate::spawn_owned_ephemeral_daemon(config_dir, socket).ok();
                 }
+            }
+
+            // Reap an early replacement exit so it cannot linger as a zombie.
+            // The single permitted respawn stays consumed; the user is flagged
+            // just like a replacement that never answers.
+            if let Some(daemon) = recovery_daemon.as_mut()
+                && matches!(daemon.poll_exit(), Ok(Some(_)))
+            {
+                recovery_daemon = None;
+                needs_intervention = true;
             }
 
             {
@@ -612,7 +627,19 @@ pub async fn run(
                         .connect(prev_id.as_deref(), prev_sig.as_deref())
                         .await
                     {
+                        let answering_pid = new_client.server_pid;
                         rpc = Arc::new(new_client);
+                        // Ownership handoff mirrors the initial-start path:
+                        // keep the replacement only if it is the daemon that
+                        // answered (it then manages its own ephemeral
+                        // lifetime); otherwise terminate and reap it so it
+                        // cannot outlive the TUI.
+                        if let Some(mut daemon) = recovery_daemon.take()
+                            && crate::reconcile_spawned_daemon_identity(answering_pid, &mut daemon)
+                                .unwrap_or(false)
+                        {
+                            daemon.detach();
+                        }
                         let resume_chat = (
                             chat_pane.current_session_id().map(String::from),
                             chat_pane.current_agent_alias().map(String::from),

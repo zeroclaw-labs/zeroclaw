@@ -476,18 +476,7 @@ async fn run_until_exit(
     }
 }
 
-pub(crate) fn spawn_ephemeral_daemon(
-    config_dir: &std::path::Path,
-    socket: &std::path::Path,
-) -> anyhow::Result<()> {
-    let mut cmd = ephemeral_daemon_command(config_dir, socket);
-    cmd.stderr(std::process::Stdio::null());
-    cmd.spawn()
-        .map_err(|e| anyhow::Error::msg(format!("failed to spawn daemon: {e}")))?;
-    Ok(())
-}
-
-fn spawn_owned_ephemeral_daemon(
+pub(crate) fn spawn_owned_ephemeral_daemon(
     config_dir: &std::path::Path,
     socket: &std::path::Path,
 ) -> anyhow::Result<SpawnedDaemon> {
@@ -537,7 +526,7 @@ fn configure_ephemeral_daemon_command(
         .env("ZEROCLAW_SOCKET", socket);
 }
 
-struct SpawnedDaemon {
+pub(crate) struct SpawnedDaemon {
     child: std::process::Child,
     stderr: Arc<Mutex<std::collections::VecDeque<u8>>>,
     capture_stderr: Arc<AtomicBool>,
@@ -628,7 +617,7 @@ impl SpawnedDaemon {
         self.child.id()
     }
 
-    fn poll_exit(&mut self) -> anyhow::Result<Option<SpawnedDaemonExit>> {
+    pub(crate) fn poll_exit(&mut self) -> anyhow::Result<Option<SpawnedDaemonExit>> {
         let Some(status) = self.child.try_wait()? else {
             return Ok(None);
         };
@@ -659,7 +648,7 @@ impl SpawnedDaemon {
         sanitize_daemon_stderr(&bytes)
     }
 
-    fn detach(mut self) {
+    pub(crate) fn detach(mut self) {
         self.cleanup_on_drop = false;
         self.capture_stderr.store(false, Ordering::Release);
         self.stderr_done.take();
@@ -724,7 +713,7 @@ fn sanitize_daemon_stderr(bytes: &[u8]) -> String {
     rendered[start..].to_owned()
 }
 
-fn reconcile_spawned_daemon_identity(
+pub(crate) fn reconcile_spawned_daemon_identity(
     server_pid: Option<u32>,
     daemon: &mut SpawnedDaemon,
 ) -> anyhow::Result<bool> {
@@ -910,6 +899,25 @@ mod connection_tests {
 
         assert!(!exit.status.success());
         assert!(daemon.try_wait().expect("poll reaped helper").is_some());
+    }
+
+    /// Recovery-path regression: when a different daemon answers the
+    /// reconnect, the spawned replacement must be terminated and reaped
+    /// rather than surviving the TUI.
+    #[test]
+    fn recovery_handoff_terminates_and_reaps_mismatched_replacement() {
+        let mut daemon =
+            SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep")).expect("spawn helper");
+        let other_pid = daemon.id().wrapping_add(1);
+
+        let owns = reconcile_spawned_daemon_identity(Some(other_pid), &mut daemon)
+            .expect("mismatch handoff cleans up the replacement");
+
+        assert!(!owns, "a different answering daemon is not our child");
+        assert!(
+            daemon.try_wait().expect("poll reaped helper").is_some(),
+            "the mismatched replacement must be terminated and reaped"
+        );
     }
 
     #[test]
