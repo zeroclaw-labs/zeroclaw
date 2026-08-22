@@ -1,4 +1,4 @@
-//! RFC #7141 inbound authentication seam: the [`AuthProvider`] trait + a
+//! RFC 7141 inbound authentication seam: the [`AuthProvider`] trait + a
 //! default-deny [`ProviderRegistry`] with EXPLICIT provider selection.
 //!
 //! Each provider verifies ONE credential kind (OIDC token, peer uid, native
