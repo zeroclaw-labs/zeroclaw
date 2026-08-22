@@ -1,4 +1,4 @@
-//! Locate and launch a `zeroclaw daemon` when none is already running.
+//! Locate and launch a bounded desktop daemon supervisor when none is already running.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -55,27 +55,17 @@ pub fn find_zeroclaw_binary() -> Option<PathBuf> {
     None
 }
 
-/// Spawn `zeroclaw daemon -p <port>`, detached so it outlives the app, with
-/// stdio routed to a log file under the OS temp dir. The child handle is
-/// returned but intentionally not reaped — the daemon is a background service.
+/// Spawn the bounded desktop daemon supervisor, detached so it outlives the app.
+/// The child handle is returned but intentionally not reaped because the
+/// supervisor owns the daemon's background lifecycle and log capture.
 pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
-    let log_path = std::env::temp_dir().join("zeroclaw-desktop-daemon.log");
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)?;
-    let log_err = log.try_clone()?;
-
-    let mut cmd = Command::new(binary);
-    cmd.arg("daemon")
-        .arg("-p")
-        .arg(port.to_string())
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
+    let mut cmd = desktop_daemon_command(binary, port);
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
 
     // Detach so signals to the app's process group (e.g. Ctrl-C on a dev
-    // `cargo run`) don't also stop the daemon, and so it survives app exit.
+    // `cargo run`) don't also stop the supervisor, and so it survives app exit.
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -89,4 +79,28 @@ pub fn spawn_daemon(binary: &Path, port: u16) -> std::io::Result<Child> {
     }
 
     cmd.spawn()
+}
+
+fn desktop_daemon_command(binary: &Path, port: u16) -> Command {
+    let mut cmd = Command::new(binary);
+    cmd.arg("service")
+        .arg("run-desktop-daemon")
+        .arg("--port")
+        .arg(port.to_string());
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_command_targets_hidden_supervisor_and_port() {
+        let command = desktop_daemon_command(Path::new("/tmp/zeroclaw"), 42617);
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(args, ["service", "run-desktop-daemon", "--port", "42617"]);
+    }
 }

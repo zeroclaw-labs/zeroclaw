@@ -1,40 +1,44 @@
 use anyhow::{Context, Result, bail};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::collections::VecDeque;
 use std::fs;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::process::Stdio;
 use std::str::FromStr;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::sync::{Arc, Condvar, Mutex};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::thread::JoinHandle;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use std::time::{Duration, Instant};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::io::{AsyncRead, AsyncReadExt};
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 use tokio::process::{Child, Command as TokioCommand};
 use zeroclaw_config::schema::Config;
 
 const SERVICE_LABEL: &str = "com.zeroclaw.daemon";
 const WINDOWS_TASK_NAME: &str = "ZeroClaw Daemon";
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const SERVICE_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 const SERVICE_LOG_COMPACT_BYTES: u64 = 4 * 1024 * 1024;
 #[cfg(any(target_os = "linux", test))]
 const OPENRC_STDOUT_LOG: &str = "/var/log/zeroclaw/access.log";
 #[cfg(any(target_os = "linux", test))]
 const OPENRC_STDERR_LOG: &str = "/var/log/zeroclaw/error.log";
-#[cfg(any(target_os = "macos", test))]
-const LAUNCHD_LOG_PENDING_BYTES: usize = 1024 * 1024;
-#[cfg(any(target_os = "macos", all(test, unix)))]
-const LAUNCHD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const SERVICE_LOG_PENDING_BYTES: usize = 1024 * 1024;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const SERVICE_LOG_WRITER_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+const DESKTOP_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(any(target_os = "linux", target_os = "macos", all(test, unix)))]
+const SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -54,13 +58,13 @@ fn launchd_capture_paths(config_dir: &Path) -> LaunchdCapturePaths {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 struct BoundedServiceLog {
     file: fs::File,
     len: u64,
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 impl BoundedServiceLog {
     fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -177,34 +181,34 @@ fn openrc_log_path(stderr: bool) -> &'static Path {
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
-struct PendingLaunchdLog {
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct PendingServiceLog {
     chunks: VecDeque<Vec<u8>>,
     bytes: usize,
     closed: bool,
 }
 
-#[cfg(any(target_os = "macos", test))]
-struct LaunchdLogSinkInner {
-    pending: Mutex<PendingLaunchdLog>,
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct ServiceLogSinkInner {
+    pending: Mutex<PendingServiceLog>,
     ready: Condvar,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
 #[derive(Clone)]
-struct LaunchdLogSink(Arc<LaunchdLogSinkInner>);
+struct ServiceLogSink(Arc<ServiceLogSinkInner>);
 
-#[cfg(any(target_os = "macos", test))]
-impl LaunchdLogSink {
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl ServiceLogSink {
     fn push(&self, mut chunk: Vec<u8>) {
-        if chunk.len() > LAUNCHD_LOG_PENDING_BYTES {
-            chunk = chunk.split_off(chunk.len() - LAUNCHD_LOG_PENDING_BYTES);
+        if chunk.len() > SERVICE_LOG_PENDING_BYTES {
+            chunk = chunk.split_off(chunk.len() - SERVICE_LOG_PENDING_BYTES);
         }
         let mut pending = self.0.pending.lock().unwrap_or_else(|e| e.into_inner());
         if pending.closed {
             return;
         }
-        while pending.bytes + chunk.len() > LAUNCHD_LOG_PENDING_BYTES {
+        while pending.bytes + chunk.len() > SERVICE_LOG_PENDING_BYTES {
             let Some(discarded) = pending.chunks.pop_front() else {
                 break;
             };
@@ -222,20 +226,23 @@ impl LaunchdLogSink {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-struct LaunchdCaptureWriters {
-    stdout: LaunchdLogSink,
-    stderr: LaunchdLogSink,
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+struct ServiceLogWriters {
+    stdout: ServiceLogSink,
+    stderr: ServiceLogSink,
     tasks: Vec<JoinHandle<()>>,
 }
 
-#[cfg(any(target_os = "macos", test))]
-impl LaunchdCaptureWriters {
-    fn open(paths: &LaunchdCapturePaths) -> Result<Self> {
-        let stdout_log = BoundedServiceLog::open(&paths.stdout)?;
-        let stderr_log = BoundedServiceLog::open(&paths.stderr)?;
-        let (stdout, stdout_task) = spawn_launchd_log_writer(paths.stdout.clone(), stdout_log);
-        let (stderr, stderr_task) = spawn_launchd_log_writer(paths.stderr.clone(), stderr_log);
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl ServiceLogWriters {
+    #[cfg(any(target_os = "macos", test))]
+    fn open_split(stdout_path: &Path, stderr_path: &Path) -> Result<Self> {
+        let stdout_log = BoundedServiceLog::open(stdout_path)?;
+        let stderr_log = BoundedServiceLog::open(stderr_path)?;
+        let (stdout, stdout_task) =
+            spawn_service_log_writer(stdout_path.to_path_buf(), stdout_log, "launchd");
+        let (stderr, stderr_task) =
+            spawn_service_log_writer(stderr_path.to_path_buf(), stderr_log, "launchd");
         Ok(Self {
             stdout,
             stderr,
@@ -243,10 +250,20 @@ impl LaunchdCaptureWriters {
         })
     }
 
+    fn open_combined(path: &Path) -> Result<Self> {
+        let log = BoundedServiceLog::open(path)?;
+        let (sink, task) = spawn_service_log_writer(path.to_path_buf(), log, "desktop");
+        Ok(Self {
+            stdout: sink.clone(),
+            stderr: sink,
+            tasks: vec![task],
+        })
+    }
+
     async fn finish(mut self) {
         self.stdout.close();
         self.stderr.close();
-        let deadline = Instant::now() + LAUNCHD_PIPE_DRAIN_TIMEOUT;
+        let deadline = Instant::now() + SERVICE_LOG_WRITER_DRAIN_TIMEOUT;
         for task in self.tasks.drain(..) {
             while !task.is_finished() && Instant::now() < deadline {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -258,28 +275,29 @@ impl LaunchdCaptureWriters {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-impl Drop for LaunchdCaptureWriters {
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+impl Drop for ServiceLogWriters {
     fn drop(&mut self) {
         self.stdout.close();
         self.stderr.close();
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn spawn_launchd_log_writer(
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+fn spawn_service_log_writer(
     path: PathBuf,
     mut log: BoundedServiceLog,
-) -> (LaunchdLogSink, JoinHandle<()>) {
-    let inner = Arc::new(LaunchdLogSinkInner {
-        pending: Mutex::new(PendingLaunchdLog {
+    failure_label: &'static str,
+) -> (ServiceLogSink, JoinHandle<()>) {
+    let inner = Arc::new(ServiceLogSinkInner {
+        pending: Mutex::new(PendingServiceLog {
             chunks: VecDeque::new(),
             bytes: 0,
             closed: false,
         }),
         ready: Condvar::new(),
     });
-    let sink = LaunchdLogSink(Arc::clone(&inner));
+    let sink = ServiceLogSink(Arc::clone(&inner));
     let task = std::thread::spawn(move || {
         let mut writable = true;
         loop {
@@ -301,7 +319,7 @@ fn spawn_launchd_log_writer(
             };
             if writable && let Err(error) = log.write_chunk(&chunk) {
                 eprintln!(
-                    "launchd log write failed for {}; continuing without capture: {error:#}",
+                    "{failure_label} log write failed for {}; continuing without capture: {error:#}",
                     path.display()
                 );
                 writable = false;
@@ -311,8 +329,8 @@ fn spawn_launchd_log_writer(
     (sink, task)
 }
 
-#[cfg(any(target_os = "macos", test))]
-async fn drain_launchd_pipe<R>(mut pipe: R, sink: LaunchdLogSink)
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn drain_service_pipe<R>(mut pipe: R, sink: ServiceLogSink, failure_label: &'static str)
 where
     R: AsyncRead + Unpin,
 {
@@ -322,11 +340,19 @@ where
             Ok(0) => break,
             Ok(read) => sink.push(buffer[..read].to_vec()),
             Err(error) => {
-                sink.push(format!("launchd log pipe read failed: {error}\n").into_bytes());
+                sink.push(format!("{failure_label} log pipe read failed: {error}\n").into_bytes());
                 break;
             }
         }
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+async fn drain_launchd_pipe<R>(pipe: R, sink: ServiceLogSink)
+where
+    R: AsyncRead + Unpin,
+{
+    drain_service_pipe(pipe, sink, "launchd").await;
 }
 
 pub async fn run_launchd_daemon(config_dir: &Path) -> Result<()> {
@@ -355,7 +381,7 @@ async fn run_with_launchd_capture<F>(paths: LaunchdCapturePaths, make_command: F
 where
     F: FnOnce() -> Result<TokioCommand>,
 {
-    let writers = LaunchdCaptureWriters::open(&paths)?;
+    let writers = ServiceLogWriters::open_split(&paths.stdout, &paths.stderr)?;
     let result = async {
         let command = make_command()?;
         supervise_launchd_child(command, &writers).await
@@ -373,10 +399,10 @@ where
 #[cfg(any(target_os = "macos", test))]
 async fn supervise_launchd_child(
     mut command: TokioCommand,
-    writers: &LaunchdCaptureWriters,
+    writers: &ServiceLogWriters,
 ) -> Result<()> {
     #[cfg(any(target_os = "macos", all(test, unix)))]
-    let mut signals = LaunchdSignals::new()?;
+    let mut signals = ServiceSignals::new()?;
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -396,10 +422,10 @@ async fn supervise_launchd_child(
     let stderr_task = zeroclaw_spawn::spawn!(drain_launchd_pipe(stderr, stderr_sink));
 
     #[cfg(any(target_os = "macos", all(test, unix)))]
-    let outcome = wait_for_launchd_child(&mut child, &mut signals).await;
+    let outcome = wait_for_service_child(&mut child, &mut signals).await;
     #[cfg(all(test, not(unix)))]
-    let outcome = wait_for_launchd_child(&mut child).await;
-    finish_launchd_pipes(stdout_task, stderr_task).await;
+    let outcome = wait_for_service_child(&mut child).await;
+    finish_service_pipes(stdout_task, stderr_task, LAUNCHD_PIPE_DRAIN_TIMEOUT).await;
     let status = outcome?;
     if status.success() {
         Ok(())
@@ -408,12 +434,95 @@ async fn supervise_launchd_child(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
-async fn finish_launchd_pipes(
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub async fn run_desktop_daemon(port: u16) -> Result<()> {
+    let path = std::env::temp_dir().join("zeroclaw-desktop-daemon.log");
+    run_with_desktop_capture(path, || {
+        let executable =
+            std::env::current_exe().context("Failed to resolve the desktop daemon executable")?;
+        let mut command = TokioCommand::new(executable);
+        command.arg("daemon").arg("-p").arg(port.to_string());
+        Ok(command)
+    })
+    .await
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+pub async fn run_desktop_daemon(port: u16) -> Result<()> {
+    let _ = port;
+    bail!("the desktop daemon runner is unsupported on this platform")
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn run_with_desktop_capture<F>(path: PathBuf, make_command: F) -> Result<()>
+where
+    F: FnOnce() -> Result<TokioCommand>,
+{
+    let writers = ServiceLogWriters::open_combined(&path)?;
+    let result = async {
+        let command = make_command()?;
+        supervise_desktop_child(command, &writers).await
+    }
+    .await;
+    if let Err(error) = &result {
+        writers
+            .stderr
+            .push(format!("desktop capture failed: {error:#}\n").into_bytes());
+    }
+    writers.finish().await;
+    result
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn supervise_desktop_child(
+    mut command: TokioCommand,
+    writers: &ServiceLogWriters,
+) -> Result<()> {
+    #[cfg(unix)]
+    let mut signals = ServiceSignals::new()?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("Failed to start desktop daemon child")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("desktop daemon stdout pipe unavailable")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("desktop daemon stderr pipe unavailable")?;
+    let stdout_sink = writers.stdout.clone();
+    let stderr_sink = writers.stderr.clone();
+    let stdout_task = zeroclaw_spawn::spawn!(drain_service_pipe(stdout, stdout_sink, "desktop"));
+    let stderr_task = zeroclaw_spawn::spawn!(drain_service_pipe(stderr, stderr_sink, "desktop"));
+    #[cfg(unix)]
+    let outcome = wait_for_service_child(&mut child, &mut signals).await;
+    #[cfg(not(unix))]
+    let outcome = child
+        .wait()
+        .await
+        .context("Failed to wait for desktop daemon child");
+    finish_service_pipes(stdout_task, stderr_task, DESKTOP_PIPE_DRAIN_TIMEOUT).await;
+    let status = outcome?;
+    if status.success() {
+        Ok(())
+    } else {
+        bail!("daemon child exited with status {status}")
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows", test))]
+async fn finish_service_pipes(
     mut stdout: tokio::task::JoinHandle<()>,
     mut stderr: tokio::task::JoinHandle<()>,
+    timeout: Duration,
 ) {
-    if tokio::time::timeout(LAUNCHD_PIPE_DRAIN_TIMEOUT, async {
+    if tokio::time::timeout(timeout, async {
         let _ = tokio::join!(&mut stdout, &mut stderr);
     })
     .await
@@ -425,14 +534,14 @@ async fn finish_launchd_pipes(
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-struct LaunchdSignals {
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+struct ServiceSignals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-impl LaunchdSignals {
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+impl ServiceSignals {
     fn new() -> Result<Self> {
         use tokio::signal::unix::{SignalKind, signal};
 
@@ -443,25 +552,25 @@ impl LaunchdSignals {
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-async fn wait_for_launchd_child(
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+async fn wait_for_service_child(
     child: &mut Child,
-    signals: &mut LaunchdSignals,
+    signals: &mut ServiceSignals,
 ) -> Result<std::process::ExitStatus> {
     let forwarded = tokio::select! {
         status = child.wait() => return status.context("Failed to wait for daemon child"),
         _ = signals.interrupt.recv() => libc::SIGINT,
         _ = signals.terminate.recv() => libc::SIGTERM,
     };
-    stop_launchd_child(child, forwarded).await
+    stop_service_child(child, forwarded).await
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-async fn stop_launchd_child(
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+async fn stop_service_child(
     child: &mut Child,
     signal: libc::c_int,
 ) -> Result<std::process::ExitStatus> {
-    if let Err(error) = forward_launchd_signal(child, signal)
+    if let Err(error) = forward_service_signal(child, signal)
         && error
             .downcast_ref::<std::io::Error>()
             .and_then(std::io::Error::raw_os_error)
@@ -470,7 +579,7 @@ async fn stop_launchd_child(
         return Err(error);
     }
 
-    match tokio::time::timeout(LAUNCHD_STOP_TIMEOUT, child.wait()).await {
+    match tokio::time::timeout(SERVICE_STOP_TIMEOUT, child.wait()).await {
         Ok(status) => status.context("Failed to wait for stopped daemon child"),
         Err(_) => {
             if let Some(status) = child
@@ -491,20 +600,20 @@ async fn stop_launchd_child(
     }
 }
 
-#[cfg(any(target_os = "macos", all(test, unix)))]
-fn forward_launchd_signal(child: &Child, signal: libc::c_int) -> Result<()> {
+#[cfg(any(target_os = "macos", target_os = "linux", all(test, unix)))]
+fn forward_service_signal(child: &Child, signal: libc::c_int) -> Result<()> {
     let pid = child.id().context("daemon child PID unavailable")?;
     // SAFETY: `pid` belongs to the child owned by this runner, and the caller
-    // passes only the SIGINT or SIGTERM value received from launchd.
+    // passes only the SIGINT or SIGTERM value received by the supervisor.
     if unsafe { libc::kill(pid as libc::pid_t, signal) } == 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error()).context("Failed to forward launchd stop signal")
+        Err(std::io::Error::last_os_error()).context("Failed to forward service stop signal")
     }
 }
 
 #[cfg(all(test, not(unix)))]
-async fn wait_for_launchd_child(child: &mut Child) -> Result<std::process::ExitStatus> {
+async fn wait_for_service_child(child: &mut Child) -> Result<std::process::ExitStatus> {
     child
         .wait()
         .await
@@ -2274,6 +2383,56 @@ mod macos_plist_tests {
 mod bounded_service_log_tests {
     use super::*;
 
+    const DESKTOP_CAPTURE_TEST_CHILD_ENV: &str = "ZEROCLAW_DESKTOP_CAPTURE_TEST_CHILD";
+
+    fn desktop_capture_test_command(mode: &str) -> TokioCommand {
+        let executable = std::env::current_exe().expect("resolve current test binary");
+        let mut command = TokioCommand::new(executable);
+        command
+            .arg("desktop_capture_subprocess_helper")
+            .arg("--ignored")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(DESKTOP_CAPTURE_TEST_CHILD_ENV, mode);
+        command
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for desktop capture tests"]
+    fn desktop_capture_subprocess_helper() {
+        use std::io::Write as _;
+
+        match std::env::var(DESKTOP_CAPTURE_TEST_CHILD_ENV).as_deref() {
+            Ok("streams") => {
+                std::io::stdout()
+                    .write_all(b"stdout-value")
+                    .expect("write stdout fixture");
+                std::io::stderr()
+                    .write_all(b"stderr-value")
+                    .expect("write stderr fixture");
+                std::process::exit(0);
+            }
+            Ok("compact") => {
+                let mut stdout = std::io::stdout().lock();
+                stdout
+                    .write_all(&vec![b'x'; 9 * 1024 * 1024])
+                    .expect("write compaction fixture");
+                stdout
+                    .write_all(b"desktop-newest-output")
+                    .expect("write newest output fixture");
+                stdout.flush().expect("flush compaction fixture");
+                std::process::exit(0);
+            }
+            Ok("nonzero") => {
+                std::io::stderr()
+                    .write_all(b"child-output")
+                    .expect("write nonzero fixture");
+                std::process::exit(7);
+            }
+            mode => panic!("unexpected desktop capture helper mode: {mode:?}"),
+        }
+    }
+
     #[test]
     fn opening_oversized_log_keeps_newest_bytes() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -2372,20 +2531,20 @@ mod bounded_service_log_tests {
 
     #[test]
     fn pending_output_evicts_oldest_chunks() {
-        let inner = Arc::new(LaunchdLogSinkInner {
-            pending: Mutex::new(PendingLaunchdLog {
+        let inner = Arc::new(ServiceLogSinkInner {
+            pending: Mutex::new(PendingServiceLog {
                 chunks: VecDeque::new(),
                 bytes: 0,
                 closed: false,
             }),
             ready: Condvar::new(),
         });
-        let sink = LaunchdLogSink(Arc::clone(&inner));
+        let sink = ServiceLogSink(Arc::clone(&inner));
         sink.push(vec![b'a'; 700 * 1024]);
         sink.push(vec![b'b'; 700 * 1024]);
 
         let pending = inner.pending.lock().expect("pending queue");
-        assert!(pending.bytes <= LAUNCHD_LOG_PENDING_BYTES);
+        assert!(pending.bytes <= SERVICE_LOG_PENDING_BYTES);
         assert_eq!(pending.chunks.len(), 1);
         assert!(pending.chunks[0].iter().all(|byte| *byte == b'b'));
     }
@@ -2446,6 +2605,72 @@ mod bounded_service_log_tests {
         assert!(stderr.contains("daemon child exited with status"));
     }
 
+    #[tokio::test]
+    async fn desktop_capture_combines_both_child_streams() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("desktop-daemon.log");
+        run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("streams")))
+            .await
+            .expect("capture child output");
+
+        let log = fs::read(path).expect("read combined desktop log");
+        assert!(
+            log.windows(b"stdout-value".len())
+                .any(|window| window == b"stdout-value")
+        );
+        assert!(
+            log.windows(b"stderr-value".len())
+                .any(|window| window == b"stderr-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_compacts_continuous_output_and_preserves_newest() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("desktop-daemon.log");
+        run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("compact")))
+            .await
+            .expect("capture continuous child output");
+
+        let log = fs::read(&path).expect("read compacted desktop log");
+        assert!(log.len() as u64 <= SERVICE_LOG_MAX_BYTES);
+        assert!(log.ends_with(b"desktop-newest-output"));
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_records_spawn_startup_failure() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("desktop-daemon.log");
+        let missing_child = dir.path().join("missing-desktop-child");
+        let error = run_with_desktop_capture(path.clone(), || Ok(TokioCommand::new(missing_child)))
+            .await
+            .expect_err("missing child should fail to spawn");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Failed to start desktop daemon child")
+        );
+        let log = fs::read_to_string(path).expect("read spawn failure diagnostics");
+        assert!(log.contains("desktop capture failed:"));
+        assert!(log.contains("Failed to start desktop daemon child"));
+    }
+
+    #[tokio::test]
+    async fn desktop_capture_records_nonzero_child_exit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("desktop-daemon.log");
+        let error =
+            run_with_desktop_capture(path.clone(), || Ok(desktop_capture_test_command("nonzero")))
+                .await
+                .expect_err("child should fail");
+
+        assert!(error.to_string().contains("status"));
+        let log = fs::read_to_string(path).expect("read nonzero-exit diagnostics");
+        assert!(log.contains("child-output"));
+        assert!(log.contains("daemon child exited with status"));
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn stop_signal_reaps_owned_child_and_preserves_status() {
@@ -2456,7 +2681,7 @@ mod bounded_service_log_tests {
             .expect("spawn child");
         let status = tokio::time::timeout(
             Duration::from_secs(2),
-            stop_launchd_child(&mut child, libc::SIGTERM),
+            stop_service_child(&mut child, libc::SIGTERM),
         )
         .await
         .expect("child stop timeout")

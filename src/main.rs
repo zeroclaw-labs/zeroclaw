@@ -3599,6 +3599,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
     #[cfg(feature = "agent-runtime")]
     if let Commands::Service {
+        service_command: ServiceCommands::RunDesktopDaemon { port },
+        ..
+    } = &cli.command
+    {
+        return service::run_desktop_daemon(*port).await;
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    if let Commands::Service {
         service_command: ServiceCommands::RunOpenrcLogWriter { stream },
         ..
     } = &cli.command
@@ -8361,6 +8370,29 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn desktop_daemon_cli_parses_hidden_command() {
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "service",
+            "run-desktop-daemon",
+            "--port",
+            "42617",
+        ])
+        .expect("internal desktop daemon should parse");
+        assert!(matches!(
+            cli.command,
+            Commands::Service {
+                service_command: ServiceCommands::RunDesktopDaemon { port },
+                ..
+            } if port == 42617
+        ));
+
+        let help = Cli::command().render_help().to_string();
+        assert!(!help.contains("run-desktop-daemon"));
     }
 
     #[test]
