@@ -1,0 +1,12 @@
+[package]
+name = "zeroclaw-relay-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire protocol (zeroclaw.relay.v1) for the ZeroClaw nominated relay: control frames shared by the relay, the daemon-side bridge, and clients."
+publish = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

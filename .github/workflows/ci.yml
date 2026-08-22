@@ -108,6 +108,60 @@ jobs:
       - name: Guard release attestation contract
         run: python3 scripts/ci/release_attestation_contract_test.py
 
+  relay-container-smoke-changes:
+    name: Detect Relay Container Smoke changes
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.changed.outputs.run }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Detect relay container smoke changes
+        id: changed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files="$(mktemp)"
+
+          case "${{ github.event_name }}" in
+            pull_request)
+              git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD > "$changed_files"
+              ;;
+            push|merge_group)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            *)
+              echo "run=true" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if grep -Eq '^(apps/zerorelay/(Dockerfile|compose\.yaml|relay\.example\.toml|src/main\.rs|src/lib\.rs|src/ws_accept\.rs|build\.rs)|scripts/ci/smoke_relay_fresh_volume\.sh|\.github/workflows/ci\.yml$)' "$changed_files"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  relay-container-smoke:
+    name: Relay Container Fresh-Volume Smoke
+    needs: [relay-container-smoke-changes]
+    if: needs.relay-container-smoke-changes.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Build the zerorelay image
+        shell: bash
+        run: docker build -f apps/zerorelay/Dockerfile -t zerorelay:smoke .
+      - name: Fresh-volume non-root startup smoke (self-provisions TLS + healthcheck)
+        shell: bash
+        run: ZERORELAY_SMOKE_IMAGE=zerorelay:smoke bash scripts/ci/smoke_relay_fresh_volume.sh
+
   # ── Post-format required quality gate ─────────────────────────────────────
 
   lint:
@@ -958,7 +1012,7 @@ jobs:
   gate:
     name: CI Required Gate
     if: always()
-    needs: [fmt, repo-structure, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
+    needs: [fmt, repo-structure, relay-container-smoke-changes, relay-container-smoke, path-changes, lint, windows-clippy-tools-changes, windows-clippy-tools, build, check, check-plugin-backends, msrv, check-32bit, bench, test, parallel-runtime-test-changes, parallel-runtime-test, test-landlock, security, nix-eval, nix-hash-drift, docs-style, installer-drift, zerocode-rpc-boundary, web-permission-tests]
     runs-on: ubuntu-latest
     steps:
       - name: Check results

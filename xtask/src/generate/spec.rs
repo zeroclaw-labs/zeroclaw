@@ -1667,12 +1667,15 @@ mod tests {
         assert!(manual.contains(
             "run: $BUILD_CMD --release --locked -p zerocode --target ${{ matrix.target }}"
         ));
+        assert!(manual.contains(
+            "run: $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}"
+        ));
         assert_eq!(
             manual
                 .matches("if: matrix.target != 'aarch64-linux-android'")
                 .count(),
-            2,
-            "both the ZeroCode build and upload must skip Android"
+            4,
+            "the ZeroCode and ZeroRelay builds and uploads must all skip Android"
         );
         assert!(!manual.contains("excluded_features"));
 

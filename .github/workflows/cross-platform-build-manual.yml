@@ -283,3 +283,14 @@ jobs:
           path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zerocode.exe' || 'zerocode' }}
           if-no-files-found: error
           retention-days: 1
+      - name: Build ZeroRelay companion
+        if: matrix.target != 'aarch64-linux-android'
+        shell: bash
+        run: $BUILD_CMD --release --locked -p zerorelay --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.target != 'aarch64-linux-android'
+        with:
+          name: zerorelay-manual-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ runner.os == 'Windows' && 'zerorelay.exe' || 'zerorelay' }}
+          if-no-files-found: error
+          retention-days: 1

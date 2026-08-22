@@ -33,6 +33,67 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
 const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
 
+/// Default ceiling on sockets past `accept()` but not yet through the TLS and
+/// WebSocket handshakes. See [`WssLimits::max_pending_handshakes`].
+pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 256;
+
+/// Default absolute budget for TLS accept plus the WebSocket upgrade.
+/// See [`WssLimits::handshake_timeout`].
+pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+
+/// Default ceiling on concurrently established WSS sessions.
+/// See [`WssLimits::max_sessions`].
+pub const DEFAULT_MAX_SESSIONS: usize = 512;
+
+/// Bounds on the WSS listener's pre-authentication and session state.
+///
+/// The remote WSS plane is the daemon's mandatory mTLS surface and its default
+/// bind is `0.0.0.0`, so every state an *unauthenticated* peer can reach has to
+/// be bounded in both time and count. Without these, each accepted TCP socket
+/// spawned a task that awaited the TLS handshake and the WebSocket upgrade with
+/// no deadline and no cap, so a peer that merely connected - and never proved
+/// anything - could accumulate sockets, tasks and TLS parser state without
+/// limit. Mirrors the bounds the relay applies to its own admission path.
+#[derive(Debug, Clone)]
+pub struct WssLimits {
+    /// Ceiling on sockets past `accept()` that have not finished the TLS
+    /// handshake and WebSocket upgrade. When the pool is exhausted new sockets
+    /// are dropped at accept rather than queued, so a slowloris spread across
+    /// many source addresses sheds instead of accumulating.
+    pub max_pending_handshakes: usize,
+    /// One absolute deadline covering TLS accept AND the WebSocket upgrade,
+    /// measured from accept. It is a single budget for the whole setup
+    /// sequence, not a fresh window per phase: the heartbeat only starts once
+    /// a session is established, so without this a peer could stall in either
+    /// handshake forever.
+    pub handshake_timeout: Duration,
+    /// Ceiling on concurrently established WSS sessions. Bounds the steady
+    /// state that survives authentication, so an authorized-but-abusive peer
+    /// cannot grow dispatcher and transport state without limit.
+    pub max_sessions: usize,
+}
+
+impl Default for WssLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_handshakes: DEFAULT_MAX_PENDING_HANDSHAKES,
+            handshake_timeout: Duration::from_secs(DEFAULT_HANDSHAKE_TIMEOUT_SECS),
+            max_sessions: DEFAULT_MAX_SESSIONS,
+        }
+    }
+}
+
+/// Decrements the shared client counter on every exit path of a connection
+/// task. The counter drives `--ephemeral` shutdown, so a missed decrement
+/// would keep an idle daemon alive forever.
+struct ClientCountGuard(Arc<AtomicUsize>);
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// File-descriptor exhaustion errno values, stable across the Unix targets
 /// we support (Linux, macOS, BSD).
 #[cfg(unix)]
@@ -153,31 +214,21 @@ impl RpcTransport for WssTransport {
 
 // ── TLS acceptor ─────────────────────────────────────────────────
 
-/// Build a `TlsAcceptor` from PEM-encoded cert and key files.
-pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
-    use rustls::ServerConfig;
-    use rustls_pemfile::{certs, private_key};
-    use std::fs::File;
-    use std::io::BufReader;
-
-    let cert_file =
-        File::open(cert_path).with_context(|| format!("opening TLS cert: {cert_path}"))?;
-    let key_file = File::open(key_path).with_context(|| format!("opening TLS key: {key_path}"))?;
-
-    let certs: Vec<_> = certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .context("parsing TLS certificates")?;
-
-    let key = private_key(&mut BufReader::new(key_file))
-        .context("parsing TLS private key")?
-        .context("no private key found in key file")?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("building TLS server config")?;
-
-    Ok(TlsAcceptor::from(Arc::new(config)))
+/// Build a [`TlsAcceptor`] for the remote WSS RPC plane.
+///
+/// The remote plane is ALWAYS mutually authenticated and TLS 1.3 only: every
+/// client certificate is verified against `ca_cert_path` (optionally pinned to
+/// `pinned_certs`). There is deliberately no server-only / no-client-auth path
+/// here (threat model A11); the secure-by-construction builder lives in
+/// [`zeroclaw_tls::build_mtls_acceptor`].
+pub fn build_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    ca_cert_path: &str,
+    pinned_certs: &[String],
+    crl_path: &str,
+) -> Result<TlsAcceptor> {
+    zeroclaw_tls::build_mtls_acceptor(cert_path, key_path, ca_cert_path, pinned_certs, crl_path)
 }
 
 // ── Listener ─────────────────────────────────────────────────────
@@ -191,10 +242,19 @@ pub async fn run_wss_listener(
     client_count: Arc<AtomicUsize>,
     tls_acceptor: TlsAcceptor,
     bind_addr: SocketAddr,
+    limits: WssLimits,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("binding WSS listener on {bind_addr}"))?;
+
+    // Bounds on unauthenticated setup work and on established sessions. A
+    // permit is held from accept until the peer is through both handshakes;
+    // the session permit is held for the life of the dispatcher.
+    let handshake_permits = Arc::new(tokio::sync::Semaphore::new(
+        limits.max_pending_handshakes.max(1),
+    ));
+    let session_permits = Arc::new(tokio::sync::Semaphore::new(limits.max_sessions.max(1)));
 
     ::zeroclaw_log::record!(
         INFO,
@@ -235,25 +295,79 @@ pub async fn run_wss_listener(
                     }
                 };
 
+                // Shed before spending any TLS/task state on this socket when
+                // either budget is exhausted. Dropping the stream closes it, so
+                // a client sees a prompt EOF instead of an indefinite stall.
+                let Ok(handshake_permit) =
+                    handshake_permits.clone().try_acquire_owned()
+                else {
+                    drop(tcp_stream);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "WSS shedding connection from {remote_addr}: {} pending handshakes \
+                             already in flight",
+                            limits.max_pending_handshakes
+                        )
+                    );
+                    continue;
+                };
+                let Ok(session_permit) = session_permits.clone().try_acquire_owned() else {
+                    drop(tcp_stream);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "WSS shedding connection from {remote_addr}: {} sessions already \
+                             established",
+                            limits.max_sessions
+                        )
+                    );
+                    continue;
+                };
+
                 let ctx = ctx.clone();
                 let count = client_count.clone();
                 let acceptor = tls_acceptor.clone();
+                let handshake_timeout = limits.handshake_timeout;
 
                 count.fetch_add(1, Ordering::Relaxed);
 
                 zeroclaw_spawn::spawn!(async move {
+                    // Guarantees the `--ephemeral` counter is decremented on
+                    // every exit path below, including the new timeout one.
+                    let _count_guard = ClientCountGuard(count);
+                    // Released only when the dispatcher finishes.
+                    let _session_permit = session_permit;
+
+                    // ONE absolute deadline over TLS accept AND the WebSocket
+                    // upgrade, measured from accept. A fresh per-phase window
+                    // would let a peer spend the full budget twice.
+                    let deadline = tokio::time::Instant::now() + handshake_timeout;
+
+                    let setup = async {
                     // TLS handshake.
                     let tls_stream = match acceptor.accept(tcp_stream).await {
                         Ok(s) => s,
                         Err(e) => {
+                            // The WSS plane is always mutually authenticated, so a
+                            // client with no certificate (un-migrated) or a revoked
+                            // one fails here. Surface it actionably rather than as a
+                            // bare TLS error so the operator knows to enroll it.
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!("WSS TLS handshake failed from {remote_addr}: {e}")
+                                &format!(
+                                    "WSS TLS handshake failed from {remote_addr}: {e}. The WSS plane \
+                                     requires a client certificate; an un-migrated client must enroll \
+                                     first (zerocode --enroll), and a revoked cert is refused."
+                                )
                             );
-                            count.fetch_sub(1, Ordering::Relaxed);
-                            return;
+                            return None;
                         }
                     };
 
@@ -267,15 +381,51 @@ pub async fn run_wss_listener(
                                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                                 &format!("WSS WebSocket upgrade failed from {remote_addr}: {e}")
                             );
-                            count.fetch_sub(1, Ordering::Relaxed);
+                            return None;
+                        }
+                    };
+                        Some(ws_stream)
+                    };
+
+                    let ws_stream = match tokio::time::timeout_at(deadline, setup).await {
+                        Ok(Some(ws)) => ws,
+                        Ok(None) => return, // logged above
+                        Err(_) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!(
+                                    "WSS setup from {remote_addr} exceeded the {}s handshake \
+                                     budget; connection dropped",
+                                    handshake_timeout.as_secs()
+                                )
+                            );
                             return;
                         }
                     };
 
+                    // Through both handshakes: this peer presented a valid
+                    // client certificate, so release the pre-authentication
+                    // permit for the next connection being set up.
+                    drop(handshake_permit);
+
+                    // The client cert was verified against the CA during the
+                    // mTLS handshake; capture its SHA-256 fingerprint (the ledger
+                    // key) before the stream is consumed by the transport.
+                    let peer_cert_fp = ws_stream
+                        .get_ref()
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|certs| certs.first())
+                        .map(|der| zeroclaw_tls::cert_sha256_fingerprint(der.as_ref()));
+
                     let mut transport = WssTransport::new(ws_stream, remote_addr);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
+                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer)
+                        .with_peer_cert_fingerprint(peer_cert_fp);
                     dispatcher.run(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {
@@ -298,8 +448,6 @@ pub async fn run_wss_listener(
                         .instrument(span)
                         .await;
                     }
-
-                    count.fetch_sub(1, Ordering::Relaxed);
                 });
             }
         }
