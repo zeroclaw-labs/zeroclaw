@@ -14567,6 +14567,21 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
+    /// When `true` (default), group-chat sessions key on the sender, so
+    /// distinct members of the same group (or forum topic) each get an
+    /// isolated conversation context (matches the existing behavior). When
+    /// `false`, all members of a group chat share one session scoped to the
+    /// chat (and forum topic, when present), so the agent keeps full
+    /// conversation context regardless of which member writes. Sharing the
+    /// session shares its session-scoped controls too: any member's `/new`
+    /// resets the shared history for the whole group/topic, and a member's
+    /// session-level `/model` route override applies to everyone in it,
+    /// while `/stop` and message debouncing stay personal to each sender.
+    /// 1-on-1 chats are unaffected (chat_id is already unique per user-bot
+    /// pair).
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub per_user_session: bool,
     /// Override for the top-level `ack_reactions` setting. When `None`, the
     /// channel falls back to `[channels].ack_reactions`. When set
     /// explicitly, it takes precedence.
@@ -14612,6 +14627,7 @@ impl Default for TelegramConfig {
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            per_user_session: true,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -27457,6 +27473,7 @@ auto_save = true
                         debounce_ms: None,
                         interrupt_on_new_message: false,
                         mention_only: false,
+                        per_user_session: true,
                         ack_reactions: None,
                         proxy_url: None,
                         approval_timeout_secs: default_telegram_approval_timeout_secs(),
@@ -28903,6 +28920,7 @@ default_temperature = 0.7
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            per_user_session: true,
             ack_reactions: None,
             proxy_url: None,
             approval_timeout_secs: 120,
@@ -33800,6 +33818,7 @@ high_entropy_tokens = false
                 draft_update_interval_ms: default_draft_update_interval_ms(),
                 interrupt_on_new_message: false,
                 mention_only: false,
+                per_user_session: true,
                 ack_reactions: None,
                 proxy_url: None,
                 approval_timeout_secs: default_telegram_approval_timeout_secs(),
