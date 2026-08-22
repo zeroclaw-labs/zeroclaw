@@ -1,5 +1,7 @@
 //! Trait abstraction for session persistence backends.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, Utc};
 use zeroclaw_api::model_provider::ChatMessage;
 
@@ -65,6 +67,63 @@ pub struct TimestampedMessage {
     pub created_at: Option<DateTime<Utc>>,
 }
 
+/// Why an agent-scoped session operation was denied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOwnershipDenial {
+    /// The session is attributed to a different agent.
+    ForeignAgent(String),
+    /// The session is attributed to a channel not owned by the calling agent.
+    ForeignChannel(String),
+    /// The session exists but carries no trusted agent or channel attribution.
+    Unattributed,
+    /// The backend cannot make ownership and access one atomic operation.
+    AtomicCheckUnavailable,
+}
+
+/// Result of an ownership-conditional session operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopedSessionAccess<T> {
+    /// Ownership matched and the operation completed.
+    Granted(T),
+    /// The session did not exist at the operation's linearization point.
+    Missing,
+    /// The session existed but the caller was not authorized to access it.
+    Denied(SessionOwnershipDenial),
+}
+
+/// Evaluate trusted persisted ownership metadata against one agent's live
+/// execution scope.
+///
+/// Agent attribution takes precedence over channel attribution, matching the
+/// session-tool contract: a row explicitly owned by another agent is never
+/// widened by a channel grant.
+pub fn check_session_ownership(
+    owner_agent: Option<&str>,
+    owner_channel: Option<&str>,
+    agent_alias: &str,
+    channel_ids: &BTreeSet<String>,
+) -> Result<(), SessionOwnershipDenial> {
+    if let Some(owner) = owner_agent {
+        return if owner == agent_alias {
+            Ok(())
+        } else {
+            Err(SessionOwnershipDenial::ForeignAgent(owner.to_string()))
+        };
+    }
+
+    if let Some(channel_id) = owner_channel {
+        return if channel_ids.contains(channel_id) {
+            Ok(())
+        } else {
+            Err(SessionOwnershipDenial::ForeignChannel(
+                channel_id.to_string(),
+            ))
+        };
+    }
+
+    Err(SessionOwnershipDenial::Unattributed)
+}
+
 /// Trait for session persistence backends.
 /// Implementations must be `Send + Sync` for sharing across async tasks.
 pub trait SessionBackend: Send + Sync {
@@ -86,6 +145,35 @@ pub trait SessionBackend: Send + Sync {
 
     /// Append a single message to a session.
     fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()>;
+
+    /// Load a session only when its persisted ownership matches the supplied
+    /// agent scope. Implementations must make the ownership predicate and load
+    /// one backend-stable operation; a separate best-effort check is unsafe.
+    fn load_if_owned(
+        &self,
+        _session_key: &str,
+        _agent_alias: &str,
+        _channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        Ok(ScopedSessionAccess::Denied(
+            SessionOwnershipDenial::AtomicCheckUnavailable,
+        ))
+    }
+
+    /// Append only when persisted ownership matches the supplied agent scope.
+    /// Implementations must make the predicate and mutation one transaction or
+    /// critical section so ownership cannot change between them.
+    fn append_if_owned(
+        &self,
+        _session_key: &str,
+        _message: &ChatMessage,
+        _agent_alias: &str,
+        _channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        Ok(ScopedSessionAccess::Denied(
+            SessionOwnershipDenial::AtomicCheckUnavailable,
+        ))
+    }
 
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;

@@ -1,7 +1,11 @@
 //! JSONL-based session persistence for channel conversations.
 
-use crate::session_backend::SessionBackend;
-use std::collections::HashMap;
+use crate::session_backend::{
+    ScopedSessionAccess, SessionBackend, SessionContext, SessionMetadata, check_session_ownership,
+};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
@@ -12,6 +16,56 @@ pub use zeroclaw_api::session_keys::sanitize_session_key;
 pub(crate) struct MutationState {
     migrated: bool,
     receipt_state_uncertain: bool,
+}
+
+const SESSION_FILE_SUFFIX: &str = ".jsonl";
+const METADATA_FILE_SUFFIX: &str = ".metadata.json";
+
+/// Durable facts that cannot be recovered from the append-only message file.
+/// Message count and timestamps remain derived from the session files at read
+/// time so the JSONL backend does not duplicate them in a second source.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct JsonlSessionMetadata {
+    pub(crate) name: Option<String>,
+    pub(crate) agent_alias: Option<String>,
+    pub(crate) channel_id: Option<String>,
+    pub(crate) room_id: Option<String>,
+    pub(crate) sender_id: Option<String>,
+}
+
+fn metadata_sidecar_path(sessions_dir: &Path, session_key: &str) -> PathBuf {
+    sessions_dir.join(format!(
+        "{}{METADATA_FILE_SUFFIX}",
+        sanitize_session_key(session_key)
+    ))
+}
+
+/// Read a session's ownership sidecar without taking the per-directory
+/// mutation lock. SQLite migration already holds that lock for the whole
+/// handoff, so it must not re-enter it through `SessionStore`.
+pub(crate) fn read_metadata_sidecar(
+    sessions_dir: &Path,
+    session_key: &str,
+) -> std::io::Result<Option<JsonlSessionMetadata>> {
+    match std::fs::File::open(metadata_sidecar_path(sessions_dir, session_key)) {
+        Ok(file) => serde_json::from_reader(std::io::BufReader::new(file))
+            .map(Some)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Archive a session's ownership sidecar alongside its migrated JSONL file.
+pub(crate) fn mark_metadata_sidecar_migrated(
+    sessions_dir: &Path,
+    session_key: &str,
+) -> std::io::Result<()> {
+    let path = metadata_sidecar_path(sessions_dir, session_key);
+    if !path.exists() {
+        return Ok(());
+    }
+    std::fs::rename(&path, path.with_extension("json.migrated"))
 }
 
 pub(crate) type MutationLock = parking_lot::Mutex<MutationState>;
@@ -57,8 +111,102 @@ impl SessionStore {
 
     /// Compute the file path for a session key, sanitizing for filesystem safety.
     fn session_path(&self, session_key: &str) -> PathBuf {
-        self.sessions_dir
-            .join(format!("{}.jsonl", sanitize_session_key(session_key)))
+        self.sessions_dir.join(format!(
+            "{}{SESSION_FILE_SUFFIX}",
+            sanitize_session_key(session_key)
+        ))
+    }
+
+    fn metadata_path(&self, session_key: &str) -> PathBuf {
+        self.sessions_dir.join(format!(
+            "{}{METADATA_FILE_SUFFIX}",
+            sanitize_session_key(session_key)
+        ))
+    }
+
+    fn read_metadata(&self, session_key: &str) -> std::io::Result<Option<JsonlSessionMetadata>> {
+        let path = self.metadata_path(session_key);
+        match std::fs::File::open(path) {
+            Ok(file) => serde_json::from_reader(std::io::BufReader::new(file))
+                .map(Some)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn write_metadata_unlocked(
+        &self,
+        session_key: &str,
+        metadata: &JsonlSessionMetadata,
+    ) -> std::io::Result<()> {
+        let path = self.metadata_path(session_key);
+        let mut temp = tempfile::NamedTempFile::new_in(&self.sessions_dir)?;
+        serde_json::to_writer(&mut temp, metadata)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        temp.write_all(b"\n")?;
+        temp.as_file().sync_all()?;
+        temp.persist(path).map(|_| ()).map_err(|error| error.error)
+    }
+
+    fn update_metadata<F>(&self, session_key: &str, update: F) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut JsonlSessionMetadata),
+    {
+        let _guard = self.mutation_guard()?;
+        self.update_metadata_unlocked(session_key, update)
+    }
+
+    fn update_metadata_unlocked<F>(&self, session_key: &str, update: F) -> std::io::Result<()>
+    where
+        F: FnOnce(&mut JsonlSessionMetadata),
+    {
+        let mut metadata = self.read_metadata(session_key)?.unwrap_or_default();
+        update(&mut metadata);
+        self.write_metadata_unlocked(session_key, &metadata)
+    }
+
+    fn metadata_for_session(&self, session_key: &str) -> Option<SessionMetadata> {
+        let session_path = self.session_path(session_key);
+        let metadata_path = self.metadata_path(session_key);
+        if !session_path.exists() && !metadata_path.exists() {
+            return None;
+        }
+
+        // Corrupt or unreadable sidecars deliberately degrade to unattributed
+        // metadata. Scoped callers therefore fail closed without hiding the
+        // underlying conversation from unscoped administrative surfaces.
+        let persisted = self
+            .read_metadata(session_key)
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let message_count = self.load(session_key).len();
+        let file_metadata = std::fs::metadata(&session_path)
+            .or_else(|_| std::fs::metadata(&metadata_path))
+            .ok();
+        let last_activity = file_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or_else(Utc::now);
+        let created_at = file_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.created().ok())
+            .map(DateTime::<Utc>::from)
+            .unwrap_or(last_activity);
+
+        Some(SessionMetadata {
+            key: sanitize_session_key(session_key),
+            name: persisted.name,
+            created_at,
+            last_activity,
+            message_count,
+            agent_alias: persisted.agent_alias,
+            channel_id: persisted.channel_id,
+            room_id: persisted.room_id,
+            sender_id: persisted.sender_id,
+        })
     }
 
     /// Load all messages for a session from its JSONL file.
@@ -206,11 +354,18 @@ impl SessionStore {
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
         let path = self.session_path(session_key);
-        if !path.exists() {
-            return Ok(false);
+        let metadata_path = self.metadata_path(session_key);
+        let existed = path.exists() || metadata_path.exists();
+        if metadata_path.exists() {
+            // Remove attribution first. If deleting the message file then
+            // fails, the surviving conversation is unattributed and scoped
+            // access fails closed rather than inheriting stale ownership.
+            std::fs::remove_file(&metadata_path)?;
         }
-        std::fs::remove_file(&path)?;
-        Ok(true)
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+        Ok(existed)
     }
 
     /// Return the modification time of a session's JSONL file.
@@ -231,8 +386,12 @@ impl SessionStore {
             .filter_map(|entry| {
                 let entry = entry.ok()?;
                 let name = entry.file_name().into_string().ok()?;
-                name.strip_suffix(".jsonl").map(String::from)
+                name.strip_suffix(SESSION_FILE_SUFFIX)
+                    .or_else(|| name.strip_suffix(METADATA_FILE_SUFFIX))
+                    .map(String::from)
             })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 }
@@ -304,6 +463,50 @@ impl SessionBackend for SessionStore {
         self.append(session_key, message)
     }
 
+    fn load_if_owned(
+        &self,
+        session_key: &str,
+        agent_alias: &str,
+        channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<Vec<ChatMessage>>> {
+        let _guard = self.mutation_lock.lock();
+        let Some(metadata) = self.metadata_for_session(session_key) else {
+            return Ok(ScopedSessionAccess::Missing);
+        };
+        if let Err(denial) = check_session_ownership(
+            metadata.agent_alias.as_deref(),
+            metadata.channel_id.as_deref(),
+            agent_alias,
+            channel_ids,
+        ) {
+            return Ok(ScopedSessionAccess::Denied(denial));
+        }
+        Ok(ScopedSessionAccess::Granted(self.load(session_key)))
+    }
+
+    fn append_if_owned(
+        &self,
+        session_key: &str,
+        message: &ChatMessage,
+        agent_alias: &str,
+        channel_ids: &BTreeSet<String>,
+    ) -> std::io::Result<ScopedSessionAccess<()>> {
+        let _guard = self.mutation_guard()?;
+        let Some(metadata) = self.metadata_for_session(session_key) else {
+            return Ok(ScopedSessionAccess::Missing);
+        };
+        if let Err(denial) = check_session_ownership(
+            metadata.agent_alias.as_deref(),
+            metadata.channel_id.as_deref(),
+            agent_alias,
+            channel_ids,
+        ) {
+            return Ok(ScopedSessionAccess::Denied(denial));
+        }
+        self.append_unlocked(session_key, message)?;
+        Ok(ScopedSessionAccess::Granted(()))
+    }
+
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         self.remove_last(session_key)
     }
@@ -316,27 +519,10 @@ impl SessionBackend for SessionStore {
         self.list_sessions()
     }
 
-    fn list_sessions_with_metadata(&self) -> Vec<crate::session_backend::SessionMetadata> {
-        use chrono::{DateTime, Utc};
+    fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         self.list_sessions()
             .into_iter()
-            .map(|key| {
-                let last_activity: DateTime<Utc> = self
-                    .session_mtime(&key)
-                    .map(DateTime::<Utc>::from)
-                    .unwrap_or_else(Utc::now);
-                crate::session_backend::SessionMetadata {
-                    name: None,
-                    created_at: last_activity,
-                    last_activity,
-                    message_count: 0,
-                    key,
-                    agent_alias: None,
-                    channel_id: None,
-                    room_id: None,
-                    sender_id: None,
-                }
-            })
+            .filter_map(|key| self.metadata_for_session(&key))
             .collect()
     }
 
@@ -352,11 +538,110 @@ impl SessionBackend for SessionStore {
         self.delete_session(session_key)
     }
 
+    fn clear_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
+        let _guard = self.mutation_guard()?;
+        let mut updated = 0;
+        for key in self.list_sessions() {
+            let Some(metadata) = self.read_metadata(&key)? else {
+                continue;
+            };
+            if metadata.agent_alias.as_deref() != Some(agent_alias) {
+                continue;
+            }
+            self.update_metadata_unlocked(&key, |metadata| metadata.agent_alias = None)?;
+            updated += 1;
+        }
+        Ok(updated)
+    }
+
+    fn rename_agent_attribution(&self, from: &str, to: &str) -> std::io::Result<usize> {
+        let _guard = self.mutation_guard()?;
+        let mut updated = 0;
+        for key in self.list_sessions() {
+            let Some(metadata) = self.read_metadata(&key)? else {
+                continue;
+            };
+            if metadata.agent_alias.as_deref() != Some(from) {
+                continue;
+            }
+            self.update_metadata_unlocked(&key, |metadata| {
+                metadata.agent_alias = Some(to.to_string());
+            })?;
+            updated += 1;
+        }
+        Ok(updated)
+    }
+
+    fn count_agent_attribution(&self, agent_alias: &str) -> std::io::Result<usize> {
+        self.list_sessions().into_iter().try_fold(0, |count, key| {
+            let owned = self
+                .read_metadata(&key)?
+                .is_some_and(|metadata| metadata.agent_alias.as_deref() == Some(agent_alias));
+            Ok(count + usize::from(owned))
+        })
+    }
+
+    fn set_session_name(&self, session_key: &str, name: &str) -> std::io::Result<()> {
+        self.update_metadata(session_key, |metadata| {
+            metadata.name = (!name.is_empty()).then(|| name.to_string());
+        })
+    }
+
+    fn get_session_name(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(self
+            .read_metadata(session_key)?
+            .and_then(|metadata| metadata.name))
+    }
+
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
+        self.update_metadata(session_key, |metadata| {
+            metadata.agent_alias = (!agent_alias.is_empty()).then(|| agent_alias.to_string());
+        })
+    }
+
+    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(self
+            .read_metadata(session_key)?
+            .and_then(|metadata| metadata.agent_alias))
+    }
+
+    fn set_session_context(
+        &self,
+        session_key: &str,
+        context: SessionContext<'_>,
+    ) -> std::io::Result<()> {
+        fn normalize(value: Option<&str>) -> Option<String> {
+            value
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        }
+
+        let channel_id = normalize(context.channel_id);
+        let room_id = normalize(context.room_id);
+        let sender_id = normalize(context.sender_id);
+        self.update_metadata(session_key, |metadata| {
+            if channel_id.is_some() {
+                metadata.channel_id = channel_id;
+            }
+            if room_id.is_some() {
+                metadata.room_id = room_id;
+            }
+            if sender_id.is_some() {
+                metadata.sender_id = sender_id;
+            }
+        })
+    }
+
+    fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
+        self.metadata_for_session(session_key)
+    }
+
     /// Quick existence probe mirroring how `delete_session` decides whether
     /// the session is on disk Checking file presence is the same
     /// O(1) `stat` that `delete_session` itself performs.
     fn session_exists(&self, session_key: &str) -> bool {
-        self.session_path(session_key).exists()
+        self.session_path(session_key).exists() || self.metadata_path(session_key).exists()
     }
 }
 
@@ -792,5 +1077,97 @@ mod tests {
         assert_eq!(meta.key, "test_session");
         assert_eq!(meta.message_count, 2);
         assert!(meta.name.is_none());
+    }
+
+    #[test]
+    fn ownership_metadata_survives_restart_and_precedes_first_message() {
+        let tmp = TempDir::new().unwrap();
+        let key = "discord_room_42";
+
+        {
+            let store = SessionStore::new(tmp.path()).unwrap();
+            let backend: &dyn SessionBackend = &store;
+            backend.set_session_name(key, "Operations").unwrap();
+            backend.set_session_agent_alias(key, "rowan").unwrap();
+            backend
+                .set_session_context(
+                    key,
+                    SessionContext {
+                        channel_id: Some("discord.primary"),
+                        room_id: Some("42"),
+                        sender_id: Some("operator"),
+                    },
+                )
+                .unwrap();
+
+            assert!(backend.session_exists(key));
+            assert_eq!(backend.list_sessions(), vec![key.to_string()]);
+            backend
+                .append(key, &ChatMessage::user("restart-safe"))
+                .unwrap();
+        }
+
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        let metadata = backend.get_session_metadata(key).unwrap();
+        assert_eq!(metadata.name.as_deref(), Some("Operations"));
+        assert_eq!(metadata.agent_alias.as_deref(), Some("rowan"));
+        assert_eq!(metadata.channel_id.as_deref(), Some("discord.primary"));
+        assert_eq!(metadata.room_id.as_deref(), Some("42"));
+        assert_eq!(metadata.sender_id.as_deref(), Some("operator"));
+        assert_eq!(metadata.message_count, 1);
+    }
+
+    #[test]
+    fn legacy_message_file_remains_unattributed() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        store
+            .append("legacy", &ChatMessage::user("pre-metadata"))
+            .unwrap();
+
+        let metadata = (&store as &dyn SessionBackend)
+            .get_session_metadata("legacy")
+            .unwrap();
+        assert!(metadata.agent_alias.is_none());
+        assert!(metadata.channel_id.is_none());
+    }
+
+    #[test]
+    fn agent_attribution_lifecycle_updates_sidecars() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        for key in ["one", "two"] {
+            backend.append(key, &ChatMessage::user(key)).unwrap();
+            backend.set_session_agent_alias(key, "rowan").unwrap();
+        }
+
+        assert_eq!(backend.count_agent_attribution("rowan").unwrap(), 2);
+        assert_eq!(
+            backend.rename_agent_attribution("rowan", "sable").unwrap(),
+            2
+        );
+        assert_eq!(backend.count_agent_attribution("rowan").unwrap(), 0);
+        assert_eq!(backend.count_agent_attribution("sable").unwrap(), 2);
+        assert_eq!(backend.clear_agent_attribution("sable").unwrap(), 2);
+        assert_eq!(backend.count_agent_attribution("sable").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_session_removes_ownership_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+        let backend: &dyn SessionBackend = &store;
+        backend
+            .append("owned", &ChatMessage::user("private"))
+            .unwrap();
+        backend.set_session_agent_alias("owned", "rowan").unwrap();
+        let metadata_path = store.metadata_path("owned");
+        assert!(metadata_path.exists());
+
+        assert!(backend.delete_session("owned").unwrap());
+        assert!(!metadata_path.exists());
+        assert!(!backend.session_exists("owned"));
     }
 }

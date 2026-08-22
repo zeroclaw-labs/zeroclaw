@@ -333,6 +333,15 @@ impl DiscordChannel {
         self
     }
 
+    /// Provenance namespace stamped on every archive row this channel
+    /// writes: its own ChannelRef (`discord.<alias>`). `discord_search`
+    /// enforces per-agent ownership against this value, so rows in the
+    /// shared discord.db are attributable to the configured channel that
+    /// observed them (never to model-supplied identifiers).
+    fn archive_namespace(&self) -> String {
+        format!("discord.{}", self.alias)
+    }
+
     async fn sync_archive_for_message_event(
         &self,
         event_type: &str,
@@ -400,11 +409,13 @@ impl DiscordChannel {
         existing: &zeroclaw_memory::MemoryEntry,
     ) {
         if let Err(e) = archive_mem
-            .store(
+            .store_with_metadata(
                 key,
                 content,
                 existing.category.clone(),
                 existing.session_id.as_deref(),
+                Some(&self.archive_namespace()),
+                None,
             )
             .await
         {
@@ -628,11 +639,13 @@ impl DiscordChannel {
             Some(channel_id)
         };
         if let Err(e) = archive_mem
-            .store(
+            .store_with_metadata(
                 &key,
                 &content,
                 zeroclaw_memory::MemoryCategory::Custom("discord".to_string()),
                 session,
+                Some(&self.archive_namespace()),
+                None,
             )
             .await
         {
@@ -2022,6 +2035,7 @@ impl Channel for DiscordChannel {
         let guild_filter = self.guild_ids.clone();
         let channel_filter = self.channel_ids.clone();
         let archive_memory = self.archive_memory.clone();
+        let archive_namespace = self.archive_namespace();
 
         // --- Stall watchdog --------------------------------------------------
         let watchdog = if self.stall_timeout_secs > 0 {
@@ -3159,13 +3173,15 @@ impl Channel for DiscordChannel {
                                 Some(archive_channel_id)
                             };
                             if let Err(e) = archive_mem
-                                .store(
+                                .store_with_metadata(
                                     &mem_key,
                                     &mem_content,
                                     zeroclaw_memory::MemoryCategory::Custom(
                                         "discord".to_string(),
                                     ),
                                     session,
+                                    Some(&archive_namespace),
+                                    None,
                                 )
                                 .await
                             {
@@ -5118,8 +5134,11 @@ mod tests {
                 .content
                 .contains("[edited at 2026-06-11T01:00:00Z: revised text]")
         );
-        // Session attribution survives the re-store.
+        // Session attribution survives the re-store, and the re-store
+        // stamps the archiving channel's provenance namespace (healing
+        // pre-provenance rows on touch).
         assert_eq!(entry.session_id.as_deref(), Some("200"));
+        assert_eq!(entry.namespace, "discord.discord_test_alias");
     }
 
     #[tokio::test]
@@ -5207,6 +5226,7 @@ mod tests {
         );
         assert_eq!(entry.content.matches("[deleted at ").count(), 1);
         assert_eq!(entry.session_id.as_deref(), Some("200"));
+        assert_eq!(entry.namespace, "discord.discord_test_alias");
     }
 
     #[tokio::test]
@@ -5433,6 +5453,9 @@ mod tests {
                 .content
                 .contains("@bob reacted 👍 to message m1 in #c1")
         );
+        // Reaction rows carry the archiving channel's provenance namespace
+        // so discord_search can ownership-filter them.
+        assert_eq!(entry.namespace, "discord.discord_test_alias");
 
         let remove = serde_json::json!({
             "user_id": "u1", "message_id": "m1", "channel_id": "c1",

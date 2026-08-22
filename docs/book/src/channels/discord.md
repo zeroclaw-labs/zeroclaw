@@ -91,6 +91,12 @@ records every message it sees, and registers a `discord_search` tool the agent
 can use to look up past conversation. Leave it off if you don't need history
 search; the bot still replies normally either way.
 
+The archive is shared across Discord aliases, but each archived row records
+which configured channel wrote it, and `discord_search` only returns rows
+belonging to the calling agent's own Discord channels. Rows archived by
+older versions carry no channel attribution: a single-agent install still
+sees them, while a multi-agent install hides them from every agent.
+
 ## Streaming
 
 {{#streaming channel="Discord" mode="stream_mode" path="channels.discord.<alias>.stream_mode"}}
