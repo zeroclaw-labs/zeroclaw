@@ -579,6 +579,14 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      # `channel-lark` is outside `default-channels`, so the workspace run above
+      # does not execute Lark's feature-gated library regressions. This step
+      # exercises the URL-verification handler coverage added by PR #9110.
+      - name: Run Lark channel URL-verification tests
+        run: "cargo nextest run --locked -p zeroclaw-channels --no-default-features --features channel-lark --lib lark_url_verification"
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
   parallel-runtime-test-changes:
     name: Detect parallel runtime test changes
