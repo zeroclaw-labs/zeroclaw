@@ -58,7 +58,7 @@ pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::email_read::EmailReadTool;
 pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
-pub use zeroclaw_tools::file_download::FileDownloadTool;
+pub use zeroclaw_tools::file_download::{FileDownloadSsrfPolicy, FileDownloadTool};
 pub use zeroclaw_tools::file_edit::FileEditTool;
 pub use zeroclaw_tools::file_upload::FileUploadTool;
 pub use zeroclaw_tools::file_upload_bundle::FileUploadBundleTool;
@@ -1333,11 +1333,42 @@ pub fn all_tools_with_runtime(
         .as_deref()
         .is_some_and(|u| !u.trim().is_empty())
     {
-        tool_arcs.push(Arc::new(FileDownloadTool::new_with_persistence(
-            security.clone(),
-            root_config.file_download.clone(),
-            persistent_writes,
-        )));
+        // The allowlist and the declared NAT64 prefixes are resolved as ONE
+        // atomic SSRF policy snapshot at use time (live handle when present,
+        // snapshot fallback otherwise) — the same seam `image_gen` and
+        // `AgentPeerGroupResolver` use — so the tool never retains a second
+        // policy copy that goes stale on a `config/set`. The single snapshot
+        // shape means one `live.read()` supplies both fields, so a concurrent
+        // `config/set` cannot present a dispatch with allowlist-from-one
+        // generation and prefix-list-from-another.
+        let policy_resolver: Arc<dyn Fn() -> FileDownloadSsrfPolicy + Send + Sync> =
+            if let Some(live) = live_config.clone() {
+                Arc::new(move || {
+                    let locked = live.read();
+                    FileDownloadSsrfPolicy {
+                        allowed_private_hosts: locked.file_download.allowed_private_hosts.clone(),
+                        // The declared NAT64 prefixes are the canonical host-level
+                        // `security.nat64_prefixes` fact (shared by http_request /
+                        // web_fetch / text_browser / image_gen); `file_download` has
+                        // no copy of its own.
+                        nat64_prefixes: locked.security.nat64_prefixes.clone(),
+                    }
+                })
+            } else {
+                let snapshot = FileDownloadSsrfPolicy {
+                    allowed_private_hosts: root_config.file_download.allowed_private_hosts.clone(),
+                    nat64_prefixes: root_config.security.nat64_prefixes.clone(),
+                };
+                Arc::new(move || snapshot.clone())
+            };
+        tool_arcs.push(Arc::new(
+            FileDownloadTool::new_with_persistence_and_resolver(
+                security.clone(),
+                root_config.file_download.clone(),
+                persistent_writes,
+                move || policy_resolver(),
+            ),
+        ));
     }
 
     // Poll tool — always registered; owns its own late-bound channel map.
@@ -3507,6 +3538,110 @@ const = true
         assert!(
             names.contains(&"shell"),
             "positive control: the registry must still be populated"
+        );
+    }
+
+    /// Runtime-level regression for the live-config factory seam used by
+    /// file_download. Constructing the tool registry through
+    /// `all_tools_with_runtime` with a live config handle must wire the
+    /// allowlist resolver to the canonical config, so a `config/set` mutation
+    /// revokes an opt-in without rebuilding the tool.
+    #[tokio::test]
+    async fn file_download_factory_seam_reflects_live_config_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_config::schema::FileDownloadConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        // Run a real local listener so the allowlisted path can succeed,
+        // proving we passed the SSRF gate.
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut root_config = test_config(&tmp);
+        root_config.file_download = FileDownloadConfig {
+            url: Some(format!("http://127.0.0.1:{port}/x")),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+            ..FileDownloadConfig::default()
+        };
+
+        let live = Arc::new(parking_lot::RwLock::new(root_config.clone()));
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &root_config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(live.clone()),
+        )
+        .tools;
+
+        let file_download = tools
+            .iter()
+            .find(|t| t.name() == "file_download")
+            .expect("file_download tool must be registered when [file_download].url is set");
+
+        let args = serde_json::json!({ "document_id": "doc-1", "dest_path": "out.bin" });
+
+        // Side 1: live allowlist contains 127.0.0.1 → validation passes and
+        // the request reaches the local listener.
+        let result1 = file_download
+            .execute(args.clone())
+            .await
+            .expect("tool execute must return a ToolResult")
+            .success;
+        assert!(
+            result1,
+            "allowlisted 127.0.0.1 must pass the SSRF gate and download"
+        );
+
+        // Side 2: operator revokes the opt-in via live config — no rebuild.
+        live.write().file_download.allowed_private_hosts.clear();
+
+        let result2 = file_download
+            .execute(args)
+            .await
+            .expect("tool execute must return a ToolResult");
+        assert!(
+            !result2.success,
+            "after revoking the live allowlist entry the request must be rejected"
+        );
+        let err2 = result2.error.unwrap_or_default().to_lowercase();
+        assert!(
+            err2.contains("private")
+                || err2.contains("non-global")
+                || err2.contains("loopback")
+                || err2.contains("link-local"),
+            "127.0.0.1 must be rejected by the SSRF gate after live-config revocation; got: {err2}"
         );
     }
 }
