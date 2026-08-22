@@ -401,16 +401,39 @@ mod platform {
                             lock_path.display()
                         );
                     }
+                    // Best-effort: record this owner's pid so a conflicting
+                    // startup can name the live owner in its error. Ownership
+                    // itself is the flock — a failed write only degrades the
+                    // conflict diagnostic, never correctness.
+                    {
+                        use std::io::Write;
+                        let _ = file.set_len(0);
+                        let _ = (&file).write_all(std::process::id().to_string().as_bytes());
+                    }
                     Ok(Self { _file: file })
                 }
-                Err(TryLockError::WouldBlock) => Err(std::io::Error::new(
-                    ErrorKind::AddrInUse,
-                    format!(
-                        "local IPC endpoint lifecycle is already owned at {}",
-                        path.display()
-                    ),
-                )
-                .into()),
+                Err(TryLockError::WouldBlock) => {
+                    // The flock is released automatically when the owning
+                    // process exits, so a held lock proves the owner is
+                    // alive right now — this branch is never a stale socket.
+                    let owner = read_owner_pid(&file)
+                        .map(|pid| format!(" (pid {pid})"))
+                        .unwrap_or_default();
+                    Err(std::io::Error::new(
+                        ErrorKind::AddrInUse,
+                        format!(
+                            "another ZeroClaw daemon{owner} is already running and owns the \
+                             local IPC endpoint at {}. The owner is alive — this is not a \
+                             stale socket, so do not delete it. If ZeroCode is running, it \
+                             supervises its daemon and restarts it when killed; quit ZeroCode \
+                             to stop that daemon. Stop a standalone daemon with SIGTERM \
+                             (`kill <pid>`), or `zeroclaw service stop` if it runs as a \
+                             managed service.",
+                            path.display()
+                        ),
+                    )
+                    .into())
+                }
                 Err(TryLockError::Error(error)) => Err(error).with_context(|| {
                     format!(
                         "locking local IPC endpoint lifecycle at {}",
@@ -419,6 +442,19 @@ mod platform {
                 }),
             }
         }
+    }
+
+    /// Owner pid recorded in the lifecycle lock file by [`EndpointLock::acquire`].
+    /// Absent or unparsable content (e.g. a lock held by an older daemon that
+    /// did not record its pid) degrades to `None` and the conflict error omits
+    /// the pid clause.
+    fn read_owner_pid(file: &std::fs::File) -> Option<u32> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut handle = file;
+        handle.seek(SeekFrom::Start(0)).ok()?;
+        let mut contents = String::new();
+        handle.take(32).read_to_string(&mut contents).ok()?;
+        contents.trim().parse().ok()
     }
 
     /// Removes the bound socket only while the path still names this listener.
@@ -1028,6 +1064,48 @@ mod tests {
         );
         let _next_owner = platform::EndpointLock::acquire(&sock_path).unwrap();
         drop(replacement);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn endpoint_lock_conflict_names_live_owner_and_recovery_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock_path = tmp.path().join("daemon.sock");
+
+        let _owner = platform::EndpointLock::acquire(&sock_path).unwrap();
+        let error = platform::EndpointLock::acquire(&sock_path)
+            .expect_err("a held lifecycle lock must reject a second acquire");
+
+        let io = error
+            .downcast_ref::<std::io::Error>()
+            .expect("ownership conflict stays an io::Error");
+        assert_eq!(io.kind(), ErrorKind::AddrInUse);
+
+        let message = io.to_string();
+        assert!(
+            message.contains(&format!("(pid {})", std::process::id())),
+            "conflict error must name the recorded owner pid: {message}"
+        );
+        assert!(
+            message.contains("another ZeroClaw daemon"),
+            "conflict error must say a daemon is already running: {message}"
+        );
+        assert!(
+            message.contains("not a stale socket"),
+            "conflict error must distinguish a live owner from a stale socket: {message}"
+        );
+        assert!(
+            message.contains("ZeroCode"),
+            "conflict error must explain ZeroCode supervision: {message}"
+        );
+        assert!(
+            message.contains("zeroclaw service stop"),
+            "conflict error must give a safe recovery path: {message}"
+        );
+        assert!(
+            !message.contains("lifecycle lock"),
+            "conflict error should describe the situation, not the lock mechanism: {message}"
+        );
     }
 
     #[cfg(unix)]
