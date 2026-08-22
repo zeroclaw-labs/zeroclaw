@@ -9,18 +9,41 @@ use std::path::{Path, PathBuf};
 pub struct LlmTrace {
     /// Identifier for the trace (surfaced in reports).
     pub model_name: String,
+    /// Optional stable report identity. When set, reports and receipts use this
+    /// instead of `model_name`; readers should go through [`LlmTrace::display_id`].
+    #[serde(default)]
+    pub id: Option<String>,
     /// Conversation turns, replayed in order.
     pub turns: Vec<TraceTurn>,
     /// Declarative expectations graded against the run.
     #[serde(default)]
     pub expects: TraceExpects,
+    /// Pre-run environment preparation for the case (live mode).
+    #[serde(default)]
+    pub setup: Option<CaseSetup>,
+    /// Tool names this case requests. Live mode only; ignored in replay.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+}
+
+/// Pre-run environment preparation for a case.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaseSetup {
+    /// Files written into the case's temp workspace before the run.
+    /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
+    #[serde(default)]
+    pub workspace_files: std::collections::BTreeMap<String, String>,
 }
 
 /// A single conversation turn (user input + scripted LLM response steps).
+///
+/// `steps` is optional: replay cases script every LLM round-trip, while live
+/// cases must omit them (the real provider produces the responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceTurn {
     pub user_input: String,
-    pub steps: Vec<TraceStep>,
+    #[serde(default)]
+    pub steps: Option<Vec<TraceStep>>,
 }
 
 /// A single LLM response step within a turn.
@@ -83,9 +106,61 @@ pub struct TraceExpects {
     /// Regex patterns the final response must match.
     #[serde(default)]
     pub response_matches: Vec<String>,
+    /// End-state checks against the case workspace after the run.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceExpects>,
+    /// Resource ceilings for the run.
+    #[serde(default)]
+    pub budget: Option<BudgetExpects>,
+    /// JSON-pointer checks against the final response parsed as JSON.
+    #[serde(default)]
+    pub response_json: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+/// End-state checks against the case workspace after the run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceExpects {
+    /// Workspace-relative paths that must exist as a regular file after the run
+    /// (a directory at the path does not satisfy the check).
+    #[serde(default)]
+    pub file_exists: Vec<String>,
+    /// Workspace-relative paths at which nothing (file or directory) may exist
+    /// after the run.
+    #[serde(default)]
+    pub file_absent: Vec<String>,
+    /// Path -> substrings that must appear in that file.
+    #[serde(default)]
+    pub file_contains: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Resource ceilings for the run (all optional; each present bound is one
+/// inclusive check, `actual <= max`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BudgetExpects {
+    /// Max accumulated input tokens reported by the provider.
+    #[serde(default)]
+    pub max_input_tokens: Option<u64>,
+    /// Max accumulated output tokens reported by the provider.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// Max total tokens (input + output).
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    /// Max wall-clock duration of the turns loop, in milliseconds.
+    #[serde(default)]
+    pub max_duration_ms: Option<u64>,
+    /// Max number of LLM responses (model round-trips) during the run.
+    #[serde(default)]
+    pub max_llm_calls: Option<u32>,
 }
 
 impl LlmTrace {
+    /// The identity used in reports and receipts: the explicit `id` when set,
+    /// otherwise `model_name`.
+    pub fn display_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.model_name)
+    }
+
     /// Load a trace from a JSON file.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -96,7 +171,44 @@ impl LlmTrace {
     }
 }
 
+/// SHA-256 hex of the case's canonical JSON, used as the receipt's comparability
+/// key. `serde_json` emits object keys in sorted (BTreeMap) order because nothing
+/// in this workspace enables `preserve_order`, so the hash is stable across
+/// re-serialization (guarded by `canonical_json_is_key_sorted`).
+pub fn case_hash(trace: &LlmTrace) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_string(&serde_json::to_value(trace)?)?;
+    let digest = Sha256::digest(canonical.as_bytes());
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Validate that `path` is a safe workspace-relative path: non-empty, not absolute,
+/// and free of any `..` component. Used before writing setup files or grading
+/// workspace paths, so a case cannot read or write outside its sandbox.
+pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("workspace path must not be empty");
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                anyhow::bail!("workspace path {path:?} must not contain a `..` component");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                anyhow::bail!("workspace path {path:?} must be relative, not absolute");
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
+///
+/// Fails closed on identity problems: an empty display id (empty `id`, or
+/// missing `id` with an empty `model_name`) or a display id shared by two
+/// fixtures is an error. Duplicate ids would let one case's result silently
+/// mask another's in reports, baselines, and the flaky re-run lookup.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let read = std::fs::read_dir(dir)
         .with_context(|| format!("reading eval suite directory {}", dir.display()))?;
@@ -108,9 +220,25 @@ pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
         .collect();
     paths.sort();
 
-    let mut out = Vec::with_capacity(paths.len());
+    let mut out: Vec<(PathBuf, LlmTrace)> = Vec::with_capacity(paths.len());
+    let mut seen: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
     for path in paths {
         let trace = LlmTrace::from_file(&path)?;
+        let id = trace.display_id();
+        if id.is_empty() {
+            anyhow::bail!(
+                "fixture {} has an empty case id (set `id`, or a non-empty `model_name`)",
+                path.display()
+            );
+        }
+        if let Some(prev) = seen.insert(id.to_string(), path.clone()) {
+            anyhow::bail!(
+                "duplicate case id {id:?} in fixtures {} and {}: one case's result would \
+                 silently mask the other's",
+                prev.display(),
+                path.display()
+            );
+        }
         out.push((path, trace));
     }
     Ok(out)
@@ -176,6 +304,72 @@ mod tests {
     }
 
     #[test]
+    fn display_id_prefers_id_then_falls_back_to_model_name() {
+        let with_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","id":"case-7","turns":[]}"#).unwrap();
+        assert_eq!(with_id.display_id(), "case-7");
+        let without_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        assert_eq!(without_id.display_id(), "m");
+    }
+
+    #[test]
+    fn turn_steps_default_to_none_when_omitted() {
+        let t: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        assert!(t.turns[0].steps.is_none());
+    }
+
+    #[test]
+    fn canonical_json_is_key_sorted() {
+        // Guard: if anyone enables serde_json's `preserve_order`, this fails,
+        // alerting that case_hash would stop being canonical.
+        let v = serde_json::json!({ "b": 1, "a": 2 });
+        assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"a":2,"b":1}"#);
+    }
+
+    #[test]
+    fn case_hash_stable_across_reserialization() {
+        let trace: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        // Re-parse from a re-serialized form; the hash must be identical.
+        let reserialized: LlmTrace =
+            serde_json::from_str(&serde_json::to_string(&trace).unwrap()).unwrap();
+        assert_eq!(
+            case_hash(&trace).unwrap(),
+            case_hash(&reserialized).unwrap()
+        );
+    }
+
+    #[test]
+    fn case_hash_changes_on_case_edit() {
+        let a: LlmTrace = serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        let b: LlmTrace = serde_json::from_str(r#"{"model_name":"m2","turns":[]}"#).unwrap();
+        assert_ne!(case_hash(&a).unwrap(), case_hash(&b).unwrap());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_absolute() {
+        assert!(validate_workspace_rel_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_empty() {
+        assert!(validate_workspace_rel_path("").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_parent_component() {
+        assert!(validate_workspace_rel_path("../secret").is_err());
+        assert!(validate_workspace_rel_path("sub/../../secret").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_accepts_nested_relative() {
+        assert!(validate_workspace_rel_path("sub/dir/file.txt").is_ok());
+    }
+
+    #[test]
     fn load_suite_filters_json_and_sorts_by_path() {
         let dir = std::env::temp_dir().join("zeroclaw_eval_case_suite_test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -187,6 +381,70 @@ mod tests {
         assert_eq!(suite.len(), 2); // the .txt file is ignored
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_rejects_duplicate_display_ids() {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_case_dup_id_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Different files, same explicit id.
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"model_name":"m1","id":"same","turns":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("b.json"),
+            r#"{"model_name":"m2","id":"same","turns":[]}"#,
+        )
+        .unwrap();
+        let err = load_suite(&dir).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("duplicate case id"), "got: {msg}");
+        assert!(
+            msg.contains("a.json") && msg.contains("b.json"),
+            "got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_rejects_id_and_model_name_collision() {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_case_cross_id_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // One case's explicit id collides with another's model_name fallback.
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"model_name":"x","id":"shared","turns":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"model_name":"shared","turns":[]}"#).unwrap();
+        let err = load_suite(&dir).unwrap_err();
+        assert!(err.to_string().contains("duplicate case id"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_rejects_empty_display_id() {
+        let dir = std::env::temp_dir().join("zeroclaw_eval_case_empty_id_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Explicit empty id.
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"model_name":"m","id":"","turns":[]}"#,
+        )
+        .unwrap();
+        let err = load_suite(&dir).unwrap_err();
+        assert!(err.to_string().contains("empty case id"));
+        // Missing id with empty model_name.
+        std::fs::remove_file(dir.join("a.json")).unwrap();
+        std::fs::write(dir.join("b.json"), r#"{"model_name":"","turns":[]}"#).unwrap();
+        let err = load_suite(&dir).unwrap_err();
+        assert!(err.to_string().contains("empty case id"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

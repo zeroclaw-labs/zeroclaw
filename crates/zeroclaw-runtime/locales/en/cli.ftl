@@ -1124,6 +1124,23 @@ sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve t
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
+# ── Evaluation harness ──
+cli-eval-failed-case-records =   failed-case records: {$dir}/
+cli-eval-flaky-unconfirmed-regression =   flaky (unconfirmed regression): {$id}
+cli-eval-baseline-comparison =   baseline comparison:
+cli-eval-comparison-new = new
+cli-eval-comparison-removed = removed (warn) - in baseline, absent now
+cli-eval-comparison-unverifiable = changed - refresh baseline
+cli-eval-comparison-current-error = RUN ERROR - errored before producing a record
+cli-eval-comparison-improvement = improvement
+cli-eval-comparison-flaky-unconfirmed = flaky (unconfirmed regression)
+cli-eval-comparison-regression = REGRESSION ({$categories})
+cli-eval-comparison-unchanged-tokens = unchanged (tokens {$pct}%)
+cli-eval-comparison-unchanged = unchanged
+cli-eval-capability-pass-rate = pass rate {$rate}%
+cli-eval-capability-pass-rate-was = pass rate {$rate}% (was {$baseline_rate}%)
+cli-eval-capability-saturation-warning = {"  "}saturation warning: >=95% - consider graduating to regression/
+cli-eval-unknown-suite-kind = unknown --suite-kind '{$kind}' (expected 'regression' or 'capability')
 # ── Runtime command construction — shell and skill shell tools ──
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
