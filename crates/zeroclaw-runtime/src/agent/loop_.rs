@@ -2833,10 +2833,52 @@ pub async fn run(
         .await
 }
 
+#[cfg(test)]
+type ProcessMessageLiveConfigTestHook =
+    Arc<dyn Fn(&str, Option<Arc<parking_lot::RwLock<Config>>>) + Send + Sync>;
+
+#[cfg(test)]
+static PROCESS_MESSAGE_LIVE_CONFIG_TEST_HOOK: LazyLock<
+    Mutex<Option<ProcessMessageLiveConfigTestHook>>,
+> = LazyLock::new(|| Mutex::new(None));
+
+/// Identity wrapper over the live-config handle handed to the registry build.
+///
+/// The gateway-path regression needs to observe the exact value that crosses
+/// the `all_tools_with_runtime` boundary, not a value captured before the call:
+/// a future change that drops the handle (e.g. passing `None` at the call site)
+/// must turn the regression red. In tests this records the value into the
+/// process-global hook *after* it is bound here, so the hook sees exactly what
+/// the registry factory receives. In production it is a plain identity.
+#[cfg(test)]
+fn observe_registry_live_config(
+    agent_alias: &str,
+    live: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> Option<Arc<parking_lot::RwLock<Config>>> {
+    if let Some(hook) = PROCESS_MESSAGE_LIVE_CONFIG_TEST_HOOK
+        .lock()
+        .expect("process-message live-config test hook lock should not be poisoned")
+        .as_ref()
+        .cloned()
+    {
+        hook(agent_alias, live.clone());
+    }
+    live
+}
+
+#[cfg(not(test))]
+fn observe_registry_live_config(
+    _agent_alias: &str,
+    live: Option<Arc<parking_lot::RwLock<Config>>>,
+) -> Option<Arc<parking_lot::RwLock<Config>>> {
+    live
+}
+
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(
     config: Config,
+    live_config: Option<Arc<parking_lot::RwLock<Config>>>,
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
@@ -2977,7 +3019,12 @@ pub async fn process_message(
             None,
             sop_engine,
             sop_audit,
-            None,
+            // Single source of truth for the registry build's live-config
+            // handle. `observe_registry_live_config` is an identity wrapper
+            // invoked inline at the final `all_tools_with_runtime` argument, so
+            // its test hook fires on exactly the value the registry factory
+            // receives — not a value captured earlier in the function.
+            observe_registry_live_config(agent_alias, live_config),
         );
         let skills = crate::skills::load_skills_for_agent_from_config(&config, agent_alias);
         let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
@@ -16067,6 +16114,7 @@ Let me check the result."#;
         .await;
         let _ = super::process_message(
             config,
+            None,
             "entrypoint-profile-agent",
             "hello",
             Some("session"),
@@ -16143,6 +16191,7 @@ Let me check the result."#;
 
         let result = super::process_message(
             config,
+            None,
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
@@ -16162,6 +16211,110 @@ Let me check the result."#;
             seen.iter().any(|has_reassembly| *has_reassembly),
             "process_message must pass a config-backed SopStepReassembly handle into agent_turn; \
              observed {seen:?}; process_message result: {result:?}"
+        );
+    }
+
+    /// Pins the process_message seam: the gateway computes its live handle and
+    /// hands it to `process_message` as the new `live_config` argument. The
+    /// process_message seam must forward that exact handle into
+    /// `all_tools_with_runtime`, so a `config/set` revocation of the
+    /// `file_download` SSRF allowlist reaches the delegate/tool registries
+    /// instead of a construction-time snapshot. Pin the seam with a test hook
+    /// that captures the live_config value the registry build receives.
+    #[tokio::test]
+    async fn process_message_forwards_gateway_live_config_into_registry_build() {
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("live-config-forward-test".to_string()),
+                    timeout_secs: Some(1),
+                    uri: Some("http://127.0.0.1:9".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "live-config-forward-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "default".into(),
+                ..Default::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("default".to_string(), RiskProfileConfig::default());
+
+        // The gateway owns the live handle (`AppState.config`) and passes a
+        // clone of it into process_message. Capture the exact Arc that the
+        // registry build receives.
+        let live: Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>> =
+            Arc::new(parking_lot::RwLock::new(config.clone()));
+
+        // The hook is process-global, and the Parallel Runtime Test runs the
+        // whole lib suite concurrently — other tests drive `process_message`
+        // with `None` and would overwrite a single-slot capture. So the hook
+        // filters by our agent alias (the same trick `RESOLVED_AGENT_FOR_TURN_
+        // TEST_HOOK` uses) and appends to a Vec; the assertion looks for the
+        // exact handle among the alias-filtered observations.
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<
+            Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>,
+        >::new()));
+        let captured_for_hook = Arc::clone(&captured);
+        {
+            let mut hook = super::PROCESS_MESSAGE_LIVE_CONFIG_TEST_HOOK
+                .lock()
+                .expect("process-message live-config test hook lock should not be poisoned");
+            *hook = Some(Arc::new(move |alias, seen| {
+                if alias != "live-config-forward-agent" {
+                    return;
+                }
+                if let Some(handle) = seen {
+                    captured_for_hook
+                        .lock()
+                        .expect("captured lock should not be poisoned")
+                        .push(handle);
+                }
+            }));
+        }
+
+        // Reaching the registry build needs the full process_message path to
+        // resolve the agent/provider/risk-profile before `all_tools_with_runtime`;
+        // the provider uri is a dead address so the turn fails after the seam
+        // fires — the hook assertion is what matters, not the turn outcome.
+        let _ = super::process_message(
+            config,
+            Some(Arc::clone(&live)),
+            "live-config-forward-agent",
+            "hello",
+            Some("session"),
+            TurnOrigin::SubTurn,
+        )
+        .await;
+
+        {
+            let mut hook = super::PROCESS_MESSAGE_LIVE_CONFIG_TEST_HOOK
+                .lock()
+                .expect("process-message live-config test hook lock should not be poisoned");
+            *hook = None;
+        }
+
+        let seen = captured
+            .lock()
+            .expect("captured lock should not be poisoned")
+            .clone();
+        assert!(
+            seen.iter().any(|handle| Arc::ptr_eq(handle, &live)),
+            "process_message must forward its live_config argument into all_tools_with_runtime \
+             for its own agent alias; observed {seen:?} (registry would fall back to the \
+             construction-time snapshot if the handle is dropped)"
         );
     }
 
