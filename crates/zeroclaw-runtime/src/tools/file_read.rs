@@ -368,7 +368,7 @@ fn looks_binary(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
-    use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
+    use zeroclaw_tools::wrappers::{PathAccessMode, PathGuardedTool, RateLimitedTool};
 
     fn test_tool(workspace: std::path::PathBuf) -> FileReadTool {
         let security = Arc::new(SecurityPolicy {
@@ -1443,7 +1443,7 @@ mod tests {
         let inner = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
         let security = inner.security.clone();
         let tool = RateLimitedTool::new(
-            PathGuardedTool::new(inner, security.clone()),
+            PathGuardedTool::new(inner, security.clone(), PathAccessMode::Read),
             security.clone(),
         );
 

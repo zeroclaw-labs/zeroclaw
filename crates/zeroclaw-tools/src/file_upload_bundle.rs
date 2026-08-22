@@ -340,7 +340,7 @@ impl Tool for FileUploadBundleTool {
                 }
             };
 
-            if !self.security.is_resolved_path_allowed(&resolved_path) {
+            if !self.security.is_resolved_path_readable(&resolved_path) {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -767,6 +767,62 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+    }
+
+    #[tokio::test]
+    async fn execute_denies_deny_read_file_in_bundle_and_never_hits_endpoint() {
+        // Regression: the resolved-path admission check used to call
+        // `is_resolved_path_allowed` (write admission) instead of
+        // `is_resolved_path_readable`, so an absolute in-workspace path
+        // denied only for reads (`forbidden_paths = ["secret.txt"]`) was
+        // read and bundled into the upload sent to the remote endpoint.
+        let server = MockServer::start().await;
+        let tmp = TempDir::new().unwrap();
+        let public = tmp.path().join("public.txt");
+        let secret = tmp.path().join("secret.txt");
+        fs::write(&public, b"public").unwrap();
+        fs::write(&secret, b"s3cr3t").unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/upload_bundle"))
+            .respond_with(ResponseTemplate::new(201).set_body_string(r#"{"ok":true}"#))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            max_actions_per_hour: 100,
+            workspace_dir: tmp.path().to_path_buf(),
+            forbidden_paths: vec!["secret.txt".to_string()],
+            ..SecurityPolicy::default()
+        });
+
+        let config = FileUploadBundleConfig {
+            url: Some(format!("{}/upload_bundle", server.uri())),
+            ..FileUploadBundleConfig::default()
+        };
+
+        let tool = FileUploadBundleTool::new(security, config);
+
+        // Absolute paths: a relative "secret.txt" arg would already be
+        // caught by the legacy component-aware `is_path_allowed` check
+        // before ever reaching the canonical resolved-path check this test
+        // targets, so it wouldn't exercise the fix.
+        let result = tool
+            .execute(json!({
+                "file_paths": [
+                    public.to_string_lossy(),
+                    secret.to_string_lossy(),
+                ]
+            }))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "bundle containing a deny_read file must not be uploaded"
+        );
     }
 
     #[tokio::test]

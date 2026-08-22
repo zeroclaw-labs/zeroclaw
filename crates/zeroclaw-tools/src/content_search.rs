@@ -231,7 +231,7 @@ impl Tool for ContentSearchTool {
         // A de-verbatimized Windows path is safe to hand to legacy grep only
         // when it still identifies the exact path that passed authorization.
         // Otherwise use the internal backend, which opens the canonical path.
-        let backend = effective_search_backend(self.backend, &resolved_canon);
+        let backend = effective_search_backend(self.backend, &resolved_canon, &self.security);
 
         // --- Multiline check for non-ripgrep fallbacks ---
         if multiline && backend != SearchBackend::Ripgrep {
@@ -1019,7 +1019,19 @@ fn strip_verbatim_prefix(path: &Path) -> std::borrow::Cow<'_, Path> {
     }
 }
 
-fn effective_search_backend(configured: SearchBackend, authorized_path: &Path) -> SearchBackend {
+fn effective_search_backend(
+    configured: SearchBackend,
+    authorized_path: &Path,
+    security: &SecurityPolicy,
+) -> SearchBackend {
+    // External backends (rg/grep) authorize only `authorized_path` itself and
+    // then recurse without re-checking each returned file against the
+    // canonical read policy. A nested `deny_read`/forbidden entry further
+    // down the tree would otherwise leak through untouched — fall back to
+    // the internal backend, which checks every visited file individually.
+    if configured != SearchBackend::Internal && security.has_nested_read_denial(authorized_path) {
+        return SearchBackend::Internal;
+    }
     if configured == SearchBackend::Grep && !grep_plain_path_preserves_identity(authorized_path) {
         SearchBackend::Internal
     } else {
@@ -1413,6 +1425,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn content_search_external_backend_hides_nested_denied_file() {
+        // Regression: the external (rg/grep) backend authorized only the
+        // requested root directory and then recursed without re-checking
+        // each returned file, so a nested `deny_read`/forbidden entry (here
+        // `secret/`) leaked matching content through a standard read tool.
+        // `effective_search_backend` now falls back to the internal backend
+        // whenever a nested denial exists under the search root, so this
+        // must find the public match but never surface the denied one even
+        // though the tool is configured to use `grep`.
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("public.txt"), "needle in public\n").unwrap();
+        std::fs::create_dir(dir.path().join("secret")).unwrap();
+        std::fs::write(dir.path().join("secret/token.txt"), "needle in secret\n").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: dir.path().to_path_buf(),
+            forbidden_paths: vec!["secret".to_string()],
+            ..SecurityPolicy::default()
+        });
+
+        let tool = ContentSearchTool::new_with_backend(security, SearchBackend::Grep);
+        let result = tool.execute(json!({"pattern": "needle"})).await.unwrap();
+
+        assert!(result.success, "expected success, got {result:?}");
+        assert!(
+            result.output.contains("public.txt"),
+            "public match must still be found: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("token.txt") && !result.output.contains("in secret"),
+            "denied nested file must never appear in results: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
     async fn content_search_multiline_without_rg() {
         let dir = TempDir::new().unwrap();
         std::fs::write(dir.path().join("test.txt"), "line1\nline2\n").unwrap();
@@ -1613,9 +1663,10 @@ mod tests {
     fn grep_backend_accepts_plain_canonical_path() {
         let dir = TempDir::new().unwrap();
         let authorized = std::fs::canonicalize(dir.path()).unwrap();
+        let security = test_security(authorized.clone());
 
         assert_eq!(
-            effective_search_backend(SearchBackend::Grep, &authorized),
+            effective_search_backend(SearchBackend::Grep, &authorized, &security),
             SearchBackend::Grep
         );
     }
@@ -1628,8 +1679,9 @@ mod tests {
         let tricky = root.join(".. ");
         std::fs::create_dir(&tricky).unwrap();
         let authorized = std::fs::canonicalize(&tricky).unwrap();
+        let security = test_security(root.clone());
 
-        let backend = effective_search_backend(SearchBackend::Grep, &authorized);
+        let backend = effective_search_backend(SearchBackend::Grep, &authorized, &security);
         std::fs::remove_dir(&tricky).unwrap();
 
         assert_eq!(backend, SearchBackend::Internal);
@@ -1653,8 +1705,9 @@ mod tests {
             std::fs::create_dir(&long_path).unwrap();
         }
         let authorized = std::fs::canonicalize(&long_path).unwrap();
+        let security = test_security(root.clone());
 
-        let backend = effective_search_backend(SearchBackend::Grep, &authorized);
+        let backend = effective_search_backend(SearchBackend::Grep, &authorized, &security);
         std::fs::remove_dir_all(&root).unwrap();
 
         assert_eq!(backend, SearchBackend::Internal);
