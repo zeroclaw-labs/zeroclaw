@@ -10,7 +10,7 @@ use axum::{
 };
 #[cfg(feature = "schema-export")]
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use zeroclaw_config::schema::Config;
@@ -31,54 +31,12 @@ const CATALOG_CARD_PREFIXED_PATH: &str = "/a2a/.well-known/agents-card.json";
 /// per-alias base where a conforming single-agent card is served.
 const WELL_KNOWN_AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 
-/// A single declared transport interface (A2A `AgentInterface`). The first
-/// entry of `supportedInterfaces` is the preferred one.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentInterface {
-    pub url: String,
-    pub protocol_binding: String,
-    pub protocol_version: String,
-}
-
-/// A2A capability flags. All optional; only `Some` values serialize.
-#[derive(Debug, Clone, Default, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentCapabilities {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub streaming: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub push_notifications: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub extended_agent_card: Option<bool>,
-}
-
-/// A2A `AgentSkill`. `id`/`name`/`description`/`tags` are spec-required.
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentSkill {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
-}
-
-/// A2A `AgentCard`. Serializes to the protobuf-JSON wire shape. Used for both
-/// the per-alias spec-conforming cards and the ZeroClaw discovery catalog
-/// card (the catalog uses `skills: []` and a synthetic catalog interface).
-#[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentCard {
-    pub name: String,
-    pub description: String,
-    pub supported_interfaces: Vec<AgentInterface>,
-    pub version: String,
-    pub capabilities: AgentCapabilities,
-    pub default_input_modes: Vec<String>,
-    pub default_output_modes: Vec<String>,
-    pub skills: Vec<AgentSkill>,
-}
+// Card DTOs (`AgentInterface`/`AgentCapabilities`/`AgentSkill`/`AgentCard`)
+// and Task/Message DTOs live in the shared wire-model source
+// `zeroclaw_api::a2a_wire`, used by both this inbound surface and the
+// outbound client in `zeroclaw-tools`. Re-exported here so the gateway's
+// existing construction sites keep working under `crate::a2a::AgentCard`.
+pub use zeroclaw_api::a2a_wire::{AgentCapabilities, AgentCard, AgentInterface, AgentSkill};
 
 /// Runtime gateway endpoint used for A2A advertisement when the operator starts
 /// the gateway with CLI host/port overrides. This is created from the listener
@@ -144,12 +102,14 @@ pub(crate) fn build_catalog_card_with_endpoint(
     supported_interfaces.push(AgentInterface {
         url: format!("{base}{CATALOG_CARD_PATH}"),
         protocol_binding: "catalog".to_string(),
+        tenant: None,
         protocol_version: A2A_PROTOCOL_VERSION.to_string(),
     });
     for alias in &published {
         supported_interfaces.push(AgentInterface {
             url: format!("{base}{}", alias_base_path(alias)),
             protocol_binding: A2A_PROTOCOL_BINDING.to_string(),
+            tenant: None,
             protocol_version: A2A_PROTOCOL_VERSION.to_string(),
         });
     }
@@ -212,6 +172,7 @@ pub(crate) fn build_agent_card_with_endpoint(
         supported_interfaces: vec![AgentInterface {
             url: endpoint,
             protocol_binding: A2A_PROTOCOL_BINDING.to_string(),
+            tenant: None,
             protocol_version: A2A_PROTOCOL_VERSION.to_string(),
         }],
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -357,8 +318,14 @@ async fn handle_alias_card(
     }
 }
 
-/// JSON-RPC 2.0 request envelope for the A2A task endpoint. Only `message/send`
-/// is handled on this build; other methods return a JSON-RPC method-not-found.
+/// JSON-RPC 2.0 request envelope for the A2A task endpoint. Only the v1
+/// `SendMessage` method (with `A2A-Version: 1.0`) is handled on this build;
+/// other methods return a JSON-RPC method-not-found.
+///
+/// This is the router-side request parser (fields private to this module).
+/// The shared `zeroclaw_api::a2a_wire::JsonRpcRequest` is the outbound
+/// construction shape; they are intentionally separate so the router keeps
+/// its parse-only surface.
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(JsonSchema))]
 pub(crate) struct JsonRpcRequest {
@@ -370,73 +337,41 @@ pub(crate) struct JsonRpcRequest {
     params: serde_json::Value,
 }
 
-/// A2A `message/send` params. The message carries ordered `parts`; we accept
-/// the text parts and join them as the agent prompt.
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct MessageSendParams {
-    message: A2aMessage,
-}
-
-#[derive(Debug, Deserialize)]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct A2aMessage {
-    #[serde(default)]
-    parts: Vec<A2aPart>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct A2aPart {
-    #[serde(default)]
-    kind: String,
-    #[serde(default)]
-    text: String,
-}
-
-/// A2A `TextPart` on the outbound artifact.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct OutTextPart {
-    kind: String,
-    text: String,
-}
-
-/// A2A `Artifact` carrying the agent's reply.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct OutArtifact {
-    artifact_id: String,
-    parts: Vec<OutTextPart>,
-}
-
-/// A2A `TaskStatus`.
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct OutTaskStatus {
-    state: String,
-}
-
-/// A2A `Task` returned by a completed `message/send`.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[cfg_attr(feature = "schema-export", derive(JsonSchema))]
-pub(crate) struct OutTask {
-    id: String,
-    context_id: String,
-    status: OutTaskStatus,
-    artifacts: Vec<OutArtifact>,
-    kind: String,
-}
+// Task/Message DTOs (`SendMessageParams`/`Message`/`Part`/`Artifact`/
+// `TaskStatus`/`Task`/`Role`/`TaskState`/`SendMessageResponse`) come from the
+// shared v1.0 wire-model `zeroclaw_api::a2a_wire`. Inbound constructs
+// responses from them; outbound deserializes peer responses from the same
+// types. Re-exported under `crate::a2a::` aliases matching the old outbound
+// names so the construction sites below compile unchanged: `OutTask` →
+// `Task`, `OutArtifact` → `Artifact`, `OutPart` → `Part`,
+// `OutTaskStatus` → `TaskStatus`.
+pub use zeroclaw_api::a2a_wire::{
+    Artifact, Message, Part, Role, SendMessageParams, SendMessageResponse, Task, TaskState,
+    TaskStatus,
+};
 
 fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
     serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
         "error": { "code": code, "message": message },
+    })
+}
+
+/// A JSON-RPC error carrying an A2A `reason` field (UPPER_SNAKE_CASE, per
+/// spec §5.4) in `error.data`. Used for A2A-specific error types like
+/// `VERSION_NOT_SUPPORTED`, which clients distinguish from generic JSON-RPC
+/// errors by `reason`, not by `code`.
+fn jsonrpc_error_with_reason(
+    id: serde_json::Value,
+    code: i64,
+    message: &str,
+    reason: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": { "code": code, "message": message, "data": { "reason": reason } },
     })
 }
 
@@ -492,19 +427,44 @@ async fn handle_alias_task(
             .into_response();
     }
 
-    if req.method != "message/send" {
+    // A2A version negotiation (spec §5.x): the inbound serves A2A `1.0`.
+    // A request advertising a different `A2A-Version` is rejected with a
+    // `VersionNotSupportedError`, distinguished from generic JSON-RPC errors
+    // by the A2A `reason` field (UPPER_SNAKE_CASE, spec §5.4).
+    let advertised_version = headers
+        .get("A2A-Version")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    if advertised_version != A2A_PROTOCOL_VERSION {
         return (
             StatusCode::OK,
-            Json(jsonrpc_error(
+            Json(jsonrpc_error_with_reason(
                 req.id,
-                -32601,
-                "Method not found: only message/send is supported on this build",
+                -32602,
+                &format!(
+                    "Unsupported A2A version '{advertised_version}': this server only speaks A2A {}",
+                    A2A_PROTOCOL_VERSION
+                ),
+                "VERSION_NOT_SUPPORTED",
             )),
         )
             .into_response();
     }
 
-    let params: MessageSendParams = match serde_json::from_value(req.params) {
+    if req.method != "SendMessage" {
+        return (
+            StatusCode::OK,
+            Json(jsonrpc_error(
+                req.id,
+                -32601,
+                "Method not found: only SendMessage is supported on this build",
+            )),
+        )
+            .into_response();
+    }
+
+    let params: SendMessageParams = match serde_json::from_value(req.params) {
         Ok(p) => p,
         Err(e) => {
             return (
@@ -523,8 +483,7 @@ async fn handle_alias_task(
         .message
         .parts
         .iter()
-        .filter(|p| p.kind == "text")
-        .map(|p| p.text.as_str())
+        .filter_map(|p| p.as_text())
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -543,27 +502,32 @@ async fn handle_alias_task(
     let session_id = format!("a2a_{alias}_{}", Uuid::new_v4());
     match run_gateway_chat_with_tools(&state, &prompt, Some(&session_id), Some(&alias)).await {
         Ok(outcome) => {
-            let task = OutTask {
+            // v1.0 wire: Task uses TaskState enum (SCREAMING_SNAKE_CASE) and
+            // flattened Part (no `kind`); the SendMessage result is a
+            // SendMessageResponse oneof whose `task` branch carries the Task.
+            let task = Task {
                 id: Uuid::new_v4().to_string(),
                 context_id: session_id,
-                status: OutTaskStatus {
-                    state: "completed".to_string(),
+                status: TaskStatus {
+                    state: TaskState::TaskStateCompleted,
+                    message: None,
+                    timestamp: None,
                 },
-                artifacts: vec![OutArtifact {
+                artifacts: vec![Artifact {
                     artifact_id: Uuid::new_v4().to_string(),
-                    parts: vec![OutTextPart {
-                        kind: "text".to_string(),
-                        text: outcome.response,
-                    }],
+                    name: None,
+                    description: None,
+                    parts: vec![Part::text_str(outcome.response)],
                 }],
-                kind: "task".to_string(),
+                history: vec![],
+                metadata: None,
             };
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": req.id,
-                    "result": task,
+                    "result": SendMessageResponse::Task { task },
                 })),
             )
                 .into_response()
@@ -883,23 +847,25 @@ mod tests {
     }
 
     #[test]
-    fn message_send_params_parse_text_parts() {
+    fn send_message_params_parse_text_parts() {
+        // v1.0 wire: flattened Part (no `kind`), data part carries `data`.
         let value = serde_json::json!({
             "message": {
+                "messageId": "m-1",
+                "role": "ROLE_USER",
                 "parts": [
-                    {"kind": "text", "text": "hello"},
-                    {"kind": "text", "text": "world"},
-                    {"kind": "data", "data": {"x": 1}}
+                    {"text": "hello"},
+                    {"text": "world"},
+                    {"data": {"x": 1}}
                 ]
             }
         });
-        let params: MessageSendParams = serde_json::from_value(value).expect("parse");
+        let params: SendMessageParams = serde_json::from_value(value).expect("parse");
         let prompt = params
             .message
             .parts
             .iter()
-            .filter(|p| p.kind == "text")
-            .map(|p| p.text.as_str())
+            .filter_map(|p| p.as_text())
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(prompt, "hello\nworld");
@@ -907,27 +873,33 @@ mod tests {
 
     #[test]
     fn out_task_serializes_to_camelcase_wire_shape() {
-        let task = OutTask {
+        // v1.0 wire: TaskState enum (SCREAMING_SNAKE_CASE), flattened Part.
+        let task = Task {
             id: "task-1".to_string(),
             context_id: "ctx-1".to_string(),
-            status: OutTaskStatus {
-                state: "completed".to_string(),
+            status: TaskStatus {
+                state: TaskState::TaskStateCompleted,
+                message: None,
+                timestamp: None,
             },
-            artifacts: vec![OutArtifact {
+            artifacts: vec![Artifact {
                 artifact_id: "art-1".to_string(),
-                parts: vec![OutTextPart {
-                    kind: "text".to_string(),
-                    text: "done".to_string(),
-                }],
+                name: None,
+                description: None,
+                parts: vec![Part::text_str("done")],
             }],
-            kind: "task".to_string(),
+            history: vec![],
+            metadata: None,
         };
         let json = serde_json::to_value(&task).expect("serialize");
         assert_eq!(json["contextId"], "ctx-1");
-        assert_eq!(json["status"]["state"], "completed");
+        assert_eq!(json["status"]["state"], "TASK_STATE_COMPLETED");
         assert_eq!(json["artifacts"][0]["artifactId"], "art-1");
-        assert_eq!(json["artifacts"][0]["parts"][0]["kind"], "text");
+        assert_eq!(json["artifacts"][0]["parts"][0]["text"], "done");
         assert!(json.get("context_id").is_none());
+        // No legacy `kind` discriminator on Part or Task.
+        assert!(json.get("kind").is_none());
+        assert!(json["artifacts"][0]["parts"][0].get("kind").is_none());
     }
 
     #[test]

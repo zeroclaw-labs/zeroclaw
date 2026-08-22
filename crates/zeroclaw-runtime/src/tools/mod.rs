@@ -35,6 +35,9 @@ pub mod todo_write;
 pub mod verifiable_intent;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
+pub use zeroclaw_tools::a2a_client::{
+    A2aCancelTool, A2aDiscoverTool, A2aGetTaskTool, A2aHttpClient, A2aSendTool,
+};
 pub use zeroclaw_tools::ask_user::AskUserTool;
 pub use zeroclaw_tools::ask_user::ChannelMapHandle;
 pub use zeroclaw_tools::backup_tool::BackupTool;
@@ -971,6 +974,80 @@ pub fn all_tools_with_runtime(
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                     "http_request: failed to construct tool, skipping registration"
+                );
+            }
+        }
+    }
+
+    // A2A outbound client (conditionally registered; opt-in via [a2a.client] enabled).
+    // The four a2a_* tools share one client holding the live config handle, so
+    // peer/credential/security resolution happens at call time (no stored peer Vec).
+    if root_config.a2a.client.enabled {
+        let live = live_config
+            .clone()
+            .unwrap_or_else(|| Arc::new(parking_lot::RwLock::new(root_config.clone())));
+        // The zeroclaw dir (config file parent) + secrets.encrypt enable
+        // decrypting encrypted peer tokens via the canonical SecretStore,
+        // the same path http_request uses for its auth_secret values.
+        let a2a_zeroclaw_dir = root_config
+            .config_path
+            .parent()
+            .map(std::path::PathBuf::from);
+        // Route cache shared across all a2a_* tools and across tool-set
+        // reassembly: every `process_message` turn and `agent::run` invocation
+        // constructs a fresh A2aHttpClient, but the process-wide shared route
+        // cache survives so a send→poll/cancel lifecycle stays on the endpoint
+        // that created the task. Daemon restart (process exit) naturally
+        // clears it (orphaned routes are stale after a restart).
+        let a2a_route_cache = zeroclaw_tools::a2a_client::shared_a2a_route_cache();
+        match A2aHttpClient::new(
+            live,
+            root_config.a2a.client.request_timeout_secs,
+            a2a_zeroclaw_dir,
+            root_config.secrets.encrypt,
+            a2a_route_cache,
+        ) {
+            Ok(client) => {
+                let client = Arc::new(client);
+                // Read tools (discover/get_task) are NOT wrapped in
+                // RateLimitedTool: ToolOperation::Read is free by policy —
+                // enforce_tool_operation(Read) is a no-op that never records
+                // an action. Wrapping them would charge the Act budget on
+                // every successful network call (RateLimitedTool.record_action
+                // after success), and a post-I/O rate-limit failure could hide
+                // a successful remote result from the agent.
+                tool_arcs.push(Arc::new(A2aDiscoverTool::new(
+                    Arc::clone(&client),
+                    security.clone(),
+                )));
+                // Act tools (send/cancel) are NOT wrapped in RateLimitedTool:
+                // they pre-charge the action budget via enforce_tool_operation(Act)
+                // before network I/O. RateLimitedTool would post-charge again,
+                // double-counting — and worse, a budget-exhausted post-charge
+                // returns failure after the remote mutation already succeeded,
+                // which can cause the agent to retry an already-created/canceled
+                // task. The pre-charge in execute() covers both autonomy gating
+                // and rate limiting (record_action fails on budget exhaustion).
+                tool_arcs.push(Arc::new(A2aSendTool::new(
+                    Arc::clone(&client),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(A2aGetTaskTool::new(
+                    Arc::clone(&client),
+                    security.clone(),
+                )));
+                tool_arcs.push(Arc::new(A2aCancelTool::new(
+                    Arc::clone(&client),
+                    security.clone(),
+                )));
+            }
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "a2a_client: failed to construct client, skipping registration of a2a_* tools"
                 );
             }
         }

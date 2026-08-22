@@ -188,6 +188,7 @@ pub mod channel_kind_opt_serde {
 #[strum(serialize_all = "snake_case")]
 pub enum ToolKind {
     Shell,
+    A2a,
     HttpRequest,
     HttpServer,
     FetchUrl,
