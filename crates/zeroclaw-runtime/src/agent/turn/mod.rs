@@ -398,7 +398,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         event_tx,
         mut steering,
         new_messages_out: raw_canonical,
-        mut image_cache,
+        image_cache,
         ingress,
         memory,
         agent_alias,
@@ -406,6 +406,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         sop_reassembly,
     } = p;
+    let mut loop_local_image_cache = None;
+    let mut image_cache = Some(match image_cache {
+        Some(cache) => cache,
+        None => {
+            loop_local_image_cache.insert(zeroclaw_providers::multimodal::LocalImageCache::new())
+        }
+    });
     let ResolvedAgentExecution {
         model_access:
             ResolvedModelAccess {
