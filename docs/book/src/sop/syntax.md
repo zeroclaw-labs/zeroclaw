@@ -169,6 +169,8 @@ Parser behavior:
   terminal.
 - `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
   are marked `skipped` and leave the run `pending` instead of dispatching.
+- `- terminal: true` completes the run instead of advancing to another step.
+  The final step also completes when it has no linear successor.
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
@@ -211,8 +213,21 @@ Classify an incoming alert, remediate critical alerts, and notify the operator.
 
 When step 1 outputs `{"severity":"critical"}`, its guard matches and `next`
 jumps to step 3. Any other severity falls through to step 2, whose explicit
-`next` skips remediation and joins the critical path at step 4. Run
-`zeroclaw sop validate <name>` after copying the example into an SOP directory.
+`next` skips remediation and joins the critical path at step 4.
+
+The loader only discovers a directory that also contains a `SOP.toml`, so pair
+the steps above with this manifest in `<sops_dir>/alert-triage/`:
+
+```toml
+[sop]
+name = "alert-triage"
+description = "Classify an incoming alert, remediate critical alerts, and notify the operator."
+
+[[triggers]]
+type = "manual"
+```
+
+Then run `zeroclaw sop validate alert-triage`, which reports the SOP as valid.
 
 ### `[sop.approval]` policies and route delivery
 
