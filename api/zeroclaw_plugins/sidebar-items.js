@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["PluginCapability","PluginPermission"],"mod":["config","egress","endpoint","error","host","instance","registry","signature"],"struct":["PluginInfo","PluginManifest"]};

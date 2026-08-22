@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["EgressError","EgressTransport","StartTlsPhase"],"struct":["AuthorizedEgress","EgressHostService","EgressPolicy","EgressPolicyResolver","EgressRequest","StartTlsState"]};

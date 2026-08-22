@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["apply_proposal","capture_successful_run","create_proposal","set_proposal_status"],"struct":["ApplyOutcome","ProposalDraft"]};

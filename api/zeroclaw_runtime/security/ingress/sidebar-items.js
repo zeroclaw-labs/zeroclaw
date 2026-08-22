@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["ingress_policy"],"struct":["IngressPolicy"]};

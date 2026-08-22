@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["features","run"],"mod":["container","container_base","docker_tags","docs","flake","install_sh","packaging","runtime_locales","setup_bat","spec","tools_ftl","zerocode_themes"]};

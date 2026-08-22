@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["normalize_lexical","resolve_under"],"struct":["RootEscapeError"]};

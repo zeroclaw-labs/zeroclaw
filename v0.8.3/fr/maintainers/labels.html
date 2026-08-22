@@ -1,0 +1,699 @@
+<!DOCTYPE HTML>
+<html lang="fr" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Étiquettes - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-698a39a3.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="étiquettes"><a class="header" href="#étiquettes">Étiquettes</a></h1>
+<p>Référence unique pour chaque libellé utilisé dans les PR et les tickets. Sources de vérité :</p>
+<ul>
+<li><code>.github/labeler.yml</code> : configuration de correspondance chemin-étiquette utilisée par <code>actions/labeler</code></li>
+<li><code>.github/label-policy.json</code> : seuils de niveaux des contributeurs</li>
+<li>Cette page : définitions, comportement, et ce qui est automatisé vs manuel</li>
+</ul>
+<p>Lorsque les définitions entrent en conflit, mettez d’abord à jour le fichier source, puis synchronisez cette page.</p>
+<h2 id="limites-de-propriété"><a class="header" href="#limites-de-propriété">Limites de propriété</a></h2>
+<p>Les labels sont des métadonnées portables. Ils doivent indiquer de quel type de travail il s’agit, quelle zone de code il affecte, quel est le niveau de risque pour la revue, et si la politique stale ou la politique de triage nécessite un traitement particulier.</p>
+<p>L’automatisation du tableau de projet est une aide à la planification, pas une seconde file d’attente de revue de PR. Le planificateur issue-dashboard actuel est manuel et limité aux rapports. Le tableau doit répondre aux questions de planification plus lentes : ce qui est prêt à être pris en charge, quelles preuves de routage le maintiennent actif, à quel tracker ou jalon il appartient, et ce qui est bloqué. L’état natif des PR GitHub doit continuer à répondre aux questions de revue et de fusion à évolution rapide.</p>
+<p>Conservez la séparation basée sur la fréquence de mise à jour :</p>
+<ul>
+<li>Les étiquettes portent leur propre classification durable : type de travail, périmètre/composant, risque de revue, taille de PR mesurée et exemption d’obsolescence.</li>
+<li>Les champs du tableau de projet conviennent à l’étape de planification des tickets, aux preuves de routage visibles, à l’état des dépendances, au motif d’exemption d’obsolescence et au regroupement de la feuille de route lorsque ces champs sont activement maintenus.</li>
+<li>L’état natif des PR GitHub gère l’état de revue qui change rapidement : décision de revue, vérifications requises, possibilité de fusion, conflits et approbations obsolètes.</li>
+</ul>
+<p>Le tableau devrait réduire le travail des mainteneurs. Si un champ nécessite une maintenance manuelle après chaque push de PR ou chaque revue, préférez plutôt les labels, les jalons ou l’état natif de GitHub.</p>
+<p>Les libellés peuvent suggérer un routage probable, mais ils ne constituent pas une appartenance. Un libellé <code>channel:*</code>, <code>provider:*</code>, <code>tool:*</code>, <code>security</code> ou <code>docs</code> identifie la surface qui nécessite probablement une attention. Les règles de preuve de routage visibles par les contributeurs figurent dans le <a href="./pr-workflow.html#issue-routing-evidence">contrat du tableau de projet</a>.</p>
+<p>Utilisez les assignees pour le travail actif. Utilisez les commentaires d’issue, les sections du corps d’issue, les champs publics ou les trackers liés comme preuve de routage lorsqu’un état spécial stale, tracker ou de décision différée nécessite une explication. <code>status:blocked</code> utilise la règle du blocker enregistré. Le <a href="./pr-workflow.html#issue-routing-evidence">contrat du tableau de projet</a> définit les sources de preuve acceptées et les résultats de routage.</p>
+<h2 id="orthographe-canonique"><a class="header" href="#orthographe-canonique">Orthographe canonique</a></h2>
+<p>Utilisez l’orthographe à deux-points sans espace pour les labels scopés : <code>provider:openai</code>, <code>channel:telegram</code>, <code>security:policy</code>, <code>risk:high</code>, <code>size:XS</code>, <code>type:docs</code>, et les labels similaires. Les labels de type phrase sans espace de noms restent de type phrase : <code>good first issue</code>, <code>help wanted</code>, <code>trusted contributor</code> et <code>stale-candidate</code>.</p>
+<p>Les anciennes étiquettes dupliquées telles que <code>provider: openai</code>, <code>channel: telegram</code> ou <code>tool: shell</code> sont des candidats au nettoyage. Les étiquettes espacées actives telles que <code>risk: high</code>, <code>size: XS</code> et <code>type: docs</code> sont des candidats à la migration, maintenant que le paquet approuvé a créé ou confirmé les étiquettes canoniques sans espace.</p>
+<p>Certaines étiquettes héritées peuvent rester actives pendant une migration progressive. Les applications nouvelles ou manuelles doivent utiliser les étiquettes canoniques sans espace, tandis que les références ouvertes héritées existantes peuvent rester jusqu’à ce que le paquet de migration des références ouvertes les traite. Migrez les issues/PR ouvertes vers l’étiquette canonique avant la suppression. Ne supprimez pas les étiquettes avec des références ouvertes, ne renommez pas largement les familles d’étiquettes, ni ne retirez les étiquettes de politique obsolète sans une décision de mainteneur pour ce lot de nettoyage.</p>
+<h2 id="contrat-dautomatisation"><a class="header" href="#contrat-dautomatisation">Contrat d’automatisation</a></h2>
+<p>L’automatisation des étiquettes de PR en direct est répartie par source. <code>pr-path-labeler.yml</code> exécute <code>actions/labeler</code> à partir de <code>.github/labeler.yml</code> à l’ouverture, à la réouverture et à chaque mise à jour poussée de la PR. Comme ce workflow utilise <code>sync-labels: true</code>, les étiquettes gérées par <code>.github/labeler.yml</code> sont recalculées à partir de l’ensemble de fichiers actuel de la PR : les étiquettes de chemin correspondantes sont ajoutées, et les étiquettes de chemin qui ne correspondent plus sont supprimées.</p>
+<p>Dependabot applique également les étiquettes configurées sur ses propres PR à partir de <code>.github/dependabot.yml</code> : les mises à jour Cargo reçoivent <code>dependencies</code> ; les mises à jour GitHub Actions et Docker reçoivent <code>ci</code> et <code>dependencies</code>. Ces étiquettes constituent les métadonnées initiales des PR Dependabot, et non le contrat synchronisé du path-labeler.</p>
+<p>Aujourd’hui, <code>.github/labeler.yml</code> ne possède que les étiquettes de chemin et de portée telles que <code>docs</code>, <code>ci</code>, <code>channel</code>, <code>provider:openai</code> et <code>tool:file</code>. Il ne possède pas les étiquettes <code>risk:*</code>, <code>size:*</code>, <code>type:*</code>, de niveau de contributeur, de statut, de résolution, d’obsolescence ou de reprise.</p>
+<p>Si une automatisation du risque ou de la taille est ajoutée ultérieurement, elle doit être recalculée à chaque mise à jour de la PR pour que les labels continuent de décrire le diff réel en cours de revue. L’automatisation du risque doit respecter <code>risk:manual</code> comme un override qui empêche tout remplacement automatique du risque pour cette PR, tant qu’un mainteneur ne supprime pas cet override.</p>
+<h2 id="protocole-de-nettoyage"><a class="header" href="#protocole-de-nettoyage">Protocole de nettoyage</a></h2>
+<p>Le nettoyage des étiquettes est une action de mainteneur, et non un effet secondaire de la revue normale d’une PR.</p>
+<p>Utilisez cette séquence :</p>
+<ol>
+<li>Actualisez l’utilisation des étiquettes en temps réel avant d’agir.</li>
+<li>Répartir les candidats en suppressions sans historique, suppressions de doublons sans éléments ouverts, étiquettes actives à migrer en priorité et exclusions de politique.</li>
+<li>Pour les labels avec des refs ouvertes, après que le lot de nettoyage approuvé a créé ou confirmé le label canonique, ajoutez le label canonique à chaque issue/PR ouverte, supprimez le label hérité, vérifiez que le label hérité a zéro ref ouverte, puis supprimez-le.</li>
+<li>Ne supprimez pas les labels de gouvernance, les labels stale-policy, les labels contributor-tier ni les labels GitHub par défaut dans le cadre du nettoyage des module-label.</li>
+</ol>
+<p>Chaque lot de nettoyage en direct nécessite l’approbation explicite d’un mainteneur pour les labels et les références d’issues/PR modifiés.</p>
+<h2 id="retenues-de-politique"><a class="header" href="#retenues-de-politique">Retenues de politique</a></h2>
+<p>Certaines familles d’étiquettes sont intentionnellement exclues du nettoyage mécanique, même lorsqu’elles semblent incohérentes avec les préférences d’orthographe ou de taxonomie plus récentes. Elles ne doivent changer qu’après une décision de politique distincte et un paquet d’opération en direct exact.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Famille</th><th>Action actuellement prise en charge par le mainteneur</th><th>Avant de modifier les labels en direct</th></tr>
+</thead>
+<tbody>
+<tr><td>Libellés de terminal et de résolution</td><td>Expliquez pourquoi la tâche a quitté la file d’attente active : non poursuivi, invalide, doublon ou explicitement refusé.</td><td>Préserver la signification historique de la clôture et les attentes des contributeurs ; définir tout paquet de renommage, d’alias, de migration ou de suppression avant de muter les étiquettes actives. Le remplacement et la supersession restent des processus documentés à moins qu’un paquet approuvé ultérieur ne crée ou ne mappe une étiquette active.</td></tr>
+<tr><td>Étiquettes de statut et périmées</td><td>Gérer le cycle de vie des tickets et les comportements liés au statut stagnant, y compris le travail accepté, les blocages, l’implémentation active, <code>status:stale</code>, <code>status:no-stale</code>, et la gestion du statut stagnant des PR dans le backlog.</td><td>Traitez en priorité les politiques car l’automatisation peut protéger, avertir ou fermer les issues différemment. Ne changez pas ces labels comme un nettoyage cosmétique ou de labels de module ; gérez-les via un paquet de politique stale/lifecycle qui tient compte de l’automatisation et des règles d’évidence de routage.</td></tr>
+<tr><td>Étiquettes de niveau de contributeur</td><td>Signal la confiance des relecteurs et l’expérience des contributeurs en utilisant les seuils de <code>.github/label-policy.json</code>.</td><td>Mettez à jour le fichier de politique et ce guide ensemble ; ne supprimez ni ne renommez les niveaux en guise de nettoyage cosmétique, car les libellés affectent les personnes et le routage des revues.</td></tr>
+<tr><td>Étiquettes par défaut GitHub</td><td>Préserver les points d’entrée familiers pour les contributeurs tels que <code>bug</code>, <code>enhancement</code>, <code>documentation</code> et <code>question</code>.</td><td>Remplacez ou retirez uniquement via une décision de taxonomie explicite destinée aux contributeurs. Les valeurs par défaut peuvent être utilisées par les modèles, les recherches, les liens externes et les intégrations.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Le test pour conserver une étiquette sensible active est opérationnel : les mainteneurs peuvent-ils nommer une action réelle qui devient plus difficile si l’étiquette active disparaît ? Si oui, conservez-la ou remplacez-la délibérément. Si non, préservez le mappage historique dans le paquet d’audit et migrez ou supprimez via l’opération approuvée.</p>
+<h2 id="étiquettes-de-type"><a class="header" href="#étiquettes-de-type">Étiquettes de type</a></h2>
+<p>Les libellés de type décrivent la catégorie générale de travail. Ils sont distincts des libellés de chemin tels que <code>docs</code>, <code>ci</code> ou <code>dependencies</code>.</p>
+<p>Les applications nouvelles ou manuelles doivent utiliser les libellés canoniques sans espace ci-dessous lorsque le libellé live existe. Les références ouvertes héritées existantes peuvent conserver les libellés espacés jusqu’à ce que le paquet de migration des références ouvertes les prenne en charge ; voir <a href="#canonical-spelling">Orthographe canonique</a>.</p>
+<p><code>type:tracker</code> est l’orthographe canonique du marqueur de tracker pour les issues de coordination parentes actives. Ne créez pas et n’appliquez pas <code>roadmap</code>, <code>type:roadmap</code> ou un autre marqueur de tracker comme alias. Si l’étiquette <code>type:tracker</code> en direct n’existe pas encore, la création d’étiquette et toute migration de marqueur de tracker doivent se faire uniquement via un paquet distinct exact approuvé par le mainteneur.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Objectif</th></tr>
+</thead>
+<tbody>
+<tr><td><code>type:ci</code></td><td>Travaux de CI, de workflow ou d’automatisation de dépôt</td></tr>
+<tr><td><code>type:dependencies</code></td><td>Maintenance des dépendances ou du fichier de verrouillage</td></tr>
+<tr><td><code>type:docs</code></td><td>Travail uniquement ou principalement documentaire</td></tr>
+<tr><td><code>type:rfc</code></td><td>Problème ou proposition RFC ; protégé contre la fermeture pour obsolescence tant qu’il est actif</td></tr>
+<tr><td><code>type:refactor</code></td><td>Nettoyage de la structure du code ou réorganisation interne visant à préserver le comportement visible par l’utilisateur.</td></tr>
+<tr><td><code>type:test</code></td><td>Travail uniquement de test ou principalement de test</td></tr>
+<tr><td><code>type:tracker</code></td><td>Issue de coordination parent active pour une version, une feuille de route, un fil de discussion RFC/conception, un lot d’implémentation, une campagne de nettoyage ou un audit. Marqueur réservé aux issues ; il ne crée pas à lui seul de protection contre les issues périmées, d’attribution, d’acceptation ou de portée prête pour les contributeurs.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="étiquettes-de-chemin"><a class="header" href="#étiquettes-de-chemin">Étiquettes de chemin</a></h2>
+<p>Appliqué automatiquement par <code>pr-path-labeler.yml</code>. Les globs se trouvent dans <code>.github/labeler.yml</code> ; en cas de divergence entre cette page et la configuration, considérez <code>.github/labeler.yml</code> comme la source opérationnelle et mettez à jour cette page.</p>
+<h3 id="étiquettes-de-portée-de-base"><a class="header" href="#étiquettes-de-portée-de-base">Étiquettes de portée de base</a></h3>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Correspondances</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs</code></td><td><code>docs/**</code>, <code>**/*.md</code>, <code>**/*.mdx</code>, <code>LICENSE</code>, <code>.markdownlint-cli2.yaml</code></td></tr>
+<tr><td><code>dependencies</code></td><td><code>Cargo.toml</code>, <code>Cargo.lock</code>, <code>deny.toml</code>, <code>.github/dependabot.yml</code></td></tr>
+<tr><td><code>ci</code></td><td><code>.github/codeql/**</code>, <code>.github/workflows/**</code>, <code>.github/*.yaml</code>, <code>.github/*.yml</code>, <code>.github/*.json</code>, <code>.githooks/**</code></td></tr>
+<tr><td><code>core</code></td><td><code>src/*.rs</code></td></tr>
+<tr><td><code>agent</code></td><td><code>src/agent/**</code>, <code>crates/zeroclaw-runtime/src/agent/**</code></td></tr>
+<tr><td><code>channel</code></td><td><code>src/channels/**</code>, <code>crates/zeroclaw-channels/src/**</code></td></tr>
+<tr><td><code>gateway</code></td><td><code>src/gateway/**</code>, <code>crates/zeroclaw-gateway/src/**</code></td></tr>
+<tr><td><code>config</code></td><td><code>src/config/**</code>, <code>crates/zeroclaw-config/src/**</code></td></tr>
+<tr><td><code>cron</code></td><td><code>src/cron/**</code>, <code>crates/zeroclaw-runtime/src/cron/**</code></td></tr>
+<tr><td><code>daemon</code></td><td><code>src/daemon/**</code>, <code>crates/zeroclaw-runtime/src/daemon/**</code></td></tr>
+<tr><td><code>doctor</code></td><td><code>src/doctor/**</code>, <code>crates/zeroclaw-runtime/src/doctor/**</code></td></tr>
+<tr><td><code>health</code></td><td><code>src/health/**</code>, <code>crates/zeroclaw-runtime/src/health/**</code></td></tr>
+<tr><td><code>heartbeat</code></td><td><code>src/heartbeat/**</code>, <code>crates/zeroclaw-runtime/src/heartbeat/**</code></td></tr>
+<tr><td><code>integration</code></td><td><code>src/integrations/**</code>, <code>crates/zeroclaw-runtime/src/integrations/**</code></td></tr>
+<tr><td><code>memory</code></td><td><code>src/memory/**</code>, <code>crates/zeroclaw-memory/src/**</code></td></tr>
+<tr><td><code>security</code></td><td><code>src/security/**</code>, <code>crates/zeroclaw-runtime/src/security/**</code></td></tr>
+<tr><td><code>runtime</code></td><td><code>src/runtime/**</code>, <code>crates/zeroclaw-runtime/src/**</code></td></tr>
+<tr><td><code>quickstart</code></td><td><code>crates/zeroclaw-runtime/src/quickstart/**</code>, <code>crates/zeroclaw-gateway/src/api_quickstart.rs</code>, <code>apps/zerocode/src/quickstart_pane.rs</code>, <code>web/src/pages/quickstart/**</code></td></tr>
+<tr><td><code>provider</code></td><td><code>src/providers/**</code>, <code>crates/zeroclaw-providers/src/**</code></td></tr>
+<tr><td><code>service</code></td><td><code>src/service/**</code>, <code>crates/zeroclaw-runtime/src/service/**</code></td></tr>
+<tr><td><code>skillforge</code></td><td><code>src/skillforge/**</code>, <code>crates/zeroclaw-runtime/src/skillforge/**</code></td></tr>
+<tr><td><code>skills</code></td><td><code>src/skills/**</code>, <code>crates/zeroclaw-runtime/src/skills/**</code></td></tr>
+<tr><td><code>tool</code></td><td><code>src/tools/**</code>, <code>crates/zeroclaw-tools/src/**</code></td></tr>
+<tr><td><code>tunnel</code></td><td><code>src/tunnel/**</code>, <code>crates/zeroclaw-runtime/src/tunnel/**</code></td></tr>
+<tr><td><code>observability</code></td><td><code>src/observability/**</code>, <code>crates/zeroclaw-runtime/src/observability/**</code></td></tr>
+<tr><td><code>tests</code></td><td><code>tests/**</code></td></tr>
+<tr><td><code>scripts</code></td><td><code>scripts/**</code></td></tr>
+<tr><td><code>dev</code></td><td><code>dev/**</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>ci</code> est limité aux fichiers d’automatisation/configuration GitHub, et non à tous les chemins <code>.github/**</code>. Le matcher racine <code>.github/*.json</code> est intentionnel pour les métadonnées d’automatisation (par exemple <code>.github/label-policy.json</code>), donc des fichiers comme <code>.github/assets/**</code>, <code>.github/ISSUE_TEMPLATE/**</code>, <code>.github/CODEOWNERS</code> et <code>.github/pull_request_template.md</code> ne correspondent pas à <code>ci</code>.</p>
+<h3 id="libellés-supplémentaires-des-composants"><a class="header" href="#libellés-supplémentaires-des-composants">Libellés supplémentaires des composants</a></h3>
+<p>Certaines surfaces ont des libellés de propriété de chemin plus étroits pour le routage des mainteneurs. Ces libellés sont synchronisés par <code>.github/labeler.yml</code> lorsque le diff de la PR touche les fichiers listés.</p>
+<p>Les labels de chemin scopés ne garantissent pas un label de base de même préfixe. Comme <code>pr-path-labeler.yml</code> s’exécute avec <code>sync-labels: true</code>, les mainteneurs doivent considérer <code>.github/labeler.yml</code> comme la source de vérité pour les labels de base et scopés qu’une PR reçoit.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Correspondances</th></tr>
+</thead>
+<tbody>
+<tr><td><code>observability:log</code></td><td><code>crates/zeroclaw-log/src/**</code>, <code>crates/zeroclaw-runtime/src/observability/log.rs</code></td></tr>
+<tr><td><code>observability:otel</code></td><td><code>otel.rs</code>, couverture de régression des fonctionnalités de dépendance OTel</td></tr>
+<tr><td><code>observability:prometheus</code></td><td><code>prometheus.rs</code></td></tr>
+<tr><td><code>runtime:wasm</code></td><td>plateforme d’exécution WASM et fichiers hôtes de plugins WASM first-party</td></tr>
+<tr><td><code>security:bubblewrap</code></td><td><code>bubblewrap.rs</code></td></tr>
+<tr><td><code>security:docker</code></td><td><code>docker.rs</code></td></tr>
+<tr><td><code>security:leak-detector</code></td><td>LeakDetector masquage et analyse des sorties sensibles</td></tr>
+<tr><td><code>security:pairing</code></td><td>sécurité d’appairage, API d’appairage de la passerelle, commande d’appairage Tauri et page d’appairage web</td></tr>
+<tr><td><code>security:policy</code></td><td>fichiers de politique de sécurité d’exécution, de politique IAM et de politique de configuration</td></tr>
+<tr><td><code>security:secrets</code></td><td>gestion des secrets d’exécution et de configuration</td></tr>
+<tr><td><code>security:traits</code></td><td>définitions partagées de traits et d’interfaces de sécurité</td></tr>
+<tr><td><code>memory:backend</code></td><td>sélection du backend de mémoire et fichiers d’implémentation du stockage</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="libellés-de-composants-manuels"><a class="header" href="#libellés-de-composants-manuels">Libellés de composants manuels</a></h3>
+<p>Certaines étiquettes de composants scopés sont des étiquettes de routage manuelles plutôt que des étiquettes de chemin synchronisées.</p>
+<p><code>agent:prompt</code> est destiné à la politique de prompt, de contexte et d’orientation des réponses visibles par le fournisseur. Utilisez-le lorsque le travail porte sur le contenu du system-prompt, les directives de formatage des appels d’outils, le contexte sensible au cache de prompt, l’orientation des réponses des canaux, ou d’autres surfaces d’instructions visibles par le modèle qui croisent les labels de base <code>agent</code>, <code>channel</code>, <code>memory</code>, <code>provider</code> ou <code>runtime</code>. Appliquez-le en plus des labels de base ou de scope applicables ; il ne les remplace pas. Ne l’appliquez pas à chaque modification de <code>crates/zeroclaw-runtime/src/agent/**</code> ; utilisez le label de base <code>agent</code> pour les modifications ordinaires du runtime de l’agent.</p>
+<p><code>agent:loop</code> est retiré. Pour le routage agent-loop, utilisez la base <code>agent</code> plus toute étiquette <code>runtime</code>, provider, channel, tool ou risk correspondante.</p>
+<p>N’appliquez pas l’étiquette <code>observability: runtime_trace</code> héritée aux nouvelles issues ou PR. Utilisez <code>observability:otel</code> lorsque le travail concerne le traçage OpenTelemetry, ajoutez uniquement la base <code>observability</code> lorsque l’issue ou la PR correspond également à cette surface de base, et décidez de toute étiquette canonique future spécifique au traçage d’exécution dans un paquet de création/migration séparé.</p>
+<p>N’appliquez pas <code>security: leak_detector</code> (hérité) aux nouvelles issues ou PRs. Utilisez <code>security:leak-detector</code> pour les travaux de masquage LeakDetector et d’analyse des sorties sensibles.</p>
+<p>Les labels de sous-zones tels que <code>gateway: api</code>, <code>gateway: sse</code>, <code>gateway:local_bridge</code> et <code>gateway:webhook_ingress</code> restent reportés pour la migration en direct. Le nouveau routage doit utiliser le <code>gateway</code> de base jusqu’à ce qu’un paquet distinct crée des sous-labels canoniques sans espaces ou avec des tirets et migre les références, ou qu’il regroupe ces labels dans le <code>gateway</code> de base.</p>
+<h3 id="étiquettes-par-canal"><a class="header" href="#étiquettes-par-canal">Étiquettes par canal</a></h3>
+<p>Chaque canal reçoit une étiquette <code>channel:&lt;name&gt;</code> en plus de l’étiquette de base <code>channel</code> lorsque la modification affecte les chemins des crates du canal. Les étiquettes de canaux inter-surface telles que <code>channel:acp</code> peuvent à la place être associées à l’étiquette de surface de base correspondante, comme <code>gateway</code>, <code>docs</code> ou les étiquettes de portée d’applications/web.</p>
+<p><code>channel:core</code> est le libellé de l’API de canal partagée et de l’orchestrateur. Utilisez-le pour travailler sur les contrats de traits de canal, l’orchestration de canaux, les hooks de livraison, le comportement de routage/session, la gestion des commandes runtime et le comportement inter-canaux qui serait trompeur sous un libellé de plateforme unique.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Correspondances</th></tr>
+</thead>
+<tbody>
+<tr><td><code>channel:acp</code></td><td><code>acp_channel.rs</code>, <code>acp_server.rs</code>, <code>zeroclaw-acp-bridge.rs</code>, <code>acp_session_store.rs</code>, <code>channels/acp.md</code>, points d’entrée ACP gateway/app/web sélectionnés</td></tr>
+<tr><td><code>channel:core</code></td><td><code>crates/zeroclaw-api/src/channel.rs</code>, <code>crates/zeroclaw-channels/src/lib.rs</code>, <code>crates/zeroclaw-channels/src/orchestrator/**</code>, <code>src/channels/mod.rs</code></td></tr>
+<tr><td><code>channel:bluesky</code></td><td><code>bluesky.rs</code></td></tr>
+<tr><td><code>channel:clawdtalk</code></td><td><code>clawdtalk.rs</code></td></tr>
+<tr><td><code>channel:cli</code></td><td><code>cli.rs</code></td></tr>
+<tr><td><code>channel:dingtalk</code></td><td><code>dingtalk.rs</code></td></tr>
+<tr><td><code>channel:discord</code></td><td><code>discord.rs</code>, <code>discord_history.rs</code></td></tr>
+<tr><td><code>channel:email</code></td><td><code>email_channel.rs</code>, <code>gmail_push.rs</code></td></tr>
+<tr><td><code>channel:imessage</code></td><td><code>imessage.rs</code></td></tr>
+<tr><td><code>channel:irc</code></td><td><code>irc.rs</code></td></tr>
+<tr><td><code>channel:lark</code></td><td><code>lark.rs</code></td></tr>
+<tr><td><code>channel:line</code></td><td><code>line.rs</code>, <code>channels/line.md</code></td></tr>
+<tr><td><code>channel:linq</code></td><td><code>linq.rs</code></td></tr>
+<tr><td><code>channel:matrix</code></td><td><code>matrix.rs</code></td></tr>
+<tr><td><code>channel:mattermost</code></td><td><code>mattermost.rs</code></td></tr>
+<tr><td><code>channel:mochat</code></td><td><code>mochat.rs</code></td></tr>
+<tr><td><code>channel:mqtt</code></td><td><code>mqtt.rs</code></td></tr>
+<tr><td><code>channel:nextcloud-talk</code></td><td><code>nextcloud_talk.rs</code></td></tr>
+<tr><td><code>channel:nostr</code></td><td><code>nostr.rs</code></td></tr>
+<tr><td><code>channel:notion</code></td><td><code>notion.rs</code></td></tr>
+<tr><td><code>channel:qq</code></td><td><code>qq.rs</code></td></tr>
+<tr><td><code>channel:reddit</code></td><td><code>reddit.rs</code></td></tr>
+<tr><td><code>channel:signal</code></td><td><code>signal.rs</code></td></tr>
+<tr><td><code>channel:slack</code></td><td><code>slack.rs</code></td></tr>
+<tr><td><code>channel:telegram</code></td><td><code>telegram.rs</code></td></tr>
+<tr><td><code>channel:twitter</code></td><td><code>twitter.rs</code></td></tr>
+<tr><td><code>channel:wati</code></td><td><code>wati.rs</code></td></tr>
+<tr><td><code>channel:webhook</code></td><td><code>webhook.rs</code></td></tr>
+<tr><td><code>channel:wecom</code></td><td><code>wecom.rs</code>, <code>wecom_ws.rs</code></td></tr>
+<tr><td><code>channel:whatsapp</code></td><td><code>whatsapp.rs</code>, <code>whatsapp_storage.rs</code>, <code>whatsapp_web.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="étiquettes-par-fournisseur"><a class="header" href="#étiquettes-par-fournisseur">Étiquettes par fournisseur</a></h3>
+<p>Les libellés spécifiques au fournisseur correspondent aux fichiers sources dédiés au fournisseur. Le routeur de fournisseur a son propre libellé de portée, car le travail de routage et de répartition des modèles est un sous-domaine partagé des fournisseurs, et non l’intégration concrète d’un fournisseur. Les fichiers de registre ou de fabrique partagés ne doivent recevoir que le libellé de base <code>provider</code> ; les mainteneurs peuvent ajouter manuellement un libellé spécifique au fournisseur lorsqu’une modification d’un fichier partagé est vraiment limitée à un seul fournisseur.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Correspondances</th></tr>
+</thead>
+<tbody>
+<tr><td><code>provider:anthropic</code></td><td><code>anthropic.rs</code></td></tr>
+<tr><td><code>provider:azure-openai</code></td><td><code>azure_openai.rs</code></td></tr>
+<tr><td><code>provider:bedrock</code></td><td><code>bedrock.rs</code></td></tr>
+<tr><td><code>fournisseur:claude-code</code></td><td><code>claude_code.rs</code></td></tr>
+<tr><td><code>provider:compatible</code></td><td><code>compatible.rs</code></td></tr>
+<tr><td><code>provider:copilot</code></td><td><code>copilot.rs</code></td></tr>
+<tr><td><code>provider:gemini</code></td><td><code>gemini.rs</code>, <code>gemini_cli.rs</code></td></tr>
+<tr><td><code>fournisseur:glm</code></td><td><code>glm.rs</code></td></tr>
+<tr><td><code>provider:kilocli</code></td><td><code>kilocli.rs</code></td></tr>
+<tr><td><code>fournisseur:ollama</code></td><td><code>ollama.rs</code></td></tr>
+<tr><td><code>provider:openai</code></td><td><code>openai.rs</code>, <code>openai_codex.rs</code></td></tr>
+<tr><td><code>provider:openrouter</code></td><td><code>openrouter.rs</code></td></tr>
+<tr><td><code>provider:reliable</code></td><td><code>reliable.rs</code></td></tr>
+<tr><td><code>provider:router</code></td><td><code>router.rs</code></td></tr>
+<tr><td><code>provider:telnyx</code></td><td><code>telnyx.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Certaines étiquettes de fournisseurs décrivent des familles de fournisseurs qui partagent actuellement l’implémentation de fournisseur compatible OpenAI au lieu d’un fichier source dédié. Les mainteneurs peuvent les appliquer manuellement lorsqu’un problème ou une PR concerne vraiment cette famille : <code>provider:groq</code>, <code>provider:kimi</code>, <code>provider:minimax</code>, <code>provider:moonshot</code> et <code>provider:qwen</code>. N’ajoutez pas de fichiers de factory partagée ou de fournisseur compatible à ces règles de labeler ; cela sur-étiquetterait des modifications partagées non liées.</p>
+<h3 id="étiquettes-par-groupe-doutils"><a class="header" href="#étiquettes-par-groupe-doutils">Étiquettes par groupe d’outils</a></h3>
+<p>Les outils sont regroupés par fonction logique plutôt qu’un label par fichier.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Correspondances</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tool:browser</code></td><td><code>browser.rs</code>, <code>browser_delegate.rs</code>, <code>browser_open.rs</code>, <code>text_browser.rs</code>, <code>screenshot.rs</code></td></tr>
+<tr><td><code>tool:cloud</code></td><td><code>cloud_ops.rs</code>, <code>cloud_patterns.rs</code></td></tr>
+<tr><td><code>tool:composio</code></td><td><code>composio.rs</code></td></tr>
+<tr><td><code>tool:cron</code></td><td><code>src/tools/cron_add.rs</code>, <code>src/tools/cron_list.rs</code>, <code>src/tools/cron_remove.rs</code>, <code>src/tools/cron_run.rs</code>, <code>src/tools/cron_runs.rs</code>, <code>src/tools/cron_update.rs</code>, <code>crates/zeroclaw-runtime/src/tools/cron_add.rs</code>, <code>crates/zeroclaw-runtime/src/tools/cron_common.rs</code>, <code>crates/zeroclaw-runtime/src/tools/cron_list.rs</code>, <code>crates/zeroclaw-runtime/src/tools/cron_remove.rs</code>, <code>crates/zeroclaw-runtime/src/tools/cron_run.rs</code>, <code>crates/zeroclaw-runtime/src/tools/cron_runs.rs</code>, <code>crates/zeroclaw-runtime/src/tools/cron_update.rs</code></td></tr>
+<tr><td><code>tool:delegate</code></td><td><code>crates/zeroclaw-runtime/src/tools/delegate.rs</code></td></tr>
+<tr><td><code>tool:file</code></td><td><code>src/tools/file_edit.rs</code>, <code>src/tools/file_read.rs</code>, <code>src/tools/file_write.rs</code>, <code>src/tools/glob_search.rs</code>, <code>src/tools/content_search.rs</code>, <code>crates/zeroclaw-tools/src/file_edit.rs</code>, <code>crates/zeroclaw-runtime/src/tools/file_read.rs</code>, <code>crates/zeroclaw-tools/src/file_write.rs</code>, <code>crates/zeroclaw-tools/src/glob_search.rs</code>, <code>crates/zeroclaw-tools/src/content_search.rs</code></td></tr>
+<tr><td><code>tool:google-workspace</code></td><td><code>google_workspace.rs</code></td></tr>
+<tr><td><code>tool:mcp</code></td><td><code>mcp_client.rs</code>, <code>mcp_deferred.rs</code>, <code>mcp_protocol.rs</code>, <code>mcp_tool.rs</code>, <code>mcp_transport.rs</code></td></tr>
+<tr><td><code>tool:memory</code></td><td><code>memory_forget.rs</code>, <code>memory_recall.rs</code>, <code>memory_store.rs</code></td></tr>
+<tr><td><code>tool:microsoft365</code></td><td><code>microsoft365/**</code></td></tr>
+<tr><td><code>tool:pushover</code></td><td><code>pushover.rs</code></td></tr>
+<tr><td><code>tool:security</code></td><td><code>src/tools/security_ops.rs</code>, <code>src/tools/verifiable_intent.rs</code>, <code>crates/zeroclaw-runtime/src/tools/security_ops.rs</code>, <code>crates/zeroclaw-runtime/src/tools/verifiable_intent.rs</code></td></tr>
+<tr><td><code>tool:shell</code></td><td><code>src/tools/shell.rs</code>, <code>src/tools/node_tool.rs</code>, <code>src/tools/cli_discovery.rs</code>, <code>crates/zeroclaw-runtime/src/tools/shell.rs</code>, <code>crates/zeroclaw-gateway/src/node_tool.rs</code>, <code>crates/zeroclaw-tools/src/cli_discovery.rs</code></td></tr>
+<tr><td><code>tool:sop</code></td><td><code>src/tools/sop_advance.rs</code>, <code>src/tools/sop_approve.rs</code>, <code>src/tools/sop_execute.rs</code>, <code>src/tools/sop_list.rs</code>, <code>src/tools/sop_status.rs</code>, <code>crates/zeroclaw-runtime/src/tools/sop_advance.rs</code>, <code>crates/zeroclaw-runtime/src/tools/sop_approve.rs</code>, <code>crates/zeroclaw-runtime/src/tools/sop_execute.rs</code>, <code>crates/zeroclaw-runtime/src/tools/sop_list.rs</code>, <code>crates/zeroclaw-runtime/src/tools/sop_status.rs</code></td></tr>
+<tr><td><code>tool:web</code></td><td><code>web_fetch.rs</code>, <code>web_search_tool.rs</code>, <code>web_search_provider_routing.rs</code>, <code>http_request.rs</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><code>tool:schema</code> est une étiquette uniquement manuelle pour les problèmes de sérialisation et de nettoyage des schémas d’outils. N’ajoutez pas de fichiers de schémas généraux à <code>.github/labeler.yml</code> ; de nombreux fichiers de schéma sont des surfaces de configuration, de fournisseur ou d’API partagées et sur-étiquetteraient des modifications non liées.</p>
+<h2 id="étiquettes-de-taille"><a class="header" href="#étiquettes-de-taille">Étiquettes de taille</a></h2>
+<p>Basé sur le nombre effectif de lignes modifiées, normalisé pour les PR ne contenant que de la documentation ou principalement des fichiers de verrouillage. Actuellement appliqué <strong>manuellement</strong> ; l’automatisation de la taille qui calculait auparavant ces valeurs a été supprimée lors de la simplification de la CI. Toute future automatisation de la taille devra respecter le <a href="#automation-contract">contrat d’automatisation</a>.</p>
+<p>Les applications nouvelles ou manuelles doivent utiliser les libellés canoniques sans espace ci-dessous. Les références ouvertes héritées existantes peuvent conserver les libellés avec espaces jusqu’à ce que le paquet de migration des références ouvertes les gère ; voir <a href="#canonical-spelling">Orthographe canonique</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Seuil</th></tr>
+</thead>
+<tbody>
+<tr><td><code>size:XS</code></td><td>≤ 80 lignes</td></tr>
+<tr><td><code>size:S</code></td><td>≤ 250 lignes</td></tr>
+<tr><td><code>size:M</code></td><td>≤ 500 lignes</td></tr>
+<tr><td><code>size:L</code></td><td>≤ 1000 lignes</td></tr>
+<tr><td><code>size:XL</code></td><td>&gt; 1000 lignes</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="étiquettes-de-risque"><a class="header" href="#étiquettes-de-risque">Étiquettes de risque</a></h2>
+<p>Pour les PR, les étiquettes de risque décrivent le diff réellement soumis à revue : chemins modifiés, changement de comportement, exposition des limites de sécurité et difficulté de rollback. Pour les issues, les étiquettes de risque décrivent le rayon d’impact probable du correctif d’après le rapport, aident à trier la profondeur de revue et l’adéquation des contributeurs, et peuvent changer une fois qu’une PR concrète révèle le chemin d’implémentation réel. Actuellement appliquées <strong>manuellement</strong>. Toute automatisation future des risques doit suivre le <a href="#automation-contract">contrat d’automatisation</a>.</p>
+<p>Les applications nouvelles ou manuelles doivent utiliser les libellés canoniques sans espace ci-dessous. Les références ouvertes héritées existantes peuvent conserver les libellés avec espaces jusqu’à ce que le paquet de migration des références ouvertes les gère ; voir <a href="#canonical-spelling">Orthographe canonique</a>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Signification</th></tr>
+</thead>
+<tbody>
+<tr><td><code>risk:low</code></td><td>Aucun chemin à haut risque n’a été touché, petite modification</td></tr>
+<tr><td><code>risk:medium</code></td><td>Modifications comportementales dans <code>crates/*/src/**</code> sans impact sur les limites ou la sécurité.</td></tr>
+<tr><td><code>risk:high</code></td><td>Touche un chemin à haut risque ou une modification importante liée à la sécurité.</td></tr>
+<tr><td><code>risk:manual</code></td><td>Override du mainteneur qui fige le recalcul automatisé des risques</td></tr>
+</tbody>
+</table>
+</div>
+<p>Chemins à haut risque (ensemble canonique ; les autres pages destinées aux mainteneurs référencent cette liste) : <code>crates/zeroclaw-runtime/src/**</code>, <code>crates/zeroclaw-gateway/src/**</code>, <code>crates/zeroclaw-tools/src/**</code>, <code>crates/zeroclaw-runtime/src/security/**</code>, <code>.github/workflows/**</code>.</p>
+<p>Appliquer <code>risk:high</code> à tout PR qui augmente le MSRV du workspace, le toolchain Rust épinglé, la baseline du toolchain de l’installateur/Docker généré, ou la version minimale du toolchain des workflows de release. Ne pas réduire le niveau de risque uniquement parce que le diff ressemble à une maintenance de CI, de dépendances ou de documentation : une version de Rust plus élevée requise affecte les builds de sources en aval, les paquets de distribution, les builds de conteneurs et les utilisateurs épinglés à des toolchains plus anciennes.</p>
+<p>En cas de doute, considérez-le comme un risque élevé.</p>
+<h2 id="étiquettes-de-niveau-de-contributeur"><a class="header" href="#étiquettes-de-niveau-de-contributeur">Étiquettes de niveau de contributeur</a></h2>
+<p>Défini dans <code>.github/label-policy.json</code>. Basé sur le nombre de PR fusionnées de l’auteur, interrogé via l’API GitHub. Actuellement appliqué <strong>manuellement</strong>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>PRs fusionnés minimum</th></tr>
+</thead>
+<tbody>
+<tr><td><code>contributeur de confiance</code></td><td>5</td></tr>
+<tr><td><code>contributeur expérimenté</code></td><td>10</td></tr>
+<tr><td><code>principal contributor</code></td><td>20</td></tr>
+<tr><td><code>contributeur distingué</code></td><td>50</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="étiquettes-détat"><a class="header" href="#étiquettes-détat">Étiquettes d’état</a></h2>
+<p>Suit l’état du cycle de vie des RFC et des éléments de travail suivis. Appliqué manuellement, sauf indication contraire d’un workflow maintenu.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>status:accepté</code></td><td>RFC ou élément de travail ratifié par l’équipe. Cela n’exempte pas le problème du traitement des éléments obsolètes par lui-même.</td></tr>
+<tr><td><code>status:bloqué</code></td><td>Le travail est valide mais en attente d’une dépendance externe, d’une décision du mainteneur ou d’un prérequis lié. Exempté du statut « obsolète » tant que le bloqueur est enregistré et non résolu. Ne pas associer à <code>status:no-stale</code> pour le même bloqueur.</td></tr>
+<tr><td><code>status:en-cours</code></td><td>Une PR ouverte cible activement ce problème. Réconcilier avec l’état actuel de la PR lors des passes d’obsolescence ; le label n’est pas une exemption permanente après la fermeture de la PR.</td></tr>
+<tr><td><code>status:stale</code></td><td>Aucune activité de l’auteur pendant la période d’inactivité ; peut être fermé s’il n’est pas actualisé</td></tr>
+<tr><td><code>status:no-stale</code></td><td>Exemption explicite de péremption pour le travail accepté ou autrement de longue durée qui n’est pas déjà protégé par une autre exclusion de péremption. Politique cible : à utiliser uniquement lorsque le <a href="./pr-workflow.html#issue-routing-evidence">contrat de tableau de projet</a> comporte une raison d’exemption de péremption visible par les contributeurs et des preuves de routage. Les trackers de release actifs et les trackers de RFC ou de conception actifs peuvent utiliser le tracker lui-même comme raison visible et surface de routage tant qu’ils restent actifs ; réexaminez-les lorsque le jalon se ferme, que le tracker s’écarte de l’état réel, que la RFC aboutit à une décision, est remplacée ou se ferme, ou que le ticket cesse de représenter une surface de décision de projet active. Les exemptions existantes auxquelles ces éléments manquent doivent être auditées et corrigées avant que les balayages de péremption cessent de les honorer.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="étiquettes-de-résolution"><a class="header" href="#étiquettes-de-résolution">Étiquettes de résolution</a></h2>
+<p>Les libellés de résolution expliquent pourquoi un ticket ou une PR est fermé ou retiré de la file d’attente active. Il s’agit de résultats terminaux, et non de libellés de statut de cycle de vie, et ils doivent inclure suffisamment de contexte en commentaire pour qu’un mainteneur puisse comprendre la décision ultérieurement.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Objectif</th></tr>
+</thead>
+<tbody>
+<tr><td><code>wontfix</code></td><td>Demande valide ou signalement que le projet choisit explicitement de ne pas poursuivre. Utilisez une justification brève ; ne fermez pas sans explication.</td></tr>
+<tr><td><code>invalid</code></td><td>Non exploitable en tant que bug, demande de fonctionnalité, élément de support, RFC ou tâche de projet suivie. Expliquez l’incohérence ou l’exigence manquante.</td></tr>
+<tr><td><code>duplicate</code></td><td>Même problème sous-jacent qu’un autre ticket ou PR déjà suivi. Liez la cible canonique avant de fermer ou de rediriger la discussion.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Ne créez ni n’appliquez de libellés proposés tels que <code>status:wont-do</code> ou <code>status:wont-fix</code> tant qu’un dossier de migration de libellés approuvé par un mainteneur n’a pas défini le plan exact de renommage, d’alias ou de suppression. Le libellé actuellement en vigueur pour le concept « Won’t Do » au niveau du tableau est <code>wontfix</code>.</p>
+<p>Le remplacement (superseding) est un processus de substitution, pas actuellement un label actif. Utilisez <a href="./superseding.html">Superseding PRs</a> pour les règles de remplacement et les exigences d’attribution jusqu’à ce qu’un paquet de migration approuvé ultérieurement crée ou mappe un label de remplacement.</p>
+<h2 id="étiquettes-de-tri"><a class="header" href="#étiquettes-de-tri">Étiquettes de tri</a></h2>
+<p>Appliqué manuellement : l’automatisation de réponse automatique qui gérait auparavant ces cas a été supprimée lors de la simplification de la CI.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Objectif</th></tr>
+</thead>
+<tbody>
+<tr><td><code>r:besoin-de-reproduction</code></td><td>Rapport de bogue incomplet ; veuillez fournir un cas de reproduction déterministe.</td></tr>
+<tr><td><code>r:support</code></td><td>Utilisation / élément d’aide mieux géré en dehors du backlog de bugs</td></tr>
+<tr><td><code>needs-author-action</code></td><td>Une réponse de l’auteur est nécessaire avant que les mainteneurs ne puissent poursuivre le processus de revue ou de fusion. Pour les PRs, il ne s’agit pas à lui seul d’un avertissement « stale ».</td></tr>
+<tr><td><code>candidat obsolète</code></td><td>PR ou issue dormant candidat à la fermeture. Pour les PRs, suivez le délai pour les éléments stales dans <a href="./reviewer-playbook.html#pr-backlog-pruning">Reviewer Playbook → PR backlog pruning</a>.</td></tr>
+</tbody>
+</table>
+</div>
+<h2 id="étiquettes-de-prise-en-charge-communautaire"><a class="header" href="#étiquettes-de-prise-en-charge-communautaire">Étiquettes de prise en charge communautaire</a></h2>
+<p>Appliqué manuellement lorsque les mainteneurs souhaitent une contribution externe.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Étiquette</th><th>Objectif</th></tr>
+</thead>
+<tbody>
+<tr><td><code>good first issue</code></td><td>Travail XS/S de petite taille, autonome et bien documenté, sûr pour un nouveau contributeur, comportant des critères d’acceptation, des liens vers le code ou la documentation pertinents, ainsi qu’un mentor ou un contact désigné</td></tr>
+<tr><td><code>help wanted</code></td><td>Travail concret et débloqué pour lequel les mainteneurs souhaitent une aide externe et qu’ils peuvent examiner, généralement à risque faible ou moyen</td></tr>
+</tbody>
+</table>
+</div>
+<p>N’utilisez pas <code>help wanted</code> comme marqueur générique pour « valide mais sans personne assignée ». Si un problème est bloqué, dépendant de l’architecture, dépourvu de critères d’acceptation, susceptible de présenter un risque élevé ou en attente d’une décision de politique, laissez-le sans étiquettes de prise en charge jusqu’à ce que le blocage soit résolu ou qu’un mainteneur en rédige le périmètre manquant.</p>
+<h2 id="déclencheurs-de-maintenance"><a class="header" href="#déclencheurs-de-maintenance">Déclencheurs de maintenance</a></h2>
+<p>Mettez à jour cette page lorsque :</p>
+<ul>
+<li>Un nouveau canal, fournisseur ou outil est ajouté à l’arborescence source (les étiquettes de chemin nécessitent de nouvelles entrées).</li>
+<li>Une politique d’étiquette ou un seuil a changé.</li>
+<li>Un nouveau workflow de triage est affiché ou un ancien est supprimé.</li>
+</ul>
+<p>Les notes sur l’état de l’automatisation (« actuellement appliqué manuellement ») sont intentionnellement incluses afin qu’un futur mainteneur ne suppose pas que l’absence d’un workflow signifie que le niveau d’étiquette n’existe pas.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../maintainers/reviewer-playbook.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../maintainers/superseding.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../maintainers/reviewer-playbook.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../maintainers/superseding.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["commit_accepted_provider_route"],"struct":["AcceptedRoute","AccountedCallReport","AccountedChatResponse","ProviderDispatch","ProviderDispatchRef","RejectedAttempt"]};

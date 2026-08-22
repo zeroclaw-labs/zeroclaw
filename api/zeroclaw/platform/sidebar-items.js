@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ShellDialect"],"fn":["create_runtime"],"mod":["docker","native"],"struct":["DockerRuntime","NativeRuntime","ShellProfile"],"trait":["RuntimeAdapter"]};

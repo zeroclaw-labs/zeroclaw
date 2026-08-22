@@ -1,0 +1,1003 @@
+<!DOCTYPE HTML>
+<html lang="ja" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>ドキュメントの標準 - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-91a95759.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <h1 id="fnd-002-意図的なドキュメント作成-標準構造i18n戦略"><a class="header" href="#fnd-002-意図的なドキュメント作成-標準構造i18n戦略">FND-002: 意図的なドキュメント作成: 標準、構造、i18n戦略</a></h1>
+<blockquote>
+<p>v0.7.0 以降 · タイプ: ドキュメント · Rev. 1</p>
+<p><strong>正規の参照</strong> · チームによって承認済み · Rev. 1 議論スレッドおよび完全な改訂履歴: <a href="https://github.com/zeroclaw-labs/zeroclaw/issues/5576">#5576</a></p>
+</blockquote>
+<hr>
+<blockquote>
+<p><strong>これを読む前にチームへの注意。</strong></p>
+<p>ドキュメントとは、コードが完成した後に書くものではありません。それ自体が独立したプロダクトの一面であり、プロジェクトと、それに貢献する人、利用する人、それを基盤に何かを構築する人すべてとの間のインターフェースです。ドキュメントのないコードベースは、新しく関わるすべての人に、あらゆることをゼロから再発見することを強います。ドキュメントの質が悪いコードベースは、しばしばもっと悪い結果を招きます。なぜなら、人々に誤った自信を与えてしまうからです。この RFC では、私たちがアーキテクチャに適用しているのと同じ意図性をもってドキュメントを扱うことを提案します。すなわち、まずビジョン、次に構造、そして内容です。</p>
+</blockquote>
+<hr>
+<h2 id="目次"><a class="header" href="#目次">目次</a></h2>
+<ol>
+<li><a href="#1-the-documentation-philosophy">ドキュメンテーションの哲学</a></li>
+<li><a href="#2-honest-assessment-where-we-are-today">正直な評価：現在の状況</a></li>
+<li><a href="#3-a-classification-framework-ea-artifacts-on-a-page">分類フレームワーク: 1ページ上のEAアーティファクト</a></li>
+<li><a href="#4-the-i18n-problem">i18nの問題</a></li>
+<li><a href="#5-the-repo--wiki-split">リポジトリとWikiの分離</a></li>
+<li><a href="#6-adr-standards">ADR 標準</a></li>
+<li><a href="#7-agentsmd-as-the-ai-development-layer">AGENTS.md を AI 開発レイヤーとして</a></li>
+<li><a href="#8-the-target-structure">ターゲット構造</a></li>
+<li><a href="#9-the-replacement-docs-contract">置換ドキュメント契約</a></li>
+<li><a href="#10-standards-we-should-adopt">採用すべき標準</a></li>
+<li><a href="#11-phased-roadmap">フェーズ別ロードマップ</a></li>
+</ol>
+<hr>
+<h2 id="1-ドキュメンテーションの哲学"><a class="header" href="#1-ドキュメンテーションの哲学">1. ドキュメンテーションの哲学</a></h2>
+<p>ドキュメントの問題は、最初の文を書く前に尋ねるべき質問を省略したことに起因することがほとんどです。<strong>このドキュメントはどのような種類のもので、誰を対象としているのか？</strong></p>
+<p>この問いに対する答えがないと、ドキュメントはすべて「プロジェクトに関するもの」という曖昧なカテゴリのわずかに異なる形状のページの山として蓄積していきます。セットアップガイドはアーキテクチャの決定事項の隣に置かれ、ユーザー向けのハウツーは内部のコーディング基準の隣に並んでいます。READMEの30言語版が、単一のセキュリティポリシー文書とスペースを争っています。誰も何も見つからず、すべてが異なるペースで古くなり、ドキュメントに触れるすべてのPRが、どのページを更新する必要があるかについての交渉になります。</p>
+<p>修正策は、さらにドキュメントを書くことではありません。修正策は、何も書き始める前に、作成するアーティファクトのタイプを決定することです。タイプは、フォーマット、対象者、場所、ライフサイクル、そしてそれを最新に保つ責任者を決定します。タイプが確立されれば、残りのことは自然と整います。</p>
+<p>このRFCでは、すべてのZeroClawドキュメントの分類基準として、Svyatoslav Kotusev氏による <strong>EA Artifacts on a Page</strong> フレームワーク（<a href="https://eaonapage.com">https://eaonapage.com</a>）を採用します。このフレームワークはエビデンスに基づき、意図的に規範的でなく、オープンソースインフラストラクチャプロジェクトが実際に必要とするドキュメントの種類に直接対応しています。</p>
+<p>このチームが採用している広範な開発哲学から借用した核心原則：</p>
+<blockquote>
+<p><strong>コードと同様に、ドキュメントも Vision → Architecture → Design → Implementation へと上向きに追跡できるものでなければなりません。書く前に、アーティファクトのタイプとその対象読者を明確にできない場合は、まだ書く準備ができていません。</strong></p>
+</blockquote>
+<hr>
+<h2 id="2-正直な評価現在の状況"><a class="header" href="#2-正直な評価現在の状況">2. 正直な評価：現在の状況</a></h2>
+<h3 id="21-i18nのフットプリント"><a class="header" href="#21-i18nのフットプリント">2.1 i18nのフットプリント</a></h3>
+<p>現在の実装で最も直接的に測定可能な問題は、ローカライゼーションシステムです。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>メトリック</th><th>値</th></tr>
+</thead>
+<tbody>
+<tr><td>リポジトリのルートにある非英語のREADMEファイル</td><td>31</td></tr>
+<tr><td><code>docs/i18n/</code> 内のファイル</td><td>169</td></tr>
+<tr><td><code>docs/i18n/</code> によって消費されるディスク容量</td><td>2.2 MB</td></tr>
+<tr><td><code>docs-contract.md</code> に基づき、積極的に「サポート」されているロケール</td><td>6 (<code>en</code>, <code>zh-CN</code>, <code>ja</code>, <code>ru</code>, <code>fr</code>, <code>vi</code>)</td></tr>
+<tr><td>ルートにREADMEファイルがあるロケール</td><td>31</td></tr>
+</tbody>
+</table>
+</div>
+<p>i18n システムは、すべてのドキュメント PR に対して<strong>コントリビューター税</strong>を課します。現在の <code>docs-contract.md</code> にはこの要件が含まれています：</p>
+<blockquote>
+<p>ドキュメントのIA、ランタイム契約の参照、または共有ドキュメント内のユーザー向け表記に変更がある場合、同じPR内でサポートされているローカライズに対してi18nのフォローアップを行ってください。</p>
+</blockquote>
+<p>つまり、セットアップガイドのタイプミスを修正するコントリビューターは、そのドキュメントの最大6つの言語版を更新する必要があります。そうしないと、PRはレビューに通りません。これは、このプロジェクトのコントリビューターの大部分を占める学生や初期キャリアのエンジニアにとって、大きな障壁となります。</p>
+<h3 id="22-構造の問題"><a class="header" href="#22-構造の問題">2.2 構造の問題</a></h3>
+<p>現在の <code>docs/</code> の階層構造は、3つの根本的に異なるドキュメントタイプを同じレベルで混在させています：</p>
+<ul>
+<li><strong>コードに隣接するドキュメント</strong>（ADR、API仕様、セキュリティポリシー、コントリビューションプロセスなど）は、コードベースと連動してバージョン管理する必要があります。</li>
+<li><strong>ユーザー向け運用ドキュメント</strong>は、コードリリースとは独立して更新されるべきです（セットアップガイド、トラブルシューティング、デプロイメントの手順書など）。</li>
+<li><strong>コミュニティ文書</strong>：コミュニティが維持管理し、正式なレビュープロセスを必要としないもの（翻訳、FAQ、コミュニティガイド）</li>
+</ul>
+<p>これら3つはすべて <code>docs/</code> にあり、それらの間に構造的な区別はありません。その結果、手動でメンテナンスする必要がある <code>SUMMARY.md</code> を持つ平坦な構造になり、何か変更があるたびに誰かが更新する必要があります。</p>
+<h3 id="23-adrギャップ"><a class="header" href="#23-adrギャップ">2.3 ADRギャップ</a></h3>
+<p>このRFCが書かれた時点で、プロジェクトには旧ドキュメントツリーに2つのArchitecture Decision Recordがありました。WASMプラグイン向けのADR-003と、ツール共有状態の所有権に関するADR-004です。ADR-004は特に優れたモデルで、構造がしっかりしており、コード参照があり、具体的でした。しかし、プロジェクトは同等かそれ以上に重要なアーキテクチャ上の決定を少なくとも5つか6つ行っていましたが、それらは一度も記録されていませんでした。</p>
+<ul>
+<li>RustをTypeScriptよりも選択する理由</li>
+<li>トレイト駆動の拡張性モデル</li>
+<li>WASM プラグインシステムの設計</li>
+<li>SQLiteとMarkdownを2つのメモリバックエンドとして選択</li>
+<li>セキュリティモデル（ペアリングコード、自律レベル、サンドボックスレイヤー）</li>
+</ul>
+<p>これらの記録がないと、新しいコントリビューターはコード考古学を通じて理由を再発見しなければなりません。コードベースを読み取るすべてのAIコーディングアシスタントは「何を」は理解できますが、「なぜ」は理解できません。これは最も高価な形式のドキュメント化されていない技術的負債の一つです。</p>
+<h3 id="24-すでに良い点"><a class="header" href="#24-すでに良い点">2.4 すでに良い点</a></h3>
+<p>ドキュメントを統制対象のプロダクト面として扱う<code>docs-contract.md</code>のコンセプトは、正しい着眼点です。あとは適切なルールが必要なだけです。ルートにある<code>AGENTS.md</code>は優れており、AI支援開発における適切な先例を示しています。ADR-004は、チームが高品質なアーキテクチャ記録を作成できることを実証しました。</p>
+<hr>
+<h2 id="3-分類フレームワーク1ページ上のeaアーティファクト"><a class="header" href="#3-分類フレームワーク1ページ上のeaアーティファクト">3. 分類フレームワーク：1ページ上のEAアーティファクト</a></h2>
+<p><strong>EA Artifacts on a Page</strong> フレームワークは、アーキテクチャアーティファクトの5つのファミリーを定義しています。ZeroClaw リポジトリ内のすべてのドキュメントは、これらのファミリーのいずれかに属しており、そのファミリーがドキュメントの保存場所、フォーマット、および古さの基準を決定します。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>EA アーティファクト ファミリ</th><th>この質問が答える内容</th><th>ZeroClawの例</th><th>場所</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>考慮事項</strong></td><td>私たちの意思決定を導く原則と基準は何ですか？</td><td><code>AGENTS.md</code> ファイル、コーディング基準、セキュリティポリシー、このドキュメント</td><td><code>docs/book/src/contributing/</code> または各クレートごと</td></tr>
+<tr><td><strong>ランドスケープ</strong></td><td>現在のシステムの状態はどのようになっていますか？</td><td>コンポーネントマップ、クレートのトポロジー、依存関係ダイアグラム</td><td><code>docs/book/src/architecture/</code></td></tr>
+<tr><td><strong>アウトライン</strong></td><td>どこへ行くのですか？</td><td>RFCとロードマップの提案</td><td><code>type:rfc</code> の GitHub Issues</td></tr>
+<tr><td><strong>デザイン</strong></td><td>具体的にどのようにこの特定の作業を行っていますか？</td><td>ADR、OpenAPI仕様、WITインターフェースファイル</td><td><code>docs/book/src/architecture/</code> (ADRセクション)</td></tr>
+<tr><td><strong>標準</strong></td><td>ビルドの具体的なルールは何ですか？</td><td>PR ワークフロー、テスト基準、リリースプロセス</td><td><code>docs/book/src/contributing/</code> と <code>docs/book/src/maintainers/</code></td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>この表から特に欠けているもの:</strong> ユーザーガイド、セットアップ手順、チャンネル固有のハウツー、トラブルシューティング、FAQ。これらは <strong>運用コンテンツ</strong> であり、EAの成果物ではありません。これらはコードと連動してバージョン管理されません。これらはGitHub Wikiに属します。</p>
+<h3 id="フレームワークの使用"><a class="header" href="#フレームワークの使用">フレームワークの使用</a></h3>
+<p>ドキュメントを作成する前に、次の2つの質問に答えてください：</p>
+<ol>
+<li><strong>これはどのアーティファクトファミリーに属しますか？</strong> これに答えられない場合、あなたは書く準備ができていません。</li>
+<li><strong>コードとバージョン管理する必要がありますか？</strong> はいの場合、リポジトリに配置します。いいえの場合、Wiki に配置します。</li>
+</ol>
+<p>2つ目の質問に対する有用なテスト：<em>この文書は、異なるバージョンのコードベースに対して読まれた場合に誤りや誤解を招くものになるでしょうか？</em> はいの場合、その文書はリポジトリにあり、コードとバージョン管理されます。いいえの場合、その文書はWikiに置かれます。</p>
+<hr>
+<h2 id="4-i18nの問題"><a class="header" href="#4-i18nの問題">4. i18nの問題</a></h2>
+<h3 id="41-削除の論拠"><a class="header" href="#41-削除の論拠">4.1 削除の論拠</a></h3>
+<p>リポジトリから英語以外のコンテンツをすべて削除する根拠は、4つの柱に支えられています。</p>
+<p><strong>1. ユーザーはオンデマンドの翻訳手段を持っている。</strong> ZeroClaw の主なユーザーは AI アシスタントを実行している人々です。そのような人は誰でも、実行しているエージェントを通じて、ブラウザを通じて、あるいは数十もの無料翻訳サービスのいずれかを通じて、即座に高品質な機械翻訳を利用できます。リポジトリに翻訳を同梱することの実用的な利点はわずかです。</p>
+<p><strong>2. 翻訳は古くなっている可能性が高いです。</strong> マシン翻訳されたコンテンツは一度生成されただけで、英語のソースと同期されていません。AI支援開発において、古いドキュメントはドキュメントがないよりも悪いです。なぜなら、言語モデルは古い情報から誤った結論を自信を持って導き出すからです。</p>
+<p><strong>3. コントリビューター税は現実的で測定可能です。</strong> <code>docs-contract.md</code> のパリティ要件により、ドキュメントのPRは最大6つの言語版にまたがって変更を行う必要があります。これにより、ドキュメントへの貢献のコストが高くなり、ドキュメントを健全に保つために不可欠な小さなインクリメンタルな改善（タイプミス修正、手順の明確化、古い参照の更新など）が抑制されます。</p>
+<p><strong>4. ローカライゼーションはコミュニティの取り組みであり、コアプロジェクトの作業ではありません。</strong> 日本語のドキュメントを維持するのに最も適した立場にあるのは、日本語を話すコントリビューターです。ローカライズされたコンテンツをメインリポジトリに配置し、同等性の要件を課すことは、恩恵を受けるコミュニティではなく、コアメンテナーに負担を強いることになります。GitHub Wiki はこれを正しく逆転させています。コミュニティメンバーは、PR を開くことなく、自言語のページを編集・維持できます。</p>
+<h3 id="42-残るもの"><a class="header" href="#42-残るもの">4.2 残るもの</a></h3>
+<p>i18nのアプローチの「構造」を維持することが重要です。ZeroClawを複数の言語で利用可能にするという考え方は正しいです。ただし、「場所」と「所有権モデル」が間違っています。</p>
+<h3 id="43-置換戦略"><a class="header" href="#43-置換戦略">4.3 置換戦略</a></h3>
+<ol>
+<li>
+<p><strong>削除</strong>してください。リポジトリのルートにあるすべての <code>README.*.md</code> ファイルから、<code>README.md</code> を除く。</p>
+</li>
+<li>
+<p><strong><code>docs/i18n/</code> を完全に削除する</strong></p>
+</li>
+<li>
+<p><code>docs/</code> ディレクトリから英語以外のハブファイル（例：<code>docs/README.zh-CN.md</code>）をすべて削除してください。</p>
+</li>
+<li>
+<p><strong>Add</strong> a <code>Languages</code> section to the main <code>README.md</code>:</p>
+<blockquote>
+<p><strong>翻訳:</strong> コミュニティによって維持されている翻訳は、<a href="https://github.com/zeroclaw-labs/zeroclaw/wiki">GitHub Wiki</a> で利用可能です。翻訳の追加や既存の翻訳の改善を行う場合は、Wiki を直接編集してください。すべての言語からの貢献を歓迎します。</p>
+</blockquote>
+</li>
+<li>
+<p>GitHub Wiki に <code>Translations</code> ページを作成し、利用可能な言語の一覧、その進捗状況、およびそれらを管理している貢献者を含む表を追加してください。</p>
+</li>
+<li>
+<p><strong>オプション:</strong> 設定されたLLMプロバイダーを使用して任意のドキュメントページをオンデマンドで翻訳する <code>zeroclaw docs --translate</code> CLI機能を追加します。これは、製品の目的全体がAIアシスタンスである製品にとって自然にマッチします</p>
+</li>
+</ol>
+<h3 id="44-agentsmd-の影響"><a class="header" href="#44-agentsmd-の影響">4.4 AGENTS.md の影響</a></h3>
+<p><code>docs-contract.md</code> から i18n のフォローアップ要件を削除し、以下の内容に置き換えてください：<em>ドキュメントの PR は英語のみでレビューされます。翻訳はコミュニティによって Wiki で維持管理され、PR のレビュー対象ではありません。</em></p>
+<hr>
+<h2 id="5-リポジトリとwikiの分離"><a class="header" href="#5-リポジトリとwikiの分離">5. リポジトリとWikiの分離</a></h2>
+<h3 id="51-判断基準"><a class="header" href="#51-判断基準">5.1 判断基準</a></h3>
+<blockquote>
+<p><strong>コードの変更によって正しくなくなる文書はリポジトリに存在し、正しくなくなる文書はWikiに存在します。</strong></p>
+</blockquote>
+<p>これはファジールールではありません。これを文字通りに適用してください。</p>
+<p>ADR は、特定の時点での特定のアーキテクチャの決定がなぜ行われたかを記録します。コードが変更されても、ADR は決定された内容と時期を正確に記述し続けます。コードはそこから進化しているかもしれませんが、記録自体は正確です。→ <strong>リポジトリ。</strong></p>
+<p><strong>これはリポジトリに置くべきもののように思えますが、そうではありません。</strong> セットアップガイドはコードのコミットに紐づけるのではなく、独自のタイムラインで更新されるべきです。正しいモデルは次のとおりです。APIリファレンス（設定の構造体に直接対応するもの）はリポジトリに置き、そのAPIの使い方をユーザーに案内するセットアップガイドはWikiに置いて、手順が変わったときに誰でも更新できるようにします。</p>
+<h3 id="52-実践における分割"><a class="header" href="#52-実践における分割">5.2 実践における分割</a></h3>
+<p><strong>リポジトリ内 (<code>docs/book/src/</code>) に保持:</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>現在の場所</th><th>アーティファクトファミリー</th><th>注釈</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/book/src/architecture/</code></td><td>風景 + デザイン</td><td>コンポーネント図、ADR、クレートのトポロジー</td></tr>
+<tr><td><code>docs/book/src/contributing/</code></td><td>考慮事項 + 基準</td><td>PR ワークフロー、テスト、コーディング基準</td></tr>
+<tr><td><code>docs/book/src/maintainers/</code></td><td>考慮事項 + 基準</td><td>リリース手順書、レビュアープレイブック、ラベルポリシー</td></tr>
+<tr><td><code>docs/book/src/security/</code></td><td>考慮事項と設計</td><td>セキュリティポリシー、サンドボックス設計、監査ログ</td></tr>
+<tr><td><code>docs/book/src/hardware/</code></td><td>デザイン</td><td>周辺機器の設計ドキュメント、データシート</td></tr>
+<tr><td><code>docs/book/src/reference/config.md</code></td><td>デザイン</td><td>設定リファレンス（コードから生成）</td></tr>
+<tr><td><code>docs/book/src/reference/cli.md</code></td><td>デザイン</td><td>CLIリファレンス（コードから生成）</td></tr>
+<tr><td><code>docs/book/src/foundations/</code></td><td>考慮事項</td><td>他のすべてのものを形作る承認済みRFC</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>GitHub Wiki への移行（提案済み；未実行）：</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>現在の場所</th><th>移動の理由</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/book/src/setup/</code></td><td>コードとは独立して変更されるユーザー向けの手引き</td></tr>
+<tr><td><code>docs/book/src/ops/service.md</code></td><td>運用上、ユーザーが管理</td></tr>
+<tr><td><code>docs/book/src/ops/troubleshooting.md</code></td><td>運用中、頻繁に変更</td></tr>
+<tr><td><code>docs/book/src/ops/network-deployment.md</code></td><td>運用・デプロイメント固有</td></tr>
+<tr><td><code>docs/book/src/channels/</code> 内のチャンネルごとの設定ページ</td><td>ユーザー向け、アップストリームプラットフォームAPIと変更</td></tr>
+</tbody>
+</table>
+</div>
+<p><strong>削除 (i18n 削除):</strong></p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>項目</th><th>サイズへの影響</th></tr>
+</thead>
+<tbody>
+<tr><td><code>docs/i18n/</code> (169 ファイル)</td><td>リポジトリから -2.2 MB</td></tr>
+<tr><td>31 × <code>README.*.md</code> at root</td><td>−重大なルートクラッター</td></tr>
+<tr><td><code>docs/</code> 内の非英語のハブファイル</td><td>−31 ファイル</td></tr>
+<tr><td>i18n カバレッジマップ、i18n インデックス</td><td>−2 ファイル</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="53-wikiの構造"><a class="header" href="#53-wikiの構造">5.3 Wikiの構造</a></h3>
+<pre><code>Home
+│
+├── Getting Started
+│     ├── Installation
+│     ├── Quick Start (TL;DR)
+│     ├── Migrating from OpenClaw
+│     └── Onboarding Walkthrough
+│
+├── Configuration
+│     ├── Providers
+│     ├── Channels
+│     ├── Memory
+│     ├── Security &amp; Pairing
+│     └── Tunnels
+│
+├── Channels
+│     ├── Telegram
+│     ├── Discord
+│     ├── Slack
+│     ├── WhatsApp
+│     └── ... (one page per channel)
+│
+├── Operations
+│     ├── Troubleshooting
+│     ├── Deployment
+│     ├── Network Setup
+│     └── Performance Tuning
+│
+├── Hardware
+│     ├── Getting Started with Peripherals
+│     ├── ESP32 Setup
+│     ├── STM32 Nucleo Setup
+│     └── Arduino Setup
+│
+└── Community
+      ├── FAQ
+      ├── Translations
+      └── How to Contribute
+</code></pre>
+<hr>
+<h2 id="6-adrの標準"><a class="header" href="#6-adrの標準">6. ADRの標準</a></h2>
+<h3 id="61-フォーマット"><a class="header" href="#61-フォーマット">6.1 フォーマット</a></h3>
+<p>すべてのアーキテクチャ決定記録は、機械可読性のために YAML フロントマターで拡張された <strong>Nygard format</strong> を使用します。ADR-004 はこの RFC によって特定されたモデルでした。このセクションはその形状を正式化します。</p>
+<p>各ADRには3つのセクションと5つのフロントmatterフィールドがあります：</p>
+<pre><code>---
+id: ADR-NNN
+title: 決定を記述した短い命令文
+date: YYYY-MM-DD
+status: proposed | accepted | deprecated | superseded-by-ADR-NNN
+relates-to:
+  - ADR-XXX (任意、関連する決定のリスト)
+  - crates/zeroclaw-api (任意、影響を受けるコードパス)
+---
+
+# ADR-NNN: タイトル
+
+## 背景
+
+どのような状況、制約、または問題が決定を必要としたのか？
+どのような要因が働いていたか？どのような選択肢が検討されたか？
+
+## 決定
+
+何が決定されたか？能動態で記述する。
+「～とする」ではなく「～と決定された」ではない。
+
+## 結果
+
+この決定の結果は何か？
+肯定的な結果と否定的な結果の両方を列挙する。すべての決定にはトレードオフがある。
+これによって生じる後続の決定やアクションを記載する。
+
+## 参照
+
+関連するコードファイル、イシュー、外部リソースへのリンク。
+</code></pre>
+<h3 id="62-adr-ライフサイクルルール"><a class="header" href="#62-adr-ライフサイクルルール">6.2 ADR ライフサイクルルール</a></h3>
+<ul>
+<li><strong>ADRは一度承認されると不変です。</strong> 決定が変更された場合、古いADRは <code>superseded-by-ADR-NNN</code> とマークされ、新しい決定とその理由を説明する新しいADRが作成されます。</li>
+<li><strong>ADRは連番で番号が付けられ、再番号付けされることはありません。</strong> 番号の間に隙間があっても問題ありません（拒否されたADRが撤回された場合、その隙間が残ります）。</li>
+<li><strong>ADRs は <code>docs/book/src/architecture/decisions/</code> にあります。</strong> これらは <code>ADR-NNN-short-slug.md</code> という名前です。</li>
+<li><strong>重要なアーキテクチャの変更にはADRが必要です。</strong>「重要」とは、新しいコントリビューターにとって驚くべき決定、将来の選択肢を制約する決定、または明らかなトレードオフを伴う決定を意味します。</li>
+</ul>
+<h3 id="63-遡及adr"><a class="header" href="#63-遡及adr">6.3 遡及ADR</a></h3>
+<p>以下の主要な決定事項は遡って文書化されるべきです。これらは、新しいコントリビューターやAIツールがコードベースを理解するために必要な基礎的な理由を表しています。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>提案されたADR</th><th>記録の決定</th></tr>
+</thead>
+<tbody>
+<tr><td>ADR-001</td><td>実装言語としてRustを使用する（TypeScript/OpenClawに置き換わる）</td></tr>
+<tr><td>ADR-002</td><td>主要なアーキテクチャパターンとしてのトレイト駆動の拡張性</td></tr>
+<tr><td>ADR-003</td><td>Extism を初期の WASM プラグイン実行ブリッジとして</td></tr>
+<tr><td>ADR-004</td><td>ツール共有状態の所有権契約</td></tr>
+<tr><td>ADR-005</td><td>SQLite と Markdown を2つのメモリバックエンドとして</td></tr>
+<tr><td>ADR-006</td><td>CLIを唯一の組み込みチャネルとし、他のすべてをプラグインとして</td></tr>
+<tr><td>ADR-007</td><td>ゲートウェイ抽出を別のオプションのバイナリとして</td></tr>
+</tbody>
+</table>
+</div>
+<p>遡及ADRには注釈を付ける必要があります：</p>
+<blockquote>
+<p><em>これは、正式なADRプロセス以前に決定された事項の遡及的な記録です。日付は、この記録が作成された日ではなく、決定が行われた日を示します。</em></p>
+</blockquote>
+<p>元の決定日が不明な場合は、ADRレコードが追加された日付を使用し、その旨をノートに記載してください。遡及的なADRがすでに後の決定によって置き換えられている場合は、履歴上のADRを保持し、置き換えるADRを別に記述してください。</p>
+<h3 id="64-なぜこれがai支援開発において重要なのか"><a class="header" href="#64-なぜこれがai支援開発において重要なのか">6.4 なぜこれがAI支援開発において重要なのか</a></h3>
+<p>AI コーディングアシスタントがリポジトリを読み込む際、現在のコードのみが可視化されます。却下された選択肢、検討されたトレードオフ、あるいは特定の構造が他の代替案に対して選ばれた理由までは把握できません。ADR が存在しない場合、AI は自身では知ることのできないアーキテクチャ上の制約に違反する変更を提案する可能性があります。一方、ADR を用いることで、その判断根拠が明示され、機械可読な形式で表現されます。フロントマターにより ADR はクエリ可能となり、AI ツールは <code>zeroclaw-api</code> に関連するすべての ADR を検索し、そのクレートを編集する前にコンテキストとして読み込むことができます。</p>
+<hr>
+<h2 id="7-ai開発レイヤーとしてのagentsmd"><a class="header" href="#7-ai開発レイヤーとしてのagentsmd">7. AI開発レイヤーとしてのAGENTS.md</a></h2>
+<h3 id="71-パターン"><a class="header" href="#71-パターン">7.1 パターン</a></h3>
+<p>ルート <code>AGENTS.md</code> は、プロジェクトが AI 支援開発に提供する最も強力な貢献です。これは AI コーディングアシスタントに対して、実行するコマンド、尊重すべきアーキテクチャ、適用すべきリスクティア、回避すべきアンチパターンを伝えます。これは具体的で、意見があり、簡潔であるため、機能しています。</p>
+<p>ワークスペースがクレートに分割されていく中で（マイクロカーネルアーキテクチャのRFCに従って）、各クレートはそれぞれ独自の<code>AGENTS.md</code>を持つべきです。これは、アーキテクチャ上の境界をAI支援レイヤーで強制可能にする仕組みであり、クレートの依存関係を通じたコンパイル時だけでなく、コードが書かれる前の推論レイヤーにおいても適用されます。</p>
+<h3 id="72-各クレート-agentsmd-の内容"><a class="header" href="#72-各クレート-agentsmd-の内容">7.2 各クレート AGENTS.md の内容</a></h3>
+<p>短く保ってください。60行を超える <code>AGENTS.md</code> は読まれません。各ファイルは5つの質問に答えます：</p>
+<pre><code class="language-markdown"># &lt;crate-name&gt;
+
+## What this crate is
+One or two sentences. What problem does this crate solve?
+
+## What this crate is allowed to depend on
+List the crates this crate may import. Be explicit.
+If a dependency is not listed here, do not add it without an ADR.
+
+## Extension points
+Where can new implementations be added? What trait do they implement?
+Link to the relevant traits.
+
+## What does NOT belong here
+Explicit anti-patterns. What would be a mistake to add to this crate?
+
+## Related ADRs
+- ADR-NNN: Short title
+</code></pre>
+<h3 id="73-例"><a class="header" href="#73-例">7.3 例</a></h3>
+<p><strong><code>crates/zeroclaw-api</code> 用（抽出後）:</strong></p>
+<pre><code class="language-markdown"># zeroclaw-api
+
+## What this crate is
+Trait definitions and shared data types for the ZeroClaw plugin and kernel
+interfaces. This is the contract layer. Everything else depends on it.
+
+## What this crate is allowed to depend on
+- serde, serde_json (serialization)
+- async-trait (async trait support)
+- anyhow (error types)
+- tokio (async runtime types, minimal)
+Nothing else. No HTTP clients. No database drivers. No external services.
+
+## Extension points
+All traits in this crate are extension points:
+- `Provider` (src/providers/traits.rs) — LLM provider implementations
+- `Channel` (src/channels/traits.rs) — messaging platform integrations
+- `Tool` (src/tools/traits.rs) — agent tool implementations
+- `Memory` (src/memory/traits.rs) — persistence backends
+- `Observer` (src/observability/traits.rs) — observability backends
+- `RuntimeAdapter` (src/runtime/traits.rs) — execution environments
+- `Peripheral` (src/peripherals/traits.rs) — hardware integrations
+
+## What does NOT belong here
+- Any concrete implementation of any trait
+- Any dependency on a specific messaging platform, LLM provider, or database
+- Any network I/O or filesystem access
+- Any binary or executable target
+
+## Related ADRs
+- ADR-002: Trait-driven extensibility
+</code></pre>
+<p><strong><code>crates/zeroclaw-kernel</code> 用（抽出後）：</strong></p>
+<pre><code class="language-markdown"># zeroclaw-kernel
+
+## What this crate is
+The orchestration engine. Runs the agent loop, manages the service registry,
+exposes the local IPC API. The kernel knows nothing about specific channels,
+providers, or tools — only their abstract interfaces.
+
+## What this crate is allowed to depend on
+- zeroclaw-api (traits only)
+- zeroclaw-tool-call-parser (parsing, no agent state)
+- Standard async/runtime crates (tokio, anyhow, tracing)
+- Config and storage crates (toml, serde, rusqlite for core memory)
+NOT: any specific channel, provider, or tool implementation crate.
+
+## Extension points
+- `Registry::register_channel()` — add a channel at startup
+- `Registry::register_tool()` — add a tool at startup
+- `Registry::set_provider()` — set the active provider at startup
+Implementations are registered by the binary crate, not by the kernel.
+
+## What does NOT belong here
+- Any import of TelegramChannel, DiscordChannel, or any named channel
+- Any import of AnthropicProvider, OpenAIProvider, or any named provider
+- Any tool implementation beyond the 10-12 designated core tools
+- The gateway HTTP server or any web serving code
+
+## Related ADRs
+- ADR-002: Trait-driven extensibility
+- ADR-006: CLI as the only built-in channel
+- ADR-007: Gateway extraction
+</code></pre>
+<h3 id="74-agentsmd-の階層"><a class="header" href="#74-agentsmd-の階層">7.4 AGENTS.md の階層</a></h3>
+<p>ルート <code>AGENTS.md</code> はプロジェクト全体のポリシーを定義します。クレートレベルの <code>AGENTS.md</code> ファイルは、そのクレートの特定の範囲に対してポリシーを絞り込みます。AIツールが <code>crates/zeroclaw-api/</code> 内のファイルを読み込む場合、ルート <code>AGENTS.md</code>（プロジェクトポリシー）と <code>crates/zeroclaw-api/AGENTS.md</code>（クレートポリシー）の両方を読み取る必要があります。クレートポリシーはより具体的であり、両者が競合する場合はクレートポリシーが優先されます。</p>
+<hr>
+<h2 id="8-ターゲット構造"><a class="header" href="#8-ターゲット構造">8. ターゲット構造</a></h2>
+<p>mdBook への移行後、リポジトリのコード隣接ドキュメントのソースレイアウトは次のとおりです:</p>
+<pre><code>docs/book/src/
+│
+├── README.md                    ← mdBook introduction
+├── SUMMARY.md                   ← Canonical mdBook TOC
+│
+├── architecture/
+│   ├── overview.md              ← Current system landscape
+│   ├── decisions/               ← ADRs (immutable once accepted)
+│   │   ├── ADR-001-rust-first.md
+│   │   ├── ADR-002-trait-driven-extensibility.md
+│   │   ├── ADR-003-wasm-plugin-model.md
+│   │   ├── ADR-004-tool-shared-state-ownership.md
+│   │   ├── ADR-005-memory-backends.md
+│   │   ├── ADR-006-cli-only-built-in-channel.md
+│   │   ├── ADR-007-gateway-extraction.md
+│   │   └── ADR-009-wit-wasmtime-plugin-execution.md
+│   └── diagrams/
+│       ├── component-map.md     ← Mermaid: crate topology
+│       └── data-flow.md         ← Mermaid: message lifecycle
+│
+├── contributing/
+│   ├── index.md
+│   ├── architecture-map.md
+│   ├── rfcs.md
+│   ├── testing.md
+│   └── pr-review-protocol.md
+│
+├── reference/
+│   ├── index.md
+│   ├── cli.md
+│   ├── config.md
+│   └── providers.md
+│
+├── security/
+│   ├── overview.md
+│   ├── model.md
+│   ├── sandboxing.md
+│   └── tool-receipts.md
+│
+├── hardware/
+│   ├── index.md
+│   ├── subsystem.md
+│   ├── adding-boards-and-tools.md
+│   └── hardware-peripherals-design.md
+│
+└── foundations/
+    ├── fnd-001-intentional-architecture.md
+    ├── fnd-002-documentation-standards.md
+    ├── fnd-003-governance.md
+    ├── fnd-004-engineering-infrastructure.md
+    ├── fnd-005-contribution-culture.md
+    └── fnd-006-zero-compromise-in-practice.md
+</code></pre>
+<p><strong>現在の構造から削除:</strong></p>
+<pre><code>docs/i18n/                       ← 169 files, 2.2 MB — removed entirely
+docs/maintainers/                ← project snapshots and i18n coverage maps
+                                   moved to Wiki (operational, not code-adjacent)
+docs/setup-guides/               ← moved to Wiki
+docs/ops/                        ← moved to Wiki
+README.ar.md (and 30 others)     ← removed from repo root
+docs/README.ar.md (and 30 others)← removed
+</code></pre>
+<p>リポジトリのルートがクリーンになります：</p>
+<pre><code>README.md
+AGENTS.md
+CHANGELOG.md
+CLAUDE.md
+CODE_OF_CONDUCT.md
+CONTRIBUTING.md
+SECURITY.md
+LICENSE-APACHE
+LICENSE-MIT
+NOTICE
+Cargo.toml
+Cargo.lock
+... (build and config files)
+</code></pre>
+<p>言語のバリエーションはありません。重複するREADMEもありません。ユーザーガイドはWikiに、技術リファレンスはdocs/ディレクトリにリンクする、1つの権威ある英語のREADMEがあります。</p>
+<hr>
+<h2 id="9-置換ドキュメント契約"><a class="header" href="#9-置換ドキュメント契約">9. 置換ドキュメント契約</a></h2>
+<p>従来の <code>docs/contributing/docs-contract.md</code> は、この RFC で廃止された i18n パリティ要件とディレクトリ構造を定義していました。このファイルは削除され、このセクションがその代替となります。</p>
+<p>この置き換えは3つの事項を統括します。成果物の分類、リポジトリ/wikiの分割、そしてADRガバナンスです。i18nについては何も触れていません。ロケールの整合性は現在、<a href="../maintainers/docs-and-translations.html">Maintainers → Docs &amp; Translations</a>ページで扱われています。</p>
+<p><strong>置換ドキュメント契約:</strong></p>
+<pre><code class="language-markdown"># Documentation Contract
+
+## Document Classification
+
+Every document in `docs/` belongs to one artifact family:
+
+- **Considerations** — principles and standards that guide decisions
+- **Landscapes** — descriptions of the current system state
+- **Outlines** — proposals and roadmaps for future work
+- **Designs** — ADRs, API specs, and detailed technical decisions
+- **Standards** — specific rules for how we build and operate
+
+If you cannot name the family before writing, do not write yet.
+
+## The Repo / Wiki Rule
+
+A document lives in the repository if it would become wrong when the
+code changes. It lives on the Wiki if it would not.
+
+Reference documentation (config reference, CLI reference) lives in the
+repository because it maps directly to code structures.
+
+User guides, setup instructions, and operational how-tos live on the Wiki
+because they update on their own timeline.
+
+## ADR Governance
+
+See `docs/book/src/architecture/decisions/` for the ADR format and lifecycle rules.
+
+Major architectural changes require an ADR before implementation begins,
+not after.
+
+## Language
+
+All documents in this repository are written in English.
+Community-maintained translations live on the GitHub Wiki.
+Documentation PRs are reviewed in English only.
+
+## Freshness
+
+Documents should be updated in the same PR as the code change that makes
+them stale. A PR that changes a configuration format must update the
+config reference. A PR that adds a new command must update the CLI reference.
+
+RFC issues and roadmap trackers are exempt - they describe intent and
+may precede implementation by multiple releases.
+</code></pre>
+<hr>
+<h2 id="10-採用すべき基準"><a class="header" href="#10-採用すべき基準">10. 採用すべき基準</a></h2>
+<p>これらのドキュメント固有の基準は、アーキテクチャRFCで提案されたより広範な基準を補完するものです。</p>
+<h3 id="diátaxis-フレームワークドキュメント構造"><a class="header" href="#diátaxis-フレームワークドキュメント構造">Diátaxis フレームワーク（ドキュメント構造）</a></h3>
+<p><strong>概要:</strong> Diátaxis（<a href="https://diataxis.fr">https://diataxis.fr</a>）は、技術文書を4つのタイプ（チュートリアル、ハウツーガイド、リファレンス、説明）に分類する体系的なフレームワークです。これは、Pythonドキュメント、Djangoドキュメントなど、多くのドキュメントの基盤となっているフレームワークです。EA Artifactsアプローチとの互換性が非常に高く、両者は異なる問いに答えます（Diátaxis: 文書の内容をどのように構成するか、EA Artifacts: これはどのタイプの文書で、どこに配置されるか）。</p>
+<p><strong>適用方法:</strong> ウィキ上のユーザー向けドキュメントはDiátaxis構造に従う必要があります。リポジトリ内のコードに隣接するドキュメントはEA Artifactsに従います。これら2つのフレームワークは異なるレベルで機能し、競合しません。</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Diátタイプの種類</th><th>目的</th><th>ZeroClaw の例</th><th>場所</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>チュートリアル</strong></td><td>学習志向で、体験を通じて導く</td><td>「最初のツールプラグインを構築する」</td><td>ウィキ</td></tr>
+<tr><td><strong>ハウツーガイド</strong></td><td>目的指向型で、特定の課題を解決します</td><td>Telegramの統合を設定する</td><td>ウィキ</td></tr>
+<tr><td><strong>参照</strong></td><td>情報指向、機械の仕組みを記述</td><td>設定リファレンス、CLIリファレンス</td><td>リポジトリ</td></tr>
+<tr><td><strong>説明</strong></td><td>理解を目的とした説明、なぜなのかを解説</td><td>ADR、アーキテクチャドキュメント</td><td>リポジトリ</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="機械可読性のためのmarkdownフロントマター"><a class="header" href="#機械可読性のためのmarkdownフロントマター">機械可読性のためのMarkdownフロントマター</a></h3>
+<p><code>docs/</code> 内のすべてのドキュメントには YAML フロントマターを含める必要があります。これにより、AI ツール、CI チェック、将来のツールでクエリ可能になります。</p>
+<pre><code class="language-yaml">---
+型: adr | 提案 | 参照 | 貢献 | セキュリティ | ハードウェア
+ステータス: ドラフト | 提案 | 承認 | 非推奨 | 代替
+最終レビュー日: YYYY-MM-DD
+関連する:
+  - ADR-NNN
+  - crates/zeroclaw-api
+---
+</code></pre>
+<p>CI チェックでは、<code>docs/</code> 内のすべてのドキュメントが有効なフロントマターを持っていることを検証する必要があります。これにより、ドキュメントがタイプとステータスを最初に宣言せずに作成されることを防ぎ、ツールレベルで分類規律を強制します。</p>
+<h3 id="commonmark--github-flavored-markdown"><a class="header" href="#commonmark--github-flavored-markdown">CommonMark + GitHub Flavored Markdown</a></h3>
+<p>すべてのドキュメントは、CommonMark（標準化されたMarkdown仕様）とGitHub Flavored Markdownの拡張機能（テーブル、タスクリスト、フェンシングされたコードブロック、Mermaidダイアグラム）を使用しています。カスタム拡張機能、MDX、ReStructuredTextは使用しません。アーキテクチャ図には画像ファイルよりもMermaidダイアグラムが推奨されます。これは、コードとバージョン管理がきれいに同期するためです。</p>
+<h3 id="prose-linting-用の-vale"><a class="header" href="#prose-linting-用の-vale">Prose Linting 用の Vale</a></h3>
+<p><strong>概要:</strong> Vale (<a href="https://vale.sh">https://vale.sh</a>) は文章用のリンターです。設定可能なルールを使って、文章のスタイル、一貫性、読みやすさをチェックします。たとえば次のようなことを強制できます。常に「the user」ではなく「you」を使う、命令形のセクションでは受動態を避ける、用語を統一する（「extension」や「module」ではなく「plugin」を使う）。</p>
+<p><strong>なぜ重要か:</strong> 現在のドキュメントは、トーン、用語、スタイルが一貫していません。一部のページでは「プラグイン」、一部では「モジュール」、一部では「拡張機能」と表記されています。Vale はこれらのルールを自動化し、Clippy がコード品質を強制するのと同じように、CI 時にそれらを強制します。</p>
+<hr>
+<h2 id="11-フェーズ別ロードマップ"><a class="header" href="#11-フェーズ別ロードマップ">11. フェーズ別ロードマップ</a></h2>
+<p>ドキュメントの移行は、アーキテクチャの移行と同じく、Strangler Fig パターンに従います。これは、段階的に行い、常に動作する状態を維持し、大規模な書き換えを避けるアプローチです。</p>
+<hr>
+<h3 id="フェーズ-1--v070-clean-the-root"><a class="header" href="#フェーズ-1--v070-clean-the-root">フェーズ 1 · v0.7.0: 「Clean the Root」</a></h3>
+<p><strong>納品物:</strong></p>
+<ul>
+<li><input disabled="" type="checkbox"> リポジトリのルートからすべての <code>README.*.md</code> ファイルを削除します（<code>README.md</code> のみを残します）。</li>
+<li><input disabled="" type="checkbox"> <code>docs/i18n/</code> を完全に削除</li>
+<li><input disabled="" type="checkbox"> <code>docs/</code> から英語以外のハブファイルをすべて削除する</li>
+<li><input disabled="" type="checkbox"> <code>README.md</code> に Wiki リンク付きの <code>Languages</code> セクションを追加</li>
+<li><input disabled="" type="checkbox"> GitHub Wiki を作成し、構造的な骨格（ホーム + 上位レベルのページ、コンテンツのスタブ）を設定します。</li>
+<li><input disabled="" type="checkbox"> <code>docs-contract.md</code> から i18n パリティ要件を削除する</li>
+<li><input disabled="" type="checkbox"> 既存の <code>docs/</code> ファイルにYAMLのフロントマターを追加する</li>
+<li><input disabled="" type="checkbox" checked=""> <code>docs/book/src/architecture/decisions/</code> を作成し、ADR-001 と ADR-002 を追加し、ADR-003 と ADR-004 を復元し、ADR-003 を置き換える WIT/wasmtime の記録として ADR-009 を追加する</li>
+</ul>
+<p><strong>成功指標:</strong></p>
+<ul>
+<li>リポジトリのルートには、READMEファイルが1つだけ含まれています。</li>
+<li><code>docs/i18n/</code> は存在しません</li>
+<li>すべての <code>docs/</code> ファイルには有効な YAML フロントマターが含まれています（CI で強制）。</li>
+<li>GitHub Wikiが公開され、READMEから公開リンクされています</li>
+</ul>
+<hr>
+<h3 id="フェーズ2--v070v080不足しているadrを記述する"><a class="header" href="#フェーズ2--v070v080不足しているadrを記述する">フェーズ2 · v0.7.0〜v0.8.0:「不足しているADRを記述する」</a></h3>
+<p><strong>納品物:</strong></p>
+<ul>
+<li><input disabled="" type="checkbox"> ADR-005からADR-007を記述する（遡及的、6.3節を参照）</li>
+<li><input disabled="" type="checkbox"> Vale の設定（<code>.vale.ini</code> およびスタイルルール）と CI チェックを追加</li>
+<li><input disabled="" type="checkbox"> Section 9 で指定されたバージョンに <code>docs-contract.md</code> を完全に置き換えます</li>
+<li><input disabled="" type="checkbox"> <code>docs/setup-guides/</code> のコンテンツを GitHub Wiki に移行する</li>
+<li><input disabled="" type="checkbox"> <code>docs/ops/</code> のコンテンツを GitHub Wiki に移行する</li>
+<li><input disabled="" type="checkbox"> <code>SUMMARY.md</code> を更新して、新しい構造（リポジトリ固有のコンテンツ）を反映してください。</li>
+<li><input disabled="" type="checkbox"> （抽出を見越して）<code>crates/zeroclaw-api</code> のルートレベル <code>AGENTS.md</code> を作成する</li>
+</ul>
+<p><strong>成功指標:</strong></p>
+<ul>
+<li>ADR-001 から ADR-007 までが、適切に承認済みまたは置き換え済みのステータスで存在する</li>
+<li>ADR-009 は ADR-003 を置き換える WIT/wasmtime の決定を記録する</li>
+<li>Vale CI チェックがすべてのドキュメントでパスしました</li>
+<li>Wikiには、移行されたすべてのセクションの完全なコンテンツがあります。</li>
+<li><code>docs/</code> 内にリンク切れはありません</li>
+</ul>
+<hr>
+<h3 id="フェーズ3--v080v090aiレイヤー"><a class="header" href="#フェーズ3--v080v090aiレイヤー">フェーズ3 · v0.8.0〜v0.9.0：「AIレイヤー」</a></h3>
+<p><strong>納品物:</strong></p>
+<ul>
+<li><input disabled="" type="checkbox"> ワークスペースの分解（アーキテクチャ RFC のフェーズに従って）に応じて、各新規クレートごとに <code>AGENTS.md</code> を作成します。</li>
+<li><input disabled="" type="checkbox"> <code>docs/book/src/architecture/diagrams/component-map.md</code>（Mermaid、対象クレートのトポロジーを反映）を作成する</li>
+<li><input disabled="" type="checkbox"> <code>docs/book/src/architecture/diagrams/data-flow.md</code> を作成する（Mermaid、メッセージのライフサイクル）</li>
+<li><input disabled="" type="checkbox"> <code>docs/book/src/developing/plugin-sdk.md</code> にプラグイン SDK のドキュメントを作成してください</li>
+<li><input disabled="" type="checkbox"> WITインターフェースのドキュメントを、<code>wit/</code> ディレクトリ内のファイル（WITから生成されたもの＋手書きの説明）と併記してください。</li>
+<li><input disabled="" type="checkbox"> カーネルのIPC APIが安定化するにつれて、OpenAPI仕様のドキュメントを更新してください。</li>
+</ul>
+<p><strong>成功指標:</strong></p>
+<ul>
+<li>ワークスペース内のすべてのクレートには <code>AGENTS.md</code> があります。</li>
+<li>アーキテクチャ図は Mermaid で記述してください（docs/ ディレクトリにはバイナリ画像ファイルを含めないでください）。</li>
+<li>プラグインSDKのドキュメントは、外部の貢献者が動作するツールプラグインを作成するのに十分な内容です。</li>
+</ul>
+<hr>
+<h3 id="フェーズ4--v100安定したプラットフォーム"><a class="header" href="#フェーズ4--v100安定したプラットフォーム">フェーズ4 · v1.0.0:「安定したプラットフォーム」</a></h3>
+<p><strong>納品物:</strong></p>
+<ul>
+<li><input disabled="" type="checkbox"> 対応するコードが出荷されたら、ADR-005 から ADR-007 までを <code>accepted</code>（<code>proposed</code> ではなく）としてマークする</li>
+<li><input disabled="" type="checkbox"> <code>v1</code> のカーネル IPC API ドキュメントに安定性保証を付与</li>
+<li><input disabled="" type="checkbox"> Plugin Registry ガバナンス文書を作成する（誰がレジストリを管理するか、プラグインをどのようにレビューするか、侵害されたプラグインをどのように取り消すか）</li>
+<li><input disabled="" type="checkbox"> プラグインSDKをスタンドアロンのドキュメントサイトとして公開する（<code>docs/book/src/developing/plugin-sdk.md</code> から）</li>
+<li><input disabled="" type="checkbox"> Wikiの翻訳コーディネーターの役割を確立する（翻訳ページを管理し、ボランティア翻訳者を調整するコミュニティメンバー）</li>
+</ul>
+<p><strong>成功指標:</strong></p>
+<ul>
+<li>すべての基礎的なADRが承認されました</li>
+<li>プラグインSDKは完成し、READMEから外部リンクされています。</li>
+<li>Wikiには、少なくとも2つの言語でコミュニティが積極的に維持している翻訳があります。</li>
+<li>ドキュメントCI（フロントmatterチェック + Vale）は、すべてのPRでパスします。</li>
+</ul>
+<hr>
+<h2 id="付録-a-用語集"><a class="header" href="#付録-a-用語集">付録 A: 用語集</a></h2>
+<p><strong>ADR（アーキテクチャ決定記録）</strong>: 重要なアーキテクチャ上の決定を記録した不変のレコードです。決定を促した背景、決定された内容、そしてその結果を記録します。ADR は一度承認されると変更されません。置き換えられた決定は、新しい ADR として記録されます。</p>
+<p><strong>Diátaxis</strong>: 技術ドキュメントの構造を体系化するためのフレームワークで、コンテンツをチュートリアル（学習）、ハウツーガイド（目的指向）、リファレンス（情報）、説明（理解）に分類します。<a href="https://diataxis.fr">https://diataxis.fr</a> を参照してください。</p>
+<p><strong>EA Artifacts on a Page</strong>: Svyatoslav Kotusev によって開発された、エンタープライズアーキテクチャドキュメントの分類フレームワーク。アーティファクトを Considerations、Landscapes、Outlines、Designs、Standards の5つのファミリーに分類します。<a href="https://eaonapage.com">https://eaonapage.com</a> を参照してください。</p>
+<p><strong>Frontmatter</strong>: Markdown ファイルの先頭にある YAML メタデータで、<code>---</code> で区切られます。ドキュメントを機械可読にし、ツールや CI チェック、AI アシスタントからクエリ可能にします。</p>
+<p><strong>Nygard形式</strong>: Michael Nygardによって導入されたADR形式。3つのセクション（Context、Decision、Consequences）で、不要な形式張った手続きなしに本質的な論拠を捉えます。</p>
+<p><strong>ストラングラーフィグパターン</strong>: 古い構造の周りに新しい構造を段階的に構築し、一度にすべてではなく部分ごとに置き換えていく移行戦略。移行期間中、システムは機能し続けます。</p>
+<p><strong>Vale</strong>: 技術ドキュメント向けの文章リンター。Clippy が Rust コードの品質を強制するのと同じように、CI 時にスタイル、一貫性、読みやすさのルールを強制します。<a href="https://vale.sh">https://vale.sh</a> を参照してください。</p>
+<hr>
+<h2 id="付録b-参考文献"><a class="header" href="#付録b-参考文献">付録B: 参考文献</a></h2>
+<ul>
+<li><a href="https://diataxis.fr">Diátaxis ドキュメンテーションフレームワーク</a>：技術ドキュメントをタイプ別に構造化するための決定版リファレンス。</li>
+<li><a href="https://eaonapage.com">1ページのEA成果物 (v2.2)</a>: セクション3で使用される分類フレームワーク。</li>
+<li><strong>“Docs for Developers”</strong>: Jared Bhatti 他著: 大規模なドキュメントシステムを保守してきたエンジニアによって書かれた、技術ドキュメントの実践ガイド。</li>
+<li><a href="https://vale.sh/docs">Vale documentation</a>: セクション10で提案されている文章リンターのセットアップガイドと設定リファレンス。</li>
+<li><a href="https://cognitect.com/blog/2011/11/15/documenting-architecture-decisions">Michael Nygard による ADR の解説</a>: Section 6 で使用されている ADR 形式を紹介した元の記事です。</li>
+<li><a href="https://docs.github.com/en/communities/documenting-your-project-with-wikis">GitHub Wikis ドキュメント</a>: セクション 5 で提案されている GitHub Wiki の設定と管理に関するリファレンス。</li>
+</ul>
+<hr>
+<p><em>この提案は、ZeroClawのドキュメントシステム（v0.6.8）の直接分析に基づいて作成されました。引用されている指標（169のi18nファイル、2.2 MB、31言語のREADMEバリアント）は直接測定に基づいています。推奨事項は、オープンソースインフラストラクチャプロジェクトの技術文書における確立されたプラクティスを反映しており、ZeroClawの特定の制約と目標に合わせて適応されています。</em></p>
+<p>フィードバック、修正、および反提案を歓迎します。優れたドキュメントはコミュニティの取り組みであり、最も良い構造はチームが実際に維持できるものです。</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../foundations/fnd-001-intentional-architecture.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../foundations/fnd-003-governance.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../foundations/fnd-001-intentional-architecture.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../foundations/fnd-003-governance.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

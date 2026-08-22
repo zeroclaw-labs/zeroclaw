@@ -1,0 +1,569 @@
+<!DOCTYPE HTML>
+<html lang="es" class="default-dark sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Protocolo de plugins - ZeroClaw Docs</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="Documentation for the ZeroClaw personal AI assistant.">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../../../_shared/favicon.svg">
+        <link rel="shortcut icon" href="../../../_shared/favicon.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-2459343d.css">
+        <link rel="stylesheet" href="../../../_shared/css/chrome.css">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets (pc-themes.css generated; ordered first) -->
+        <link rel="stylesheet" href="../../../_shared/theme/pc-themes.css">
+        <link rel="stylesheet" href="../../../_shared/theme/custom.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "default-dark";
+            const default_dark_theme = "default-dark";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-4642b369.js"></script>
+        <script>
+            // Persist sidebar fold state across navigations. mdBook's toc.js
+            // expands only the active page's ancestor chain on every load,
+            // collapsing every other section the reader opened. Wrap the
+            // scrollbox element's connectedCallback so saved state is applied
+            // synchronously at the end of its own render — same paint, no
+            // flicker — and record state whenever a fold is toggled.
+            (function () {
+                var KEY = 'pc-sidebar-folds';
+                var proto = window.MDBookSidebarScrollbox
+                    && window.MDBookSidebarScrollbox.prototype;
+                var ce = window.customElements
+                    && window.customElements.get('mdbook-sidebar-scrollbox');
+                proto = (ce && ce.prototype) || proto;
+                if (!proto || proto.__pcFolds) { return; }
+                proto.__pcFolds = true;
+
+                function read() {
+                    try { return JSON.parse(localStorage.getItem(KEY)) || {}; }
+                    catch (e) { return {}; }
+                }
+                function write(s) {
+                    try { localStorage.setItem(KEY, JSON.stringify(s)); }
+                    catch (e) { /* storage unavailable */ }
+                }
+                function foldables(box) {
+                    return Array.prototype.filter.call(
+                        box.querySelectorAll('li.chapter-item'),
+                        function (li) {
+                            return li.querySelector(':scope > .chapter-link-wrapper > a.chapter-fold-toggle');
+                        }
+                    );
+                }
+                function keyFor(li) {
+                    var wrap = li.querySelector(':scope > .chapter-link-wrapper');
+                    if (!wrap) { return null; }
+                    var link = wrap.querySelector(':scope > a[href]');
+                    if (link) { return 'h:' + link.getAttribute('href'); }
+                    var strong = wrap.querySelector(':scope > span strong, :scope > a strong');
+                    return strong ? 'n:' + strong.textContent.trim() : null;
+                }
+                function applyState(box) {
+                    var state = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k == null || !(k in state)) { return; }
+                        // Never collapse the section holding the active page.
+                        if (!state[k] && li.querySelector('a.active')) { return; }
+                        li.classList.toggle('expanded', !!state[k]);
+                    });
+                }
+                function recordState(box) {
+                    var s = read();
+                    foldables(box).forEach(function (li) {
+                        var k = keyFor(li);
+                        if (k != null) { s[k] = li.classList.contains('expanded'); }
+                    });
+                    write(s);
+                }
+
+                var origConnected = proto.connectedCallback;
+                proto.connectedCallback = function () {
+                    if (origConnected) { origConnected.call(this); }
+                    var box = this;
+                    applyState(box);
+                    box.addEventListener('click', function (e) {
+                        if (!e.target.closest('a.chapter-fold-toggle, .chapter-link-wrapper')) {
+                            return;
+                        }
+                        requestAnimationFrame(function () { recordState(box); });
+                    });
+                };
+            })();
+        </script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('default-dark')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed.
+             The user's saved preference (mdbook-sidebar) wins at every width so
+             navigating between pages never collapses an open sidebar. Only when
+             no preference is stored do we pick a width-based default, and only a
+             genuinely narrow (phone) viewport defaults to hidden. -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+            if (sidebar !== 'visible' && sidebar !== 'hidden') {
+                sidebar = document.body.clientWidth >= 768 ? 'visible' : 'hidden';
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                sidebar_toggle.checked = false;
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <!-- PC_THEME_LIST_START: generated from themes.json by `cargo xtask mdbook themes`; do not edit between markers -->
+                            <li role="none" class="pc-theme-group">Dark</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0c0e12;--s1:#38bdf8;--s2:#7dd3fc;--s3:#9aa0aa"></span><span class="pc-theme-name">Operator Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-ayu-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e14;--s1:#39bae6;--s2:#d2a6ff;--s3:#ffb454"></span><span class="pc-theme-name">Ayu Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-mocha"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e2e;--s1:#89b4fa;--s2:#cba6f7;--s3:#f9e2af"></span><span class="pc-theme-name">Catppuccin Mocha</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-cobalt2"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#193549;--s1:#ffc600;--s2:#ff9d00;--s3:#80ffbb"></span><span class="pc-theme-name">Cobalt2</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-code-red"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#160a0a;--s1:#ff3b3b;--s2:#ff8a5c;--s3:#ffb454"></span><span class="pc-theme-name">Code Red</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1e1e24;--s1:#22d3ee;--s2:#a78bfa;--s3:#f59e0b"></span><span class="pc-theme-name">Default Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-icy-blue"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#080e18;--s1:#64c8ff;--s2:#b48cff;--s3:#ffdc50"></span><span class="pc-theme-name">Icy Blue</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-dracula"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282a36;--s1:#bd93f9;--s2:#ff79c6;--s3:#50fa7b"></span><span class="pc-theme-name">Dracula</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2d353b;--s1:#a7c080;--s2:#83c092;--s3:#dbbc7f"></span><span class="pc-theme-name">Everforest Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#100f0f;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282828;--s1:#83a598;--s2:#d3869b;--s3:#fabd2f"></span><span class="pc-theme-name">Gruvbox Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hacker-green"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#0a0e0a;--s1:#00ff41;--s2:#00cc33;--s3:#008f11"></span><span class="pc-theme-name">Hacker Green</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-hazard"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#16140a;--s1:#ffd60a;--s2:#ffb454;--s3:#ff8a5c"></span><span class="pc-theme-name">Hazard</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#ffffff;--s2:#ff00ff;--s3:#ffff00"></span><span class="pc-theme-name">High Contrast Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-dragon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#181616;--s1:#8ba4b0;--s2:#a292a3;--s3:#c4b28a"></span><span class="pc-theme-name">Kanagawa Dragon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-wave"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1f1f28;--s1:#7e9cd8;--s2:#957fb8;--s3:#e6c384"></span><span class="pc-theme-name">Kanagawa Wave</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#212121;--s1:#89ddff;--s2:#c792ea;--s3:#ffcb6b"></span><span class="pc-theme-name">Material Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-monokai"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#272822;--s1:#f92672;--s2:#a6e22e;--s3:#e6db74"></span><span class="pc-theme-name">Monokai</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-night-owl"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#011627;--s1:#82aaff;--s2:#c792ea;--s3:#addb67"></span><span class="pc-theme-name">Night Owl</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#2e3440;--s1:#88c0d0;--s2:#81a1c1;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-oled-black"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#000000;--s1:#22d3ee;--s2:#8b5cf6;--s3:#10b981"></span><span class="pc-theme-name">OLED Black</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#282c34;--s1:#61afef;--s2:#c678dd;--s3:#e5c07b"></span><span class="pc-theme-name">One Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#191724;--s1:#ebbcba;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-moon"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#232136;--s1:#ea9a97;--s2:#c4a7e7;--s3:#f6c177"></span><span class="pc-theme-name">Rosé Pine Moon</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-dark"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#002b36;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Dark</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#1a1b26;--s1:#7aa2f7;--s2:#bb9af7;--s3:#e0af68"></span><span class="pc-theme-name">Tokyo Night</span></button></li>
+                            <li role="none" class="pc-theme-group">Light</li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-operator-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#0284c7;--s2:#0ea5e9;--s3:#475569"></span><span class="pc-theme-name">Operator Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-catppuccin-latte"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eff1f5;--s1:#1e66f5;--s2:#8839ef;--s3:#df8e1d"></span><span class="pc-theme-name">Catppuccin Latte</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-default-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f4f4f5;--s1:#22d3ee;--s2:#8b5cf6;--s3:#f59e0b"></span><span class="pc-theme-name">Default Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-everforest-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#8da101;--s2:#35a77c;--s3:#dfa000"></span><span class="pc-theme-name">Everforest Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-flexoki-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fffcf0;--s1:#ce5d97;--s2:#879a39;--s3:#da702c"></span><span class="pc-theme-name">Flexoki Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-gruvbox-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fbf1c7;--s1:#076678;--s2:#8f3f71;--s3:#b57614"></span><span class="pc-theme-name">Gruvbox Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-high-contrast-white"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#ffffff;--s1:#000000;--s2:#600080;--s3:#806000"></span><span class="pc-theme-name">High Contrast White</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-kanagawa-lotus"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#f2ecbc;--s1:#4d699b;--s2:#b35b79;--s3:#836f4a"></span><span class="pc-theme-name">Kanagawa Lotus</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-material-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#6182b8;--s2:#7c4dff;--s3:#f76d47"></span><span class="pc-theme-name">Material Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-nord-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#eceff4;--s1:#5e81ac;--s2:#88c0d0;--s3:#a3be8c"></span><span class="pc-theme-name">Nord Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-one-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fafafa;--s1:#4078f2;--s2:#a626a4;--s3:#c18401"></span><span class="pc-theme-name">One Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-rose-pine-dawn"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#faf4ed;--s1:#d7827e;--s2:#907aa9;--s3:#ea9d34"></span><span class="pc-theme-name">Rosé Pine Dawn</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-solarized-light"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#fdf6e3;--s1:#268bd2;--s2:#2aa198;--s3:#b58900"></span><span class="pc-theme-name">Solarized Light</span></button></li>
+                            <li role="none" class="pc-theme-item"><button role="menuitem" class="theme" id="mdbook-theme-tokyo-night-day"><span class="pc-theme-swatch" aria-hidden="true" style="--s0:#e1e2e7;--s1:#2e7de9;--s2:#9854f1;--s3:#8c6c3e"></span><span class="pc-theme-name">Tokyo Night Day</span></button></li>
+                            <!-- PC_THEME_LIST_END -->
+                        </ul>
+                    </div>
+
+                    <h1 class="menu-title">ZeroClaw Docs</h1>
+
+                    <div class="right-buttons">
+                        <a href="https://github.com/zeroclaw-labs/zeroclaw" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://discord.gg/tQ88WUkPyJ" title="Join our Discord" aria-label="Join our Discord" rel="external noopener" target="_blank">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M524.531,69.836a1.5,1.5,0,0,0-.764-.7A485.065,485.065,0,0,0,404.081,32.03a1.816,1.816,0,0,0-1.923.91,337.461,337.461,0,0,0-14.9,30.6,447.848,447.848,0,0,0-134.426,0,309.541,309.541,0,0,0-15.135-30.6,1.89,1.89,0,0,0-1.924-.91A483.689,483.689,0,0,0,116.085,69.137a1.712,1.712,0,0,0-.788.676C39.068,183.651,18.186,294.69,28.43,404.354a2.016,2.016,0,0,0,.765,1.375A487.666,487.666,0,0,0,176.02,479.918a1.9,1.9,0,0,0,2.063-.676A348.2,348.2,0,0,0,208.12,430.4a1.86,1.86,0,0,0-1.019-2.588,321.173,321.173,0,0,1-45.868-21.853,1.885,1.885,0,0,1-.185-3.126c3.082-2.309,6.166-4.711,9.109-7.137a1.819,1.819,0,0,1,1.9-.256c96.229,43.917,200.41,43.917,295.5,0a1.812,1.812,0,0,1,1.924.233c2.944,2.426,6.027,4.851,9.132,7.16a1.884,1.884,0,0,1-.162,3.126,301.407,301.407,0,0,1-45.89,21.83,1.875,1.875,0,0,0-1,2.611,391.055,391.055,0,0,0,30.014,48.815,1.864,1.864,0,0,0,2.063.7A486.048,486.048,0,0,0,610.7,405.729a1.882,1.882,0,0,0,.765-1.352C623.729,277.594,590.933,167.465,524.531,69.836ZM222.491,337.58c-28.972,0-52.844-26.587-52.844-59.239S193.056,219.1,222.491,219.1c29.665,0,53.306,26.82,52.843,59.239C275.334,310.993,251.924,337.58,222.491,337.58Zm195.38,0c-28.971,0-52.843-26.587-52.843-59.239S388.437,219.1,417.871,219.1c29.667,0,53.307,26.82,52.844,59.239C470.715,310.993,447.538,337.58,417.871,337.58Z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <aside id="pc-page-toc" class="pc-page-toc" aria-label="On this page"></aside>
+                    <main>
+                        <hr>
+<p>tipo: referencia estado: aceptado última revisión: 2026-06-29 se relaciona con:</p>
+<ul>
+<li>FND-001</li>
+<li>ADR-003</li>
+<li>crates/zeroclaw-plugins</li>
+</ul>
+<hr>
+<h1 id="protocolo-del-complemento"><a class="header" href="#protocolo-del-complemento">Protocolo del complemento</a></h1>
+<p>Este documento define el protocolo entre el host de complementos de ZeroClaw y los componentes de complementos WASM.</p>
+<h2 id="qué-es-un-complemento"><a class="header" href="#qué-es-un-complemento">Qué es un complemento</a></h2>
+<p>Un plugin es un componente WebAssembly autónomo que ZeroClaw carga en tiempo de ejecución para añadir una capacidad que el binario principal no incluye. Vive en su propio directorio bajo <code>~/.zeroclaw/plugins/</code>, junto a un manifiesto que lo nombra y declara lo que proporciona. ZeroClaw lo descubre al iniciarse, lo verifica y conecta sus funciones exportadas al agente en ejecución para que se comporten como capacidades integradas: un plugin de herramienta aparece ante el modelo como simplemente otra herramienta invocable (<code>WasmTool</code> implementa el mismo trait <code>Tool</code> que una herramienta nativa), un plugin de canal se comporta como un canal de mensajería y un plugin de memoria como un backend de almacenamiento.</p>
+<p>Un plugin puede proporcionar una o más de las capacidades definidas en <code>PluginCapability</code> (<code>crates/zeroclaw-plugins/src/lib.rs</code>): una herramienta invocable, un canal de mensajería, un backend de memoria, un backend de observabilidad o un conjunto de habilidades en Markdown. El caso de habilidad es especial: no incluye ningún WASM, solo un directorio <code>skills/</code> de Markdown, por lo que es la única capacidad que omite el componente compilado.</p>
+<h3 id="por-qué-construir-uno"><a class="header" href="#por-qué-construir-uno">¿Por qué construir uno?</a></h3>
+<ul>
+<li><strong>Extiende sin bifurcar.</strong> Agrega una herramienta o canal sin modificar el árbol de código fuente de ZeroClaw ni esperar una versión; el complemento es tuyo y se carga desde tu directorio de instalación.</li>
+<li><strong>Comportamiento nativo.</strong> Un plugin cargado no es un complemento de segunda clase. El puente implementa las mismas características en tiempo de ejecución que usan los integrados, por lo que una herramienta del plugin se ofrece al modelo, se atribuye y se invoca exactamente igual que una de primera parte.</li>
+<li><strong>Elección de lenguaje.</strong> El contrato es WIT y el WASI Component Model, no una API de Rust. Cualquier lenguaje que compile a un componente <code>wasm32-wasip2</code> puede implementar un world. La guía desarrollada a continuación es Rust porque esa es la vía con más compatibilidad hoy, pero el límite en sí es agnóstico al lenguaje.</li>
+<li><strong>Aislado por defecto.</strong> El host carga cada plugin en un contexto WASI sin preaperturas del sistema de archivos y sin red ambiental. Un plugin no puede acceder silenciosamente al host; recibe exactamente las funciones del host conectadas a su mundo y nada más. HTTP saliente es la única superficie de red que puede abrirse, y solo para un plugin cuyo manifiesto concede <code>http_client</code>.</li>
+<li><strong>Procedencia verificable.</strong> Los manifiestos pueden firmarse con Ed25519, y un operador puede exigir firmas de editores de confianza antes de que se cargue cualquier plugin.</li>
+</ul>
+<h3 id="lo-que-un-plugin-no-puede-hacer-hoy"><a class="header" href="#lo-que-un-plugin-no-puede-hacer-hoy">Lo que un plugin no puede hacer (hoy)</a></h3>
+<p>Estos son límites reales del host actual, no preferencias de estilo. Conócelos antes de diseñar en torno a una capacidad que no existe.</p>
+<ul>
+<li><strong><code>logging</code>, inyección de configuración, <code>http_client</code> y la entrada alimentada por el host están conectados.</strong> De los permisos que un manifiesto puede declarar, <code>config_read</code> inyecta la sección de configuración propia del plugin, y <code>http_client</code> adjunta una superficie saliente <code>wasi:http</code> para que el plugin pueda hacer solicitudes HTTP. Filesystem y los permisos de acceso a memoria siguen siendo aceptados por el esquema del manifiesto, pero están inertes: sus funciones del host aún no están registradas en el enlazador. Consulta Permisos e imports del host más abajo.</li>
+<li><strong>Sin red de host ni sistema de archivos ambiente.</strong> El contexto WASI no tiene preaperturas ni red ambiente, así que un complemento no puede abrir sockets sin procesar ni leer archivos del host a través de WASI ambiente. Un complemento <code>http_client</code> obtiene acceso saliente a <code>wasi:http</code> y nada más; no puede escuchar. Los complementos de canal que deben recibir tráfico entrante no abren un listener por sí mismos: el host ejecuta el listener y entrega mensajes a través de la importación <code>inbound</code>, que el complemento extrae desde su exportación <code>poll-message</code>.</li>
+<li><strong>Un límite de 32 bits.</strong> El objetivo es <code>wasm32-wasip2</code>. La memoria invitada es un espacio de direcciones de 32 bits y la ABI de componentes reduce los desplazamientos a 32 bits independientemente del tamaño de palabra del host. Los valores grandes (por ejemplo, los bytes sin procesar de un adjunto de canal) cruzan el límite por valor. Consulte la sección de espacio de direcciones de 32 bits para ver por qué se trata de una restricción de la cadena de herramientas upstream, no de un flag que este repositorio pueda cambiar.</li>
+<li><strong>Una herramienta por complemento de herramienta.</strong> El mundo <code>tool-plugin</code> exporta una única interfaz <code>tool</code> con un nombre y un esquema. Un complemento que necesita exponer varias herramientas incluye varios componentes, o un mundo diferente.</li>
+<li><strong>Contrato experimental, no congelado.</strong> <code>wit/v0</code> aún no lleva un marcador <code>.frozen</code>, así que las interfaces todavía pueden cambiar antes de la primera versión estable. Fija una versión y espera tener que recompilar tras un cambio de WIT.</li>
+</ul>
+<h2 id="arquitectura"><a class="header" href="#arquitectura">Arquitectura</a></h2>
+<p>Los complementos de ZeroClaw son componentes de WebAssembly definidos por interfaces WIT bajo <code>wit/v0/</code> y alojados mediante <code>wasmtime</code> directo (<code>crates/zeroclaw-plugins</code>). Un complemento se compila como un componente WASI Preview 2 (<code>wasm32-wasip2</code>) que exporta uno de los mundos de complemento (<code>tool-plugin</code>, <code>channel-plugin</code>, <code>memory-plugin</code>) e importa la interfaz <code>logging</code> del host.</p>
+<p>El host vive en <code>crates/zeroclaw-plugins/src/component.rs</code>. Mantiene un único <code>wasmtime::Engine</code> habilitado para async, genera los enlaces del mundo con <code>wasmtime::component::bindgen!</code> a partir de <code>wit/v0</code> y conecta una superficie WASI p2 aislada al linker de cada mundo. El estado del host por llamada (<code>PluginState</code>) lleva un <code>WasiCtx</code> construido sin preopens y sin red, además del <code>ResourceTable</code> que requiere WASI. La única importación del host enlazada al linker es <code>logging</code>; por tanto, la autoridad ambiente de un plugin es solo el contexto WASI aislado y nada más (véase Host imports).</p>
+<p>Los tres puentes mundiales mapean cada mundo WIT a los traits nativos del runtime:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>World</th><th>Módulo puente</th><th>Superficie de ejecución</th></tr>
+</thead>
+<tbody>
+<tr><td><code>tool-plugin</code></td><td><code>runtime.rs</code>, <code>wasm_tool.rs</code></td><td><code>zeroclaw_api::tool::Tool</code></td></tr>
+<tr><td><code>channel-plugin</code></td><td><code>wasm_channel.rs</code></td><td>rasgo de canal</td></tr>
+<tr><td><code>memory-plugin</code></td><td><code>wasm_memory.rs</code></td><td>rasgo de backend de memoria</td></tr>
+</tbody>
+</table>
+</div>
+<p>Los plugins de herramientas usan un almacén nuevo en cada llamada (sin estado). Los plugins de canal y memoria mantienen un almacén persistente protegido por un mutex asíncrono durante toda la vida del plugin.</p>
+<p>Los plugins de herramientas se descubren y registran de extremo a extremo: el runtime recorre el homólogo de herramientas de <code>channel_plugin_details()</code> y construye un <code>WasmTool</code> para cada uno. El adaptador de host del canal (<code>WasmChannel</code>, su gating <code>wasi:http</code>, el jail <code>configure</code> y la cola <code>inbound</code> alimentada por el host) está completo y cubierto por pruebas unitarias, y <code>PluginHost::channel_plugin_details()</code> expone los plugins de canal respaldados por wasm para registrarlos. Integrarlos en el orquestador en ejecución (el bucle de descubrimiento a canal en el runtime, más un listener de host por proveedor que drena su transporte hacia la cola <code>inbound</code> de cada canal) es la seam restante y se incorpora con el cambio de registro de canales del runtime, no con este fragmento del host. El puente de memoria (<code>WasmMemory</code>) está en la misma situación un paso antes: el adaptador implementa el trait completo <code>Memory</code> frente al world <code>memory-plugin</code>, pero el host aún no expone un homólogo de memoria a <code>channel_plugin_details()</code> y el runtime aún no construye un <code>WasmMemory</code> como backend configurable.</p>
+<h2 id="estructura-del-complemento"><a class="header" href="#estructura-del-complemento">Estructura del complemento</a></h2>
+<p>Un plugin es un directorio que contiene:</p>
+<pre><code>my-plugin/
+  manifest.toml    # Plugin metadata and permissions
+  plugin.wasm      # Compiled WASM module (optional for skill-only plugins)
+</code></pre>
+<p>Los complementos se descubren desde <code>~/.zeroclaw/plugins/</code> (configurable mediante <code>plugins.plugins_dir</code> en la configuración).</p>
+<h2 id="búsqueda-e-instalación-en-el-registro"><a class="header" href="#búsqueda-e-instalación-en-el-registro">Búsqueda e instalación en el registro</a></h2>
+<p>La ruta local de instalación del complemento sigue siendo la fuente de verdad para los complementos instalados. Un registro es solo un índice JSON usado en tiempo de ejecución del comando para descubrir y descargar un archivo del complemento:</p>
+<pre><code class="language-bash">zeroclaw plugin search calendar
+zeroclaw plugin install team-calendar
+zeroclaw plugin install team-calendar@0.2.0
+zeroclaw plugin search calendar --registry https://example.invalid/registry.json
+zeroclaw plugin install team-calendar --registry https://example.invalid/registry.json
+</code></pre>
+<p><code>zeroclaw plugin search</code> obtiene metadatos del registro y compara la consulta con los nombres y descripciones de los plugins. No instala, habilita ni ejecuta código de plugin.</p>
+<p><code>zeroclaw plugin install &lt;name&gt;</code> resuelve el nombre desde el registro, descarga el archivo zip seleccionado, verifica el resumen SHA-256 opcional, extrae el archivo de forma segura y luego entrega el directorio del plugin extraído a la ruta existente <code>PluginHost::install</code>. Las instalaciones desde rutas locales no cambian:</p>
+<p>Cuando no hay una versión fijada, ZeroClaw elige la última entrada coincidente en el índice del registro, por lo que los publicadores del registro deben ordenar intencionalmente los nombres repetidos.</p>
+<pre><code class="language-bash">zeroclaw plugin install ./my-plugin
+zeroclaw plugin install ./my-plugin/manifest.toml
+</code></pre>
+<p>La URL predeterminada del registro es:</p>
+<p>https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw-plugins/main/registry.jsonPara registros privados o en etapas, usa <code>--registry &lt;url&gt;</code> por comando o establece <code>ZEROCLAW_PLUGIN_REGISTRY_URL</code>.</p>
+<p>Las entradas del registro usan esta estructura:</p>
+<pre><code class="language-json">{
+  plugins: [
+    {
+      "nombre": "team-calendar",
+      versión: 0.8.3,
+      "descripción": "Programar reuniones en un calendario de equipo",
+      author: "Example Team",
+      capabilities: [herramienta],
+      "url": "https://example.invalid/team-calendar-0.2.0.zip",
+      "sha256": "sha256:&lt;hex digest del zip&gt;"
+    }
+  ]
+}
+</code></pre>
+<p>El archivo debe contener o bien un <code>manifest.toml</code> en la raíz o un único directorio de complemento anidado que contenga <code>manifest.toml</code>. Los archivos con rutas de traversal, rutas absolutas, rutas de Windows con prefijo de unidad o más de un manifest se rechazan antes de la instalación. Las descargas tienen un límite mientras se transmiten, por lo que un servidor sin <code>Content-Length</code> no puede obligar a ZeroClaw a almacenar en búfer un archivo comprimido de tamaño excesivo. La extracción también tiene un límite, de modo que un archivo comprimido no puede expandirse sin límite en el área temporal de instalación.</p>
+<p>La búsqueda es descubrimiento no autenticado. La instalación es el límite de seguridad: las instalaciones desde el registro usan la política de firma de plugins configurada y las claves de editor de confianza, igual que las instalaciones locales de plugins mediante <code>PluginHost::install</code>.</p>
+<h3 id="estructura-de-plugin-solo-de-habilidades-paquete-markdown"><a class="header" href="#estructura-de-plugin-solo-de-habilidades-paquete-markdown">Estructura de plugin solo de habilidades (paquete markdown)</a></h3>
+<p>Un plugin cuya única capacidad es <code>skill</code> incluye skills en un directorio <code>skills/</code> con formato <a href="https://agentskills.io">agentskills.io</a> y omite <code>wasm_path</code>:</p>
+<pre><code>my-toolkit/
+  manifest.toml              # declares the skill capability, no wasm_path
+  README.md                  # optional bundle-level overview
+  skills/
+    design-review/
+      SKILL.md
+      scripts/
+      references/
+    code-review/
+      SKILL.md
+    data-analysis/
+      SKILL.md
+      references/
+</code></pre>
+<p>Cada <code>SKILL.md</code> debe incluir frontmatter YAML con los campos <code>name</code> y <code>description</code>; el runtime rechaza los paquetes cuyas skills omitan cualquiera de los dos en el momento del descubrimiento, en lugar de en la primera invocación. Las skills se registran con IDs con espacio de nombres de plugin con el formato <code>plugin:&lt;plugin-name&gt;/&lt;skill-name&gt;</code> (p. ej. <code>plugin:my-toolkit/design-review</code>) para evitar colisiones con las skills creadas por el usuario y entre paquetes.</p>
+<h2 id="formato-del-manifiesto"><a class="header" href="#formato-del-manifiesto">Formato del manifiesto</a></h2>
+<h3 id="capacidades"><a class="header" href="#capacidades">Capacidades</a></h3>
+<p><code>capabilities</code> es una lista no vacía de valores <code>PluginCapability</code>, definida en <code>crates/zeroclaw-plugins/src/lib.rs</code> (serializada en <code>snake_case</code>). Cada valor selecciona el mundo WIT que exporta el plugin (<code>tool</code>, <code>channel</code>, <code>memory</code>), nombra un backend de observabilidad (<code>observer</code>) o marca un paquete de habilidades solo en markdown (<code>skill</code>). Consulta la enumeración para el conjunto canónico; es la fuente de verdad y esta página no lo vuelve a enunciar.</p>
+<p>Un manifiesto debe declarar al menos una capacidad. <code>wasm_path</code> es obligatorio para cada capacidad excepto en un plugin cuya única capacidad sea <code>skill</code>, que no lleva ninguna carga útil de WASM y se rechaza en el descubrimiento si omite un bundle válido <code>skills/</code> (<code>validate_manifest_shape</code> en <code>host.rs</code>).</p>
+<h3 id="permisos"><a class="header" href="#permisos">Permisos</a></h3>
+<p><code>permissions</code> es una lista de valores de <code>PluginPermission</code>, también definidos en <code>crates/zeroclaw-plugins/src/lib.rs</code>. Lee el enum para el conjunto canónico.</p>
+<p>Tenga en cuenta la diferencia entre lo declarado y lo aplicado: en el host del componente hoy <code>config_read</code> y <code>http_client</code> tienen efecto de comportamiento. <code>runtime.rs</code> pasa la sección de configuración resuelta de un plugin de herramienta a <code>execute</code> solo cuando el manifiesto concede <code>config_read</code>, y elimina cualquier <code>__config</code> suministrado por el llamador para que la sección no pueda suplantarse; un plugin de canal recibe la misma sección a través de su export <code>configure</code> bajo la misma regla. <code>http_client</code> adjunta un contexto saliente <code>wasi:http</code> al store del plugin y enlaza la interfaz <code>wasi:http</code>, de modo que un plugin con ese permiso puede realizar solicitudes HTTP y uno sin él no tiene ninguna superficie de red. Las variantes restantes (<code>file_read</code>, <code>file_write</code>, <code>memory_read</code>, <code>memory_write</code>) son aceptadas por el esquema del manifiesto, pero aún no están conectadas a un import del host: declararlas no concede nada por sí solo. Reservan los nombres para las funciones del host que las validarán (véase Imports del host más abajo).</p>
+<h2 id="interfaces-wit"><a class="header" href="#interfaces-wit">Interfaces WIT</a></h2>
+<p>El contrato del complemento es el conjunto de archivos WIT en <code>wit/v0/</code>, paquete <code>zeroclaw:plugin@0.1.0</code>. Cada elemento está detrás de <code>@unstable(feature = plugins-wit-v0)</code> hasta que el paquete se estabilice; consulte <code>wit/VERSIONING.md</code> para las reglas de compatibilidad. Las interfaces a continuación son un resumen orientativo; los archivos <code>.wit</code> son la fuente de autoridad para las firmas exactas.</p>
+<h3 id="mundos"><a class="header" href="#mundos">Mundos</a></h3>
+<p><code>wit/v0/</code> define tres mundos, vinculados por <code>bindgen!</code> en <code>component.rs</code>. Cada uno importa <code>logging</code> (host) y exporta <code>plugin-info</code> además de su interfaz principal: <code>tool-plugin</code> exporta <code>tool</code>, <code>channel-plugin</code> exporta <code>channel</code>, <code>memory-plugin</code> exporta <code>memory</code>. Los exports requeridos (sin valor predeterminado) de cada mundo se enumeran en el comentario de documentación del mundo en su archivo <code>.wit</code>.</p>
+<h3 id="tool-interfaz"><a class="header" href="#tool-interfaz"><code>tool</code> interfaz</a></h3>
+<p><code>wit/v0/tool.wit</code> define la interfaz de una sola herramienta. El host llama a <code>name</code>, <code>description</code> y <code>parameters-schema</code> una vez al cargar, y luego despacha <code>execute</code> por cada invocación:</p>
+<pre><code class="language-wit">record tool-result {
+    success: bool,
+    output: string,
+    error: option&lt;string&gt;,
+}
+
+name: func() -&gt; string;
+description: func() -&gt; string;
+parameters-schema: func() -&gt; json-string;
+execute: func(args: json-string) -&gt; result&lt;tool-result, string&gt;;
+</code></pre>
+<p><code>parameters-schema</code> devuelve una cadena de JSON Schema presentada al LLM para la invocación de herramientas. <code>execute</code> recibe argumentos codificados en JSON que coinciden con ese esquema y devuelve un <code>tool-result</code> o una cadena de error. <code>json-string</code> es un alias de tipo <code>string</code> de <code>wit/v0/types.wit</code>; los llamadores producen JSON válido y los receptores lo analizan.</p>
+<h3 id="channel-e-memory-interfaces"><a class="header" href="#channel-e-memory-interfaces"><code>channel</code> e <code>memory</code> interfaces</a></h3>
+<p><code>wit/v0/channel.wit</code> y <code>wit/v0/memory.wit</code> definen superficies controladas por capacidades. El host llama a <code>get-channel-capabilities</code> / <code>get-memory-capabilities</code> una vez al cargar, y para cada indicador no establecido usa el valor por defecto del trait de Rust en lugar de llamar al plugin. Un plugin aún debe exportar cada función (basta con un stub que devuelva el valor por defecto documentado); el host simplemente nunca llama a las que tienen el indicador ausente. El valor por defecto al que se resuelve cada indicador no establecido está documentado en línea en el WIT junto a los indicadores <code>*-capabilities</code>, que son la fuente de verdad tanto para el conjunto de indicadores como para sus valores por defecto.</p>
+<h3 id="banderas-de-capacidad"><a class="header" href="#banderas-de-capacidad">Banderas de capacidad</a></h3>
+<p>Los métodos opcionales se publicitan mediante <code>flags channel-capabilities</code> y <code>flags memory-capabilities</code>. Como las flags son una máscara de bits, se pueden agregar nuevos métodos opcionales a un paquete <code>vN/</code> sin un cambio incompatible, junto con una nueva función <code>@since</code>. Quitar o renombrar una flag, función, campo o caso de variante es incompatible y requiere un nuevo directorio <code>vN+1/</code>.</p>
+<h2 id="importaciones-de-host"><a class="header" href="#importaciones-de-host">Importaciones de host</a></h2>
+<p>Las funciones de host son importadas por el plugin y proporcionadas por el runtime. El linker de cada world conecta <code>logging</code> (mediante la implementación de host en <code>component_logging.rs</code>, enlazada junto con <code>add_wasi</code> en <code>component.rs</code>). El world <code>channel-plugin</code> también importa <code>inbound</code>, la cola de mensajes alimentada por el host de la que un canal drena desde <code>poll-message</code>. El <code>wasi:http</code> saliente se enlaza encima para cualquier plugin cuyo manifiesto conceda <code>http_client</code> (<code>add_wasi_http</code> en <code>component.rs</code>), con una restricción para que el contexto y la interfaz enlazada coincidan siempre. Los permisos de sistema de archivos y acceso a memoria permanecen inertes: las funciones de host que los restringirían aún no están conectadas al linker. La autoridad ambiental de un plugin es el contexto WASI (sin preopens, sin red ambiental) más exactamente las importaciones de host que su world y sus permisos conectan.</p>
+<h3 id="inbound"><a class="header" href="#inbound"><code>inbound</code></a></h3>
+<p><code>wit/v0/inbound.wit</code> es importado por el mundo <code>channel-plugin</code>. Un plugin de canal se ejecuta sin un listener propio, así que el host ejecuta el listener (un servidor webhook, un túnel del proveedor, un cliente de sondeo) y encola cada mensaje recibido. El plugin vacía la cola desde su export <code>poll-message</code> llamando a <code>inbound-poll</code>, con <code>inbound-pending</code> disponible para vaciar en lotes:</p>
+<pre><code class="language-wit">inbound-poll: func() -&gt; option&lt;host-inbound-message&gt;;
+inbound-pending: func() -&gt; u32;
+</code></pre>
+<p>El lado del host posee un <code>InboundQueue</code> por canal; <code>WasmChannel::inbound</code> entrega una clonación a la tarea de escucha para que el tráfico en cola sea visible para el vaciado del complemento.</p>
+<h3 id="logging"><a class="header" href="#logging"><code>logging</code></a></h3>
+<p><code>wit/v0/logging.wit</code> es importado por los tres mundos. Los plugins llaman a <code>log-record</code> para emitir eventos estructurados de vuelta al host:</p>
+<pre><code class="language-wit">log-record: func(level: log-level, event: plugin-event);
+</code></pre>
+<p>La llamada es de tipo fire-and-forget: no devuelve nada y el host (<code>component_logging.rs</code>) absorbe todos los errores, así que una escritura de registro fallida nunca puede provocar un fallo en la ejecución del plugin. <code>plugin-action</code> y <code>plugin-outcome</code> reflejan las taxonomías cerradas <code>Action</code> / <code>EventOutcome</code> de <code>zeroclaw-log</code>; a propósito no existe una variante de escape. No llames <code>wasi:logging</code> directamente, los eventos del plugin se formatearían de manera inconsistente y no llegarían a todos los destinos a los que escribe <code>zeroclaw_log</code>.</p>
+<h3 id="configuración-por-plugin-__config"><a class="header" href="#configuración-por-plugin-__config">Configuración por plugin (<code>__config</code>)</a></h3>
+<p><strong>Permiso:</strong> <code>config_read</code></p>
+<p>Un plugin no lee variables de entorno del proceso. Para los plugins de herramienta, el host resuelve la propia sección de configuración del plugin (el mapa <code>config</code> por entrada bajo el esquema <code>plugins.entries</code>) y la inyecta en la entrada de <code>execute</code> bajo la clave reservada <code>__config</code>, pero solo cuando el manifiesto concede <code>config_read</code>:</p>
+<pre><code class="language-json">{
+  "prompt": "una puesta de sol",
+  "__config": { "api_key": "...", "base_url": "..." }
+}
+</code></pre>
+<p><code>runtime.rs</code> elimina cualquier <code>__config</code> proporcionado por el llamador antes de inyectar la sección resuelta, por lo que la sección no puede ser suplantada, y la omite por completo cuando falta el permiso. Los operadores rellenan esta sección mediante las superficies de configuración anteriores (zerocode, la CLI, el gateway) en lugar de editar un archivo manualmente, con una excepción actual: un plugin recién instalado aún no tiene ninguna entrada <code>plugins.entries</code>, y <code>config set</code> no puede materializar una entrada de clave natural ausente, así que la primera entrada debe añadirse al archivo a mano (seguido en el issue #8636). Las claves de la sección son las que declare el esquema del plugin. El campo está marcado como secreto, así que los valores escritos por CLI se cifran en reposo bajo el adyacente <code>.secret_key</code>; los valores en texto plano escritos a mano también se aceptan al cargar. Un plugin solo ve su propia sección.</p>
+<h2 id="host-de-componentes-wasi"><a class="header" href="#host-de-componentes-wasi">Host de componentes WASI</a></h2>
+<p>El host (<code>crates/zeroclaw-plugins/src/component.rs</code>) compila e instancia componentes contra un único <code>wasmtime::Engine</code> asíncrono. La forma en que se carga un archivo <code>.wasm</code> depende del backend de ejecución de la compilación:</p>
+<ul>
+<li><strong><code>plugins-wasm-cranelift</code></strong>: hay un backend JIT presente, así que <code>load_component</code> compila un componente <code>.wasm</code> al cargarlo mediante <code>Component::from_file</code>.</li>
+<li><strong>Sin backend JIT</strong> (<code>plugins-wasm-pulley</code> o solo en tiempo de ejecución): no hay compilador en el binario, por lo que <code>load_component</code> deserializa el archivo directamente mediante <code>Component::deserialize_file</code>, tratándolo como un <code>.cwasm</code> precompilado producido por una wasmtime compatible. Un artefacto no coincidente es rechazado por la comprobación de versión de deserialize.</li>
+</ul>
+<p>Ambas funciones del backend incorporan <code>plugins-wasmtime</code>; la ruta de carga se basa en si el compilador cranelift está en la compilación, no en pulley.</p>
+<h3 id="límites-de-ejecución-por-llamada"><a class="header" href="#límites-de-ejecución-por-llamada">Límites de ejecución por llamada</a></h3>
+<p>Cada llamada de plugin se ejecuta bajo límites de recursos por llamada que el host aplica al store. El motor habilita la medición de fuel, y a cada llamada se le asigna un presupuesto nuevo de fuel para que un componente desbocado o malicioso haga trap en lugar de colgar el host. Un techo de <code>StoreLimits</code> limita la memoria lineal, los elementos de tabla y el número de instancias. El world de la herramienta recibe un store nuevo por cada ejecución; el canal warm y los stores de memoria se reabastecen antes de cada llamada para que un plugin de larga duración reciba un presupuesto nuevo en lugar de agotarlo a lo largo de su vida útil.</p>
+<p>Los cuatro límites son ajustables por el operador y cada valor se valida como distinto de cero: <code>plugins.limits.call_fuel</code> (valor predeterminado 1.000.000.000 unidades de instrucciones), <code>plugins.limits.max_memory_mb</code> (valor predeterminado 256), <code>plugins.limits.max_table_elements</code> (valor predeterminado 100.000) y <code>plugins.limits.max_instances</code> (valor predeterminado 64). Un almacén solo puede construirse con límites explícitos, por lo que ninguna ruta de carga puede construir un plugin sin sandbox. Los campos canónicos y los valores predeterminados están en la <a href="../reference/index.html">Referencia de Configuración</a>.</p>
+<h3 id="espacio-de-direcciones-de-32-bits-wasip2-es-wasm32"><a class="header" href="#espacio-de-direcciones-de-32-bits-wasip2-es-wasm32">espacio de direcciones de 32 bits (wasip2 es wasm32)</a></h3>
+<p>El target del plugin es <code>wasm32-wasip2</code>, y el motor host está compilado con la medición de fuel habilitada (<code>Config::consume_fuel(true)</code>) sin <code>wasm_memory64</code>. El límite del plugin es un formato fijo de 32 bits, y eso tiene consecuencias que conviene decir claramente:</p>
+<ul>
+<li><strong>El espacio de direcciones del invitado es de 32 bits.</strong> Un plugin se ejecuta en una memoria lineal wasm32. Los valores grandes cruzan el límite por valor: <code>media-attachment</code> de un plugin de canal transporta sus bytes completos como un <code>list&lt;u8&gt;</code>, y <code>wit/v0/channel.wit</code> ya señala que esto puede ser de varios megabytes y deja un modelo de identificador de recurso para una revisión futura. Dentro de ese espacio de 32 bits, el host aplica un límite explícito de memoria por almacén desde <code>plugins.limits.max_memory_mb</code> (predeterminado 256), así que un invitado queda limitado por el menor entre el espacio de direcciones wasm32 y ese límite configurado por ZeroClaw.</li>
+<li><strong>La ABI de componentes reduce los desplazamientos a 32 bits independientemente del tamaño de palabra del host.</strong> Incluso en un host de 64 bits, los desplazamientos de lista y cadena en la ABI canónica son <code>i32</code>. <code>memory64</code> amplía el direccionamiento de memoria lineal de un invitado, no la ABI canónica del modelo de componentes, por lo que habilitarlo no haría que los campos a nivel de WIT fueran de 64 bits.</li>
+<li><strong>No existe ningún objetivo wasip2 de 64 bits contra el que enlazar.</strong> <code>wasm32-wasip2</code> es el único objetivo de WASI Preview 2 en rustc y LLVM hoy; un plugin no puede compilarse como un componente p2 de 64 bits, así que no hay nada que el host pueda cargar aunque el motor habilitara <code>memory64</code>.</li>
+</ul>
+<p>Esta es una restricción de la cadena de herramientas upstream, no una limitación del host que un flag en este repo pueda levantar. Cuando un target p2 de 64 bits y una ABI de componente más amplia lleguen upstream, la costura <code>bindgen!</code> se regenerará contra ellos y los anchos de campo se revisarán en el WIT dentro de la ventana <code>wit/VERSIONING.md</code>. Hasta entonces, trate el límite del plugin como de 32 bits por construcción.</p>
+<h2 id="firmas"><a class="header" href="#firmas">Firmas</a></h2>
+<p>Los manifiestos de plugin pueden llevar una firma Ed25519 (<code>crates/zeroclaw-plugins/src/signature.rs</code>). La firma está codificada en base64url sobre los bytes canónicos del manifiesto (el TOML con las líneas <code>signature</code> y <code>publisher_key</code> eliminadas); la clave pública del publicador está codificada en hexadecimal. El host aplica uno de tres modos de <code>plugins.security.signature_mode</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Modo</th><th>Plugin sin firmar</th><th>Firma no confiable o no válida</th></tr>
+</thead>
+<tbody>
+<tr><td><code>strict</code></td><td>rechazado</td><td>rechazado</td></tr>
+<tr><td><code>permissive</code></td><td>cargado con una advertencia</td><td>cargado con una advertencia</td></tr>
+<tr><td><code>disabled</code></td><td>cargado</td><td>no verificado</td></tr>
+</tbody>
+</table>
+</div>
+<p>La verificación se ejecuta tanto en discovery como en install. Discovery omite un plugin que no cumple su política en lugar de abortar todo el host; install devuelve el error.</p>
+<h2 id="escribir-un-plugin-en-rust"><a class="header" href="#escribir-un-plugin-en-rust">Escribir un plugin en Rust</a></h2>
+<p>Un plugin es un crate <code>cdylib</code> que apunta al modelo de componentes. Genera los bindings de invitado a partir del mismo paquete <code>wit/v0</code> que usa el host, implementa el world exportado y compila para <code>wasm32-wasip2</code>. Para ver los recorridos completos desde un crate vacío hasta un plugin instalado, consulta las <a href="../plugins/index.html">guías de plugins</a>; las notas a continuación cubren la compilación y la instalación.</p>
+<h3 id="construyendo"><a class="header" href="#construyendo">Construyendo</a></h3>
+<div class="os-tabs-src">
+<h4 id="sh"><a class="header" href="#sh">sh</a></h4>
+<pre><code class="language-sh"># Instala el destino de WASI Preview 2 (una vez)
+rustup target add wasm32-wasip2
+
+# Compilar el componente
+cargo build --target wasm32-wasip2 --release
+</code></pre>
+</div>
+
+<p>El componente de salida está en <code>target/wasm32-wasip2/release/&lt;crate_name&gt;.wasm</code>. Cópialo junto a tu <code>manifest.toml</code>. Para una compilación del host solo en tiempo de ejecución sin backend JIT, precompila el componente a un <code>.cwasm</code> con un wasmtime compatible y distribúyelo en su lugar, ya que ese tipo de host deserializa en vez de compilar al cargarse.</p>
+<p>El fixture de referencia no está confirmado en el árbol (es un artefacto de compilación, no código fuente). Cuando <code>crates/zeroclaw-plugins/tests/fixtures/reference-plugin.wasm</code> se aprovisiona mediante una compilación limpia <code>cargo build --target wasm32-wasip2</code> del plugin de referencia publicado, <code>reference_plugin.rs</code> y <code>reference_plugin_e2e.rs</code> lo cargan a través de las mismas rutas de <code>PluginHost</code> y de resolución de configuración que ejecuta el daemon. Cuando el artefacto está ausente, esas pruebas se omiten.</p>
+<h3 id="instalando"><a class="header" href="#instalando">Instalando</a></h3>
+<div class="os-tabs-src">
+<h4 id="sh-1"><a class="header" href="#sh-1">sh</a></h4>
+<pre><code class="language-sh"># Copiar al directorio del complemento
+zeroclaw plugin install /path/to/my-plugin/
+
+# O manualmente
+cp -r my-plugin/ ~/.zeroclaw/plugins/my-plugin/
+</code></pre>
+</div>
+
+<h2 id="configuración"><a class="header" href="#configuración">Configuración</a></h2>
+<p>Rara vez editas TOML a mano para configurar un plugin. ZeroClaw expone el esquema de configuración del plugin a través de todas las superficies, y cada superficie escribe el mismo estado subyacente mediante el espejo del esquema (la única excepción actual: sembrar una entrada nueva <code>plugins.entries</code> de un plugin, según la nota bajo Configuración por plugin). Elige la que mejor encaje en el momento:</p>
+<ul>
+<li><strong>zerocode</strong> el editor de configuración interactivo. Ve a la sección de plugins y establece campos con validación y ayuda en línea.</li>
+<li><strong>La CLI</strong> para el ciclo de vida de los plugins. <code>zeroclaw plugin</code> proporciona <code>list</code>, <code>search</code>, <code>install</code>, <code>remove</code>, <code>info</code> y <code>migrate</code>. <code>zeroclaw config set</code> ajusta campos individuales de la configuración del plugin.</li>
+<li><strong>La puerta de enlace web</strong> para una vista del panel. <code>GET /api/plugins</code> informa de los plugins cargados y de si el sistema está habilitado.</li>
+<li><strong>El esquema del plugin</strong>, si eres el autor del plugin. Tu superficie de configuración está definida por el esquema, no por pedir a los operadores que escriban TOML. El host inyecta una sección de configuración definida por el autor en el plugin en tiempo de llamada (consulta Configuración por plugin), así que lo que rellena un operador es lo que declare tu esquema.</li>
+</ul>
+<p>El espejo del esquema es lo que hace que esto funcione: los tipos de configuración de plugin en <code>crates/zeroclaw-config/src/schema.rs</code> llevan <code>#[prefix = "plugins"]</code>, <code>#[prefix = "plugins.entries"]</code> y <code>#[prefix = "plugins.security"]</code>, y la derivación <code>Configurable</code> convierte cada campo con prefijo en una ruta que todas las superficies leen y escriben. Los campos secretos (el mapa <code>config</code> de una entrada de plugin está marcado <code>#[secret]</code>) se cifran en reposo bajo la <code>.secret_key</code> adyacente. Los campos canónicos, los valores predeterminados y los valores de <code>signature_mode</code> viven en la <a href="../reference/index.html">Referencia de configuración</a>; ese esquema es la fuente de verdad, no esta página.</p>
+<h3 id="compilar-funcionalidades"><a class="header" href="#compilar-funcionalidades">Compilar funcionalidades</a></h3>
+<p>El host de complementos es una opción de activación en tiempo de compilación. Las características a nivel de binario en el <code>Cargo.toml</code> del espacio de trabajo seleccionan si los complementos se incluyen en la compilación en absoluto y qué backend de ejecución se distribuye:</p>
+<ul>
+<li><code>plugins-wasm</code> es el paraguas que incorpora el host de complementos y su integración en tiempo de ejecución dentro del binario. Es <strong>necesario</strong>: las características de backend que aparecen abajo seleccionan un motor de ejecución, pero no implican el paraguas, así que compilar solo con una característica de backend se completa con éxito y, silenciosamente, produce un binario sin el subcomando <code>plugin</code>. Pasa siempre <code>plugins-wasm</code> junto con el backend que elijas, por ejemplo, <code>--features plugins-wasm,plugins-wasm-cranelift</code>.</li>
+<li><code>plugins-wasm-runtime-only</code> es el más pequeño y el más rápido de iniciar: no hay JIT, por lo que los componentes se deserializan desde un <code>.cwasm</code> precompilado.</li>
+<li><code>plugins-wasm-cranelift</code> añade el JIT de Cranelift, por lo que un componente <code>.wasm</code> se compila al cargarse.</li>
+<li><code>plugins-wasm-pulley</code> es el más portátil y admite compilación en objetivos que Cranelift no cubre.</li>
+</ul>
+<p>Estos delegan en las características del crate <code>zeroclaw-plugins</code> (<code>plugins-wasmtime</code>, <code>plugins-wasm-cranelift</code>, <code>plugins-wasm-pulley</code>) que conectan <code>wasmtime</code>. La ruta de carga se basa en si el compilador Cranelift está en la compilación, como se describe en WASI Component Host. Lee los comentarios de las características en el <code>Cargo.toml</code> del espacio de trabajo para las descripciones autorizadas.</p>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../developing/tool-inventory.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../plugins/index.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../developing/tool-inventory.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../plugins/index.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-a0b12cfe.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../../../_shared/theme/version-selector.js"></script>
+        <script src="../../../_shared/theme/lang-switcher.js"></script>
+        <script src="../../../_shared/theme/pc-enhance.js"></script>
+        <script src="../../../_shared/mermaid.min.js"></script>
+        <script src="../../../_shared/mermaid-init.js"></script>
+
+
+
+    </div>
+    </body>
+</html>
