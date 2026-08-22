@@ -5813,7 +5813,7 @@ pub struct ToolFilterGroup {
 }
 
 /// OpenAI Whisper STT model_provider configuration (`[transcription.openai]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "transcription.openai"]
 pub struct OpenAiSttConfig {
@@ -5826,6 +5826,15 @@ pub struct OpenAiSttConfig {
     /// Whisper model name (default: "whisper-1").
     #[serde(default = "default_openai_stt_model")]
     pub model: String,
+}
+
+impl Default for OpenAiSttConfig {
+    fn default() -> Self {
+        Self {
+            api_key: None,
+            model: "whisper-1".to_string(),
+        }
+    }
 }
 
 /// Deepgram STT model_provider configuration (`[transcription.deepgram]`).
@@ -20062,6 +20071,15 @@ impl Config {
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
 
+            // Native STT env bridge: map TRANSCRIPTION_API_KEY / OPENAI_API_KEY
+            // into typed config when no explicit STT provider intent exists.
+            if let Some(bridge_path) = crate::env_overrides::apply_native_stt_bridge(&mut config) {
+                config.env_overridden_paths.insert(bridge_path.clone());
+                config
+                    .pre_override_snapshots
+                    .insert(bridge_path, String::new());
+            }
+
             // Validation must NOT prevent the daemon from booting. If
             // it did, a single broken agent reference would lock the
             // operator out of `/config` — the only place they can fix
@@ -20105,6 +20123,14 @@ impl Config {
             let applied = crate::env_overrides::apply_env_overrides(&mut config)?;
             config.env_overridden_paths = applied.paths;
             config.pre_override_snapshots = applied.snapshots;
+
+            // Native STT env bridge (fresh-init branch).
+            if let Some(bridge_path) = crate::env_overrides::apply_native_stt_bridge(&mut config) {
+                config.env_overridden_paths.insert(bridge_path.clone());
+                config
+                    .pre_override_snapshots
+                    .insert(bridge_path, String::new());
+            }
 
             // Same boot-resilience as the load-existing branch above:
             // a fresh-init config can't realistically fail validation,
