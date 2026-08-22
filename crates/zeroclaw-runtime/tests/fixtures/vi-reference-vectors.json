@@ -1,0 +1,149 @@
+{
+  "_README": "Expected values produced by the agent-intent/verifiable-intent reference implementation, not by ZeroClaw. See the generator named below.",
+  "reference_commit": "356c29635f1c44df7de02edb58699ca9f29bece6",
+  "generator": "scripts/dev/generate-vi-reference-vectors.py",
+  "disclosures": [
+    {
+      "case": "object_scalar",
+      "salt": "AAAAAAAAAAAAAAAAAAAAAA",
+      "claim_name": "checkout_mandate",
+      "claim_value": {
+        "vct": "x"
+      },
+      "disclosure": "WyJBQUFBQUFBQUFBQUFBQUFBQUFBQUFBIiwiY2hlY2tvdXRfbWFuZGF0ZSIseyJ2Y3QiOiJ4In1d",
+      "hash": "hrPPJ7L3t5KDOjA04PIL08z0_6UyW8finU53nPf-sCU"
+    },
+    {
+      "case": "object_nested",
+      "salt": "AQEBAQEBAQEBAQEBAQEBAQ",
+      "claim_name": "merchant",
+      "claim_value": {
+        "id": "m-1",
+        "name": "Açaí & Co",
+        "tags": [
+          "a",
+          "b"
+        ]
+      },
+      "disclosure": "WyJBUUVCQVFFQkFRRUJBUUVCQVFFQkFRIiwibWVyY2hhbnQiLHsiaWQiOiJtLTEiLCJuYW1lIjoiQVx1MDBlN2FcdTAwZWQgJiBDbyIsInRhZ3MiOlsiYSIsImIiXX1d",
+      "hash": "DtUp7al5Oio0VzxNUiMl-tmR_trS211Gn7isujAqESs"
+    },
+    {
+      "case": "object_number",
+      "salt": "AgICAgICAgICAgICAgICAg",
+      "claim_name": "amount",
+      "claim_value": 1250,
+      "disclosure": "WyJBZ0lDQWdJQ0FnSUNBZ0lDQWdJQ0FnIiwiYW1vdW50IiwxMjUwXQ",
+      "hash": "PJRcZlv9NMTksS2C3yzJAZUd01ifjukN-c9ssgxm9vo"
+    },
+    {
+      "case": "object_null",
+      "salt": "AwMDAwMDAwMDAwMDAwMDAw",
+      "claim_name": "note",
+      "claim_value": null,
+      "disclosure": "WyJBd01EQXdNREF3TURBd01EQXdNREF3Iiwibm90ZSIsbnVsbF0",
+      "hash": "ayDLg8-tixB_IUE0YSXxmMhtRtU_DHzwnQ-Cmw1nZzk"
+    },
+    {
+      "case": "array_element",
+      "salt": "BAQEBAQEBAQEBAQEBAQEBA",
+      "claim_name": null,
+      "claim_value": {
+        "id": "sku-1",
+        "quantity": 2
+      },
+      "disclosure": "WyJCQVFFQkFRRUJBUUVCQVFFQkFRRUJBIix7ImlkIjoic2t1LTEiLCJxdWFudGl0eSI6Mn1d",
+      "hash": "CrcjrJbYyI0DzH4C7BVCgbsFad8pGMaMkimsRwczq2w"
+    },
+    {
+      "case": "array_element_scalar",
+      "salt": "BQUFBQUFBQUFBQUFBQUFBQ",
+      "claim_name": null,
+      "claim_value": "plain-string",
+      "disclosure": "WyJCUVVGQlFVRkJRVUZCUVVGQlFVRkJRIiwicGxhaW4tc3RyaW5nIl0",
+      "hash": "yyGvXEBiTKt9-Kn2N7OryDx-gvKvNNj9GRmcv0bfXig"
+    }
+  ],
+  "sd_jwt": {
+    "_note": "`serialized` carries a real ECDSA signature and is therefore a one-time capture; every other field here is deterministic. Re-running the generator changes this one string and nothing else.",
+    "public_jwk": {
+      "kty": "EC",
+      "crv": "P-256",
+      "x": "5IgT5lYhm0CQwoKgIPQOB7Th79YKPdF0kqFmfFdY7ls",
+      "y": "dg-bmxyEC09PY6tAQ8BTfKKbNRLDLlDlb15OjULQ0x4"
+    },
+    "header": {
+      "alg": "ES256",
+      "typ": "kb-sd-jwt"
+    },
+    "payload": {
+      "iss": "https://issuer.example",
+      "iat": 1750000000,
+      "_sd_alg": "sha-256",
+      "_sd": [
+        "5Da3MkzHfLtbBuMpvvjBx5OgBJSlGnP-GUGFPF58t70",
+        "PAeBSxZseWtT1BV-LBOsYtCgv8Y2P-MePdD-t7BQYWE",
+        "8D_xkzkpu7V6LRFR3RWt5xt1N65ZqS16AIow3g1TnAM",
+        "nib6GQWiWDVI_fgvyzVRMYWnnd7C2K9gWkO1kkY8amM"
+      ],
+      "delegate_payload": [
+        {
+          "...": "r7icOg2cnXxyYvDdFInsR6_In_o6GHIL14ZE6yFHxmg"
+        },
+        {
+          "...": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        },
+        {
+          "literal": "not-a-reference"
+        },
+        "bare-string-entry"
+      ]
+    },
+    "presented_disclosures": [
+      "WyJFQkFRRUJBUUVCQVFFQkFRRUJBUUVBIiwiY2hlY2tvdXRfbWFuZGF0ZSIseyJ2Y3QiOiJtYW5kYXRlLmNoZWNrb3V0Lm9wZW4ifV0",
+      "WyJFUkVSRVJFUkVSRVJFUkVSRVJFUkVRIiwicGF5bWVudF9tYW5kYXRlIix7InZjdCI6Im1hbmRhdGUucGF5bWVudCJ9XQ",
+      "WyJFaElTRWhJU0VoSVNFaElTRWhJU0VnIix7ImlkIjoiYWdlbnQtMSIsInJvbGUiOiJkZWxlZ2F0ZSJ9XQ",
+      "WyJGQlFVRkJRVUZCUVVGQlFVRkJRVUZBIiwiYXJyYXktZWxlbWVudC1saXN0ZWQtaW4tc2QiXQ"
+    ],
+    "serialized": "eyJhbGciOiJFUzI1NiIsInR5cCI6ImtiLXNkLWp3dCJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIiwiaWF0IjoxNzUwMDAwMDAwLCJfc2RfYWxnIjoic2hhLTI1NiIsIl9zZCI6WyI1RGEzTWt6SGZMdGJCdU1wdnZqQng1T2dCSlNsR25QLUdVR0ZQRjU4dDcwIiwiUEFlQlN4WnNlV3RUMUJWLUxCT3NZdENndjhZMlAtTWVQZEQtdDdCUVlXRSIsIjhEX3hremtwdTdWNkxSRlIzUld0NXh0MU42NVpxUzE2QUlvdzNnMVRuQU0iLCJuaWI2R1FXaVdEVklfZmd2eXpWUk1ZV25uZDdDMks5Z1drTzFra1k4YW1NIl0sImRlbGVnYXRlX3BheWxvYWQiOlt7Ii4uLiI6InI3aWNPZzJjblh4eVl2RGRGSW5zUjZfSW5fbzZHSElMMTRaRTZ5Rkh4bWcifSx7Ii4uLiI6IkFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUEifSx7ImxpdGVyYWwiOiJub3QtYS1yZWZlcmVuY2UifSwiYmFyZS1zdHJpbmctZW50cnkiXX0.i4hbNne5uGYJcSoNjDBWtKONUbra0eJvx16sTG0ay5vefKhyUNX3J4hM8QKt_30lshQvkfOABUL0MymJouzvog~WyJFQkFRRUJBUUVCQVFFQkFRRUJBUUVBIiwiY2hlY2tvdXRfbWFuZGF0ZSIseyJ2Y3QiOiJtYW5kYXRlLmNoZWNrb3V0Lm9wZW4ifV0~WyJFUkVSRVJFUkVSRVJFUkVSRVJFUkVRIiwicGF5bWVudF9tYW5kYXRlIix7InZjdCI6Im1hbmRhdGUucGF5bWVudCJ9XQ~WyJFaElTRWhJU0VoSVNFaElTRWhJU0VnIix7ImlkIjoiYWdlbnQtMSIsInJvbGUiOiJkZWxlZ2F0ZSJ9XQ~WyJGQlFVRkJRVUZCUVVGQlFVRkJRVUZBIiwiYXJyYXktZWxlbWVudC1saXN0ZWQtaW4tc2QiXQ~",
+    "resolved_claims": {
+      "iss": "https://issuer.example",
+      "iat": 1750000000,
+      "_sd_alg": "sha-256",
+      "_sd": [
+        "5Da3MkzHfLtbBuMpvvjBx5OgBJSlGnP-GUGFPF58t70",
+        "PAeBSxZseWtT1BV-LBOsYtCgv8Y2P-MePdD-t7BQYWE",
+        "8D_xkzkpu7V6LRFR3RWt5xt1N65ZqS16AIow3g1TnAM",
+        "nib6GQWiWDVI_fgvyzVRMYWnnd7C2K9gWkO1kkY8amM"
+      ],
+      "delegate_payload": [
+        {
+          "id": "agent-1",
+          "role": "delegate"
+        },
+        {
+          "...": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        },
+        {
+          "literal": "not-a-reference"
+        },
+        "bare-string-entry"
+      ],
+      "checkout_mandate": {
+        "vct": "mandate.checkout.open"
+      },
+      "payment_mandate": {
+        "vct": "mandate.payment"
+      }
+    }
+  },
+  "selective_presentation": {
+    "base_jwt": "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIn0.AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw",
+    "subset_disclosures": [
+      "WyJFQkFRRUJBUUVCQVFFQkFRRUJBUUVBIiwiY2hlY2tvdXRfbWFuZGF0ZSIseyJ2Y3QiOiJtYW5kYXRlLmNoZWNrb3V0Lm9wZW4ifV0",
+      "WyJFaElTRWhJU0VoSVNFaElTRWhJU0VnIix7ImlkIjoiYWdlbnQtMSIsInJvbGUiOiJkZWxlZ2F0ZSJ9XQ"
+    ],
+    "presentation": "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJodHRwczovL2lzc3Vlci5leGFtcGxlIn0.AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0-Pw~WyJFQkFRRUJBUUVCQVFFQkFRRUJBUUVBIiwiY2hlY2tvdXRfbWFuZGF0ZSIseyJ2Y3QiOiJtYW5kYXRlLmNoZWNrb3V0Lm9wZW4ifV0~WyJFaElTRWhJU0VoSVNFaElTRWhJU0VnIix7ImlkIjoiYWdlbnQtMSIsInJvbGUiOiJkZWxlZ2F0ZSJ9XQ~",
+    "binding_hash": "-y90J_R0i2H9Kv0aPL4Ma7VNz93CPqMDmhD2GwrkdUQ"
+  }
+}
