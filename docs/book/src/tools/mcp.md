@@ -96,7 +96,7 @@ Keep the three MCP tool controls on their own axes:
 
 For runtime-discovered MCP tools the capability contract has an MCP-specific exception:
 
-- If the risk profile's `allowed_tools` is empty or omitted, no authorization constraint applies; every discovered tool (MCP or built-in) is reachable. The TOML config does not distinguish an omitted field from `allowed_tools = []`; both deserialize to the same "no authorization constraint" state at the risk-profile level. If you need an explicit deny-all gate, do it on the caller-supplied per-run `allowed_tools` (cron jobs and other narrowers pass that list in directly) or via `excluded_tools` covering the specific tools you want blocked.
+- If the risk profile's `allowed_tools` is omitted or empty, no authorization constraint applies; every discovered tool (MCP or built-in) is reachable; an empty list is the legacy unrestricted state, not deny-all. For an explicit deny-all gate, set the sibling `deny_all_tools = true`: it denies MCP tools too (there is no `__` auto-admit under deny-all) and cannot be combined with a nonempty `allowed_tools`.
 - If `allowed_tools` is non-empty, any MCP tool whose name contains `__` (the `<server>__<tool>` convention) is auto-admitted into the effective allow-list without being listed there individually. Non-MCP built-ins still need an exact entry.
 - `excluded_tools` always subtracts, including from the auto-admitted MCP set. To block a single MCP tool like `filesystem__write_file` while keeping the rest of the `filesystem` server reachable, put it in `excluded_tools`.
 

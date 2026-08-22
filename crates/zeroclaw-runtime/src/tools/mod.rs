@@ -400,6 +400,19 @@ pub fn register_skill_tools_with_context_and_runtime(
                     tool.name()
                 )
             );
+        } else if policy
+            .allowed_tools
+            .as_ref()
+            .is_some_and(|list| list.is_empty())
+        {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!(
+                    "Skill tool '{}' denied by empty allowed_tools (deny-all), skipping",
+                    tool.name()
+                )
+            );
         } else if policy.is_tool_excluded(tool.name()) {
             ::zeroclaw_log::record!(
                 INFO,

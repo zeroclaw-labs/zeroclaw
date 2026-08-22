@@ -2718,3 +2718,66 @@ api_key = "sk-openai-lead"
         );
     }
 }
+
+#[test]
+fn v3_explicit_empty_allowed_tools_stays_unrestricted() {
+    // No schema migration touches `allowed_tools`: V3 files with an explicit
+    // `allowed_tools = []` keep the legacy unrestricted meaning.
+    let raw = r#"
+schema_version = 3
+
+[risk_profiles.default]
+allowed_tools = []
+"#;
+    let cfg = migrate_to_current(raw).expect("V3 empty allowed_tools loads");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+    let profile = cfg
+        .risk_profiles
+        .get("default")
+        .expect("default profile survives");
+    assert!(
+        profile.allowed_tools.is_empty(),
+        "legacy V3 allowed_tools = [] must stay the unrestricted state, got {:?}",
+        profile.allowed_tools
+    );
+    assert!(!profile.deny_all_tools);
+    let policy = zeroclaw_config::policy::SecurityPolicy::from_risk_profile(
+        profile,
+        std::path::Path::new("/ws"),
+    );
+    assert!(
+        policy.is_tool_allowed("shell"),
+        "legacy empty array must remain unrestricted"
+    );
+}
+
+#[test]
+fn v3_deny_all_tools_flag_loads_without_migration() {
+    // `deny_all_tools` is a plain additive V3 field: no migration step, it
+    // deserializes directly and maps to deny-all at the policy boundary.
+    let raw = r#"
+schema_version = 3
+
+[risk_profiles.default]
+deny_all_tools = true
+"#;
+    let cfg = migrate_to_current(raw).expect("V3 deny_all_tools loads");
+    assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
+    let profile = cfg
+        .risk_profiles
+        .get("default")
+        .expect("default profile present");
+    assert!(profile.deny_all_tools);
+    let policy = zeroclaw_config::policy::SecurityPolicy::from_risk_profile(
+        profile,
+        std::path::Path::new("/ws"),
+    );
+    assert!(
+        !policy.is_tool_allowed("shell"),
+        "deny_all_tools = true must deny built-ins"
+    );
+    assert!(
+        !policy.is_tool_allowed("filesystem__write_file"),
+        "deny_all_tools = true must deny MCP-shaped names; the __ auto-admit is nonempty-allowlist only"
+    );
+}

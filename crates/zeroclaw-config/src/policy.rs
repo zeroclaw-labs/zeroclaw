@@ -3444,7 +3444,15 @@ impl SecurityPolicy {
             block_high_risk_commands: risk_profile.block_high_risk_commands,
             shell_env_passthrough: risk_profile.shell_env_passthrough.clone(),
             shell_timeout_secs: runtime.shell_timeout_secs,
-            allowed_tools: if risk_profile.allowed_tools.is_empty() {
+            // Tri-state mapping: `deny_all_tools` is the explicit deny-all
+            // gate (`Some(vec![])`); an absent or empty `allowed_tools` is the
+            // legacy unrestricted state (`None`); a non-empty list is the
+            // closed set. `Config::validate` rejects the contradictory
+            // combination up front, so deny-all wins here only for
+            // hand-constructed profiles that bypassed validation.
+            allowed_tools: if risk_profile.deny_all_tools {
+                Some(Vec::new())
+            } else if risk_profile.allowed_tools.is_empty() {
                 None
             } else {
                 Some(risk_profile.allowed_tools.clone())
@@ -3819,6 +3827,7 @@ mod tests {
             delegation_policy: crate::autonomy::DelegationPolicy::default(),
             approval_route: None,
             allowed_tools: vec!["shell".into(), "memory_recall".into()],
+            deny_all_tools: false,
             excluded_tools: vec!["spawn_subagent".into()],
             sandbox_enabled: Some(true),
             sandbox_backend: Some("firejail".into()),
@@ -3893,12 +3902,16 @@ mod tests {
     }
 
     #[test]
-    fn from_profiles_empty_allowed_tools_means_unrestricted_not_deny_all() {
+    fn from_profiles_legacy_empty_allowed_tools_means_unrestricted() {
         use crate::schema::RiskProfileConfig;
         use std::path::Path;
 
+        // Both an omitted field (Default → empty) and an explicit
+        // `allowed_tools = []` deserialize to the same legacy state and must
+        // map to unrestricted — an empty list is NOT deny-all.
         let risk = RiskProfileConfig {
-            allowed_tools: Vec::new(),
+            allowed_tools: vec![],
+            deny_all_tools: false,
             ..RiskProfileConfig::default()
         };
 
@@ -3906,13 +3919,62 @@ mod tests {
 
         assert!(
             policy.allowed_tools.is_none(),
-            "RiskProfileConfig cannot distinguish an omitted allowed_tools field \
-             from allowed_tools = []; both map to no authorization constraint"
+            "legacy empty allowed_tools must map to unrestricted (None)"
         );
         assert!(
             policy.is_tool_allowed("filesystem__write_file"),
-            "empty risk-profile allowed_tools is unrestricted, not deny-all"
+            "legacy empty allowed_tools is unrestricted, not deny-all"
         );
+    }
+
+    #[test]
+    fn from_profiles_deny_all_tools_flag_means_deny_all() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: vec![],
+            deny_all_tools: true, // explicit deny-all gate
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert_eq!(
+            policy.allowed_tools,
+            Some(vec![]),
+            "deny_all_tools = true must map to Some(vec![]) (deny-all), not None (unrestricted)"
+        );
+        assert!(
+            !policy.is_tool_allowed("shell"),
+            "deny_all_tools denies built-in tools"
+        );
+        assert!(
+            !policy.is_tool_allowed("filesystem__write_file"),
+            "deny_all_tools also denies MCP-discovered tools — no auto-admit under deny-all"
+        );
+    }
+
+    #[test]
+    fn from_profiles_nonempty_allowed_tools_preserves_closed_set() {
+        use crate::schema::RiskProfileConfig;
+        use std::path::Path;
+
+        let risk = RiskProfileConfig {
+            allowed_tools: vec!["shell".into(), "memory_recall".into()],
+            ..RiskProfileConfig::default()
+        };
+
+        let policy = SecurityPolicy::from_profiles(&risk, None, Path::new("/ws"));
+
+        assert_eq!(
+            policy.allowed_tools.as_deref(),
+            Some(&["shell".to_string(), "memory_recall".to_string()][..]),
+            "nonempty allowed_tools preserves the explicit closed set"
+        );
+        assert!(policy.is_tool_allowed("shell"));
+        assert!(policy.is_tool_allowed("memory_recall"));
+        assert!(!policy.is_tool_allowed("file_write"));
     }
 
     #[test]

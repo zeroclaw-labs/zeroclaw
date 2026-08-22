@@ -12,24 +12,89 @@ export type CustomPermissionTarget = AuthState | ApprState;
 export type AutonomyLevel = 'readonly' | 'supervised' | 'full';
 
 export interface ToolPermissionGridValue {
-  allowedTools: string[];
+  /** `null` = unrestricted (field omitted or empty — both are the legacy
+   *  unrestricted state in the config). Nonempty = allowlist. Deny-all is
+   *  expressed by `denyAllTools`, never by an empty array. */
+  allowedTools: string[] | null;
+  /** Explicit deny-all (`risk_profiles.<alias>.deny_all_tools = true`).
+   *  Mutually exclusive with a nonempty `allowedTools`. */
+  denyAllTools: boolean;
   excludedTools: string[];
   autoApprove: string[];
   alwaysAsk: string[];
 }
 
 /** Risk-profile permission arrays contain agent-callable tool names. The
- * shared picker catalog also contains executables discovered on PATH for SOP
- * and shell-oriented pickers; those names are not tools in the runtime
- * registry and must not be offered as authorization or approval entries. */
+ *  shared picker catalog also contains executables discovered on PATH for SOP
+ *  and shell-oriented pickers; those names are not tools in the runtime
+ *  registry and must not be offered as authorization or approval entries. */
 export function filterPermissionCatalogEntries<
   T extends { group: 'agent' | 'cli' },
 >(entries: readonly T[]): T[] {
   return entries.filter((entry) => entry.group === 'agent');
 }
 
-export function realAllowedTools(allowedTools: string[]): string[] {
+export function realAllowedTools(allowedTools: string[] | null): string[] {
+  if (allowedTools === null) return [];
   return allowedTools.filter((name) => name !== NONE_SENTINEL);
+}
+
+/** Strict = any explicit gate is configured: an allowlist or deny-all. */
+export function isStrictAllowlist(value: ToolPermissionGridValue): boolean {
+  return value.allowedTools !== null || value.denyAllTools;
+}
+
+/** Normalize a raw config array. A bare `__none__` (the legacy hand-written
+ *  fake deny-all sentinel) maps to the explicit `denyAllTools` flag. */
+export function normalizeAllowedTools(raw: string[]): {
+  allowedTools: string[] | null;
+  denyAllTools: boolean;
+} {
+  const real = raw.filter((name) => name !== NONE_SENTINEL);
+  if (raw.includes(NONE_SENTINEL) && real.length === 0) {
+    return { allowedTools: null, denyAllTools: true };
+  }
+  return { allowedTools: real.length > 0 ? real : null, denyAllTools: false };
+}
+
+/** Draft string → three-state allowlist. `""` / `"null"` / `"<unset>"` are
+ *  unrestricted, as is a literal `[]` (its legacy config meaning). */
+export function parseOptionalAllowedTools(value: string): {
+  allowedTools: string[] | null;
+  denyAllTools: boolean;
+} {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === 'null' || trimmed === '<unset>') {
+    return { allowedTools: null, denyAllTools: false };
+  }
+  let names: string[] | null = null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed === null) return { allowedTools: null, denyAllTools: false };
+    if (Array.isArray(parsed)) {
+      names = parsed.map(String);
+    }
+  } catch {
+    // Fall through to freeform split.
+  }
+  if (names === null) {
+    names = trimmed
+      .split(/[\n,]/)
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  }
+  return normalizeAllowedTools(names);
+}
+
+/** Boolean draft leaf (`deny_all_tools`) → flag. Only the literal string
+ *  "true" enables deny-all; unset/absent stays false. */
+export function parseDenyAllToolsDraft(value: string | undefined): boolean {
+  return (value ?? '').trim() === 'true';
+}
+
+export function serializeAllowedTools(allowedTools: string[] | null): string {
+  if (allowedTools === null) return '';
+  return JSON.stringify(allowedTools);
 }
 
 export function isMcpToolName(name: string): boolean {
@@ -52,7 +117,9 @@ export function effectiveAuthState({
   excludedSet: ReadonlySet<string>;
 }): AuthState {
   if (excludedSet.has(name)) return 'deny';
-  if (strict && (realAllowSet.has(name) || isMcpToolName(name))) return 'allow';
+  if (strict && (realAllowSet.has(name) || (realAllowSet.size > 0 && isMcpToolName(name)))) {
+    return 'allow';
+  }
   return 'inherit';
 }
 
@@ -69,6 +136,7 @@ export function isMcpAutoAdmitted({
 }): boolean {
   return (
     strict &&
+    realAllowSet.size > 0 &&
     isMcpToolName(name) &&
     !realAllowSet.has(name) &&
     !excludedSet.has(name)
@@ -157,16 +225,17 @@ export function applyAuthState(
     nextRealAllow.add(name);
   }
 
-  const nextAllowedTools = strict
-    ? nextRealAllow.size > 0
-      ? [...nextRealAllow]
-      : [NONE_SENTINEL]
-    : [];
+  // Strict with nothing marked Allow is the explicit deny-all state
+  // (`denyAllTools = true`), not an empty array — `[]` keeps its legacy
+  // unrestricted meaning in the config. Allowing any tool naturally exits
+  // deny-all.
+  const nextDenyAll = strict && nextRealAllow.size === 0;
 
   return {
     ...value,
     excludedTools: nextExcluded,
-    allowedTools: nextAllowedTools,
+    allowedTools: strict && !nextDenyAll ? [...nextRealAllow] : null,
+    denyAllTools: nextDenyAll,
   };
 }
 
@@ -193,14 +262,14 @@ export function applyStrictMode(
   nextStrict: boolean,
 ): ToolPermissionGridValue {
   const nextRealAllow = realAllowedTools(value.allowedTools);
-  return {
-    ...value,
-    allowedTools: nextStrict
-      ? nextRealAllow.length > 0
-        ? nextRealAllow
-        : [NONE_SENTINEL]
-      : [],
-  };
+  if (!nextStrict) {
+    return { ...value, allowedTools: null, denyAllTools: false };
+  }
+  // Strict ON with nothing to allow = explicit deny-all.
+  if (nextRealAllow.length === 0) {
+    return { ...value, allowedTools: null, denyAllTools: true };
+  }
+  return { ...value, allowedTools: nextRealAllow, denyAllTools: false };
 }
 
 export function applyCustomPermission(
@@ -216,7 +285,7 @@ export function applyCustomPermission(
   }
 
   if (target === 'deny') {
-    return applyAuthState(value, name, 'deny', value.allowedTools.length > 0);
+    return applyAuthState(value, name, 'deny', isStrictAllowlist(value));
   }
   if (target === 'allow') {
     return {
