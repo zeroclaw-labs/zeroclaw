@@ -4212,6 +4212,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_cli_provider_failure_projection_hides_retry_diagnostics() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::RateLimited,
+            None,
+            "All model providers/models failed after 3 failure event(s). Events: \
+             event 1 (retry 1/3): rate_limited"
+                .to_string(),
+        ));
+
+        let projected = super::project_cli_terminal_completion_error(error);
+
+        assert_eq!(
+            projected.to_string(),
+            "The selected model provider rate-limited the request. Wait, review quota, or choose \
+             another provider."
+        );
+        assert!(!projected.to_string().contains("retry 1/3"));
+        assert!(
+            !projected
+                .to_string()
+                .contains("All model providers/models failed")
+        );
+    }
+
     struct NonVisionModelProvider {
         calls: Arc<AtomicUsize>,
     }

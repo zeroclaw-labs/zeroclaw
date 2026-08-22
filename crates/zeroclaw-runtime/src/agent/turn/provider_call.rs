@@ -259,6 +259,7 @@ pub(crate) async fn call_provider(
                             {
                                 scope.mark_stream_recovery_semantic_empty();
                             }
+                            scope.record_stream_recovery_failure(&stream_err);
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -624,13 +625,16 @@ mod streaming_fallback_tests {
     use crate::observability::NoopObserver;
     use async_trait::async_trait;
     use futures_util::stream::BoxStream;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
     use zeroclaw_api::model_provider::StreamEvent;
     use zeroclaw_config::schema::PacingConfig;
-    use zeroclaw_providers::ModelProvider;
     use zeroclaw_providers::reliable::ReliableModelProvider;
     use zeroclaw_providers::traits::{StreamOptions, StreamResult, TokenUsage};
+    use zeroclaw_providers::{
+        ModelProvider, ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+    };
 
     struct EmptyStreamThenTextProvider {
         non_stream_calls: AtomicUsize,
@@ -642,6 +646,10 @@ mod streaming_fallback_tests {
 
     struct EmptyThenPendingProvider {
         calls: AtomicUsize,
+    }
+
+    struct StreamFailureNoReplayProvider {
+        non_stream_calls: Arc<AtomicUsize>,
     }
 
     impl Attributable for EmptyStreamThenTextProvider {
@@ -671,6 +679,16 @@ mod streaming_fallback_tests {
 
         fn alias(&self) -> &str {
             "EmptyThenPendingProvider"
+        }
+    }
+
+    impl Attributable for StreamFailureNoReplayProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "StreamFailureNoReplayProvider"
         }
     }
 
@@ -809,6 +827,54 @@ mod streaming_fallback_tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for StreamFailureNoReplayProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not replay".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![Err(
+                zeroclaw_providers::traits::StreamError::ModelProvider(
+                    "error sending request for url (http://127.0.0.1:9/v1/messages): \
+                     client error (Connect): connection refused"
+                        .to_string(),
+                ),
+            )]))
+        }
+    }
+
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
         let provider = EmptyStreamThenTextProvider {
@@ -865,6 +931,75 @@ mod streaming_fallback_tests {
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 10);
         assert_eq!(recorded.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn stream_failure_without_fallback_keeps_typed_terminal_cause() {
+        let non_stream_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".to_string(),
+                Box::new(StreamFailureNoReplayProvider {
+                    non_stream_calls: Arc::clone(&non_stream_calls),
+                }) as Box<dyn ModelProvider>,
+            )],
+            0,
+            1,
+        );
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let error = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("stream fallback remains a provider-call outcome")
+        .chat_result
+        .expect_err("the only stream candidate must fail");
+
+        assert_eq!(non_stream_calls.load(Ordering::Relaxed), 0);
+        assert!(
+            error
+                .to_string()
+                .contains("All model providers/models failed after 0 failure event(s)")
+        );
+        let terminal = error
+            .chain()
+            .find_map(|source| source.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("recovery error must preserve a typed terminal cause");
+        assert_eq!(
+            terminal.kind(),
+            ReliableProviderTerminalFailureKind::Connection
+        );
+        assert_eq!(terminal.endpoint(), Some("http://127.0.0.1:9/v1/messages"));
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ use futures_util::{StreamExt, stream};
 use parking_lot::Mutex as ParkingMutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -80,6 +81,7 @@ pub(crate) struct ReliableCallAccounting {
     pending_stream_attempt: Option<ReliableRejectedAttempt>,
     stream_resume_after: Option<ReliableEntryId>,
     stream_recovery_semantic_empty: bool,
+    stream_recovery_failure: Option<ProviderErrorDiagnostic>,
 }
 
 impl ReliableCallAccounting {
@@ -316,10 +318,25 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
     });
 }
 
+/// Preserve the classified stream failure while runtime recovers through the
+/// remaining candidates without replaying the failed stream entry.
+pub(crate) fn record_stream_recovery_failure(error: &anyhow::Error) {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        accounting.lock().stream_recovery_failure = Some(provider_error_diagnostic(error));
+    });
+}
+
 fn stream_recovery_was_semantic_empty() -> bool {
     RELIABLE_CALL_ACCOUNTING
         .try_with(|accounting| accounting.lock().stream_recovery_semantic_empty)
         .unwrap_or(false)
+}
+
+fn stream_recovery_failure_diagnostic() -> Option<ProviderErrorDiagnostic> {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().stream_recovery_failure.clone())
+        .ok()
+        .flatten()
 }
 
 /// Take (consume) the last model_provider fallback info, if any.
@@ -788,6 +805,114 @@ struct ProviderErrorDiagnostic {
     endpoint: Option<String>,
 }
 
+/// A terminal Reliable failure that can be rendered safely at a user-facing
+/// delivery boundary without exposing retry-attempt diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliableProviderTerminalFailureKind {
+    ContextWindow,
+    Authentication,
+    RateLimited,
+    ProviderServer,
+    ModelNotFound,
+    ClientRequest,
+    Connection,
+    Timeout,
+    Other,
+}
+
+impl ReliableProviderTerminalFailureKind {
+    fn from_diagnostic_kind(kind: &str) -> Self {
+        match kind {
+            "context_window" => Self::ContextWindow,
+            "auth" => Self::Authentication,
+            "rate_limited" => Self::RateLimited,
+            "provider_server" => Self::ProviderServer,
+            "model_not_found" => Self::ModelNotFound,
+            "client_error" => Self::ClientRequest,
+            "connect" | "connect_timeout" | "dns" => Self::Connection,
+            "timeout" => Self::Timeout,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The typed terminal presentation cause for a Reliable provider failure.
+///
+/// `Display` intentionally remains the full diagnostic summary used by logs.
+/// User-facing delivery must select a localized message from [`Self::kind`]
+/// instead of exposing the retry envelope.
+#[derive(Debug)]
+pub struct ReliableProviderTerminalFailure {
+    kind: ReliableProviderTerminalFailureKind,
+    endpoint: Option<String>,
+    diagnostic: String,
+    terminal_cause: Option<anyhow::Error>,
+}
+
+impl ReliableProviderTerminalFailure {
+    pub fn new(
+        kind: ReliableProviderTerminalFailureKind,
+        endpoint: Option<String>,
+        diagnostic: String,
+    ) -> Self {
+        Self {
+            kind,
+            endpoint,
+            diagnostic,
+            terminal_cause: None,
+        }
+    }
+
+    fn with_cause(
+        diagnostic: ProviderErrorDiagnostic,
+        failure_aggregate: String,
+        terminal_cause: anyhow::Error,
+    ) -> Self {
+        Self {
+            kind: ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            endpoint: diagnostic.endpoint,
+            diagnostic: failure_aggregate,
+            terminal_cause: Some(terminal_cause),
+        }
+    }
+
+    pub fn kind(&self) -> ReliableProviderTerminalFailureKind {
+        self.kind
+    }
+
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    pub fn endpoint_is_local(&self) -> bool {
+        self.endpoint.as_deref().is_some_and(|endpoint| {
+            reqwest::Url::parse(endpoint)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .parse::<IpAddr>()
+                            .is_ok_and(|address| address.is_loopback())
+                })
+        })
+    }
+}
+
+impl std::fmt::Display for ReliableProviderTerminalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for ReliableProviderTerminalFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.terminal_cause
+            .as_ref()
+            .map(|cause| cause.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
 fn sanitized_url_endpoint(mut url: reqwest::Url) -> String {
     let _ = url.set_username("");
     let _ = url.set_password(None);
@@ -806,6 +931,43 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
         .or_else(|_| reqwest::Url::parse(raw.trim_end_matches([':', '.'])))
         .ok()?;
     Some(sanitized_url_endpoint(url))
+}
+
+fn http_status_from_error_text(text: &str) -> Option<u16> {
+    let start = text.find("api error (")? + "api error (".len();
+    let code = text.get(start..start + 3)?.parse().ok()?;
+    (400..600).contains(&code).then_some(code)
+}
+
+fn http_status_diagnostic(code: u16, endpoint: Option<String>) -> ProviderErrorDiagnostic {
+    let (kind, hint) = if matches!(code, 401 | 403) {
+        ("auth", "check provider credentials")
+    } else if code == 429 {
+        ("rate_limited", "wait, change key/quota, or switch provider")
+    } else if (500..600).contains(&code) {
+        (
+            "provider_server",
+            "provider returned a server error; retry or switch provider",
+        )
+    } else if code == 404 {
+        (
+            "model_not_found",
+            "check the configured model id for this provider",
+        )
+    } else if (400..500).contains(&code) {
+        (
+            "client_error",
+            "provider rejected the request; check config, model, or request shape",
+        )
+    } else {
+        ("http_error", "inspect provider response or switch provider")
+    };
+    ProviderErrorDiagnostic {
+        kind,
+        phase: "http_response",
+        hint,
+        endpoint,
+    }
 }
 
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
@@ -845,31 +1007,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
 
     if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
         if let Some(status) = reqwest_err.status() {
-            let code = status.as_u16();
-            let (kind, hint) = if status.is_server_error() {
-                (
-                    "provider_server",
-                    "provider returned a server error; retry or switch provider",
-                )
-            } else if code == 404 {
-                (
-                    "model_not_found",
-                    "check the configured model id for this provider",
-                )
-            } else if status.is_client_error() {
-                (
-                    "client_error",
-                    "provider rejected the request; check config, model, or request shape",
-                )
-            } else {
-                ("http_error", "inspect provider response or switch provider")
-            };
-            return ProviderErrorDiagnostic {
-                kind,
-                phase: "http_response",
-                hint,
-                endpoint,
-            };
+            return http_status_diagnostic(status.as_u16(), endpoint);
         }
 
         if reqwest_err.is_timeout() && reqwest_err.is_connect() {
@@ -912,6 +1050,15 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
+    if lower.contains("client error (connect)") || lower.contains("connection refused") {
+        return ProviderErrorDiagnostic {
+            kind: "connect",
+            phase: "connect",
+            hint: "could not open provider connection; check network, VPN, or firewall",
+            endpoint,
+        };
+    }
+
     if lower.contains("timed out") || lower.contains("timeout") {
         return ProviderErrorDiagnostic {
             kind: "timeout",
@@ -943,6 +1090,10 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             hint: "check the configured model id for this provider",
             endpoint,
         };
+    }
+
+    if let Some(status) = http_status_from_error_text(&lower) {
+        return http_status_diagnostic(status, endpoint);
     }
 
     ProviderErrorDiagnostic {
@@ -1313,12 +1464,35 @@ fn reliable_terminal_error_with_cause(
 ) -> anyhow::Error {
     let rejected_attempt_usage = rejected_attempt_usage.or_else(accounted_rejected_attempt_usage);
     if !final_cause_is_semantic_empty && let Some(cause) = final_cause {
+        let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure::with_cause(
+            provider_error_diagnostic(&cause),
+            failure_aggregate(&failures),
+            cause,
+        ));
         if let Some(usage) = rejected_attempt_usage {
             return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
-                usage, failures, cause,
+                usage,
+                failures,
+                terminal_failure,
             ));
         }
-        return cause.context(failure_aggregate(&failures));
+        return terminal_failure;
+    }
+    if !final_cause_is_semantic_empty && let Some(diagnostic) = stream_recovery_failure_diagnostic()
+    {
+        let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            diagnostic.endpoint,
+            failure_aggregate(&failures),
+        ));
+        if let Some(usage) = rejected_attempt_usage {
+            return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
+                usage,
+                failures,
+                terminal_failure,
+            ));
+        }
+        return terminal_failure;
     }
     reliable_terminal_error(
         failures,
@@ -5532,6 +5706,36 @@ mod tests {
                 "model id",
             ),
             (
+                "compatible API error (503 Service Unavailable): overload",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "compatible API error (400 Bad Request): malformed request",
+                "client_error",
+                "http_response",
+                "request shape",
+            ),
+            (
+                "compatible API error (401 Unauthorized): invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "compatible API error (403 Forbidden): invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "compatible API error (429 Too Many Requests): retry later",
+                "rate_limited",
+                "http_response",
+                "quota",
+            ),
+            (
                 "provider returned an opaque transport error",
                 "provider_error",
                 "unknown",
@@ -5546,6 +5750,66 @@ mod tests {
             assert_eq!(diagnostic.phase, expected_phase, "{message}");
             assert!(diagnostic.hint.contains(expected_hint), "{message}");
         }
+    }
+
+    #[test]
+    fn terminal_provider_failure_keeps_attempt_diagnostics_out_of_presentation_type() {
+        let mut failures = FailureEvents::default();
+        failures.push("event 1 (retry 1/1): retryable; provider detail".to_string());
+        let error = reliable_terminal_error_with_cause(
+            failures,
+            None,
+            false,
+            Some(anyhow::Error::msg(
+                "error sending request for url (http://127.0.0.1:11434/v1/chat/completions): \
+                 client error (Connect): connection refused",
+            )),
+        );
+
+        assert!(error.to_string().contains("event 1 (retry 1/1)"));
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("terminal provider failure must retain its typed presentation cause");
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::Connection
+        );
+        assert_eq!(
+            failure.endpoint(),
+            Some("http://127.0.0.1:11434/v1/chat/completions")
+        );
+        assert!(failure.endpoint_is_local());
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("client error (Connect): connection refused")
+        }));
+    }
+
+    #[test]
+    fn terminal_provider_failure_preserves_rejected_usage_accounting() {
+        let mut failures = FailureEvents::default();
+        failures.push("event 1 (retry 1/1): retryable; provider detail".to_string());
+        let error = reliable_terminal_error_with_cause(
+            failures,
+            Some(TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+            }),
+            false,
+            Some(anyhow::Error::msg(
+                "compatible API error (503 Service Unavailable)",
+            )),
+        );
+
+        assert_rejected_usage_survives(&error);
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<ReliableProviderTerminalFailure>()
+                .is_some()
+        }));
     }
 
     #[test]

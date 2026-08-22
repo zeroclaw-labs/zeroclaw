@@ -136,11 +136,62 @@ fn pre_executed_tools_without_final_response_message(agent_name: Option<&str>) -
     }
 }
 
+fn reliable_provider_terminal_failure_message(
+    failure: &zeroclaw_providers::ReliableProviderTerminalFailure,
+) -> String {
+    use zeroclaw_providers::ReliableProviderTerminalFailureKind;
+
+    match failure.kind() {
+        ReliableProviderTerminalFailureKind::ContextWindow => {
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-context-window")
+        }
+        ReliableProviderTerminalFailureKind::Authentication => {
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-authentication")
+        }
+        ReliableProviderTerminalFailureKind::RateLimited => {
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-rate-limited")
+        }
+        ReliableProviderTerminalFailureKind::ProviderServer => {
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-server")
+        }
+        ReliableProviderTerminalFailureKind::ModelNotFound => {
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-model-not-found")
+        }
+        ReliableProviderTerminalFailureKind::ClientRequest => {
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-client-request")
+        }
+        ReliableProviderTerminalFailureKind::Connection => match failure.endpoint() {
+            Some(endpoint) if failure.endpoint_is_local() => {
+                crate::i18n::get_required_cli_string_with_args(
+                    "cli-agent-error-provider-connection-local",
+                    &[("endpoint", endpoint)],
+                )
+            }
+            Some(endpoint) => crate::i18n::get_required_cli_string_with_args(
+                "cli-agent-error-provider-connection-remote",
+                &[("endpoint", endpoint)],
+            ),
+            None => crate::i18n::get_required_cli_string("cli-agent-error-provider-connection"),
+        },
+        ReliableProviderTerminalFailureKind::Timeout => {
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-timeout")
+        }
+        ReliableProviderTerminalFailureKind::Other => {
+            crate::i18n::get_required_cli_string("cli-agent-error-provider-generic")
+        }
+    }
+}
+
 /// Map typed terminal-delivery failures to their Fluent user-facing message.
 pub fn terminal_completion_error_message(
     err: &anyhow::Error,
     agent_name: Option<&str>,
 ) -> Option<String> {
+    if let Some(failure) = err.chain().find_map(|source| {
+        source.downcast_ref::<zeroclaw_providers::ReliableProviderTerminalFailure>()
+    }) {
+        return Some(reliable_provider_terminal_failure_message(failure));
+    }
     if is_semantic_empty_terminal_completion(err) {
         return Some(semantic_empty_terminal_completion_message(agent_name));
     }
@@ -286,6 +337,140 @@ mod tests {
             terminal_completion_error_message(&error, None),
             Some("The model provider returned an invalid semantic completion.".to_string())
         );
+    }
+
+    #[test]
+    fn reliable_provider_cause_uses_localized_delivery_without_retry_envelope() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let diagnostic = "All model providers/models failed after 3 failure event(s). Events: \
+                          event 1 (retry 1/3): retryable";
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::Connection,
+            Some("http://127.0.0.1:11434/v1/chat/completions".to_string()),
+            diagnostic.to_string(),
+        ));
+
+        assert_eq!(error.to_string(), diagnostic);
+        assert_eq!(
+            terminal_completion_error_message(&error, None),
+            Some(
+                "The local model server at http://127.0.0.1:11434/v1/chat/completions is \
+                 unavailable. Start it or update the endpoint."
+                    .to_string()
+            )
+        );
+        assert!(
+            !terminal_completion_error_message(&error, None)
+                .expect("typed provider failure must project")
+                .contains("All model providers/models failed")
+        );
+    }
+
+    #[test]
+    fn reliable_provider_cause_distinguishes_remote_endpoint_guidance() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::Connection,
+            Some("https://api.example.com/v1/chat/completions".to_string()),
+            "All model providers/models failed after 1 failure event(s).".to_string(),
+        ));
+
+        assert_eq!(
+            terminal_completion_error_message(&error, None),
+            Some(
+                "Cannot reach the model provider at https://api.example.com/v1/chat/completions. \
+                 Check network access or choose another provider."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn reliable_context_window_cause_uses_concise_delivery_message() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::ContextWindow,
+            None,
+            "Request exceeds model context window. Failed after 1 failure event(s).".to_string(),
+        ));
+
+        assert_eq!(
+            terminal_completion_error_message(&error, None),
+            Some(
+                "The request is too large for the selected model. Reduce the conversation or choose \
+                 a model with a larger context window."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn reliable_provider_failure_kinds_use_their_fluent_messages() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let cases = [
+            (
+                ReliableProviderTerminalFailureKind::ContextWindow,
+                "cli-agent-error-provider-context-window",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Authentication,
+                "cli-agent-error-provider-authentication",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::RateLimited,
+                "cli-agent-error-provider-rate-limited",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ProviderServer,
+                "cli-agent-error-provider-server",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ModelNotFound,
+                "cli-agent-error-provider-model-not-found",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::ClientRequest,
+                "cli-agent-error-provider-client-request",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Connection,
+                "cli-agent-error-provider-connection",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Timeout,
+                "cli-agent-error-provider-timeout",
+            ),
+            (
+                ReliableProviderTerminalFailureKind::Other,
+                "cli-agent-error-provider-generic",
+            ),
+        ];
+
+        for (kind, key) in cases {
+            let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+                kind,
+                None,
+                "All model providers/models failed after 1 failure event(s).".to_string(),
+            ));
+
+            assert_eq!(
+                terminal_completion_error_message(&error, None),
+                Some(crate::i18n::get_english_cli_string_with_args(key, &[])),
+                "{kind:?} must use its dedicated Fluent message"
+            );
+        }
     }
 
     #[test]

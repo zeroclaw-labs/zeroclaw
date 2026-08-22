@@ -415,6 +415,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn provider_terminal_completion_keeps_retry_diagnostic_out_of_rpc_delivery() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let err = StreamedTurnError {
+            error: anyhow::Error::new(ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Connection,
+                Some("http://localhost:11434/v1/chat/completions".to_string()),
+                "All model providers/models failed after 3 failure event(s). Events: \
+                 event 1 (retry 1/3): retryable"
+                    .to_string(),
+            )),
+            committed_response: String::new(),
+            new_messages: Vec::new(),
+        };
+
+        let outcome = match outcome_from_task_result(Err(err), String::new()) {
+            Err(error) => error,
+            Ok(_) => panic!("provider terminal completion must fail"),
+        };
+        assert!(
+            outcome
+                .to_string()
+                .contains("All model providers/models failed")
+        );
+        assert_eq!(
+            outcome.user_message(),
+            Some(
+                "The local model server at http://localhost:11434/v1/chat/completions is \
+                 unavailable. Start it or update the endpoint."
+            )
+        );
+        assert!(
+            !outcome
+                .user_message()
+                .expect("terminal completion supplies a user message")
+                .contains("retry 1/3")
+        );
+    }
+
     #[tokio::test]
     async fn execute_turn_scopes_cost_context_so_usage_is_persisted() {
         use crate::agent::agent::Agent;

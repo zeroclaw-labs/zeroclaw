@@ -38,8 +38,12 @@ fn invalid_semantic_completion_error(agent_name: &str) -> String {
 }
 
 fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
-    crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
-        .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
+    if crate::agent::turn::outcome::is_semantic_empty_terminal_completion(error) {
+        return invalid_semantic_completion_error(agent_name);
+    }
+
+    // Delegated task records retain the redacted, ordered retry diagnostic.
+    format!("Agent '{agent_name}' failed: {error}")
 }
 
 async fn scope_delegate_session_key<F>(session_key: Option<String>, future: F) -> F::Output

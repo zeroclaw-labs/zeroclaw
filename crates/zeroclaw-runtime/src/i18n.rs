@@ -1452,6 +1452,32 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_terminal_failure_endpoint_messages_are_owned_by_each_locale() {
+        for locale in ["en", "es", "fr", "ja", "zh-CN"] {
+            let sources = load_cli_ftl_sources(locale);
+            for key in [
+                "cli-agent-error-provider-connection-local",
+                "cli-agent-error-provider-connection-remote",
+            ] {
+                let formatted = format_cli_string_with_args(
+                    &sources,
+                    key,
+                    &[("endpoint", "http://127.0.0.1:11434/v1")],
+                )
+                .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("http://127.0.0.1:11434/v1"),
+                    "{locale}: {key} must own endpoint grammar: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{$endpoint}"),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+        }
+    }
+
     /// Argless `channel-approval-*` keys must be defined and non-empty in
     /// every committed locale.
     const CHANNEL_APPROVAL_ARGLESS_KEYS: &[&str] = &[
