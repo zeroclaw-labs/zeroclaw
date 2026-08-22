@@ -450,3 +450,89 @@ fn landlock_workspace_boundary() {
         let _ = std::fs::remove_file(&outside_trunc);
     }
 }
+
+/// Regression test: `LandlockSandbox::with_roots` must grant kernel-level
+/// access to `SecurityPolicy`'s extra allowed-roots tiers, not just the
+/// primary workspace. Before this fix, `LandlockSandbox` only ever saw
+/// `workspace_dir`, so a directory the application-layer policy permitted
+/// via `allowed_roots` (e.g. `[autonomy].allowed_roots` or a cross-agent
+/// grant) was still rejected by the kernel — Landlock silently became
+/// *more* restrictive than the configured policy.
+#[test]
+fn landlock_with_roots_grants_extra_allowed_root_access() {
+    use tempfile::tempdir;
+
+    let workspace = tempdir().expect("failed to create temp directory");
+    let extra_rw = tempdir().expect("failed to create extra read-write root");
+    let extra_ro = tempdir().expect("failed to create extra read-only root");
+
+    let sandbox = LandlockSandbox::with_roots(
+        Some(workspace.path().to_path_buf()),
+        vec![extra_rw.path().to_path_buf()],
+        vec![extra_ro.path().to_path_buf()],
+        Vec::new(),
+    )
+    .expect("landlock should succeed on linux with feature enabled");
+
+    let rw_file = extra_rw.path().join("rw.txt");
+    let ro_file = extra_ro.path().join("ro.txt");
+    let ro_write_target = extra_ro.path().join("should_not_be_created.txt");
+
+    // Parent seeds the read-only root's content before the child runs.
+    std::fs::write(&ro_file, "seed").expect("parent must seed read-only root content");
+
+    let mut script = String::new();
+    script.push_str("set -e\n");
+
+    // Positive: the rw extra root must be writable and readable.
+    script.push_str(&format!("echo test > {}\n", rw_file.display()));
+    script.push_str(&format!(
+        "if [ \"$(cat {})\" != 'test' ]; then \
+            echo 'FAIL: extra read-write root ReadFile/WriteFile failed' >&2; \
+            exit 1; \
+         fi\n",
+        rw_file.display(),
+    ));
+
+    // Positive: the read-only extra root must be readable.
+    script.push_str(&format!(
+        "if [ \"$(cat {})\" != 'seed' ]; then \
+            echo 'FAIL: extra read-only root ReadFile failed' >&2; \
+            exit 1; \
+         fi\n",
+        ro_file.display(),
+    ));
+
+    // Negative: the read-only extra root must NOT be writable.
+    script.push_str(&format!(
+        "if echo bad > {} 2>/dev/null; then \
+            echo 'FAIL: extra read-only root should have denied WriteFile' >&2; \
+            exit 1; \
+         fi\n",
+        ro_write_target.display(),
+    ));
+
+    let mut cmd = Command::new("bash");
+    cmd.args(["-c", &script]);
+
+    sandbox
+        .wrap_command(&mut cmd)
+        .expect("landlock should successfully wrap the command");
+
+    let status = cmd
+        .spawn()
+        .expect("should spawn bash under landlock restrictions")
+        .wait()
+        .expect("should wait for bash to complete");
+
+    assert!(
+        status.success(),
+        "extra allowed-roots contract failed: rw root must be read/write, \
+         ro root must be read-only; exit status: {status}",
+    );
+
+    assert!(
+        !ro_write_target.exists(),
+        "sandboxed child must NOT have been able to create a file in the read-only extra root",
+    );
+}

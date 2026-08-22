@@ -19,6 +19,15 @@ use crate::security::traits::Sandbox;
 #[derive(Debug)]
 pub struct LandlockSandbox {
     workspace_dir: Option<std::path::PathBuf>,
+    /// Extra roots the agent may read AND write, mirroring
+    /// `SecurityPolicy::allowed_roots`.
+    allowed_roots: Vec<std::path::PathBuf>,
+    /// Extra roots the agent may read but NOT write, mirroring
+    /// `SecurityPolicy::allowed_roots_read_only`.
+    allowed_roots_read_only: Vec<std::path::PathBuf>,
+    /// Extra roots the agent may write but NOT read, mirroring
+    /// `SecurityPolicy::allowed_roots_write_only`.
+    allowed_roots_write_only: Vec<std::path::PathBuf>,
 }
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
@@ -30,13 +39,32 @@ impl LandlockSandbox {
 
     /// Create a Landlock sandbox with a specific workspace directory
     pub fn with_workspace(workspace_dir: Option<std::path::PathBuf>) -> std::io::Result<Self> {
+        Self::with_roots(workspace_dir, Vec::new(), Vec::new(), Vec::new())
+    }
+
+    /// Create a Landlock sandbox with a workspace directory plus the extra
+    /// allowed-roots tiers from `SecurityPolicy`. Without this, paths that
+    /// the application-layer policy permits outside the primary workspace
+    /// (e.g. cross-agent shared directories) would still be rejected by the
+    /// kernel, since Landlock would never have a rule for them.
+    pub fn with_roots(
+        workspace_dir: Option<std::path::PathBuf>,
+        allowed_roots: Vec<std::path::PathBuf>,
+        allowed_roots_read_only: Vec<std::path::PathBuf>,
+        allowed_roots_write_only: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<Self> {
         // Test if Landlock is available by trying to create a minimal ruleset
         let test_ruleset = Ruleset::default()
             .handle_access(AccessFs::ReadFile | AccessFs::WriteFile)
             .and_then(|ruleset| ruleset.create());
 
         match test_ruleset {
-            Ok(_) => Ok(Self { workspace_dir }),
+            Ok(_) => Ok(Self {
+                workspace_dir,
+                allowed_roots,
+                allowed_roots_read_only,
+                allowed_roots_write_only,
+            }),
             Err(e) => {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -106,6 +134,55 @@ impl LandlockSandbox {
                         | AccessFs::MakeSym,
                 ))
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+
+        // Allow the extra `SecurityPolicy` root tiers (cross-agent grants,
+        // `[autonomy].allowed_roots`, etc.). Like the workspace above, a
+        // configured root that doesn't exist fails closed rather than
+        // silently running without a rule for it — the application layer
+        // already believes these paths are reachable, so a missing kernel
+        // rule would make Landlock the more restrictive (and inconsistent)
+        // authority instead of just enforcing the same boundary.
+        for (roots, perm) in [
+            (
+                &self.allowed_roots,
+                AccessFs::Execute
+                    | AccessFs::WriteFile
+                    | AccessFs::ReadFile
+                    | AccessFs::Truncate
+                    | AccessFs::ReadDir
+                    | AccessFs::RemoveDir
+                    | AccessFs::RemoveFile
+                    | AccessFs::MakeDir
+                    | AccessFs::MakeReg
+                    | AccessFs::MakeSock
+                    | AccessFs::MakeFifo
+                    | AccessFs::MakeSym,
+            ),
+            (
+                &self.allowed_roots_read_only,
+                AccessFs::ReadFile | AccessFs::ReadDir,
+            ),
+            (
+                &self.allowed_roots_write_only,
+                AccessFs::WriteFile
+                    | AccessFs::Truncate
+                    | AccessFs::RemoveDir
+                    | AccessFs::RemoveFile
+                    | AccessFs::MakeDir
+                    | AccessFs::MakeReg
+                    | AccessFs::MakeSock
+                    | AccessFs::MakeFifo
+                    | AccessFs::MakeSym,
+            ),
+        ] {
+            for root in roots {
+                let root_fd =
+                    PathFd::new(root).map_err(|e| std::io::Error::other(e.to_string()))?;
+                ruleset = ruleset
+                    .add_rule(PathBeneath::new(root_fd, perm))
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
         }
 
         // Allow paths for general operations.
@@ -318,6 +395,18 @@ impl LandlockSandbox {
     }
 
     pub fn with_workspace(_workspace_dir: Option<std::path::PathBuf>) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Landlock is only supported on Linux",
+        ))
+    }
+
+    pub fn with_roots(
+        _workspace_dir: Option<std::path::PathBuf>,
+        _allowed_roots: Vec<std::path::PathBuf>,
+        _allowed_roots_read_only: Vec<std::path::PathBuf>,
+        _allowed_roots_write_only: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<Self> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Landlock is only supported on Linux",
