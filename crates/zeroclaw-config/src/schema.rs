@@ -506,7 +506,7 @@ pub struct Config {
 
     /// Named permission profiles (`[permission_profiles.<alias>]`): the
     /// single runtime authorization vocabulary. OIDC claim mappings and
-    /// user roster entries resolve here; deny-by-default — anything a
+    /// user roster entries resolve here; deny-by-default: anything a
     /// profile does not grant is refused.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -12916,8 +12916,8 @@ pub struct OidcConfig {
     /// requirement; non-empty = the token's `acr` claim must be one of
     /// these values or authentication fails closed.
     pub required_acr: Vec<String>,
-    /// Allowed `azp` (authorized party) values — the client the token was
-    /// issued TO. Empty = no restriction; non-empty = the token must carry
+    /// Allowed `azp` (authorized party) values, meaning the client the
+    /// token was issued TO. Empty = no restriction; non-empty = the token must carry
     /// an `azp` claim listed here or authentication fails closed.
     pub allowed_authorized_parties: Vec<String>,
     /// Client identities that resolve to SERVICE principals
@@ -13115,7 +13115,7 @@ impl OidcConfig {
 pub struct UserConfig {
     /// Durable principal identifier for this entry; defaults to the entry
     /// name. Ownership of sessions, memory, approvals, and audit trails
-    /// keys on this id, NOT on the entry name — so to rename the entry
+    /// keys on this id, NOT on the entry name. To rename the entry
     /// without orphaning its data, set `principal_id` to the original id
     /// in the same edit. Changing an entry's effective principal id
     /// creates a new principal that owns nothing.
@@ -13193,7 +13193,7 @@ pub struct PermissionProfileConfig {
     /// exact prop; `"*"` grants every path. Empty grants NO paths.
     pub config_write_paths: Vec<String>,
     /// Tool names holders may cause an agent to run. Empty grants NO
-    /// tools — broad access requires the explicit `"*"` entry. (Note this
+    /// tools; broad access requires the explicit `"*"` entry. (Note this
     /// differs from risk-profile `allowed_tools`, where empty means
     /// unconstrained: permission profiles are deny-by-default. The
     /// agent's own risk-profile policy still applies on top.)
