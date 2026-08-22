@@ -22565,33 +22565,71 @@ impl Config {
         // The granted egress allowlist is a security control, so a
         // malformed entry is a hard config error rather than a silently
         // dropped line. Both lists validate against the one shared strict
-        // grammar in `zeroclaw_infra::net_guard`.
+        // grammar in `zeroclaw_infra::net_guard`, and the canonical forms it
+        // returns are what the carve-out relationship check below compares —
+        // the same canonical forms the runtime matcher (`EgressPolicy::new`)
+        // normalizes into, so the validator and the runtime agree on shapes the
+        // grammar rewrites, such as a bracketed IPv6 literal `[::1]`
+        // canonicalized to bare `::1`.
         for entry in &self.plugins.entries {
-            for (field, patterns) in [
-                ("egress_hosts", &entry.egress_hosts),
-                ("egress_allow_private", &entry.egress_allow_private),
-            ] {
-                let path = format!("plugins.entries.{}.{field}", entry.name);
-                if let Err(e) =
-                    zeroclaw_infra::net_guard::normalize_egress_patterns(patterns, &path)
-                {
-                    validation_bail!(InvalidFormat, path.clone(), "{}", e);
+            let egress_hosts = {
+                let path = format!("plugins.entries.{}.egress_hosts", entry.name);
+                match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &entry.egress_hosts,
+                    &path,
+                ) {
+                    Ok(hosts) => hosts,
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
                 }
-            }
+            };
+            let egress_allow_private = {
+                let path = format!("plugins.entries.{}.egress_allow_private", entry.name);
+                match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &entry.egress_allow_private,
+                    &path,
+                ) {
+                    Ok(allow_private) => allow_private,
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
+                }
+            };
 
             // A carveout for a host that was never granted is almost always a
             // typo, and silently ignoring it leaves an operator believing they
             // opened a path they did not.
-            for private in &entry.egress_allow_private {
-                if !zeroclaw_infra::net_guard::egress_host_matches(
-                    private.trim_start_matches("*."),
-                    &entry.egress_hosts,
-                ) && !entry.egress_hosts.iter().any(|h| h == private)
-                {
+            for private in &egress_allow_private {
+                // A carve-out only relaxes an address class for hosts
+                // `egress_hosts` already grants, so it must be compared the way
+                // the runtime matcher (`egress_host_matches`) compares a
+                // request — over the shared canonical grammar forms, so a
+                // bracketed and a bare spelling of the same IPv6 literal agree.
+                // Trimming `*.` and asking only whether the apex is granted
+                // validates a wildcard carve-out that the matcher then renders
+                // inert: `egress_hosts=["api.example.com"]` names the apex
+                // alone, while `*.api.example.com` grants only its subdomains,
+                // so no request could ever use the carve-out.
+                let granted = match private.strip_prefix("*.") {
+                    // A wildcard carve-out `*.X` widens the class for every
+                    // strict subdomain of `X`. Only an equal-or-broader
+                    // *wildcard* grant reaches those hosts: `*.X` itself, or
+                    // `*.Y` where `X` is `Y` or a subdomain of `Y`. An exact
+                    // grant `X` reaches no subdomain, so it never validates a
+                    // wildcard carve-out.
+                    Some(apex) => egress_hosts
+                        .iter()
+                        .filter_map(|grant| grant.strip_prefix("*."))
+                        .any(|grant_apex| {
+                            apex == grant_apex || apex.ends_with(&format!(".{grant_apex}"))
+                        }),
+                    // An exact carve-out `X` is granted when `X` is named
+                    // exactly or falls under a wildcard grant — exactly the
+                    // reachability question the runtime matcher answers.
+                    None => zeroclaw_infra::net_guard::egress_host_matches(private, &egress_hosts),
+                };
+                if !granted {
                     validation_bail!(
                         InvalidFormat,
                         format!("plugins.entries.{}.egress_allow_private", entry.name),
-                        "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one",
+                        "plugins.entries.{}.egress_allow_private lists {private:?}, which is not granted by egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one. A wildcard carveout ('*.host') needs an equal-or-broader wildcard grant, not an exact one",
                         entry.name
                     );
                 }
@@ -26002,6 +26040,119 @@ enabled = true
             "error must name the offending path; got: {text}"
         );
         assert!(text.contains("not granted by egress_hosts"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_wildcard_carveouts_that_are_subsets_of_the_grant() {
+        for carveout in ["*.example.com", "*.lan.example.com"] {
+            let mut config = Config::default();
+            config.plugins.entries = vec![super::PluginEntryConfig {
+                name: "zpi1_eqwild".into(),
+                egress_hosts: vec!["*.example.com".into()],
+                egress_allow_private: vec![carveout.into()],
+                ..Default::default()
+            }];
+            assert!(
+                config.validate().is_ok(),
+                "a carveout of {carveout:?} is a subset of the *.example.com grant and must validate"
+            );
+        }
+    }
+
+    /// A wildcard carve-out must be validated the way the runtime matcher
+    /// matches it — an exact grant names an apex alone and reaches no subdomain,
+    /// so it cannot make `*.host` do anything. Compared semantically rather than
+    /// by trimming `*.` and asking whether the apex is granted.
+    #[test]
+    async fn validate_rejects_a_wildcard_carveout_under_only_an_exact_grant() {
+        let mut config = Config::default();
+        config.plugins.entries = vec![super::PluginEntryConfig {
+            name: "wild_under_exact".into(),
+            egress_hosts: vec!["api.example.com".into()],
+            egress_allow_private: vec!["*.api.example.com".into()],
+            ..Default::default()
+        }];
+        let err = config
+            .validate()
+            .expect_err("a wildcard carveout under an exact grant is inert and must be rejected");
+        let text = err.to_string();
+        assert!(
+            text.contains("egress_allow_private"),
+            "error must name the offending path; got: {text}"
+        );
+        assert!(
+            text.contains("not granted by egress_hosts"),
+            "error must explain the carveout is not granted; got: {text}"
+        );
+    }
+
+    /// The valid wildcard-carve-out shapes still pass: an equal wildcard grant,
+    /// a broader wildcard grant, and (for an exact carve-out) an exact grant.
+    #[test]
+    async fn validate_accepts_wildcard_carveouts_under_a_wildcard_grant_and_exact_under_exact() {
+        let cases: &[(&[&str], &str)] = &[
+            // equal wildcard grant
+            (&["*.api.example.com"], "*.api.example.com"),
+            // broader wildcard grant
+            (&["*.example.com"], "*.api.example.com"),
+            // exact carveout under an exact grant
+            (&["api.example.com"], "api.example.com"),
+            // exact carveout under a wildcard grant (matcher reaches it)
+            (&["*.example.com"], "host.example.com"),
+        ];
+        for (hosts, carveout) in cases {
+            let mut config = Config::default();
+            config.plugins.entries = vec![super::PluginEntryConfig {
+                name: "wild_ok".into(),
+                egress_hosts: hosts.iter().map(|h| (*h).to_string()).collect(),
+                egress_allow_private: vec![(*carveout).to_string()],
+                ..Default::default()
+            }];
+            assert!(
+                config.validate().is_ok(),
+                "carveout {carveout:?} under grant {hosts:?} must validate"
+            );
+        }
+    }
+
+    /// The shared grammar canonicalizes a bracketed IPv6 literal (`[::1]`) to
+    /// its bare form (`::1`), and the runtime matcher normalizes both egress
+    /// lists before comparing them. The carve-out relationship check must do the
+    /// same, so a granted loopback carve-out validates whether the operator
+    /// wrote it bracketed or bare — otherwise the validator rejects a config the
+    /// runtime would accept. A carve-out with no matching grant still rejects.
+    #[tokio::test]
+    async fn validate_accepts_bracketed_and_bare_ipv6_private_carveouts() {
+        for host in ["[::1]", "::1"] {
+            let mut config = Config::default();
+            config.plugins.entries = vec![super::PluginEntryConfig {
+                name: "ipv6_carveout".into(),
+                egress_hosts: vec![host.into()],
+                egress_allow_private: vec![host.into()],
+                ..Default::default()
+            }];
+            assert!(
+                config.validate().is_ok(),
+                "a granted {host:?} loopback carve-out must validate; the runtime normalizes both lists to the same canonical form"
+            );
+        }
+
+        // A genuinely ungranted IPv6 carve-out is still a typo the validator
+        // catches: canonicalizing both sides must not turn the check inert.
+        let mut config = Config::default();
+        config.plugins.entries = vec![super::PluginEntryConfig {
+            name: "ipv6_ungranted".into(),
+            egress_hosts: vec!["api.example.com".into()],
+            egress_allow_private: vec!["[::1]".into()],
+            ..Default::default()
+        }];
+        let err = config
+            .validate()
+            .expect_err("an ungranted IPv6 carve-out must be rejected");
+        assert!(
+            err.to_string().contains("not granted by egress_hosts"),
+            "error must explain the carveout is not granted; got: {err}"
+        );
     }
 
     /// The allowlist must stay in the plaintext half of the entry: an operator

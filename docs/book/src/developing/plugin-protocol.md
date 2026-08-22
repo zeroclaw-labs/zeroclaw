@@ -49,8 +49,12 @@ omits the compiled component.
   the host; it gets exactly the host functions wired into its world and nothing
   more. Outbound HTTP is the one network surface that can be opened, and only
   when the manifest grants `http_client` and that capability adapter explicitly
-  enables its tested HTTP boundary. Tool and channel adapters do; memory does
-  not yet.
+  enables its tested HTTP boundary. The tool adapter does. The channel adapter
+  links the surface but is not yet handed an egress policy, so channel HTTP is
+  deny-all, refusing every request before the network, until the channel
+  activation work wires one
+  ([#10146](https://github.com/zeroclaw-labs/zeroclaw/issues/10146)). Memory
+  does not open the surface at all yet.
 - **Verifiable provenance.** Manifests can be Ed25519-signed, and an operator
   can require signatures from trusted publishers before any plugin loads.
 
@@ -59,12 +63,16 @@ omits the compiled component.
 These are real limits of the current host, not style preferences. Know them
 before you design around a capability that is not there.
 
-- **`logging`, typed config injection, and host-fed inbound are wired; tool and
-  channel adapters also implement `http_client`.** Of the permissions a
-  manifest can declare, `config_read` exposes the plugin's own section only
-  after the host materializes and validates it against the manifest-owned
-  `config_schema`. An `http_client` grant is necessary for outbound
-  `wasi:http`, but the adapter must also opt into the host surface. Memory
+- **`logging`, typed config injection, and host-fed inbound are wired; the tool
+  adapter implements `http_client`, while the channel adapter links the same
+  surface but denies every request until an egress policy is wired.** Of the
+  permissions a manifest can declare, `config_read` exposes the plugin's own
+  section only after the host materializes and validates it against the
+  manifest-owned `config_schema`. An `http_client` grant is necessary for
+  outbound `wasi:http`, but the adapter must also opt into the host surface and
+  be handed an egress policy. The tool adapter has both; the channel adapter
+  opts into the surface but is not yet handed a policy, so channel HTTP is
+  deny-all until the channel activation work supplies one. Memory
   intentionally remains HTTP-free until its network boundary has
   component-level coverage. Filesystem and
   memory-access permissions are still accepted by the manifest schema but
@@ -72,8 +80,11 @@ before you design around a capability that is not there.
   Permissions and Host imports below.
 - **No ambient host network or filesystem.** The WASI context has no preopens and
   no ambient network, so a plugin cannot open raw sockets or read host files
-  through ambient WASI. A tool or channel plugin with an `http_client` grant
-  gets outbound `wasi:http` because those adapters opt in; it cannot listen.
+  through ambient WASI. A tool plugin with an `http_client` grant gets outbound
+  `wasi:http` because the tool adapter opts in and is handed an egress policy. A
+  channel plugin's adapter links the same surface but is not yet handed a
+  policy, so its outbound HTTP is denied until the channel activation work wires
+  one; neither can listen.
   Channel plugins that must receive inbound traffic do not open a listener
   themselves: the host runs the listener and feeds messages through the
   `inbound` import, which the plugin drains from its `poll-message` export.
@@ -438,6 +449,49 @@ fails closed before the guest starts. A plugin only ever sees its own section.
 Tool and channel are the current config consumers. The memory world has no
 config export yet, so memory plugins must not request `config_read` until that
 ABI and runtime wiring land.
+
+### Declared egress (`[egress]`)
+
+**Applies to:** any plugin requesting a transport permission (`http_client`)
+
+A manifest may carry an optional `[egress]` table naming the destinations the
+plugin declares it needs:
+
+```toml
+[egress]
+hosts = ["api.example.com", "*.cdn.example.com"]
+```
+
+Entries use the strict egress grammar: exact hosts or explicit `*.suffix`
+patterns, with no allow-all form. Invalid grammar rejects the whole manifest at
+discovery and at install. The table is part of the canonical manifest bytes, so
+a signed manifest covers it and changing it requires re-signing.
+
+This is an attestation of intent, never a grant. The allowlist the host
+enforces is the operator's `plugins.entries.<instance-key>.egress_hosts`, on the
+same `zpi1_…` row that carries the instance's private `config` map, resolved
+from live config per request rather than snapshotted into the store. A
+component shipping its own `[egress]` table without an operator grant reaches
+nothing. On this release the grant alone governs that check: the declaration is
+not additionally intersected with it at request time, so declaring a host
+neither grants it nor bounds a grant the operator authored. Intersecting the
+two is later rollout work under
+[#8850](https://github.com/zeroclaw-labs/zeroclaw/issues/8850).
+
+What the declaration buys is the install ceremony. `zeroclaw plugin install`
+seeds it into the `[[plugins.entries]]` row it creates, so a first install of a
+plugin that declares its destinations works without the operator transcribing
+hosts, and the seeded values are printed. It never extends a row that already
+exists: an upgrade whose declaration grew prints the difference plus the exact
+`zeroclaw config set` command, and the operator applies it. `zeroclaw plugin
+list` reports the same gap as a standing diagnostic. Declare the destinations
+your code actually contacts, and treat a growing declaration as something every
+operator has to approve on every upgrade.
+
+Plugins whose destination is deployment configuration (a self-hosted Gitea, a
+LAN Nextcloud) should declare nothing here. The operator authors that grant
+directly on the instance row, and a manifest that declares nothing is never
+reported as having lost destinations.
 
 ## WASI Component Host
 

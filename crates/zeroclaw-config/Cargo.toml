@@ -10,7 +10,7 @@ publish = false
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-macros.workspace = true
-# ADR-013: `plugins.entries[].egress_hosts` validates against the one shared
+# `plugins.entries[].egress_hosts` validates against the one shared
 # egress grammar in `zeroclaw_infra::net_guard`. Reimplementing the grammar here
 # would give a security-relevant rule two definitions that can drift apart.
 zeroclaw-infra.workspace = true

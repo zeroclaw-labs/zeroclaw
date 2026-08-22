@@ -746,6 +746,144 @@ mod tests {
     }
 
     #[test]
+    fn plugin_egress_grant_ceremony_strings_format_in_every_locale() {
+        // The grant ceremony is the one moment an operator is told what
+        // network reach a plugin was granted, and the `{$command}` argument is
+        // the literal `zeroclaw config set plugins.entries.<zpi1_key>...`
+        // invocation they are expected to run. A catalogue that drops the key
+        // ships the raw `{key}` sentinel; one that drops the placeholder ships
+        // a command the operator cannot execute. Assert both, in every shipped
+        // catalogue.
+        let key = "zpi1_WyJ3ZWF0aGVyLXRvb2wiLCJ0b29sIiwid2VhdGhlci10b29sIl0";
+        let command = format!("zeroclaw config set plugins.entries.{key}.egress_hosts \"a.test\"");
+        /// One catalogue assertion: key, the args it is formatted with, and
+        /// the substrings the rendered value must contain.
+        type EgressStringCase<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
+
+        let cases: [EgressStringCase<'_>; 13] = [
+            (
+                "cli-plugin-egress-seeded",
+                &[("name", "weather-tool"), ("count", "2")],
+                &["weather-tool", "2"],
+            ),
+            (
+                "cli-plugin-egress-destination",
+                &[("host", "api.example.com")],
+                &["api.example.com"],
+            ),
+            (
+                "cli-plugin-egress-edit-command",
+                &[("command", command.as_str())],
+                &[command.as_str()],
+            ),
+            (
+                "cli-plugin-egress-declared-not-granted",
+                &[("name", "weather-tool"), ("count", "1")],
+                &["weather-tool", "1"],
+            ),
+            (
+                "cli-plugin-egress-added",
+                &[("host", "api2.example.com")],
+                &["api2.example.com"],
+            ),
+            (
+                "cli-plugin-egress-apply-command",
+                &[("command", command.as_str())],
+                &[command.as_str()],
+            ),
+            (
+                "cli-plugin-egress-granted-not-declared",
+                &[("name", "weather-tool"), ("count", "1")],
+                &["weather-tool", "1"],
+            ),
+            (
+                "cli-plugin-egress-removed",
+                &[("host", "gitea.internal.test")],
+                &["gitea.internal.test"],
+            ),
+            (
+                "cli-plugin-egress-never-extended",
+                &[("name", "weather-tool")],
+                &["weather-tool"],
+            ),
+            (
+                "cli-plugin-egress-gap",
+                &[
+                    ("name", "weather-tool"),
+                    ("hosts", "api2.example.com"),
+                    ("command", command.as_str()),
+                ],
+                &["weather-tool", "api2.example.com", command.as_str()],
+            ),
+            // The legacy-row arm of the same diagnostic. Its first line must
+            // NOT carry `{$command}`: the command only works after the rename,
+            // so the ordered steps below own it.
+            (
+                "cli-plugin-egress-gap-legacy",
+                &[("name", "weather-tool"), ("hosts", "api2.example.com")],
+                &["weather-tool", "api2.example.com"],
+            ),
+            // A catalogue that drops `{$legacy}` or `{$key}` ships a rename
+            // instruction naming neither the row to rename nor the name to
+            // give it, which is worse than no instruction at all.
+            (
+                "cli-plugin-egress-migrate-step",
+                &[
+                    ("name", "weather-tool"),
+                    ("legacy", "weather-tool"),
+                    ("key", key),
+                ],
+                &["weather-tool", key],
+            ),
+            (
+                "cli-plugin-egress-grant-step",
+                &[("command", command.as_str())],
+                &[command.as_str()],
+            ),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key_name, args, must_contain) in &cases {
+                let value = format_ftl_message(source, locale, key_name, args)
+                    .unwrap_or_else(|| panic!("{key_name} should format in {locale}"));
+                assert!(
+                    !value.trim().is_empty(),
+                    "{key_name} must not be empty in {locale}"
+                );
+                for needle in *must_contain {
+                    assert!(
+                        value.contains(needle),
+                        "{key_name} in {locale} must inline {needle:?}; got: {value:?}"
+                    );
+                }
+            }
+
+            // The legacy-row headline must not carry the grant command itself.
+            // That command only resolves after the rename, so a catalogue that
+            // folds it back into the headline hands the operator the failing
+            // step before the one that makes it work.
+            let headline = format_ftl_message(
+                source,
+                locale,
+                "cli-plugin-egress-gap-legacy",
+                &[("name", "weather-tool"), ("hosts", "api2.example.com")],
+            )
+            .unwrap_or_else(|| panic!("cli-plugin-egress-gap-legacy should format in {locale}"));
+            assert!(
+                !headline.contains("zeroclaw config set"),
+                "cli-plugin-egress-gap-legacy in {locale} must leave the grant \
+                 command to the ordered steps; got: {headline:?}"
+            );
+        }
+    }
+
+    #[test]
     fn channel_approval_group_visibility_warning_is_translated_in_every_locale() {
         // This warning is what tells an operator why a stranger's reply to a
         // group approval token will bounce, so a catalogue that omits it ships

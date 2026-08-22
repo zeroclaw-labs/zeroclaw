@@ -558,6 +558,7 @@ mod tests {
             config_schema: schema,
             signature: None,
             publisher_key: None,
+            egress: Default::default(),
         }
     }
 
