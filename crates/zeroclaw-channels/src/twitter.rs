@@ -49,9 +49,24 @@ impl TwitterChannel {
         zeroclaw_config::schema::build_runtime_proxy_client("channel.twitter")
     }
 
+    /// Single-identifier convenience kept for the unit tests; the polling
+    /// path authorizes the whole identity set at once.
+    #[cfg(test)]
     fn is_user_allowed(&self, user_id: &str) -> bool {
+        self.is_author_allowed(&[user_id])
+    }
+
+    /// A tweet carries both a username and a numeric author ID for the same
+    /// account, so they are evaluated together against one snapshot of the
+    /// peer list. Checking them separately lets a deny on one be defeated by a
+    /// wildcard reached through the other.
+    fn is_author_allowed(&self, identities: &[&str]) -> bool {
         let peers = (self.peer_resolver)();
-        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
+        crate::allowlist::is_identity_allowed(
+            &peers,
+            identities,
+            crate::allowlist::Match::Sensitive,
+        )
     }
 
     /// Check and insert tweet ID for deduplication.
@@ -311,8 +326,7 @@ impl Channel for TwitterChannel {
                                 .cloned()
                                 .unwrap_or_else(|| author_id.to_string());
 
-                            if !self.is_user_allowed(&username) && !self.is_user_allowed(author_id)
-                            {
+                            if !self.is_author_allowed(&[&username, author_id]) {
                                 ::zeroclaw_log::record!(
                                     DEBUG,
                                     ::zeroclaw_log::Event::new(
@@ -475,6 +489,29 @@ mod tests {
             Arc::new(|| vec!["*".into()]),
         );
         assert!(ch.is_user_allowed("anyone"));
+    }
+
+    #[test]
+    fn twitter_deny_on_the_username_is_not_defeated_by_the_author_id() {
+        // A tweet is authorized from both identifiers, so a deny naming one of
+        // them must not lose to the wildcard evaluated against the other.
+        let ch = TwitterChannel::new(
+            "token".into(),
+            "twitter_test_alias",
+            Arc::new(|| vec!["*".into(), "!spammer".into()]),
+        );
+        assert!(!ch.is_author_allowed(&["spammer", "1234567890"]));
+        assert!(ch.is_author_allowed(&["someone", "999"]));
+    }
+
+    #[test]
+    fn twitter_deny_on_the_author_id_is_not_defeated_by_the_username() {
+        let ch = TwitterChannel::new(
+            "token".into(),
+            "twitter_test_alias",
+            Arc::new(|| vec!["*".into(), "!1234567890".into()]),
+        );
+        assert!(!ch.is_author_allowed(&["spammer", "1234567890"]));
     }
 
     #[test]

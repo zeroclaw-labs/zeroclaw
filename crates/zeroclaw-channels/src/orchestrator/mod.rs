@@ -9286,8 +9286,7 @@ fn build_channel_by_id(
                 let snapshot = wc.clone();
                 Arc::new(move || {
                     let config = cfg_arc.read();
-                    let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
-                    external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+                    let external_peers = wecom_ws_external_peers(&config, &alias);
 
                     if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
                         WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
@@ -9735,6 +9734,18 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+/// The resolved peer policy for a WeCom WebSocket alias.
+///
+/// This channel is written both `wecom-ws` and `wecom_ws` in `peer_groups`, and
+/// every startup path has to resolve both spellings in one pass: resolving them
+/// separately and concatenating leaves a wildcard under one spelling unaware of
+/// an `ignore` under the other. Named once so the one-shot and normal startup
+/// paths cannot answer this differently again.
+#[cfg(feature = "channel-wecom-ws")]
+pub(crate) fn wecom_ws_external_peers(config: &Config, alias: &str) -> Vec<String> {
+    config.channel_external_peers_for(&["wecom-ws", "wecom_ws"], alias)
+}
+
 /// Compose the registry key for a channel given its `name()` and configured alias.
 /// Aliased channels live at `<name>.<alias>`; un-aliased singletons keep the bare name.
 pub(crate) fn composite_channel_key(name: &str, alias: Option<&str>) -> String {
@@ -9983,6 +9994,15 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
         .parent()
         .map(|p| p.join("state").join("matrix").join(alias))
         .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
+}
+
+#[cfg(any(feature = "channel-bluesky", feature = "channel-reddit"))]
+fn live_external_peer_resolver(
+    config: Arc<RwLock<Config>>,
+    channel_type: &'static str,
+    alias: String,
+) -> Arc<dyn Fn() -> Vec<String> + Send + Sync> {
+    Arc::new(move || config.read().channel_external_peers(channel_type, &alias))
 }
 
 fn collect_configured_channels(
@@ -11232,8 +11252,7 @@ fn collect_configured_channels(
             let snapshot = wc_ws.clone();
             Arc::new(move || {
                 let config = cfg_arc.read();
-                let mut external_peers = config.channel_external_peers("wecom-ws", &alias);
-                external_peers.extend(config.channel_external_peers("wecom_ws", &alias));
+                let external_peers = wecom_ws_external_peers(&config, &alias);
 
                 if let Some(wc_ws) = config.channels.wecom_ws.get(&alias) {
                     WeComWsRuntimePolicy::from_config(wc_ws, external_peers)
@@ -11409,6 +11428,8 @@ fn collect_configured_channels(
         if !rd.enabled {
             continue;
         }
+        let peer_resolver =
+            live_external_peer_resolver(Arc::clone(config_arc), "reddit", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Reddit",
             alias: Some(alias.clone()),
@@ -11419,6 +11440,7 @@ fn collect_configured_channels(
                 rd.refresh_token.clone(),
                 rd.username.clone(),
                 rd.subreddits.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -11442,6 +11464,8 @@ fn collect_configured_channels(
         if !bs.enabled {
             continue;
         }
+        let peer_resolver =
+            live_external_peer_resolver(Arc::clone(config_arc), "bluesky", alias.clone());
         channels.push(ConfiguredChannel {
             display_name: "Bluesky",
             alias: Some(alias.clone()),
@@ -11449,6 +11473,7 @@ fn collect_configured_channels(
                 alias.clone(),
                 bs.handle.clone(),
                 bs.app_password.clone(),
+                peer_resolver,
             )),
         });
     }
@@ -13258,6 +13283,51 @@ pub(crate) mod tests {
     const ASSEMBLY_HANG_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
     use zeroclaw_runtime::agent::loop_::apply_policy_tool_filter;
     use zeroclaw_runtime::agent::loop_::build_tool_instructions;
+
+    #[cfg(feature = "channel-reddit")]
+    #[test]
+    fn reddit_peer_resolver_uses_the_production_alias() {
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.ops]
+            channel = "reddit.ops"
+            external_peers = ["authorized-redditor"]
+
+            [peer_groups.other]
+            channel = "reddit.other"
+            external_peers = ["wrong-redditor"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        let resolver =
+            live_external_peer_resolver(Arc::new(RwLock::new(config)), "reddit", "ops".to_string());
+
+        assert_eq!(resolver(), vec!["authorized-redditor".to_string()]);
+    }
+
+    #[cfg(feature = "channel-bluesky")]
+    #[test]
+    fn bluesky_peer_resolver_uses_the_production_alias() {
+        let config: Config = toml::from_str(
+            r#"
+            [peer_groups.work]
+            channel = "bluesky.work"
+            external_peers = ["allowed.bsky.social"]
+
+            [peer_groups.other]
+            channel = "bluesky.other"
+            external_peers = ["wrong.bsky.social"]
+            "#,
+        )
+        .expect("peer-group config should parse");
+        let resolver = live_external_peer_resolver(
+            Arc::new(RwLock::new(config)),
+            "bluesky",
+            "work".to_string(),
+        );
+
+        assert_eq!(resolver(), vec!["allowed.bsky.social".to_string()]);
+    }
 
     /// Runs a channel-dispatch test on an explicit stack because its async
     /// future can exceed the default test-thread stack on hosted CI.

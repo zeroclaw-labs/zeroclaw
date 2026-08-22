@@ -257,6 +257,15 @@ async fn persist_line_paired_identity(state: &LineState, user_id: &str) -> anyho
         if !cfg.channels.line.contains_key(&state.alias) {
             anyhow::bail!("Missing [channels.line.{}] section", state.alias);
         }
+        if let Some(conflict) = crate::allowlist::pairing_deny_conflict(
+            &cfg.channel_external_peers("line", &state.alias),
+            "line",
+            &state.alias,
+            &normalized,
+            |entry, user| entry == user,
+        ) {
+            anyhow::bail!(conflict);
+        }
         let group = cfg
             .peer_groups
             .entry(group_name)
@@ -722,7 +731,9 @@ impl LineChannel {
 
         let alias = alias.into();
         let configured_peers = peer_resolver();
-        let pairing = if dm_policy == LineDmPolicy::Pairing && configured_peers.is_empty() {
+        let pairing = if dm_policy == LineDmPolicy::Pairing
+            && !crate::allowlist::grants_anyone(&configured_peers)
+        {
             let guard = PairingGuard::new(true, &[]);
             if let Some(code) = guard.pairing_code() {
                 // Mirror Telegram/WeChat: a backgrounded daemon discards

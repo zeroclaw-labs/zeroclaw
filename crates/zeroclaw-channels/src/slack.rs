@@ -4362,7 +4362,7 @@ impl SlackChannel {
                                 "alias": self.alias,
                                 "allowed_peer_count": allowed_peers.len(),
                             })),
-                        if allowed_peers.is_empty() {
+                        if !crate::allowlist::grants_anyone(&allowed_peers) {
                             "ignoring message: no peers resolved for this channel — add a [peer_groups.<name>] with channel = \"slack.<alias>\" and external_peers (use [\"*\"] to allow everyone)"
                         } else {
                             "ignoring message from unauthorized user"
@@ -5743,7 +5743,7 @@ impl Channel for SlackChannel {
                                     "alias": self.alias,
                                     "allowed_peer_count": allowed_peers.len(),
                                 })),
-                                if allowed_peers.is_empty() {
+                                if !crate::allowlist::grants_anyone(&allowed_peers) {
                                     "ignoring message: no peers resolved for this channel — add a [peer_groups.<name>] with channel = \"slack.<alias>\" and external_peers (use [\"*\"] to allow everyone)"
                                 } else {
                                     "ignoring message from unauthorized user"

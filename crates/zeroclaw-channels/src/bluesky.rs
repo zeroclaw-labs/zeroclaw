@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -10,6 +11,9 @@ pub struct BlueskyChannel {
     alias: String,
     handle: String,
     app_password: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// The resolver reads live configuration and is not cached.
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     auth: Mutex<BlueskyAuth>,
 }
 
@@ -44,6 +48,19 @@ struct RefreshSessionResponse {
 struct NotificationListResponse {
     notifications: Vec<Notification>,
     cursor: Option<String>,
+}
+
+struct NotificationPage {
+    messages: Vec<ChannelMessage>,
+    next_cursor: Option<String>,
+}
+
+/// One page walk that reached the read boundary. Its existence is the
+/// precondition for delivering anything: a partial walk produces no value, so
+/// there is nothing to send and nothing to commit.
+struct CompletedWalk {
+    messages: Vec<ChannelMessage>,
+    newest_unread: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -101,11 +118,17 @@ struct PostRef {
 }
 
 impl BlueskyChannel {
-    pub fn new(alias: String, handle: String, app_password: String) -> Self {
+    pub fn new(
+        alias: String,
+        handle: String,
+        app_password: String,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+    ) -> Self {
         Self {
             alias,
             handle,
             app_password,
+            peer_resolver,
             auth: Mutex::new(BlueskyAuth {
                 access_jwt: String::new(),
                 refresh_jwt: String::new(),
@@ -117,6 +140,28 @@ impl BlueskyChannel {
 
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_runtime_proxy_client("channel.bluesky")
+    }
+
+    /// Strip the leading `@` an operator is likely to paste from the app.
+    fn normalize_identity(value: &str) -> &str {
+        value.trim().trim_start_matches('@')
+    }
+
+    /// A peer group may list either the mutable handle or the stable DID, so
+    /// an operator is not forced to re-approve an account that renames itself.
+    ///
+    /// Compared case-insensitively: AT Protocol normalizes handles to lowercase
+    /// and `did:plc` identifiers are lowercase, so two distinct accounts cannot
+    /// differ only by case and this admits no one extra.
+    /// An account is reachable by handle or DID, so both are evaluated against
+    /// one snapshot of the peer list: a deny on either identifier rejects the
+    /// account, and resolving once means a config reload cannot land between
+    /// the two checks.
+    fn is_author_allowed(&self, handle: &str, did: &str) -> bool {
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_identity_allowed_by(&peers, &[handle, did], |entry, user| {
+            Self::normalize_identity(entry).eq_ignore_ascii_case(Self::normalize_identity(user))
+        })
     }
 
     /// Create a new session with handle + app password.
@@ -222,6 +267,24 @@ impl BlueskyChannel {
             return None;
         }
 
+        // Bluesky is a public network, so being mentioned is not consent to be
+        // driven. An empty peer group denies everyone; `"*"` is the explicit
+        // opt-in for a public bot.
+        //
+        // Either identifier may carry the grant, so the deny has to be checked
+        // across both before the grants are: an operator who ignores the handle
+        // would otherwise still be overridden by a wildcard reached through the
+        // DID, and vice versa.
+        if !self.is_author_allowed(&notif.author.handle, &notif.author.did) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"handle": notif.author.handle})),
+                "ignoring notification from unauthorized sender"
+            );
+            return None;
+        }
+
         // Extract text from the record
         let text = notif
             .record
@@ -265,6 +328,81 @@ impl BlueskyChannel {
 
             ..Default::default()
         })
+    }
+
+    /// Process one newest-first notification page and decide whether polling
+    /// must continue. The seen watermark advances for every examined unread
+    /// notification, including notifications rejected by authorization.
+    fn process_notification_page(
+        &self,
+        listing: &NotificationListResponse,
+        newest_unread: &mut Option<String>,
+    ) -> NotificationPage {
+        let mut reached_read_boundary = false;
+        let mut messages = Vec::new();
+
+        for notification in &listing.notifications {
+            if notification.is_read {
+                reached_read_boundary = true;
+            } else if newest_unread.is_none() {
+                // listNotifications is newest-first, so the first unread item
+                // across the page walk is the watermark updateSeen needs.
+                *newest_unread = Some(notification.indexed_at.clone());
+            }
+
+            if let Some(message) = self.parse_notification(notification) {
+                messages.push(message);
+            }
+        }
+
+        NotificationPage {
+            messages,
+            next_cursor: (!reached_read_boundary)
+                .then(|| listing.cursor.clone())
+                .flatten(),
+        }
+    }
+
+    /// Walk the unread notification pages newest-first and collect every
+    /// accepted message, or `None` if the walk did not reach the read
+    /// boundary.
+    ///
+    /// Nothing is returned for a partial walk, so delivery and the seen
+    /// watermark can only move together: page one is not handed to the caller
+    /// until the pages behind it have also been examined. `fetch_page` yields
+    /// `None` for a failure it has already reported.
+    async fn walk_unread_notifications<F, Fut>(&self, fetch_page: F) -> Option<CompletedWalk>
+    where
+        F: Fn(Option<String>) -> Fut,
+        Fut: std::future::Future<Output = Option<NotificationListResponse>>,
+    {
+        let mut cursor: Option<String> = None;
+        let mut seen_cursors = std::collections::HashSet::new();
+        let mut newest_unread: Option<String> = None;
+        let mut messages = Vec::new();
+
+        loop {
+            let listing = fetch_page(cursor.clone()).await?;
+            let page = self.process_notification_page(&listing, &mut newest_unread);
+            messages.extend(page.messages);
+
+            let Some(next_cursor) = page.next_cursor else {
+                return Some(CompletedWalk {
+                    messages,
+                    newest_unread,
+                });
+            };
+            if !seen_cursors.insert(next_cursor.clone()) {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    "notification pagination returned a repeated cursor"
+                );
+                return None;
+            }
+            cursor = Some(next_cursor);
+        }
     }
 
     /// Mark notifications as read up to a given timestamp.
@@ -405,64 +543,89 @@ impl Channel for BlueskyChannel {
             };
 
             let client = self.http_client();
-            let resp = match client
-                .get(format!(
-                    "{BSKY_API_BASE}/app.bsky.notification.listNotifications"
-                ))
-                .bearer_auth(&token)
-                .query(&[("limit", "25")])
-                .send()
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "poll error"
-                    );
-                    continue;
-                }
-            };
+            let walk = self
+                .walk_unread_notifications(|cursor| {
+                    let client = client.clone();
+                    let token = token.clone();
+                    async move {
+                        let mut query = vec![("limit", "25")];
+                        if let Some(value) = cursor.as_deref() {
+                            query.push(("cursor", value));
+                        }
 
-            if !resp.status().is_success() {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                    &format!("notifications failed: {}", resp.status())
-                );
-                continue;
-            }
+                        let resp = match client
+                            .get(format!(
+                                "{BSKY_API_BASE}/app.bsky.notification.listNotifications"
+                            ))
+                            .bearer_auth(&token)
+                            .query(&query)
+                            .send()
+                            .await
+                        {
+                            Ok(response) => response,
+                            Err(error) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                                    "poll error"
+                                );
+                                return None;
+                            }
+                        };
 
-            let listing: NotificationListResponse = match resp.json().await {
-                Ok(l) => l,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "parse error"
-                    );
-                    continue;
-                }
-            };
+                        if !resp.status().is_success() {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!("notifications failed: {}", resp.status())
+                            );
+                            return None;
+                        }
 
-            let mut latest_indexed_at: Option<String> = None;
-            for notif in &listing.notifications {
-                if let Some(msg) = self.parse_notification(notif) {
-                    latest_indexed_at = Some(notif.indexed_at.clone());
-                    if tx.send(msg).await.is_err() {
-                        return Ok(());
+                        match resp.json::<NotificationListResponse>().await {
+                            Ok(listing) => Some(listing),
+                            Err(error) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{error}")})),
+                                    "parse error"
+                                );
+                                None
+                            }
+                        }
                     }
+                })
+                .await;
+
+            // A partial walk yields no messages at all, so a page failure
+            // cannot leave earlier pages delivered with the watermark behind
+            // them. The whole unread range is re-walked on the next poll.
+            let Some(walk) = walk else {
+                continue;
+            };
+
+            for message in walk.messages {
+                if tx.send(message).await.is_err() {
+                    return Ok(());
                 }
             }
 
             // Mark as seen
-            if let Some(ref seen_at) = latest_indexed_at
+            if let Some(ref seen_at) = walk.newest_unread
                 && let Err(e) = self.update_seen(seen_at).await
             {
                 ::zeroclaw_log::record!(
@@ -473,8 +636,6 @@ impl Channel for BlueskyChannel {
                     "updateSeen error"
                 );
             }
-
-            let _ = &listing.cursor; // cursor available for pagination if needed
         }
     }
 
@@ -496,11 +657,26 @@ impl Channel for BlueskyChannel {
 mod tests {
     use super::*;
 
+    /// The senders the shared fixtures use. Tests that care about the
+    /// authorization boundary itself build their own peer set.
+    fn default_peers() -> Vec<String> {
+        vec![
+            "user1.bsky.social".to_string(),
+            "user2.bsky.social".to_string(),
+            "did:plc:test123".to_string(),
+        ]
+    }
+
     fn make_channel() -> BlueskyChannel {
+        make_channel_with_peers(default_peers())
+    }
+
+    fn make_channel_with_peers(peers: Vec<String>) -> BlueskyChannel {
         let ch = BlueskyChannel::new(
             "testbot".into(),
             "testbot.bsky.social".into(),
             "app-password".into(),
+            Arc::new(move || peers.clone()),
         );
         // Seed auth with a DID for tests
         {
@@ -595,6 +771,123 @@ mod tests {
     }
 
     #[test]
+    fn denied_full_page_does_not_starve_authorized_notification_behind_it() {
+        let ch = make_channel_with_peers(vec!["allowed.bsky.social".to_string()]);
+        let first_page = NotificationListResponse {
+            notifications: (0..25)
+                .map(|index| {
+                    make_notification(
+                        "mention",
+                        &format!("denied{index}.bsky.social"),
+                        &format!("did:plc:denied{index}"),
+                        "@testbot denied",
+                        false,
+                    )
+                })
+                .collect(),
+            cursor: Some("second-page".to_string()),
+        };
+        let second_page = NotificationListResponse {
+            notifications: vec![make_notification(
+                "mention",
+                "allowed.bsky.social",
+                "did:plc:allowed",
+                "@testbot authorized",
+                false,
+            )],
+            cursor: None,
+        };
+        let mut newest_unread = None;
+
+        let first = ch.process_notification_page(&first_page, &mut newest_unread);
+        assert!(first.messages.is_empty());
+        assert_eq!(first.next_cursor.as_deref(), Some("second-page"));
+        assert!(
+            newest_unread.is_some(),
+            "denied notifications must still advance the eventual seen watermark"
+        );
+
+        let second = ch.process_notification_page(&second_page, &mut newest_unread);
+        assert_eq!(second.messages.len(), 1);
+        assert_eq!(second.messages[0].sender, "allowed.bsky.social");
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_partial_page_walk_delivers_nothing_and_the_retry_delivers_once() {
+        // Dispatching each page as it arrived meant a page-two failure left
+        // page one delivered while the watermark stayed put, so every five
+        // second poll delivered page one again for as long as the failure
+        // lasted.
+        let ch = make_channel_with_peers(vec!["*".to_string()]);
+        let page_one = || NotificationListResponse {
+            notifications: vec![make_notification(
+                "mention",
+                "allowed.bsky.social",
+                "did:plc:allowed",
+                "@testbot first page",
+                false,
+            )],
+            cursor: Some("second-page".to_string()),
+        };
+        let page_two = || NotificationListResponse {
+            notifications: vec![make_notification(
+                "mention",
+                "allowed.bsky.social",
+                "did:plc:allowed",
+                "@testbot second page",
+                false,
+            )],
+            cursor: None,
+        };
+
+        let fetches = std::cell::Cell::new(0);
+        let partial = ch
+            .walk_unread_notifications(|cursor| {
+                fetches.set(fetches.get() + 1);
+                let listing = match cursor.as_deref() {
+                    None => Some(page_one()),
+                    Some("second-page") => None,
+                    other => panic!("unexpected cursor {other:?}"),
+                };
+                async move { listing }
+            })
+            .await;
+        assert!(
+            partial.is_none(),
+            "a page-two failure must not hand page one's message to the caller"
+        );
+        assert_eq!(fetches.get(), 2, "the walk must have reached page two");
+
+        let retried = ch
+            .walk_unread_notifications(|cursor| {
+                let listing = match cursor.as_deref() {
+                    None => Some(page_one()),
+                    Some("second-page") => Some(page_two()),
+                    other => panic!("unexpected cursor {other:?}"),
+                };
+                async move { listing }
+            })
+            .await
+            .expect("a walk that reaches the read boundary must yield its messages");
+
+        let delivered: Vec<&str> = retried
+            .messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(
+            delivered,
+            vec!["@testbot first page", "@testbot second page"],
+            "page one is delivered by the retry, and only by the retry"
+        );
+        assert!(
+            retried.newest_unread.is_some(),
+            "the watermark commits with the delivery, not before it"
+        );
+    }
+
+    #[test]
     fn skip_like_notifications() {
         let ch = make_channel();
         let notif = make_notification(
@@ -633,6 +926,180 @@ mod tests {
         let parts: Vec<&str> = msg.reply_target.splitn(2, '|').collect();
         assert_eq!(parts.len(), 2);
         assert!(parts[0].starts_with("at://"));
+    }
+
+    #[test]
+    fn drops_notification_from_unauthorized_sender() {
+        let ch = make_channel();
+        let notif = make_notification(
+            "mention",
+            "intruder.bsky.social",
+            "did:plc:intruder",
+            "@testbot run something",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_none());
+    }
+
+    #[test]
+    fn drops_reply_from_unauthorized_sender() {
+        let ch = make_channel();
+        let notif = make_notification(
+            "reply",
+            "intruder.bsky.social",
+            "did:plc:intruder",
+            "replying to your post",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_none());
+    }
+
+    #[test]
+    fn empty_peer_group_denies_everyone() {
+        let ch = make_channel_with_peers(Vec::new());
+        let notif = make_notification(
+            "mention",
+            "user1.bsky.social",
+            "did:plc:user1",
+            "@testbot hello",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_none());
+    }
+
+    #[test]
+    fn wildcard_peer_allows_a_public_bot() {
+        let ch = make_channel_with_peers(vec!["*".to_string()]);
+        let notif = make_notification(
+            "mention",
+            "anyone.bsky.social",
+            "did:plc:anyone",
+            "@testbot hello",
+            false,
+        );
+
+        let msg = ch.parse_notification(&notif).unwrap();
+        assert_eq!(msg.sender, "anyone.bsky.social");
+    }
+
+    #[test]
+    fn ignored_peer_is_denied_under_a_wildcard_grant() {
+        // The list shape `Config::channel_external_peers` produces when one
+        // matching group grants `["*"]` and another ignores a sender.
+        let ch = make_channel_with_peers(vec!["*".to_string(), "!alice.bsky.social".to_string()]);
+
+        let denied = make_notification(
+            "mention",
+            "alice.bsky.social",
+            "did:plc:alice",
+            "@testbot hello",
+            false,
+        );
+        assert!(
+            ch.parse_notification(&denied).is_none(),
+            "an ignored sender must not ride the wildcard"
+        );
+
+        let allowed = make_notification(
+            "mention",
+            "bob.bsky.social",
+            "did:plc:bob",
+            "@testbot hello",
+            false,
+        );
+        assert_eq!(
+            ch.parse_notification(&allowed)
+                .expect("an unignored sender still rides the wildcard")
+                .sender,
+            "bob.bsky.social"
+        );
+    }
+
+    #[test]
+    fn ignoring_one_identifier_denies_the_account_through_the_other() {
+        // An account is reachable by handle or DID and either may carry the
+        // grant, so ignoring one identifier must not leave the wildcard
+        // reachable through the other.
+        let by_handle =
+            make_channel_with_peers(vec!["*".to_string(), "!alice.bsky.social".to_string()]);
+        let by_did = make_channel_with_peers(vec!["*".to_string(), "!did:plc:alice".to_string()]);
+        let notif = make_notification(
+            "mention",
+            "alice.bsky.social",
+            "did:plc:alice",
+            "@testbot hello",
+            false,
+        );
+
+        assert!(
+            by_handle.parse_notification(&notif).is_none(),
+            "handle deny must not be defeated by a wildcard reached via the DID"
+        );
+        assert!(
+            by_did.parse_notification(&notif).is_none(),
+            "DID deny must not be defeated by a wildcard reached via the handle"
+        );
+    }
+
+    #[test]
+    fn peer_listed_by_did_is_allowed_after_a_handle_rename() {
+        let ch = make_channel_with_peers(vec!["did:plc:user1".to_string()]);
+        let notif = make_notification(
+            "mention",
+            "renamed.bsky.social",
+            "did:plc:user1",
+            "@testbot hello",
+            false,
+        );
+
+        let msg = ch.parse_notification(&notif).unwrap();
+        assert_eq!(msg.sender, "renamed.bsky.social");
+    }
+
+    #[test]
+    fn peer_entry_may_carry_a_leading_at_sign() {
+        // The docs promise a leading `@` is stripped, so an operator pasting
+        // the handle as the app displays it is not silently denied.
+        let ch = make_channel_with_peers(vec!["@user1.bsky.social".to_string()]);
+        let notif = make_notification(
+            "mention",
+            "user1.bsky.social",
+            "did:plc:user1",
+            "@testbot hello",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_some());
+    }
+
+    #[test]
+    fn peers_are_resolved_per_message_not_cached() {
+        let peers = Arc::new(Mutex::new(Vec::<String>::new()));
+        let ch = {
+            let peers = peers.clone();
+            let ch = BlueskyChannel::new(
+                "testbot".into(),
+                "testbot.bsky.social".into(),
+                "app-password".into(),
+                Arc::new(move || peers.lock().clone()),
+            );
+            ch.auth.lock().did = "did:plc:test123".into();
+            ch
+        };
+        let notif = make_notification(
+            "mention",
+            "user1.bsky.social",
+            "did:plc:user1",
+            "@testbot hello",
+            false,
+        );
+
+        assert!(ch.parse_notification(&notif).is_none());
+        peers.lock().push("user1.bsky.social".to_string());
+        assert!(ch.parse_notification(&notif).is_some());
     }
 
     #[test]

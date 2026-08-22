@@ -705,7 +705,7 @@ impl WeChatChannel {
         let cdn_base_url = https_base_url("cdn_base_url", cdn_base_url, CDN_BASE_URL)?;
 
         let alias = alias.into();
-        let has_peers = !peer_resolver().is_empty();
+        let has_peers = crate::allowlist::grants_anyone(&peer_resolver());
         let pairing = if has_peers {
             None
         } else {
@@ -983,9 +983,17 @@ impl WeChatChannel {
         self.context_tokens.lock().get(user_id).cloned()
     }
 
+    /// WeChat IDs are case-sensitive, so two spellings that differ only in
+    /// case are two accounts. Admission and paired-identity persistence share
+    /// this so the writer cannot mistake one for the other and skip a write
+    /// the runtime then needs.
+    fn identity_matches(entry: &str, user_id: &str) -> bool {
+        entry == user_id
+    }
+
     fn is_user_allowed(&self, user_id: &str) -> bool {
         let peers = (self.peer_resolver)();
-        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
+        crate::allowlist::is_user_allowed_by(&peers, user_id, Self::identity_matches)
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
@@ -994,6 +1002,7 @@ impl WeChatChannel {
             "wechat",
             &self.alias,
             identity,
+            Self::identity_matches,
         )
         .await
     }
@@ -2863,6 +2872,66 @@ mod tests {
         .unwrap();
         assert!(ch.is_user_allowed("user1@im.wechat"));
         assert!(!ch.is_user_allowed("user2@im.wechat"));
+    }
+
+    /// Config to writer to runtime, on the distinction WeChat makes and the
+    /// shared writer used not to. A grant that differs only in case is a
+    /// different account here, so treating it as already authorized skips the
+    /// write the runtime needs and the paired user stays unrecognized.
+    #[test]
+    fn wechat_pairing_writes_a_grant_a_case_distinct_one_does_not_cover() {
+        use zeroclaw_config::multi_agent::{PeerGroupConfig, PeerUsername};
+        use zeroclaw_config::providers::ChannelRef;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.wechat.insert(
+            "admin".to_string(),
+            zeroclaw_config::schema::WeChatConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.peer_groups.insert(
+            "wechat_admin".to_string(),
+            PeerGroupConfig {
+                channel: ChannelRef::new("wechat.admin".to_string()),
+                external_peers: vec![PeerUsername::new("USER1@im.wechat".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let channel_over = |cfg: &zeroclaw_config::schema::Config| {
+            let peers = cfg.channel_external_peers("wechat", "admin");
+            WeChatChannel::new(
+                "admin",
+                Arc::new(move || peers.clone()),
+                None,
+                None,
+                Some("/tmp/test-wechat".into()),
+            )
+            .expect("channel builds")
+        };
+
+        assert!(
+            !channel_over(&config).is_user_allowed("user1@im.wechat"),
+            "WeChat IDs are case-sensitive, so the existing grant is another account"
+        );
+
+        assert!(
+            crate::identity_persist::merge_external_peer(
+                &mut config,
+                "wechat",
+                "admin",
+                "user1@im.wechat",
+                WeChatChannel::identity_matches,
+            )
+            .expect("merge succeeds"),
+            "the case-distinct grant does not already authorize this identity"
+        );
+        assert!(
+            channel_over(&config).is_user_allowed("user1@im.wechat"),
+            "the paired identity is admissible under the channel's own matcher"
+        );
     }
 
     #[tokio::test]
