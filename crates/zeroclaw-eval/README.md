@@ -12,11 +12,11 @@ measure model quality — that is the live mode added in a later phase.
 ## CLI
 
 ```bash
-# Replay every *.json fixture in the suite directory (defaults to ./evals)
+# Replay every *.json fixture in the suite directory (defaults to ./evals/regression)
 zeroclaw eval run
 
 # Point at an explicit suite, emit machine-readable JSON
-zeroclaw eval run --suite evals --format json
+zeroclaw eval run --suite evals/regression --format json
 ```
 
 Exits non-zero if any case fails, so it can gate CI. `--mode live` is reserved for
