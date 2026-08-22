@@ -29,6 +29,7 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "model_provider.copilot",
     "model_provider.gemini",
     "model_provider.glm",
+    "model_provider.hailo_ollama",
     "model_provider.ollama",
     "model_provider.openai",
     "model_provider.openrouter",
@@ -1320,6 +1321,40 @@ pub struct OllamaModelProviderConfig {
     /// backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temperature_override: Option<f64>,
+}
+
+// ── Hailo-Ollama (native local-default endpoint) ──
+
+/// Native Hailo-Ollama loopback endpoint used when an alias omits `uri`.
+pub const HAILO_OLLAMA_DEFAULT_URI: &str = "http://localhost:8000";
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HailoOllamaEndpoint {
+    #[default]
+    LocalDefault,
+}
+
+impl ModelEndpoint for HailoOllamaEndpoint {
+    fn uri(&self) -> &'static str {
+        match self {
+            Self::LocalDefault => HAILO_OLLAMA_DEFAULT_URI,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.hailo_ollama"]
+pub struct HailoOllamaModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_timeout_secs: Option<u64>,
 }
 
 // ── Together ──
@@ -3330,6 +3365,7 @@ impl_default_family_endpoint! {
     AtomicChatModelProviderConfig,
     OpenRouterModelProviderConfig,
     OllamaModelProviderConfig,
+    HailoOllamaModelProviderConfig,
     TogetherModelProviderConfig,
     FireworksModelProviderConfig,
     GroqModelProviderConfig,
@@ -9904,6 +9940,42 @@ impl ProxyConfig {
         }
     }
 
+    /// Apply a selected proxy to a client builder without falling back to
+    /// direct traffic when proxy construction fails.
+    pub fn try_apply_to_reqwest_builder(
+        &self,
+        mut builder: reqwest::ClientBuilder,
+        service_key: &str,
+    ) -> Result<reqwest::ClientBuilder> {
+        if !self.should_apply_to_service(service_key) {
+            return Ok(builder);
+        }
+
+        let no_proxy = self.no_proxy_value();
+
+        if let Some(url) = normalize_proxy_url_option(self.all_proxy.as_deref()) {
+            let proxy = reqwest::Proxy::all(&url)
+                .with_context(|| format!("Invalid all_proxy URL for {service_key}"))?;
+            builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
+        }
+
+        if let Some(url) = normalize_proxy_url_option(self.http_proxy.as_deref()) {
+            let proxy = reqwest::Proxy::http(&url)
+                .with_context(|| format!("Invalid http_proxy URL for {service_key}"))?;
+            builder = builder.proxy(apply_no_proxy(proxy, no_proxy.clone()));
+        }
+
+        if let Some(url) = normalize_proxy_url_option(self.https_proxy.as_deref()) {
+            let proxy = reqwest::Proxy::https(&url)
+                .with_context(|| format!("Invalid https_proxy URL for {service_key}"))?;
+            builder = builder.proxy(apply_no_proxy(proxy, no_proxy));
+        }
+
+        Ok(builder)
+    }
+
+    /// Apply a selected proxy to a client builder, preserving the legacy
+    /// best-effort behavior for callers that may fall back to direct traffic.
     pub fn apply_to_reqwest_builder(
         &self,
         mut builder: reqwest::ClientBuilder,
@@ -10481,6 +10553,21 @@ pub fn runtime_proxy_config() -> ProxyConfig {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
     }
+}
+
+pub fn try_apply_runtime_proxy_to_builder(
+    builder: reqwest::ClientBuilder,
+    service_key: &str,
+) -> Result<reqwest::ClientBuilder> {
+    let proxy = runtime_proxy_config();
+    if proxy.should_apply_to_service(service_key) {
+        proxy.validate().map_err(|_| {
+            anyhow::Error::msg(format!(
+                "Invalid runtime proxy configuration for {service_key}"
+            ))
+        })?;
+    }
+    proxy.try_apply_to_reqwest_builder(builder, service_key)
 }
 
 pub fn apply_runtime_proxy_to_builder(
@@ -31862,6 +31949,70 @@ api_token = "tok"
                 .collect_warnings()
                 .iter()
                 .all(|warning| warning.code != "proxy_conflicts_with_dns_pinned_tools")
+        );
+    }
+
+    #[test]
+    async fn proxy_config_accepts_exact_hailo_model_provider_selector() {
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        };
+
+        proxy
+            .validate()
+            .expect("canonical Hailo selector validates");
+        assert!(ProxyConfig::supported_service_keys().contains(&"model_provider.hailo_ollama"));
+        assert!(proxy.should_apply_to_service("model_provider.hailo_ollama"));
+        assert!(!proxy.should_apply_to_service("model_provider.ollama"));
+    }
+
+    #[test]
+    async fn selected_invalid_proxy_fails_closed_when_applying_to_a_client_builder() {
+        let proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://[::1".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        };
+
+        let error = proxy
+            .try_apply_to_reqwest_builder(reqwest::Client::builder(), "model_provider.hailo_ollama")
+            .expect_err("selected invalid proxy must fail before a direct client is built");
+        assert!(error.to_string().contains("Invalid http_proxy URL"));
+
+        let _ = proxy
+            .try_apply_to_reqwest_builder(reqwest::Client::builder(), "model_provider.ollama")
+            .expect("unselected proxy must not affect another provider");
+    }
+
+    #[test]
+    async fn selected_invalid_runtime_proxy_fails_closed_before_client_construction() {
+        let _env_guard = env_override_lock().await;
+        let previous = runtime_proxy_config();
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://[::1".into()),
+            scope: ProxyScope::Services,
+            services: vec!["model_provider.hailo_ollama".into()],
+            ..Default::default()
+        });
+
+        let result = try_apply_runtime_proxy_to_builder(
+            reqwest::Client::builder(),
+            "model_provider.hailo_ollama",
+        );
+        set_runtime_proxy_config(previous);
+
+        let error = result.expect_err("selected invalid runtime proxy must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid runtime proxy configuration for model_provider.hailo_ollama")
         );
     }
 
