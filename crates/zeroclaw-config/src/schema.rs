@@ -22633,6 +22633,18 @@ impl Config {
     /// the path is not a map-keyed entry). The bool is advisory; statement-callers
     /// that do not distinguish the reserved case may ignore it.
     ///
+    /// When it newly creates the alias, it also guarantees no phantom is left
+    /// behind: if `path` still doesn't resolve afterward (e.g. an unknown tail
+    /// field), the just-created alias is rolled back before returning, so the
+    /// caller never observes a half-materialized entry from this probe alone.
+    ///
+    /// Failures that happen *after* this returns (value coercion, a masked
+    /// secret, or a `set_prop` parse error) are the caller's to contain. The
+    /// RPC `config_set` path does so by mutating a cloned `Config` and only
+    /// committing it on full success, so a discarded attempt drops the alias
+    /// with the clone — no tracked-tuple mirror of config transaction state is
+    /// exposed to the runtime.
+    ///
     /// `#[resource_key]` sections are excluded. Their keys are values drawn from
     /// another domain (model id, voice, tool name) and may themselves contain
     /// dots, so the first-dot split below would read
@@ -22694,7 +22706,21 @@ impl Config {
             );
             return true;
         }
-        let _ = self.create_map_key(section, alias);
+        // Roll back on the same `Ok(true)` == "newly created" signal the CLI
+        // helper `ensure_map_key_for_prop_path` (src/main.rs) uses: never gate
+        // this on the earlier `get_map_keys` pre-check, or a bogus tail field
+        // on an already-existing alias would delete a legitimate config entry.
+        if matches!(self.create_map_key(section, alias), Ok(true))
+            && self.get_prop(path).is_err()
+            // A missing entry under a dynamic secret map is a valid first
+            // write, not an unknown schema tail. `get_prop` can only read
+            // keys that already exist, while the generated `set_prop`
+            // intentionally inserts them. The static secret classifier
+            // recognizes the map prefix without requiring the key to exist.
+            && !Self::prop_is_secret(path)
+        {
+            let _ = self.delete_map_key(section, alias);
+        }
         false
     }
 
@@ -22702,13 +22728,50 @@ impl Config {
         self.dirty_paths.clear();
     }
 
+    /// Refuse paths whose bytes identify both a complete live map key and a
+    /// field below a shorter live key. Mutation routes to the shorter key,
+    /// while whole-entry persistence must treat the exact key as canonical;
+    /// rejecting before either operation keeps memory and disk aligned.
+    fn reject_ambiguous_persistent_map_key_path(&self, name: &str) -> Result<()> {
+        let Some(section) = find_map_key_section_for_path(name) else {
+            return Ok(());
+        };
+        let remainder = &name[section.path.len() + 1..];
+        let Some(keys) = self.get_map_keys(section.path) else {
+            return Ok(());
+        };
+        if !keys.iter().any(|key| key == remainder) {
+            return Ok(());
+        }
+
+        let Some((field_key, inner_name)) = crate::helpers::route_hashmap_path(
+            name,
+            "",
+            section.path,
+            "",
+            keys.iter().map(String::as_str),
+        ) else {
+            return Ok(());
+        };
+
+        anyhow::bail!(
+            "Ambiguous config path `{name}`: it could mean the map entry `{}[{:?}]` or property `{}[{:?}].{inner_name}`. Refusing to choose; rename one of the colliding map keys",
+            section.path,
+            remainder,
+            section.path,
+            field_key,
+        )
+    }
+
     pub fn set_prop_persistent(&mut self, name: &str, value_str: &str) -> Result<()> {
+        self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_prop(name, value_str)?;
         self.mark_dirty(name);
         Ok(())
     }
 
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
+        self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_secret(name, value)?;
         self.mark_dirty(name);
         Ok(())
@@ -22932,8 +22995,78 @@ fn restore_onepassword_references_for_save(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PostReplaceSync {
+    Real,
+    #[cfg(any(test, feature = "test-helpers"))]
+    FailForTest,
+}
+
+/// Test-only fault injection: when armed for a specific config path, the
+/// next atomic write to that path simulates a post-rename directory sync
+/// failure. This lets downstream crates (e.g. the runtime's `config/set`
+/// RPC tests) drive the injected fault through the full production save
+/// path instead of calling the write helper directly. Keying by path keeps
+/// concurrently running tests from consuming each other's fault.
+/// Unreachable from production builds: the hook only exists under `test`
+/// or the `test-helpers` feature, which no production dependency enables.
+#[cfg(any(test, feature = "test-helpers"))]
+static FAIL_POST_REPLACE_SYNC_FOR_PATHS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm a one-shot post-rename sync failure for the next atomic write to
+/// `config_path`.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn arm_post_replace_sync_failure_for_test(config_path: &Path) {
+    FAIL_POST_REPLACE_SYNC_FOR_PATHS
+        .lock()
+        .unwrap()
+        .push(config_path.to_path_buf());
+}
+
+/// Whether an armed post-rename sync failure is still pending for
+/// `config_path`. Tests use this to prove the fault actually fired (the
+/// entry is consumed) rather than being bypassed by a save path that never
+/// reached the atomic writer.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn post_replace_sync_failure_armed(config_path: &Path) -> bool {
+    FAIL_POST_REPLACE_SYNC_FOR_PATHS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p == config_path)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn take_post_replace_sync_failure(config_path: &Path) -> bool {
+    let mut armed = FAIL_POST_REPLACE_SYNC_FOR_PATHS.lock().unwrap();
+    if let Some(idx) = armed.iter().position(|p| p == config_path) {
+        armed.swap_remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
 /// Atomic write shared by `save()` and `save_dirty()`.
 async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if take_post_replace_sync_failure(config_path) {
+        return write_config_atomically_with_sync(
+            config_path,
+            toml_str,
+            PostReplaceSync::FailForTest,
+        )
+        .await;
+    }
+    write_config_atomically_with_sync(config_path, toml_str, PostReplaceSync::Real).await
+}
+
+async fn write_config_atomically_with_sync(
+    config_path: &Path,
+    toml_str: &str,
+    post_replace_sync: PostReplaceSync,
+) -> Result<()> {
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -22944,6 +23077,11 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
             parent_dir.display()
         )
     })?;
+
+    // Open and sync the directory before replacement so permission, handle,
+    // and platform failures are reported while disk and live config are still
+    // unchanged. A second sync after rename establishes rename durability.
+    sync_directory(parent_dir).await?;
 
     let file_name = config_path
         .file_name()
@@ -22981,6 +23119,36 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
                 backup_path.display()
             )
         })?;
+        // The post-rename uncertainty path retains this copy as recovery
+        // material, so make that promise durable before the replacement can
+        // become visible. `copy` alone only establishes an immediately
+        // readable file; syncing both its contents and the parent directory
+        // pins the backup data and directory entry across a crash. Any failure
+        // here is still pre-commit and therefore returns with `config.toml`
+        // unchanged.
+        // The handle must carry write access: on Windows `sync_all` reaches
+        // `FlushFileBuffers`, which rejects a handle opened without
+        // `GENERIC_WRITE`. `write(true)` without `truncate`/`create_new`
+        // keeps the freshly copied bytes intact and only widens the access
+        // rights, so the fsync below is portable rather than Unix-only.
+        let backup_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backup_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to open config backup for fsync: {}",
+                    backup_path.display()
+                )
+            })?;
+        backup_file
+            .sync_all()
+            .await
+            .with_context(|| format!("Failed to fsync config backup: {}", backup_path.display()))?;
+        sync_directory(parent_dir)
+            .await
+            .context("Failed to fsync config backup directory entry before atomic replace")?;
     }
 
     if let Err(e) = fs::rename(&temp_path, config_path).await {
@@ -23010,9 +23178,34 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
         }
     }
 
-    sync_directory(parent_dir).await?;
-
-    if had_existing_config {
+    let post_replace_sync_result = match post_replace_sync {
+        PostReplaceSync::Real => sync_directory(parent_dir).await,
+        #[cfg(any(test, feature = "test-helpers"))]
+        PostReplaceSync::FailForTest => Err(anyhow::Error::msg(
+            "injected post-replace directory sync failure",
+        )),
+    };
+    if let Err(err) = post_replace_sync_result {
+        // The rename is already visible and the replacement file itself was
+        // fsynced before it moved. Returning an error here would make callers
+        // keep the old live snapshot even though disk contains the new one.
+        // Report the durability uncertainty, keep the backup for recovery,
+        // and classify the save as committed so save-then-swap callers install
+        // the matching snapshot.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "config.directory_sync_after_replace_failed",
+                    "path": config_path.display().to_string(),
+                    "backup_path": had_existing_config
+                        .then(|| backup_path.display().to_string()),
+                    "error": err.to_string(),
+                })),
+            "Config replacement committed but directory durability sync failed; keeping backup"
+        );
+    } else if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
     }
 
@@ -23466,15 +23659,19 @@ fn apply_dirty_map_key_path(
         // Same dash-aware segment resolution `apply_dirty_natural_key_path`
         // uses for its inner suffix, rooted at the matched key's own
         // serialized table so kebab inner segments (`tool-timeout-secs`)
-        // resolve to the snake struct field on disk.
+        // resolve to the snake struct field on disk. Consult the matching
+        // on-disk table too: when a dotted dynamic-map key is being deleted,
+        // it is absent from memory by definition but still needs to resolve
+        // as one opaque segment in the document.
         let key_table = mem_table
             .and_then(|t| t.get(key))
             .and_then(|v| v.as_table());
+        let doc_key_table = doc_table
+            .and_then(|t| t.get(key))
+            .and_then(|item| item.as_table_like());
         let inner_raw: Vec<&str> = inner.split('.').collect();
-        let inner_segments: Vec<String> = match key_table {
-            Some(t) => resolve_dirty_segments(t, &inner_raw),
-            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
-        };
+        let inner_segments =
+            resolve_dirty_segments_from_sources(key_table, doc_key_table, &inner_raw);
         segments.extend(inner_segments);
     }
 
@@ -23789,28 +23986,61 @@ fn prune_empty_leaves(value: &mut toml::Value) {
 }
 
 fn resolve_dirty_segments(root: &toml::Table, raw: &[&str]) -> Vec<String> {
+    resolve_dirty_segments_from_sources(Some(root), None, raw)
+}
+
+/// Resolve a dotted dirty-path suffix against the canonical serialized
+/// in-memory table and, when supplied, its on-disk counterpart.
+///
+/// Struct fields consume one segment (with the existing kebab-to-snake
+/// fallback). Map keys are different: the serialized table owns their exact
+/// spelling, and a key may itself contain dots. Longest-match the remaining
+/// suffix against keys present in either source so `X-Foo.bar` remains one
+/// segment for both writes (present in memory) and deletes (present only on
+/// disk). No parallel key registry is introduced; both views are derived from
+/// the two states `save_dirty` is already reconciling.
+fn resolve_dirty_segments_from_sources(
+    mut memory_table: Option<&toml::Table>,
+    mut document_table: Option<&dyn toml_edit::TableLike>,
+    raw: &[&str],
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(raw.len());
-    let mut current: Option<&toml::Value> = None;
-    for seg in raw {
-        let table_opt: Option<&toml::Table> = if out.is_empty() {
-            Some(root)
-        } else {
-            current.and_then(|v| v.as_table())
-        };
-        let resolved = match table_opt {
-            Some(t) if t.contains_key(*seg) => (*seg).to_string(),
-            Some(t) => {
-                let snake = seg.replace('-', "_");
-                if t.contains_key(&snake) {
+    let mut index = 0;
+    while index < raw.len() {
+        // Prefer the longest exact key from the remaining suffix. This is
+        // load-bearing for opaque HashMap keys containing dots; an ordinary
+        // struct table has no such key, so it naturally falls through to the
+        // one-segment field lookup below.
+        let exact = (index + 1..=raw.len()).rev().find_map(|end| {
+            let candidate = raw[index..end].join(".");
+            let exists_in_memory = memory_table.is_some_and(|t| t.contains_key(&candidate));
+            let exists_on_disk = document_table.is_some_and(|t| t.contains_key(&candidate));
+            (exists_in_memory || exists_on_disk).then_some((candidate, end - index))
+        });
+
+        let (resolved, consumed) = exact.unwrap_or_else(|| {
+            let segment = raw[index];
+            let snake = segment.replace('-', "_");
+            let snake_exists = memory_table.is_some_and(|t| t.contains_key(&snake))
+                || document_table.is_some_and(|t| t.contains_key(&snake));
+            (
+                if snake_exists {
                     snake
                 } else {
-                    (*seg).to_string()
-                }
-            }
-            None => (*seg).to_string(),
-        };
-        current = table_opt.and_then(|t| t.get(&resolved));
+                    segment.to_string()
+                },
+                1,
+            )
+        });
+
+        memory_table = memory_table
+            .and_then(|t| t.get(&resolved))
+            .and_then(|v| v.as_table());
+        document_table = document_table
+            .and_then(|t| t.get(&resolved))
+            .and_then(|item| item.as_table_like());
         out.push(resolved);
+        index += consumed;
     }
     out
 }
@@ -28240,6 +28470,90 @@ default_temperature = 0.7
         fs::create_dir_all(&dir).await.unwrap();
 
         sync_directory(&dir).await.unwrap();
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn post_replace_sync_failure_keeps_disk_commit_and_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_post_replace_sync_failure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+
+        let result = write_config_atomically_with_sync(
+            &config_path,
+            "schema_version = 2\n",
+            PostReplaceSync::FailForTest,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a post-replace sync fault must report a committed save: {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "the successful rename is the canonical on-disk result"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup_path).await.unwrap(),
+            "schema_version = 1\n",
+            "durability uncertainty must retain the pre-replace backup"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn save_over_existing_config_syncs_backup_on_every_platform() {
+        // The backup fsync runs on the ordinary save-over-existing-config
+        // path, so the handle it uses must be valid at runtime, not merely
+        // compile. Opening the `.bak` copy read-only builds everywhere but
+        // fails under Windows `FlushFileBuffers`, which requires write
+        // access. Executing the real path here turns that into a test
+        // failure wherever the suite runs instead of a review-only catch.
+        // The companion fault-injection test asserts the retained backup
+        // still holds the pre-replace bytes, which is what proves the
+        // widened access rights do not truncate the recovery copy.
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_save_over_existing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+
+        let result = write_config_atomically_with_sync(
+            &config_path,
+            "schema_version = 2\n",
+            PostReplaceSync::Real,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "saving over an existing config must not fail while syncing the backup: {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "the replacement must be visible after a committed save"
+        );
+        assert!(
+            !backup_path.exists(),
+            "a fully durable save consumes the backup rather than leaving it behind"
+        );
 
         let _ = fs::remove_dir_all(&dir).await;
     }
@@ -32685,6 +32999,67 @@ group_policy = "disabled"
         );
     }
 
+    #[test]
+    async fn set_prop_persistent_rejects_ambiguous_dotted_map_key_path_before_mutation() {
+        let mut config = Config::default();
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1.input_per_mtok".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(2.0),
+                ..Default::default()
+            },
+        );
+
+        let path = "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok";
+        let err = config
+            .set_prop_persistent(path, "9.9")
+            .expect_err("colliding whole-key and field interpretations must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\"gpt-4.1.input_per_mtok\"]"),
+            "error must name the whole-entry interpretation: {message}"
+        );
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\"gpt-4.1\"].input_per_mtok"),
+            "error must name the field interpretation: {message}"
+        );
+        assert_eq!(
+            config
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(1.0),
+            "rejection must happen before the shorter key's field is mutated"
+        );
+        assert_eq!(
+            config
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1.input_per_mtok")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(2.0),
+            "rejection must not mutate the exact-key entry"
+        );
+        assert!(
+            !config.dirty_paths.contains(path),
+            "a rejected path must not be recorded as persistable"
+        );
+    }
+
     /// Control for `save_dirty_persists_dotted_map_key_field`: a dot-free
     /// resource key must keep working through the same map-key-section
     /// branch (it's no longer special-cased out — every `HashMap<String,
@@ -32938,6 +33313,121 @@ group_policy = "disabled"
         assert!(
             msg.contains("cost.rates.providers.models.openai.ghost-model.input_per_mtok"),
             "error must name the offending dirty path; got: {msg}"
+        );
+    }
+
+    /// A dynamic secret map (`#[secret] HashMap<String, String>`, e.g.
+    /// `extra_headers`) treats its whole non-empty suffix as ONE opaque
+    /// key — `set_prop` stores the literal `"X-Foo.bar"`. The dirty
+    /// writer must not re-split that key at dots into `X-Foo` → `bar`,
+    /// or `write_or_delete_leaf` finds nothing, takes the delete branch,
+    /// and `save_dirty` returns `Ok(())` having written nothing: the
+    /// operator sees success and the value is gone at next reload.
+    #[test]
+    async fn save_dirty_writes_dotted_dynamic_secret_map_key_as_one_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [providers.models.openai.fresh]\n\
+             model = \"gpt-4o\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .create_map_key("providers.models.openai", "fresh")
+            .expect("seed the alias");
+
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo.bar";
+        config
+            .set_prop_persistent(path, "header-value")
+            .expect("a dotted dynamic secret-map key must be insertable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .map(String::as_str),
+            Some("header-value"),
+            "precondition: set_prop stores ONE literal HashMap key"
+        );
+
+        config.save_dirty().await.expect("save_dirty must succeed");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written)
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .map(String::as_str),
+            Some("header-value"),
+            "a dotted dynamic secret-map key must round-trip through disk as the \
+             literal key `set_prop` stored, not be split at dots and dropped; got:\n{written}"
+        );
+    }
+
+    /// Unset half of the same contract: clearing a dotted dynamic
+    /// secret-map key must remove the literal on-disk entry rather than
+    /// hunting for a nested `bar` table that never existed.
+    #[test]
+    async fn save_dirty_removes_dotted_dynamic_secret_map_key_as_one_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [providers.models.openai.fresh]\n\
+             model = \"gpt-4o\"\n\n\
+             [providers.models.openai.fresh.extra_headers]\n\
+             \"X-Foo.bar\" = \"header-value\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config: Config = toml::from_str(&seed).unwrap();
+        config.config_path = config_path.clone();
+        config.secrets.encrypt = false;
+        assert!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .is_some_and(|p| p.base.extra_headers.contains_key("X-Foo.bar")),
+            "precondition: seeded dotted header key must load"
+        );
+
+        config
+            .providers
+            .models
+            .openai
+            .get_mut("fresh")
+            .unwrap()
+            .base
+            .extra_headers
+            .remove("X-Foo.bar");
+        config.mark_dirty("providers.models.openai.fresh.extra_headers.X-Foo.bar");
+        config.save_dirty().await.expect("save_dirty must succeed");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("X-Foo.bar"),
+            "unsetting a dotted dynamic secret-map key must delete the literal \
+             on-disk entry; got:\n{written}"
         );
     }
 
@@ -36921,6 +37411,70 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         assert!(
             config.cost.rates.tools.is_empty(),
             "`cost.rates.tools` is resource-keyed by the tool's registered name"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_rolls_back_alias_when_tail_field_unknown() {
+        let mut config = Config::default();
+        let path = "providers.models.anthropic.default.not_a_real_field";
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "precondition: alias must not exist yet"
+        );
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "the just-created alias must be rolled back when the tail field can't resolve"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_keeps_preexisting_alias_on_unknown_tail_field() {
+        let mut config = Config::default();
+        config
+            .create_map_key("providers.models.anthropic", "default")
+            .expect("seed a pre-existing alias");
+
+        let refused =
+            config.ensure_map_key_for_path("providers.models.anthropic.default.not_a_real_field");
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| keys.iter().any(|k| k == "default")),
+            "a pre-existing alias must never be deleted for a typo'd tail field"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_preserves_first_dynamic_secret_map_write() {
+        let mut config = Config::default();
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo";
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        config
+            .set_prop(path, "bar")
+            .expect("a new dynamic secret-map key must be insertable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Foo"))
+                .map(String::as_str),
+            Some("bar")
         );
     }
 

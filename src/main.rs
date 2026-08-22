@@ -2596,7 +2596,7 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         // when `created == false`, or a bogus tail-field on an
         // ALREADY-EXISTING alias would delete a legitimate, pre-existing
         // config entry that has nothing to do with this call.
-        if config.get_prop(prop_path).is_err() {
+        if config.get_prop(prop_path).is_err() && !Config::prop_is_secret(prop_path) {
             let _ = config.delete_map_key(section_path, key);
             return Ok(false);
         }
@@ -9471,6 +9471,31 @@ mod tests {
                 .iter_entries()
                 .any(|(family, alias, _)| family == "openai" && alias == "alloy"),
             "tts alias should resolve after materialization"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_materializes_first_dynamic_secret_map_entry() {
+        let mut config = Config::default();
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo";
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("known dynamic secret-map path should materialize");
+
+        assert!(created, "missing provider alias should be created");
+        config
+            .set_prop_persistent(path, "bar")
+            .expect("first dynamic secret-map entry should be writable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Foo"))
+                .map(String::as_str),
+            Some("bar")
         );
     }
 
