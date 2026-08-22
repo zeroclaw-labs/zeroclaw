@@ -518,7 +518,7 @@ impl LogLevel {
 enum EvalCommands {
     /// Run a suite of evaluation cases.
     Run {
-        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        /// Directory of `*.json` trace fixtures (defaults to `evals/regression`).
         #[arg(long)]
         suite: Option<String>,
 
@@ -530,6 +530,11 @@ enum EvalCommands {
         /// Output format.
         #[arg(long, value_enum, default_value = "table")]
         format: commands::eval::OutputFormat,
+
+        /// Directory to write a per-case run record (JSON) into.
+        // i18n-exempt: clap derive help — framework requires a compile-time literal
+        #[arg(long)]
+        dump_records: Option<String>,
     },
 }
 
@@ -1058,8 +1063,8 @@ expectations. No network calls, fully deterministic. Exits non-zero if any case 
 so it can gate CI.
 
 Examples:
-  zeroclaw eval run                                  # replay ./evals
-  zeroclaw eval run --suite evals --format json")]
+  zeroclaw eval run                                  # replay ./evals/regression
+  zeroclaw eval run --suite evals/regression --format json")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -5383,16 +5388,37 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 suite,
                 mode,
                 format,
+                dump_records,
             } => {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode =
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
-                let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
+                let (report, artifacts) =
+                    commands::eval::run(&config, std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                if !report.all_passed() {
-                    std::process::exit(1);
+                // Dumps land in this run's own staging dir; it becomes `last-run`
+                // only after the run completes, so `eval-last-run` never resolves
+                // to a mix of two runs.
+                let wrote_auto = commands::eval::write_dumps(
+                    &report,
+                    dump_records.as_deref().map(std::path::Path::new),
+                    &artifacts.staged,
+                )?;
+                let published = artifacts.publish()?;
+                // Footer is a table affordance only; never emit it in JSON mode, or
+                // it would corrupt the machine-readable stdout artifact.
+                if wrote_auto && format == commands::eval::OutputFormat::Table {
+                    let dir = published.display().to_string();
+                    println!(
+                        "{}",
+                        ta(
+                            "cli-eval-failed-case-records",
+                            &[("dir", dir.as_str())],
+                            &format!("  failed-case records: {dir}/"),
+                        )
+                    );
                 }
-                Ok(())
+                std::process::exit(report.exit_code());
             }
         },
 
