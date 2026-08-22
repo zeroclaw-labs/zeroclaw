@@ -203,6 +203,10 @@ keyactions! {
         BeginSearch      [Chord::char('/')] => "search",
         ClearSearch      [Chord::char('c')] => "clear search",
         CopyDetail       [Chord::char('y')] => "copy detail",
+        CopySelection    [
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
+            Chord::with(KeyCode::Char('C'), KeyModifiers::CONTROL.union(KeyModifiers::SHIFT)),
+        ] => "copy selection/row",
         IncreaseLevel    [Chord::char('+'), Chord::char('=')] => "verbosity up",
         DecreaseLevel    [Chord::char('-')] => "verbosity down",
     }
@@ -427,6 +431,14 @@ mod tests {
         assert_eq!(
             ChatTabAction::from_chord(&terminal_copy),
             Some(ChatTabAction::CopyAllVisible)
+        );
+        assert_eq!(
+            LogsTabAction::from_chord(&command_c),
+            Some(LogsTabAction::CopySelection)
+        );
+        assert_eq!(
+            LogsTabAction::from_chord(&terminal_copy),
+            Some(LogsTabAction::CopySelection)
         );
     }
 }

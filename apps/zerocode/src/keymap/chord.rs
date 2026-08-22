@@ -87,6 +87,18 @@ impl Chord {
         }
     }
 
+    pub(crate) fn show_in_help(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        if self.code == KeyCode::Char('C')
+            && self.modifiers == KeyModifiers::CONTROL.union(KeyModifiers::SHIFT)
+        {
+            // Some macOS terminals collapse Ctrl+Shift+C to Ctrl+C, which
+            // reaches ZeroCode as Quit instead of the advertised action.
+            return false;
+        }
+        true
+    }
+
     pub fn wire(&self) -> String {
         let mut out = String::new();
         // Modifier tokens walk the canonical registry so render and
@@ -388,6 +400,17 @@ mod tests {
 
         assert!(!chord.matches(&copy));
         assert!(chord.matches(&quit));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ctrl_shift_c_is_not_advertised_on_darwin() {
+        let fallback = Chord::with(
+            KeyCode::Char('C'),
+            KeyModifiers::CONTROL.union(KeyModifiers::SHIFT),
+        );
+        assert!(!fallback.show_in_help());
+        assert!(Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER).show_in_help());
     }
 
     #[cfg(target_os = "macos")]

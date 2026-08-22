@@ -51,6 +51,7 @@ fn reset() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::{LogsTabAction, RebindableActions};
     use crossterm::event::KeyCode;
     use std::sync::Mutex;
 
@@ -84,6 +85,22 @@ mod tests {
         set_row("logs", "toggle_follow", vec![Chord::char('F')]);
         let got = lookup("logs").expect("tag created");
         assert_eq!(got.get("toggle_follow").unwrap(), &vec![Chord::char('F')]);
+        reset();
+    }
+
+    #[test]
+    fn absent_logs_copy_override_keeps_its_default_chords() {
+        let _g = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut table = OverrideTable::new();
+        let mut logs = HashMap::new();
+        logs.insert("up".to_string(), vec![Chord::char('z')]);
+        table.insert("logs".to_string(), logs);
+        set_active(table);
+
+        assert_eq!(
+            LogsTabAction::CopySelection.resolved(),
+            LogsTabAction::CopySelection.default_chords()
+        );
         reset();
     }
 }

@@ -42,6 +42,7 @@ mod quickstart_pane;
 mod sop_pane;
 mod terminal_backend;
 mod text_navigation;
+mod text_selection;
 mod theme;
 mod todo_tracker;
 mod turn_status;

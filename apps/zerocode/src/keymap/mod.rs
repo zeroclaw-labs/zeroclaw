@@ -95,7 +95,12 @@ pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A>
 /// chords (e.g. `["Tab"]`, `["⌘x"]`). Help surfaces use this so the keys
 /// they advertise track the live keybinding registry instead of literals.
 pub fn action_key_labels<A: RebindableActions>(action: A) -> Vec<String> {
-    action.resolved().iter().map(Chord::display).collect()
+    action
+        .resolved()
+        .iter()
+        .filter(|chord| chord.show_in_help())
+        .map(Chord::display)
+        .collect()
 }
 
 #[cfg(test)]
@@ -221,6 +226,12 @@ mod tests {
             LogsTabAction::from_chord(&ev),
             Some(LogsTabAction::OpenDetail)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn logs_copy_help_hides_unreliable_terminal_fallback() {
+        assert_eq!(action_key_labels(LogsTabAction::CopySelection), vec!["⌘c"]);
     }
 
     #[test]
