@@ -1487,6 +1487,7 @@ impl WhatsAppWebChannel {
             file_name,
             data,
             mime_type,
+            marker: None,
         });
     }
 
