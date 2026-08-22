@@ -210,6 +210,7 @@ cli-acp-long-about =
 
     Examples:
       zeroclaw acp                        # start ACP server
+      zeroclaw acp --agent fable         # default new sessions to agent fable
       zeroclaw acp --max-sessions 5       # limit concurrent sessions
 
 cli-daemon-long-about =
