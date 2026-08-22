@@ -218,6 +218,17 @@ fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Resolve the memory/session scope for one gateway webhook turn.
+///
+/// Callers that intentionally want a conversation supply `X-Session-Id` and keep using the same
+/// value. A request without that header is a one-shot command, so it gets a fresh scope rather than
+/// falling through to unscoped memory recall. `None` at the runtime boundary means "recall global
+/// memory", which can resurrect an unrelated prior task and is unsafe for command-style clients.
+fn resolved_webhook_session_id(headers: &HeaderMap) -> String {
+    webhook_session_id(headers)
+        .unwrap_or_else(|| format!("webhook_req_{}", Uuid::new_v4().simple()))
+}
+
 fn hash_webhook_secret(value: &str) -> String {
     use sha2::{Digest, Sha256};
 
@@ -1620,7 +1631,6 @@ pub async fn run_gateway(
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
-        .route("/webhook", post(handle_webhook))
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
@@ -1951,12 +1961,18 @@ pub async fn run_gateway(
             Duration::from_secs(gateway_request_timeout_secs(&config.gateway)),
         ));
 
-    // Manual cron-trigger and A2A task routes live on their own sub-router so
-    // they can opt out of the 30s gateway-wide TimeoutLayer. Both run a
+    // Manual cron-trigger, webhook, and A2A task routes live on their own sub-router so
+    // they can opt out of the 30s gateway-wide TimeoutLayer. All run a
     // synchronous agent turn inline. Layers attached here travel with the
     // route through `merge`, so only these endpoints see the longer timeout.
-    let long_running_router: Router<AppState> =
-        Router::new().route("/api/cron/{id}/run", post(api::handle_api_cron_run));
+    //
+    // /webhook belongs here for the same reason as the other two, and its absence was a real
+    // bug: any turn that takes a screenshot and calls a vision model comfortably exceeds 30s,
+    // so a caller waiting on the reply got 408 while the agent was still working. Quick
+    // endpoints keep the tight default rather than everything being loosened to suit this one.
+    let long_running_router: Router<AppState> = Router::new()
+        .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
+        .route("/webhook", post(handle_webhook));
     #[cfg(feature = "a2a")]
     let long_running_router = long_running_router.merge(a2a::a2a_task_route());
     let long_running_router: Router = long_running_router
@@ -2809,7 +2825,7 @@ async fn handle_webhook(
     }
 
     let message = &webhook_body.message;
-    let session_id = webhook_session_id(&headers);
+    let session_id = resolved_webhook_session_id(&headers);
 
     if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(message) {
         let key = webhook_memory_key();
@@ -2819,7 +2835,7 @@ async fn handle_webhook(
                 &key,
                 message,
                 MemoryCategory::Conversation,
-                session_id.as_deref(),
+                Some(session_id.as_str()),
             )
             .await;
     }
@@ -2848,7 +2864,8 @@ async fn handle_webhook(
     // gives one webhook prompt two unrelated turn IDs.
     let started_at = Instant::now();
 
-    match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
+    match run_gateway_chat_with_tools(&state, message, Some(session_id.as_str()), agent_override)
+        .await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
             let duration = started_at.elapsed();
@@ -3731,12 +3748,54 @@ fn require_localhost(peer: &SocketAddr) -> Result<(), (StatusCode, Json<serde_js
     }
 }
 
+/// Require the optional app-private second factor for localhost admin calls.
+///
+/// Loopback identifies the local machine on desktop, but Android shares TCP
+/// loopback across application UIDs. Embedders can set
+/// `gateway.loopback_admin_secret` so knowledge of the gateway URL alone does
+/// not let another local app mint pairing codes, rotate devices, reload, or
+/// stop the gateway.
+fn require_loopback_admin_secret(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    let expected = state
+        .config
+        .read()
+        .gateway
+        .loopback_admin_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(str::to_owned);
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let provided = headers
+        .get("X-Loopback-Admin-Secret")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .unwrap_or_default();
+    if constant_time_eq(provided, &expected) {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": "Missing or invalid loopback admin secret"
+            })),
+        ))
+    }
+}
+
 /// POST /admin/shutdown — graceful shutdown from CLI (localhost only)
 async fn handle_admin_shutdown(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_loopback_admin_secret(&state, &headers)?;
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -3803,7 +3862,7 @@ async fn handle_admin_reload(
     // diverge from what `require_auth` will actually enforce.
     let require_pairing = state.pairing.require_pairing();
     match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
-        AdminReloadGate::Allow => {}
+        AdminReloadGate::Allow => require_loopback_admin_secret(&state, &headers)?,
         AdminReloadGate::RequireAuth => api::require_auth(&state, &headers)?,
         AdminReloadGate::Forbidden => {
             return Err((
@@ -3874,8 +3933,10 @@ async fn handle_admin_reload(
 async fn handle_admin_paircode(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_loopback_admin_secret(&state, &headers)?;
     let code = state.pairing.pairing_code();
 
     let body = if let Some(c) = code {
@@ -3911,8 +3972,10 @@ async fn handle_admin_paircode_new(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(params): Query<AdminPaircodeQuery>,
+    headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
     require_localhost(&peer)?;
+    require_loopback_admin_secret(&state, &headers)?;
 
     if !state.pairing.require_pairing() {
         let body = serde_json::json!({
@@ -4056,7 +4119,11 @@ async fn handle_admin_paircode_new(
     Ok((StatusCode::OK, Json(body)))
 }
 
-async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
+async fn handle_pair_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    require_loopback_admin_secret(&state, &headers)?;
     let require = state.pairing.require_pairing();
     let is_paired = state.pairing.is_paired();
 
@@ -4073,7 +4140,7 @@ async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
         "pairing_code": code,
     });
 
-    (StatusCode::OK, Json(body))
+    Ok((StatusCode::OK, Json(body)))
 }
 
 #[cfg(test)]
@@ -4507,6 +4574,7 @@ mod tests {
                 State(state.clone()),
                 test_connect_info(),
                 Query(AdminPaircodeQuery::default()),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4534,6 +4602,7 @@ mod tests {
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4573,6 +4642,7 @@ mod tests {
                 Query(AdminPaircodeQuery {
                     rotate: Some("dev-a".into()),
                 }),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4609,6 +4679,7 @@ mod tests {
                 Query(AdminPaircodeQuery {
                     rotate: Some("ghost".into()),
                 }),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4633,6 +4704,7 @@ mod tests {
                 Query(AdminPaircodeQuery {
                     rotate: Some("all".into()),
                 }),
+                HeaderMap::new(),
             )
             .await,
         )
@@ -4649,8 +4721,13 @@ mod tests {
 
         let remote = ConnectInfo(SocketAddr::from(([203, 0, 113, 7], 40_000)));
         let (status, _json) = admin_paircode_response_json(
-            handle_admin_paircode_new(State(state), remote, Query(AdminPaircodeQuery::default()))
-                .await,
+            handle_admin_paircode_new(
+                State(state),
+                remote,
+                Query(AdminPaircodeQuery::default()),
+                HeaderMap::new(),
+            )
+            .await,
         )
         .await;
 
@@ -4659,6 +4736,68 @@ mod tests {
             StatusCode::FORBIDDEN,
             "minting a pairing code must be rejected for non-loopback peers"
         );
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_requires_configured_loopback_secret() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        state.config.write().gateway.loopback_admin_secret =
+            Some("0123456789abcdef0123456789abcdef".into());
+
+        let (status, _json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state),
+                test_connect_info(),
+                Query(AdminPaircodeQuery::default()),
+                HeaderMap::new(),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_paircode_new_accepts_configured_loopback_secret() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        state.config.write().gateway.loopback_admin_secret =
+            Some("0123456789abcdef0123456789abcdef".into());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Loopback-Admin-Secret",
+            HeaderValue::from_static("0123456789abcdef0123456789abcdef"),
+        );
+
+        let (status, json) = admin_paircode_response_json(
+            handle_admin_paircode_new(
+                State(state),
+                test_connect_info(),
+                Query(AdminPaircodeQuery::default()),
+                headers,
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["pairing_code"].is_string());
+    }
+
+    #[tokio::test]
+    async fn public_pair_code_also_requires_configured_loopback_secret() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let state = admin_paircode_state(&tmp, true, true);
+        state.config.write().gateway.loopback_admin_secret =
+            Some("0123456789abcdef0123456789abcdef".into());
+
+        let response = handle_pair_code(State(state), HeaderMap::new())
+            .await
+            .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[test]
@@ -5580,6 +5719,40 @@ mod tests {
     }
 
     #[test]
+    fn resolved_webhook_session_id_preserves_explicit_conversation_scope() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "X-Session-Id",
+            HeaderValue::from_static("overlay-conversation"),
+        );
+
+        assert_eq!(
+            resolved_webhook_session_id(&headers),
+            "overlay-conversation"
+        );
+    }
+
+    #[test]
+    fn resolved_webhook_session_id_is_unique_for_headerless_one_shots() {
+        let headers = HeaderMap::new();
+
+        let first = resolved_webhook_session_id(&headers);
+        let second = resolved_webhook_session_id(&headers);
+
+        assert!(first.starts_with("webhook_req_"));
+        assert!(second.starts_with("webhook_req_"));
+        assert_ne!(first, second);
+        for generated in [first, second] {
+            assert!(generated.len() <= 128);
+            assert!(
+                generated
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+            );
+        }
+    }
+
+    #[test]
     fn webhook_session_id_rejects_empty() {
         let mut headers = HeaderMap::new();
         headers.insert("X-Session-Id", HeaderValue::from_static(""));
@@ -5797,6 +5970,7 @@ mod tests {
     #[derive(Default)]
     struct TrackingMemory {
         keys: Mutex<Vec<String>>,
+        sessions: Mutex<Vec<Option<String>>>,
     }
 
     #[async_trait]
@@ -5810,9 +5984,10 @@ mod tests {
             key: &str,
             _content: &str,
             _category: MemoryCategory,
-            _session_id: Option<&str>,
+            session_id: Option<&str>,
         ) -> anyhow::Result<()> {
             self.keys.lock().push(key.to_string());
+            self.sessions.lock().push(session_id.map(str::to_string));
             Ok(())
         }
 
@@ -6323,6 +6498,17 @@ mod tests {
         assert_ne!(keys[0], keys[1]);
         assert!(keys[0].starts_with("webhook_msg_"));
         assert!(keys[1].starts_with("webhook_msg_"));
+        let sessions = tracking_impl.sessions.lock().clone();
+        assert_eq!(sessions.len(), 2);
+        let first_session = sessions[0]
+            .as_deref()
+            .expect("headerless webhook must still get a request scope");
+        let second_session = sessions[1]
+            .as_deref()
+            .expect("headerless webhook must still get a request scope");
+        assert!(first_session.starts_with("webhook_req_"));
+        assert!(second_session.starts_with("webhook_req_"));
+        assert_ne!(first_session, second_session);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
     }
 

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      CellClaw overlay palette. Keep these names and values aligned with
+      com.cellclaw.service.overlay.OverlayService rather than inventing a second theme in
+      zerodroid. Purple is an accent, never a live agent-state colour.
+    -->
+    <color name="cellclaw_overlay_accent">#6200EE</color>
+    <color name="cellclaw_overlay_accent_text">#BB86FC</color>
+    <color name="cellclaw_overlay_surface">#1E1E2E</color>
+    <color name="cellclaw_overlay_input_surface">#2A2A3E</color>
+    <color name="cellclaw_overlay_text_primary">#FFFFFF</color>
+    <color name="cellclaw_overlay_text_hint">#888888</color>
+
+    <!-- Exact CellClaw bubble-state palette. -->
+    <color name="cellclaw_state_idle">#4CAF50</color>
+    <color name="cellclaw_state_monitoring">#2196F3</color>
+    <color name="cellclaw_state_busy">#FF9800</color>
+    <color name="cellclaw_state_paused">#9E9E9E</color>
+    <color name="cellclaw_state_error">#B00020</color>
+</resources>

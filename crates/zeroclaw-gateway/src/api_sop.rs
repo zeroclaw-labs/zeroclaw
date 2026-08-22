@@ -1,12 +1,13 @@
 //! Out-of-band SOP approval surface (EPIC C, C6; EPIC G broker).
 //!
 //! `GET /admin/sop/pending`, `POST /admin/sop/approve`, `POST /admin/sop/deny`.
-//! Auth reuses the vetted `/admin/reload` gate: loopback is always allowed and
-//! attributed as `cli` UNLESS pairing is required and it also presents a valid
-//! bearer token, in which case it is attributed as `http` (the authenticated
-//! subject); a non-loopback caller needs `gateway.allow_remote_admin` + pairing
-//! and passes `require_auth`, attributed as an `http` principal. The principal
-//! is ALWAYS derived from the transport here, never from the request body.
+//! Auth reuses the vetted `/admin/reload` gate: loopback must satisfy the
+//! optional app-private admin secret, then is attributed as `cli` UNLESS
+//! pairing is required and it also presents a valid bearer token, in which
+//! case it is attributed as `http` (the authenticated subject); a non-loopback
+//! caller needs `gateway.allow_remote_admin` + pairing and passes
+//! `require_auth`, attributed as an `http` principal. The principal is ALWAYS
+//! derived from the transport here, never from the request body.
 //! Resolution funnels through `resolve_via_broker` (EPIC G's authorization/
 //! quorum layer over the shared engine's `resolve_gate` chokepoint - a no-op
 //! pass-through when no `[sop.approval]` policy applies); `sop_engine = None`
@@ -20,7 +21,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use serde::Deserialize;
 
-use crate::{AdminReloadGate, AppState, admin_reload_gate};
+use crate::{AdminReloadGate, AppState, admin_reload_gate, require_loopback_admin_secret};
 use zeroclaw_runtime::sop::approval::{
     ApprovalDecision, ApprovalPrincipal, BrokerOutcome, ResolveOutcome,
 };
@@ -61,14 +62,19 @@ fn authorize(
     let require_pairing = state.pairing.require_pairing();
     match admin_reload_gate(peer.ip().is_loopback(), allow_remote, require_pairing) {
         AdminReloadGate::Allow => {
-            // A loopback caller is always allowed, but if pairing is actually
-            // REQUIRED and it ALSO presents a valid paired bearer token, capture
-            // that authenticated identity instead of discarding it as anonymous
-            // CLI - otherwise a local dashboard/HTTP client with a valid token and
-            // `http:<hash>` group membership would be rejected as an anonymous
-            // `cli(None)` (no identity, so it can never satisfy a required-group
-            // policy), while the SAME token from a non-loopback peer (the
-            // `RequireAuth` arm below) resolves correctly.
+            // Android shares TCP loopback across application UIDs. Enforce the
+            // same optional app-private second factor as /admin/reload before
+            // deriving any paired identity from caller-controlled headers.
+            require_loopback_admin_secret(state, headers)?;
+
+            // If pairing is actually REQUIRED and the caller ALSO presents a
+            // valid paired bearer token, capture that authenticated identity
+            // instead of discarding it as anonymous CLI - otherwise a local
+            // dashboard/HTTP client with a valid token and `http:<hash>` group
+            // membership would be rejected as an anonymous `cli(None)` (no
+            // identity, so it can never satisfy a required-group policy), while
+            // the SAME token from a non-loopback peer (the `RequireAuth` arm
+            // below) resolves correctly.
             //
             // Gated on `require_pairing`: when pairing is OFF,
             // `authenticate_and_hash` treats EVERY token as valid (a no-op
@@ -392,6 +398,138 @@ pub(crate) mod tests {
             format!("Bearer {token}").parse().unwrap(),
         );
         headers
+    }
+
+    fn loopback_headers(token: Option<&str>, secret: Option<&str>) -> HeaderMap {
+        let mut headers = token.map_or_else(HeaderMap::new, bearer);
+        if let Some(secret) = secret {
+            headers.insert("X-Loopback-Admin-Secret", secret.parse().unwrap());
+        }
+        headers
+    }
+
+    fn configure_loopback_secret(state: &AppState, secret: &str) {
+        state.config.write().gateway.loopback_admin_secret = Some(secret.to_string());
+    }
+
+    #[tokio::test]
+    async fn loopback_sop_pending_requires_configured_admin_secret() {
+        let token = "pair-token-abc";
+        let secret = "test-loopback-admin-secret";
+        let loopback: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        for headers in [
+            loopback_headers(Some(token), None),
+            loopback_headers(Some(token), Some("wrong-secret")),
+        ] {
+            let (state, _) = state_with_policied_gate(token);
+            configure_loopback_secret(&state, secret);
+            let err = handle_sop_pending(State(state), ConnectInfo(loopback), headers)
+                .await
+                .err()
+                .expect("missing or wrong loopback secret must fail authentication");
+            assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        }
+
+        let (state, _) = state_with_policied_gate(token);
+        configure_loopback_secret(&state, secret);
+        let response = handle_sop_pending(
+            State(state),
+            ConnectInfo(loopback),
+            loopback_headers(Some(token), Some(secret)),
+        )
+        .await
+        .expect("correct loopback secret must proceed beyond authentication")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn loopback_sop_approve_requires_configured_admin_secret() {
+        let token = "pair-token-abc";
+        let secret = "test-loopback-admin-secret";
+        let loopback: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        for headers in [
+            loopback_headers(Some(token), None),
+            loopback_headers(Some(token), Some("wrong-secret")),
+        ] {
+            let (state, run_id) = state_with_policied_gate(token);
+            configure_loopback_secret(&state, secret);
+            let err = handle_sop_approve(
+                State(state),
+                ConnectInfo(loopback),
+                headers,
+                Json(SopResolveBody {
+                    run_id,
+                    reason: None,
+                }),
+            )
+            .await
+            .err()
+            .expect("missing or wrong loopback secret must fail authentication");
+            assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        }
+
+        let (state, run_id) = state_with_policied_gate(token);
+        configure_loopback_secret(&state, secret);
+        let response = handle_sop_approve(
+            State(state),
+            ConnectInfo(loopback),
+            loopback_headers(Some(token), Some(secret)),
+            Json(SopResolveBody {
+                run_id,
+                reason: None,
+            }),
+        )
+        .await
+        .expect("correct loopback secret must proceed beyond authentication")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn loopback_sop_deny_requires_configured_admin_secret() {
+        let token = "pair-token-abc";
+        let secret = "test-loopback-admin-secret";
+        let loopback: SocketAddr = "127.0.0.1:9".parse().unwrap();
+
+        for headers in [
+            loopback_headers(Some(token), None),
+            loopback_headers(Some(token), Some("wrong-secret")),
+        ] {
+            let (state, run_id) = state_with_policied_gate(token);
+            configure_loopback_secret(&state, secret);
+            let err = handle_sop_deny(
+                State(state),
+                ConnectInfo(loopback),
+                headers,
+                Json(SopResolveBody {
+                    run_id,
+                    reason: Some("not approved".into()),
+                }),
+            )
+            .await
+            .err()
+            .expect("missing or wrong loopback secret must fail authentication");
+            assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        }
+
+        let (state, run_id) = state_with_policied_gate(token);
+        configure_loopback_secret(&state, secret);
+        let response = handle_sop_deny(
+            State(state),
+            ConnectInfo(loopback),
+            loopback_headers(Some(token), Some(secret)),
+            Json(SopResolveBody {
+                run_id,
+                reason: Some("not approved".into()),
+            }),
+        )
+        .await
+        .expect("correct loopback secret must proceed beyond authentication")
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

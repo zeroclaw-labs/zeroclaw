@@ -341,6 +341,21 @@ pub struct Config {
     #[group = "Storage"]
     pub secrets: SecretsConfig,
 
+    /// Android UI-control configuration (`[android]`).
+    ///
+    /// Off by default. When `enabled = true` *and* the process is running on
+    /// Android, registers the `android_screenshot`, `android_ui_read`,
+    /// `android_action`, `android_dialog`, `android_launch`, and `android_device` tools. They expose
+    /// UI control and read-only device facts through the app-private Android bridge.
+    ///
+    /// Compatibility: additive and disabled by default; existing configs remain
+    /// valid when omitted.
+    /// Rollback: remove `[android]` or set `enabled = false`.
+    #[serde(default)]
+    #[nested]
+    #[group = "Tools"]
+    pub android: AndroidConfig,
+
     /// Browser automation configuration (`[browser]`).
     #[serde(default)]
     #[nested]
@@ -6941,6 +6956,18 @@ pub struct GatewayConfig {
     /// (default: false)
     #[serde(default)]
     pub allow_remote_admin: bool,
+    /// Optional second factor for localhost-only admin endpoints.
+    ///
+    /// Desktop loopback normally identifies the local operator. Mobile
+    /// platforms share TCP loopback across application UIDs, so an embedding
+    /// app can set this secret and require callers to prove possession through
+    /// `X-Loopback-Admin-Secret` before minting pairing codes or invoking local
+    /// admin controls. Empty/omitted preserves the existing desktop contract.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub loopback_admin_secret: Option<String>,
     /// Paired bearer tokens (managed automatically, not user-edited)
     #[serde(default)]
     #[secret]
@@ -7104,6 +7131,7 @@ impl Default for GatewayConfig {
             require_pairing: true,
             allow_public_bind: false,
             allow_remote_admin: false,
+            loopback_admin_secret: None,
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
@@ -7523,6 +7551,67 @@ impl Default for BrowserComputerUseConfig {
             window_allowlist: Vec::new(),
             max_coordinate_x: None,
             max_coordinate_y: None,
+        }
+    }
+}
+
+// ── Android UI bridge ───────────────────────────────────────────
+
+/// Android UI-control configuration (`[android]` section).
+///
+/// Gates the `android_screenshot`, `android_ui_read`, `android_action`,
+/// `android_dialog`, `android_launch`, and `android_device` tools. ZeroClaw running as an ordinary
+/// Android app cannot drive the screen itself, so these tools speak newline-delimited
+/// JSON over a Unix-domain socket to the in-APK Android bridge.
+///
+/// Default closed: the family requires `enabled = true` **and** a runtime
+/// Android check, so enabling it on a desktop host registers nothing.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "android"]
+#[integration(
+    category = "ToolsAutomation",
+    display_name = "Android",
+    description = "On-device UI and Android API tools",
+    status_field = "enabled"
+)]
+pub struct AndroidConfig {
+    /// Enable the `android_*` tool family. Also requires the process to be
+    /// running on Android; on any other platform the tools stay unregistered.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Path to the Android app's Unix-domain socket. Lives inside the app's
+    /// private files directory, which is what makes it safe:
+    /// kernel UID isolation is the only trust boundary the protocol relies on.
+    #[serde(default = "default_android_socket_path")]
+    pub socket_path: String,
+    /// Refuse to register `android_action` when the active risk profile would
+    /// auto-approve it. Taps, swipes, and typing mutate device state, so a
+    /// blanket `auto_approve` entry (including `"*"`) would otherwise grant
+    /// unattended control of the phone. Leave `true` unless you intend that.
+    #[serde(default = "default_true")]
+    pub require_approval_for_actions: bool,
+    /// Maximum width in pixels for `android_screenshot` captures. Screens are
+    /// downscaled to this width before encoding, trading detail for tokens.
+    #[serde(default = "default_android_screenshot_max_width")]
+    pub screenshot_max_width: u32,
+}
+
+fn default_android_socket_path() -> String {
+    "/data/data/org.zerodroid.bridge/files/ui.sock".into()
+}
+
+fn default_android_screenshot_max_width() -> u32 {
+    540
+}
+
+impl Default for AndroidConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            socket_path: default_android_socket_path(),
+            require_approval_for_actions: true,
+            screenshot_max_width: default_android_screenshot_max_width(),
         }
     }
 }
@@ -18812,6 +18901,7 @@ impl Default for Config {
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
+            android: AndroidConfig::default(),
             browser: BrowserConfig::default(),
             browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -19588,6 +19678,7 @@ impl Config {
         // whether any job is configured. Display copy lives next to
         // the field so the registry never branches on a category name.
         vec![
+            self.android.integration_descriptor(),
             self.browser.integration_descriptor(),
             self.google_workspace.integration_descriptor(),
             crate::config::IntegrationDescriptor {
@@ -27474,6 +27565,7 @@ auto_save = true
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
+            android: AndroidConfig::default(),
             browser: BrowserConfig::default(),
             browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -27686,6 +27778,72 @@ auto_approve = ["my_custom_tool", "another_tool"]
     async fn default_auto_approve_includes_tool_search() {
         let defaults = default_auto_approve();
         assert!(defaults.contains(&"tool_search".to_string()));
+    }
+
+    /// `android_action` taps, swipes, and types on a real device, while
+    /// `android_dialog` confirms privileged system prompts. Neither must
+    /// never be auto-approved by default: staying off this list is what makes
+    /// `ApprovalManager::approval_requirement` fall through to `Prompt`.
+    #[test]
+    async fn default_auto_approve_excludes_android_mutation_boundaries() {
+        let defaults = default_auto_approve();
+        for tool in ["android_action", "android_dialog"] {
+            assert!(
+                !defaults.contains(&tool.to_string()),
+                "{tool} must not be auto-approved by default: {defaults:?}"
+            );
+        }
+    }
+
+    /// The whole Android family is opt-in; a config that never mentions
+    /// `[android]` must leave it off.
+    #[test]
+    async fn android_is_disabled_by_default() {
+        assert!(!AndroidConfig::default().enabled);
+        assert!(!Config::default().android.enabled);
+
+        let parsed = parse_test_config("default_temperature = 0.7\n");
+        assert!(
+            !parsed.android.enabled,
+            "omitting [android] must leave the family disabled"
+        );
+    }
+
+    /// The remaining defaults are part of the bridge contract: the socket path
+    /// matches the Android app's private files dir, actions are approval-
+    /// gated, and captures are downscaled to keep screenshots affordable.
+    #[test]
+    async fn android_defaults_match_the_bridge_contract() {
+        let android = AndroidConfig::default();
+        assert_eq!(
+            android.socket_path,
+            "/data/data/org.zerodroid.bridge/files/ui.sock"
+        );
+        assert!(android.require_approval_for_actions);
+        assert_eq!(android.screenshot_max_width, 540);
+    }
+
+    /// `[android]` must round-trip through TOML so operators can actually
+    /// enable it and point it at a different package's socket.
+    #[test]
+    async fn android_section_parses_from_toml() {
+        let raw = r#"
+default_temperature = 0.7
+
+[android]
+enabled = true
+socket_path = "/data/data/com.example.bridge/files/ui.sock"
+screenshot_max_width = 720
+"#;
+        let parsed = parse_test_config(raw);
+        assert!(parsed.android.enabled);
+        assert_eq!(
+            parsed.android.socket_path,
+            "/data/data/com.example.bridge/files/ui.sock"
+        );
+        assert_eq!(parsed.android.screenshot_max_width, 720);
+        // Unspecified fields keep their safe defaults.
+        assert!(parsed.android.require_approval_for_actions);
     }
 
     /// Regression test: empty auto_approve still gets defaults merged.
@@ -28346,6 +28504,7 @@ default_temperature = 0.7
             composio: ComposioConfig::default(),
             microsoft365: Microsoft365Config::default(),
             secrets: SecretsConfig::default(),
+            android: AndroidConfig::default(),
             browser: BrowserConfig::default(),
             browser_delegate: crate::scattered_types::BrowserDelegateConfig::default(),
             http_request: HttpRequestConfig::default(),
@@ -29879,6 +30038,7 @@ allowed_numbers = ["+1", "+2"]
             require_pairing: true,
             allow_public_bind: false,
             allow_remote_admin: false,
+            loopback_admin_secret: Some("0123456789abcdef0123456789abcdef".into()),
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
@@ -29904,6 +30064,10 @@ allowed_numbers = ["+1", "+2"]
         assert!(parsed.session_persistence);
         assert_eq!(parsed.session_ttl_hours, 0);
         assert!(!parsed.allow_public_bind);
+        assert_eq!(
+            parsed.loopback_admin_secret.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
         assert_eq!(parsed.paired_tokens, vec!["zc_test_token"]);
         assert_eq!(parsed.pair_rate_limit_per_minute, 12);
         assert_eq!(parsed.webhook_rate_limit_per_minute, 80);

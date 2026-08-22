@@ -109,6 +109,8 @@
 - [Tools & Extensibility](./tools/overview.md)
   - [MCP (Model Context Protocol)](./tools/mcp.md)
   - [Browser automation](./tools/browser.md)
+  - [Android-native tools](./tools/android.md)
+    - [Bridge protocol](./tools/android-bridge-protocol.md)
   - [Relationship memory](./tools/relationship-memory.md)
     - [Using relationship memory from skills](./tools/relationship-memory-skill-template.md)
   - [Skills](./tools/skills.md)

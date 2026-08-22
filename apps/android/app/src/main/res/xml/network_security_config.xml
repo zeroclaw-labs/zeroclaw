@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The on-device gateway serves cleartext HTTP on loopback only (127.0.0.1:<port>).
+  In-app clients (the floating bubble's GatewayClient) must be allowed to reach it;
+  Android blocks app-outbound cleartext by default on targetSdk 28+. Permit cleartext
+  to localhost ONLY — all other destinations stay TLS-required.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

@@ -3908,7 +3908,9 @@ mod tests {
 
     #[test]
     fn every_gateway_secret_is_classified() {
-        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &[];
+        // Embedders/operators provision this value in config; the gateway only
+        // validates the request header and never mints, rotates or persists it.
+        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &["gateway.loopback_admin_secret"];
 
         let cfg = zeroclaw_config::schema::Config::default();
         let unclassified: Vec<String> = cfg

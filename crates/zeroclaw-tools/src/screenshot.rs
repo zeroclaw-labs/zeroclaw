@@ -12,16 +12,61 @@ const SCREENSHOT_TIMEOUT_SECS: u64 = 15;
 /// Maximum base64 payload size to return (2 MB of base64 ≈ 1.5 MB image).
 const MAX_BASE64_BYTES: usize = 2_097_152;
 
+/// Native desktop capture spawns a process and writes into the workspace, so it retains the
+/// existing mutating-autonomy gate. An Android bridge capture is a read-only observation through
+/// an already-authorized AccessibilityService and must remain available in read-only profiles.
+fn requires_action_permission(android_bridge_available: bool) -> bool {
+    !android_bridge_available
+}
+
+/// Resolve the width forwarded by the bridge-backed generic alias. Kept as a
+/// pure helper so Unix host tests can exercise Android argument handling.
+#[cfg(any(all(unix, target_os = "android"), all(test, unix)))]
+fn bridge_screenshot_width(args: &serde_json::Value, default_width: u32) -> u32 {
+    crate::android::screenshot::resolve_android_screenshot_width(args, default_width)
+}
+
 /// Tool for capturing screenshots using platform-native commands.
 /// macOS: `screencapture`
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
+/// Android: none of those exist and an app UID may not run them, so the capture is delegated to
+/// the accessibility bridge when one is wired in (see `with_android_bridge`).
 pub struct ScreenshotTool {
     security: Arc<SecurityPolicy>,
+    /// Present only on Android, where the subprocess path cannot work at all.
+    #[cfg(all(unix, target_os = "android"))]
+    android_bridge: Option<crate::android::AndroidBridgeClient>,
+    #[cfg(all(unix, target_os = "android"))]
+    android_max_width: u32,
 }
 
 impl ScreenshotTool {
     pub fn new(security: Arc<SecurityPolicy>) -> Self {
-        Self { security }
+        Self {
+            security,
+            #[cfg(all(unix, target_os = "android"))]
+            android_bridge: None,
+            #[cfg(all(unix, target_os = "android"))]
+            android_max_width: 540,
+        }
+    }
+
+    /// Route captures through the Android accessibility bridge.
+    ///
+    /// Without this, `screenshot` is dead on Android: it shells out to `screencapture` or
+    /// `gnome-screenshot`, none of which exist there, so every call returns "not supported". A
+    /// model that reaches for the familiar name then has no image and no working alternative under
+    /// that name. Delegating means one behaviour under both names rather than a trap.
+    #[cfg(all(unix, target_os = "android"))]
+    #[must_use]
+    pub fn with_android_bridge(
+        mut self,
+        client: crate::android::AndroidBridgeClient,
+        max_width: u32,
+    ) -> Self {
+        self.android_bridge = Some(client);
+        self.android_max_width = max_width;
+        self
     }
 
     /// Determine the screenshot command for the current platform.
@@ -55,6 +100,24 @@ impl ScreenshotTool {
 
     /// Execute the screenshot capture and return the result.
     async fn capture(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        // On Android the subprocess path below cannot succeed, so take the bridge when we have
+        // one. The same expect_package guard applies as on android_screenshot: offering a second
+        // name for the same job must not offer a second, unguarded way to do it.
+        #[cfg(all(unix, target_os = "android"))]
+        if let Some(client) = &self.android_bridge {
+            if let Some(expected) = args
+                .get("expect_package")
+                .and_then(serde_json::Value::as_str)
+            {
+                client.assert_foreground(expected).await?;
+            }
+            let max_width = bridge_screenshot_width(&args, self.android_max_width);
+            let data = client
+                .call("screenshot", json!({ "max_width": max_width }))
+                .await?;
+            return crate::android::screenshot::render_screenshot(&data);
+        }
+
         let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
         let filename = args
             .get("filename")
@@ -226,7 +289,10 @@ impl Tool for ScreenshotTool {
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
-        json!({
+        // Only the android cfg below mutates this; on every other target it is built and returned
+        // as-is, so the binding reads as needlessly mutable there.
+        #[cfg_attr(not(all(unix, target_os = "android")), allow(unused_mut))]
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "filename": {
@@ -238,11 +304,41 @@ impl Tool for ScreenshotTool {
                     "description": "Optional region for macOS: 'selection' for interactive crop, 'window' for front window. Ignored on Linux."
                 }
             }
-        })
+        });
+        // On Android this tool captures through the accessibility bridge, so it accepts the same
+        // arguments as android_screenshot. Advertise them, or the guard is unreachable through
+        // this name and a caller has no way to say which app it means.
+        #[cfg(all(unix, target_os = "android"))]
+        if self.android_bridge.is_some()
+            && let Some(props) = schema
+                .get_mut("properties")
+                .and_then(serde_json::Value::as_object_mut)
+        {
+            props.insert(
+                "expect_package".into(),
+                json!({
+                    "type": "string",
+                    "description": crate::android::tool_msg("tool-android-action-param-expect-package")
+                }),
+            );
+            props.insert(
+                "max_width".into(),
+                json!({
+                    "type": "integer",
+                    "description": crate::android::tool_msg("tool-android-screenshot-param-max-width")
+                }),
+            );
+        }
+        schema
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.security.can_act() {
+        #[cfg(all(unix, target_os = "android"))]
+        let bridge_backed = self.android_bridge.is_some();
+        #[cfg(not(all(unix, target_os = "android")))]
+        let bridge_backed = false;
+
+        if requires_action_permission(bridge_backed) && !self.security.can_act() {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -278,6 +374,38 @@ mod tests {
         let tool = ScreenshotTool::new(test_security());
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("screenshot"));
+    }
+
+    #[test]
+    fn bridge_capture_does_not_require_mutating_autonomy() {
+        assert!(!requires_action_permission(true));
+        assert!(requires_action_permission(false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bridge_alias_width_matches_android_tool_policy_at_boundaries() {
+        let cases = [
+            (json!({}), 0),
+            (json!({}), 540),
+            (json!({}), 5000),
+            (json!({ "max_width": 0 }), 540),
+            (json!({ "max_width": 119 }), 540),
+            (json!({ "max_width": 120 }), 540),
+            (json!({ "max_width": 4096 }), 540),
+            (json!({ "max_width": 4097 }), 540),
+            (json!({ "max_width": u32::MAX }), 540),
+            (json!({ "max_width": u64::from(u32::MAX) + 1 }), 540),
+        ];
+
+        for (args, default_width) in cases {
+            assert_eq!(
+                bridge_screenshot_width(&args, default_width),
+                crate::android::screenshot::resolve_android_screenshot_width(&args, default_width),
+                "generic and android_screenshot widths diverged for args={args}, \
+                 default_width={default_width}"
+            );
+        }
     }
 
     #[test]

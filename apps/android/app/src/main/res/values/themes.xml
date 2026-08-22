@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Zerodroid" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowActionBar">false</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:colorBackground">#000000</item>
+        <item name="android:textColorPrimary">#FFFFFF</item>
+        <item name="android:textColorSecondary">#B0B0B0</item>
+        <item name="android:textColorHint">@color/cellclaw_overlay_text_hint</item>
+        <item name="android:editTextColor">@color/cellclaw_overlay_text_primary</item>
+        <item name="colorAccent">@color/cellclaw_overlay_accent</item>
+    </style>
+</resources>

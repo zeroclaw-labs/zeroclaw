@@ -53,6 +53,9 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 
 ### Configuration, Logging, and Tools
 
+- Add an opt-in Android-native tool family (`android_screenshot`, `android_ui_read`, `android_action`, `android_dialog`, `android_launch`, `android_device`) and an experimental standalone APK under `apps/android/`. The bundled agent reaches the in-app Accessibility and device bridge over a private Unix-domain socket. The family is off by default, requires `[android] enabled = true` plus a runtime Android check, revalidates the foreground package before mutation, and keeps privileged system-dialog confirmation separate from ordinary autonomous UI control.
+- Isolate headerless gateway `/webhook` calls in fresh session scopes so one-shot clients cannot recall unrelated conversation memory; callers that want continuity opt in with `X-Session-Id`.
+- Serialize tool-call batches containing `android_*` operations so taps, typing, screenshots, and app launches preserve model-emitted order even under full autonomy.
 - Preserve partial configuration during salvage and improve dotted-map keys, nested values, dirty-path resolution, and patch error handling (#8836, #9309, #9297, #9243, #9310, #9296).
 - Serialize configuration writes and reject unsafe or invalid inputs without panics (#9312, #9059, #9441).
 - Align the inert `context_compression.enabled` schema default with actual runtime behavior and warn when obsolete compression fields are authored (#9299).
