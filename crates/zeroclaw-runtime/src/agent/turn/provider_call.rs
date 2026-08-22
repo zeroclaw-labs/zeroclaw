@@ -6,7 +6,8 @@ use super::events::{ProgressEvent, StreamDelta, send_progress, thinking_status_t
 use super::outcome::{
     StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
     StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
-    StreamSemanticEmptyCompletion, ToolLoopCancelled, is_tool_loop_cancelled,
+    StreamSemanticEmptyCompletion, StreamTerminalCompletion, ToolLoopCancelled,
+    is_tool_loop_cancelled,
 };
 use super::redact::scrub_credentials;
 use super::stream_consume::consume_provider_streaming_response;
@@ -214,7 +215,7 @@ pub(crate) async fn call_provider(
                                 .or_else(|| {
                                     stream_err
                                         .downcast_ref::<StreamInterruptedAfterOutput>()
-                                        .and_then(|error| error.usage.clone())
+                                        .and_then(|error| error.usage().cloned())
                                 })
                                 .or_else(|| {
                                     stream_err
@@ -237,6 +238,71 @@ pub(crate) async fn call_provider(
                             (Err(stream_err), false, false, String::new())
                         }
                         Err(stream_err) => {
+                            if let Some(terminal) = stream_err
+                                .downcast_ref::<StreamTerminalCompletion>()
+                            {
+                                // Capture identity before usage accounting
+                                // consumes the provisional Reliable attempt.
+                                // Only that exact pre-existing entry permits
+                                // one non-stream recovery.
+                                let has_exact_reliable_candidate =
+                                    scope.has_pending_reliable_stream_attempt();
+                                if terminal.policy.usage_chargeability()
+                                    == zeroclaw_providers::TerminalUsageChargeability::Billable
+                                    && let Some(usage) = terminal.failure.usage.clone()
+                                    && !scope.record_rejected_stream_usage(usage.clone())
+                                {
+                                    record_rejected_tool_loop_cost_usage(
+                                        ctx.provider_name,
+                                        ctx.model,
+                                        &usage,
+                                    );
+                                }
+                                if terminal.policy.recovery()
+                                    == zeroclaw_providers::TerminalRecoveryDisposition::NoReplay
+                                    || !has_exact_reliable_candidate
+                                {
+                                    (Err(stream_err), false, false, String::new())
+                                } else {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                            .with_category(::zeroclaw_log::EventCategory::Provider)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                            .with_attrs(::serde_json::json!({
+                                                "model": active_model,
+                                                "iteration": iteration + 1,
+                                                "error": scrub_credentials(&stream_err.to_string()),
+                                                "trace_id": ctx.turn_id,
+                                            })),
+                                        "llm_stream_fallback: incomplete provider stream, continuing after selected candidate"
+                                    );
+                                    scope.clear_provisional_provider_route();
+                                    let dispatcher = ProviderDispatch::from_ref(active_model_provider);
+                                    let recovery = dispatcher.chat(
+                                        ChatRequest {
+                                            messages: prepared_messages,
+                                            tools: request_tools,
+                                            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                                .try_with(Clone::clone)
+                                                .ok()
+                                                .flatten(),
+                                        },
+                                        active_model,
+                                        ctx.temperature,
+                                    );
+                                    let result = if let Some(token) = ctx.cancellation_token {
+                                        tokio::select! {
+                                            biased;
+                                            result = recovery => result,
+                                            () = token.cancelled() => Err(ToolLoopCancelled.into()),
+                                        }
+                                    } else {
+                                        recovery.await
+                                    };
+                                    (result, false, false, String::new())
+                                }
+                            } else {
                             if let Some(usage) = stream_err
                                 .downcast_ref::<StreamSemanticEmptyCompletion>()
                                 .and_then(|error| error.usage.clone())
@@ -296,6 +362,7 @@ pub(crate) async fn call_provider(
                                 recovery.await
                             };
                             (result, false, false, String::new())
+                            }
                         }
                     }
                 }))))
@@ -644,6 +711,10 @@ mod streaming_fallback_tests {
         calls: AtomicUsize,
     }
 
+    struct DirectTerminalStreamProvider {
+        non_stream_calls: AtomicUsize,
+    }
+
     impl Attributable for EmptyStreamThenTextProvider {
         fn role(&self) -> Role {
             Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
@@ -671,6 +742,16 @@ mod streaming_fallback_tests {
 
         fn alias(&self) -> &str {
             "EmptyThenPendingProvider"
+        }
+    }
+
+    impl Attributable for DirectTerminalStreamProvider {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "DirectTerminalStreamProvider"
         }
     }
 
@@ -809,6 +890,54 @@ mod streaming_fallback_tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for DirectTerminalStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            self.non_stream_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(ChatResponse {
+                text: Some("must not be requested".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![Err(
+                zeroclaw_api::model_provider::StreamError::TerminalCompletion(
+                    zeroclaw_api::model_provider::TerminalCompletionFailure::from(
+                        zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit,
+                    ),
+                ),
+            )]))
+        }
+    }
+
     #[tokio::test]
     async fn completed_empty_stream_uses_one_non_streaming_fallback() {
         let provider = EmptyStreamThenTextProvider {
@@ -865,6 +994,60 @@ mod streaming_fallback_tests {
         let recorded = *turn_usage.lock();
         assert_eq!(recorded.input_tokens, 10);
         assert_eq!(recorded.output_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn direct_terminal_stream_without_reliable_candidate_never_replays() {
+        let provider = DirectTerminalStreamProvider {
+            non_stream_calls: AtomicUsize::new(0),
+        };
+        let observer = NoopObserver;
+        let pacing = PacingConfig::default();
+        let ctx = TurnCtx {
+            observer: &observer,
+            provider_name: "direct-provider",
+            model: "test-model",
+            temperature: Some(0.0),
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "test-turn",
+            agent_alias: None,
+            parent_agent_alias: None,
+        };
+
+        let error = call_provider(
+            &ctx,
+            &provider,
+            "test-model",
+            &[ChatMessage::user("go")],
+            None,
+            true,
+            0,
+        )
+        .await
+        .expect("dispatch returns the terminal provider outcome")
+        .chat_result
+        .expect_err("a direct provider has no exact fallback candidate");
+
+        assert_eq!(
+            zeroclaw_api::model_provider::terminal_completion_error(&error),
+            Some(zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit)
+        );
+        assert_eq!(
+            provider.non_stream_calls.load(Ordering::Relaxed),
+            0,
+            "missing Reliable candidate identity must not replay the request"
+        );
     }
 
     #[tokio::test]

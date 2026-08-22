@@ -43,34 +43,89 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 #[derive(Debug)]
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
-    pub(crate) message: String,
-    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    cause: StreamInterruptionCause,
+}
+
+/// The reason an already-visible provider stream cannot complete. A typed
+/// terminal cause must survive this boundary: delivery code distinguishes a
+/// provider-declared incomplete response from an ordinary transport break.
+#[derive(Debug)]
+enum StreamInterruptionCause {
+    Transport {
+        message: String,
+        usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    },
+    Terminal(zeroclaw_api::model_provider::TerminalCompletionFailure),
+}
+
+impl StreamInterruptedAfterOutput {
+    pub(crate) fn transport(
+        partial_text: String,
+        message: String,
+        usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    ) -> Self {
+        Self {
+            partial_text,
+            cause: StreamInterruptionCause::Transport { message, usage },
+        }
+    }
+
+    pub(crate) fn terminal(
+        partial_text: String,
+        failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
+    ) -> Self {
+        Self {
+            partial_text,
+            cause: StreamInterruptionCause::Terminal(failure),
+        }
+    }
+
+    pub(crate) fn usage(&self) -> Option<&zeroclaw_providers::traits::TokenUsage> {
+        match &self.cause {
+            StreamInterruptionCause::Transport { usage, .. } => usage.as_ref(),
+            StreamInterruptionCause::Terminal(failure) => failure.usage.as_ref(),
+        }
+    }
 }
 
 impl std::fmt::Display for StreamInterruptedAfterOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        match &self.cause {
+            StreamInterruptionCause::Transport { message, .. } => f.write_str(message),
+            StreamInterruptionCause::Terminal(failure) => failure.fmt(f),
+        }
     }
 }
 
-impl std::error::Error for StreamInterruptedAfterOutput {}
+impl std::error::Error for StreamInterruptedAfterOutput {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.cause {
+            StreamInterruptionCause::Transport { .. } => None,
+            StreamInterruptionCause::Terminal(failure) => Some(failure),
+        }
+    }
+}
 
-/// A transport stream failure before user-visible output. The cumulative usage
-/// snapshot is retained so Reliable recovery can bill the exact selected
-/// stream attempt once.
+/// A no-output stream reached a provider-declared terminal incomplete state.
+/// The active Reliable accounting scope owns the selected stream identity, so
+/// this outcome carries only the provider failure and its recovery policy.
 #[derive(Debug)]
-pub(crate) struct StreamErrorWithUsage {
-    pub(crate) message: String,
-    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+pub(crate) struct StreamTerminalCompletion {
+    pub(crate) failure: zeroclaw_api::model_provider::TerminalCompletionFailure,
+    pub(crate) policy: zeroclaw_providers::TerminalCompletionPolicy,
 }
 
-impl std::fmt::Display for StreamErrorWithUsage {
+impl std::fmt::Display for StreamTerminalCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        self.failure.fmt(f)
     }
 }
 
-impl std::error::Error for StreamErrorWithUsage {}
+impl std::error::Error for StreamTerminalCompletion {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.failure)
+    }
+}
 
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those
@@ -104,10 +159,42 @@ impl std::fmt::Display for StreamSemanticEmptyCompletion {
 
 impl std::error::Error for StreamSemanticEmptyCompletion {}
 
+/// A stream failed before exposing output, after the provider reported usage.
+/// Keep that usage through the recovery boundary so the fallback cannot hide
+/// a billed failed attempt.
+#[derive(Debug)]
+pub(crate) struct StreamErrorWithUsage {
+    pub(crate) message: String,
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+}
+
+impl std::fmt::Display for StreamErrorWithUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StreamErrorWithUsage {}
+
+/// A non-streaming provider response that cannot complete a turn because it
+/// exposes neither a final answer nor a tool call. Keep this typed through the
+/// turn boundary so delivery adapters do not infer it from English diagnostics.
+#[derive(Debug)]
+pub(crate) struct SemanticEmptyTerminalCompletion;
+
+impl std::fmt::Display for SemanticEmptyTerminalCompletion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("provider completed without final text or tool calls")
+    }
+}
+
+impl std::error::Error for SemanticEmptyTerminalCompletion {}
+
 /// Whether a turn error has the canonical semantic-empty terminal reason.
 pub fn is_semantic_empty_terminal_completion(err: &anyhow::Error) -> bool {
     err.chain().any(|source| {
-        source.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+        source.is::<SemanticEmptyTerminalCompletion>()
+            || source.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
             || source.is::<StreamSemanticEmptyCompletion>()
             || source.is::<zeroclaw_providers::ReliableSemanticEmptyCompletion>()
     })
@@ -136,6 +223,41 @@ fn pre_executed_tools_without_final_response_message(agent_name: Option<&str>) -
     }
 }
 
+fn terminal_reason_message(
+    reason: zeroclaw_api::model_provider::TerminalCompletionError,
+    agent_name: Option<&str>,
+) -> String {
+    let (agent_key, delegate_key) = match reason {
+        zeroclaw_api::model_provider::TerminalCompletionError::OutputTokenLimit => (
+            "cli-agent-error-output-token-limit",
+            "cli-delegate-error-output-token-limit",
+        ),
+        zeroclaw_api::model_provider::TerminalCompletionError::ContextWindow => (
+            "cli-agent-error-context-window",
+            "cli-delegate-error-context-window",
+        ),
+        zeroclaw_api::model_provider::TerminalCompletionError::PausedTurn => (
+            "cli-agent-error-paused-turn",
+            "cli-delegate-error-paused-turn",
+        ),
+        zeroclaw_api::model_provider::TerminalCompletionError::Refusal => {
+            ("cli-agent-error-refusal", "cli-delegate-error-refusal")
+        }
+        zeroclaw_api::model_provider::TerminalCompletionError::InvalidTerminalReason => (
+            "cli-agent-error-invalid-terminal-reason",
+            "cli-delegate-error-invalid-terminal-reason",
+        ),
+    };
+
+    match agent_name {
+        Some(agent_name) => crate::i18n::get_required_cli_string_with_args(
+            delegate_key,
+            &[("agent_name", agent_name)],
+        ),
+        None => crate::i18n::get_required_cli_string(agent_key),
+    }
+}
+
 /// Map typed terminal-delivery failures to their Fluent user-facing message.
 pub fn terminal_completion_error_message(
     err: &anyhow::Error,
@@ -143,6 +265,9 @@ pub fn terminal_completion_error_message(
 ) -> Option<String> {
     if is_semantic_empty_terminal_completion(err) {
         return Some(semantic_empty_terminal_completion_message(agent_name));
+    }
+    if let Some(reason) = zeroclaw_api::model_provider::terminal_completion_error(err) {
+        return Some(terminal_reason_message(reason, agent_name));
     }
     err.chain()
         .any(|source| source.is::<StreamPreExecutedToolsWithoutFinalResponse>())
@@ -181,8 +306,8 @@ impl std::error::Error for StreamCancelledAfterOutput {
     }
 }
 
-/// Cancellation before caller-visible output. The cause remains the canonical
-/// tool-loop cancellation while usage survives for rejected accounting.
+/// Cancellation before caller-visible output. The canonical cancellation cause
+/// remains intact while usage stays available for rejected-attempt accounting.
 #[derive(Debug)]
 pub(crate) struct StreamCancelledWithUsage {
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
@@ -259,7 +384,7 @@ mod tests {
 
     #[test]
     fn terminal_completion_diagnostics_are_stable_english() {
-        let direct = zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion;
+        let direct = SemanticEmptyTerminalCompletion;
         let stream = StreamSemanticEmptyCompletion { usage: None };
         let provider_tools = StreamPreExecutedToolsWithoutFinalResponse { usage: None };
 
@@ -279,8 +404,7 @@ mod tests {
 
     #[test]
     fn semantic_empty_cause_uses_the_fluent_delivery_projection() {
-        let error =
-            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+        let error = anyhow::Error::new(SemanticEmptyTerminalCompletion);
         assert!(is_semantic_empty_terminal_completion(&error));
         assert_eq!(
             terminal_completion_error_message(&error, None),
@@ -289,9 +413,110 @@ mod tests {
     }
 
     #[test]
+    fn native_terminal_reasons_use_direct_and_delegate_fluent_messages() {
+        use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
+
+        let cases = [
+            (
+                TerminalCompletionError::OutputTokenLimit,
+                "The provider reached its output token limit before completing the response.",
+                "Agent 'reviewer' failed: the provider reached its output token limit before completing the response.",
+            ),
+            (
+                TerminalCompletionError::ContextWindow,
+                "The provider reached its context window before completing the response.",
+                "Agent 'reviewer' failed: the provider reached its context window before completing the response.",
+            ),
+            (
+                TerminalCompletionError::PausedTurn,
+                "The provider paused the turn before completing the response.",
+                "Agent 'reviewer' failed: the provider paused the turn before completing the response.",
+            ),
+            (
+                TerminalCompletionError::Refusal,
+                "The provider refused before completing the response.",
+                "Agent 'reviewer' failed: the provider refused before completing the response.",
+            ),
+            (
+                TerminalCompletionError::InvalidTerminalReason,
+                "The provider ended with an invalid terminal response state.",
+                "Agent 'reviewer' failed: the provider ended with an invalid terminal response state.",
+            ),
+        ];
+
+        for (reason, direct, delegate) in cases {
+            let error = anyhow::Error::new(TerminalCompletionFailure::from(reason));
+
+            assert_eq!(
+                terminal_completion_error_message(&error, None).as_deref(),
+                Some(direct)
+            );
+            assert_eq!(
+                terminal_completion_error_message(&error, Some("reviewer")).as_deref(),
+                Some(delegate)
+            );
+            assert_eq!(error.to_string(), reason.to_string());
+        }
+    }
+
+    #[test]
+    fn streamed_terminal_reason_uses_fluent_delivery_projection() {
+        use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
+
+        let error = anyhow::Error::new(StreamTerminalCompletion {
+            failure: TerminalCompletionFailure::from(TerminalCompletionError::OutputTokenLimit),
+            policy: zeroclaw_providers::default_terminal_policy(
+                TerminalCompletionError::OutputTokenLimit,
+            ),
+        });
+
+        assert_eq!(
+            terminal_completion_error_message(&error, None),
+            Some(
+                "The provider reached its output token limit before completing the response."
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            error.to_string(),
+            "response incomplete: output token limit reached"
+        );
+    }
+
+    #[test]
+    fn visible_stream_terminal_failure_keeps_its_typed_delivery_cause() {
+        use zeroclaw_api::model_provider::{TerminalCompletionError, TerminalCompletionFailure};
+        use zeroclaw_providers::traits::TokenUsage;
+
+        let error = anyhow::Error::new(StreamInterruptedAfterOutput::terminal(
+            "partial".to_string(),
+            TerminalCompletionFailure::new(
+                TerminalCompletionError::OutputTokenLimit,
+                Some(TokenUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(4),
+                    cached_input_tokens: None,
+                }),
+            ),
+        ));
+
+        assert_eq!(
+            terminal_completion_error_message(&error, None),
+            Some(
+                "The provider reached its output token limit before completing the response."
+                    .to_string()
+            )
+        );
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<TerminalCompletionFailure>()
+                .is_some_and(|failure| failure.reason == TerminalCompletionError::OutputTokenLimit)
+        }));
+    }
+
+    #[test]
     fn disk_catalog_override_changes_delivery_not_the_diagnostic() {
-        let error =
-            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+        let error = anyhow::Error::new(SemanticEmptyTerminalCompletion);
         let disk_override =
             "cli-agent-error-invalid-semantic-completion = Réponse terminale invalide.\n";
         let delivered = crate::i18n::get_disk_override_cli_string_for_test(
