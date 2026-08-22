@@ -27,9 +27,13 @@
 //! an empty registry rejects everything — wiring it on is a deliberate, later
 //! step.
 
+pub mod native;
 pub mod oidc;
+pub mod peercred;
 
+pub use native::NativeAuthProvider;
 pub use oidc::OidcAuthProvider;
+pub use peercred::{PeercredAuthProvider, UidRoster};
 
 use std::collections::HashMap;
 use std::sync::Arc;
