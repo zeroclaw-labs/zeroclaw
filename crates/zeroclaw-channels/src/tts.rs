@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
+use reqwest::header::HeaderValue;
 
 use zeroclaw_config::schema::{Config, TtsProviderConfig};
 
@@ -12,6 +13,9 @@ const DEFAULT_MAX_TEXT_LENGTH: usize = 4096;
 
 /// Default HTTP request timeout for TTS API calls.
 const TTS_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+const GOOGLE_TTS_ENDPOINT: &str = "https://texttospeech.googleapis.com/v1/text:synthesize";
+const GOOGLE_TTS_API_KEY_HEADER: &str = "x-goog-api-key";
 
 /// Maximum time allowed for a local ffmpeg transcode.
 const FFMPEG_TRANSCODE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -320,6 +324,34 @@ impl GoogleTtsProvider {
                 .context("Failed to build HTTP client for Google TTS")?,
         })
     }
+
+    fn sensitive_api_key_header(&self) -> Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(&self.api_key).map_err(|_| {
+            anyhow::Error::msg("Google TTS API key contains invalid header characters")
+        })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    fn build_synthesize_request(&self, text: &str, voice: &str) -> Result<reqwest::RequestBuilder> {
+        let body = serde_json::json!({
+            "input": { "text": text },
+            "voice": {
+                "languageCode": self.language_code,
+                "name": voice,
+            },
+            "audioConfig": {
+                "audioEncoding": "MP3",
+            },
+        });
+        let api_key = self.sensitive_api_key_header()?;
+
+        Ok(self
+            .client
+            .post(GOOGLE_TTS_ENDPOINT)
+            .header(GOOGLE_TTS_API_KEY_HEADER, api_key)
+            .json(&body))
+    }
 }
 
 #[async_trait::async_trait]
@@ -334,23 +366,8 @@ impl TtsProvider for GoogleTtsProvider {
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
-        let url = "https://texttospeech.googleapis.com/v1/text:synthesize";
-        let body = serde_json::json!({
-            "input": { "text": text },
-            "voice": {
-                "languageCode": self.language_code,
-                "name": voice,
-            },
-            "audioConfig": {
-                "audioEncoding": "MP3",
-            },
-        });
-
         let resp = self
-            .client
-            .post(url)
-            .header("x-goog-api-key", &self.api_key)
-            .json(&body)
+            .build_synthesize_request(text, voice)?
             .send()
             .await
             .context("Failed to send Google TTS request")?;
@@ -1329,6 +1346,74 @@ mod tests {
             },
         );
         cfg
+    }
+
+    fn google_tts_provider(api_key: &str) -> GoogleTtsProvider {
+        GoogleTtsProvider::new(
+            "test",
+            &TtsProviderConfig {
+                api_key: Some(api_key.to_string()),
+                ..TtsProviderConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn google_synthesize_request_preserves_endpoint_body_and_sensitive_header() {
+        let credential = "synthetic-google-tts-key";
+        let provider = google_tts_provider(credential);
+        let request = provider
+            .build_synthesize_request("hello world", "en-US-Standard-A")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(request.url().as_str(), GOOGLE_TTS_ENDPOINT);
+        assert!(!request.url().as_str().contains(credential));
+        assert!(!request.url().query_pairs().any(|(name, _)| name == "key"));
+
+        let header = request
+            .headers()
+            .get(GOOGLE_TTS_API_KEY_HEADER)
+            .expect("Google TTS API key header");
+        assert_eq!(header.to_str().unwrap(), credential);
+        assert!(header.is_sensitive());
+
+        let payload = request
+            .body()
+            .and_then(|body| body.as_bytes())
+            .expect("Google TTS request body should be bytes");
+        let body: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "input": { "text": "hello world" },
+                "voice": {
+                    "languageCode": "en-US",
+                    "name": "en-US-Standard-A",
+                },
+                "audioConfig": {
+                    "audioEncoding": "MP3",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn google_tts_rejects_control_characters_without_echoing_credential() {
+        let credential = "synthetic-google-tts-key\r\ninjected: value";
+        let provider = google_tts_provider(credential);
+        let error = match provider.build_synthesize_request("hello", "en-US-Standard-A") {
+            Ok(_) => panic!("control characters must be rejected before dispatch"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "Google TTS API key contains invalid header characters"
+        );
+        assert!(!error.to_string().contains(credential));
     }
 
     fn config_with_piper_alias() -> Config {
