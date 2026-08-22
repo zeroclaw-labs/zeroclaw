@@ -430,34 +430,42 @@ impl InterruptOnNewMessageConfig {
     }
 }
 
+/// Resolve `interrupt_on_new_message` for each channel type.
+///
+/// A channel type opts in when ANY configured alias enables it. The alias maps
+/// are keyed by the operator-chosen section name — `[channels.whatsapp.home]`
+/// is alias `home` — so a lookup of the literal key `"default"` silently
+/// ignored the flag for every deployment that did not happen to name its alias
+/// `default`, with no warning and no way to tell from the config that the
+/// setting was inert.
 fn interrupt_on_new_message_config(
     channels: &zeroclaw_config::schema::ChannelsConfig,
 ) -> InterruptOnNewMessageConfig {
     InterruptOnNewMessageConfig {
         telegram: channels
             .telegram
-            .get("default")
-            .is_some_and(|tg| tg.interrupt_on_new_message),
+            .values()
+            .any(|tg| tg.interrupt_on_new_message),
         slack: channels
             .slack
-            .get("default")
-            .is_some_and(|sl| sl.interrupt_on_new_message),
+            .values()
+            .any(|sl| sl.interrupt_on_new_message),
         discord: channels
             .discord
-            .get("default")
-            .is_some_and(|dc| dc.interrupt_on_new_message),
+            .values()
+            .any(|dc| dc.interrupt_on_new_message),
         mattermost: channels
             .mattermost
-            .get("default")
-            .is_some_and(|mm| mm.interrupt_on_new_message),
+            .values()
+            .any(|mm| mm.interrupt_on_new_message),
         matrix: channels
             .matrix
-            .get("default")
-            .is_some_and(|mx| mx.interrupt_on_new_message),
+            .values()
+            .any(|mx| mx.interrupt_on_new_message),
         whatsapp: channels
             .whatsapp
-            .get("default")
-            .is_some_and(|wa| wa.interrupt_on_new_message),
+            .values()
+            .any(|wa| wa.interrupt_on_new_message),
     }
 }
 
@@ -31210,6 +31218,45 @@ This is an example JSON object for profile settings."#;
 
         assert!(cfg.enabled_for_channel("whatsapp"));
         assert!(!cfg.enabled_for_channel("telegram"));
+    }
+
+    /// Regression: the alias map is keyed by the operator-chosen section name,
+    /// so `[channels.whatsapp.home]` must opt in exactly like a `default` one.
+    /// This previously resolved to `false` because the lookup hardcoded the
+    /// literal key `"default"`.
+    #[test]
+    fn interrupt_on_new_message_config_reads_non_default_whatsapp_alias() {
+        let mut channels = zeroclaw_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "home".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
+                interrupt_on_new_message: true,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(cfg.enabled_for_channel("whatsapp"));
+    }
+
+    /// A configured alias that leaves the flag off must not opt the channel in.
+    #[test]
+    fn interrupt_on_new_message_config_ignores_non_default_alias_with_flag_off() {
+        let mut channels = zeroclaw_config::schema::ChannelsConfig::default();
+        channels.whatsapp.insert(
+            "home".to_string(),
+            zeroclaw_config::schema::WhatsAppConfig {
+                session_path: Some("/tmp/zeroclaw-whatsapp-session.db".into()),
+                interrupt_on_new_message: false,
+                ..Default::default()
+            },
+        );
+
+        let cfg = interrupt_on_new_message_config(&channels);
+
+        assert!(!cfg.enabled_for_channel("whatsapp"));
     }
 
     #[test]
