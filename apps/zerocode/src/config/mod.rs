@@ -108,13 +108,28 @@ impl ConnectionSection {
 pub(crate) struct WssSection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
+    /// Bearer presented as `auth_token` in the initialize handshake (a
+    /// gateway pairing token, or an OIDC access token together with
+    /// `auth_provider`). Remote daemons require it since the RFC 7141
+    /// enforcement boundary. The `ZEROCLAW_AUTH_TOKEN` environment
+    /// variable overrides this value, so the token can stay out of the
+    /// config file entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Provider selection for `auth_token` (e.g. `oidc.corp`). Defaults
+    /// to the daemon's `native` pairing provider when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_provider: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
 }
 
 impl WssSection {
     fn is_empty(&self) -> bool {
-        self.uri.is_none() && self.tls.is_empty()
+        self.uri.is_none()
+            && self.auth_token.is_none()
+            && self.auth_provider.is_none()
+            && self.tls.is_empty()
     }
 }
 
