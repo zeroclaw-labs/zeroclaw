@@ -572,7 +572,7 @@ async fn execute_job_now_with_runtime(
     .await
 }
 
-fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
+fn cron_agent_run_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
     let mut policy = base.clone();
     if !matches!(job.job_type, JobType::Agent) || job.allowed_tools.is_some() {
         return policy;
@@ -798,13 +798,6 @@ async fn run_agent_job(
     agent_alias: &str,
     job: &CronJob,
 ) -> (bool, String) {
-    let subagent_ctx = match crate::subagent::SubAgentSpawn::for_agent(config, agent_alias)
-        .and_then(|spawn| spawn.build(crate::subagent::SubAgentOverrides::default()))
-    {
-        Ok(ctx) => ctx,
-        Err(e) => return (false, format!("subagent spawn failed: {e:#}")),
-    };
-
     if !security.can_act() {
         return (
             false,
@@ -850,7 +843,7 @@ async fn run_agent_job(
         spawn_site = "cron",
     );
 
-    let run_security = cron_agent_run_security_policy(subagent_ctx.policy.as_ref(), job);
+    let run_security = cron_agent_run_policy(security, job);
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
         security: Some(Arc::new(run_security)),
         memory: None,
@@ -1444,6 +1437,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cron_agent_run_policy_uses_scheduler_workspace() {
+        let workspace = std::path::PathBuf::from("/tmp/zeroclaw-cron-agent-workspace");
+        let security = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+
+        let policy = cron_agent_run_policy(&security, &job);
+
+        assert_eq!(policy.workspace_dir, workspace);
+    }
+
     struct PowerShellProbeRuntime {
         build_calls: std::sync::atomic::AtomicUsize,
     }
@@ -1626,13 +1634,13 @@ mod tests {
     }
 
     #[test]
-    fn cron_agent_run_security_policy_excludes_scheduler_mutation_tools_by_default() {
+    fn cron_agent_run_policy_excludes_scheduler_mutation_tools_by_default() {
         let security = SecurityPolicy::default();
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.allowed_tools = None;
 
-        let policy = cron_agent_run_security_policy(&security, &job);
+        let policy = cron_agent_run_policy(&security, &job);
 
         for tool in [
             "cron_add",
@@ -1653,13 +1661,13 @@ mod tests {
     }
 
     #[test]
-    fn cron_agent_run_security_policy_respects_explicit_allowed_tools() {
+    fn cron_agent_run_policy_respects_explicit_allowed_tools() {
         let security = SecurityPolicy::default();
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.allowed_tools = Some(vec!["cron_add".into()]);
 
-        let policy = cron_agent_run_security_policy(&security, &job);
+        let policy = cron_agent_run_policy(&security, &job);
 
         assert!(
             policy.is_tool_allowed("cron_add"),
