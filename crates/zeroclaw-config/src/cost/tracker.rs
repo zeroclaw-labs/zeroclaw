@@ -554,6 +554,7 @@ fn add_model_stats(by_model: &mut HashMap<String, ModelStats>, record: &CostReco
             input_tokens: 0,
             output_tokens: 0,
             cached_input_tokens: 0,
+            unpriced_tokens: 0,
             request_count: 0,
         });
     add_usage_to_model_stats(entry, record);
@@ -565,6 +566,11 @@ fn add_usage_to_model_stats(entry: &mut ModelStats, record: &CostRecord) {
     entry.input_tokens += record.usage.input_tokens;
     entry.output_tokens += record.usage.output_tokens;
     entry.cached_input_tokens += record.usage.cached_input_tokens;
+    if !record.usage.pricing_available {
+        entry.unpriced_tokens = entry
+            .unpriced_tokens
+            .saturating_add(record.usage.total_tokens);
+    }
     entry.request_count += 1;
 }
 
@@ -1017,6 +1023,24 @@ mod tests {
         assert_eq!(summary.request_count, 1);
         assert!(summary.session_cost_usd > 0.0);
         assert_eq!(summary.by_model.len(), 1);
+    }
+
+    #[test]
+    fn model_summary_counts_only_explicitly_unpriced_tokens() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::new(enabled_config(), tmp.path()).unwrap();
+        let configured_free = TokenUsage::new("test/model", 100, 50, 0, 0.0, 0.0, 0.0);
+        let mut unpriced = TokenUsage::new("test/model", 200, 75, 0, 0.0, 0.0, 0.0);
+        unpriced.pricing_available = false;
+
+        tracker.record_usage(configured_free).unwrap();
+        tracker.record_usage(unpriced).unwrap();
+
+        let summary = tracker.get_summary().unwrap();
+        let model = summary.by_model.get("test/model").unwrap();
+        assert_eq!(model.total_tokens, 425);
+        assert_eq!(model.unpriced_tokens, 275);
+        assert_eq!(model.cost_usd, 0.0);
     }
 
     #[test]

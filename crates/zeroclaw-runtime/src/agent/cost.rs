@@ -215,20 +215,53 @@ fn live_pricing_for(model_provider_name: &str, model: &str) -> Option<ModelRates
     zeroclaw_providers::pricing::lookup(&snapshot, model_provider_name, model).copied()
 }
 
-/// Flatten config rates merged with the live-price fallback into the
-/// `(input, output, cached)` tuple used for cost math. Config wins per
-/// dimension ([`ModelRates::or`]); live only fills dimensions config left
-/// unset; any dimension still unset bills at `0.0`.
-fn merge_config_and_live_rates(
-    config_rates: ModelRates,
-    live: Option<ModelRates>,
-) -> (f64, f64, f64) {
-    let merged = config_rates.or(live.unwrap_or_default());
-    (
-        merged.input_per_mtok.unwrap_or(0.0),
-        merged.output_per_mtok.unwrap_or(0.0),
-        merged.cached_input_per_mtok.unwrap_or(0.0),
-    )
+/// Merge configured rates with the live-price fallback without discarding
+/// whether each dimension was present. Config wins per dimension
+/// ([`ModelRates::or`]); live only fills dimensions config left unset.
+fn merge_config_and_live_rates(config_rates: ModelRates, live: Option<ModelRates>) -> ModelRates {
+    config_rates.or(live.unwrap_or_default())
+}
+
+fn pricing_available_for_usage(
+    rates: ModelRates,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+) -> bool {
+    let cached_input_tokens = cached_input_tokens.min(input_tokens);
+    let uncached_input_tokens = input_tokens.saturating_sub(cached_input_tokens);
+    let uncached_input_priced = uncached_input_tokens == 0 || rates.input_per_mtok.is_some();
+    let cached_input_priced = cached_input_tokens == 0
+        || rates.cached_input_per_mtok.is_some()
+        || rates.input_per_mtok.is_some();
+    let output_priced = output_tokens == 0 || rates.output_per_mtok.is_some();
+
+    uncached_input_priced && cached_input_priced && output_priced
+}
+
+/// A model with token usage whose ledger records explicitly report that one
+/// or more token-bearing pricing dimensions were unavailable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpricedModel {
+    pub model: String,
+    pub unpriced_tokens: u64,
+}
+
+/// Return per-model unpriced token subsets from the ledger-derived summary,
+/// sorted by model id for stable output.
+pub fn unpriced_models_in_summary(
+    by_model: &HashMap<String, zeroclaw_config::cost::ModelStats>,
+) -> Vec<UnpricedModel> {
+    let mut out: Vec<UnpricedModel> = by_model
+        .values()
+        .filter(|m| m.unpriced_tokens > 0)
+        .map(|m| UnpricedModel {
+            model: m.model.clone(),
+            unpriced_tokens: m.unpriced_tokens,
+        })
+        .collect();
+    out.sort_by(|a, b| a.model.cmp(&b.model));
+    out
 }
 
 /// Record usage from a rejected provider attempt without replacing the accepted
@@ -281,29 +314,27 @@ fn record_tool_loop_cost_usage_inner(
     let live = (!config_rates.is_complete())
         .then(|| live_pricing_for(model_provider_name, model))
         .flatten();
-    // `mut` so the global-catalog fallback below can still fill rates config and
-    // the live snapshot both left unset.
-    let (mut input_rate, mut output_rate, mut cached_rate) =
-        merge_config_and_live_rates(config_rates, live);
+    let mut rates = merge_config_and_live_rates(config_rates, live);
 
-    let priced_from_catalog = if input_rate == 0.0 && output_rate == 0.0 {
-        if let Some((cat_in, cat_out, cat_cached)) =
+    if rates.input_per_mtok.is_none()
+        && rates.output_per_mtok.is_none()
+        && let Some((cat_in, cat_out, cat_cached)) =
             crate::agent::pricing_catalog::global_pricing_rates(model)
-        {
-            input_rate = cat_in;
-            output_rate = cat_out;
-            if cached_rate == 0.0 {
-                cached_rate = cat_cached;
-            }
-            true
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    {
+        rates = rates.or(ModelRates {
+            input_per_mtok: (cat_in > 0.0).then_some(cat_in),
+            output_per_mtok: (cat_out > 0.0).then_some(cat_out),
+            cached_input_per_mtok: (cat_cached > 0.0).then_some(cat_cached),
+        });
+    }
 
-    let cost_usage = CostTokenUsage::new_with_cache(
+    let pricing_available =
+        pricing_available_for_usage(rates, input_tokens, cached_input_tokens, output_tokens);
+    let input_rate = rates.input_per_mtok.unwrap_or(0.0);
+    let output_rate = rates.output_per_mtok.unwrap_or(0.0);
+    let cached_rate = rates.cached_input_per_mtok.unwrap_or(0.0);
+
+    let mut cost_usage = CostTokenUsage::new_with_cache(
         model,
         input_tokens,
         cached_input_tokens,
@@ -312,8 +343,9 @@ fn record_tool_loop_cost_usage_inner(
         cached_rate,
         output_rate,
     );
+    cost_usage.pricing_available = pricing_available;
 
-    if ctx.tracker.is_some() && !priced_from_catalog && input_rate == 0.0 && output_rate == 0.0 {
+    if ctx.tracker.is_some() && !pricing_available {
         warn_once_missing_pricing(model_provider_name, model);
     }
 
@@ -427,6 +459,93 @@ mod tests {
         Mutex::new(HashSet::new())
     }
 
+    fn model_stats(
+        model: &str,
+        total_tokens: u64,
+        cost_usd: f64,
+        unpriced_tokens: u64,
+    ) -> zeroclaw_config::cost::ModelStats {
+        zeroclaw_config::cost::ModelStats {
+            model: model.to_string(),
+            cost_usd,
+            input_tokens: total_tokens,
+            cached_input_tokens: 0,
+            output_tokens: 0,
+            total_tokens,
+            unpriced_tokens,
+            request_count: 1,
+        }
+    }
+
+    #[test]
+    fn unpriced_models_use_recorded_provenance_not_aggregate_cost() {
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "claude-haiku-4-5-20251001".to_string(),
+            model_stats("claude-haiku-4-5-20251001", 9420, 0.0, 9420),
+        );
+        by_model.insert(
+            "configured-free".to_string(),
+            model_stats("configured-free", 1000, 0.0, 0),
+        );
+        by_model.insert("mixed".to_string(), model_stats("mixed", 3000, 0.05, 700));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        assert_eq!(unpriced.len(), 2);
+        assert_eq!(unpriced[0].model, "claude-haiku-4-5-20251001");
+        assert_eq!(unpriced[0].unpriced_tokens, 9420);
+        assert_eq!(unpriced[1].model, "mixed");
+        assert_eq!(unpriced[1].unpriced_tokens, 700);
+    }
+
+    /// Output is sorted by model id for stable, deterministic status output.
+    #[test]
+    fn unpriced_models_are_sorted_by_id() {
+        let mut by_model = HashMap::new();
+        by_model.insert("zeta".to_string(), model_stats("zeta", 10, 0.0, 10));
+        by_model.insert("alpha".to_string(), model_stats("alpha", 20, 0.0, 20));
+        by_model.insert("mike".to_string(), model_stats("mike", 30, 0.0, 30));
+
+        let unpriced = unpriced_models_in_summary(&by_model);
+        let ids: Vec<&str> = unpriced.iter().map(|m| m.model.as_str()).collect();
+        assert_eq!(ids, vec!["alpha", "mike", "zeta"]);
+    }
+
+    #[test]
+    fn genuinely_free_model_does_not_warn() {
+        let mut by_model = HashMap::new();
+        by_model.insert(
+            "configured-free".to_string(),
+            model_stats("configured-free", 1000, 0.0, 0),
+        );
+        assert!(unpriced_models_in_summary(&by_model).is_empty());
+    }
+
+    /// Routing Anthropic through the existing global catalog
+    /// (rather than a bespoke hand-maintained table) prices a direct-provider
+    /// Anthropic model by its bare model id. This is the drift-free path — the
+    /// same catalog that prices every other provider.
+    #[test]
+    fn global_catalog_prices_anthropic_model_by_id() {
+        use crate::agent::pricing_catalog::{GlobalPricingCatalog, set_global_pricing_catalog};
+        let catalog: GlobalPricingCatalog = serde_json::from_str(
+            r#"{"models":{"claude-haiku-4-5-20251001":{"input_usd_per_mtok":1.0,"output_usd_per_mtok":5.0,"cache_read_usd_per_mtok":0.1}}}"#,
+        )
+        .expect("catalog json parses");
+        set_global_pricing_catalog(catalog);
+
+        let rates =
+            crate::agent::pricing_catalog::global_pricing_rates("claude-haiku-4-5-20251001");
+        assert_eq!(
+            rates,
+            Some((1.0, 5.0, 0.1)),
+            "catalog must price the direct Anthropic model by its bare id"
+        );
+
+        // Reset the process-global catalog so we don't leak into other tests.
+        set_global_pricing_catalog(GlobalPricingCatalog::default());
+    }
+
     #[test]
     fn config_rate_wins_live_fills_only_gaps() {
         // Config priced ONLY input; live prices all three. Input must stay the
@@ -440,7 +559,14 @@ mod tests {
             output_per_mtok: Some(15.0),
             cached_input_per_mtok: Some(1.5),
         });
-        assert_eq!(merge_config_and_live_rates(config, live), (5.0, 15.0, 1.5));
+        assert_eq!(
+            merge_config_and_live_rates(config, live),
+            ModelRates {
+                input_per_mtok: Some(5.0),
+                output_per_mtok: Some(15.0),
+                cached_input_per_mtok: Some(1.5),
+            }
+        );
     }
 
     #[test]
@@ -449,7 +575,7 @@ mod tests {
         // exactly: all rates zero.
         assert_eq!(
             merge_config_and_live_rates(ModelRates::default(), None),
-            (0.0, 0.0, 0.0)
+            ModelRates::default()
         );
         // A configured zero (genuinely free) is preserved, not "filled".
         assert_eq!(
@@ -465,8 +591,32 @@ mod tests {
                     cached_input_per_mtok: Some(0.3),
                 })
             ),
-            (0.0, 0.0, 0.3)
+            ModelRates {
+                input_per_mtok: Some(0.0),
+                output_per_mtok: Some(0.0),
+                cached_input_per_mtok: Some(0.3),
+            }
         );
+    }
+
+    #[test]
+    fn pricing_availability_requires_each_token_bearing_dimension() {
+        let input_only = ModelRates {
+            input_per_mtok: Some(0.0),
+            output_per_mtok: None,
+            cached_input_per_mtok: None,
+        };
+        assert!(pricing_available_for_usage(input_only, 100, 0, 0));
+        assert!(!pricing_available_for_usage(input_only, 100, 0, 1));
+        assert!(pricing_available_for_usage(input_only, 100, 100, 0));
+
+        let cached_only = ModelRates {
+            input_per_mtok: None,
+            output_per_mtok: None,
+            cached_input_per_mtok: Some(0.0),
+        };
+        assert!(pricing_available_for_usage(cached_only, 100, 100, 0));
+        assert!(!pricing_available_for_usage(cached_only, 100, 99, 0));
     }
 
     #[test]
@@ -777,6 +927,62 @@ mod tests {
             serde_json::from_str(stored.lines().next().expect("one record")).unwrap();
         assert_eq!(record.usage.cached_input_tokens, 4_000);
         assert_eq!(record.usage.billable_input_tokens(), 1_000);
+    }
+
+    #[test]
+    fn record_tool_loop_cost_usage_persists_pricing_provenance() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig::default(),
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let ctx = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(HashMap::from([(
+                "configured-free".to_string(),
+                pricing_with_cache("free-model", 0.0, 0.0, 0.0),
+            )])),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cached_input_tokens: Some(0),
+        };
+
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx.clone()), async {
+                    record_tool_loop_cost_usage("configured-free", "free-model", &usage)
+                })
+                .await
+                .expect("configured-free usage");
+            TOOL_LOOP_COST_TRACKING_CONTEXT
+                .scope(Some(ctx), async {
+                    record_tool_loop_cost_usage(
+                        "missing-provider",
+                        "missing-provenance-model",
+                        &usage,
+                    )
+                })
+                .await
+                .expect("unpriced usage");
+        });
+
+        let stored = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .expect("costs.jsonl should be written");
+        let records: Vec<zeroclaw_config::cost::types::CostRecord> = stored
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(records[0].usage.pricing_available);
+        assert_eq!(records[0].usage.cost_usd, 0.0);
+        assert!(!records[1].usage.pricing_available);
+        assert_eq!(records[1].usage.total_tokens, 150);
     }
 
     #[test]

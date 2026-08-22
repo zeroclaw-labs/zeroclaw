@@ -4791,6 +4791,45 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                     &spent_month_fallback
                                 )
                             );
+                            // Pricing provenance is recorded per usage row and
+                            // rolled up over the current month. Surface any
+                            // explicitly unpriced subset loudly rather than
+                            // let an understated dollar total reassure the
+                            // operator. Configured zero rates and legacy rows
+                            // without provenance remain compatible and do not
+                            // trigger this warning.
+                            let unpriced =
+                                zeroclaw_runtime::agent::cost::unpriced_models_in_summary(
+                                    &summary.by_model,
+                                );
+                            if !unpriced.is_empty() {
+                                let uncosted_tokens: u64 =
+                                    unpriced.iter().map(|m| m.unpriced_tokens).sum();
+                                let count = unpriced.len().to_string();
+                                let tokens = uncosted_tokens.to_string();
+                                let models = unpriced
+                                    .iter()
+                                    .map(|m| m.model.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                let warn_fallback = format!(
+                                    "  ⚠ Pricing unavailable for {count} model(s) ({tokens} tokens uncosted): {models}. \
+Recorded spend is understated and daily/monthly caps CANNOT be enforced for these. \
+Add pricing to the active provider profile or supply a catalog entry."
+                                );
+                                eprintln!(
+                                    "{}",
+                                    ta(
+                                        "cli-status-pricing-unavailable",
+                                        &[
+                                            ("count", &count),
+                                            ("tokens", &tokens),
+                                            ("models", &models),
+                                        ],
+                                        &warn_fallback
+                                    )
+                                );
+                            }
                         }
                         Err(e) => {
                             eprintln!(

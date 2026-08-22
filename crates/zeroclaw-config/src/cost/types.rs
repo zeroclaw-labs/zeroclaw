@@ -284,6 +284,12 @@ pub struct ModelStats {
     pub output_tokens: u64,
     /// Total tokens for this model
     pub total_tokens: u64,
+    /// Tokens from records that explicitly report unavailable pricing.
+    ///
+    /// Legacy ledger rows omit `pricing_available` and deserialize as priced,
+    /// so they do not contribute to this total.
+    #[serde(default)]
+    pub unpriced_tokens: u64,
     /// Number of LLM responses for this model.
     pub request_count: usize,
 }
