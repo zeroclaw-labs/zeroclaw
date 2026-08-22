@@ -605,6 +605,7 @@ cli-quickstart-error-channel-required = se requieren tipo de canal y alias
 cli-quickstart-error-channel-field-not-advertised = el campo de canal `{$field}` no está disponible en Quickstart
 cli-quickstart-error-channel-token-required = se requiere el token del bot de Telegram
 cli-quickstart-error-webhook-secret-required = se requiere el secreto compartido del webhook
+cli-quickstart-error-webhook-port-conflict = el puerto de webhook {$port} ya está en uso por el webhook habilitado `{$alias}` — cada webhook habilitado necesita su propio puerto
 cli-quickstart-error-peer-group-name-required = se requiere el nombre del grupo de pares
 cli-quickstart-error-peer-group-channel-required = se requiere la referencia de canal del grupo de pares
 cli-quickstart-error-peer-group-unknown-channel = el grupo de pares `{$name}` referencia un canal desconocido `{$channel}`

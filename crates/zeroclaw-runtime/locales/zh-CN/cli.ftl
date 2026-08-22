@@ -604,6 +604,7 @@ cli-quickstart-error-channel-required = 必须填写通道类型和别名
 cli-quickstart-error-channel-field-not-advertised = Quickstart 中不支持通道字段 `{$field}`
 cli-quickstart-error-channel-token-required = 必须填写 Telegram Bot 令牌
 cli-quickstart-error-webhook-secret-required = 必须填写 Webhook 共享密钥
+cli-quickstart-error-webhook-port-conflict = Webhook 端口 {$port} 已被启用的 Webhook `{$alias}` 占用 — 每个启用的 Webhook 都需要各自的端口
 cli-quickstart-error-peer-group-name-required = 必须填写对等组名称
 cli-quickstart-error-peer-group-channel-required = 必须填写对等组通道引用
 cli-quickstart-error-peer-group-unknown-channel = 对等组 `{$name}` 引用了未知通道 `{$channel}`

@@ -687,6 +687,7 @@ cli-quickstart-error-channel-required = channel type and alias are required
 cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
 cli-quickstart-error-channel-token-required = Telegram bot token is required
 cli-quickstart-error-webhook-secret-required = Webhook shared secret is required
+cli-quickstart-error-webhook-port-conflict = webhook port {$port} is already used by enabled webhook `{$alias}` — each enabled webhook needs its own port
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
