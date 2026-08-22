@@ -443,6 +443,7 @@ pub async fn run(
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
             chrome_status.clear();
+            dashboard_pane.invalidate_daemon_data();
         } else {
             chrome_status.tick(&rpc);
         }

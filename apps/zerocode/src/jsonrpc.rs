@@ -124,18 +124,24 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 
 type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
 
+#[derive(Debug, Default)]
+struct PendingRequests {
+    responders: HashMap<String, PendingResponder>,
+    terminal_error: Option<JsonRpcError>,
+}
+
 /// Writer + outbound-call tracker shared between the read loop and
 /// the calling tasks. All writes go through `writer_tx` so concurrent
 /// notifications and outbound requests cannot interleave bytes.
 #[derive(Debug)]
 pub struct RpcOutbound {
     writer_tx: mpsc::Sender<String>,
-    pending: std::sync::Mutex<HashMap<String, PendingResponder>>,
+    pending: std::sync::Mutex<PendingRequests>,
     next_id: AtomicU64,
 }
 
 struct PendingRequestGuard<'a> {
-    pending: &'a std::sync::Mutex<HashMap<String, PendingResponder>>,
+    pending: &'a std::sync::Mutex<PendingRequests>,
     id: String,
 }
 
@@ -144,6 +150,7 @@ impl Drop for PendingRequestGuard<'_> {
         self.pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .responders
             .remove(&self.id);
     }
 }
@@ -152,7 +159,7 @@ impl RpcOutbound {
     pub fn new(writer_tx: mpsc::Sender<String>) -> Self {
         Self {
             writer_tx,
-            pending: std::sync::Mutex::new(HashMap::new()),
+            pending: std::sync::Mutex::new(PendingRequests::default()),
             next_id: AtomicU64::new(0),
         }
     }
@@ -199,7 +206,10 @@ impl RpcOutbound {
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.insert(id.clone(), tx);
+            if let Some(error) = &pending.terminal_error {
+                return Err(error.clone());
+            }
+            pending.responders.insert(id.clone(), tx);
         }
         let _pending_guard = PendingRequestGuard {
             pending: &self.pending,
@@ -242,6 +252,7 @@ impl RpcOutbound {
             .pending
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .responders
             .remove(id_str);
         if let Some(tx) = responder {
             let payload = if let Some(err) = error {
@@ -253,7 +264,83 @@ impl RpcOutbound {
         }
     }
 
+    /// Fail every in-flight request when the underlying transport closes.
+    ///
+    /// Drain the map before waking callers so their request guards never
+    /// contend with this method while dropping.
+    pub(crate) fn fail_all_pending(&self, error: JsonRpcError) {
+        let responders = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.terminal_error = Some(error.clone());
+            pending
+                .responders
+                .drain()
+                .map(|(_, responder)| responder)
+                .collect::<Vec<_>>()
+        };
+
+        for responder in responders {
+            let _ = responder.send(Err(error.clone()));
+        }
+    }
+
     pub fn pending_count(&self) -> usize {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .responders
+            .len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn transport_failure_wakes_and_rejects_requests() {
+        let (writer_tx, mut writer_rx) = mpsc::channel::<String>(1);
+        let rpc = Arc::new(RpcOutbound::new(writer_tx));
+        let request_rpc = Arc::clone(&rpc);
+        let request = tokio::spawn(async move {
+            request_rpc
+                .request("session/new", serde_json::json!({}))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), writer_rx.recv())
+            .await
+            .expect("request should be written")
+            .expect("writer should stay open");
+        assert_eq!(rpc.pending_count(), 1);
+
+        rpc.fail_all_pending(JsonRpcError {
+            code: error_codes::INTERNAL_ERROR,
+            message: "daemon disconnected".to_string(),
+            data: None,
+        });
+
+        let error = tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("pending request should wake immediately")
+            .expect("request task should complete")
+            .expect_err("disconnection should fail the request");
+        assert_eq!(error.message, "daemon disconnected");
+        assert_eq!(rpc.pending_count(), 0);
+
+        let late_error = tokio::time::timeout(
+            Duration::from_secs(1),
+            rpc.request("session/new", serde_json::json!({})),
+        )
+        .await
+        .expect("request after disconnect should fail immediately")
+        .expect_err("disconnected transport should reject new requests");
+        assert_eq!(late_error.message, "daemon disconnected");
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 }
