@@ -524,7 +524,8 @@ async fn safety_net_thinking_never_leaks_into_draft_or_chunks() {
             crate::agent::loop_::StreamDelta::Reasoning(t) => t,
             crate::agent::loop_::StreamDelta::ToolStart { .. }
             | crate::agent::loop_::StreamDelta::ToolComplete { .. }
-            | crate::agent::loop_::StreamDelta::Lifecycle(_) => continue,
+            | crate::agent::loop_::StreamDelta::Lifecycle(_)
+            | crate::agent::loop_::StreamDelta::FlushBarrier(_) => continue,
         };
         assert!(
             !body.contains("SECRET"),
