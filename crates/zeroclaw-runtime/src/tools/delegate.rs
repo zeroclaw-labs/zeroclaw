@@ -2500,6 +2500,7 @@ impl DelegateTool {
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            inject_memory: true,
             shell_profile,
         };
 

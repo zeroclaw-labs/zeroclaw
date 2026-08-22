@@ -30,6 +30,12 @@ pub struct PromptContext<'a> {
     /// includes "ask before acting" instructions. Full autonomy omits them
     /// so the model executes tools directly without simulating approval.
     pub autonomy_level: AutonomyLevel,
+    /// False for isolated / ACP sessions created with `exclude_memory: true`.
+    /// Mirrors `system_prompt::build_system_prompt_with_mode_and_autonomy`'s
+    /// `inject_memory` flag so both prompt builders enforce one policy: when
+    /// it is false, `MEMORY.md` is not injected into the provider-visible
+    /// system prompt.
+    pub inject_memory: bool,
     /// The shell the runtime adapter will spawn, or `None` for a shell-less
     /// runtime (which omits the `Shell:` field and the dialect guidance).
     /// Resolved from `RuntimeAdapter::shell_profile` so the reported shell
@@ -121,7 +127,14 @@ impl PromptSection for IdentitySection {
             );
         }
 
-        let profile = personality::load_personality(ctx.agent_workspace_dir);
+        let profile = if ctx.inject_memory {
+            personality::load_personality(ctx.agent_workspace_dir)
+        } else {
+            personality::load_personality_files(
+                ctx.agent_workspace_dir,
+                &personality::personality_files_without_memory(),
+            )
+        };
         prompt.push_str(&profile.render());
 
         Ok(prompt)
@@ -472,6 +485,80 @@ mod tests {
         }
     }
 
+    /// Builds an `IdentitySection` prompt over a temp workspace that contains
+    /// both a `MEMORY.md` sentinel and a `SOUL.md` control file, at the given
+    /// `inject_memory` setting. Returns the rendered section.
+    #[cfg(test)]
+    fn identity_section_with_memory_sentinel(inject_memory: bool) -> (String, std::path::PathBuf) {
+        let workspace =
+            std::env::temp_dir().join(format!("zeroclaw_prompt_mem_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("MEMORY.md"), "MEMORY_MD_SENTINEL_9341").unwrap();
+        std::fs::write(workspace.join("SOUL.md"), "SOUL_MD_CONTROL_9341").unwrap();
+
+        let tools: Vec<Box<dyn Tool>> = vec![];
+        let ctx = PromptContext {
+            workspace_dir: &workspace,
+            agent_workspace_dir: &workspace,
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            skills_prompt_mode: zeroclaw_config::schema::SkillsPromptInjectionMode::Full,
+            identity_config: None,
+            dispatcher_instructions: "",
+            sends_native_tool_specs: false,
+            security_summary: None,
+            autonomy_level: AutonomyLevel::Supervised,
+            inject_memory,
+            shell_profile: None,
+        };
+
+        let output = IdentitySection.build(&ctx).unwrap();
+        (output, workspace)
+    }
+
+    /// An isolated / ACP session (`exclude_memory: true` => `inject_memory:
+    /// false`) must not leak curated `MEMORY.md` content into the
+    /// provider-visible system prompt. The picker/Help copy promises
+    /// "persistent memory isolated"; this is the prompt-side half of that
+    /// guarantee.
+    #[test]
+    fn identity_section_omits_memory_md_when_inject_memory_false() {
+        let (output, workspace) = identity_section_with_memory_sentinel(false);
+
+        assert!(
+            !output.contains("MEMORY_MD_SENTINEL_9341"),
+            "MEMORY.md content must be absent when inject_memory is false, got:\n{output}"
+        );
+        // Positive control in the same direction: the section is not simply
+        // empty, so the assertion above cannot pass vacuously.
+        assert!(
+            output.contains("SOUL_MD_CONTROL_9341"),
+            "non-memory personality files must still load when inject_memory is false, got:\n{output}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    /// The Chat path (`exclude_memory: false`) is unchanged: curated memory
+    /// still reaches the prompt. Guards against "fix" the gate by always
+    /// dropping MEMORY.md.
+    #[test]
+    fn identity_section_includes_memory_md_when_inject_memory_true() {
+        let (output, workspace) = identity_section_with_memory_sentinel(true);
+
+        assert!(
+            output.contains("MEMORY_MD_SENTINEL_9341"),
+            "MEMORY.md content must still load when inject_memory is true, got:\n{output}"
+        );
+        assert!(
+            output.contains("SOUL_MD_CONTROL_9341"),
+            "SOUL.md must load when inject_memory is true, got:\n{output}"
+        );
+
+        let _ = std::fs::remove_dir_all(workspace);
+    }
+
     #[test]
     fn identity_section_with_aieos_includes_workspace_files() {
         let workspace =
@@ -503,6 +590,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -537,6 +625,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -561,6 +650,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
         let prompt = SystemPromptBuilder::with_defaults().build(&ctx).unwrap();
@@ -585,6 +675,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -638,6 +729,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -689,6 +781,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -732,6 +825,7 @@ mod tests {
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -780,6 +874,7 @@ mod tests {
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -809,6 +904,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -862,6 +958,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -899,6 +996,7 @@ mod tests {
 
             security_summary: Some(summary.clone()),
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -937,6 +1035,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -967,6 +1066,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Full,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -1005,6 +1105,7 @@ mod tests {
 
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile: None,
         };
 
@@ -1037,6 +1138,7 @@ mod tests {
             sends_native_tool_specs: false,
             security_summary: None,
             autonomy_level: AutonomyLevel::Supervised,
+            inject_memory: true,
             shell_profile,
         }
     }

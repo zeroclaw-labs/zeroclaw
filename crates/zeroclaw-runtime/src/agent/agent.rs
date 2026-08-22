@@ -363,6 +363,12 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// False for isolated / ACP sessions built with `exclude_memory: true`.
+    /// Drives `PromptContext::inject_memory` so `IdentitySection` cannot pull
+    /// `MEMORY.md` into the provider-visible system prompt for a session that
+    /// advertises persistent-memory isolation. Set from the same builder value
+    /// that installs `NoneMemory` and forces `auto_save` off.
+    inject_memory: bool,
     /// The shell this agent's runtime adapter will spawn, so the system
     /// prompt reports the dialect the agent actually executes under.
     /// `None` for a shell-less runtime.
@@ -974,6 +980,10 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            // One policy, one source: the same `exclude_memory` that strips
+            // memory tools and installs `NoneMemory` also withholds MEMORY.md
+            // from the prompt.
+            inject_memory: !exclude_memory,
             shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
@@ -2046,6 +2056,7 @@ impl Agent {
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            inject_memory: self.inject_memory,
             shell_profile: self.shell_profile.clone(),
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
@@ -5233,6 +5244,81 @@ mod tests {
                 builder = builder.multimodal_config(mm);
             }
             builder.build().expect("agent builder should succeed")
+        }
+
+        /// Builds an Agent over a temp workspace holding a `MEMORY.md` sentinel
+        /// and a `SOUL.md` control, at the given `exclude_memory` setting, and
+        /// returns its assembled system prompt.
+        fn system_prompt_with_memory_sentinel(exclude_memory: bool) -> String {
+            let workspace = tempfile::TempDir::new().expect("temp dir");
+            std::fs::write(
+                workspace.path().join("MEMORY.md"),
+                "MEMORY_MD_SENTINEL_9341",
+            )
+            .expect("write MEMORY.md");
+            std::fs::write(workspace.path().join("SOUL.md"), "SOUL_MD_CONTROL_9341")
+                .expect("write SOUL.md");
+
+            let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+                backend: "none".into(),
+                ..zeroclaw_config::schema::MemoryConfig::default()
+            };
+            let mem: Arc<dyn Memory> = Arc::from(
+                zeroclaw_memory::create_memory(&memory_cfg, workspace.path(), None)
+                    .expect("memory creation should succeed"),
+            );
+            let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+            let agent = Agent::builder()
+                .model_provider(Box::new(MockModelProvider {
+                    responses: Mutex::new(vec![]),
+                }))
+                .tools(vec![Box::new(MockTool)])
+                .memory(mem)
+                .observer(observer)
+                .tool_dispatcher(Box::new(NativeToolDispatcher))
+                .workspace_dir(workspace.path().to_path_buf())
+                .agent_workspace_dir(workspace.path().to_path_buf())
+                .exclude_memory(exclude_memory)
+                .build()
+                .expect("agent builder should succeed");
+
+            agent
+                .build_system_prompt_with_dispatcher(&NativeToolDispatcher as &dyn ToolDispatcher)
+                .expect("system prompt builds")
+        }
+
+        /// `exclude_memory: true` is the ACP / isolated-session policy. It
+        /// already strips memory tools, installs `NoneMemory` and forces
+        /// `auto_save` off; it must also keep curated `MEMORY.md` *content* out
+        /// of the provider-visible system prompt, otherwise the "persistent
+        /// memory isolated" copy is a claim the prompt path violates.
+        #[test]
+        fn build_system_prompt_omits_memory_md_when_exclude_memory() {
+            let prompt = system_prompt_with_memory_sentinel(true);
+
+            assert!(
+                !prompt.contains("MEMORY_MD_SENTINEL_9341"),
+                "MEMORY.md must not reach the ACP system prompt"
+            );
+            assert!(
+                prompt.contains("SOUL_MD_CONTROL_9341"),
+                "other personality files must still load under exclude_memory"
+            );
+        }
+
+        /// Chat sessions (`exclude_memory: false`) are unchanged.
+        #[test]
+        fn build_system_prompt_includes_memory_md_without_exclude_memory() {
+            let prompt = system_prompt_with_memory_sentinel(false);
+
+            assert!(
+                prompt.contains("MEMORY_MD_SENTINEL_9341"),
+                "MEMORY.md must still reach the Chat system prompt"
+            );
+            assert!(
+                prompt.contains("SOUL_MD_CONTROL_9341"),
+                "SOUL.md must still reach the Chat system prompt"
+            );
         }
 
         #[test]
