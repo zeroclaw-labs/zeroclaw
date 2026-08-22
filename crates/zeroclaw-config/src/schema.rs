@@ -15808,6 +15808,12 @@ pub struct WhatsAppConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub ws_url: Option<String>,
+    /// Display name announced to contacts (Web mode, optional)
+    /// Applied on connect when it differs from the name the linked device
+    /// already carries; leave unset to keep the account's own name
+    #[tab(Connection)]
+    #[serde(default)]
+    pub push_name: Option<String>,
     /// When true, only respond to messages that @-mention the bot in groups (Web mode only).
     /// Direct messages are always processed.
     /// Bot identity is resolved from the wa-rs device at runtime; `pair_phone` seeds it on first connect.
@@ -29534,6 +29540,7 @@ bot_token = "xoxb-tok"
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29569,6 +29576,7 @@ bot_token = "xoxb-tok"
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29601,6 +29609,30 @@ bot_token = "xoxb-tok"
         let parsed: WhatsAppConfig =
             serde_json::from_str(r#"{"passive_group_context":true}"#).unwrap();
         assert!(parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn whatsapp_config_push_name_absent_stays_none_and_round_trips_non_ascii() {
+        let parsed: WhatsAppConfig = serde_json::from_str("{}").unwrap();
+        assert!(parsed.push_name.is_none());
+
+        let name = "סוכן – שירות";
+        let wc = WhatsAppConfig {
+            push_name: Some(name.into()),
+            ..Default::default()
+        };
+        let parsed: WhatsAppConfig = toml::from_str(&toml::to_string(&wc).unwrap()).unwrap();
+        assert_eq!(parsed.push_name.as_deref(), Some(name));
+    }
+
+    #[test]
+    async fn whatsapp_config_push_name_is_not_a_web_selector() {
+        let wc = WhatsAppConfig {
+            push_name: Some("ZeroClawAgent".into()),
+            ..Default::default()
+        };
+        assert!(!wc.has_web_selector());
+        assert_eq!(wc.backend_type(), "cloud");
     }
 
     #[test]
@@ -29640,6 +29672,7 @@ allowed_numbers = ["+1", "+2"]
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29672,6 +29705,7 @@ allowed_numbers = ["+1", "+2"]
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29751,6 +29785,7 @@ allowed_numbers = ["+1", "+2"]
                     pair_phone: None,
                     pair_code: None,
                     ws_url: None,
+                    push_name: None,
                     mention_only: false,
                     passive_group_context: false,
                     interrupt_on_new_message: false,
