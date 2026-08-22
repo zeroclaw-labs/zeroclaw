@@ -3576,7 +3576,12 @@ data: {\"type\":\"message_stop\"}\n\n";
                         .get("attributes")
                         .and_then(|attributes| attributes.get("_file"))
                         .and_then(|value| value.as_str())
-                        .is_some_and(|file| file.ends_with("zeroclaw-providers/src/anthropic.rs"));
+                        .is_some_and(|file| {
+                            // `file!()` uses the host separator, so normalize
+                            // before matching the `/`-spelled module path.
+                            file.replace('\\', "/")
+                                .ends_with("zeroclaw-providers/src/anthropic.rs")
+                        });
                     let matches_auth = event.get("attributes").is_some_and(|attributes| {
                         attributes.get("header").and_then(|value| value.as_str())
                             == Some(expected_header)

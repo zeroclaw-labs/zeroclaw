@@ -3787,7 +3787,10 @@ Done."#;
                     .get("attributes")
                     .and_then(|attributes| attributes.get("_file"))
                     .and_then(|value| value.as_str())
-                    .is_some_and(|file| file.ends_with("zeroclaw-tool-call-parser/src/lib.rs"));
+                    .is_some_and(|file| {
+                        file.replace('\\', "/")
+                            .ends_with("zeroclaw-tool-call-parser/src/lib.rs")
+                    });
                 if matches_message && matches_source {
                     break 'search event;
                 }

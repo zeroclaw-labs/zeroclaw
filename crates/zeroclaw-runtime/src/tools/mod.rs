@@ -2142,10 +2142,20 @@ const = true
             workspace_dir: &std::path::Path,
         ) -> anyhow::Result<tokio::process::Command> {
             *self.seen_command.lock().unwrap() = Some(command.to_string());
+            #[cfg(windows)]
+            let mut process = {
+                let mut process = tokio::process::Command::new("cmd.exe");
+                process.args(["/D", "/S", "/C", "echo zc-runtime"]);
+                process
+            };
+            #[cfg(not(windows))]
             let mut process = tokio::process::Command::new("/bin/sh");
+            #[cfg(not(windows))]
             process
                 .args(["-c", "printf '%s' \"$0\"", "zc-runtime"])
                 .current_dir(workspace_dir);
+            #[cfg(windows)]
+            process.current_dir(workspace_dir);
             Ok(process)
         }
     }
