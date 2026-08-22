@@ -15,7 +15,16 @@ zc-chrome-summary-loading = loading
 zc-app-help-cycle-mode = Cycle mode
 zc-app-help-help = Help
 zc-app-help-reload = Reload daemon
+zc-app-help-toggle-sidebar = Toggle agent sidebar
 zc-app-help-quit = Quit
+
+zc-sidebar-title = Agents
+zc-sidebar-empty = No active agents
+zc-sidebar-picker-title = Add agent
+zc-sidebar-picker-loading = Loading agents…
+zc-sidebar-picker-empty = No configured agents
+zc-sidebar-picker-error = Failed to load agents ({ $error })
+zc-sidebar-picker-open-suffix = (open)
 zc-app-keybindings-title = Keybindings
 zc-app-help-filter-label = Filter
 zc-app-help-filter-placeholder = type a key or action…
@@ -407,6 +416,8 @@ zc-chat-error-create-session = Failed to create session: { $error }
 zc-chat-session-switch-error = Failed to switch session: { $error }
 zc-chat-elicitation-dropped = A prompt from the agent was dropped before it could be shown (the client fell behind). The agent's question may be waiting; try again.
 zc-chat-session-restarted = New session started.
+zc-chat-session-cap = Session limit for this pane reached ({ $max }). Close a session from the sidebar first.
+zc-chat-resume-dropped = { $count } prior session(s) could not be re-attached and were dropped.
 zc-chat-session-restart-error = Failed to start a new session: { $error }
 
 zc-chat-thinking-visible = Thinking output: visible

@@ -220,6 +220,14 @@ pub struct RpcInboundRequest {
 /// the rare drop is diagnosable rather than a silent hang.
 pub const INBOUND_REQUEST_CHANNEL_CAPACITY: usize = 1024;
 
+/// Buffer size for the `session/update` notification broadcast.
+///
+/// Sized for N concurrent sessions streaming at once (the agent sidebar keeps
+/// background sessions live): chunk volume multiplies between draw-loop
+/// drains, and a `Lagged`-dropped `TurnComplete` would strand a background
+/// session's status dot in "running" forever.
+pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 1024;
+
 // ── Typed session updates ────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -279,6 +287,24 @@ pub enum SessionUpdate {
         session_id: String,
         entries: Vec<crate::wire::PlanEntry>,
     },
+}
+
+impl SessionUpdate {
+    /// The session this update belongs to. Every variant carries the id;
+    /// multi-session panes route on it before applying the update.
+    pub fn session_id(&self) -> &str {
+        match self {
+            SessionUpdate::AgentMessageChunk { session_id, .. }
+            | SessionUpdate::AgentThoughtChunk { session_id, .. }
+            | SessionUpdate::ToolCall { session_id, .. }
+            | SessionUpdate::ToolResult { session_id, .. }
+            | SessionUpdate::ApprovalRequest { session_id, .. }
+            | SessionUpdate::ContextUsage { session_id, .. }
+            | SessionUpdate::HistoryTrimmed { session_id, .. }
+            | SessionUpdate::TurnComplete { session_id, .. }
+            | SessionUpdate::Plan { session_id, .. } => session_id,
+        }
+    }
 }
 
 /// Wire mirror of the daemon's `TurnCompletionOutcome`. Decoded straight from
@@ -666,7 +692,7 @@ impl RpcClient {
         });
 
         let rpc = Arc::new(RpcOutbound::new(writer_tx));
-        let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
+        let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
         let notif_tx_for_reader = notif_tx.clone();
         let (inbound_tx, _) =
             broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
@@ -810,7 +836,7 @@ impl RpcClient {
         });
 
         let rpc = Arc::new(jsonrpc::RpcOutbound::new(writer_tx));
-        let (notif_tx, _) = broadcast::channel::<RpcNotification>(256);
+        let (notif_tx, _) = broadcast::channel::<RpcNotification>(NOTIFICATION_CHANNEL_CAPACITY);
         let notif_tx_for_reader = notif_tx.clone();
         let (inbound_tx, _) =
             broadcast::channel::<RpcInboundRequest>(INBOUND_REQUEST_CHANNEL_CAPACITY);
@@ -1485,6 +1511,7 @@ impl RpcClient {
                 "tui_id": tui_id,
                 "exclude_memory": true,
                 "chat_mode": "acp",
+                "keep_siblings": true,
             }),
         )
         .await
@@ -1493,6 +1520,10 @@ impl RpcClient {
     /// Create or rehydrate a session. When `session_id` is `Some`, the daemon
     /// creates the session with that ID, restoring persisted history if it
     /// exists — effectively "attaching" to a prior session.
+    ///
+    /// Always sends `keep_siblings: true`: zerocode tracks every session it
+    /// opens (agent sidebar) and closes them explicitly, so the daemon's
+    /// idle-sibling eviction sweep must not reap the tracked backgrounds.
     pub async fn session_new_with_id(
         &self,
         agent_alias: &str,
@@ -1502,7 +1533,13 @@ impl RpcClient {
         let tui_id = self.tui_id.as_deref();
         self.call(
             method::SESSION_NEW,
-            serde_json::json!({ "agent_alias": agent_alias, "cwd": cwd, "session_id": session_id, "tui_id": tui_id }),
+            serde_json::json!({
+                "agent_alias": agent_alias,
+                "cwd": cwd,
+                "session_id": session_id,
+                "tui_id": tui_id,
+                "keep_siblings": true,
+            }),
         )
         .await
     }
@@ -1760,10 +1797,12 @@ impl RpcClient {
     // ── Test-only constructors ────────────────────────────────────
 
     /// Test-only constructor that skips the Unix socket connect + initialize handshake.
+    /// Broadcast buffers are large enough for scripted notification-routing
+    /// tests to enqueue a burst before the pane drains it.
     #[cfg(test)]
     pub fn with_rpc(outbound: Arc<RpcOutbound>) -> Self {
-        let (notif_tx, _) = tokio::sync::broadcast::channel(1);
-        let (inbound_tx, _) = tokio::sync::broadcast::channel(1);
+        let (notif_tx, _) = tokio::sync::broadcast::channel(64);
+        let (inbound_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
             rpc: outbound,
             _read_task: tokio::spawn(async {}),
@@ -1778,6 +1817,17 @@ impl RpcClient {
             transport: Transport::Local,
             commands: Vec::new(),
         }
+    }
+
+    /// Test-only: inject a notification as if the daemon had sent it.
+    /// Subscribers created before this call (e.g. a pane's drain receiver)
+    /// observe it on their next `try_recv`.
+    #[cfg(test)]
+    pub fn push_notification_for_test(&self, method: &str, params: Value) {
+        let _ = self.notifications_bcast.send(RpcNotification {
+            method: method.to_string(),
+            params,
+        });
     }
 
     /// Transport protocol of this connection.
