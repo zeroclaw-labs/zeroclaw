@@ -13465,7 +13465,10 @@ pub struct DeliveryConfigDecl {
     /// Delivery mode: `"none"` or `"announce"`.
     #[serde(default = "default_delivery_mode")]
     pub mode: String,
-    /// Channel name (e.g. `"telegram"`, `"discord"`).
+    /// Channel to deliver to, as `<type>.<alias>` (e.g.
+    /// `"telegram.work"`, `"discord.ops"`). A bare type (`"telegram"`)
+    /// resolves only while that type has exactly one configured instance,
+    /// so prefer the aliased form.
     #[serde(default)]
     pub channel: Option<String>,
     /// Target/recipient identifier.
