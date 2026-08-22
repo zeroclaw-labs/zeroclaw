@@ -8264,7 +8264,7 @@ async fn dispatch_channel_sop_gate(
         Some(msg.sender.clone()),
     );
     let outcome = match engine.lock() {
-        Ok(mut guard) => guard.resolve_via_broker(&run_id, decision, principal),
+        Ok(mut guard) => guard.resolve_via_broker_deferred(&run_id, decision, principal),
         Err(_) => return true,
     };
     match outcome {

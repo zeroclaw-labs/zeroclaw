@@ -8,6 +8,7 @@ import {
   isTerminalRunStatus,
   type RunOverlay,
 } from '@/lib/sops';
+import { LatestOverlayWriteGate } from './useRunOverlay.logic';
 
 const POLL_MS = 2000;
 
@@ -23,6 +24,8 @@ export function useRunOverlay(sop: string, runId: string): RunOverlayState {
   const [overlay, setOverlayState] = useState<RunOverlay | null>(null);
   const [error, setError] = useState<string | null>(null);
   const timerRef = useRef(0);
+  const writeGateRef = useRef<LatestOverlayWriteGate | null>(null);
+  if (!writeGateRef.current) writeGateRef.current = new LatestOverlayWriteGate();
 
   const stop = useCallback(() => {
     if (timerRef.current) {
@@ -33,6 +36,7 @@ export function useRunOverlay(sop: string, runId: string): RunOverlayState {
 
   const setOverlay = useCallback(
     (o: RunOverlay) => {
+      writeGateRef.current?.supersedePendingRequests();
       setOverlayState(o);
       setError(null);
       if (isTerminalRunStatus(o.status)) stop();
@@ -44,21 +48,25 @@ export function useRunOverlay(sop: string, runId: string): RunOverlayState {
     if (!sop || !runId) return;
     let active = true;
     const poll = () => {
+      const requestRevision = writeGateRef.current?.beginRequest() ?? 0;
       getRunOverlay(sop, runId)
         .then((o) => {
-          if (!active) return;
+          if (!active || !writeGateRef.current?.isCurrent(requestRevision)) return;
           setOverlayState(o);
           setError(null);
           if (isTerminalRunStatus(o.status)) stop();
         })
         .catch((e: unknown) => {
-          if (active) setError(e instanceof Error ? e.message : String(e));
+          if (active && writeGateRef.current?.isCurrent(requestRevision)) {
+            setError(e instanceof Error ? e.message : String(e));
+          }
         });
     };
-    poll();
     timerRef.current = window.setInterval(poll, POLL_MS);
+    poll();
     return () => {
       active = false;
+      writeGateRef.current?.supersedePendingRequests();
       stop();
     };
   }, [sop, runId, stop]);

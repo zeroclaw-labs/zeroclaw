@@ -4380,7 +4380,7 @@ impl RpcDispatcher {
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
             match guard
-                .resolve_via_broker(&req.run_id, decision, principal)
+                .resolve_via_broker_deferred(&req.run_id, decision, principal)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
             {
                 outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {

@@ -286,7 +286,7 @@ where
         // EPIC G: route through the broker (membership + quorum); with no
         // `[sop.approval]` policy this is exactly `resolve_gate`.
         let resolved = match engine.lock() {
-            Ok(mut g) => Some(g.resolve_via_broker(&run_id, decision, principal)),
+            Ok(mut g) => Some(g.resolve_via_broker_deferred(&run_id, decision, principal)),
             Err(_) => None,
         };
         match resolved {
