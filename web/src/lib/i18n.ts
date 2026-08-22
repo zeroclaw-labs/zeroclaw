@@ -1082,6 +1082,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'unsaved_banner.saving': "Saving…",
     'unsaved_banner.unsaved_change': "unsaved change",
     'unsaved_banner.unsaved_changes': "unsaved changes",
+    'validation_warning.security_audit_enabled_has_no_effect': 'Command audit logging is not active. The security.audit.enabled setting currently has no effect, so use an external supervisor, a process-observing logging wrapper, or OS-level process accounting.',
     'workspace.back_to_chat_prefix': "Back to chat",
     'workspace.binary_file_prefix': "Binary file",
     'workspace.binary_file_suffix': "Preview is base64-encoded; download via CLI to inspect.",

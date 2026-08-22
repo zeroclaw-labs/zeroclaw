@@ -107,8 +107,8 @@ Out of the box:
 - Autonomy: `Supervised`
 - Workspace-only: `true`
 - Sandbox: auto-detect (uses whatever the OS provides)
-- Audit logging: `false` (enable explicitly)
+- Command audit logging: unavailable (the `[security.audit]` setting is currently inert)
 - OTP: `false`
 - E-stop: `false`
 
-This is a reasonable middle ground, safe enough for a laptop, permissive enough to not frustrate. Crank it up for production (OTP, audit, restricted tools) or down to [YOLO](../getting-started/yolo.md) for a dev box.
+This is a reasonable middle ground, safe enough for a laptop, permissive enough to not frustrate. For production, enable OTP and restricted tools. Until command audit logging has a production writer, use an external supervisor or logging wrapper that observes the ZeroClaw process, or enable OS-level process accounting. For a development box, you can instead opt down to [YOLO](../getting-started/yolo.md).

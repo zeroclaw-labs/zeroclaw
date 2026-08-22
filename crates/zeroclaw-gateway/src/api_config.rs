@@ -2690,6 +2690,36 @@ mod tests {
     // live `~/.zeroclaw/config.toml`.
 
     #[tokio::test]
+    async fn prop_get_surfaces_inert_command_audit_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = temp_config(&tmp);
+        config.security.audit.enabled = true;
+        let state = test_state(config);
+
+        let (status, json) = response_json(
+            handle_prop_get(
+                State(state),
+                HeaderMap::new(),
+                Query(PropQuery {
+                    path: "security.audit.enabled".to_string(),
+                }),
+            )
+            .await,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["value"], "true");
+        let warning = json["warnings"]
+            .as_array()
+            .expect("warnings is an array")
+            .iter()
+            .find(|warning| warning["code"] == "security_audit_enabled_has_no_effect")
+            .expect("gateway response includes the inert audit warning");
+        assert_eq!(warning["path"], "security.audit.enabled");
+    }
+
+    #[tokio::test]
     async fn prop_put_does_not_materialize_resource_keyed_rate_alias() {
         let tmp = tempfile::tempdir().unwrap();
         let state = test_state(temp_config(&tmp));
