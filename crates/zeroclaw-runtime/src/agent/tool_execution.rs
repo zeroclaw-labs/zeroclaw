@@ -461,6 +461,20 @@ pub fn should_execute_tools_in_parallel(
     tool_calls: &[ParsedToolCall],
     approval: Option<&ApprovalManager>,
 ) -> bool {
+    should_execute_tools_in_parallel_for_platform(
+        tool_calls,
+        approval,
+        zeroclaw_api::platform::is_android(),
+    )
+}
+
+/// Platform-parameterized dispatch policy, kept pure so host tests can verify
+/// Android-only aliases without pretending the host itself is Android.
+fn should_execute_tools_in_parallel_for_platform(
+    tool_calls: &[ParsedToolCall],
+    approval: Option<&ApprovalManager>,
+    is_android: bool,
+) -> bool {
     if tool_calls.len() <= 1 {
         return false;
     }
@@ -474,13 +488,14 @@ pub fn should_execute_tools_in_parallel(
     }
 
     // Android tools share one foreground app, input focus, display, and accessibility bridge.
-    // Their call order is part of the operation: tap a field, then type, then tap Send. Running a
-    // model-emitted batch concurrently can type before focus moves or send before text lands. Force
-    // the whole batch through the sequential executor whenever any Android device call is present,
-    // regardless of approval posture or full autonomy.
+    // Their call order is part of the operation: tap a field, then type, then tap Send. The generic
+    // `screenshot` alias is bridge-backed on Android and observes that same display state. Force the
+    // whole batch through the sequential executor whenever any Android device call is present,
+    // regardless of approval posture or full autonomy. On desktop, `screenshot` keeps its existing
+    // parallel eligibility.
     if tool_calls
         .iter()
-        .any(|call| call.name.starts_with("android_"))
+        .any(|call| call.name.starts_with("android_") || (is_android && call.name == "screenshot"))
     {
         return false;
     }
@@ -773,7 +788,7 @@ mod tests {
         assert_eq!(invocations.load(Ordering::SeqCst), 0);
     }
 
-    use super::should_execute_tools_in_parallel;
+    use super::{should_execute_tools_in_parallel, should_execute_tools_in_parallel_for_platform};
     use crate::agent::loop_::ParsedToolCall;
     use crate::approval::ApprovalManager;
     use zeroclaw_config::autonomy::AutonomyLevel;
@@ -874,6 +889,32 @@ mod tests {
         assert!(
             !should_execute_tools_in_parallel(&calls, Some(&mgr)),
             "full autonomy must not parallelize a batch that mutates Android screen state"
+        );
+    }
+
+    #[test]
+    fn generic_screenshot_alias_forces_serial_on_android() {
+        let calls = vec![
+            parsed_tool_call("screenshot"),
+            parsed_tool_call("file_read"),
+        ];
+
+        assert!(
+            !should_execute_tools_in_parallel_for_platform(&calls, None, true),
+            "the bridge-backed generic screenshot alias shares Android display state"
+        );
+    }
+
+    #[test]
+    fn generic_screenshot_alias_remains_parallel_eligible_on_desktop() {
+        let calls = vec![
+            parsed_tool_call("screenshot"),
+            parsed_tool_call("file_read"),
+        ];
+
+        assert!(
+            should_execute_tools_in_parallel_for_platform(&calls, None, false),
+            "desktop screenshot behavior must remain unchanged"
         );
     }
 

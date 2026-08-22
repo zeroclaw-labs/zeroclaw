@@ -4,6 +4,7 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.BroadcastReceiver
 import android.content.ClipData
+import android.content.ClipDescription
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
@@ -15,6 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PersistableBundle
 import android.os.ResultReceiver
 import android.util.DisplayMetrics
 import android.util.Log
@@ -76,7 +78,7 @@ class UiAccessibilityService : AccessibilityService() {
                 // Coordinate gestures inject at screen points; hide the floating bubble first so it
                 // can't intercept the tap (mirrors cellclaw AppControlTool's requestHide(500)).
                 "tap" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
-                    guardedMutation(intent) {
+                    guardedMutation(intent) { _ ->
                         handleTap(
                             intent.getIntExtra("x", Int.MIN_VALUE),
                             intent.getIntExtra("y", Int.MIN_VALUE),
@@ -85,7 +87,7 @@ class UiAccessibilityService : AccessibilityService() {
                     }
                 }
                 "swipe" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
-                    guardedMutation(intent) {
+                    guardedMutation(intent) { _ ->
                         handleSwipe(
                             intent.getIntExtra("x1", 0), intent.getIntExtra("y1", 0),
                             intent.getIntExtra("x2", 0), intent.getIntExtra("y2", 0),
@@ -94,7 +96,7 @@ class UiAccessibilityService : AccessibilityService() {
                     }
                 }
                 "scroll" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
-                    guardedMutation(intent) {
+                    guardedMutation(intent) { _ ->
                         handleScroll(
                             intent.getStringExtra("direction") ?: "forward",
                             intent.getIntExtra("x", Int.MIN_VALUE),
@@ -103,13 +105,17 @@ class UiAccessibilityService : AccessibilityService() {
                     }
                 }
                 "text" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
-                    guardedMutation(intent) { handleType(intent.getStringExtra("text") ?: "") }
+                    guardedMutation(intent) { expectedPackage ->
+                        handleType(intent.getStringExtra("text") ?: "", expectedPackage)
+                    }
                 }
                 "key" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
-                    guardedMutation(intent) { handleKey(intent.getStringExtra("key") ?: "") }
+                    guardedMutation(intent) { expectedPackage ->
+                        handleKey(intent.getStringExtra("key") ?: "", expectedPackage)
+                    }
                 }
                 "dialog" -> deferOverlay(resultReceiver, HIDE_GESTURE_MS) {
-                    guardedMutation(intent, systemDialog = true) {
+                    guardedMutation(intent, systemDialog = true) { _ ->
                         handleSystemDialog(intent.getStringExtra("button") ?: "")
                     }
                 }
@@ -197,7 +203,7 @@ class UiAccessibilityService : AccessibilityService() {
     private fun guardedMutation(
         intent: Intent,
         systemDialog: Boolean = false,
-        action: () -> JSONObject,
+        action: (expectedPackage: String) -> JSONObject,
     ): JSONObject {
         val expected = intent.getStringExtra("expect_package")?.trim()
         val actual = rootInActiveWindow?.packageName?.toString()
@@ -210,7 +216,7 @@ class UiAccessibilityService : AccessibilityService() {
         )?.let {
             return err(it.code, it.message)
         }
-        return action()
+        return action(expected.orEmpty())
     }
 
     // ── tap ─────────────────────────────────────────────────────────────
@@ -299,79 +305,93 @@ class UiAccessibilityService : AccessibilityService() {
     }
 
     // ── text (set text on input-focused node) ───────────────────────────
-    private fun handleType(text: String): JSONObject {
+    private fun handleType(text: String, expectedPackage: String): JSONObject {
         val focused = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-            ?: return err("no_focus", "No input-focused field")
-
-        // Never type into our own UI. The floating bubble's input keeps global input focus after
-        // the user submits a prompt, so findFocus returns the bubble's own box and the agent types
-        // its reply into the thing it was asked from, instead of into the app on screen. Hiding the
-        // overlay does not help: visibility is not focus. The agent drives OTHER apps by
-        // definition, so a focused node belonging to this package is always the wrong target.
-        if (focused.packageName?.toString() == packageName) {
-            return err(
-                "no_focus",
-                "Input focus is on zerodroid's own overlay, not the target app. Tap the field you " +
-                    "want to type into first."
-            )
+        UiSecurityPolicy.focusRejection(
+            expectedPackage,
+            focused?.packageName?.toString(),
+            packageName,
+        )?.let {
+            return err(it.code, it.message)
         }
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
         }
         // A field can refuse ACTION_SET_TEXT (custom editors, IME-only inputs). Saying "set": true
         // regardless would have the agent compose a reply into a box that never received it.
-        if (focused.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+        if (focused?.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args) == true) {
             return JSONObject().put("set", true).put("method", "set_text")
         }
         // Fallback: put the text on the clipboard and ask the field to paste it. Many custom
         // editors that reject SET_TEXT still honour ACTION_PASTE, because that is the path the
         // system's own long-press menu uses. Chat composers are the common case, and they are
         // exactly the fields worth typing into.
-        if (pasteViaClipboard(focused, text)) {
+        if (focused != null && pasteViaClipboard(focused, text)) {
             return JSONObject().put("set", true).put("method", "paste")
         }
         return err("internal", "focused field refused both ACTION_SET_TEXT and ACTION_PASTE")
     }
 
     /**
-     * Clipboard-then-paste fallback. The user's existing clipboard is saved and restored on a
-     * delay, since silently eating whatever they had copied is a nasty side effect of a tool call.
-     * Restoration is best-effort: it must not run before the paste has been consumed.
+     * Clipboard-then-paste fallback. Android's TextView ACTION_PASTE path synchronously reads the
+     * clipboard and applies the content before performAction returns, so cleanup happens in this
+     * call's finally block. A readable prior clip is restored; when Android denies that read, the
+     * agent clip is cleared rather than leaving caller text in the global clipboard.
      */
     private fun pasteViaClipboard(node: AccessibilityNodeInfo, text: String): Boolean {
         val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return false
         val previous = runCatching { cm.primaryClip }.getOrNull()
+        val agentClip = ClipData.newPlainText("zerodroid", text).apply {
+            description.extras = PersistableBundle().apply {
+                putBoolean(ClipDescription.EXTRA_IS_SENSITIVE, true)
+            }
+        }
         return try {
-            cm.setPrimaryClip(ClipData.newPlainText("zerodroid", text))
-            // Focus first: ACTION_PASTE targets the node, and some editors ignore it unless the
-            // node also holds input focus.
-            node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-            node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            cm.setPrimaryClip(agentClip)
+            try {
+                // Focus first: ACTION_PASTE targets the node, and some editors ignore it unless
+                // the node also holds input focus.
+                node.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
+                node.performAction(AccessibilityNodeInfo.ACTION_PASTE)
+            } finally {
+                runCatching {
+                    when (UiSecurityPolicy.clipboardCleanupAction(previous != null)) {
+                        UiSecurityPolicy.ClipboardCleanupAction.RESTORE_PREVIOUS ->
+                            previous?.let { cm.setPrimaryClip(it) }
+                        UiSecurityPolicy.ClipboardCleanupAction.CLEAR_AGENT_CLIP ->
+                            cm.clearPrimaryClip()
+                    }
+                }.onFailure { e ->
+                    Log.w(TAG, "clipboard cleanup failed: ${e.message}")
+                }
+            }
         } catch (e: Exception) {
             Log.w(TAG, "clipboard paste fallback failed: ${e.message}")
             false
-        } finally {
-            if (previous != null) {
-                mainHandler.postDelayed({
-                    runCatching { cm.setPrimaryClip(previous) }
-                }, CLIPBOARD_RESTORE_MS)
-            }
         }
     }
 
     // ── key (global actions + IME enter) ────────────────────────────────
-    private fun handleKey(key: String): JSONObject {
+    private fun handleKey(key: String, expectedPackage: String): JSONObject {
         val acted = when (key) {
             "back" -> performGlobalAction(GLOBAL_ACTION_BACK)
             "home" -> performGlobalAction(GLOBAL_ACTION_HOME)
             "recents" -> performGlobalAction(GLOBAL_ACTION_RECENTS)
             "enter" -> {
                 val focused = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
-                    ?: return err("no_focus", "No input-focused field for enter")
+                UiSecurityPolicy.focusRejection(
+                    expectedPackage,
+                    focused?.packageName?.toString(),
+                    packageName,
+                )?.let {
+                    return err(it.code, it.message)
+                }
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
                     return err("unsupported_op", "enter needs Android 11+")
                 }
-                focused.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+                focused?.performAction(
+                    AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id
+                ) == true
             }
             else -> return err("bad_args", "Unknown key: $key")
         }
@@ -382,17 +402,17 @@ class UiAccessibilityService : AccessibilityService() {
     // ── read (UI tree → PROTOCOL nodes) ─────────────────────────────────
     private fun readScreen(maxDepth: Int): JSONObject {
         val root = rootInActiveWindow
-            ?: return JSONObject().put("foreground_package", "unknown")
-                .put("system_dialog", false).put("nodes", JSONArray())
-        val pkg = root.packageName?.toString() ?: "unknown"
+        val pkg = root?.packageName?.toString()
         UiSecurityPolicy.observationRejection(pkg, packageName)?.let {
             return err(it.code, it.message)
         }
+        val activeRoot = root ?: return err("service_unavailable", "No active window")
+        val observedPackage = pkg.orEmpty()
         val nodes = JSONArray()
-        traverseNode(root, nodes, maxDepth, 0)
+        traverseNode(activeRoot, nodes, maxDepth, 0)
 
-        val out = JSONObject().put("foreground_package", pkg)
-        val isDialog = pkg in systemDialogPackages
+        val out = JSONObject().put("foreground_package", observedPackage)
+        val isDialog = observedPackage in systemDialogPackages
         out.put("system_dialog", isDialog)
         if (isDialog) {
             val buttons = JSONArray()
@@ -403,7 +423,10 @@ class UiAccessibilityService : AccessibilityService() {
                         .takeIf { it.isNotBlank() }?.let { buttons.put(it) }
                 }
             }
-            out.put("dialog", JSONObject().put("kind", classifyDialog(pkg, nodes)).put("buttons", buttons))
+            out.put(
+                "dialog",
+                JSONObject().put("kind", classifyDialog(observedPackage, nodes)).put("buttons", buttons),
+            )
         }
         out.put("nodes", nodes)
         return out
@@ -501,11 +524,20 @@ class UiAccessibilityService : AccessibilityService() {
             sendResult(receiver, err(it.code, it.message))
             return
         }
+        val initialPackage = pkg.orEmpty()
         val width = maxWidth.coerceIn(64, 4096)
         takeScreenshot(Display.DEFAULT_DISPLAY, mainExecutor, object : TakeScreenshotCallback {
             override fun onSuccess(result: ScreenshotResult) {
                 var hb = result.hardwareBuffer
                 try {
+                    val callbackPackage = rootInActiveWindow?.packageName?.toString()
+                    UiSecurityPolicy.screenshotCallbackRejection(
+                        initialPackage,
+                        callbackPackage,
+                        packageName,
+                    )?.let {
+                        return sendResult(receiver, err(it.code, it.message))
+                    }
                     val raw = Bitmap.wrapHardwareBuffer(hb, result.colorSpace)
                         ?: return sendResult(receiver, err("screenshot_failed", "null bitmap"))
                     val soft = raw.copy(Bitmap.Config.ARGB_8888, false)
@@ -612,10 +644,6 @@ class UiAccessibilityService : AccessibilityService() {
         private const val HIDE_GESTURE_MS = 500L
         private const val HIDE_OBSERVATION_MS = 500L
         private const val SETTLE_MS = 150L
-
-        // Long enough that the target app has consumed the paste before we hand the user
-        // their own clipboard back.
-        private const val CLIPBOARD_RESTORE_MS = 1500L
 
         // Blank-frame guard. 92% rather than ~100% because the status bar and nav bar always
         // render even when the app body has not, so a genuinely useless frame still carries a

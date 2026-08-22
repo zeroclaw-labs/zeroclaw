@@ -19,6 +19,13 @@ fn requires_action_permission(android_bridge_available: bool) -> bool {
     !android_bridge_available
 }
 
+/// Resolve the width forwarded by the bridge-backed generic alias. Kept as a
+/// pure helper so Unix host tests can exercise Android argument handling.
+#[cfg(any(all(unix, target_os = "android"), all(test, unix)))]
+fn bridge_screenshot_width(args: &serde_json::Value, default_width: u32) -> u32 {
+    crate::android::screenshot::resolve_android_screenshot_width(args, default_width)
+}
+
 /// Tool for capturing screenshots using platform-native commands.
 /// macOS: `screencapture`
 /// Linux: tries `gnome-screenshot`, `scrot`, `import` (`ImageMagick`) in order.
@@ -104,11 +111,7 @@ impl ScreenshotTool {
             {
                 client.assert_foreground(expected).await?;
             }
-            let max_width = args
-                .get("max_width")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|v| u32::try_from(v).ok())
-                .unwrap_or(self.android_max_width);
+            let max_width = bridge_screenshot_width(&args, self.android_max_width);
             let data = client
                 .call("screenshot", json!({ "max_width": max_width }))
                 .await?;
@@ -377,6 +380,32 @@ mod tests {
     fn bridge_capture_does_not_require_mutating_autonomy() {
         assert!(!requires_action_permission(true));
         assert!(requires_action_permission(false));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bridge_alias_width_matches_android_tool_policy_at_boundaries() {
+        let cases = [
+            (json!({}), 0),
+            (json!({}), 540),
+            (json!({}), 5000),
+            (json!({ "max_width": 0 }), 540),
+            (json!({ "max_width": 119 }), 540),
+            (json!({ "max_width": 120 }), 540),
+            (json!({ "max_width": 4096 }), 540),
+            (json!({ "max_width": 4097 }), 540),
+            (json!({ "max_width": u32::MAX }), 540),
+            (json!({ "max_width": u64::from(u32::MAX) + 1 }), 540),
+        ];
+
+        for (args, default_width) in cases {
+            assert_eq!(
+                bridge_screenshot_width(&args, default_width),
+                crate::android::screenshot::resolve_android_screenshot_width(&args, default_width),
+                "generic and android_screenshot widths diverged for args={args}, \
+                 default_width={default_width}"
+            );
+        }
     }
 
     #[test]

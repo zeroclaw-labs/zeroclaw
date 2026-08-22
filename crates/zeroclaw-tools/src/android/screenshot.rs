@@ -19,9 +19,26 @@ const MAX_BASE64_BYTES: usize = 2_097_152;
 
 /// Lower bound on a useful capture width; also guards against a zero or
 /// negative `max_width` reaching the bridge.
-const MIN_WIDTH: u32 = 120;
+pub(crate) const MIN_WIDTH: u32 = 120;
 /// Upper bound on requested width. Beyond this the base64 cap dominates anyway.
-const MAX_WIDTH: u32 = 4096;
+pub(crate) const MAX_WIDTH: u32 = 4096;
+
+/// Canonical Android screenshot width policy, shared by both public tool names.
+pub(crate) fn clamp_android_screenshot_width(width: u32) -> u32 {
+    width.clamp(MIN_WIDTH, MAX_WIDTH)
+}
+
+/// Resolve an optional tool argument against a configured default using the
+/// canonical Android width policy. Values outside `u32` retain the historical
+/// fallback-to-default behavior; in-range integers are clamped to the bridge
+/// contract's bounds.
+pub(crate) fn resolve_android_screenshot_width(args: &Value, default_width: u32) -> u32 {
+    let default_width = clamp_android_screenshot_width(default_width);
+    args.get("max_width")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .map_or(default_width, clamp_android_screenshot_width)
+}
 
 static TOOL_DESCRIPTION: OnceLock<String> = OnceLock::new();
 static SCREENSHOT_SWEEPER: OnceLock<()> = OnceLock::new();
@@ -116,7 +133,7 @@ impl AndroidScreenshotTool {
     pub fn new(client: AndroidBridgeClient, default_max_width: u32) -> Self {
         Self {
             client,
-            default_max_width: default_max_width.clamp(MIN_WIDTH, MAX_WIDTH),
+            default_max_width: clamp_android_screenshot_width(default_max_width),
         }
     }
 }
@@ -238,11 +255,7 @@ impl Tool for AndroidScreenshotTool {
     }
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
-        let max_width = args
-            .get("max_width")
-            .and_then(Value::as_u64)
-            .and_then(|v| u32::try_from(v).ok())
-            .map_or(self.default_max_width, |w| w.clamp(MIN_WIDTH, MAX_WIDTH));
+        let max_width = resolve_android_screenshot_width(&args, self.default_max_width);
 
         // Verify the app on screen before capturing, so a picture of the wrong app cannot be
         // described as if it were the right one.
@@ -277,6 +290,51 @@ mod tests {
             "width": 540,
             "height": 1140,
         })
+    }
+
+    #[test]
+    fn constructor_clamps_default_width_to_existing_android_bounds() {
+        let client = AndroidBridgeClient::new("/tmp/zeroclaw-width-test.sock");
+        assert_eq!(
+            AndroidScreenshotTool::new(client.clone(), 0).default_max_width,
+            120
+        );
+        assert_eq!(
+            AndroidScreenshotTool::new(client.clone(), 120).default_max_width,
+            120
+        );
+        assert_eq!(
+            AndroidScreenshotTool::new(client.clone(), 4096).default_max_width,
+            4096
+        );
+        assert_eq!(
+            AndroidScreenshotTool::new(client, u32::MAX).default_max_width,
+            4096
+        );
+    }
+
+    #[test]
+    fn width_resolver_enforces_existing_android_boundaries() {
+        let cases = [
+            (json!({}), 0, 120),
+            (json!({}), 540, 540),
+            (json!({}), 5000, 4096),
+            (json!({ "max_width": 0 }), 540, 120),
+            (json!({ "max_width": 119 }), 540, 120),
+            (json!({ "max_width": 120 }), 540, 120),
+            (json!({ "max_width": 4096 }), 540, 4096),
+            (json!({ "max_width": 4097 }), 540, 4096),
+            (json!({ "max_width": u32::MAX }), 540, 4096),
+            (json!({ "max_width": u64::from(u32::MAX) + 1 }), 540, 540),
+        ];
+
+        for (args, default_width, expected) in cases {
+            assert_eq!(
+                resolve_android_screenshot_width(&args, default_width),
+                expected,
+                "args={args}, default_width={default_width}"
+            );
+        }
     }
 
     /// The whole point of the tool: the capture must reach the vision model

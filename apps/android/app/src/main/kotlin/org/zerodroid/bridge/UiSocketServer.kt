@@ -244,6 +244,7 @@ class UiSocketServer(private val ctx: Context) {
     private fun expectedPackage(args: JSONObject): String? =
         args.optString("expect_package").trim().takeIf { it.isNotEmpty() }
 
+    @Suppress("DEPRECATION")
     private fun launch(id: String?, args: JSONObject): JSONObject {
         val pkg = args.optString("package").ifEmpty { return fail(id, "bad_args", "launch needs 'package'") }
         val activity = if (args.has("activity")) args.optString("activity") else null
@@ -254,6 +255,19 @@ class UiSocketServer(private val ctx: Context) {
         } else {
             ctx.packageManager.getLaunchIntentForPackage(pkg)
                 ?: return fail(id, "not_found", "no launch intent for $pkg")
+        }
+        val resolvedActivity = if (activity != null) {
+            ctx.packageManager.resolveActivity(intent, 0)?.activityInfo
+        } else {
+            null
+        }
+        UiSecurityPolicy.launchRejection(
+            requestedPackage = pkg,
+            ownPackage = ctx.packageName,
+            explicitActivity = activity,
+            resolvedActivityExported = resolvedActivity?.exported,
+        )?.let {
+            return fail(id, it.code, it.message)
         }
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         return try {
