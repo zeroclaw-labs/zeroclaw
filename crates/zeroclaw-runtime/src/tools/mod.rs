@@ -726,7 +726,7 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronListTool::new(config.clone())),
+        Arc::new(CronListTool::new(config.clone(), agent_alias)),
         Arc::new(CronRemoveTool::new(
             config.clone(),
             security.clone(),
@@ -741,9 +741,10 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunTool::new_with_runtime(
             config.clone(),
             security.clone(),
+            agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunsTool::new(config.clone())),
+        Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
