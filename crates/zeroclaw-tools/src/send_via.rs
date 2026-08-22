@@ -38,10 +38,35 @@ pub struct TurnRoutingEntry {
     pub recipient: Option<String>,
 }
 
+/// One successful immediate (`body`) delivery performed by `send_via` this
+/// turn. The orchestrator's duplicate-delivery guard reads these after the
+/// tool loop: when the turn's ordinary reply targets the same channel and
+/// recipient with identical content, delivering it again would duplicate the
+/// message, so the ordinary reply is suppressed.
+#[derive(Debug, Clone)]
+pub struct ImmediateSendRecord {
+    /// Resolved channel key the message was sent through (e.g. `"telegram.default"`).
+    pub channel_key: String,
+    /// Concrete recipient the message was addressed to.
+    pub recipient: String,
+    /// Message content exactly as sent.
+    pub body: String,
+}
+
+/// One turn's routing state: routing instructions written in no-body mode and
+/// the immediate deliveries performed in body mode.
+#[derive(Debug, Default)]
+pub struct TurnRouting {
+    /// Routing instructions for the turn's main reply; the last entry wins.
+    pub routes: Vec<TurnRoutingEntry>,
+    /// Immediate (`body`) sends that were actually delivered this turn.
+    pub immediate_sends: Vec<ImmediateSendRecord>,
+}
+
 /// Handle to one turn's routing state. The orchestrator creates a fresh handle
 /// before each `run_tool_call_loop` call, scopes it into [`TURN_ROUTING`] for the
 /// duration of the loop, and reads it back after the loop completes.
-pub type TurnRoutingHandle = Arc<Mutex<Vec<TurnRoutingEntry>>>;
+pub type TurnRoutingHandle = Arc<Mutex<TurnRouting>>;
 
 /// Agent-callable tool for per-turn output routing and channel fanout.
 pub struct SendViaTool {
@@ -307,16 +332,34 @@ impl Tool for SendViaTool {
             };
 
             return match channel.send(&message).await {
-                Ok(()) => Ok(ToolResult {
-                    success: true,
-                    output: ToolOutput::json(json!({
-                        "target": channel_key,
-                        "mode": "immediate",
-                        "resolved_modality": modality_str(modality),
-                        "status": "ok"
-                    })),
-                    error: None,
-                }),
+                Ok(()) => {
+                    // Record the delivery for the orchestrator's same-turn
+                    // duplicate guard. Outside a scoped turn there is no
+                    // reader, so the record is intentionally dropped.
+                    let _ = TURN_ROUTING.try_with(|handle| {
+                        if let Some(handle) = handle {
+                            handle
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .immediate_sends
+                                .push(ImmediateSendRecord {
+                                    channel_key: channel_key.clone(),
+                                    recipient: recipient.clone(),
+                                    body: body.clone(),
+                                });
+                        }
+                    });
+                    Ok(ToolResult {
+                        success: true,
+                        output: ToolOutput::json(json!({
+                            "target": channel_key,
+                            "mode": "immediate",
+                            "resolved_modality": modality_str(modality),
+                            "status": "ok"
+                        })),
+                        error: None,
+                    })
+                }
                 Err(e) => Ok(ToolResult {
                     success: false,
                     output: ToolOutput::json(json!({
@@ -397,7 +440,11 @@ impl Tool for SendViaTool {
         let queued = TURN_ROUTING
             .try_with(|handle| {
                 if let Some(handle) = handle {
-                    handle.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+                    handle
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .routes
+                        .push(entry);
                     true
                 } else {
                     false
@@ -509,7 +556,7 @@ mod tests {
         for (name, ch) in channels {
             map.write().insert(name.to_string(), ch);
         }
-        let routing: TurnRoutingHandle = Arc::new(Mutex::new(Vec::new()));
+        let routing: TurnRoutingHandle = Arc::new(Mutex::new(TurnRouting::default()));
         let groups = Arc::new(peer_groups);
         let inner = SendViaTool::new(
             Arc::new(SecurityPolicy::default()),
@@ -567,7 +614,8 @@ mod tests {
         assert_eq!(out["mode"], "routing");
         assert_eq!(out["resolved_modality"], "text");
 
-        let entries = routing.lock().unwrap();
+        let state = routing.lock().unwrap();
+        let entries = &state.routes;
         assert_eq!(entries.len(), 1);
         assert!(entries[0].channel.is_none());
         assert!(matches!(entries[0].modality, OutputModality::Text));
@@ -582,7 +630,8 @@ mod tests {
         let result = tool.execute(json!({ "modality": "voice" })).await.unwrap();
 
         assert!(result.success);
-        let entries = routing.lock().unwrap();
+        let state = routing.lock().unwrap();
+        let entries = &state.routes;
         assert_eq!(entries.len(), 1);
         assert!(matches!(entries[0].modality, OutputModality::Voice));
     }
@@ -606,7 +655,8 @@ mod tests {
         assert!(result.success);
         let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(out["mode"], "routing");
-        let entries = routing.lock().unwrap();
+        let state = routing.lock().unwrap();
+        let entries = &state.routes;
         assert_eq!(entries[0].channel.as_deref(), Some("telegram.default"));
         assert!(matches!(entries[0].modality, OutputModality::Voice));
         assert_eq!(
@@ -638,7 +688,7 @@ mod tests {
                 .unwrap()
                 .contains("no external_peers")
         );
-        assert!(routing.lock().unwrap().is_empty());
+        assert!(routing.lock().unwrap().routes.is_empty());
     }
 
     #[tokio::test]
@@ -650,7 +700,7 @@ mod tests {
         assert!(!result.success);
         let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(out["status"], "rejected");
-        assert!(routing.lock().unwrap().is_empty());
+        assert!(routing.lock().unwrap().routes.is_empty());
     }
 
     // ── Immediate send mode ───────────────────────────────────────────────────
@@ -686,7 +736,14 @@ mod tests {
             "immediate send must deliver to the resolved external_peers recipient"
         );
         // routing state untouched
-        assert!(routing.lock().unwrap().is_empty());
+        assert!(routing.lock().unwrap().routes.is_empty());
+
+        // delivery recorded for the orchestrator's same-turn duplicate guard
+        let state = routing.lock().unwrap();
+        assert_eq!(state.immediate_sends.len(), 1);
+        assert_eq!(state.immediate_sends[0].channel_key, "telegram.default");
+        assert_eq!(state.immediate_sends[0].recipient, "@amaury");
+        assert_eq!(state.immediate_sends[0].body, "extra message");
     }
 
     #[tokio::test]
@@ -698,7 +755,7 @@ mod tests {
         assert!(!result.success);
         let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(out["status"], "rejected");
-        assert!(routing.lock().unwrap().is_empty());
+        assert!(routing.lock().unwrap().routes.is_empty());
     }
 
     #[tokio::test]
@@ -723,7 +780,7 @@ mod tests {
                 .unwrap()
                 .contains("no external_peers")
         );
-        assert!(routing.lock().unwrap().is_empty());
+        assert!(routing.lock().unwrap().routes.is_empty());
     }
 
     #[tokio::test]
@@ -856,7 +913,7 @@ mod tests {
         );
         // nothing was sent and no routing entry leaked
         assert!(sent.read().is_empty());
-        assert!(routing.lock().unwrap().is_empty());
+        assert!(routing.lock().unwrap().routes.is_empty());
 
         // A peer-group name still resolves unambiguously.
         let result = tool
@@ -935,7 +992,7 @@ mod tests {
                 .contains("no matching channel is registered")
         );
         assert!(main_sent.read().is_empty());
-        assert!(routing.lock().unwrap().is_empty());
+        assert!(routing.lock().unwrap().routes.is_empty());
     }
 
     // ── Concurrency isolation ─────────────────────────────────────────────────
@@ -970,7 +1027,7 @@ mod tests {
         // Each turn: scope a fresh handle, queue a route, hold the scope across an
         // await so the two turns genuinely overlap, then read back only our handle.
         async fn run_turn(tool: Arc<SendViaTool>, target: &str) -> Vec<TurnRoutingEntry> {
-            let handle: TurnRoutingHandle = Arc::new(Mutex::new(Vec::new()));
+            let handle: TurnRoutingHandle = Arc::new(Mutex::new(TurnRouting::default()));
             let target = target.to_string();
             TURN_ROUTING
                 .scope(Some(Arc::clone(&handle)), async move {
@@ -979,7 +1036,7 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
                 })
                 .await;
-            handle.lock().unwrap().clone()
+            handle.lock().unwrap().routes.clone()
         }
 
         let (tg, mail) = tokio::join!(
@@ -1025,7 +1082,7 @@ mod tests {
         let tool = SendViaTool::new(Arc::new(SecurityPolicy::default()), map, resolver);
 
         async fn route(tool: &SendViaTool, target: &str) -> TurnRoutingEntry {
-            let handle: TurnRoutingHandle = Arc::new(Mutex::new(Vec::new()));
+            let handle: TurnRoutingHandle = Arc::new(Mutex::new(TurnRouting::default()));
             let result = TURN_ROUTING
                 .scope(
                     Some(Arc::clone(&handle)),
@@ -1034,7 +1091,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(result.success, "{:?}", result.error);
-            handle.lock().unwrap()[0].clone()
+            handle.lock().unwrap().routes[0].clone()
         }
 
         let before = route(&tool, "g1").await;

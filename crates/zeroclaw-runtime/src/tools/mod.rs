@@ -105,7 +105,8 @@ pub use zeroclaw_tools::reaction::ReactionTool;
 pub use zeroclaw_tools::report_template_tool::ReportTemplateTool;
 pub use zeroclaw_tools::screenshot::ScreenshotTool;
 pub use zeroclaw_tools::send_via::{
-    AgentPeerGroupResolver, SendViaTool, TURN_ROUTING, TurnRoutingHandle,
+    AgentPeerGroupResolver, ImmediateSendRecord, SendViaTool, TURN_ROUTING, TurnRouting,
+    TurnRoutingHandle,
 };
 pub use zeroclaw_tools::sessions::{
     SessionDeleteTool, SessionResetTool, SessionsCurrentTool, SessionsHistoryTool,

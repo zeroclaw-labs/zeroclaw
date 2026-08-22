@@ -6036,7 +6036,9 @@ async fn process_channel_message_body(
         msg
     };
 
-    let target_channel = find_channel_for_message(&ctx.channels_by_name, &msg).cloned();
+    let target_entry = find_channel_entry_for_message(&ctx.channels_by_name, &msg);
+    let originating_channel_key = target_entry.as_ref().map(|(key, _)| key.clone());
+    let target_channel = target_entry.map(|(_, ch)| ch);
 
     if let Some(channel) = target_channel.as_ref() {
         if channel.drop_self_messages(&msg) {
@@ -6910,7 +6912,7 @@ async fn process_channel_message_body(
     // the tool-call loop below. Allocating per turn (rather than clearing a shared
     // handle) keeps concurrent same-agent turns from reading each other's routes.
     let turn_routing: tools::TurnRoutingHandle =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        std::sync::Arc::new(std::sync::Mutex::new(tools::TurnRouting::default()));
 
     let tool_receipts_collector: std::sync::Arc<std::sync::Mutex<Vec<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -7459,11 +7461,10 @@ async fn process_channel_message_body(
 
             // Read the last routing instruction set by `send_via` this turn from
             // the per-turn handle scoped into TURN_ROUTING around the loop above.
-            let turn_route = turn_routing
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .last()
-                .cloned();
+            let (turn_route, immediate_sends) = {
+                let turn = turn_routing.lock().unwrap_or_else(|e| e.into_inner());
+                (turn.routes.last().cloned(), turn.immediate_sends.clone())
+            };
 
             // Resolve the delivery channel and modality from the routing entry.
             // `None` entry → default delivery (originating channel, no modality override).
@@ -7505,9 +7506,40 @@ async fn process_channel_message_body(
                     .as_ref()
                     .and_then(|r| r.channel.as_deref())
                     .is_some();
+                let delivery_channel_key = turn_route
+                    .as_ref()
+                    .and_then(|r| r.channel.clone())
+                    .filter(|k| !k.is_empty())
+                    .or_else(|| originating_channel_key.clone());
+                // Same-turn duplicate guard: models sometimes place identical
+                // text in both the assistant `content` and an immediate
+                // `send_via` `body`. When that immediate send already delivered
+                // exactly this content to exactly this destination, delivering
+                // the ordinary reply again would double the message. Different
+                // content, or the same content to a different destination, is
+                // intentional fanout and delivers normally.
+                let duplicate_of_immediate_send = immediate_sends.iter().any(|s| {
+                    Some(s.channel_key.as_str()) == delivery_channel_key.as_deref()
+                        && s.recipient == delivery_recipient
+                        && s.body == delivered_response.trim()
+                });
                 // Whether the agent's reply reached a channel — gates the
                 // `fire_message_sent` observer hook below.
-                let reply_delivered = if is_redirect {
+                let reply_delivered = if duplicate_of_immediate_send {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel.cancel_draft(&delivery_recipient, draft_id).await;
+                    }
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "channel": delivery_channel_key,
+                                "recipient": delivery_recipient,
+                            })),
+                        "suppressing final reply: an immediate send_via delivery already sent identical content to this destination this turn"
+                    );
+                    true
+                } else if is_redirect {
                     // Routing redirects to a different channel: cancel any in-progress
                     // draft on the originating channel before delivering elsewhere.
                     if let (Some(orig_ch), Some(draft_id)) =
@@ -9778,6 +9810,29 @@ fn find_channel_for_message<'a>(
     msg.channel
         .split_once(':')
         .and_then(|(base, _)| channels.get(base))
+}
+
+/// Like [`find_channel_for_message`], but also returns the registry key the
+/// channel resolved under, so delivery accounting can compare destinations
+/// in the same key namespace `send_via` records them in.
+fn find_channel_entry_for_message(
+    channels: &HashMap<String, Arc<dyn Channel>>,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Option<(String, Arc<dyn Channel>)> {
+    if let Some(alias) = msg.channel_alias.as_deref().filter(|s| !s.is_empty()) {
+        let composite = format!("{}.{alias}", msg.channel);
+        if let Some(ch) = channels.get(&composite) {
+            return Some((composite, Arc::clone(ch)));
+        }
+    }
+    if let Some(ch) = channels.get(&msg.channel) {
+        return Some((msg.channel.clone(), Arc::clone(ch)));
+    }
+    msg.channel.split_once(':').and_then(|(base, _)| {
+        channels
+            .get(base)
+            .map(|ch| (base.to_string(), Arc::clone(ch)))
+    })
 }
 
 fn send_message_to_peer_tool_available(
@@ -17507,6 +17562,181 @@ api_key = "anthropic-key"
                 "chat-42".to_string(),
                 "ok".to_string()
             )]
+        );
+    }
+
+    /// Provider that first calls `send_via` with a `body` targeting the test
+    /// channel, then answers the tool-result round with `final_text` as the
+    /// turn's assistant content.
+    struct SendViaBodyModelProvider {
+        body: &'static str,
+        final_text: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for SendViaBodyModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(format!(
+                "<tool_call>\n{{\"name\":\"send_via\",\"arguments\":{{\"target\":\"test-channel\",\"body\":\"{}\"}}}}\n</tool_call>",
+                self.body
+            ))
+        }
+
+        async fn chat_with_history(
+            &self,
+            messages: &[ChatMessage],
+            model: &str,
+            temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            let has_tool_results = messages
+                .iter()
+                .any(|msg| msg.role == "user" && msg.content.contains("[Tool results]"));
+            if has_tool_results {
+                Ok(self.final_text.to_string())
+            } else {
+                self.chat_with_system(None, "", model, temperature).await
+            }
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for SendViaBodyModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "SendViaBodyModelProvider"
+        }
+    }
+
+    /// Real `SendViaTool` wired to the given channel under the same
+    /// `"test-channel"` key the orchestrator's registry uses, in a peer group
+    /// whose external peer matches the test message's reply target.
+    fn send_via_tool_for(channel: Arc<dyn Channel>) -> Box<dyn Tool> {
+        let map: tools::PerToolChannelHandle = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+        map.write().insert("test-channel".to_string(), channel);
+        let mut groups = HashMap::new();
+        groups.insert(
+            "test-group".to_string(),
+            zeroclaw_config::multi_agent::PeerGroupConfig {
+                channel: "test-channel".into(),
+                external_peers: vec![zeroclaw_config::multi_agent::PeerUsername::new("chat-42")],
+                ..zeroclaw_config::multi_agent::PeerGroupConfig::default()
+            },
+        );
+        Box::new(tools::SendViaTool::new(
+            Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+            map,
+            Arc::new(move || groups.clone()),
+        ))
+    }
+
+    /// Regression for the same-turn duplicate-delivery guard: a model that
+    /// places identical text in an immediate `send_via` `body` and in the
+    /// turn's assistant content must produce exactly one delivered message.
+    #[tokio::test]
+    async fn duplicate_send_via_body_suppresses_final_reply() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            Arc::clone(&channel),
+            Arc::new(SendViaBodyModelProvider {
+                body: "Hello there!",
+                final_text: "Hello there!",
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![send_via_tool_for(Arc::clone(&channel))],
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        // The test ctx enables show_tool_calls, so the channel also receives a
+        // "🔧 `send_via`: ..." tool-call notification; that surface is
+        // unrelated to delivery accounting and is filtered out here.
+        let sent: Vec<String> = channel_impl
+            .sent_messages
+            .lock()
+            .await
+            .iter()
+            .filter(|entry| !entry.contains("🔧"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            sent.as_slice(),
+            ["chat-42:Hello there!"],
+            "identical content must reach the destination exactly once"
+        );
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            0,
+            "the ordinary reply must be suppressed as a duplicate of the immediate send_via delivery"
+        );
+    }
+
+    /// Distinct content is intentional fanout: both the immediate `send_via`
+    /// message and the turn's ordinary reply must be delivered.
+    #[tokio::test]
+    async fn distinct_send_via_body_and_reply_both_deliver() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            Arc::clone(&channel),
+            Arc::new(SendViaBodyModelProvider {
+                body: "Heads-up: report archived.",
+                final_text: "Done, and I sent the heads-up.",
+            }),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![send_via_tool_for(Arc::clone(&channel))],
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            message_sent_hook_test_message(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent: Vec<String> = channel_impl
+            .sent_messages
+            .lock()
+            .await
+            .iter()
+            .filter(|entry| !entry.contains("🔧"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            sent.as_slice(),
+            [
+                "chat-42:Heads-up: report archived.",
+                "chat-42:Done, and I sent the heads-up."
+            ],
+            "distinct content is intentional fanout and both messages must deliver"
+        );
+        assert_eq!(
+            channel_impl.final_send_calls.load(Ordering::SeqCst),
+            1,
+            "the ordinary reply still uses the final-response send path"
         );
     }
 
