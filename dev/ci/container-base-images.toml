@@ -15,7 +15,7 @@ repo = "library/node"
 image_ref = "node"
 discover = true
 tag = "24-bookworm-slim"
-digest = "sha256:235600a8101ab264e117b1768e925532262668dc9b581ef1dd7d96ced463b8e7"
+digest = "sha256:3638d9a6fe4030bd716be989438248074489337ba3275657f93595428be4fc03"
 
 [[image]]
 zone = "base-arg-rust-slim"
@@ -23,8 +23,8 @@ arg = "ZEROCLAW_BASE_RUST_SLIM"
 registry = "dockerhub"
 repo = "library/rust"
 image_ref = "rust"
-tag = "1.96-slim"
-digest = "sha256:31ee7fc65186be7e0e0ccb3f2ca305f14e4739e7642a1ae65753aa5d7b874523"
+tag = "1.98-slim"
+digest = "sha256:cc0448b41c3b7b7fea44f5dc50eacba729a56db365b65b7bd5e8a82d5b3db078"
 
 [[image]]
 zone = "base-arg-rust-bookworm"
@@ -32,8 +32,8 @@ arg = "ZEROCLAW_BASE_RUST_BOOKWORM"
 registry = "dockerhub"
 repo = "library/rust"
 image_ref = "rust"
-tag = "1.96-bookworm"
-digest = "sha256:a339861ae23e9abb272cea45dfafde21760d2ce6577a70f8a926153677902663"
+tag = "1.98-bookworm"
+digest = "sha256:e70e2eec3d495fd5c8e0be74adda86507dfac7f51a724fbf9813ff59b2b247c7"
 
 [[image]]
 zone = "base-arg-debian"
@@ -42,7 +42,7 @@ registry = "dockerhub"
 repo = "library/debian"
 image_ref = "debian"
 tag = "trixie-slim"
-digest = "sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd"
+digest = "sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258"
 
 [[image]]
 zone = "base-arg-distroless"
@@ -60,7 +60,7 @@ registry = "dockerhub"
 repo = "library/node"
 image_ref = "node"
 tag = "24-alpine3.23"
-digest = "sha256:595398b0081eacda8e1c4c5b97b76cd1020e4d58a8ebcb4843b9bca1e79e7436"
+digest = "sha256:244cc2b53f46f9e876304391d17682b0ddae9ac33491f4857e25e35a36ba7995"
 
 [[image]]
 zone = "base-arg-rust-alpine"
@@ -68,8 +68,8 @@ arg = "ZEROCLAW_BASE_RUST_ALPINE"
 registry = "dockerhub"
 repo = "library/rust"
 image_ref = "rust"
-tag = "1.96-alpine3.23"
-digest = "sha256:14b9b5f47dcc6644d0f0c1b35a2c2c5d0124f67159aaee28a348627523459b55"
+tag = "1.98-alpine3.23"
+digest = "sha256:4743b6231029d726d7a0f81d730a7c9f4eff23225a4499c01e275efb5e260235"
 
 [[image]]
 zone = "base-arg-alpine"
