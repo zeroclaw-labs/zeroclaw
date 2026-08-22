@@ -767,66 +767,6 @@ fn network_specific_embedded_ipv4s(
         .filter_map(move |prefix| prefix.embedded_ipv4(v6).map(|v4| (*prefix, v4)))
 }
 
-/// Decode `v6` under **every** RFC 6052 §2.2 layout, independently of any
-/// prefix the operator declared, and report the first layout whose embedded
-/// IPv4 is a known cloud metadata address.
-///
-/// The declared-prefix decode in [`network_specific_embedded_ipv4s`] only
-/// classifies prefixes the operator listed in `security.nat64_prefixes`. A
-/// deployment that routes an *undeclared* NAT64 prefix would still translate an
-/// IPv6 answer embedding `169.254.169.254` (or another metadata address) to the
-/// metadata service, and the private carve-out would let the raw non-global
-/// IPv6 through — metadata leaking from a prefix nobody declared.
-///
-/// Metadata is a fixed, tiny target, so both validators refuse it whether or
-/// not its prefix was declared. This is defense in depth for that specific set
-/// only: general private/global routing classification still consults declared
-/// prefixes alone, because an undeclared prefix genuinely cannot be resolved to
-/// a routing decision. Decoding every layout can only over-approximate what a
-/// translator reaches, the safe direction for a deny boundary.
-///
-/// The extraction reuses [`Nat64Prefix::embedded_ipv4`] against a synthetic
-/// prefix built from `v6` itself masked to each length, so the exact
-/// (non-contiguous, u-octet-skipping) per-length octet layout stays defined in
-/// exactly one place rather than being re-derived here.
-fn metadata_under_any_rfc6052_layout(v6: std::net::Ipv6Addr) -> Option<(u8, std::net::Ipv4Addr)> {
-    RFC6052_PREFIX_LENGTHS.iter().find_map(|&len| {
-        // `len` is one of the six RFC 6052 lengths and the host bits below it
-        // are cleared, so this is a valid `Nat64Prefix` (its documented
-        // invariant holds) that, by construction, contains `v6`. Decoding
-        // therefore always yields the IPv4 the fixed §2.2 offsets carry for
-        // that length; only whether that IPv4 is metadata decides the match.
-        let prefix_mask = !(u128::MAX >> len);
-        let network = std::net::Ipv6Addr::from(u128::from_be_bytes(v6.octets()) & prefix_mask);
-        let synthetic = Nat64Prefix { network, len };
-        synthetic
-            .embedded_ipv4(v6)
-            .filter(|embedded| is_cloud_metadata_ip(std::net::IpAddr::V4(*embedded)))
-            .map(|embedded| (len, embedded))
-    })
-}
-
-fn undeclared_nat64_metadata_block_error(
-    host: &str,
-    resolved: std::net::Ipv6Addr,
-    len: u8,
-    embedded: std::net::Ipv4Addr,
-) -> anyhow::Error {
-    if is_known_cloud_metadata_endpoint(std::net::IpAddr::V4(embedded)) {
-        anyhow::Error::msg(format!(
-            "Blocked host '{host}' resolved to {resolved}, which embeds cloud metadata address \
-             {embedded} under an RFC 6052 /{len} NAT64 layout; metadata is refused whether or not \
-             the prefix is declared in security.nat64_prefixes"
-        ))
-    } else {
-        anyhow::Error::msg(format!(
-            "Blocked host '{host}' resolved to {resolved}, which embeds link-local address \
-             {embedded} under an RFC 6052 /{len} NAT64 layout; this range is blocked \
-             unconditionally because cloud metadata services are hosted in 169.254.0.0/16"
-        ))
-    }
-}
-
 fn metadata_block_error(host: &str, ip: std::net::IpAddr) -> anyhow::Error {
     if is_known_cloud_metadata_endpoint(ip) {
         anyhow::Error::msg(format!(
@@ -881,11 +821,12 @@ fn nat64_metadata_block_error(
 /// destination is reachable, so the answer is rejected when any one of them is
 /// denied rather than accepted on the first that happens to be acceptable.
 ///
-/// A metadata address embedded under any RFC 6052 layout is refused even when
-/// its NAT64 prefix is *not* in `nat64_prefixes`, as a defense in depth for
-/// that fixed set (see `metadata_under_any_rfc6052_layout`). General
-/// private/global classification, by contrast, still consults declared prefixes
-/// alone, because an undeclared prefix cannot be resolved to a routing verdict.
+/// Metadata is decoded only for *evidenced* translators: the well-known
+/// `64:ff9b::/96` prefix (which the address-class predicates decode
+/// unconditionally) and any prefix the operator declared in `nat64_prefixes`.
+/// An undeclared prefix is not synthesized, because nothing in the address
+/// proves the deployment routes it and doing so would deny legitimate global
+/// IPv6 whose bytes coincidentally embed a metadata address under some layout.
 ///
 /// # DNS pinning
 ///
@@ -897,9 +838,8 @@ fn nat64_metadata_block_error(
 /// # Errors
 ///
 /// Returns an error when `ips` is empty, contains a known cloud metadata
-/// address — including one reached through a configured NAT64 prefix or
-/// embedded under any RFC 6052 layout of an undeclared one — or contains any
-/// non-globally-routable address reached through a configured NAT64 prefix.
+/// address, or contains any non-globally-routable address — including one
+/// reached through a configured NAT64 prefix.
 pub fn validate_resolved_ips_are_public(
     host: &str,
     ips: &[std::net::IpAddr],
@@ -930,18 +870,16 @@ pub fn validate_resolved_ips_are_public(
                 }
             }
 
-            // Defense in depth for the fixed metadata set: refuse an answer that
-            // embeds a metadata IPv4 under any RFC 6052 layout even when its
-            // NAT64 prefix was never declared. This runs after the declared-
-            // prefix loop so a declared translation keeps its precise,
-            // prefix-naming error, and before the raw non-global check so a
-            // metadata answer is reported as metadata rather than as generic
-            // non-global.
-            if let Some((len, embedded)) = metadata_under_any_rfc6052_layout(*v6) {
-                return Err(undeclared_nat64_metadata_block_error(
-                    host, *v6, len, embedded,
-                ));
-            }
+            // Metadata decoding is tied to evidenced translators only: the
+            // well-known 64:ff9b::/96 prefix (already handled by the
+            // is_cloud_metadata_ip check above) and the operator-declared
+            // prefixes (the loop above). An operator whose network routes a
+            // network-specific NAT64 prefix must declare it in
+            // security.nat64_prefixes; that config key is the mechanism.
+            // Synthesizing all six RFC 6052 layouts for undeclared prefixes is
+            // deliberately not done: nothing in the answer proves the prefix is
+            // routed here, and doing so denies legitimate global IPv6 whose
+            // bytes coincidentally embed a metadata address under some layout.
         }
 
         let non_global = match ip {
@@ -965,10 +903,9 @@ pub fn validate_resolved_ips_are_public(
 /// inside one of `nat64_prefixes` is rejected when the IPv4 address it embeds
 /// is a metadata address. Overlapping prefixes decode one answer to several
 /// destinations; the answer is rejected when any of them is a metadata
-/// address. A metadata address embedded under any RFC 6052 layout is refused
-/// even when its NAT64 prefix is *not* declared, so the private carve-out
-/// cannot let metadata through an undeclared translator (see
-/// `metadata_under_any_rfc6052_layout`).
+/// address. Metadata is decoded only for evidenced translators — the well-known
+/// `64:ff9b::/96` prefix and the operator-declared `nat64_prefixes`; an
+/// undeclared prefix is not synthesized (see [`validate_resolved_ips_are_public`]).
 ///
 /// # DNS pinning
 ///
@@ -1005,15 +942,14 @@ pub fn validate_resolved_ips_exclude_metadata(
                 }
             }
 
-            // The private opt-in relaxes non-global addresses but never
-            // metadata, so refuse an answer that embeds a metadata IPv4 under
-            // any RFC 6052 layout even when its NAT64 prefix was never declared.
-            // See `metadata_under_any_rfc6052_layout`.
-            if let Some((len, embedded)) = metadata_under_any_rfc6052_layout(*v6) {
-                return Err(undeclared_nat64_metadata_block_error(
-                    host, *v6, len, embedded,
-                ));
-            }
+            // As in validate_resolved_ips_are_public, metadata is decoded only
+            // for evidenced translators: the well-known 64:ff9b::/96 prefix
+            // (handled by the is_cloud_metadata_ip check above) and the
+            // operator-declared prefixes (the loop above). An operator whose
+            // network routes a network-specific NAT64 prefix must declare it in
+            // security.nat64_prefixes. Undeclared RFC 6052 layouts are not
+            // synthesized, since that would deny legitimate global IPv6 whose
+            // bytes coincidentally embed a metadata address under some layout.
         }
     }
 
@@ -2461,13 +2397,14 @@ mod tests {
 
     #[test]
     fn network_specific_private_nat64_addresses_pass_when_no_prefix_is_configured() {
-        // Honest boundary documentation for *non-metadata* destinations: without
-        // the operator declaring the prefix, nothing in this address marks it as
-        // NAT64 to a private host, so both validators accept it. This is the
-        // hole the config key closes for general private routing, and the reason
-        // the key exists at all. Metadata is the deliberate exception — refused
-        // whether or not the prefix is declared; see
-        // `undeclared_prefix_metadata_is_refused_under_every_rfc6052_layout`.
+        // Honest boundary documentation: without the operator declaring the
+        // prefix, nothing in this address marks it as NAT64 to a private host,
+        // so both validators accept it. This is the hole the config key closes
+        // for general private routing, and the reason the key exists at all.
+        // Metadata is decoded only for evidenced translators (the well-known
+        // 64:ff9b::/96 and declared prefixes), never synthesized for an
+        // undeclared one; see
+        // `global_ipv6_that_resembles_metadata_under_a_synthetic_layout_is_allowed`.
         let private_behind_global_prefix = [ip("2001:67c:2b0:db32:0:1:a00:1")];
         assert!(
             validate_resolved_ips_are_public("attacker.test", &private_behind_global_prefix, &[])
@@ -2484,71 +2421,38 @@ mod tests {
     }
 
     #[test]
-    fn undeclared_prefix_metadata_is_refused_under_every_rfc6052_layout() {
-        // Metadata is a fixed target refused whether or not its NAT64 prefix
-        // was declared. Each address embeds a metadata IPv4 at the
-        // fixed §2.2 offsets for exactly one RFC 6052 length, using a benign,
-        // undeclared prefix (0x11 filler, and a non-zero u-octet where the
-        // length skips it) so only the unconditional layout decode can catch it.
-        // Both validators refuse it even with the private opt-in and no declared
-        // prefix.
-        let by_length = [
-            (32, "1111:1111:a9fe:a9fe:1111:1111:1111:1111"),
-            (40, "1111:1111:11a9:fea9:11fe:1111:1111:1111"),
-            (48, "1111:1111:1111:a9fe:11a9:fe11:1111:1111"),
-            (56, "1111:1111:1111:11a9:11fe:a9fe:1111:1111"),
-            (64, "1111:1111:1111:1111:11a9:fea9:fe11:1111"),
-            (96, "1111:1111:1111:1111:1111:1111:a9fe:a9fe"),
-        ];
-        for (len, address) in by_length {
+    fn global_ipv6_that_resembles_metadata_under_a_synthetic_layout_is_allowed() {
+        // Metadata is decoded only for *evidenced* translators: the well-known
+        // 64:ff9b::/96 (always) and any prefix the operator declared in
+        // `security.nat64_prefixes` (when configured). It is never synthesized
+        // for a prefix the deployment gave no evidence it routes. A genuinely
+        // global IPv6 whose bytes happen to read as 169.254.169.254 under some
+        // synthetic RFC 6052 length is therefore accepted, not denied as
+        // metadata. This is the negative control the earlier over-block failed.
+        //
+        // 2606:4700:a9fe:a9fe:: is Cloudflare-space global unicast; under a
+        // synthetic /32 layout its bytes 4-7 read as 169.254.169.254. The second
+        // address carries the same bytes at the /96 offset. With no declared
+        // prefix both are ordinary global answers and pass both validators.
+        for address in ["2606:4700:a9fe:a9fe::", "2606:4700:4700::a9fe:a9fe"] {
             let ips = [ip(address)];
-            // No prefix declared, so any decode here is the unconditional one.
-            for validator in [
-                validate_resolved_ips_are_public("attacker.test", &ips, &[]),
-                validate_resolved_ips_exclude_metadata("attacker.test", &ips, &[]),
-            ] {
-                let err = validator.unwrap_err().to_string();
-                assert!(
-                    err.contains("cloud metadata address 169.254.169.254"),
-                    "/{len} layout {address} must be refused as metadata; got: {err}"
-                );
-            }
+            assert!(
+                !is_cloud_metadata_ip(ips[0]),
+                "{address} is not itself a metadata address"
+            );
+            assert!(
+                !is_non_global_v6(address.parse::<Ipv6Addr>().unwrap()),
+                "{address} is a global unicast address"
+            );
+            assert!(
+                validate_resolved_ips_are_public("cdn.test", &ips, &[]).is_ok(),
+                "{address} must pass are_public with no declared prefix"
+            );
+            assert!(
+                validate_resolved_ips_exclude_metadata("cdn.test", &ips, &[]).is_ok(),
+                "{address} must pass exclude_metadata with no declared prefix"
+            );
         }
-
-        // A second metadata IPv4 (Alibaba ECS) embedded under a /96 layout is
-        // refused too, so the check follows `is_cloud_metadata_ip`, not a single
-        // hard-coded address. 100.100.100.200 = 0x64:64:64:c8.
-        let alibaba = [ip("1111:1111:1111:1111:1111:1111:6464:64c8")];
-        assert!(
-            validate_resolved_ips_exclude_metadata("attacker.test", &alibaba, &[]).is_err(),
-            "an undeclared-prefix Alibaba metadata answer must be refused"
-        );
-
-        // The private carve-out grants the host, and metadata is refused anyway.
-        let carveout_metadata = [ip("1111:1111:1111:1111:1111:1111:a9fe:a9fe")];
-        let err = validate_resolved_ips_exclude_metadata(
-            "granted.internal.test",
-            &carveout_metadata,
-            &[],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(
-            err.contains("169.254.169.254"),
-            "the private opt-in must not re-open metadata; got: {err}"
-        );
-
-        // A benign global v6 under no declared prefix embeds no metadata at any
-        // layout and still passes both validators.
-        let benign_global = [ip("2606:4700:4700::1111")];
-        assert!(
-            validate_resolved_ips_are_public("cdn.test", &benign_global, &[]).is_ok(),
-            "a benign global v6 must not be caught by the layout decode"
-        );
-        assert!(
-            validate_resolved_ips_exclude_metadata("cdn.test", &benign_global, &[]).is_ok(),
-            "a benign global v6 must not be caught by the layout decode"
-        );
     }
 
     #[test]

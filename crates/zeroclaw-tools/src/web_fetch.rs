@@ -2462,33 +2462,17 @@ mod tests {
     }
 
     #[test]
-    fn nat64_embedded_private_v4_passes_without_a_configured_prefix() {
-        // Honest boundary for *non-metadata* destinations: nothing in the
-        // address marks it as NAT64 to a private host, so without a declared
-        // prefix the SSRF gate accepts it. This is the hole
-        // `security.nat64_prefixes` closes for general private routing, and the
-        // reason the key exists. Metadata is the deliberate exception, refused
-        // whether or not the prefix is declared; see
-        // `undeclared_prefix_metadata_is_refused_without_a_configured_prefix`.
+    fn nat64_embedded_addresses_pass_without_a_configured_prefix() {
+        // Honest boundary: nothing in the address marks it as NAT64. Without a
+        // declared `security.nat64_prefixes` entry the SSRF gate has no evidence
+        // the deployment translates this prefix, so both a private-embedding and
+        // a metadata-embedding answer are treated as ordinary global IPv6 and
+        // pass. Declaring the prefix is what turns the decode on; see
+        // `configured_nat64_prefix_rejects_embedded_metadata_v4_under_private_opt_in`.
         let private = vec!["2001:67c:2b0:db32:0:1:a00:1".parse().unwrap()];
         assert!(validate_resolved_ips_for_ssrf("attacker.example", false, &private, &[]).is_ok());
-    }
-
-    #[test]
-    fn undeclared_prefix_metadata_is_refused_without_a_configured_prefix() {
-        // Metadata is refused even with the private opt-in and no declared
-        // prefix: the unconditional RFC 6052 layout decode catches the embedded
-        // 169.254.169.254 regardless of whether the operator declared its
-        // translator. Mirrors the net_guard contract
-        // (`undeclared_prefix_metadata_is_refused_under_every_rfc6052_layout`).
         let metadata = vec!["2001:67c:2b0:db32:0:1:a9fe:a9fe".parse().unwrap()];
-        let err = validate_resolved_ips_for_ssrf("attacker.example", true, &metadata, &[])
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("cloud metadata address 169.254.169.254"),
-            "unexpected error: {err}"
-        );
+        assert!(validate_resolved_ips_for_ssrf("attacker.example", true, &metadata, &[]).is_ok());
     }
 
     #[test]
