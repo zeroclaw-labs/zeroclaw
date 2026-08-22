@@ -53,6 +53,7 @@ pub use zeroclaw_tools::cloud_patterns::CloudPatternsTool;
 pub use zeroclaw_tools::codex_cli::CodexCliTool;
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
+pub use zeroclaw_tools::dag_plan_execute::{ChildDispatchFn, DagPlanExecuteTool};
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::email_read::EmailReadTool;
@@ -1760,6 +1761,41 @@ pub fn all_tools_with_runtime(
 
     // Pipeline construction waits for ScopedToolRegistry::assemble(), where the
     // effective per-agent policy and optional caller allowlist are both known.
+
+    // DagPlanExecute — DAG-based sequential and parallel planning.
+    let dag_tools = Arc::new(parking_lot::RwLock::new(tool_arcs.clone()));
+    let excluded: Arc<Vec<String>> = Arc::new(Vec::new());
+    let dispatch_tools = Arc::clone(&dag_tools);
+    let excluded_clone = Arc::clone(&excluded);
+    let child_dispatch: Arc<ChildDispatchFn> =
+        Arc::new(move |tool_name: String, args: serde_json::Value| {
+            let tools = Arc::clone(&dispatch_tools);
+            let excl = Arc::clone(&excluded_clone);
+            Box::pin(async move {
+                let trimmed = tool_name.trim();
+                if excl.iter().any(|e| e.trim().eq_ignore_ascii_case(trimmed)) {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: Default::default(),
+                        error: Some(format!("tool {trimmed} is excluded")),
+                    });
+                }
+                let tool = tools
+                    .read()
+                    .iter()
+                    .find(|t| t.name() == trimmed)
+                    .cloned()
+                    .ok_or_else(|| anyhow::Error::msg(format!("unknown tool: {tool_name}")))?;
+                tool.execute(args)
+                    .await
+                    .map_err(|e| anyhow::Error::msg(format!("{e:#}")))
+            })
+        });
+    tool_arcs.push(Arc::new(
+        DagPlanExecuteTool::new(Arc::clone(&dag_tools))
+            .with_child_dispatch(child_dispatch)
+            .with_excluded_tools(excluded),
+    ));
 
     AllToolsResult {
         unfiltered_tool_arcs: tool_arcs.clone(),
