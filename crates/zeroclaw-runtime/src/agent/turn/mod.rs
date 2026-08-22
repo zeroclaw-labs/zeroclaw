@@ -238,18 +238,19 @@ pub struct ToolLoop<'a> {
 
 /// Project the token population of the NEXT provider request that would be
 /// built from `history`: prepare the messages through the multimodal boundary,
-/// run any `before_llm_call` hooks on the prepared population (the real
-/// iteration re-runs them before dispatching), add the next iteration's native
-/// tool-schema population, and scale by the measured-request calibration ratio.
-/// Returns the calibrated projected count.
+/// add the next iteration's native tool-schema population, and scale by the
+/// measured-request calibration ratio. This projection never executes
+/// `before_llm_call` hooks: a modifying hook is not a pure estimator, so
+/// running it here would observe a stateful or one-shot handler twice for one
+/// dispatched request (the real iteration runs it once before dispatching).
+/// The transient per-request growth such a hook adds is accounted by the
+/// caller through a measured reserve instead of a second execution.
 #[allow(clippy::too_many_arguments)]
 async fn projected_provider_facing_tokens(
     history: &[ChatMessage],
     multimodal_config: &zeroclaw_config::schema::MultimodalConfig,
     degrade_strip_images: bool,
     image_cache: Option<&mut zeroclaw_providers::multimodal::LocalImageCache>,
-    hooks: Option<&crate::hooks::HookRunner>,
-    model: &str,
     tool_schema_tokens: usize,
     ratio: f64,
 ) -> usize {
@@ -266,21 +267,7 @@ async fn projected_provider_facing_tokens(
         // raw history so enforcement still runs.
         Err(_) => history.to_vec(),
     };
-    let mut population = prepared;
-    if let Some(hooks) = hooks.filter(|hooks| !hooks.is_empty()) {
-        let mut candidate = population.clone();
-        let mut candidate_model = model.to_string();
-        // A cancelling hook withholds the request, leaving the population
-        // unchanged — matching the runner's cancel semantics — so the
-        // projection keeps the pre-hook estimate in that case.
-        if let crate::hooks::HookResult::Continue(()) = hooks
-            .run_before_llm_call(&mut candidate, &mut candidate_model)
-            .await
-        {
-            population = candidate;
-        }
-    }
-    ((crate::agent::history::estimate_history_tokens(&population) + tool_schema_tokens) as f64
+    ((crate::agent::history::estimate_history_tokens(&prepared) + tool_schema_tokens) as f64
         * ratio)
         .round() as usize
 }
@@ -319,16 +306,15 @@ async fn enforce_reported_budget(
     // estimates the retained population; otherwise the projected count can
     // differ slightly from the dispatched prompt near tight budget boundaries.
     next_use_native_tools: bool,
-    // The `before_llm_call` hooks the NEXT iteration re-runs on its prepared
-    // messages before dispatch. A growing, filtering, or replacement hook
-    // changes the provider-facing population after a naive prepare-based
-    // projection, so the projection must account for the post-hook population
-    // to decide against the actual next request.
-    hooks: Option<&crate::hooks::HookRunner>,
-    // The model the next iteration starts its hook pass from (`active_model`
-    // at the real `run_before_llm_call` site). The projection only needs a
-    // starting value; a hook-selected model does not re-route the projection.
-    model: &str,
+    // Transient per-request growth that a modifying `before_llm_call` hook adds
+    // on top of the durable population, measured from the request that just
+    // completed (post-hook minus pre-hook estimate). The decision below reserves
+    // this growth against the budget instead of executing the hook a second time:
+    // enforcement never invokes hooks, because a stateful or one-shot handler
+    // must be observed exactly once per dispatched request. Hooks whose growth
+    // varies between iterations are re-measured at the next dispatch seam, which
+    // re-enforces against its own measured population.
+    hook_reserve_tokens: usize,
 ) {
     if context_token_budget == 0 {
         return;
@@ -342,11 +328,11 @@ async fn enforce_reported_budget(
     // `tokens_before` always describes the population actually trimmed — even
     // when the raw selection already dropped turns below the prior provider
     // report (whose count belongs to a different, earlier request). It is a
-    // calibrated estimate of the durable (pre-hook) population: prepared
-    // messages and next-iteration schemas, without the transient hook growth a
-    // growing `before_llm_call` hook adds to each dispatched request. The hook
-    // result drives the budget DECISION below; the accounting stays anchored to
-    // the durable context that is actually persisted and trimmed.
+    // calibrated estimate of the durable population: prepared messages and
+    // next-iteration schemas, without the transient hook growth a modifying
+    // `before_llm_call` hook adds to each dispatched request. That growth is
+    // reserved against the budget in the DECISION below; the accounting stays
+    // anchored to the durable context that is actually persisted and trimmed.
     // Compute `tokens_before` after the next prompt-anchor swap so the event
     // reflects the prompt that will actually be dispatched next. The real
     // next iteration applies `refresh_prompt_anchor` before preparing its
@@ -354,13 +340,17 @@ async fn enforce_reported_budget(
     // when native-tool mode changes.
     let mut taken_for_before = taken.clone();
     refresh_prompt_anchor(&mut taken_for_before, next_use_native_tools);
+    // The durable projection below never runs hooks; the measured transient
+    // growth a modifying hook adds to each dispatched request is reserved
+    // against the budget here so the decision still targets the request that
+    // will actually be sent.
+    let calibrated_hook_reserve = (hook_reserve_tokens as f64 * ratio).round() as usize;
+    let decision_budget = context_token_budget.saturating_sub(calibrated_hook_reserve);
     let projected_pre_trim = projected_provider_facing_tokens(
         &taken_for_before,
         multimodal_config,
         degrade_strip_images,
         image_cache.as_deref_mut(),
-        None,
-        "",
         tool_schema_tokens,
         ratio,
     )
@@ -407,30 +397,23 @@ async fn enforce_reported_budget(
     // dropping the newest turn — an outcome that must be surfaced, not silently
     // kept as if the trim succeeded.
     let mut hit_floor = false;
-    // The decision seam is the actual next request: the real next
-    // iteration re-runs `run_before_llm_call` on the prepared messages
-    // before dispatch, so the projection must include the hook result to
-    // decide against the true provider-facing population. This does run
-    // the hook as an estimation step; a side-effect-free projection
-    // contract is the intended follow-up to avoid double-invocation of
-    // stateful hooks, but for the current pure append-only hooks the
-    // estimation is necessary to make the budget exact and the
-    // `enforce_projection_runs_hooks_so_post_hook_next_request_fits`
-    // regression meaningful (it would otherwise hang waiting for a trim
-    // that never occurs).
+    // The decision seam targets the actual next request without executing any
+    // hook: the durable projection is compared against the budget minus the
+    // measured hook reserve, so a request-growing `before_llm_call` hook cannot
+    // push the dispatched population past the budget after this decision. The
+    // reserve is re-measured at every dispatch seam, so hooks whose growth
+    // varies between iterations converge at the next enforcement pass.
     loop {
         tokens_after = projected_provider_facing_tokens(
             &trimmed,
             multimodal_config,
             degrade_strip_images,
             image_cache.as_deref_mut(),
-            hooks,
-            model,
             tool_schema_tokens,
             ratio,
         )
         .await;
-        if tokens_after <= context_token_budget {
+        if tokens_after <= decision_budget {
             break;
         }
         let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed);
@@ -444,8 +427,8 @@ async fn enforce_reported_budget(
         // The trim is real: insert the model-visible breadcrumb. It is part of
         // the NEXT provider request, so recount the prepared retained
         // population with it included and, if the crumb pushes the calibrated
-        // count over the budget, drop the oldest whole turn again (stopping at
-        // the newest-turn/schema floor).
+        // count over the decision budget, drop the oldest whole turn again
+        // (stopping at the newest-turn/schema floor).
         crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
         loop {
             tokens_after = projected_provider_facing_tokens(
@@ -453,13 +436,11 @@ async fn enforce_reported_budget(
                 multimodal_config,
                 degrade_strip_images,
                 image_cache.as_deref_mut(),
-                hooks,
-                model,
                 tool_schema_tokens,
                 ratio,
             )
             .await;
-            if tokens_after <= context_token_budget {
+            if tokens_after <= decision_budget {
                 break;
             }
             let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed);
@@ -468,11 +449,11 @@ async fn enforce_reported_budget(
                 break;
             }
         }
-        // If the breadcrumb pushes the retained newest turn over the budget
-        // and no more whole turn can be dropped, carry the floor flag so
+        // If the breadcrumb pushes the retained newest turn over the decision
+        // budget and no more whole turn can be dropped, carry the floor flag so
         // the explicit floor is surfaced instead of a successful ordinary
         // trim that still exceeds the budget.
-        if hit_floor && tokens_after > context_token_budget {
+        if hit_floor && tokens_after > decision_budget {
             let floor_turns = crate::agent::history_trim::count_turns(&trimmed);
             *history = trimmed;
             if let Some(tx) = event_tx {
@@ -527,15 +508,13 @@ async fn enforce_reported_budget(
         // is persisted and re-dispatched next — a calibrated estimate of the
         // prepared retained population (breadcrumb included, schemas included),
         // WITHOUT the transient hook growth that each dispatched request adds
-        // back on top. The decision seam above already proved the post-hook
-        // next request fits.
+        // back on top. The decision seam above reserved that growth against the
+        // budget, so the post-hook next request fits.
         result.tokens_after = projected_provider_facing_tokens(
             &trimmed,
             multimodal_config,
             degrade_strip_images,
             image_cache,
-            None,
-            "",
             tool_schema_tokens,
             ratio,
         )
@@ -1124,6 +1103,14 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
         let mut provider_request_messages = prepared_messages.messages;
+        // Measure the transient per-request hook growth from THIS dispatched
+        // request: the delta between the pre-hook and post-hook estimates of
+        // the exact population sent to the provider. The post-tool budget
+        // enforcement below reserves this measured growth instead of executing
+        // hooks for estimation — a modifying `before_llm_call` handler must be
+        // observed exactly once per dispatched request.
+        let pre_hook_estimated =
+            crate::agent::history::estimate_history_tokens(&provider_request_messages);
         let mut hook_selected_model = None;
 
         if let Some(hooks) = ctx.hooks.filter(|hooks| !hooks.is_empty()) {
@@ -1140,6 +1127,9 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 }
             }
         }
+        let measured_hook_growth_tokens =
+            crate::agent::history::estimate_history_tokens(&provider_request_messages)
+                .saturating_sub(pre_hook_estimated);
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
         // Only direct Agent turns scope the complete prompt variants. Preserve
         // the channel loop's existing hook/protocol behavior rather than
@@ -1559,12 +1549,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let msg = ChatMessage::assistant(response_text.clone());
             turn_state.push_dual(msg);
             if let Some(reported) = reported_input_tokens {
-                // Terminal response: no next request will be dispatched, so do
-                // not project the next hook's population as an estimation
-                // step. Passing `None` avoids executing a modifying
-                // `before_llm_call` hook merely to estimate a request that
-                // will never be sent, and prevents double-invocation of
-                // stateful hooks.
+                // Terminal response: no next request will be dispatched, so no
+                // hook reserve is carried — enforcement never executes a
+                // modifying `before_llm_call` hook merely to estimate a request
+                // that will never be sent.
                 enforce_reported_budget(
                     turn_state.history,
                     reported as usize,
@@ -1577,8 +1565,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     degrade_strip_images,
                     image_cache.as_deref_mut(),
                     use_native_tools,
-                    None,
-                    "",
+                    0,
                 )
                 .await;
             }
@@ -1928,8 +1915,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 next_degrade_strip_images,
                 image_cache.as_deref_mut(),
                 next_use_native_tools,
-                hooks,
-                active_model,
+                measured_hook_growth_tokens,
             )
             .await;
         }
@@ -3014,8 +3000,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
         assert!(
@@ -3050,8 +3035,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -3079,8 +3063,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
 
@@ -3107,8 +3090,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -3134,8 +3116,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
 
@@ -3197,8 +3178,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
 
@@ -3285,8 +3265,7 @@ mod reported_budget_tests {
             false,
             Some(&mut image_cache),
             false,
-            None,
-            "",
+            0,
         )
         .await;
 
@@ -3373,8 +3352,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
 
@@ -3447,8 +3425,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
 
@@ -3513,8 +3490,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
         assert!(
@@ -3595,8 +3571,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
 
@@ -3655,14 +3630,16 @@ mod reported_budget_tests {
     }
 
     #[tokio::test]
-    async fn enforce_projection_runs_hooks_so_post_hook_next_request_fits() {
-        // The next iteration re-runs `before_llm_call` before dispatch: a
-        // growing hook appends to the prepared population AFTER a naive
-        // prepare-based projection would have decided the next request fits.
-        // Enforcement must account for the post-hook population in its
-        // projection, trim until the post-hook next request fits, and only then
-        // claim the trim succeeded.
-        use crate::hooks::{HookHandler, HookResult, HookRunner};
+    async fn enforce_measured_hook_reserve_keeps_post_hook_next_request_fits() {
+        // A growing `before_llm_call` hook appends to the prepared population
+        // AFTER a naive prepare-based projection would have decided the next
+        // request fits. The dispatch seam measures that growth as a delta and
+        // post-tool enforcement reserves it against the budget — without ever
+        // executing the hook itself, so the stateful handler is observed only
+        // at its real dispatch pass. The trim must continue until the durable
+        // population plus the reserve fits, and the actual second post-hook
+        // request must fit the budget.
+        use crate::hooks::{HookHandler, HookResult};
         use async_trait::async_trait;
 
         struct GrowingRequestHook;
@@ -3722,8 +3699,13 @@ mod reported_budget_tests {
              for this regression"
         );
 
-        let mut hooks = HookRunner::new();
-        hooks.register(Box::new(GrowingRequestHook));
+        // Measure the hook growth exactly as the dispatch seam does: the delta
+        // between the pre-hook and post-hook estimates of the prepared
+        // population. This measured delta is the only hook signal enforcement
+        // receives — it never executes the handler itself.
+        let pre_hook_estimated = crate::agent::history::estimate_history_tokens(&pre_hook.messages);
+        let hook_reserve_tokens = crate::agent::history::estimate_history_tokens(&hook_grown)
+            .saturating_sub(pre_hook_estimated);
 
         let before = history.len();
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
@@ -3739,8 +3721,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            Some(&hooks),
-            "test-model",
+            hook_reserve_tokens,
         )
         .await;
 
@@ -3808,7 +3789,10 @@ mod reported_budget_tests {
         // Output appended to `history` after the provider request was measured
         // (e.g. this iteration's tool result) is part of the population
         // actually trimmed but was never part of the provider-reported count.
-        history.push(ChatMessage::assistant("y".repeat(5000)));
+        // It stays small enough that the retained newest turn still fits once
+        // the older droppable turns are gone; the explicit
+        // newest-turn-floor outcome is covered separately below.
+        history.push(ChatMessage::assistant("y".repeat(1000)));
         let taken_snapshot = history.clone();
         let ratio = reported as f64 / estimated.max(1) as f64;
 
@@ -3825,8 +3809,7 @@ mod reported_budget_tests {
             false,
             None,
             false,
-            None,
-            "",
+            0,
         )
         .await;
 

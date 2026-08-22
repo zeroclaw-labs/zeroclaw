@@ -16651,6 +16651,476 @@ Let me check the result."#;
         );
     }
 
+    /// A provider that records every dispatched request and answers with a
+    /// scripted XML tool call on the first dispatch (when `script_tool_call`)
+    /// and plain text after.
+    struct DispatchRecordingProvider {
+        dispatched: Arc<Mutex<Vec<(bool, String)>>>,
+        script_tool_call: bool,
+    }
+
+    #[async_trait]
+    impl ModelProvider for DispatchRecordingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in this test");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let dispatch_index = {
+                let mut guard = self
+                    .dispatched
+                    .lock()
+                    .expect("dispatched lock should be valid");
+                guard.push((request.tools.is_some(), model.to_string()));
+                guard.len()
+            };
+            let text = if self.script_tool_call && dispatch_index == 1 {
+                r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#
+            } else {
+                "done"
+            };
+            Ok(ChatResponse {
+                text: Some(text.to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for DispatchRecordingProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "DispatchRecordingProvider"
+        }
+    }
+
+    #[tokio::test]
+    async fn stateful_before_llm_call_hook_runs_once_per_dispatched_request() {
+        // A modifying `before_llm_call` hook must be observed exactly once per
+        // dispatched request. The dispatch seam runs it before each provider
+        // call; budget enforcement never executes it as an estimation step.
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct CountingHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for CountingHook {
+            fn name(&self) -> &str {
+                "count-before-llm"
+            }
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(())
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(CountingHook(Arc::clone(&hook_calls))));
+
+        let provider = DispatchRecordingProvider {
+            dispatched: Arc::new(Mutex::new(Vec::new())),
+            script_tool_call: true,
+        };
+        let dispatched = Arc::clone(&provider.dispatched);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run the tool once"),
+        ];
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&tool_calls),
+        ))];
+        let (event_tx, _event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            2,
+            "the stateful hook must run exactly once per dispatched request"
+        );
+        assert_eq!(hook_calls.load(Ordering::SeqCst), {
+            let guard = dispatched.lock().unwrap();
+            guard.len()
+        });
+    }
+
+    #[tokio::test]
+    async fn terminal_response_never_invokes_before_llm_call_for_estimation() {
+        // A terminal response dispatches exactly one request; no later budget
+        // projection may execute a `before_llm_call` hook for a request that
+        // will never be sent.
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct CountingHook(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for CountingHook {
+            fn name(&self) -> &str {
+                "count-before-llm-terminal"
+            }
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                _model: &mut String,
+            ) -> HookResult<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                HookResult::Continue(())
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(CountingHook(Arc::clone(&hook_calls))));
+
+        let provider = DispatchRecordingProvider {
+            dispatched: Arc::new(Mutex::new(Vec::new())),
+            script_tool_call: false,
+        };
+        let observer = NoopObserver;
+        let mut history = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
+        let (event_tx, _event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+
+        let result = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &[],
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 2,
+                hooks: Some(&hooks),
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 100_000,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect("tool loop should succeed");
+
+        assert_eq!(result, "done");
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            1,
+            "a single-shot turn must invoke the hook only for its one dispatched request"
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_selected_model_flip_sends_native_schemas_on_the_next_request() {
+        // A stateful hook that selects a native-tool-capable model between
+        // iterations must move the NEXT dispatched request to native schemas:
+        // the protocol/native-mode resolution follows the hook-selected model
+        // at each dispatch seam.
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+        use crate::hooks::{HookHandler, HookResult, HookRunner};
+
+        struct FlipModelOnSecondCall(Arc<AtomicUsize>);
+
+        #[async_trait]
+        impl HookHandler for FlipModelOnSecondCall {
+            fn name(&self) -> &str {
+                "flip-model"
+            }
+            async fn before_llm_call(
+                &self,
+                _messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> HookResult<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) >= 1 {
+                    *model = "native-model".to_string();
+                }
+                HookResult::Continue(())
+            }
+        }
+
+        #[derive(Default)]
+        struct CapabilityByModelProvider {
+            requests: Arc<Mutex<Vec<(bool, String)>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapabilityByModelProvider {
+            fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+                ProviderCapabilities {
+                    native_tool_calling: model.starts_with("native-"),
+                    ..ProviderCapabilities::default()
+                }
+            }
+
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                let has_native_tools = request.tools.is_some();
+                self.requests
+                    .lock()
+                    .expect("requests lock should be valid")
+                    .push((has_native_tools, model.to_string()));
+                let text = if self.requests.lock().unwrap().len() == 1 {
+                    r#"<tool_call>
+{"name":"count_tool","arguments":{"value":"X"}}
+</tool_call>"#
+                } else {
+                    "done"
+                };
+                Ok(ChatResponse {
+                    text: Some(text.to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for CapabilityByModelProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapabilityByModelProvider"
+            }
+        }
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let mut hooks = HookRunner::new();
+        hooks.register(Box::new(FlipModelOnSecondCall(Arc::clone(&hook_calls))));
+
+        let provider = CapabilityByModelProvider::default();
+        let requests = Arc::clone(&provider.requests);
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("run the tool once"),
+        ];
+        let tool_calls = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&tool_calls),
+        ))];
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: Some(&hooks),
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_token_budget: 100_000,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+            }),
+        )
+        .await
+        .expect("tool loop should succeed");
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(
+            captured.len(),
+            2,
+            "two iterations must dispatch two requests"
+        );
+        assert_eq!(
+            hook_calls.load(Ordering::SeqCst),
+            2,
+            "the flipping hook runs once per dispatched request"
+        );
+        assert_eq!(
+            captured[0].1, "plain-model",
+            "the first dispatch keeps the configured model"
+        );
+        assert_eq!(
+            captured[1].1, "native-model",
+            "the second dispatch follows the hook-selected model"
+        );
+        assert!(
+            !captured[0].0,
+            "the non-native first request must not carry native schemas"
+        );
+        assert!(
+            captured[1].0,
+            "the hook-flipped second request must carry native schemas"
+        );
+        while let Ok(event) = event_rx.try_recv() {
+            assert!(
+                !matches!(event, zeroclaw_api::agent::TurnEvent::HistoryTrimmed { .. }),
+                "a comfortable budget must not emit trim events"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn agent_turn_propagates_resolved_agent_alias_to_observer_events() {
         // Regression guard: process_message resolves agent_alias but
