@@ -1416,6 +1416,29 @@ impl OpenAiCodexModelProvider {
                     return Err(stream_err);
                 }
 
+                // The ChatGPT Codex backend REQUIRES streaming: a `stream: false`
+                // body is rejected with `400 {"detail":"Stream must be set to
+                // true"}`. Retrying without streaming there cannot succeed, and
+                // it destroys the diagnosis: the caller sees a non-retryable 400
+                // instead of the transient decode error that actually happened,
+                // so a recoverable blip is reported as a hard provider failure.
+                // Custom endpoints keep the fallback; many accept both modes.
+                if !self.custom_endpoint {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{}", stream_err),
+                                "endpoint": "default",
+                            })),
+                        "OpenAI Codex streaming response decode failed; the default endpoint \
+                         requires streaming, so the original error is surfaced rather than \
+                         retried without it"
+                    );
+                    return Err(stream_err);
+                }
+
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2031,6 +2054,43 @@ mod tests {
         let provider = OpenAiCodexModelProvider::new("test", &options, Some("test-key")).unwrap();
         assert!(provider.custom_endpoint);
         assert_eq!(provider.gateway_api_key.as_deref(), Some("test-key"));
+    }
+
+    /// The ChatGPT Codex backend rejects `stream: false` with
+    /// `400 {"detail":"Stream must be set to true"}`, so retrying a failed
+    /// stream without streaming cannot succeed there. It only replaces a
+    /// transient, retryable decode error with a non-retryable 400, which the
+    /// reliability layer then refuses to retry, so a recoverable blip ends the
+    /// turn. The default endpoint must surface the original error instead.
+    ///
+    /// `mock_codex_provider` binds a local port, so every mock-backed test is a
+    /// CUSTOM endpoint and keeps the fallback. This pins the flag those two
+    /// paths actually branch on.
+    #[test]
+    fn default_endpoint_is_not_marked_custom() {
+        let provider =
+            OpenAiCodexModelProvider::new("test", &ModelProviderRuntimeOptions::default(), None)
+                .expect("default provider constructs");
+        assert!(
+            !provider.custom_endpoint,
+            "the default Codex endpoint must not be treated as custom: the \
+             non-streaming fallback is skipped on exactly that flag"
+        );
+
+        let custom = OpenAiCodexModelProvider::new(
+            "test",
+            &ModelProviderRuntimeOptions {
+                provider_api_url: Some("https://api.tonsof.blue/v1".to_string()),
+                ..ModelProviderRuntimeOptions::default()
+            },
+            Some("test-key"),
+        )
+        .expect("custom provider constructs");
+        assert!(
+            custom.custom_endpoint,
+            "a configured provider_api_url must keep the fallback: many \
+             OpenAI-compatible endpoints accept both modes"
+        );
     }
 
     #[tokio::test]
