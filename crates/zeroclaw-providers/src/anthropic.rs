@@ -1206,7 +1206,20 @@ impl AnthropicModelProvider {
                                 Ok((mime, payload)) => {
                                     (mime.to_ascii_lowercase(), payload.to_string())
                                 }
-                                Err(_) => {
+                                Err(reason) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(::serde_json::json!({
+                                            "error": format!("{reason}"),
+                                            "error_key": "anthropic_image_marker_malformed_data_uri",
+                                        })),
+                                        "dropping image marker: data URI failed the structural check"
+                                    );
                                     omitted += 1;
                                     continue;
                                 }
@@ -1230,12 +1243,39 @@ impl AnthropicModelProvider {
                                     .to_string();
                                     (mime, b64)
                                 }
-                                Err(_) => {
+                                Err(error) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "error": format!("{error}"),
+                                                "error_key": "anthropic_image_local_read_failed",
+                                            })
+                                        ),
+                                        "dropping image marker: local file could not be read"
+                                    );
                                     omitted += 1;
                                     continue;
                                 }
                             }
                         } else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({
+                                    "error_key": "anthropic_image_source_missing",
+                                })),
+                                "dropping image marker: source is neither a data URI nor an existing file"
+                            );
                             omitted += 1;
                             continue;
                         };
@@ -7169,13 +7209,21 @@ data: {\"type\":\"message_stop\"}\n\n";
     async fn prepared_local_image_reaches_the_wire_as_a_nested_block() {
         let temp = tempfile::tempdir().expect("temp dir");
         let image_path = temp.path().join("screenshot.png");
-        // A PNG signature is enough for MIME detection, and its 12-character
-        // base64 is canonical.
-        std::fs::write(
-            &image_path,
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
-        )
-        .expect("write png");
+        // A real 1x1 PNG, not a bare signature. Preparation now decodes the
+        // pixels to reject corrupt images, so a signature-only file is dropped
+        // before it can reach the converter and this test would assert nothing.
+        let png_bytes = {
+            let mut buf = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                1,
+                1,
+                image::Rgba([255, 0, 0, 255]),
+            ))
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("test PNG encodes");
+            buf.into_inner()
+        };
+        std::fs::write(&image_path, &png_bytes).expect("write png");
 
         let messages = vec![
             ChatMessage::user("take a screenshot"),
@@ -7230,7 +7278,7 @@ data: {\"type\":\"message_stop\"}\n\n";
             base64::engine::general_purpose::STANDARD
                 .decode(data)
                 .expect("payload must be decodable base64"),
-            [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'],
+            png_bytes,
             "the bytes written to disk must be the bytes on the wire"
         );
 

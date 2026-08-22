@@ -110,7 +110,12 @@ impl<'a> MediaPipeline<'a> {
 
     fn process_image(&self, attachment: &MediaAttachment) -> String {
         if self.vision_available {
-            let (mime, data) = image_payload_for_vision(attachment);
+            let Some((mime, data)) = image_payload_for_vision(attachment) else {
+                return format!(
+                    "[Image: {} attached, could not be read]",
+                    attachment.file_name
+                );
+            };
             let b64 = STANDARD.encode(data.as_ref());
             format!(
                 "[Image: {} attached, will be processed by vision model]\n[IMAGE:data:{};base64,{}]",
@@ -129,13 +134,16 @@ impl<'a> MediaPipeline<'a> {
     }
 }
 
-fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u8]>) {
+/// Resolve the bytes to inline for the vision model. Returns `None` when the
+/// attachment is known-bad, so the caller degrades to a text annotation instead
+/// of inlining bytes the decoder already rejected.
+fn image_payload_for_vision(attachment: &MediaAttachment) -> Option<(String, Cow<'_, [u8]>)> {
     let mime = attachment.mime_type.as_deref().unwrap_or("image/jpeg");
 
     #[cfg(feature = "image-normalization")]
     if is_webp_attachment(attachment, mime) {
         match webp_to_png(&attachment.data) {
-            Ok(png) => return ("image/png".to_string(), Cow::Owned(png)),
+            Ok(png) => return Some(("image/png".to_string(), Cow::Owned(png))),
             Err(err) => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -146,13 +154,17 @@ fn image_payload_for_vision(attachment: &MediaAttachment) -> (String, Cow<'_, [u
                             "error": format!("{}", err),
                             "error_key": "media_pipeline_webp_to_png_failed",
                         })),
-                    "Media pipeline: failed to normalize WebP image for vision"
+                    "Media pipeline: dropping WebP image that failed to decode"
                 );
+                // The decoder has already proven these bytes are not a usable
+                // image. Forwarding them anyway earns a provider-side 400 that
+                // fails the entire turn, including the accompanying text.
+                return None;
             }
         }
     }
 
-    (mime.to_string(), Cow::Borrowed(&attachment.data))
+    Some((mime.to_string(), Cow::Borrowed(&attachment.data)))
 }
 
 #[cfg(feature = "image-normalization")]
@@ -324,6 +336,37 @@ mod tests {
         assert!(result.contains("[IMAGE:data:image/png;base64,"));
         assert!(!result.contains("[IMAGE:data:image/webp;base64,"));
         assert!(result.contains("what is this?"));
+    }
+
+    #[cfg(feature = "image-normalization")]
+    #[tokio::test]
+    async fn corrupt_webp_is_dropped_rather_than_inlined() {
+        // The decoder has already proven these bytes are unusable. Inlining
+        // them anyway earns a provider-side 400 that fails the whole turn,
+        // taking the user's text down with it.
+        let config = default_pipeline_config(true);
+        let pipeline = MediaPipeline::new(&config, None, true);
+
+        let sticker = MediaAttachment {
+            file_name: "sticker.webp".to_string(),
+            data: b"RIFF\x00\x00\x00\x00WEBPnot-a-real-webp".to_vec(),
+            mime_type: Some("image/webp".to_string()),
+        };
+
+        let result = pipeline.process("what is this?", &[sticker]).await;
+
+        assert!(
+            !result.contains("[IMAGE:data:"),
+            "corrupt WebP must not be inlined: {result}"
+        );
+        assert!(
+            result.contains("could not be read"),
+            "annotation must state the image was dropped: {result}"
+        );
+        assert!(
+            result.contains("what is this?"),
+            "user text must survive: {result}"
+        );
     }
 
     #[tokio::test]
