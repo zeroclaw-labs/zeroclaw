@@ -1209,17 +1209,18 @@ where
                     }
                 }
                 Err(e) => {
-                    crate::health::mark_component_error(name, e.to_string());
+                    let error_chain = format!("{e:#}");
+                    crate::health::mark_component_error(name, &error_chain);
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "error": format!("{}", e),
+                                "error": &error_chain,
                                 "name": name,
                                 "ran_for_secs": ran_for.as_secs(),
                             })),
-                        &format!("Daemon component '{name}' failed: {e}")
+                        &format!("Daemon component '{name}' failed: {error_chain}")
                     );
                     // A long-lived run that eventually errors is not a
                     // fast-fail loop; let it reset so a component that ran fine
@@ -2899,6 +2900,37 @@ mod tests {
                 .as_str()
                 .unwrap_or("")
                 .contains("boom")
+        );
+    }
+
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn supervisor_preserves_component_error_chain() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle =
+            spawn_component_supervisor("daemon-test-error-chain", 60, 60, cancel, || async {
+                Err(anyhow::Error::msg("provider entry has no model")
+                    .context("agents.ox.model_provider"))
+            });
+
+        let expected_chain = "agents.ox.model_provider: provider entry has no model";
+        let expected_message =
+            format!("Daemon component 'daemon-test-error-chain' failed: {expected_chain}");
+        let value = recv_log_event(&mut rx, &expected_message).await;
+        handle.abort();
+        let _ = handle.await;
+
+        assert_eq!(value["attributes"]["error"], expected_chain);
+        let snapshot = crate::health::snapshot_json();
+        assert_eq!(
+            snapshot["components"]["daemon-test-error-chain"]["last_error"],
+            expected_chain
         );
     }
 
