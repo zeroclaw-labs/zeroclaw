@@ -41,22 +41,25 @@ pub fn set_row(tag: &str, variant: &str, chords: Vec<Chord>) {
     }
 }
 
+/// Drop the active table so a test starts from compile-time defaults.
+/// Hold [`TEST_GUARD`] across the call.
 #[cfg(test)]
-fn reset() {
+pub(crate) fn reset() {
     if let Ok(mut guard) = ACTIVE.write() {
         *guard = None;
     }
 }
 
+/// Serializes every test that installs an override, wherever it lives.
+/// `ACTIVE` is process-wide, so two such tests running in parallel would
+/// clobber each other's state.
+#[cfg(test)]
+pub(crate) static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyCode;
-    use std::sync::Mutex;
-
-    // Both tests mutate the process-wide `ACTIVE` table; serialize them so
-    // parallel execution can't clobber one test's state from another.
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn set_and_lookup_round_trips() {

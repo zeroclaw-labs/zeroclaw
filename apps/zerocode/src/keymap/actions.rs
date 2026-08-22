@@ -68,15 +68,31 @@ macro_rules! keyactions {
             /// Bindings after applying any runtime override for `TAG`;
             /// falls back to the compile-time table when none is active.
             /// Sparse: an un-overridden variant keeps its default chords.
+            ///
+            /// An explicitly bound chord outranks a merely retained default,
+            /// whichever action declares it first. Without that, shipping a new
+            /// default chord would silently take a chord the operator had
+            /// already assigned elsewhere, because dispatch takes the first
+            /// match in declaration order.
             pub fn resolved_bindings() -> Vec<(Chord, $name)> {
                 let Some(over) = super::overrides::lookup(Self::TAG) else {
                     return Self::bindings();
                 };
+                let claimed: Vec<Chord> = Self::variants()
+                    .iter()
+                    .filter_map(|v| over.get(&v.variant_name()))
+                    .flatten()
+                    .cloned()
+                    .collect();
                 let mut out: Vec<(Chord, $name)> = Vec::new();
                 for v in Self::variants() {
                     let chords = match over.get(&v.variant_name()) {
                         Some(cs) => cs.clone(),
-                        None => v.default_chords(),
+                        None => v
+                            .default_chords()
+                            .into_iter()
+                            .filter(|c| !claimed.contains(c))
+                            .collect(),
                     };
                     for c in chords {
                         out.push((c, *v));
@@ -331,7 +347,7 @@ keyactions! {
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
         OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
-        DeletePreviousWord [Chord::ctrl('w')] => "delete previous word",
+        DeletePreviousWord [Chord::ctrl('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
         ClearInput         [Chord::ctrl('u')] => "clear input",
         SelectAll          [] => "select all",
         Paste              [Chord::ctrl('v')] => "paste",

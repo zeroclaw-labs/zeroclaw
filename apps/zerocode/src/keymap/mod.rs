@@ -240,6 +240,158 @@ mod tests {
     }
 
     #[test]
+    fn delete_previous_word_answers_to_both_ctrl_w_and_alt_backspace() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        with_default_bindings(|| {
+            // Both chords resolve to the one action, so the existing
+            // Unicode-aware deletion stays the single behavior owner.
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(
+                    KeyCode::Char('w'),
+                    KeyModifiers::CONTROL
+                )),
+                Some(InputBarAction::DeletePreviousWord)
+            );
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+                Some(InputBarAction::DeletePreviousWord)
+            );
+
+            // Unmodified Backspace keeps its own action rather than falling
+            // through to the word delete.
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                Some(InputBarAction::Backspace)
+            );
+
+            // Help and the rebinding surface read the defaults, so both chords
+            // have to be advertised there, not just accepted at match time.
+            let defaults = InputBarAction::DeletePreviousWord.default_chords();
+            assert!(defaults.contains(&Chord::ctrl('w')));
+            assert!(defaults.contains(&Chord::with(KeyCode::Backspace, KeyModifiers::ALT)));
+            assert_eq!(
+                action_key_labels(InputBarAction::DeletePreviousWord).len(),
+                2
+            );
+        });
+    }
+
+    /// Run `body` with no override table installed, so the assertions see
+    /// compile-time defaults. Needed by any test that reads
+    /// `action_key_labels`, which resolves through the process-wide
+    /// override state and would otherwise race a test that installs one.
+    #[cfg(test)]
+    fn with_default_bindings(body: impl FnOnce()) {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        body();
+    }
+
+    /// Install a sparse `input_bar` override for one variant, run `body`,
+    /// then drop the table again. Serialized against every other test that
+    /// touches the process-wide override state.
+    #[cfg(test)]
+    fn with_input_bar_override(variant: &str, chords: Vec<Chord>, body: impl FnOnce()) {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let mut table = overrides::OverrideTable::new();
+        let mut rows = std::collections::HashMap::new();
+        rows.insert(variant.to_string(), chords);
+        table.insert(InputBarAction::TAG.to_string(), rows);
+        overrides::set_active(table);
+        body();
+        overrides::reset();
+    }
+
+    #[test]
+    fn an_explicit_binding_outranks_a_retained_default_on_another_action() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let alt_backspace = Chord::with(KeyCode::Backspace, KeyModifiers::ALT);
+
+        // ClearInput is declared *after* DeletePreviousWord, whose defaults
+        // include the same chord. Dispatch takes the first match, so without
+        // the claim check the operator's binding would never be reached.
+        with_input_bar_override("clear_input", vec![alt_backspace.clone()], || {
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+                Some(InputBarAction::ClearInput),
+                "an explicitly bound chord must reach the action the operator chose"
+            );
+
+            // Help must not advertise the chord for both actions.
+            assert_eq!(
+                action_key_labels(InputBarAction::ClearInput),
+                vec![alt_backspace.display()]
+            );
+            assert!(
+                !action_key_labels(InputBarAction::DeletePreviousWord)
+                    .contains(&alt_backspace.display()),
+                "the shadowed default must disappear from Help, not just from dispatch"
+            );
+
+            // The default that was not claimed is untouched.
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(
+                    KeyCode::Char('w'),
+                    KeyModifiers::CONTROL
+                )),
+                Some(InputBarAction::DeletePreviousWord)
+            );
+        });
+    }
+
+    #[test]
+    fn override_precedence_does_not_depend_on_declaration_order() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // The mirror of the case above: the override is on the *earlier*
+        // declared action and the retained default on the later one. Both
+        // directions must land on the explicit binding, or the contract is
+        // just an artifact of enum ordering.
+        let ctrl_u = Chord::ctrl('u');
+        with_input_bar_override("backspace", vec![ctrl_u.clone()], || {
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(
+                    KeyCode::Char('u'),
+                    KeyModifiers::CONTROL
+                )),
+                Some(InputBarAction::Backspace)
+            );
+            assert!(
+                !action_key_labels(InputBarAction::ClearInput).contains(&ctrl_u.display()),
+                "ClearInput's retained default lost the chord to an explicit binding"
+            );
+        });
+    }
+
+    #[test]
+    fn an_unrelated_override_leaves_other_defaults_alone() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // Guard against the claim filter being too eager: a sparse override
+        // elsewhere in the enum must not strip defaults it never mentions.
+        with_input_bar_override("clear_input", vec![Chord::ctrl('k')], || {
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+                Some(InputBarAction::DeletePreviousWord)
+            );
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                Some(InputBarAction::Backspace)
+            );
+            assert_eq!(
+                action_key_labels(InputBarAction::DeletePreviousWord).len(),
+                2
+            );
+        });
+    }
+
+    #[test]
     fn no_intra_enum_chord_conflicts() {
         fn check<A: Copy + std::fmt::Debug>(label: &str, table: Vec<(Chord, A)>) {
             for (i, (c1, a1)) in table.iter().enumerate() {
