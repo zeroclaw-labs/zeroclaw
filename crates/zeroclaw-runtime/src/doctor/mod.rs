@@ -1356,10 +1356,9 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     // Delegate agents: model_provider validity (resolved from model_provider alias)
-    let mut agent_names: Vec<_> = config.agents.keys().collect();
-    agent_names.sort();
-    for name in agent_names {
-        let agent = config.agents.get(name).unwrap();
+    let mut agents: Vec<_> = config.agents.iter().collect();
+    agents.sort_by_key(|(name, _)| *name);
+    for (name, agent) in agents {
         let provider_ref = agent.model_provider.as_str();
         if provider_ref.is_empty() {
             continue;

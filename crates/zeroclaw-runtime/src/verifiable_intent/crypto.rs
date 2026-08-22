@@ -232,7 +232,12 @@ pub fn parse_sd_jwt(serialized: &str) -> Result<(&str, Vec<&str>, Option<&str>),
         ));
     }
     let issuer_jwt = parts[0];
-    let last = *parts.last().unwrap();
+    let last = parts.last().copied().ok_or_else(|| {
+        ViError::new(
+            ViErrorKind::InvalidDisclosure,
+            "SD-JWT has no trailing segment",
+        )
+    })?;
     let kb_jwt = if last.is_empty() { None } else { Some(last) };
 
     let disclosures = parts[1..parts.len() - 1].to_vec();

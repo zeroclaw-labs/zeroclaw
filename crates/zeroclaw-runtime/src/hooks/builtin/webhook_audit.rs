@@ -105,7 +105,7 @@ pub struct WebhookAuditHook {
 }
 
 impl WebhookAuditHook {
-    pub fn new(config: WebhookAuditConfig) -> Self {
+    pub fn new(mut config: WebhookAuditConfig) -> Self {
         // Warn if enabled but no URL configured.
         if config.enabled && config.url.is_empty() {
             ::zeroclaw_log::record!(
@@ -130,7 +130,7 @@ impl WebhookAuditHook {
                     ),
                 "webhook URL validation failed"
             );
-            panic!("webhook-audit: {e}");
+            config.enabled = false;
         }
 
         let client = reqwest::Client::builder()

@@ -299,16 +299,16 @@ impl Observer for TeeObserver {
 fn warn_otel_content_policy(config: OtelContentConfig) {
     use zeroclaw_config::schema::OtelContentPolicy;
 
-    if config.genai_policy != OtelContentPolicy::Off {
-        let msg = match config.genai_policy {
-            OtelContentPolicy::Redacted => {
-                "otel_genai_content=redacted: OTel GenAI input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
-            }
-            OtelContentPolicy::Full => {
-                "otel_genai_content=full: OTel GenAI input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
-            }
-            _ => unreachable!(),
-        };
+    let genai_warning = match config.genai_policy {
+        OtelContentPolicy::Redacted => Some(
+            "otel_genai_content=redacted: OTel GenAI input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary.",
+        ),
+        OtelContentPolicy::Full => Some(
+            "otel_genai_content=full: OTel GenAI input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments.",
+        ),
+        OtelContentPolicy::Off => None,
+    };
+    if let Some(msg) = genai_warning {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -316,16 +316,16 @@ fn warn_otel_content_policy(config: OtelContentConfig) {
             msg
         );
     }
-    if config.tool_io_policy != OtelContentPolicy::Off {
-        let msg = match config.tool_io_policy {
-            OtelContentPolicy::Redacted => {
-                "otel_tool_io=redacted: OTel tool input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary."
-            }
-            OtelContentPolicy::Full => {
-                "otel_tool_io=full: OTel tool input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments."
-            }
-            _ => unreachable!(),
-        };
+    let tool_io_warning = match config.tool_io_policy {
+        OtelContentPolicy::Redacted => Some(
+            "otel_tool_io=redacted: OTel tool input/output will be captured with sensitive-content processing and per-field truncation. Processed content may still contain information that could lead to leakage. Enable only when necessary.",
+        ),
+        OtelContentPolicy::Full => Some(
+            "otel_tool_io=full: OTel tool input/output will be captured with sensitive-content processing but WITHOUT truncation. Use only in controlled environments.",
+        ),
+        OtelContentPolicy::Off => None,
+    };
+    if let Some(msg) = tool_io_warning {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
