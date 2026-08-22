@@ -431,6 +431,7 @@ cli-sop-none = SOP が見つかりません。
 cli-sop-pending-none = 承認待ちの SOP 実行はありません。
 cli-sop-pending-header = 承認待ちの SOP 実行:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] ステップ {$step}/{$total}
+cli-sop-status-failure-reason = 失敗の理由: {$reason}
 cli-sop-ws-invalid-approval = sop approval_response には run_id と approve または deny の決定が必要です
 cli-sop-ws-resolve-failed = SOP の解決に失敗しました: {$error}
 cli-sop-ws-engine-lock-poisoned = SOP エンジンロックがポイズンされました

@@ -434,6 +434,7 @@ cli-sop-none = Aucun SOP trouvé.
 cli-sop-pending-none = Aucune exécution SOP en attente d'approbation.
 cli-sop-pending-header = Exécutions SOP en attente d'approbation :
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] étape {$step}/{$total}
+cli-sop-status-failure-reason = Motif de l’échec : {$reason}
 cli-sop-ws-invalid-approval = sop approval_response requiert run_id et une décision approve ou deny
 cli-sop-ws-resolve-failed = échec de la résolution SOP : {$error}
 cli-sop-ws-engine-lock-poisoned = verrou du moteur SOP empoisonné
