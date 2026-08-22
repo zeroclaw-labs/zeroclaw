@@ -779,6 +779,7 @@ mod tests {
             "corp".to_string(),
             OidcConfig {
                 issuer: "https://sso.example.com".to_string(),
+                audience: "zeroclaw".to_string(),
                 claim_path: "groups".to_string(),
                 profile_map: HashMap::from([("ops".to_string(), "operator".to_string())]),
                 ..OidcConfig::default()
