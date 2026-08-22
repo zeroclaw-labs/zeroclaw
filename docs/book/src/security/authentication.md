@@ -3,8 +3,8 @@
 Every RPC connection to the daemon binds a **principal** during the
 `initialize` handshake, and every method call is checked against the grants
 the current configuration assigns that principal. This page covers the
-provider set, the local-user roster, permission profiles, and — most
-importantly — what changes for existing remote connections.
+provider set, the local-user roster, permission profiles, and, most
+importantly, what changes for existing remote connections.
 
 ## The model in one pass
 
@@ -12,7 +12,7 @@ importantly — what changes for existing remote connections.
    the handshake selects the provider named by `auth_provider` (defaulting
    to `native`, the gateway pairing token), and with no token a local Unix
    socket presents its kernel peer uid to the `peercred` provider. A
-   selected provider's rejection is final — a credential is never retried
+   selected provider's rejection is final: a credential is never retried
    against another provider.
 2. The **shared resolver** maps the verified identity to a canonical
    principal id and the permission profiles the configuration assigns it.
@@ -25,8 +25,8 @@ importantly — what changes for existing remote connections.
 
 Authorization is **live**: editing `[permission_profiles]`, `[users]`,
 `[oidc]`, or `security.trust_daemon_uid` re-compiles the policy at save
-time, and established connections re-resolve at their next operation — no
-reconnect or restart. Revoking a gateway pairing token invalidates
+time, and established connections re-resolve at their next operation, with
+no reconnect or restart. Revoking a gateway pairing token invalidates
 connections authenticated with it the same way.
 
 ## Providers
@@ -47,7 +47,7 @@ The daemon's **own uid** keeps that trusted path even after a roster is
 configured, controlled by `security.trust_daemon_uid` (default `true`).
 The operator who runs the daemon owns its config file, and local-only
 lockout recovery depends on that authority. Set it to `false` to require
-every local peer — including the daemon's own uid — to map through the
+every local peer, including the daemon's own uid, to map through the
 roster or present a token.
 
 Any **other** uid must be mapped by an explicit `[users.<name>].uid`
@@ -60,7 +60,7 @@ shared-operator access.
 
 The entry name doubles as the durable principal id unless `principal_id`
 pins one explicitly. Ownership of sessions, memory, and audit trails keys
-on that id — to rename an entry without orphaning its data, set
+on that id. To rename an entry without orphaning its data, set
 `principal_id` to the original id in the same edit.
 
 ### OIDC
@@ -97,7 +97,7 @@ clients.
 Migration for existing remote zerocode users:
 
 1. Pair with the gateway as usual to obtain a bearer token.
-2. Give zerocode the token — either in its config:
+2. Give zerocode the token, either in its config:
 
    ```toml
    [connection.wss]
