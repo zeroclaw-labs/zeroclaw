@@ -27,7 +27,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -109,6 +109,12 @@ type WorkerDead = Arc<AtomicBool>;
 struct WorkerState {
     policy: ResolvedPolicy,
     worker_dead: WorkerDead,
+    /// Non-empty JSONL lines written to the *current* active segment since
+    /// the last rotation. Reset to `0` whenever `rotate_active` runs
+    /// (date, size, or entry-count trigger). Seeded at worker startup by
+    /// counting the existing active file so a restart resumes the correct
+    /// count instead of rotating prematurely (or too late) after reload.
+    line_count: AtomicU64,
 }
 
 /// Producer-facing state. The `tx` sender is NOT shared with the worker
@@ -163,6 +169,20 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
     let _reinit_guard = REINIT_LOCK.lock();
     let policy = ResolvedPolicy::from_config(config, workspace_dir);
 
+    if config
+        .log_persistence
+        .trim()
+        .eq_ignore_ascii_case("rolling")
+    {
+        tracing::warn!(
+            target: "zeroclaw_log",
+            "log: log_persistence = \"rolling\" is deprecated; transparently remapped to \
+             \"rotating\" with entry-count rotation (max_entries_per_segment = {}). \
+             Update your config to silence this warning.",
+            policy.max_entries_per_segment
+        );
+    }
+
     // Route writes emitted during reload into a temporary buffer. Taking this
     // lock before removing the old writer closes the race with producers that
     // are about to clone its sender.
@@ -185,9 +205,23 @@ fn init_from_config_with_migration_and_shutdown_warning<F>(
     let worker_dead: WorkerDead = Arc::new(AtomicBool::new(false));
 
     if policy.storage.is_enabled() {
+        let initial_line_count = if policy.max_entries_per_segment > 0 {
+            count_nonempty_lines(&policy.path)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(
+                        target: "zeroclaw_log",
+                        error = ?err,
+                        "log: could not count existing active file lines for entry-count trigger; starting from 0"
+                    );
+                    0
+                }) as u64
+        } else {
+            0
+        };
         let worker_state = Arc::new(WorkerState {
             policy: policy.clone(),
             worker_dead: Arc::clone(&worker_dead),
+            line_count: AtomicU64::new(initial_line_count),
         });
         spawn_worker(rx, worker_state);
     } else {
@@ -375,8 +409,8 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
     // Date-boundary rotation runs *before* the append so a new day's
     // first event lands in a fresh file. Idempotent when no rotation
     // is needed.
-    if state.policy.storage == StoragePolicy::Rotating {
-        maybe_rotate_for_date(state)?;
+    if state.policy.storage == StoragePolicy::Rotating && maybe_rotate_for_date(state)? {
+        state.line_count.store(0, Ordering::Relaxed);
     }
     let mut file = open_active_file(state)?;
     {
@@ -386,7 +420,15 @@ fn write_one(state: &Arc<WorkerState>, value: &Value) -> Result<()> {
     }
     match state.policy.storage {
         StoragePolicy::Rolling => trim_to_last_entries(state)?,
-        StoragePolicy::Rotating => maybe_rotate_for_size(state)?,
+        StoragePolicy::Rotating => {
+            state.line_count.fetch_add(1, Ordering::Relaxed);
+            // Triggers are mutually exclusive per write: the first one that
+            // fires rotates the file and resets the count, so a later
+            // trigger in the same call never fires against a stale file.
+            if maybe_rotate_for_size(state)? || maybe_rotate_for_entry_count(state)? {
+                state.line_count.store(0, Ordering::Relaxed);
+            }
+        }
         StoragePolicy::None | StoragePolicy::Full => {}
     }
     Ok(())
@@ -727,15 +769,15 @@ fn count_nonempty_lines(path: &Path) -> Result<usize> {
 
 /// Rotate the active file to an archive when it has crossed a UTC day boundary
 /// since its last write. No-op when daily rotation is off, the file is absent,
-/// or it was last written today.
-fn maybe_rotate_for_date(state: &Arc<WorkerState>) -> Result<()> {
+/// or it was last written today. Returns `true` when a rotation occurred.
+fn maybe_rotate_for_date(state: &Arc<WorkerState>) -> Result<bool> {
     if !state.policy.rotate_daily {
-        return Ok(());
+        return Ok(false);
     }
     let path = &state.policy.path;
     let meta = match fs::metadata(path) {
         Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => {
             return Err(err)
                 .with_context(|| format!("stat log for date rotation: {}", path.display()));
@@ -743,27 +785,28 @@ fn maybe_rotate_for_date(state: &Arc<WorkerState>) -> Result<()> {
     };
     // An empty active file has nothing worth archiving.
     if meta.len() == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let modified: DateTime<Utc> = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
     if modified.date_naive() < Utc::now().date_naive() {
         rotate_active(state, modified)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Rotate the active file when a just-completed append left it at or above the
 /// configured byte budget. No-op when size rotation is disabled (`max_bytes`
-/// `== 0`) or the file is under budget.
-fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<()> {
+/// `== 0`) or the file is under budget. Returns `true` when a rotation occurred.
+fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<bool> {
     let max = state.policy.max_bytes;
     if max == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let path = &state.policy.path;
     let meta = match fs::metadata(path) {
         Ok(m) => m,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(err) => {
             return Err(err)
                 .with_context(|| format!("stat log for size rotation: {}", path.display()));
@@ -774,8 +817,37 @@ fn maybe_rotate_for_size(state: &Arc<WorkerState>) -> Result<()> {
         // matching date rotation, so the archive name reflects its contents.
         let when: DateTime<Utc> = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
         rotate_active(state, when)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Rotate the active file when the in-memory line counter says the segment has
+/// reached the configured entry cap. Returns `true` when a rotation occurred.
+fn maybe_rotate_for_entry_count(state: &Arc<WorkerState>) -> Result<bool> {
+    let cap = state.policy.max_entries_per_segment;
+    if cap == 0 {
+        return Ok(false);
+    }
+    let count = state.line_count.load(Ordering::Relaxed);
+    if count <= cap as u64 {
+        return Ok(false);
+    }
+    let path = &state.policy.path;
+    let meta = match fs::metadata(path) {
+        Ok(m) => m,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("stat log for entry-count rotation: {}", path.display()));
+        }
+    };
+    if meta.len() == 0 {
+        return Ok(false);
+    }
+    let when: DateTime<Utc> = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH).into();
+    rotate_active(state, when)?;
+    Ok(true)
 }
 
 fn rotate_active(state: &Arc<WorkerState>, when: DateTime<Utc>) -> Result<()> {
@@ -955,6 +1027,22 @@ fn remove_archive(path: &Path) {
     }
 }
 
+/// Return the active log path and all retained archive files. Archives are
+/// sorted oldest-first by mtime; the active file is not included in the
+/// archive list. Returns `None` when no writer is installed or persistence is
+/// disabled. Used by the gateway's `/api/logs` multi-segment reader.
+pub fn segment_files() -> Option<(PathBuf, Vec<(PathBuf, std::time::SystemTime)>)> {
+    let state = current_state()?;
+    if !state.policy.storage.is_enabled() {
+        return None;
+    }
+    let active = state.policy.path.clone();
+    let mut archives = list_archives(&active).unwrap_or_default();
+    // Oldest first so the caller can scan in chronological order.
+    archives.sort_by_key(|(_, mtime)| *mtime);
+    Some((active, archives))
+}
+
 pub(crate) static WRITER_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 #[cfg(test)]
@@ -1092,9 +1180,13 @@ mod tests {
     }
 
     #[test]
-    fn append_and_rolling_keeps_only_max_entries() {
+    fn append_and_rolling_remaps_to_rotating_and_retains_all_events() {
+        // `rolling` is now transparently remapped to `rotating` with
+        // entry-count rotation at `max_entries`. The old in-place trim is
+        // gone — every event is preserved across the active file + archives.
         let _guard = WRITER_TEST_LOCK.lock();
         let tmp = tempfile::tempdir().unwrap();
+        // rolling with cap=3: after every 4 events the segment rotates.
         install_writer(tmp.path(), 3);
 
         for i in 0..10 {
@@ -1105,14 +1197,17 @@ mod tests {
 
         flush_for_test().unwrap();
         let path = runtime_trace_path().unwrap();
-        let contents = fs::read_to_string(&path).unwrap();
-        let lines: Vec<&str> = contents.lines().filter(|l| !l.trim().is_empty()).collect();
-        assert_eq!(lines.len(), 3);
-        // Last three should be 7, 8, 9 (oldest to newest order preserved).
-        for (idx, &line) in lines.iter().enumerate() {
-            let v: Value = serde_json::from_str(line).unwrap();
-            assert_eq!(v["message"].as_str().unwrap(), format!("event-{}", idx + 7));
-        }
+        // All 10 events are preserved across active file + archives.
+        assert_eq!(
+            total_events(&path),
+            10,
+            "rolling compat must not discard events; all 10 must survive across segments"
+        );
+        // At least one rotation must have happened.
+        assert!(
+            !list_archives(&path).unwrap().is_empty(),
+            "rolling compat must produce archives via entry-count rotation"
+        );
     }
 
     #[test]
@@ -1938,5 +2033,73 @@ mod tests {
         );
         // Real archives are still pruned to the cap.
         assert_eq!(archives.len(), 1, "real archives are still capped");
+    }
+
+    #[test]
+    fn rotating_entry_count_rotation_trigger() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = LogConfig {
+            log_persistence: "rotating".into(),
+            log_persistence_max_bytes: 0,
+            log_persistence_rotate_daily: false,
+            log_persistence_retention_max_files: 0,
+            log_persistence_max_entries_per_segment: 2,
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+        let path = runtime_trace_path().unwrap();
+
+        emit("event-1");
+        emit("event-2");
+        // Two events reached the cap; the 3rd write must trigger a rotation.
+        assert!(
+            list_archives(&path).unwrap().is_empty(),
+            "no rotation yet after exactly cap events"
+        );
+        emit("event-3");
+        let archives = list_archives(&path).unwrap();
+        assert_eq!(
+            archives.len(),
+            1,
+            "entry-count cap must rotate the active file after cap+1 writes"
+        );
+        assert_eq!(
+            total_events(&path),
+            3,
+            "all events preserved across active + archive"
+        );
+    }
+
+    #[test]
+    fn rolling_compat_maps_to_rotating() {
+        let _guard = WRITER_TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        // `rolling` with a cap of 2: after 3 events the active file must be
+        // rotated (O(1) rename), not rewritten in place.
+        let cfg = LogConfig {
+            log_persistence: "rolling".into(),
+            log_persistence_max_entries: 2,
+            log_persistence_rotate_daily: false,
+            log_persistence_retention_max_files: 0,
+            ..LogConfig::default()
+        };
+        init_from_config(&cfg, tmp.path());
+        let path = runtime_trace_path().unwrap();
+
+        emit("a");
+        emit("b");
+        emit("c");
+
+        let archives = list_archives(&path).unwrap();
+        assert!(
+            !archives.is_empty(),
+            "rolling compat must rotate (not trim) after max_entries writes"
+        );
+        assert_eq!(
+            total_events(&path),
+            3,
+            "all 3 events must be preserved — rolling compat must not trim"
+        );
     }
 }

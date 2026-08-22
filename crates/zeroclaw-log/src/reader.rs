@@ -38,6 +38,41 @@ pub struct LogFilter {
     pub field_eq: BTreeMap<String, String>,
 }
 
+/// Segment-aware pagination cursor. Identifies a byte position within a named
+/// segment file. Pass back as `?until_segment_cursor=` on the next `/api/logs`
+/// request to walk older pages across segment boundaries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SegmentCursor {
+    /// Basename of the segment file, e.g. `runtime-trace.jsonl` for the active
+    /// file or `runtime-trace.20260101-120000.jsonl` for an archive.
+    pub seg: String,
+    /// Byte offset within that segment: only lines whose `line_byte_end` is
+    /// strictly less than this offset are included on the next page (same
+    /// semantics as [`LogFilter::until_line_offset`]).
+    pub off: u64,
+}
+
+impl SegmentCursor {
+    /// Parse from wire format `"<seg_basename>:<byte_offset>"`. Returns `None`
+    /// on any parse error.
+    pub fn from_wire(s: &str) -> Option<Self> {
+        let (seg, off_str) = s.rsplit_once(':')?;
+        let off = off_str.parse().ok()?;
+        if seg.is_empty() {
+            return None;
+        }
+        Some(Self {
+            seg: seg.to_owned(),
+            off,
+        })
+    }
+
+    /// Serialize to wire format.
+    pub fn to_wire(&self) -> String {
+        format!("{}:{}", self.seg, self.off)
+    }
+}
+
 /// One page returned by [`load_page`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogPage {
@@ -53,7 +88,16 @@ pub struct LogPage {
     /// file order that is earliest among this page's matches). Pass
     /// back as [`LogFilter::until_line_offset`] on the next request to
     /// walk older pages. `None` when the page is empty.
+    ///
+    /// For multi-segment deployments, this is `None` when the oldest event is
+    /// in an archive file rather than the active file; use
+    /// [`Self::next_segment_cursor`] in that case.
     pub next_cursor_line_offset: Option<u64>,
+    /// Segment-aware cursor for the oldest event on this page. Pass back as
+    /// `?until_segment_cursor=` on the next request to walk older pages across
+    /// segment boundaries. Supersedes `next_cursor_line_offset` for
+    /// multi-segment deployments. `None` when the page is empty.
+    pub next_segment_cursor: Option<String>,
     /// True when the file was fully scanned. UI uses this to disable
     /// "load older" affordances.
     pub at_end: bool,
@@ -68,6 +112,7 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
             events: Vec::new(),
             next_cursor: None,
             next_cursor_line_offset: None,
+            next_segment_cursor: None,
             at_end: true,
         });
     }
@@ -168,6 +213,7 @@ pub fn load_page(path: &Path, filter: &LogFilter, limit: usize) -> Result<LogPag
         events,
         next_cursor,
         next_cursor_line_offset: oldest_line_offset,
+        next_segment_cursor: None,
         at_end,
     })
 }
@@ -264,6 +310,188 @@ pub fn find_event_by_id(path: &Path, id: &str) -> Result<Option<LogEvent>> {
 #[must_use]
 pub fn current_log_path() -> Option<PathBuf> {
     crate::writer::runtime_trace_path()
+}
+
+/// Paginated load across the active file and all retained archive files.
+///
+/// Segments are scanned in ascending time order (oldest archive first, active
+/// last). The result is returned newest-first, identical to [`load_page`].
+///
+/// `segment_cursor` is the composite cursor returned by a prior call as
+/// `LogPage::next_segment_cursor`. When absent the full stream is scanned. The
+/// old `filter.until_line_offset` field is honoured when `segment_cursor` is
+/// absent, interpreted as a cursor into the active file only.
+#[allow(deprecated)]
+pub fn load_page_multi(
+    active: &Path,
+    archives: &[(PathBuf, std::time::SystemTime)],
+    filter: &LogFilter,
+    limit: usize,
+    segment_cursor: Option<&SegmentCursor>,
+) -> Result<LogPage> {
+    let limit = limit.clamp(1, 10_000);
+    let needle = filter.q.as_deref().map(|s| s.to_ascii_lowercase());
+
+    // Build the ordered segment list: oldest archive first, active last.
+    let mut segs: Vec<(PathBuf, String)> = {
+        let mut sorted = archives.to_vec();
+        sorted.sort_by_key(|(_, mtime)| *mtime);
+        sorted
+            .into_iter()
+            .map(|(p, _)| {
+                let name = p
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_owned();
+                (p, name)
+            })
+            .collect()
+    };
+    let active_name = active
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_owned();
+    segs.push((active.to_path_buf(), active_name.clone()));
+
+    // Determine cursor segment name and byte offset.
+    let (cursor_seg, cursor_off): (Option<&str>, Option<u64>) = match segment_cursor {
+        Some(c) => (Some(c.seg.as_str()), Some(c.off)),
+        None => match filter.until_line_offset {
+            Some(off) => (Some(active_name.as_str()), Some(off)),
+            None => (None, None),
+        },
+    };
+
+    // Find the index of the cursor segment (or the last segment if absent).
+    // If the named segment no longer exists (e.g. its archive was pruned by
+    // retention between requests), fall back to a full scan rather than
+    // misapplying the offset to an unrelated segment.
+    let (cursor_idx, cursor_off): (usize, Option<u64>) = match cursor_seg {
+        None => (segs.len().saturating_sub(1), None),
+        Some(name) => match segs.iter().rposition(|(_, n)| n == name) {
+            Some(idx) => (idx, cursor_off),
+            None => (segs.len().saturating_sub(1), None),
+        },
+    };
+
+    // Sliding window that accumulates the most-recent `limit` matching events
+    // across all scanned segments. Each entry carries the event, its segment
+    // basename, and its line_byte_end.
+    let mut window: VecDeque<(LogEvent, String, u64)> = VecDeque::with_capacity(limit + 1);
+    let mut dropped_older = false;
+
+    for (i, (seg_path, seg_name)) in segs.iter().enumerate() {
+        if i > cursor_idx {
+            // Segment is newer than the cursor; skip entirely.
+            break;
+        }
+        let seg_until_line_offset = if i == cursor_idx { cursor_off } else { None };
+
+        if !seg_path.exists() {
+            continue;
+        }
+        let file = match std::fs::File::open(seg_path) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!(
+                    target: "zeroclaw_log",
+                    error = ?err,
+                    path = %seg_path.display(),
+                    "log: load_page_multi could not open segment; skipping"
+                );
+                continue;
+            }
+        };
+        let mut reader = BufReader::new(file);
+        let mut next_byte_offset: u64 = 0;
+        let mut buf = String::new();
+
+        loop {
+            buf.clear();
+            let bytes_read = reader.read_line(&mut buf).context("reading log line")?;
+            if bytes_read == 0 {
+                break;
+            }
+            let line_byte_end = next_byte_offset + bytes_read as u64;
+
+            if let Some(cap) = seg_until_line_offset
+                && line_byte_end >= cap
+            {
+                break;
+            }
+
+            let trimmed = buf.trim();
+            next_byte_offset = line_byte_end;
+
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            let event: LogEvent = match serde_json::from_str(trimmed) {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::trace!(
+                        target: "zeroclaw_log",
+                        error = ?err,
+                        "log: skipping malformed JSONL line"
+                    );
+                    continue;
+                }
+            };
+
+            if !matches_filter(&event, filter, needle.as_deref()) {
+                continue;
+            }
+
+            window.push_back((event, seg_name.clone(), line_byte_end));
+            if window.len() > limit {
+                window.pop_front();
+                dropped_older = true;
+            }
+        }
+    }
+
+    // Derive cursors from the oldest event in the window.
+    let oldest = window.front();
+    let next_segment_cursor = oldest.map(|(_, seg, off)| {
+        SegmentCursor {
+            seg: seg.clone(),
+            off: *off,
+        }
+        .to_wire()
+    });
+    let next_cursor_line_offset = oldest.and_then(|(_, seg, off)| {
+        if seg == &active_name {
+            Some(*off)
+        } else {
+            None
+        }
+    });
+
+    let mut events: Vec<LogEvent> = window.into_iter().map(|(e, _, _)| e).collect();
+    events.reverse();
+
+    let next_cursor = events.last().map(|e| (e.timestamp.clone(), e.id.clone()));
+    // `at_end` answers "are there OLDER events past this page?". Every segment
+    // up to and including the cursor's is scanned in full, so the only way an
+    // older match can exist is if the sliding window evicted one. Hitting the
+    // cursor mid-segment truncates that segment's *newer* tail, which says
+    // nothing about older events, so it deliberately does not feed this
+    // decision — unlike single-file `load_page`, which folds that in and is
+    // therefore conservative. Being conservative here would pin `at_end` to
+    // false on every cross-segment page, since the cursor segment is always
+    // truncated.
+    let at_end = !dropped_older;
+
+    Ok(LogPage {
+        events,
+        next_cursor,
+        next_cursor_line_offset,
+        next_segment_cursor,
+        at_end,
+    })
 }
 
 #[cfg(test)]
@@ -820,5 +1048,87 @@ mod tests {
         let page = load_page(&path, &filter, 10).unwrap();
         assert_eq!(page.events.len(), 1);
         assert_eq!(page.events[0].event.action, "b");
+    }
+
+    #[test]
+    fn multi_segment_reads_across_active_and_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        // Archive: two older events.
+        let archive = tmp.path().join("trace.20260101-000000.jsonl");
+        let mut old_a = make_event("a", None);
+        old_a.timestamp = "2026-01-01T00:00:00.000Z".into();
+        old_a.message = Some("old-a".into());
+        let mut old_b = make_event("b", None);
+        old_b.timestamp = "2026-01-01T00:00:01.000Z".into();
+        old_b.message = Some("old-b".into());
+        write_jsonl(&archive, &[old_a, old_b]);
+        let archive_mtime = std::fs::metadata(&archive).unwrap().modified().unwrap();
+
+        // Active file: two newer events.
+        let mut new_c = make_event("c", None);
+        new_c.timestamp = "2026-06-01T00:00:00.000Z".into();
+        new_c.message = Some("new-c".into());
+        let mut new_d = make_event("d", None);
+        new_d.timestamp = "2026-06-01T00:00:01.000Z".into();
+        new_d.message = Some("new-d".into());
+        write_jsonl(&active, &[new_c, new_d]);
+
+        let archives = vec![(archive.clone(), archive_mtime)];
+        let page = load_page_multi(&active, &archives, &LogFilter::default(), 10, None).unwrap();
+
+        assert_eq!(page.events.len(), 4, "all 4 events across segments");
+        // Newest first.
+        assert_eq!(page.events[0].message.as_deref(), Some("new-d"));
+        assert_eq!(page.events[1].message.as_deref(), Some("new-c"));
+        assert_eq!(page.events[2].message.as_deref(), Some("old-b"));
+        assert_eq!(page.events[3].message.as_deref(), Some("old-a"));
+        assert!(page.at_end, "entire stream was scanned");
+    }
+
+    #[test]
+    fn segment_cursor_paginates_into_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let active = tmp.path().join("trace.jsonl");
+        let archive = tmp.path().join("trace.20260101-000000.jsonl");
+
+        let mut old_a = make_event("a", None);
+        old_a.timestamp = "2026-01-01T00:00:00.000Z".into();
+        old_a.message = Some("old-a".into());
+        let mut old_b = make_event("b", None);
+        old_b.timestamp = "2026-01-01T00:00:01.000Z".into();
+        old_b.message = Some("old-b".into());
+        write_jsonl(&archive, &[old_a, old_b]);
+        let archive_mtime = std::fs::metadata(&archive).unwrap().modified().unwrap();
+
+        let mut new_c = make_event("c", None);
+        new_c.timestamp = "2026-06-01T00:00:00.000Z".into();
+        new_c.message = Some("new-c".into());
+        let mut new_d = make_event("d", None);
+        new_d.timestamp = "2026-06-01T00:00:01.000Z".into();
+        new_d.message = Some("new-d".into());
+        write_jsonl(&active, &[new_c, new_d]);
+
+        let archives = vec![(archive.clone(), archive_mtime)];
+
+        // Page 1: limit 2 → newest two events (from active file).
+        let page1 = load_page_multi(&active, &archives, &LogFilter::default(), 2, None).unwrap();
+        assert_eq!(page1.events.len(), 2);
+        assert_eq!(page1.events[0].message.as_deref(), Some("new-d"));
+        assert_eq!(page1.events[1].message.as_deref(), Some("new-c"));
+        assert!(!page1.at_end, "there are older events in the archive");
+        let cursor_wire = page1
+            .next_segment_cursor
+            .clone()
+            .expect("cursor must be set");
+
+        // Page 2: using the cursor → should return the two archive events.
+        let cursor = SegmentCursor::from_wire(&cursor_wire).expect("valid cursor wire format");
+        let page2 =
+            load_page_multi(&active, &archives, &LogFilter::default(), 2, Some(&cursor)).unwrap();
+        assert_eq!(page2.events.len(), 2);
+        assert_eq!(page2.events[0].message.as_deref(), Some("old-b"));
+        assert_eq!(page2.events[1].message.as_deref(), Some("old-a"));
+        assert!(page2.at_end, "no older events remain");
     }
 }
