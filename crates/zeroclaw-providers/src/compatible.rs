@@ -975,6 +975,15 @@ impl OpenAiCompatibleModelProvider {
                 .get_valid_xai_access_token(self.auth_profile_override.as_deref())
                 .await;
         }
+        // ZeroRouter aliases can address unrelated, independently operated
+        // routers, and a key minted by one is worthless on another. Selection
+        // is therefore by destination, not by family: this provider's own
+        // base URL decides which stored profile may answer.
+        if model_provider == "zerorouter" {
+            return auth
+                .get_zerorouter_bearer_token(&self.base_url, self.auth_profile_override.as_deref())
+                .await;
+        }
         auth.get_provider_bearer_token(model_provider, self.auth_profile_override.as_deref())
             .await
     }
@@ -3730,6 +3739,59 @@ impl ::zeroclaw_api::attribution::Attributable for OpenAiCompatibleModelProvider
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two ZeroRouter aliases pointing at unrelated routers, sharing one
+    /// auth store. Only the router that minted a key may be handed it: the
+    /// keyless alias for the other router must not fall back to the
+    /// family-wide active profile.
+    #[tokio::test]
+    async fn zerorouter_alias_never_sends_another_routers_key() {
+        let temp = tempfile::tempdir().expect("temp auth dir");
+        let auth = AuthService::new(temp.path(), false);
+        let mut metadata = std::collections::HashMap::new();
+        metadata.insert(
+            "issuer".to_string(),
+            "https://router-a.example.com".to_string(),
+        );
+        auth.store_model_provider_token("zerorouter", "router-a", "zcr_key_for_a", metadata, true)
+            .await
+            .expect("store router A's key");
+
+        let alias_a = OpenAiCompatibleModelProvider::builder("zr-a")
+            .display_name("ZeroRouter")
+            .base_url("https://router-a.example.com/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .auth_profile("zerorouter", auth.clone(), None)
+            .build();
+        let alias_b = OpenAiCompatibleModelProvider::builder("zr-b")
+            .display_name("ZeroRouter")
+            .base_url("https://router-b.example.com/v1")
+            .credential(None)
+            .auth_style(AuthStyle::Bearer)
+            .auth_profile("zerorouter", auth.clone(), None)
+            .build();
+
+        assert_eq!(
+            alias_a
+                .resolve_credential()
+                .await
+                .expect("router A resolves its own key")
+                .as_deref(),
+            Some("zcr_key_for_a"),
+        );
+
+        let resolved_for_b = alias_b.resolve_credential().await;
+        match resolved_for_b {
+            Ok(credential) => {
+                panic!("router B was handed a credential minted by router A: {credential:?}")
+            }
+            Err(error) => assert!(
+                !error.to_string().contains("zcr_key_for_a"),
+                "the key leaked into the error text: {error}"
+            ),
+        }
+    }
 
     /// Empty / whitespace arguments must collapse to `"{}"` so OpenAI-style
     /// providers never see an invalid `tool_calls[].function.arguments`.

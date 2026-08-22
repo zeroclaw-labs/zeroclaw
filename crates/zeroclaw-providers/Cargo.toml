@@ -7,6 +7,7 @@ description = "LLM provider implementations, auth services, and multimodal proce
 publish = false
 
 [dependencies]
+hostname = "0.4.2"
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-spawn.workspace = true

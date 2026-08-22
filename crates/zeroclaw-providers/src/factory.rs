@@ -497,6 +497,7 @@ use zeroclaw_config::schema::{
     TelnyxModelProviderConfig, TogetherModelProviderConfig, UpstageModelProviderConfig,
     VeniceModelProviderConfig, VercelModelProviderConfig, VllmModelProviderConfig,
     XaiModelProviderConfig, YiModelProviderConfig, ZaiModelProviderConfig,
+    ZerorouterModelProviderConfig,
 };
 
 #[must_use]
@@ -1577,6 +1578,70 @@ impl FamilyProviderFactory for KiloCliModelProviderConfig {
 
 // ── Kilo AI Gateway (OpenAI-compatible) ────────────────────────────────
 
+// ── ZeroRouter (self-hosted LLM gateway — OpenAI-compatible) ───────────
+
+/// No hosted deployment is the default: the router container's own bind
+/// (ZEROROUTER_BIND=0.0.0.0:8080); remote routers are reached via
+/// `base.uri`. Must stay in lockstep with ZerorouterEndpoint in
+/// zeroclaw-config — see `zerorouter_default_url_matches_schema_endpoint`.
+pub const ZEROROUTER_DEFAULT_URL: &str = "http://localhost:8080/v1";
+
+/// Direct factory impl rather than the CompatFamilySpec blanket: the
+/// device-flow login stores the minted `zcr_` key as a Token-kind auth
+/// profile, and consuming it needs the auth-service bridge that only the
+/// full `create_provider` signature can reach (the xai pattern). Without
+/// this, `zeroclaw auth login --model-provider zerorouter` would store a
+/// credential the factory then ignores — caught by the first end-to-end
+/// device-flow run.
+impl FamilyProviderFactory for ZerorouterModelProviderConfig {
+    const ENDPOINT: ProviderEndpoint = ProviderEndpoint::Fixed(ZEROROUTER_DEFAULT_URL);
+
+    fn create_provider(
+        &self,
+        alias: &str,
+        key: Option<&str>,
+        api_url: Option<&str>,
+        opts: &ModelProviderRuntimeOptions,
+    ) -> Result<Box<dyn ModelProvider>> {
+        let mut b = OpenAiCompatibleModelProvider::builder(alias)
+            .display_name("ZeroRouter")
+            .base_url(api_url.unwrap_or(ZEROROUTER_DEFAULT_URL))
+            // `default_base_url()` reads only the canonical field, so a fixed
+            // family that sets `base_url` alone reports `None` to every
+            // consumer of endpoint metadata.
+            .canonical_base_url(fixed_family_endpoint::<Self>())
+            .credential(key)
+            .auth_style(AuthStyle::Bearer)
+            // ZeroRouter's GET /v1/models is unauthenticated and carries
+            // pricing (OpenRouter-shaped per-token decimal strings), so live
+            // pricing works before any key is configured.
+            .public_model_listing();
+
+        if !has_api_key(key) {
+            let state_dir = opts.zeroclaw_dir.clone().unwrap_or_else(|| {
+                directories::UserDirs::new().map_or_else(
+                    || std::path::PathBuf::from(".zeroclaw"),
+                    |dirs| dirs.home_dir().join(".zeroclaw"),
+                )
+            });
+            let auth_service = crate::auth::AuthService::new(&state_dir, opts.secrets_encrypt);
+            b = b.auth_profile(
+                "zerorouter",
+                auth_service,
+                opts.auth_profile_override.clone(),
+            );
+        }
+
+        Ok(apply_compat_options(b, opts))
+    }
+
+    /// A device-flow profile can supply the credential when config has no
+    /// api_key, so a keyless slot is still viable.
+    fn fallback_auth_ready(&self, _key: Option<&str>, _opts: &ModelProviderRuntimeOptions) -> bool {
+        true
+    }
+}
+
 impl CompatFamilySpec for KiloModelProviderConfig {
     const DISPLAY: &'static str = "Kilo";
     // Canonical gateway host per https://kilo.ai/docs/gateway (api.kilo.ai;
@@ -2043,6 +2108,20 @@ mod tests {
         assert!(
             merge_extra_body(None, None).is_none(),
             "no extras must yield None so the caller skips extra_body"
+        );
+    }
+
+    #[test]
+    fn zerorouter_default_url_matches_schema_endpoint() {
+        use zeroclaw_config::schema::{ModelEndpoint, ZerorouterEndpoint};
+        assert_eq!(
+            ZEROROUTER_DEFAULT_URL,
+            ZerorouterEndpoint::default().uri(),
+            "schema ZerorouterEndpoint and factory DEFAULT_URL disagree on the ZeroRouter URL"
+        );
+        assert_eq!(
+            ZerorouterEndpoint::default().uri(),
+            "http://localhost:8080/v1"
         );
     }
 

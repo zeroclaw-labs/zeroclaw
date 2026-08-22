@@ -13832,6 +13832,7 @@ dependencies = [
  "futures-util",
  "hex",
  "hmac 0.12.1",
+ "hostname",
  "hyper",
  "nix 0.30.1",
  "parking_lot",

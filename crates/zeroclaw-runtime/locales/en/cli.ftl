@@ -857,6 +857,10 @@ cli-auth-xai-open-oauth-url = Open this xAI OAuth URL in your browser and author
 cli-auth-callback-capture-failed = Callback capture failed: {$error}
 cli-auth-run-paste-redirect = Run `zeroclaw auth paste-redirect --model-provider {$provider} --profile {$profile}`
 cli-auth-xai-no-pending-login = No pending xAI login found. Run `zeroclaw auth login --model-provider xai` first.
+cli-auth-zerorouter-requesting-key = Requesting a ZeroRouter key from {$issuer}.
+cli-auth-zerorouter-key-label = The router will store this key under the label "{$label}" (this machine's hostname) and show it in the portal's key list.
+cli-auth-zerorouter-device-started = ZeroRouter device login started (router: {$issuer}).
+cli-auth-zerorouter-revoke-hint = The stored credential is a permanent ZeroRouter API key; revoke it from the router portal if this machine is retired.
 cli-auth-paste-redirect-requires-input = paste-redirect requires the redirect URL or OAuth code
 
 # ── locales fetch ──
