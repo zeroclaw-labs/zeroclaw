@@ -138,6 +138,66 @@ impl WebFetchTool {
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// Build the standard-fetch client, wiring the redirect policy that keeps
+    /// the DNS pin honest.
+    ///
+    /// The custom policy is the SSRF boundary for redirects: it caps the chain,
+    /// refuses any hop that leaves the pinned host, and re-runs the target
+    /// validation on each hop. When it denies a hop it sets the returned flag,
+    /// which `should_fallback_to_firecrawl` reads to guarantee that a redirect
+    /// blocked here is never retried through Firecrawl — that would hand the
+    /// blocked URL to a third party and defeat the denial.
+    ///
+    /// `execute()` and the redirect regression tests both build their client
+    /// here so the policy under test is the policy that ships.
+    fn build_redirect_guarded_client(
+        &self,
+        target: &ResolvedWebFetchTarget,
+        timeout_secs: u64,
+    ) -> reqwest::Result<RedirectGuardedClient> {
+        let allowed_domains = self.allowed_domains.clone();
+        let blocked_domains = self.blocked_domains.clone();
+        let allowed_private_hosts = self.allowed_private_hosts.clone();
+        let pinned_host = target.host.clone();
+        let redirect_policy_rejected = Arc::new(AtomicBool::new(false));
+        let rejected_by_policy = Arc::clone(&redirect_policy_rejected);
+        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                rejected_by_policy.store(true, Ordering::Relaxed);
+                return attempt.error(std::io::Error::other("Too many redirects (max 10)"));
+            }
+
+            if let Err(err) = validate_redirect_target(
+                attempt.url().as_str(),
+                &pinned_host,
+                &allowed_domains,
+                &blocked_domains,
+                &allowed_private_hosts,
+            ) {
+                rejected_by_policy.store(true, Ordering::Relaxed);
+                return attempt.error(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("Blocked redirect target: {err}"),
+                ));
+            }
+
+            attempt.follow()
+        });
+
+        let builder = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(10))
+            .redirect(redirect_policy)
+            .user_agent("ZeroClaw/0.1 (web_fetch)");
+        let client = pin_resolved_host(builder, target).build()?;
+
+        Ok(RedirectGuardedClient {
+            client,
+            redirect_policy_rejected,
+        })
+    }
+
     /// Whether the standard fetch result should trigger a Firecrawl fallback.
     fn should_fallback_to_firecrawl(
         &self,
@@ -451,43 +511,10 @@ impl Tool for WebFetchTool {
             self.timeout_secs
         };
 
-        let allowed_domains = self.allowed_domains.clone();
-        let blocked_domains = self.blocked_domains.clone();
-        let allowed_private_hosts = self.allowed_private_hosts.clone();
-        let pinned_host = target.host.clone();
-        let redirect_policy_rejected = Arc::new(AtomicBool::new(false));
-        let rejected_by_policy = Arc::clone(&redirect_policy_rejected);
-        let redirect_policy = reqwest::redirect::Policy::custom(move |attempt| {
-            if attempt.previous().len() >= 10 {
-                rejected_by_policy.store(true, Ordering::Relaxed);
-                return attempt.error(std::io::Error::other("Too many redirects (max 10)"));
-            }
-
-            if let Err(err) = validate_redirect_target(
-                attempt.url().as_str(),
-                &pinned_host,
-                &allowed_domains,
-                &blocked_domains,
-                &allowed_private_hosts,
-            ) {
-                rejected_by_policy.store(true, Ordering::Relaxed);
-                return attempt.error(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!("Blocked redirect target: {err}"),
-                ));
-            }
-
-            attempt.follow()
-        });
-
-        let builder = reqwest::Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_secs(timeout_secs))
-            .connect_timeout(Duration::from_secs(10))
-            .redirect(redirect_policy)
-            .user_agent("ZeroClaw/0.1 (web_fetch)");
-        let builder = pin_resolved_host(builder, &target);
-        let client = match builder.build() {
+        let RedirectGuardedClient {
+            client,
+            redirect_policy_rejected,
+        } = match self.build_redirect_guarded_client(&target, timeout_secs) {
             Ok(c) => c,
             Err(e) => {
                 return Ok(ToolResult {
@@ -579,6 +606,14 @@ struct ResolvedWebFetchTarget {
     url: String,
     host: String,
     resolved_addrs: Vec<std::net::SocketAddr>,
+}
+
+/// A standard-fetch client together with the flag its redirect policy sets
+/// when it denies a hop. The two are returned as a pair because reading the
+/// flag only means anything for the client that owns it.
+struct RedirectGuardedClient {
+    client: reqwest::Client,
+    redirect_policy_rejected: Arc<AtomicBool>,
 }
 
 fn pin_resolved_host(
@@ -1549,6 +1584,196 @@ mod tests {
         let response = client.get(&target.url).send().await.unwrap();
         assert_eq!(response.text().await.unwrap(), "ok");
         server.await.unwrap();
+    }
+
+    // ── Redirect boundary, end to end over real sockets ─────────────
+    //
+    // These drive a real 3xx through the real client built by
+    // `build_redirect_guarded_client` — the same constructor `execute()`
+    // uses. Everything else in this file tests `validate_redirect_target` in
+    // isolation, which cannot catch the policy being unwired from the client
+    // or the rejection flag going missing.
+
+    /// A raw loopback HTTP server that counts accepted connections and replies
+    /// with a canned response chosen by request path.
+    struct CountingServer {
+        addr: std::net::SocketAddr,
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl CountingServer {
+        fn hits(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Drop for CountingServer {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn spawn_counting_server<F>(responder: F) -> CountingServer
+    where
+        F: Fn(&str) -> String + Send + Sync + 'static,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_for_task = Arc::clone(&hits);
+
+        let handle = zeroclaw_spawn::spawn!(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                // Count on accept: merely reaching this server is the leak we
+                // are asserting against, whether or not a request follows.
+                hits_for_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                let mut buf = [0u8; 1024];
+                let read = stream.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+
+                let _ = stream.write_all(responder(&path).as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+
+        CountingServer { addr, hits, handle }
+    }
+
+    /// A 302 whose `Location` leaves the pinned host must not be followed, and
+    /// the resulting failure must never be retried through Firecrawl — that
+    /// would hand the blocked URL to a third party and undo the denial.
+    #[tokio::test]
+    async fn cross_host_redirect_is_denied_and_never_falls_back_to_firecrawl() {
+        // Server B: the off-host redirect target. Must never be contacted.
+        let server_b = spawn_counting_server(|_| {
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\
+             Content-Length: 7\r\n\r\nLEAKED!"
+                .to_string()
+        })
+        .await;
+
+        // Server A: pinned host, redirects off-host to server B. The literal
+        // 127.0.0.1 is resolvable without the pin, so a policy that follows
+        // this hop really does reach B.
+        let location = format!("http://127.0.0.1:{}/leak", server_b.addr.port());
+        let server_a = spawn_counting_server(move |_| {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nConnection: close\r\n\
+                 Content-Length: 0\r\n\r\n"
+            )
+        })
+        .await;
+
+        // Firecrawl ENABLED on purpose: with it enabled and the fetch failing,
+        // the redirect-policy flag is the only thing that can suppress the
+        // fallback, so assertion (c) below tests exactly that flag.
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let target = ResolvedWebFetchTarget {
+            url: format!("http://pinned.invalid:{}/", server_a.addr.port()),
+            host: "pinned.invalid".to_string(),
+            resolved_addrs: vec![std::net::SocketAddr::new(server_a.addr.ip(), 0)],
+        };
+
+        let guarded = tool
+            .build_redirect_guarded_client(&target, 5)
+            .expect("client builds");
+        let result = tool.standard_fetch(&guarded.client, &target.url).await;
+        let rejected = guarded.redirect_policy_rejected.load(Ordering::Relaxed);
+
+        assert_eq!(server_a.hits(), 1, "the pinned host should be fetched once");
+
+        // (a) the cross-host hop was not followed.
+        assert_eq!(
+            server_b.hits(),
+            0,
+            "cross-host redirect was followed to the off-host target; error={:?}",
+            result.error
+        );
+        assert!(
+            !result.success,
+            "a denied redirect must surface as a failed fetch"
+        );
+
+        // (c) before (b) deliberately: the security-relevant consequence of
+        // losing the flag is the Firecrawl retry, so assert the real decision
+        // fn on the real flag first and let that be the failure that shows.
+        assert!(
+            !tool.should_fallback_to_firecrawl(&result, rejected),
+            "an SSRF-blocked redirect must never be retried through Firecrawl"
+        );
+
+        // (b) the outcome is marked as a redirect-policy rejection.
+        assert!(
+            rejected,
+            "a policy-denied redirect must set the redirect-policy flag"
+        );
+    }
+
+    /// The counterpart: the policy must not be a blanket deny. A redirect that
+    /// stays on the pinned host is still followed, and does not trip the
+    /// rejection flag.
+    #[tokio::test]
+    async fn same_host_redirect_is_followed_without_tripping_the_policy_flag() {
+        let body = "b".repeat(200);
+        let body_for_server = body.clone();
+        let server = spawn_counting_server(move |path| {
+            if path == "/second" {
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\
+                     Content-Length: {}\r\n\r\n{}",
+                    body_for_server.len(),
+                    body_for_server
+                )
+            } else {
+                "HTTP/1.1 302 Found\r\nLocation: /second\r\nConnection: close\r\n\
+                 Content-Length: 0\r\n\r\n"
+                    .to_string()
+            }
+        })
+        .await;
+
+        let tool = test_tool_with_firecrawl(FirecrawlConfig {
+            enabled: true,
+            ..FirecrawlConfig::default()
+        });
+        let target = ResolvedWebFetchTarget {
+            url: format!("http://pinned.invalid:{}/", server.addr.port()),
+            host: "pinned.invalid".to_string(),
+            resolved_addrs: vec![std::net::SocketAddr::new(server.addr.ip(), 0)],
+        };
+
+        let guarded = tool
+            .build_redirect_guarded_client(&target, 5)
+            .expect("client builds");
+        let result = tool.standard_fetch(&guarded.client, &target.url).await;
+        let rejected = guarded.redirect_policy_rejected.load(Ordering::Relaxed);
+
+        assert!(
+            result.success,
+            "same-host redirect must still be followed; error={:?}",
+            result.error
+        );
+        assert_eq!(result.output, body, "must return the redirected body");
+        assert!(
+            !rejected,
+            "an allowed redirect must not set the redirect-policy flag"
+        );
+        assert_eq!(
+            server.hits(),
+            2,
+            "both the 302 and the followed request should reach the pinned host"
+        );
     }
 
     // ── Firecrawl config parsing ────────────────────────────────────

@@ -394,8 +394,6 @@
       - any-glob-to-any-file:
           - "src/hardware/**"
           - "crates/zeroclaw-hardware/**"
-          - "crates/robot-kit/**"
-          - "crates/aardvark-sys/**"
           - "firmware/**"
 
 "web":

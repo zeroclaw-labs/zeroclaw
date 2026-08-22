@@ -100,7 +100,7 @@ Triggered on tag push (and `workflow_dispatch`); builds and publishes versioned 
 
 ### Docker Image PR Check (`docker-image-pr.yml`)
 
-Runs only when Docker image, Compose, or release-Docker context files change. It validates the merged default-plus-Alpine Compose configuration and, for changes beyond Compose-only edits, builds the default and Debian prebuilt smoke images plus the source Dockerfiles without pushing them. The default and Alpine source images build for `linux/amd64` and `linux/arm64`; the Debian source image builds for `linux/amd64`.
+Runs only when Docker image, Compose, or release-Docker context files change. It validates the merged default-plus-Alpine Compose configuration and, for changes beyond Compose-only edits, builds the default and Debian prebuilt smoke images plus the source Dockerfiles without pushing them. The default and Alpine source images build for `linux/amd64` and `linux/arm64`; the Debian source image builds for `linux/amd64`. Separate Alpine and Debian `linux/amd64` lanes enable `plugins-wasm-runtime-only` so their builder contexts continuously prove that the repository WIT contract is available to plugin-enabled source builds.
 
 The all-features `Containerfile` source image builds for `linux/amd64` when that file or the Docker workflow changes. It uses an isolated cache scope and is neither loaded nor pushed. The Alpine amd64 lane runs both binaries, starts the built image through the merged Compose configuration, and checks the gateway health and dashboard surfaces. The Alpine arm64 lane is compile- and image-assembly coverage only. Compose-only changes use a reduced Alpine amd64 matrix so they still exercise the runtime contract without rebuilding unrelated images. All jobs have read-only repository permissions and no registry write permission.
 
@@ -140,6 +140,10 @@ First triage step for a new issue: check if the reported outdated crates have se
 
 Manual trigger for building release binaries across the full target matrix: Linux x86_64/aarch64 GNU and MUSL plus armv7 and arm hard-float, macOS Intel/ARM, Windows x86_64, and `aarch64-linux-android` (built with the NDK). Use this to verify a branch compiles cleanly on non-Linux targets before tagging.
 
+Every dispatch also runs a small release-tool smoke matrix independently of the builds. Set `release_tools_only` when only this evidence is needed; the web and release-build jobs are then skipped. On trusted GitHub-hosted Linux x86_64, the smoke installs the pinned `cross` archive, confirms both `cross` and `cross-util`, and records `cross --version`. On trusted GitHub-hosted Windows x86_64, it uses the same Rust version and Bash-to-Cargo path shape as the stable release workflow, then records both `cargo-tauri.exe --version` and `cargo tauri --version`. Each leg records the exact tested commit and runner architecture in the public job summary. The smoke uses read-only repository permissions and has no publishing job, environment, secret, or artifact upload.
+
+MUSL build legs also install `cross` through `scripts/ci/install_release_tool.sh`, which downloads the exact pinned upstream release asset and verifies its SHA-256 before installing it. The required Repository Structure job tests the supported runner-to-asset mapping and the smoke workflow contract without making network calls.
+
 ### Cross-Platform Clippy (`cross-platform-clippy.yml`)
 
 Manual and weekly scheduled advisory lint coverage on macOS aarch64 and Windows x86_64 targets. It mirrors the required PR lint command with `--target` set for each platform, but intentionally does not run on PRs and is not part of `CI Required Gate`.
@@ -156,6 +160,13 @@ both SBOM formats are checksummed and attested before the release is created.
 Cosign remains limited to GHCR image signing.
 
 See the [Release Runbook](./release-runbook.md) for the full procedure.
+
+Release-only build tools do not compile from source on every run. The workflow
+installs pinned upstream `cross` and Tauri CLI release binaries through
+`scripts/ci/install_release_tool.sh`; that script verifies a repository-owned
+SHA-256 for each runner-specific archive before placing the binary in Cargo's
+bin directory. Updating either tool requires updating its version, asset name,
+and checksum together, then running `scripts/ci/install_release_tool.test.sh`.
 
 ### Package Publishers
 
@@ -311,7 +322,7 @@ Export the current effective policy:
 
 <div class="os-tabs-src">
 
-#### sh
+### sh
 
 ```sh
 gh api repos/zeroclaw-labs/zeroclaw/actions/permissions

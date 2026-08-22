@@ -805,6 +805,90 @@ impl Chat {
         }
     }
 
+    async fn cancel_active_turn_for_injection(&mut self) {
+        let session_id = match self.phase {
+            ChatPhase::Active(ref state)
+                if state.turn_in_flight && !matches!(state.turn_status, TurnStatus::Cancelling) =>
+            {
+                state.session_id.clone()
+            }
+            _ => return,
+        };
+        let result = self.rpc.session_cancel(&session_id).await;
+        if let ChatPhase::Active(ref mut state) = self.phase {
+            if result.is_ok() {
+                state.enter_cancelling();
+            } else {
+                state.commit_turn(String::new(), false);
+            }
+        }
+    }
+
+    async fn execute_context_menu_request(&mut self, request: ChatContextMenuRequest) {
+        match request {
+            ChatContextMenuRequest::CopyTranscript(target) => {
+                let ChatPhase::Active(ref mut state) = self.phase else {
+                    return;
+                };
+                if !state.copy_text_and_clear_selection(&target.text) {
+                    return;
+                }
+                match target.kind {
+                    CopyHitKind::Code => {
+                        state.set_copy_feedback(CopyFeedbackTarget::Code(target.group));
+                    }
+                    CopyHitKind::Message | CopyHitKind::Transcript => {
+                        state.set_overlay_copy_feedback(target.rect);
+                    }
+                }
+            }
+            ChatContextMenuRequest::Queue { id, action } => match action {
+                ChatContextMenuAction::SendNow => {
+                    let promoted = match self.phase {
+                        ChatPhase::Active(ref mut state) => state.promote_queued_by_id(id),
+                        _ => false,
+                    };
+                    if promoted {
+                        self.cancel_active_turn_for_injection().await;
+                        self.pump_queue();
+                    }
+                }
+                ChatContextMenuAction::Copy => {
+                    let ChatPhase::Active(ref mut state) = self.phase else {
+                        return;
+                    };
+                    let Some(text) = state.queued_text(id).filter(|text| !text.is_empty()) else {
+                        return;
+                    };
+                    crate::mouse::copy_osc52(&text);
+                    state.set_info_notice(crate::i18n::t("zc-chat-copied-clipboard"));
+                }
+                ChatContextMenuAction::Edit => {
+                    let ChatPhase::Active(ref mut state) = self.phase else {
+                        return;
+                    };
+                    let composer_busy = !state.input_bar.input().trim().is_empty()
+                        || state.input_bar.has_pending_attachments();
+                    if composer_busy {
+                        state
+                            .entries
+                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
+                                "zc-queue-edit-busy",
+                            ))));
+                        state.mark_dirty_append();
+                    } else if let Some((text, attachments)) = state.take_queued_for_edit(id) {
+                        state.input_bar.load_for_edit(text, attachments);
+                    }
+                }
+                ChatContextMenuAction::Delete => {
+                    if let ChatPhase::Active(ref mut state) = self.phase {
+                        state.delete_queued_by_id(id);
+                    }
+                }
+            },
+        }
+    }
+
     fn pump_queue(&mut self) {
         let next = match self.phase {
             ChatPhase::Active(ref mut state) => state.take_next_dispatchable(),
@@ -1272,19 +1356,29 @@ impl Chat {
             return false;
         }
 
-        // The transcript context menu is modal within an active chat. Handle
+        // The transcript or queue context menu is modal within an active chat. Handle
         // it before selection clearing or input dispatch so Esc cannot leak
         // into the editor and Enter cannot submit a prompt.
-        if state.copy_context_menu.is_some() {
+        if state.context_menu.is_some() {
             use crate::keymap::ModalAction;
-            match ModalAction::from_chord(&key) {
-                Some(ModalAction::Confirm) => {
-                    state.activate_copy_context_menu();
+            let request = match ModalAction::from_chord(&key) {
+                Some(ModalAction::Up) => {
+                    state.context_menu_select_step(-1);
+                    None
                 }
+                Some(ModalAction::Down) => {
+                    state.context_menu_select_step(1);
+                    None
+                }
+                Some(ModalAction::Confirm) => state.take_context_menu_request(),
                 Some(ModalAction::Cancel) => {
-                    state.dismiss_copy_context_menu();
+                    state.dismiss_context_menu();
+                    None
                 }
-                _ => {}
+                _ => None,
+            };
+            if let Some(request) = request {
+                self.execute_context_menu_request(request).await;
             }
             return false;
         }
@@ -1323,22 +1417,22 @@ impl Chat {
                     state.queue_select_step(1);
                     return false;
                 }
-                Some(QAction::QueueDelete) if state.queue_sidebar_open() => {
-                    state.delete_selected_queued();
-                    return false;
-                }
-                Some(QAction::QueueEdit) if state.queue_sidebar_open() => {
-                    let bar_busy = !state.input_bar.input().trim().is_empty()
-                        || state.input_bar.has_pending_attachments();
-                    if bar_busy {
-                        state
-                            .entries
-                            .push(ChatEntry::SystemMessage(Arc::<str>::from(crate::i18n::t(
-                                "zc-queue-edit-busy",
-                            ))));
-                        state.mark_dirty_append();
-                    } else if let Some((text, attachments)) = state.take_selected_for_edit() {
-                        state.input_bar.load_for_edit(text, attachments);
+                Some(
+                    action @ (QAction::QueueSendNow
+                    | QAction::QueueCopy
+                    | QAction::QueueDelete
+                    | QAction::QueueEdit),
+                ) if state.queue_sidebar_open() => {
+                    let action = match action {
+                        QAction::QueueSendNow => ChatContextMenuAction::SendNow,
+                        QAction::QueueCopy => ChatContextMenuAction::Copy,
+                        QAction::QueueEdit => ChatContextMenuAction::Edit,
+                        QAction::QueueDelete => ChatContextMenuAction::Delete,
+                        _ => unreachable!(),
+                    };
+                    if let Some(id) = state.selected_queue_id() {
+                        let request = ChatContextMenuRequest::Queue { id, action };
+                        self.execute_context_menu_request(request).await;
                     }
                     return false;
                 }
@@ -1423,19 +1517,8 @@ impl Chat {
                     state.clear_info_notice();
                     let prompt = text.unwrap_or_default();
                     let enq = state.inject_message(prompt, attachments);
-                    if enq.is_ok()
-                        && state.turn_in_flight
-                        && !matches!(state.turn_status, TurnStatus::Cancelling)
-                    {
-                        let sid = state.session_id.clone();
-                        let res = self.rpc.session_cancel(&sid).await;
-                        if let ChatPhase::Active(ref mut state) = self.phase {
-                            if res.is_ok() {
-                                state.enter_cancelling();
-                            } else {
-                                state.commit_turn(String::new(), false);
-                            }
-                        }
+                    if enq.is_ok() {
+                        self.cancel_active_turn_for_injection().await;
                     }
                     self.after_enqueue(enq);
                     return false;
@@ -2289,24 +2372,24 @@ impl Chat {
                 return;
             }
 
-            if state.copy_context_menu.is_some() {
+            if state.context_menu.is_some() {
                 match mouse.kind {
                     MouseEventKind::Down(MouseButton::Left) => {
-                        let activate = state
-                            .copy_context_menu
-                            .as_ref()
-                            .is_some_and(|menu| menu.action_contains(mouse.column, mouse.row));
-                        if activate {
-                            state.activate_copy_context_menu();
+                        let request = if state.context_menu_select_at(mouse.column, mouse.row) {
+                            state.take_context_menu_request()
                         } else {
-                            state.dismiss_copy_context_menu();
+                            state.dismiss_context_menu();
+                            None
+                        };
+                        if let Some(request) = request {
+                            self.execute_context_menu_request(request).await;
                         }
                         return;
                     }
                     MouseEventKind::Down(MouseButton::Right)
                     | MouseEventKind::ScrollUp
                     | MouseEventKind::ScrollDown => {
-                        state.dismiss_copy_context_menu();
+                        state.dismiss_context_menu();
                     }
                     MouseEventKind::Drag(MouseButton::Left)
                     | MouseEventKind::Up(MouseButton::Left) => return,
@@ -2346,6 +2429,15 @@ impl Chat {
             // conversation handler, so clicks select queued items and the wheel
             // scrolls the queue rather than the transcript.
             if state.queue_sidebar_open() && state.point_in_queue_sidebar(col, row) {
+                let opens_context_menu =
+                    matches!(mouse.kind, MouseEventKind::Down(MouseButton::Right))
+                        || (cfg!(target_os = "macos")
+                            && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                            && mouse.modifiers.contains(KM::CONTROL));
+                if opens_context_menu {
+                    state.open_queue_context_menu(col, row);
+                    return;
+                }
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.queue_scroll_by(-3),
                     MouseEventKind::ScrollDown => state.queue_scroll_by(3),
@@ -2414,7 +2506,7 @@ impl Chat {
                     && matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
                     && mouse.modifiers.contains(KM::CONTROL));
             if opens_context_menu {
-                state.open_copy_context_menu(col, row);
+                state.open_transcript_context_menu(col, row);
                 return;
             }
 
@@ -2561,7 +2653,10 @@ impl Chat {
         let ChatPhase::Active(state) = &mut self.phase else {
             return;
         };
-        if state.turn_in_flight {
+        // Approval overlays own input while an agent turn is paused for a
+        // decision. Keep paste aligned with the keyboard-input guard so it
+        // cannot mutate the hidden composer beneath the modal.
+        if state.pending_approval().is_some() {
             return;
         }
         let action = state.input_bar.handle_paste(text);
@@ -3275,6 +3370,14 @@ fn queue_sidebar_help_entries() -> Vec<crate::widgets::HelpEntry> {
             crate::i18n::t("zc-queue-help-nav"),
         ),
         E::key(
+            chord_label(A::QueueSendNow),
+            crate::i18n::t("zc-queue-help-inject"),
+        ),
+        E::key(
+            chord_label(A::QueueCopy),
+            crate::i18n::t("zc-chat-context-menu-copy"),
+        ),
+        E::key(
             chord_label(A::QueueDelete),
             crate::i18n::t("zc-queue-help-delete"),
         ),
@@ -3663,8 +3766,19 @@ fn message_copied_label() -> String {
     crate::i18n::t("zc-chat-copy-message-copied")
 }
 
+#[cfg(test)]
 fn context_menu_copy_label() -> String {
     crate::i18n::t("zc-chat-context-menu-copy")
+}
+
+fn context_menu_action_label(action: ChatContextMenuAction) -> String {
+    let key = match action {
+        ChatContextMenuAction::SendNow => "zc-chat-context-menu-send-now",
+        ChatContextMenuAction::Copy => "zc-chat-context-menu-copy",
+        ChatContextMenuAction::Edit => "zc-chat-context-menu-edit",
+        ChatContextMenuAction::Delete => "zc-chat-context-menu-delete",
+    };
+    crate::i18n::t(key)
 }
 
 fn should_copy_current_selection(state: &ChatState, key: &KeyEvent) -> bool {
@@ -3690,16 +3804,24 @@ fn should_copy_action(
     }
 }
 
-fn copy_context_menu_rect(column: u16, row: u16, bounds: Rect) -> Option<Rect> {
+fn context_menu_rect(
+    column: u16,
+    row: u16,
+    bounds: Rect,
+    actions: &[ChatContextMenuAction],
+) -> Option<Rect> {
     use unicode_width::UnicodeWidthStr;
 
-    if bounds.width < 3 || bounds.height < 3 {
+    if bounds.width < 3 || bounds.height < 3 || actions.is_empty() {
         return None;
     }
-    let width = (UnicodeWidthStr::width(context_menu_copy_label().as_str()) as u16 + 4)
-        .min(bounds.width)
-        .max(3);
-    let height = 3;
+    let label_width = actions
+        .iter()
+        .map(|action| UnicodeWidthStr::width(context_menu_action_label(*action).as_str()) as u16)
+        .max()
+        .unwrap_or(0);
+    let width = (label_width + 4).min(bounds.width).max(3);
+    let height = (actions.len() as u16 + 2).min(bounds.height);
     let max_x = bounds.x.saturating_add(bounds.width.saturating_sub(width));
     let max_y = bounds
         .y
@@ -4031,7 +4153,7 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     }
     render_copy_feedback(f, state);
     render_message_copy_overlay(f, state, body_rect);
-    render_copy_context_menu(f, state);
+    render_context_menu(f, state);
     let mut scrollbar_state = ScrollbarState::new(total_rows as usize)
         .position(scroll as usize)
         .viewport_content_length(inner_height as usize);
@@ -4194,18 +4316,27 @@ fn render_copy_feedback(f: &mut Frame, state: &ChatState) {
     }
 }
 
-fn render_copy_context_menu(f: &mut Frame, state: &ChatState) {
-    let Some(menu) = &state.copy_context_menu else {
+fn render_context_menu(f: &mut Frame, state: &ChatState) {
+    let Some(menu) = &state.context_menu else {
         return;
     };
     f.render_widget(Clear, menu.rect);
+    let lines = menu
+        .target
+        .actions()
+        .iter()
+        .enumerate()
+        .map(|(index, action)| {
+            let style = if index == menu.selected {
+                theme::accent_style().add_modifier(Modifier::BOLD)
+            } else {
+                theme::body_style()
+            };
+            Line::from(Span::styled(context_menu_action_label(*action), style))
+        })
+        .collect::<Vec<_>>();
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            context_menu_copy_label(),
-            theme::accent_style().add_modifier(Modifier::BOLD),
-        )))
-        .alignment(Alignment::Center)
-        .block(
+        Paragraph::new(lines).alignment(Alignment::Center).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(theme::accent_style()),
@@ -5156,22 +5287,81 @@ struct CopyHitRegion {
     group: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct CopyContextMenu {
-    rect: Rect,
-    target: CopyHitRegion,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatContextMenuAction {
+    SendNow,
+    Copy,
+    Edit,
+    Delete,
 }
 
-impl CopyContextMenu {
-    fn action_contains(&self, column: u16, row: u16) -> bool {
-        self.rect.width > 2
-            && self.rect.height > 2
-            && mouse::in_rect(
-                column,
-                row,
-                Rect::new(self.rect.x + 1, self.rect.y + 1, self.rect.width - 2, 1),
-            )
+const TRANSCRIPT_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[ChatContextMenuAction::Copy];
+const QUEUE_CONTEXT_ACTIONS: &[ChatContextMenuAction] = &[
+    ChatContextMenuAction::SendNow,
+    ChatContextMenuAction::Copy,
+    ChatContextMenuAction::Edit,
+    ChatContextMenuAction::Delete,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatContextMenuTarget {
+    Transcript(CopyHitRegion),
+    Queue(u64),
+}
+
+impl ChatContextMenuTarget {
+    fn actions(&self) -> &'static [ChatContextMenuAction] {
+        match self {
+            Self::Transcript(_) => TRANSCRIPT_CONTEXT_ACTIONS,
+            Self::Queue(_) => QUEUE_CONTEXT_ACTIONS,
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChatContextMenu {
+    rect: Rect,
+    target: ChatContextMenuTarget,
+    selected: usize,
+}
+
+impl ChatContextMenu {
+    fn selected_action(&self) -> Option<ChatContextMenuAction> {
+        self.target.actions().get(self.selected).copied()
+    }
+
+    fn select_step(&mut self, delta: isize) {
+        let count = self.target.actions().len();
+        if count > 0 {
+            self.selected = (self.selected as isize + delta).clamp(0, count as isize - 1) as usize;
+        }
+    }
+
+    fn action_at(&self, column: u16, row: u16) -> Option<usize> {
+        if self.rect.width <= 2 || self.rect.height <= 2 {
+            return None;
+        }
+        let inner = Rect::new(
+            self.rect.x + 1,
+            self.rect.y + 1,
+            self.rect.width - 2,
+            self.rect.height - 2,
+        );
+        if !mouse::in_rect(column, row, inner) {
+            return None;
+        }
+        let index = usize::from(row.saturating_sub(inner.y));
+        (index < self.target.actions().len()).then_some(index)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatContextMenuRequest {
+    CopyTranscript(CopyHitRegion),
+    Queue {
+        id: u64,
+        action: ChatContextMenuAction,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5454,8 +5644,8 @@ pub struct ChatState {
     copy_hit_regions: Vec<CopyHitRegion>,
     /// Full code-block targets used by right-click context-menu resolution.
     context_copy_regions: Vec<CopyHitRegion>,
-    /// Active one-action transcript context menu.
-    copy_context_menu: Option<CopyContextMenu>,
+    /// Active transcript or queue context menu.
+    context_menu: Option<ChatContextMenu>,
     /// Temporary `[Copied]` overlay for copy labels.
     copy_feedback: Option<CopyFeedback>,
     /// Clickable provider/model title spans from the last draw.
@@ -5580,7 +5770,7 @@ impl ChatState {
             entry_rects: Vec::new(),
             copy_hit_regions: Vec::new(),
             context_copy_regions: Vec::new(),
-            copy_context_menu: None,
+            context_menu: None,
             copy_feedback: None,
             title_hit_rects: Vec::new(),
             scrollbar_track_rect: None,
@@ -5632,7 +5822,7 @@ impl ChatState {
         self.transcript_selection = None;
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
-        self.copy_context_menu = None;
+        self.context_menu = None;
         self.copy_feedback = None;
     }
 
@@ -5714,12 +5904,12 @@ impl ChatState {
             || self.browse_cursor.is_some()
             || self.browse_anchor.is_some()
             || !self.browse_multi.is_empty();
-        if lines_changed || self.copy_context_menu.is_some() || self.copy_feedback.is_some() {
+        if lines_changed || self.context_menu.is_some() || self.copy_feedback.is_some() {
             self.mouse_down_entry = None;
             self.browse_cursor = None;
             self.browse_anchor = None;
             self.browse_multi.clear();
-            self.copy_context_menu = None;
+            self.context_menu = None;
             self.copy_feedback = None;
         }
         if lines_changed {
@@ -5773,11 +5963,11 @@ impl ChatState {
         self.yank_selection()
     }
 
-    fn dismiss_copy_context_menu(&mut self) {
-        self.copy_context_menu = None;
+    fn dismiss_context_menu(&mut self) {
+        self.context_menu = None;
     }
 
-    fn open_copy_context_menu(&mut self, column: u16, row: u16) -> bool {
+    fn open_transcript_context_menu(&mut self, column: u16, row: u16) -> bool {
         let Some(bounds) = self
             .transcript_snapshot
             .as_ref()
@@ -5835,31 +6025,71 @@ impl ChatState {
         let Some(target) = target else {
             return false;
         };
-        let Some(rect) = copy_context_menu_rect(column, row, bounds) else {
+        let target = ChatContextMenuTarget::Transcript(target);
+        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
             return false;
         };
-        self.copy_context_menu = Some(CopyContextMenu { rect, target });
+        self.context_menu = Some(ChatContextMenu {
+            rect,
+            target,
+            selected: 0,
+        });
         true
     }
 
-    fn activate_copy_context_menu(&mut self) -> bool {
-        let Some(menu) = self.copy_context_menu.take() else {
+    fn open_queue_context_menu(&mut self, column: u16, row: u16) -> bool {
+        let id = self
+            .queue_item_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(id, _)| *id);
+        let (Some(id), Some(bounds)) = (id, self.queue_sidebar_rect) else {
             return false;
         };
-        if menu.target.text.is_empty() {
+        self.select_queued_by_id(id);
+        let target = ChatContextMenuTarget::Queue(id);
+        let Some(rect) = context_menu_rect(column, row, bounds, target.actions()) else {
             return false;
-        }
-
-        self.copy_text_and_clear_selection(&menu.target.text);
-        match menu.target.kind {
-            CopyHitKind::Code => {
-                self.set_copy_feedback(CopyFeedbackTarget::Code(menu.target.group));
-            }
-            CopyHitKind::Message | CopyHitKind::Transcript => {
-                self.set_overlay_copy_feedback(menu.target.rect);
-            }
-        }
+        };
+        self.context_menu = Some(ChatContextMenu {
+            rect,
+            target,
+            selected: 0,
+        });
+        self.mark_dirty_full();
         true
+    }
+
+    fn context_menu_select_step(&mut self, delta: isize) {
+        if let Some(menu) = self.context_menu.as_mut() {
+            menu.select_step(delta);
+            self.mark_dirty_full();
+        }
+    }
+
+    fn context_menu_select_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return false;
+        };
+        let Some(index) = menu.action_at(column, row) else {
+            return false;
+        };
+        menu.selected = index;
+        true
+    }
+
+    fn take_context_menu_request(&mut self) -> Option<ChatContextMenuRequest> {
+        let menu = self.context_menu.take()?;
+        let action = menu.selected_action()?;
+        match (menu.target, action) {
+            (ChatContextMenuTarget::Transcript(target), ChatContextMenuAction::Copy) => {
+                Some(ChatContextMenuRequest::CopyTranscript(target))
+            }
+            (ChatContextMenuTarget::Queue(id), action) => {
+                Some(ChatContextMenuRequest::Queue { id, action })
+            }
+            (ChatContextMenuTarget::Transcript(_), _) => None,
+        }
     }
 
     /// Yank a single entry's body text for explicit copy actions.
@@ -5908,7 +6138,7 @@ impl ChatState {
         self.browse_anchor = None;
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
-        self.copy_context_menu = None;
+        self.context_menu = None;
         self.copy_feedback = None;
         self.mark_dirty_full();
     }
@@ -6968,25 +7198,87 @@ impl ChatState {
         self.mark_dirty_full();
     }
 
-    pub fn delete_selected_queued(&mut self) {
-        let Some(id) = self.queue_sel else { return };
-        if let Some(pos) = self.message_queue.iter().position(|m| m.id == id) {
-            if let Some(msg) = self.message_queue.remove(pos) {
-                cleanup_attachment_temps(&msg.attachments);
-            }
-            let ids = self.editable_ids();
-            self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
+    fn selected_queue_id(&self) -> Option<u64> {
+        self.queue_sel
+            .filter(|id| self.message_queue.iter().any(|message| message.id == *id))
+    }
+
+    fn queued_text(&self, id: u64) -> Option<String> {
+        self.message_queue
+            .iter()
+            .find(|message| message.id == id)
+            .map(|message| message.text.clone())
+    }
+
+    fn promote_queued_by_id(&mut self, id: u64) -> bool {
+        let Some(position) = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return false;
+        };
+        let pending = self.message_queue[position].status == QueueItemStatus::Pending;
+        if pending {
+            let Some(mut message) = self.message_queue.remove(position) else {
+                return false;
+            };
+            message.status = QueueItemStatus::Injected;
+            let insert_at = self
+                .message_queue
+                .iter()
+                .position(|queued| queued.status == QueueItemStatus::Pending)
+                .unwrap_or(self.message_queue.len());
+            self.message_queue.insert(insert_at, message);
+        }
+        let resumed = self.resume_queue();
+        if self.turn_in_flight {
+            self.resume_override = true;
+        }
+        if pending || resumed {
             self.mark_dirty_full();
+        }
+        true
+    }
+
+    fn delete_queued_by_id(&mut self, id: u64) -> bool {
+        let Some(position) = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == id)
+        else {
+            return false;
+        };
+        if let Some(message) = self.message_queue.remove(position) {
+            cleanup_attachment_temps(&message.attachments);
+        }
+        let ids = self.editable_ids();
+        self.queue_sel = ids.get(position.min(ids.len().saturating_sub(1))).copied();
+        self.mark_dirty_full();
+        true
+    }
+
+    #[cfg(test)]
+    pub fn delete_selected_queued(&mut self) {
+        if let Some(id) = self.selected_queue_id() {
+            self.delete_queued_by_id(id);
         }
     }
 
-    pub fn take_selected_for_edit(&mut self) -> Option<(String, Vec<PendingAttachment>)> {
-        let id = self.queue_sel?;
-        let pos = self.message_queue.iter().position(|m| m.id == id)?;
-        let msg = self.message_queue.remove(pos)?;
+    fn take_queued_for_edit(&mut self, id: u64) -> Option<(String, Vec<PendingAttachment>)> {
+        let position = self
+            .message_queue
+            .iter()
+            .position(|message| message.id == id)?;
+        let message = self.message_queue.remove(position)?;
         self.queue_sel = self.editable_ids().first().copied();
         self.mark_dirty_full();
-        Some((msg.text, msg.attachments))
+        Some((message.text, message.attachments))
+    }
+
+    #[cfg(test)]
+    pub fn take_selected_for_edit(&mut self) -> Option<(String, Vec<PendingAttachment>)> {
+        self.take_queued_for_edit(self.selected_queue_id()?)
     }
 
     /// Slash-command queue removal. `None` clears the whole queue; `Some(n)`
@@ -7074,7 +7366,7 @@ impl ChatState {
         self.entry_rects.clear();
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
-        self.copy_context_menu = None;
+        self.context_menu = None;
         self.copy_feedback = None;
         self.dirty = LinesDirty::Full;
         self.cached_entry_count = 0;
@@ -7523,7 +7815,7 @@ mod tests {
             .max(3);
 
         assert_eq!(
-            copy_context_menu_rect(29, 12, bounds),
+            context_menu_rect(29, 12, bounds, TRANSCRIPT_CONTEXT_ACTIONS),
             Some(Rect::new(
                 bounds.x + bounds.width - menu_width,
                 bounds.y + bounds.height - 3,
@@ -7531,8 +7823,18 @@ mod tests {
                 3,
             ))
         );
-        assert_eq!(copy_context_menu_rect(0, 0, bounds).unwrap().x, bounds.x);
-        assert_eq!(copy_context_menu_rect(0, 0, bounds).unwrap().y, bounds.y);
+        assert_eq!(
+            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
+                .unwrap()
+                .x,
+            bounds.x
+        );
+        assert_eq!(
+            context_menu_rect(0, 0, bounds, TRANSCRIPT_CONTEXT_ACTIONS)
+                .unwrap()
+                .y,
+            bounds.y
+        );
     }
 
     #[test]
@@ -7544,10 +7846,13 @@ mod tests {
         state.transcript_snapshot = Some(transcript_snapshot(Rect::new(10, 5, 30, 3), &["hello"]));
         state.entry_rects.push((0, Rect::new(10, 5, 5, 1)));
 
-        assert!(state.open_copy_context_menu(35, 5));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Message);
-        assert_eq!(menu.target.text, "hello");
+        assert!(state.open_transcript_context_menu(35, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Message);
+        assert_eq!(target.text, "hello");
     }
 
     #[test]
@@ -7564,23 +7869,32 @@ mod tests {
             dragged: true,
         });
 
-        assert!(state.open_copy_context_menu(12, 5));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Transcript);
-        assert_eq!(menu.target.text, "ell");
+        assert!(state.open_transcript_context_menu(12, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Transcript);
+        assert_eq!(target.text, "ell");
 
-        state.dismiss_copy_context_menu();
-        assert!(state.open_copy_context_menu(10, 5));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Transcript);
-        assert_eq!(menu.target.text, "ell");
+        state.dismiss_context_menu();
+        assert!(state.open_transcript_context_menu(10, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Transcript);
+        assert_eq!(target.text, "ell");
 
-        state.dismiss_copy_context_menu();
+        state.dismiss_context_menu();
         state.clear_transcript_selection();
-        assert!(state.open_copy_context_menu(10, 5));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Message);
-        assert_eq!(menu.target.text, "hello");
+        assert!(state.open_transcript_context_menu(10, 5));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Message);
+        assert_eq!(target.text, "hello");
     }
 
     #[test]
@@ -7602,8 +7916,8 @@ mod tests {
         });
 
         assert!(state.current_selection_text().is_empty());
-        assert!(!state.open_copy_context_menu(10, 5));
-        assert!(state.copy_context_menu.is_none());
+        assert!(!state.open_transcript_context_menu(10, 5));
+        assert!(state.context_menu.is_none());
     }
 
     #[test]
@@ -7624,11 +7938,14 @@ mod tests {
             group: 7,
         });
 
-        assert!(state.open_copy_context_menu(2, 2));
-        let menu = state.copy_context_menu.as_ref().expect("menu opens");
-        assert_eq!(menu.target.kind, CopyHitKind::Code);
-        assert_eq!(menu.target.text, "echo hi");
-        assert_eq!(menu.target.group, 7);
+        assert!(state.open_transcript_context_menu(2, 2));
+        let menu = state.context_menu.as_ref().expect("menu opens");
+        let ChatContextMenuTarget::Transcript(target) = &menu.target else {
+            panic!("transcript target");
+        };
+        assert_eq!(target.kind, CopyHitKind::Code);
+        assert_eq!(target.text, "echo hi");
+        assert_eq!(target.group, 7);
     }
 
     #[test]
@@ -7645,11 +7962,11 @@ mod tests {
         state.browse_cursor = Some(0);
         state.dirty = LinesDirty::Clean;
 
-        assert!(state.open_copy_context_menu(1, 0));
+        assert!(state.open_transcript_context_menu(1, 0));
         assert_eq!(state.dirty, LinesDirty::Clean);
-        state.dismiss_copy_context_menu();
+        state.dismiss_context_menu();
 
-        assert!(state.copy_context_menu.is_none());
+        assert!(state.context_menu.is_none());
         assert_eq!(state.browse_cursor, Some(0));
         assert!(state.info_message.is_none());
         assert_eq!(state.copy_feedback, None);
@@ -7657,7 +7974,7 @@ mod tests {
     }
 
     #[test]
-    fn context_menu_activation_copies_target_and_clears_stale_selection() {
+    fn context_menu_request_keeps_the_exact_transcript_target() {
         let mut state = state();
         state
             .entries
@@ -7669,27 +7986,26 @@ mod tests {
             dragged: true,
         });
         state.browse_cursor = Some(0);
-        state.copy_context_menu = Some(CopyContextMenu {
+        state.context_menu = Some(ChatContextMenu {
             rect: Rect::new(0, 0, 8, 3),
-            target: CopyHitRegion {
+            target: ChatContextMenuTarget::Transcript(CopyHitRegion {
                 rect: Rect::new(0, 0, 5, 1),
                 text: "hello".to_string(),
                 kind: CopyHitKind::Message,
                 group: 0,
-            },
+            }),
+            selected: 0,
         });
 
-        assert!(state.activate_copy_context_menu());
-        assert!(state.copy_context_menu.is_none());
-        assert_eq!(state.transcript_selection, None);
-        assert_eq!(state.browse_cursor, None);
-        assert!(state.info_message.is_some());
+        let request = state.take_context_menu_request().expect("copy request");
+        assert!(state.context_menu.is_none());
         assert!(matches!(
-            state.copy_feedback,
-            Some(CopyFeedback {
-                target: CopyFeedbackTarget::Overlay(_),
+            request,
+            ChatContextMenuRequest::CopyTranscript(CopyHitRegion {
+                kind: CopyHitKind::Message,
+                text,
                 ..
-            })
+            }) if text == "hello"
         ));
     }
 
@@ -9803,14 +10119,14 @@ mod tests {
             "modifier-click outside browse mode should not select the whole message"
         );
         assert_eq!(
-            state.copy_context_menu.is_some(),
+            state.context_menu.is_some(),
             cfg!(target_os = "macos"),
             "Control+click should open the context menu only on macOS"
         );
     }
 
     #[tokio::test]
-    async fn right_click_copy_context_menu_activation_runs_through_mouse_boundary() {
+    async fn right_click_context_menu_activation_runs_through_mouse_boundary() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -9844,7 +10160,7 @@ mod tests {
             let ChatPhase::Active(state) = &chat.phase else {
                 panic!("expected active chat");
             };
-            let menu = state.copy_context_menu.as_ref().expect("menu opens");
+            let menu = state.context_menu.as_ref().expect("menu opens");
             assert!(state.info_message.is_none());
             (menu.rect.x + 1, menu.rect.y + 1)
         };
@@ -9863,7 +10179,7 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert!(state.copy_context_menu.is_none());
+        assert!(state.context_menu.is_none());
         assert!(state.info_message.is_some());
         assert!(matches!(
             state.copy_feedback,
@@ -9875,7 +10191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn outside_click_dismisses_copy_context_menu_without_copying() {
+    async fn outside_click_dismisses_context_menu_without_copying() {
         use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -9907,7 +10223,7 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert!(state.copy_context_menu.is_some());
+        assert!(state.context_menu.is_some());
         chat.handle_mouse(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
@@ -9922,7 +10238,7 @@ mod tests {
         let ChatPhase::Active(state) = &chat.phase else {
             panic!("expected active chat");
         };
-        assert!(state.copy_context_menu.is_none());
+        assert!(state.context_menu.is_none());
         assert!(state.info_message.is_none());
         assert!(state.copy_feedback.is_none());
     }
@@ -11330,6 +11646,240 @@ mod tests {
     }
 
     #[test]
+    fn queue_action_send_now_preserves_payload_and_injected_fifo() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.inject_message("already urgent".to_string(), Vec::new())
+            .unwrap();
+        s.enqueue_message("ordinary one".to_string(), Vec::new())
+            .unwrap();
+        s.enqueue_message("promote me".to_string(), vec![att("keep.txt")])
+            .unwrap();
+        s.enqueue_message("ordinary two".to_string(), Vec::new())
+            .unwrap();
+        let promoted_id = s.message_queue[2].id;
+        s.queue_paused = true;
+
+        assert!(s.promote_queued_by_id(promoted_id));
+        assert!(!s.queue_paused());
+        assert!(s.resume_override);
+        assert_eq!(
+            s.message_queue
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "already urgent",
+                "promote me",
+                "ordinary one",
+                "ordinary two"
+            ]
+        );
+        let promoted = &s.message_queue[1];
+        assert_eq!(promoted.id, promoted_id);
+        assert_eq!(promoted.status, QueueItemStatus::Injected);
+        assert_eq!(promoted.attachments.len(), 1);
+        assert_eq!(promoted.attachments[0].filename, "keep.txt");
+    }
+
+    #[test]
+    fn queue_action_send_now_is_idempotent_for_injected_items() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.inject_message("first".to_string(), Vec::new()).unwrap();
+        s.inject_message("second".to_string(), Vec::new()).unwrap();
+        let second_id = s.message_queue[1].id;
+
+        assert!(s.promote_queued_by_id(second_id));
+        assert!(s.promote_queued_by_id(second_id));
+        assert_eq!(
+            s.message_queue
+                .iter()
+                .map(|message| message.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+    }
+
+    #[test]
+    fn queue_action_menu_targets_clicked_id_and_orders_actions() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("first".to_string(), Vec::new()).unwrap();
+        s.enqueue_message("second".to_string(), Vec::new()).unwrap();
+        let second_id = s.message_queue[1].id;
+        s.queue_sidebar_rect = Some(Rect::new(40, 2, 30, 12));
+        s.queue_item_rects = vec![
+            (s.message_queue[0].id, Rect::new(41, 3, 28, 2)),
+            (second_id, Rect::new(41, 5, 28, 2)),
+        ];
+
+        assert!(s.open_queue_context_menu(45, 5));
+        assert_eq!(s.queue_sel, Some(second_id));
+        let menu = s.context_menu.as_ref().expect("queue menu opens");
+        assert_eq!(menu.target.actions(), QUEUE_CONTEXT_ACTIONS);
+        assert!(matches!(menu.target, ChatContextMenuTarget::Queue(id) if id == second_id));
+
+        s.context_menu_select_step(1);
+        assert_eq!(
+            s.take_context_menu_request(),
+            Some(ChatContextMenuRequest::Queue {
+                id: second_id,
+                action: ChatContextMenuAction::Copy,
+            })
+        );
+    }
+
+    #[test]
+    fn queue_action_menu_navigation_clamps_at_boundaries() {
+        let target = ChatContextMenuTarget::Queue(1);
+        let mut menu = ChatContextMenu {
+            rect: Rect::new(0, 0, 16, 6),
+            target,
+            selected: 0,
+        };
+
+        menu.select_step(-1);
+        assert_eq!(menu.selected_action(), Some(ChatContextMenuAction::SendNow));
+        menu.selected = QUEUE_CONTEXT_ACTIONS.len() - 1;
+        menu.select_step(1);
+        assert_eq!(menu.selected_action(), Some(ChatContextMenuAction::Delete));
+    }
+
+    #[test]
+    fn queue_action_copy_lookup_does_not_mutate_queue() {
+        let mut s = state();
+        s.turn_in_flight = true;
+        s.enqueue_message("copy me".to_string(), vec![att("keep.txt")])
+            .unwrap();
+        s.ensure_queue_selection();
+        let id = s.selected_queue_id().unwrap();
+        let before_selection = s.queue_sel;
+
+        assert_eq!(s.queued_text(id).as_deref(), Some("copy me"));
+        assert_eq!(s.queue_len(), 1);
+        assert_eq!(s.queue_sel, before_selection);
+        assert_eq!(s.message_queue[0].id, id);
+        assert_eq!(s.message_queue[0].status, QueueItemStatus::Pending);
+        assert_eq!(s.message_queue[0].attachments[0].filename, "keep.txt");
+    }
+
+    #[tokio::test]
+    async fn queue_action_send_now_requests_cancel_only_once() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.turn_in_flight = true;
+        active
+            .enqueue_message("send now".to_string(), Vec::new())
+            .unwrap();
+        let id = active.message_queue[0].id;
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let first = tokio::spawn(async move {
+            chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
+                id,
+                action: ChatContextMenuAction::SendNow,
+            })
+            .await;
+            chat
+        });
+        let line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("send now should request cancellation")
+            .expect("writer channel open");
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["method"], method::SESSION_CANCEL);
+        let request_id = request["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &request_id,
+            Some(serde_json::json!({"session_id":"sess-1","cancelled":true})),
+            None,
+        );
+        let mut chat = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("send now should finish after cancel response")
+            .unwrap();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(matches!(state.turn_status, TurnStatus::Cancelling));
+        assert_eq!(state.message_queue[0].status, QueueItemStatus::Injected);
+
+        chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
+            id,
+            action: ChatContextMenuAction::SendNow,
+        })
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "an already-cancelling turn must not emit another cancel request"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_action_send_now_dispatches_after_cancel_failure() {
+        let (tx, mut rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc(Arc::clone(&rpc)));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active.turn_in_flight = true;
+        active
+            .enqueue_message("recover me".to_string(), Vec::new())
+            .unwrap();
+        let id = active.message_queue[0].id;
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        let action = tokio::spawn(async move {
+            chat.execute_context_menu_request(ChatContextMenuRequest::Queue {
+                id,
+                action: ChatContextMenuAction::SendNow,
+            })
+            .await;
+            chat
+        });
+        let cancel_line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("send now should request cancellation")
+            .expect("writer channel open");
+        let cancel: serde_json::Value = serde_json::from_str(&cancel_line).unwrap();
+        let request_id = cancel["id"].as_str().unwrap().to_string();
+        rpc.dispatch_response(
+            &request_id,
+            None,
+            Some(crate::jsonrpc::JsonRpcError {
+                code: -32000,
+                message: "cancel failed".to_string(),
+                data: None,
+            }),
+        );
+        let chat = tokio::time::timeout(Duration::from_secs(2), action)
+            .await
+            .expect("failed cancellation should settle locally")
+            .unwrap();
+        let prompt_line = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("promoted item should dispatch after cancel failure")
+            .expect("writer channel open");
+        let prompt: serde_json::Value = serde_json::from_str(&prompt_line).unwrap();
+        assert_eq!(prompt["method"], method::SESSION_PROMPT);
+        assert_eq!(prompt["params"]["prompt"], "recover me");
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.turn_in_flight);
+        assert!(!state.queue_paused());
+        assert!(state.message_queue.is_empty());
+    }
+
+    #[test]
     fn cancel_pauses_pending_but_injection_resumes() {
         let mut s = state();
         s.turn_in_flight = true;
@@ -11969,6 +12519,52 @@ mod tests {
             unreachable!();
         };
         active
+    }
+
+    #[tokio::test]
+    async fn active_turn_paste_populates_composer_and_queues_on_submit() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.input_bar.clear_input();
+        state.turn_in_flight = true;
+
+        chat.handle_paste("pasted while active");
+
+        let state = active_state(&mut chat);
+        assert_eq!(state.input_bar.input(), "pasted while active");
+        assert!(state.turn_in_flight);
+
+        let InputBarAction::Submit { text, attachments } =
+            state.input_bar.submit_current_input_for_test()
+        else {
+            panic!("pasted input must submit normally");
+        };
+        state
+            .enqueue_message(text.unwrap_or_default(), attachments)
+            .expect("pasted input queues during an active turn");
+
+        assert_eq!(state.queue_len(), 1);
+        assert!(
+            state.take_next_dispatchable().is_none(),
+            "an active turn must not dispatch the queued pasted input"
+        );
+    }
+
+    #[tokio::test]
+    async fn paste_does_not_mutate_composer_while_approval_is_pending() {
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.pending_approval = Some(PendingApproval {
+            request_id: "request-1".to_string(),
+            tool_name: "shell".to_string(),
+            arguments_summary: "pwd".to_string(),
+            timeout_secs: 30,
+        });
+
+        chat.handle_paste(" must not reach the composer");
+
+        assert_eq!(active_state(&mut chat).input_bar.input(), "alpha beta");
     }
 
     #[tokio::test]

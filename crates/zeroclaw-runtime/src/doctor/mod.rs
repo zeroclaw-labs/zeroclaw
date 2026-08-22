@@ -2092,6 +2092,26 @@ mod tests {
     }
 
     #[test]
+    fn diagnose_surfaces_codex_cli_security_boundary_warning() {
+        let mut config = Config::default();
+        config.codex_cli.extra_args =
+            vec!["--sandbox".to_string(), "danger-full-access".to_string()];
+
+        let results = diagnose(&config);
+        let warning = results.iter().find(|item| {
+            item.category == "config"
+                && item.severity == Severity::Warn
+                && item.message.contains("Codex CLI argument")
+                && item.message.contains("--sandbox")
+                && item.message.contains("codex_cli.extra_args[0]")
+        });
+        assert!(
+            warning.is_some(),
+            "doctor should surface the canonical Codex CLI warning: {results:?}"
+        );
+    }
+
+    #[test]
     fn degraded_sections_reported_as_warning() {
         let config = Config {
             degraded_sections: vec!["channels.telegram.default".to_string()],

@@ -44,6 +44,7 @@ pub fn is_tool_loop_cancelled(err: &anyhow::Error) -> bool {
 pub(crate) struct StreamInterruptedAfterOutput {
     pub(crate) partial_text: String,
     pub(crate) message: String,
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
 
 impl std::fmt::Display for StreamInterruptedAfterOutput {
@@ -53,6 +54,23 @@ impl std::fmt::Display for StreamInterruptedAfterOutput {
 }
 
 impl std::error::Error for StreamInterruptedAfterOutput {}
+
+/// A transport stream failure before user-visible output. The cumulative usage
+/// snapshot is retained so Reliable recovery can bill the exact selected
+/// stream attempt once.
+#[derive(Debug)]
+pub(crate) struct StreamErrorWithUsage {
+    pub(crate) message: String,
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+}
+
+impl std::fmt::Display for StreamErrorWithUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StreamErrorWithUsage {}
 
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those
@@ -134,13 +152,18 @@ pub fn terminal_completion_error_message(
 #[derive(Debug)]
 pub(crate) struct StreamCancelledAfterOutput {
     pub(crate) partial_text: String,
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
     cause: ToolLoopCancelled,
 }
 
 impl StreamCancelledAfterOutput {
-    pub(crate) fn new(partial_text: String) -> Self {
+    pub(crate) fn with_usage(
+        partial_text: String,
+        usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    ) -> Self {
         Self {
             partial_text,
+            usage,
             cause: ToolLoopCancelled,
         }
     }
@@ -153,6 +176,35 @@ impl std::fmt::Display for StreamCancelledAfterOutput {
 }
 
 impl std::error::Error for StreamCancelledAfterOutput {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
+/// Cancellation before caller-visible output. The cause remains the canonical
+/// tool-loop cancellation while usage survives for rejected accounting.
+#[derive(Debug)]
+pub(crate) struct StreamCancelledWithUsage {
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    cause: ToolLoopCancelled,
+}
+
+impl StreamCancelledWithUsage {
+    pub(crate) fn new(usage: Option<zeroclaw_providers::traits::TokenUsage>) -> Self {
+        Self {
+            usage,
+            cause: ToolLoopCancelled,
+        }
+    }
+}
+
+impl std::fmt::Display for StreamCancelledWithUsage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("tool loop cancelled")
+    }
+}
+
+impl std::error::Error for StreamCancelledWithUsage {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.cause)
     }
@@ -258,7 +310,7 @@ mod tests {
 
     #[test]
     fn stream_cancelled_after_output_display() {
-        let e = StreamCancelledAfterOutput::new("partial text".to_string());
+        let e = StreamCancelledAfterOutput::with_usage("partial text".to_string(), None);
         assert_eq!(e.to_string(), "tool loop cancelled after streamed output");
         assert_eq!(e.partial_text, "partial text");
     }
@@ -266,14 +318,17 @@ mod tests {
     #[test]
     fn stream_cancelled_after_output_source_chains_to_tool_loop_cancelled() {
         use std::error::Error;
-        let e = StreamCancelledAfterOutput::new(String::new());
+        let e = StreamCancelledAfterOutput::with_usage(String::new(), None);
         let source = e.source().expect("must have source");
         assert!(source.is::<ToolLoopCancelled>());
     }
 
     #[test]
     fn is_tool_loop_cancelled_recognizes_stream_cancelled_after_output() {
-        let e = anyhow::Error::new(StreamCancelledAfterOutput::new("txt".to_string()));
+        let e = anyhow::Error::new(StreamCancelledAfterOutput::with_usage(
+            "txt".to_string(),
+            None,
+        ));
         assert!(is_tool_loop_cancelled(&e));
     }
 }

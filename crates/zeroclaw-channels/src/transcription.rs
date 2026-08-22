@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use reqwest::multipart::{Form, Part};
+use reqwest::{
+    header::HeaderValue,
+    multipart::{Form, Part},
+};
 
 use zeroclaw_config::providers::{TranscriptionProviderEntry, TranscriptionProviders};
 use zeroclaw_config::schema::{Config, TranscriptionConfig};
@@ -12,6 +15,9 @@ const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
 /// Request timeout for transcription API calls (seconds).
 const TRANSCRIPTION_TIMEOUT_SECS: u64 = 120;
+
+const GOOGLE_STT_ENDPOINT: &str = "https://speech.googleapis.com/v1/speech:recognize";
+const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
 
 // ── Audio utilities ─────────────────────────────────────────────
 
@@ -648,6 +654,24 @@ impl GoogleSttProvider {
                 .unwrap_or_else(|| "en-US".to_string()),
         })
     }
+
+    fn sensitive_api_key_header(&self) -> Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(&self.api_key).map_err(|_| {
+            anyhow::Error::msg("Google STT API key contains invalid header characters")
+        })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    fn build_request(&self, request_body: &serde_json::Value) -> Result<reqwest::RequestBuilder> {
+        Ok(
+            zeroclaw_config::schema::build_runtime_proxy_client("transcription.google")
+                .post(GOOGLE_STT_ENDPOINT)
+                .header(GOOGLE_API_KEY_HEADER, self.sensitive_api_key_header()?)
+                .json(request_body)
+                .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS)),
+        )
+    }
 }
 
 #[async_trait]
@@ -666,8 +690,6 @@ impl TranscriptionProvider for GoogleSttProvider {
 
     async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
         let (normalized_name, _) = validate_audio(audio_data, file_name)?;
-
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.google");
 
         let encoding = match normalized_name
             .rsplit_once('.')
@@ -697,15 +719,8 @@ impl TranscriptionProvider for GoogleSttProvider {
             }
         });
 
-        let url = format!(
-            "https://speech.googleapis.com/v1/speech:recognize?key={}",
-            self.api_key
-        );
-
-        let resp = client
-            .post(&url)
-            .json(&request_body)
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
+        let resp = self
+            .build_request(&request_body)?
             .send()
             .await
             .context("Failed to send transcription request to Google STT")?;
@@ -1715,6 +1730,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(google.language_code, "en-US");
+    }
+
+    #[test]
+    fn google_stt_request_uses_sensitive_header_without_url_credential() {
+        let provider = GoogleSttProvider {
+            alias: "default".to_string(),
+            api_key: "api-key-123".to_string(),
+            language_code: "en-US".to_string(),
+        };
+        let body = serde_json::json!({
+            "config": { "languageCode": "en-US" },
+            "audio": { "content": "dGVzdA==" },
+        });
+
+        let request = provider.build_request(&body).unwrap().build().unwrap();
+
+        assert_eq!(request.url().as_str(), GOOGLE_STT_ENDPOINT);
+        assert!(!request.url().as_str().contains("api-key-123"));
+        assert!(!request.url().query_pairs().any(|(name, _)| name == "key"));
+
+        let header = request
+            .headers()
+            .get(GOOGLE_API_KEY_HEADER)
+            .expect("Google API key header");
+        assert_eq!(header.to_str().unwrap(), "api-key-123");
+        assert!(header.is_sensitive());
+
+        let payload = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .expect("JSON request body should be buffered");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(payload).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn google_stt_request_rejects_malformed_header_without_echoing_key() {
+        let api_key = "api-key-123\r\nleaked";
+        let provider = GoogleSttProvider {
+            alias: "default".to_string(),
+            api_key: api_key.to_string(),
+            language_code: "en-US".to_string(),
+        };
+
+        let err = match provider.build_request(&serde_json::json!({})) {
+            Ok(_) => panic!("malformed Google STT API key should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Google STT API key contains invalid header characters"
+        );
+        assert!(!err.to_string().contains(api_key));
     }
 
     #[test]

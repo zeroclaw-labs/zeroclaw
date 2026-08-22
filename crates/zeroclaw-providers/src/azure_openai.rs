@@ -325,6 +325,63 @@ impl AzureOpenAiModelProvider {
         is_reasoning_model.then(|| effort.clone())
     }
 
+    async fn send_native_chat_request(
+        &self,
+        credential: &str,
+        request: &mut NativeChatRequest,
+    ) -> anyhow::Result<reqwest::Response> {
+        let tools_count = request.tools.as_ref().map_or(0, Vec::len);
+        loop {
+            let response = self
+                .http_client()
+                .post(self.chat_completions_url())
+                .header("api-key", credential)
+                .json(request)
+                .send()
+                .await?;
+            if response.status().is_success() {
+                return Ok(response);
+            }
+
+            let status = response.status();
+            let body = response.text().await.unwrap_or_else(|_| {
+                "<failed to read Azure OpenAI error response body>".to_string()
+            });
+            // Retry unless the request already states exactly "none": an
+            // absent reasoning_effort defaults to a non-none effort
+            // server-side, so it is rejected exactly like "high" and must
+            // still be repaired. The comparison is case-sensitive so a
+            // differently-spelled "NONE" is normalized to the canonical value
+            // a case-sensitive endpoint accepts instead of being treated as
+            // already repaired. Setting Some("none") is the fixed point that
+            // bounds this loop to one extra request.
+            if tools_count > 0
+                && request.reasoning_effort.as_deref() != Some("none")
+                && super::rejects_tools_with_reasoning_effort(status, &body)
+            {
+                request.reasoning_effort = Some("none".to_string());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "alias": &self.alias,
+                            "request_api": "chat_completions",
+                            "tools_count": tools_count,
+                            "reasoning_effort_overridden": true,
+                            "reasoning_effort_fallback": "none",
+                            "reasoning_effort_override_reason": "endpoint_rejected_tools_with_reasoning",
+                            "status": status.as_u16(),
+                        })),
+                    "azure_openai: retrying with reasoning effort disabled after endpoint capability rejection"
+                );
+                continue;
+            }
+
+            return Err(super::api_error_from_parts("Azure OpenAI", status, &body));
+        }
+    }
+
     fn convert_tools(tools: Option<&[ToolSpec]>) -> Option<Vec<NativeToolSpec>> {
         tools.map(|items| {
             items
@@ -574,7 +631,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
         })?;
 
         let tools = Self::convert_tools(request.tools);
-        let native_request = NativeChatRequest {
+        let mut native_request = NativeChatRequest {
             messages: Self::convert_messages(request.messages),
             temperature,
             // Omit tool_choice when the tool list is empty — Azure (and
@@ -589,16 +646,8 @@ impl ModelProvider for AzureOpenAiModelProvider {
         };
 
         let response = self
-            .http_client()
-            .post(self.chat_completions_url())
-            .header("api-key", credential.as_str())
-            .json(&native_request)
-            .send()
+            .send_native_chat_request(credential, &mut native_request)
             .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("Azure OpenAI", response).await);
-        }
 
         let native_response: NativeChatResponse = response.json().await?;
         let usage = native_response.usage.map(|u| TokenUsage {
@@ -657,7 +706,7 @@ impl ModelProvider for AzureOpenAiModelProvider {
             )
         };
 
-        let native_request = NativeChatRequest {
+        let mut native_request = NativeChatRequest {
             messages: Self::convert_messages(messages),
             temperature,
             // See above: omit tool_choice when the tool list is empty.
@@ -670,16 +719,8 @@ impl ModelProvider for AzureOpenAiModelProvider {
         };
 
         let response = self
-            .http_client()
-            .post(self.chat_completions_url())
-            .header("api-key", credential.as_str())
-            .json(&native_request)
-            .send()
+            .send_native_chat_request(credential, &mut native_request)
             .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("Azure OpenAI", response).await);
-        }
 
         let native_response: NativeChatResponse = response.json().await?;
         let usage = native_response.usage.map(|u| TokenUsage {
@@ -803,6 +844,395 @@ mod tests {
             .deployment_name("deployment")
             .build();
         assert!(p.credential.is_none());
+    }
+
+    #[test]
+    fn reasoning_effort_for_model_keeps_configured_effort_for_eligible_models() {
+        let p = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+
+        assert_eq!(
+            p.reasoning_effort_for_model("gpt-5"),
+            Some("high".to_string()),
+            "eligible models keep the operator-selected effort"
+        );
+        assert_eq!(
+            p.reasoning_effort_for_model("gpt-5-chat-latest"),
+            None,
+            "ineligible router models still omit reasoning_effort"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_capability_rejection_retries_once_with_reasoning_disabled() {
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let rejects = body.get("tools").is_some()
+                        && body
+                            .get("reasoning_effort")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("none");
+                    bodies.lock().unwrap().push(body);
+                    if rejects {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "Function tools with reasoning effort are not supported",
+                                    "param": "reasoning_effort"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut provider = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .reasoning_effort(Some("high".to_string()))
+            .build();
+        provider.base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "fallback must retry exactly once");
+        assert_eq!(
+            bodies[0]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none")
+        );
+        assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn azure_retries_once_with_reasoning_none_when_unset() {
+        // Regression: the retry guard previously required a pre-existing
+        // non-"none" reasoning_effort, so a deployment that sent no effort at
+        // all never recovered from a tools/reasoning rejection. An omitted
+        // field defaults to a non-none effort server-side, so it must be
+        // repaired the same way an explicit "high" is.
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let rejects = body.get("tools").is_some()
+                        && body
+                            .get("reasoning_effort")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("none");
+                    bodies.lock().unwrap().push(body);
+                    if rejects {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "Function tools with reasoning effort are not supported",
+                                    "param": "reasoning_effort"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut provider = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .reasoning_effort(None)
+            .build();
+        provider.base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "fallback must retry exactly once");
+        assert!(
+            bodies[0].get("reasoning_effort").is_none(),
+            "first request must omit reasoning_effort when none is configured; got: {}",
+            bodies[0]
+        );
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none"),
+            "retry must send an explicit reasoning_effort of none"
+        );
+        assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn azure_does_not_retry_when_reasoning_effort_already_none() {
+        // The "none" fixed point must terminate the loop: an endpoint that
+        // keeps rejecting a request already carrying "none" must see exactly
+        // one request and have its error propagated.
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    bodies.lock().unwrap().push(body);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": {
+                                "message": "Function tools with reasoning effort are not supported",
+                                "param": "reasoning_effort"
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut provider = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .reasoning_effort(Some("none".to_string()))
+            .build();
+        provider.base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let result = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await;
+        assert!(result.is_err(), "persistent rejection must propagate");
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "a request already carrying none must not be retried"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn azure_retry_normalizes_uppercase_reasoning_effort_on_the_wire() {
+        // Wire-payload regression: a case-sensitive endpoint rejects an
+        // operator-supplied "NONE", and the retry must carry the canonical
+        // lowercase spelling instead of treating "NONE" as already repaired.
+        use axum::Json;
+        use axum::Router;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let bodies = Arc::new(Mutex::new(Vec::<serde_json::Value>::new()));
+        let bodies_for_route = Arc::clone(&bodies);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                let bodies = Arc::clone(&bodies_for_route);
+                async move {
+                    let rejects = body.get("tools").is_some()
+                        && body
+                            .get("reasoning_effort")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("none");
+                    bodies.lock().unwrap().push(body);
+                    if rejects {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "error": {
+                                    "message": "Function tools with reasoning effort are not supported",
+                                    "param": "reasoning_effort"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{"message": {"content": "ok"}}]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut provider = AzureOpenAiModelProvider::builder("test")
+            .resource_name("resource")
+            .deployment_name("deployment")
+            .credential(Some("key"))
+            .reasoning_effort(Some("NONE".to_string()))
+            .build();
+        provider.base_url = format!("http://{addr}");
+        let messages = vec![ChatMessage::user("hello")];
+        let tools = vec![zeroclaw_api::tool::ToolSpec::new(
+            "get_weather",
+            "Get weather",
+            serde_json::json!({"type": "object", "properties": {}}),
+        )];
+
+        let response = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: Some(&tools),
+                    thinking: None,
+                },
+                "gpt-5",
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.text.as_deref(), Some("ok"));
+
+        let bodies = bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 2, "fallback must retry exactly once");
+        assert_eq!(
+            bodies[0]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("NONE"),
+            "the first request preserves the operator-supplied spelling"
+        );
+        assert_eq!(
+            bodies[1]
+                .get("reasoning_effort")
+                .and_then(serde_json::Value::as_str),
+            Some("none"),
+            "the retry must normalize to the canonical lowercase none"
+        );
+        assert!(bodies.iter().all(|body| body.get("tools").is_some()));
+        server.abort();
     }
 
     #[test]

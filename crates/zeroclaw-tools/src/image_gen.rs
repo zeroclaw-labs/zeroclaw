@@ -27,7 +27,7 @@ fn parse_public_https_url(raw_url: &str) -> anyhow::Result<(reqwest::Url, String
         anyhow::bail!("Generated image URL must be a non-empty URL without whitespace");
     }
 
-    let url = reqwest::Url::parse(raw_url).context("Invalid generated image URL")?;
+    let mut url = reqwest::Url::parse(raw_url).context("Invalid generated image URL")?;
     if url.scheme() != "https" {
         anyhow::bail!("Generated image URL must use HTTPS");
     }
@@ -49,6 +49,18 @@ fn parse_public_https_url(raw_url: &str) -> anyhow::Result<(reqwest::Url, String
     }
     if ip_literal.is_some_and(domain_guard::is_cloud_metadata_ip) {
         anyhow::bail!("Generated image URL targets a cloud metadata host");
+    }
+
+    // Request the host that was validated, not the raw spelling. Normalization
+    // can change the host (a leading dot is stripped), and the DNS pin applied
+    // by `generated_image_client_with_builder` is keyed on the normalized host.
+    // Without this, `resolve_to_addrs` never matches the request host and
+    // reqwest silently falls back to its own unvalidated lookup. IP-literal
+    // hosts are left alone: they carry no DNS pin, and `set_host` rejects the
+    // unbracketed IPv6 form that normalization produces.
+    if ip_literal.is_none() {
+        url.set_host(Some(&host))
+            .map_err(|_| anyhow::Error::msg("Generated image URL host is invalid"))?;
     }
 
     let port = url
@@ -625,6 +637,28 @@ mod tests {
     #[test]
     fn generated_image_target_rejects_trailing_dot_host() {
         assert!(parse_public_https_url("https://example.com./image.png").is_err());
+    }
+
+    /// The returned URL must carry the host that was actually validated, not
+    /// the raw spelling. `normalize_domain` strips a leading dot, so
+    /// `https://.example.com/` validates and pins `example.com` while the raw
+    /// URL still asks for `.example.com`. The pin is keyed on the normalized
+    /// host, so a mismatch means `resolve_to_addrs` never matches and reqwest
+    /// performs its own unvalidated lookup for the request host.
+    #[test]
+    fn generated_image_target_url_host_matches_the_validated_host() {
+        let (url, host, _port) = parse_public_https_url("https://.example.com/img.png")
+            .expect("leading-dot host normalizes to a public host");
+
+        assert_eq!(host, "example.com", "host must normalize");
+        assert_eq!(
+            url.host_str(),
+            Some(host.as_str()),
+            "returned URL must request the validated host, otherwise the DNS \
+             pin keyed on '{host}' never matches and reqwest re-resolves \
+             '{:?}' unvalidated",
+            url.host_str()
+        );
     }
 
     #[tokio::test]
