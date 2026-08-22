@@ -175,7 +175,13 @@ where
                  call create_memory_with_storage_and_routes instead of create_memory_with_builders"
             )
         }
-        MemoryBackendKind::Qdrant | MemoryBackendKind::Markdown => wrap_scanned_and_audit(
+        MemoryBackendKind::Qdrant => {
+            anyhow::bail!(
+                "memory backend 'qdrant' is not supported by this operation; choose sqlite, lucid, \
+                 or markdown"
+            )
+        }
+        MemoryBackendKind::Markdown => wrap_scanned_and_audit(
             MarkdownMemory::new("markdown", workspace_dir),
             policy,
             workspace_dir,
@@ -2087,6 +2093,57 @@ store_timeout_ms = 40000
             error.to_string().contains("full Config"),
             "error should require config-aware construction: {error}"
         );
+    }
+
+    /// Regression for the builder-only factory: `qdrant` must never silently
+    /// degrade to the Markdown fallback. On the pre-fix code this returned a
+    /// working handle named "markdown"; now it is an explicit error naming
+    /// supported targets without exposing an internal factory function.
+    #[test]
+    fn builder_only_factory_rejects_qdrant_instead_of_markdown_fallback() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.memory.backend = "qdrant".into();
+        config.data_dir = tmp.path().to_path_buf();
+        let error = create_memory_for_migration(&config)
+            .err()
+            .expect("backend=qdrant must be rejected by the builder-only factory");
+        let message = error.to_string();
+        assert!(
+            message.contains("not supported")
+                && message.contains("sqlite")
+                && message.contains("lucid")
+                && message.contains("markdown"),
+            "error should direct operators to supported targets: {message}"
+        );
+        assert!(!message.contains("create_memory_"));
+    }
+
+    /// The storage-aware factory still accepts Qdrant when a
+    /// `[storage.qdrant.<alias>]` entry with a URL resolves (construction is
+    /// lazy; no server contact happens here).
+    #[test]
+    fn storage_aware_factory_still_builds_qdrant_with_storage_config() {
+        use zeroclaw_config::schema::QdrantStorageConfig;
+        let tmp = TempDir::new().unwrap();
+        let cfg = MemoryConfig {
+            backend: "qdrant.default".into(),
+            ..MemoryConfig::default()
+        };
+        let storage = QdrantStorageConfig {
+            url: Some("http://localhost:6333".into()),
+            ..QdrantStorageConfig::default()
+        };
+        let mem = create_memory_with_storage_and_routes(
+            &cfg,
+            &[],
+            ActiveStorage::Qdrant(&storage),
+            tmp.path(),
+            None,
+            None,
+        )
+        .expect("qdrant with resolved storage config must still construct");
+        assert_eq!(mem.name(), "qdrant");
     }
 
     #[test]
