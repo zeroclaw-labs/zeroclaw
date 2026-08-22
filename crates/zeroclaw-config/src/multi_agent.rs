@@ -3,7 +3,7 @@
 //! [`crate::schema::AliasedAgentConfig`] and [`crate::schema::Config`].
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use zeroclaw_macros::Configurable;
 
@@ -79,6 +79,61 @@ pub struct AgentMemoryConfig {
     /// The backend kind this agent uses. Defaults to `Sqlite` for new
     /// agents; once an agent has on-disk data the value is locked.
     pub backend: MemoryBackendKind,
+}
+
+/// How this agent's spawned-tool `HOME` is resolved. Default `Inherit`
+/// preserves today's behavior (the daemon's real `$HOME`, shared across
+/// every agent).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum HomeMode {
+    /// Inherit the daemon's real `$HOME` (today's behavior).
+    #[default]
+    Inherit,
+    /// Use a directory inside the agent's own workspace
+    /// (`<agent_workspace>/home/`, created on demand) as `HOME`.
+    Workspace,
+    /// Use `AgentEnvConfig::home_path`, resolved and validated to stay
+    /// inside the agent's workspace boundary unless
+    /// `AgentWorkspaceConfig::unrestricted_filesystem` is set. See
+    /// `SecurityPolicy::for_agent`.
+    Custom,
+}
+
+/// Per-agent environment injection and HOME confinement
+/// (`[agents.<alias>.env]`). Distinct from
+/// `RiskProfileConfig::shell_env_passthrough` (a NAME allowlist of host env
+/// vars whose VALUES are copied from the daemon's own trusted ambient
+/// environment) — these are explicit `KEY=VALUE` pairs and an explicit
+/// `HOME` override, both fully operator-controlled config, never
+/// model-controlled at runtime. Same trust model as `McpServerConfig::env`.
+/// Applies to the `shell` tool today; other spawn-based tools can adopt
+/// the same `SecurityPolicy` fields later.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "agent_env"]
+#[serde(default)]
+pub struct AgentEnvConfig {
+    /// Explicit `KEY=VALUE` pairs injected into subprocesses this agent
+    /// spawns, on top of (and overriding) the safe-env snapshot and any
+    /// TUI-forwarded environment. Treated as secret, matching
+    /// `McpServerConfig::env`, since these commonly carry credentials
+    /// (e.g. `GITHUB_TOKEN`) for spawned tools.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub vars: HashMap<String, String>,
+    /// How `HOME` is resolved for this agent's spawned subprocesses.
+    pub home_mode: HomeMode,
+    /// Custom `HOME` path, used only when `home_mode = "custom"`. Relative
+    /// paths resolve against the agent's workspace; absolute paths must
+    /// still resolve inside the workspace boundary unless
+    /// `workspace.unrestricted_filesystem = true`. Ignored for
+    /// `inherit`/`workspace` modes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub home_path: Option<PathBuf>,
 }
 
 /// Preferred output modality for a peer group.

@@ -368,18 +368,41 @@ impl Tool for ShellTool {
             }
         }
 
+        // Per-agent explicit env vars (agents.<alias>.env.vars) are
+        // deliberate operator config, not ambient/inherited env — they win
+        // over both the safe-env snapshot AND the TUI overlay. An operator
+        // who pins a value for this agent should get that value even when
+        // a connected TUI's shell happens to export something else.
+        for (k, v) in &self.security.env_vars {
+            cmd.env(k, v);
+        }
+
+        // Per-agent HOME override (agents.<alias>.env.home_mode), resolved
+        // and workspace-confined by SecurityPolicy::for_agent. Applied
+        // after the blanket env_vars loop so it always wins even if
+        // `env_vars` also happens to contain a HOME key.
+        if let Some(ref home) = self.security.home_override {
+            cmd.env("HOME", home);
+            #[cfg(target_os = "windows")]
+            {
+                cmd.env("USERPROFILE", home);
+            }
+        }
+
         // Android: platform tools (sh, getprop, am, dumpsys, content, pm, ...)
         // live in /system/bin and /system/xbin. The cleared+rebuilt PATH above
         // may omit them, leaving the shell unable to resolve any platform tool.
         // Detect Android at runtime (works for bionic and musl builds).
         if is_android() {
             let ambient = std::env::var("PATH").unwrap_or_default();
-            let tui_path = self
-                .tui_env
-                .as_ref()
-                .and_then(|env| env.get("PATH"))
-                .map(String::as_str);
-            cmd.env("PATH", android_child_path(tui_path, &ambient));
+            // Same precedence as the overlays above: a PATH pinned in
+            // `agents.<alias>.env.vars` outranks the TUI's, which outranks
+            // the daemon's ambient one. The platform dirs are still
+            // prepended in every case — without them the Android shell
+            // cannot resolve `sh` itself, so a pinned PATH extends the
+            // lookup rather than replacing it outright.
+            let path_override = resolved_path_override(&self.security.env_vars, &self.tui_env);
+            cmd.env("PATH", android_child_path(path_override, &ambient));
         }
 
         let timeout_secs = self.timeout_secs;
@@ -567,8 +590,26 @@ fn append_truncation_marker(output: &mut String, marker: &str) {
 /// (`/system/bin:/system/xbin`) are prefixed onto the curated PATH, with a
 /// TUI-provided PATH winning over the daemon's ambient PATH. Yields the bare
 /// platform dirs when the resolved base is empty.
-fn android_child_path(tui_path: Option<&str>, ambient_path: &str) -> String {
-    let base = tui_path.unwrap_or(ambient_path);
+/// Highest-precedence `PATH` among the env overlays applied to a spawned
+/// subprocess: a value pinned in `agents.<alias>.env.vars` outranks the
+/// TUI's forwarded one, matching the order those overlays are applied in
+/// `ShellTool::execute`. `None` means neither overlay set `PATH`, so the
+/// daemon's ambient value stands.
+fn resolved_path_override<'a>(
+    env_vars: &'a std::collections::BTreeMap<String, String>,
+    tui_env: &'a Option<HashMap<String, String>>,
+) -> Option<&'a str> {
+    env_vars
+        .get("PATH")
+        .or_else(|| tui_env.as_ref().and_then(|env| env.get("PATH")))
+        .map(String::as_str)
+}
+
+/// Build the Android child PATH: platform dirs always first, then the
+/// highest-precedence PATH the caller resolved (per-agent `env.vars`, else
+/// the TUI's, else the daemon's ambient one).
+fn android_child_path(override_path: Option<&str>, ambient_path: &str) -> String {
+    let base = override_path.unwrap_or(ambient_path);
     if base.is_empty() {
         "/system/bin:/system/xbin".to_string()
     } else {
@@ -592,6 +633,43 @@ mod tests {
         assert_eq!(
             super::android_child_path(None, ""),
             "/system/bin:/system/xbin"
+        );
+    }
+
+    #[test]
+    fn resolved_path_override_prefers_agent_env_over_tui_env() {
+        let mut env_vars = std::collections::BTreeMap::new();
+        env_vars.insert("PATH".to_string(), "/opt/pinned/bin".to_string());
+        let mut tui = std::collections::HashMap::new();
+        tui.insert("PATH".to_string(), "/tui/bin".to_string());
+
+        // Agent config wins over the TUI overlay.
+        assert_eq!(
+            super::resolved_path_override(&env_vars, &Some(tui.clone())),
+            Some("/opt/pinned/bin")
+        );
+        // TUI still wins over ambient when the agent pins nothing.
+        assert_eq!(
+            super::resolved_path_override(&std::collections::BTreeMap::new(), &Some(tui)),
+            Some("/tui/bin")
+        );
+        // Neither set: caller falls back to the daemon's ambient PATH.
+        assert_eq!(
+            super::resolved_path_override(&std::collections::BTreeMap::new(), &None),
+            None
+        );
+    }
+
+    #[test]
+    fn android_child_path_keeps_platform_dirs_ahead_of_pinned_agent_path() {
+        // A per-agent PATH extends the Android lookup; it must not drop
+        // the platform dirs, or the child shell cannot resolve `sh`.
+        let mut env_vars = std::collections::BTreeMap::new();
+        env_vars.insert("PATH".to_string(), "/opt/pinned/bin".to_string());
+        let resolved = super::resolved_path_override(&env_vars, &None);
+        assert_eq!(
+            super::android_child_path(resolved, "/daemon"),
+            "/system/bin:/system/xbin:/opt/pinned/bin"
         );
     }
 
@@ -1425,6 +1503,23 @@ mod tests {
         })
     }
 
+    fn test_security_with_agent_env(
+        vars: &[(&str, &str)],
+        home_override: Option<std::path::PathBuf>,
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec![env_print_command().into()],
+            env_vars: vars
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            home_override,
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[cfg(target_os = "windows")]
     fn env_print_command() -> &'static str {
         "set"
@@ -2082,5 +2177,154 @@ mod tests {
             env_output_contains_assignment(&result.output, "SSH_AUTH_SOCK", "/tmp/fake.sock"),
             "SSH_AUTH_SOCK from tui_env must reach subprocess"
         );
+    }
+
+    // ── Per-agent env / HOME overlay tests ──────────────────────────
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_agent_env_vars_are_passed_to_subprocess() {
+        let tool = ShellTool::new(
+            test_security_with_agent_env(&[("ZC_AGENT_TEST_VAR", "agent_injected")], None),
+            test_runtime(),
+        );
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+        assert!(
+            env_output_contains_assignment(&result.output, "ZC_AGENT_TEST_VAR", "agent_injected"),
+            "agent-configured env var should appear in subprocess env, got:\n{}",
+            result.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_agent_env_vars_override_tui_env_on_conflict() {
+        // Explicit per-agent config (agents.<alias>.env.vars) is deliberate
+        // operator intent and must win over ambient TUI-forwarded env.
+        let tool = ShellTool::new(
+            test_security_with_agent_env(&[("ZC_CONFLICT_VAR", "agent_wins")], None),
+            test_runtime(),
+        )
+        .with_tui_env(Some({
+            let mut m = std::collections::HashMap::new();
+            m.insert("ZC_CONFLICT_VAR".to_string(), "tui_loses".to_string());
+            m
+        }));
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+        assert!(
+            env_output_contains_assignment(&result.output, "ZC_CONFLICT_VAR", "agent_wins"),
+            "per-agent env var should win over tui_env on conflict, got:\n{}",
+            result.output
+        );
+        assert!(
+            !env_output_contains_assignment(&result.output, "ZC_CONFLICT_VAR", "tui_loses"),
+            "tui_env value must not leak through when the agent config overrides it, got:\n{}",
+            result.output
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_home_override_sets_home_in_subprocess() {
+        let home_dir = std::env::temp_dir().join(format!(
+            "zeroclaw-shell-home-override-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home_dir).unwrap();
+
+        let tool = ShellTool::new(
+            test_security_with_agent_env(&[], Some(home_dir.clone())),
+            test_runtime(),
+        );
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+        assert!(
+            env_output_contains_assignment(
+                &result.output,
+                home_env_key(),
+                &home_dir.display().to_string()
+            ),
+            "home_override should set {} in subprocess env, got:\n{}",
+            home_env_key(),
+            result.output
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_home_override_none_inherits_daemon_home() {
+        // No agent-configured home_override: HOME must come from the
+        // existing SAFE_ENV_VARS-sourced daemon env, unchanged.
+        let tool = ShellTool::new(test_security_with_agent_env(&[], None), test_runtime());
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+        assert!(
+            env_output_contains_key(&result.output, home_env_key()),
+            "{} should still be available without an agent home_override",
+            home_env_key()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shell_home_override_wins_over_tui_env_home() {
+        let home_dir = std::env::temp_dir().join(format!(
+            "zeroclaw-shell-home-vs-tui-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home_dir).unwrap();
+        let home_key = home_env_key();
+
+        let tool = ShellTool::new(
+            test_security_with_agent_env(&[], Some(home_dir.clone())),
+            test_runtime(),
+        )
+        .with_tui_env(Some({
+            let mut m = std::collections::HashMap::new();
+            m.insert(home_key.to_string(), "tui-home".to_string());
+            m
+        }));
+
+        let result = tool
+            .execute(json!({"command": env_print_command()}))
+            .await
+            .expect("environment print command should succeed");
+
+        assert!(result.success);
+        assert!(
+            env_output_contains_assignment(
+                &result.output,
+                home_key,
+                &home_dir.display().to_string()
+            ),
+            "home_override should win over a tui_env-forwarded {home_key}, got:\n{}",
+            result.output
+        );
+        assert!(
+            !env_output_contains_assignment(&result.output, home_key, "tui-home"),
+            "tui_env {home_key} must not leak through when home_override is set, got:\n{}",
+            result.output
+        );
+
+        let _ = std::fs::remove_dir_all(&home_dir);
     }
 }

@@ -81,3 +81,25 @@ An agent's identity (its personality) is sourced per agent:
 The `format` selects how the identity is loaded. The default reads the
 project's personality files; the alternative loads an AIEOS JSON definition,
 either from a path relative to the workspace or inline.
+
+## Environment
+
+Subprocesses an agent spawns (the `shell` tool today) can be given explicit
+env vars and a confined `HOME`, scoped to that one agent:
+
+{{#config-fields agents.env}}
+
+- **`vars`** are explicit `KEY=VALUE` pairs injected into every subprocess
+  this agent spawns, on top of (and overriding) the safe-env snapshot and any
+  TUI-forwarded environment. This allows setting literal values, fully
+  user-controlled, the same trust model as an MCP server's `env` block.
+  One exception to "overriding": on Android, `/system/bin` and
+  `/system/xbin` are always prepended to `PATH`, so a `PATH` pinned here
+  extends the platform lookup rather than replacing it, without those
+  directories the child shell cannot resolve `sh` itself.
+- **`home_mode`** controls what `HOME` resolves to for this agent's
+  subprocesses: `inherit` (default) keeps normal behavior, the daemon's
+  real `$HOME`, shared across every agent. `workspace` points `HOME` at
+  `agents/<alias>/workspace/home/`, created on demand. `custom` uses
+  `home_path`, which is validated to stay inside the agent's workspace
+  boundary unless `workspace.unrestricted-filesystem = true`.
