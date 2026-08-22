@@ -2425,6 +2425,41 @@ fn typed_hailo_factory_rejects_conflicting_authorization_sources() {
 }
 
 #[test]
+fn typed_hailo_factory_rejects_case_insensitive_duplicate_extra_headers() {
+    let config = HailoOllamaModelProviderConfig::default();
+    let options = ModelProviderRuntimeOptions {
+        extra_headers: [
+            (
+                "Authorization".to_string(),
+                "Bearer first-token".to_string(),
+            ),
+            (
+                "authorization".to_string(),
+                "Bearer second-token".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+
+    let error = hailo_provider_from_public_factory(
+        &config,
+        "duplicate_extra_headers",
+        None,
+        Some("http://127.0.0.1:8000"),
+        &options,
+    )
+    .err()
+    .expect("case-insensitive duplicate extra headers must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("duplicate"));
+    assert!(message.contains("case-insensitive"));
+    assert!(!message.contains("first-token"));
+    assert!(!message.contains("second-token"));
+}
+
+#[test]
 fn typed_hailo_factory_rejects_unsupported_shared_options() {
     let config = HailoOllamaModelProviderConfig::default();
     let cases = [
