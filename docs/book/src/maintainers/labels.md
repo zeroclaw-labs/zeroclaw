@@ -43,11 +43,13 @@ Some legacy labels may remain live during a staged migration. New or manual appl
 
 Live PR label automation is split by source. `pr-path-labeler.yml` runs `actions/labeler` from `.github/labeler.yml` on PR open, reopen, and every pushed update. Because that workflow uses `sync-labels: true`, labels owned by `.github/labeler.yml` are recalculated from the current PR file set: matching path labels are added, and path labels that no longer match are removed.
 
+`pr-size-labeler.yml` owns canonical `size:*` labels. It runs on PR open, reopen, and every pushed update, reads GitHub PR file metadata from the API, and applies the one canonical size label that matches the effective changed-line count. The workflow fetches the classifier script from the trusted workflow/default-branch revision; it must not check out, build, import, source, or execute pull-request code in its elevated label-writing context.
+
 Dependabot also seeds configured labels on its own PRs from `.github/dependabot.yml`: Cargo updates get `dependencies`; GitHub Actions and Docker updates get `ci` and `dependencies`. Those labels are initial Dependabot PR metadata, not the synchronized path-labeler contract.
 
-Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`, `channel`, `provider:openai`, and `tool:file`. It does not own `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels.
+Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`, `channel`, `provider:openai`, and `tool:file`. It does not own `risk:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels.
 
-If risk or size automation is added later, it should recalculate on every pushed PR update so the labels continue to describe the actual diff under review. Risk automation must honor `risk:manual` as an override that prevents future automated risk replacement for that PR until a maintainer removes the override.
+If risk automation is added later, it should recalculate on every pushed PR update so the labels continue to describe the actual diff under review. Risk automation must honor `risk:manual` as an override that prevents future automated risk replacement for that PR until a maintainer removes the override.
 
 ## Cleanup protocol
 
@@ -283,9 +285,11 @@ Tools are grouped by logical function rather than one label per file.
 
 ## Size labels
 
-Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Currently applied **manually**; the size automation that previously computed these was removed during CI simplification. Future size automation should follow the [automation contract](#automation-contract).
+Based on effective changed line count, normalized for docs-only and lockfile-heavy PRs. Applied automatically by `pr-size-labeler.yml` from GitHub PR file metadata.
 
 New or manual applications should use the canonical no-space labels below. Existing legacy open refs may keep spaced labels until the open-reference migration packet handles them; see [Canonical spelling](#canonical-spelling).
+
+Effective changed lines are additions plus deletions after excluding docs-like files and `Cargo.lock`. Docs-like files are paths under `docs/`, Markdown or MDX files, `.github/ISSUE_TEMPLATE/**`, `.github/pull_request_template.md`, `.markdownlint-cli2.yaml`, and `LICENSE`. The size workflow manages only canonical no-space `size:*` labels; it does not delete legacy spaced labels as a side effect.
 
 | Label | Threshold |
 |---|---|

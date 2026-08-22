@@ -788,7 +788,7 @@ Configure these in the Project's built-in automation settings:
 
 **Auto-label by changed files:**
 
-The active path labeler applies scope labels to PRs based on changed files. Risk and size labels are currently maintainer-applied; the maintainer label guide is the live source for label names, automation status, and risk semantics.
+The active path labeler applies scope labels to PRs based on changed files, and the active size labeler recalculates canonical `size:*` labels from PR file metadata. Risk labels remain maintainer-applied; the maintainer label guide is the live source for label names, automation status, and risk semantics.
 
 **Auto-request CODEOWNERS review (built into CODEOWNERS: no Action needed):**
 
@@ -798,9 +798,9 @@ GitHub enforces CODEOWNERS automatically when the file exists and branch protect
 
 No GitHub Actions stale workflow is currently configured in the repository. Maintainers run stale passes to prevent inactive issues from accumulating while preserving a defined response window for the affected community. The [issue stale policy](../maintainers/labels.md#issue-stale-policy) is the sole operational source for timing, qualifying activity, exclusions, and re-engagement; the issue-triage protocol carries only the execution mechanics.
 
-**PR size labeling (future/optional):**
+**PR size labeling (active):**
 
-If size automation is added later, it should follow the maintainer label guide's live names (`size:XS` through `size:XL`) and recalculate on pushed updates so the label describes the diff under review. Until then, size labels are maintainer-applied.
+The size labeler follows the maintainer label guide's live names (`size:XS` through `size:XL`) and recalculates on PR open, reopen, and pushed updates so the label describes the diff under review. It reads GitHub PR metadata and executes only the trusted classifier from the workflow revision; it does not check out or execute pull-request code.
 
 **Milestone check on PR merge (`.github/workflows/milestone-check.yml`):**
 
@@ -859,7 +859,7 @@ Establish the full workflow and populate the backlog from the accepted RFCs.
 
 As the plugin system becomes usable, external contributors will start arriving. The contribution infrastructure must be ready.
 
-- [ ] Implement the PR size labeling workflow
+- [x] Implement the PR size labeling workflow
 - [ ] Create the first batch of `good first issue` items (minimum 5) for the plugin SDK work
 - [ ] Add the `Good First Issue Index` as a pinned issue with links to current good first issues
 - [ ] Establish the idea promotion threshold and promote the first Discussion idea to an issue

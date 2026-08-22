@@ -716,13 +716,14 @@ jobs:
           for path in (
               ".github/workflows/ci.yml",
               ".github/workflows/project-dashboard-plan.yml",
+              ".github/workflows/pr-size-labeler.yml",
               ".github/workflows/release-stable-manual.yml",
           ):
               yaml.safe_load(open(path))
               print(f"{path}: valid")
           PY
-      - name: Validate project dashboard planner
-        run: python3 scripts/github/project_dashboard_plan_test.py
+      - name: Validate GitHub helper scripts
+        run: python3 -m unittest discover -s scripts/github -p '*_test.py'
       - name: Install cargo-audit
         run: |
           curl -LsSf https://github.com/rustsec/rustsec/releases/download/cargo-audit%2Fv0.22.2/cargo-audit-x86_64-unknown-linux-gnu-v0.22.2.tgz \
