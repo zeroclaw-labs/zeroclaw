@@ -135,9 +135,29 @@ type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
 /// Live channel registry consulted by `deliver_announcement` so cron sends reuse the
 /// authenticated channel instance (Matrix E2EE can't tolerate per-send session restore).
-/// Replaced wholesale by each `start_channels` call.
+/// Replaced wholesale by the active channel task and cleared when that task ends.
 static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
     std::sync::RwLock::new(None);
+
+/// Owns one published registry generation for the lifetime of its channel task.
+/// A stale task must not clear a newer task's replacement when it finally exits.
+struct CronChannelRegistryLease {
+    published: CronChannelRegistry,
+}
+
+impl Drop for CronChannelRegistryLease {
+    fn drop(&mut self) {
+        let mut current = CRON_CHANNEL_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|registry| Arc::ptr_eq(registry, &self.published))
+        {
+            *current = Some(Arc::new(HashMap::new()));
+        }
+    }
+}
 
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
@@ -9762,6 +9782,19 @@ fn configured_channel_map(configured: &[ConfiguredChannel]) -> HashMap<String, A
     map
 }
 
+fn publish_cron_channel_registry(
+    configured: &[ConfiguredChannel],
+) -> (CronChannelRegistry, CronChannelRegistryLease) {
+    let registry = Arc::new(configured_channel_map(configured));
+    *CRON_CHANNEL_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&registry));
+    let lease = CronChannelRegistryLease {
+        published: Arc::clone(&registry),
+    };
+    (registry, lease)
+}
+
 fn find_channel_for_message<'a>(
     channels: &'a HashMap<String, Arc<dyn Channel>>,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -12060,6 +12093,7 @@ pub async fn start_channels(
         };
 
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
+    let mut cron_channel_registry_lease: Option<CronChannelRegistryLease> = None;
     let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -12426,11 +12460,10 @@ pub async fn start_channels(
                      `channel-filesystem`; skipping Filesystem."
                 );
             }
-            let channels: Vec<Arc<dyn Channel>> = configured_channels
-                .iter()
-                .map(|cc| Arc::clone(&cc.channel))
-                .collect();
-            if channels.is_empty() {
+            let (channels_by_name, registry_lease) =
+                publish_cron_channel_registry(&configured_channels);
+            cron_channel_registry_lease = Some(registry_lease);
+            if configured_channels.is_empty() {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -12485,17 +12518,12 @@ pub async fn start_channels(
             }
             drop(tx);
 
-            // Composite-key registry (see `composite_channel_key`).
-            let cbn = Arc::new(configured_channel_map(&configured_channels));
-            *CRON_CHANNEL_REGISTRY
-                .write()
-                .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cbn));
-
-            let in_flight = max_in_flight_messages_for_config(channels.len(), &config.channels);
+            let in_flight =
+                max_in_flight_messages_for_config(configured_channels.len(), &config.channels);
             println!("  🚦 In-flight message limit: {in_flight}");
 
             max_in_flight_messages = Some(in_flight);
-            channels_by_name_shared = Some(cbn);
+            channels_by_name_shared = Some(channels_by_name);
             rx_holder = Some(rx);
         }
 
@@ -12736,6 +12764,7 @@ pub async fn start_channels(
     for h in listener_handles {
         let _ = h.await;
     }
+    drop(cron_channel_registry_lease);
 
     Ok(())
 }
@@ -14492,6 +14521,73 @@ temperature = 0.3
         assert!(
             !map.contains_key("discord"),
             "bare key would be ambiguous for multiple aliases"
+        );
+    }
+
+    struct CronChannelRegistryRestore(Option<CronChannelRegistry>);
+
+    impl Drop for CronChannelRegistryRestore {
+        fn drop(&mut self) {
+            *CRON_CHANNEL_REGISTRY
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = self.0.take();
+        }
+    }
+
+    #[tokio::test]
+    async fn ending_channel_task_clears_stale_delivery_handles() {
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let stale = mock_channel("wecom_ws");
+        let (_published, stale_lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WeCom WebSocket",
+            alias: Some("removed".to_string()),
+            channel: stale,
+        }]);
+
+        let current = mock_channel("wecom_ws");
+        let (_published, current_lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WeCom WebSocket",
+            alias: Some("current".to_string()),
+            channel: current,
+        }]);
+
+        drop(stale_lease);
+        assert!(
+            CRON_CHANNEL_REGISTRY
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|registry| registry.contains_key("wecom_ws.current")),
+            "ending an older task must not clear the newer registry generation"
+        );
+
+        drop(current_lease);
+
+        let registry = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("ended channel task must publish an initialized empty registry");
+        assert!(registry.is_empty());
+
+        let err = deliver_announcement(
+            &Config::default(),
+            "wecom_ws.removed",
+            "recipient",
+            None,
+            "message",
+        )
+        .await
+        .expect_err("removed channel must not use its stale live handle");
+        assert!(
+            err.to_string()
+                .contains("[channels.wecom_ws.removed] not configured"),
+            "delivery must fall back to the current empty config: {err:#}"
         );
     }
 
