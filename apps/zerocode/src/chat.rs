@@ -7332,6 +7332,52 @@ impl ChatState {
 
     fn load_history(&mut self, messages: Vec<crate::client::MessageEntry>) {
         for m in messages {
+            match m.kind {
+                crate::client::MessageEntryKind::ToolCall => {
+                    let input_json = m
+                        .tool_input
+                        .as_ref()
+                        .and_then(|value| serde_json::to_string(value).ok())
+                        .unwrap_or_else(|| "null".to_string());
+                    self.entries.push(ChatEntry::Tool {
+                        tool_call_id: Arc::<str>::from(m.tool_call_id.unwrap_or_default()),
+                        name: Arc::<str>::from(
+                            m.tool_name.unwrap_or_else(|| "unknown".to_string()),
+                        ),
+                        input_json: Arc::<str>::from(input_json),
+                        result: m.tool_output.map(Arc::<str>::from),
+                    });
+                    continue;
+                }
+                crate::client::MessageEntryKind::ToolResult => {
+                    let tool_call_id = m.tool_call_id.unwrap_or_default();
+                    if let Some(ChatEntry::Tool { result, .. }) =
+                        self.entries.iter_mut().rev().find(|entry| {
+                            matches!(
+                                entry,
+                                ChatEntry::Tool {
+                                    tool_call_id: id,
+                                    result: None,
+                                    ..
+                                } if id.as_ref() == tool_call_id
+                            )
+                        })
+                    {
+                        *result = Some(Arc::<str>::from(m.tool_output.unwrap_or(m.content)));
+                    } else {
+                        self.entries.push(ChatEntry::Tool {
+                            tool_call_id: Arc::<str>::from(tool_call_id),
+                            name: Arc::<str>::from(
+                                m.tool_name.unwrap_or_else(|| "unknown".to_string()),
+                            ),
+                            input_json: Arc::<str>::from("null"),
+                            result: Some(Arc::<str>::from(m.tool_output.unwrap_or(m.content))),
+                        });
+                    }
+                    continue;
+                }
+                crate::client::MessageEntryKind::Message => {}
+            }
             match m.role() {
                 crate::client::MessageRole::User => {
                     if self.first_message.is_none() {
@@ -7346,7 +7392,11 @@ impl ChatState {
                     self.entries
                         .push(ChatEntry::AgentMessage(Arc::<str>::from(m.content)));
                 }
-                crate::client::MessageRole::System | crate::client::MessageRole::Other => {}
+                crate::client::MessageRole::System => {
+                    self.entries
+                        .push(ChatEntry::SystemMessage(Arc::<str>::from(m.content)));
+                }
+                crate::client::MessageRole::Other => {}
             }
         }
         self.mark_dirty_full();
@@ -12330,24 +12380,96 @@ mod tests {
             MessageEntry {
                 role: "user".to_string(),
                 content: "first ask".to_string(),
+                ..Default::default()
             },
             MessageEntry {
                 role: "assistant".to_string(),
                 content: "reply".to_string(),
+                ..Default::default()
             },
             MessageEntry {
                 role: "system".to_string(),
                 content: "ignored".to_string(),
+                ..Default::default()
             },
             MessageEntry {
                 role: "user".to_string(),
                 content: "second ask".to_string(),
+                ..Default::default()
             },
         ]);
-        // User + assistant + user replayed; system dropped.
-        assert_eq!(s.entries.len(), before + 3);
+        // User + assistant + system + user replayed.
+        assert_eq!(s.entries.len(), before + 4);
         // First user message seeds the pinned recovery row.
         assert_eq!(s.first_message.as_deref(), Some("first ask"));
+    }
+
+    #[test]
+    fn load_history_restores_completed_tool_card() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+
+        let mut s = state();
+        s.load_history(vec![MessageEntry {
+            role: "assistant".to_string(),
+            content: "Tool call: shell\n{}\nResult:\nok".to_string(),
+            kind: MessageEntryKind::ToolCall,
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("shell".to_string()),
+            tool_input: Some(serde_json::json!({"command": "pwd"})),
+            tool_output: Some("ok".to_string()),
+        }]);
+
+        assert!(s.entries.iter().any(|entry| matches!(
+            entry,
+            ChatEntry::Tool {
+                tool_call_id,
+                name,
+                result: Some(result),
+                ..
+            } if tool_call_id.as_ref() == "call-1"
+                && name.as_ref() == "shell"
+                && result.as_ref() == "ok"
+        )));
+    }
+
+    #[test]
+    fn load_history_does_not_overwrite_completed_tool_card_with_duplicate_result() {
+        use crate::client::{MessageEntry, MessageEntryKind};
+
+        let mut s = state();
+        s.load_history(vec![
+            MessageEntry {
+                role: "assistant".to_string(),
+                content: "Tool call: shell\n{}\nResult:\nfirst".to_string(),
+                kind: MessageEntryKind::ToolCall,
+                tool_call_id: Some("call-1".to_string()),
+                tool_name: Some("shell".to_string()),
+                tool_input: Some(serde_json::json!({})),
+                tool_output: Some("first".to_string()),
+            },
+            MessageEntry {
+                role: "tool".to_string(),
+                content: "Tool result: shell\nduplicate".to_string(),
+                kind: MessageEntryKind::ToolResult,
+                tool_call_id: Some("call-1".to_string()),
+                tool_name: Some("shell".to_string()),
+                tool_input: None,
+                tool_output: Some("duplicate".to_string()),
+            },
+        ]);
+
+        let results: Vec<_> = s
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                ChatEntry::Tool {
+                    result: Some(result),
+                    ..
+                } => Some(result.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results, vec!["first", "duplicate"]);
     }
 
     // ── Elicitation modal ────────────────────────────────────────

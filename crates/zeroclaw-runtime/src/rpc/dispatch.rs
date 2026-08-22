@@ -24,7 +24,7 @@ use zeroclaw_api::jsonrpc::{
     JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
     SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
-use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
@@ -1118,6 +1118,32 @@ impl RpcDispatcher {
             .clone()
             .unwrap_or(crate::rpc::types::ChatMode::Chat);
 
+        let _recovery_guard = if resuming && matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+            let guard = self
+                .ctx
+                .sessions
+                .session_queue
+                .acquire(&session_id)
+                .await
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
+            if self.ctx.sessions.get_agent(&session_id).await.is_none()
+                && !self.ctx.sessions.has_inflight_turn(&session_id)
+                && let Some(store) = self.ctx.acp_session_store.clone()
+            {
+                recover_acp_checkpoint(store, &session_id)
+                    .await
+                    .map_err(|error| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to recover interrupted ACP turn: {error}"),
+                        )
+                    })?;
+            }
+            Some(guard)
+        } else {
+            None
+        };
+
         // Resuming an ACP session with no caller cwd: recover the original
         // working directory from the persisted store so the rehydrated session
         // keeps its own cwd instead of falling back to the agent workspace dir.
@@ -1334,10 +1360,14 @@ impl RpcDispatcher {
                             ));
                         }
                         message_count = data.messages.len();
+                        let provider_history =
+                            zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
+                                &data.messages,
+                            );
                         let seed_event = self
                             .ctx
                             .sessions
-                            .seed_conversation_history_with_event(&session_id, data.messages)
+                            .seed_conversation_history_with_event(&session_id, provider_history)
                             .await;
                         self.forward_seed_event(&session_id, seed_event).await;
                         // Restore the durable TodoWrite plan into the fresh
@@ -1596,15 +1626,32 @@ impl RpcDispatcher {
     /// prompt recovers to a working session instead of hanging. Returns the
     /// live agent on success; returns `None` for missing, killed, or unreadable
     /// durable state.
-    async fn rehydrate_reaped_session(
+    /// Rehydrate a durable ACP session while the caller holds `session_queue`
+    /// for `sid`, covering the owner check through insertion.
+    async fn rehydrate_reaped_session_under_guard(
         &self,
         sid: &str,
     ) -> Option<Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>> {
         let store = self.ctx.acp_session_store.clone()?;
+        if self.ctx.sessions.get_agent(sid).await.is_some()
+            || self.ctx.sessions.has_inflight_turn(sid)
+        {
+            return None;
+        }
+        if let Err(error) = recover_acp_checkpoint(Arc::clone(&store), sid).await {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Read)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"session_id": sid, "error": error})),
+                "Failed to recover interrupted ACP turn before rehydration"
+            );
+            return None;
+        }
         let sid_owned = sid.to_string();
         let loaded =
             tokio::task::spawn_blocking(move || store.load_session_for_restore(&sid_owned)).await;
-        let data = match loaded {
+        let mut data = match loaded {
             Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Restorable(data))) => data,
             Ok(Ok(zeroclaw_infra::acp_session_store::AcpSessionRestore::Killed)) => {
                 ::zeroclaw_log::record!(
@@ -1647,6 +1694,10 @@ impl RpcDispatcher {
             }
         };
 
+        data.messages = zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
+            &data.messages,
+        );
+
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
             .tui_id
@@ -1679,6 +1730,12 @@ impl RpcDispatcher {
         // key so interactive tools default to this conversation.
         agent.set_channel_name("rpc".to_string());
         agent.channel_handles().register_channel("rpc", approval_ch);
+
+        if self.ctx.sessions.get_agent(sid).await.is_some()
+            || self.ctx.sessions.has_inflight_turn(sid)
+        {
+            return None;
+        }
 
         let message_count = data.messages.len();
         self.ctx
@@ -1730,9 +1787,17 @@ impl RpcDispatcher {
             ));
         }
 
+        let _guard = self
+            .ctx
+            .sessions
+            .session_queue
+            .acquire(sid)
+            .await
+            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
+
         let agent = match self.ctx.sessions.get_agent(sid).await {
             Some(a) => a,
-            None => match self.rehydrate_reaped_session(sid).await {
+            None => match self.rehydrate_reaped_session_under_guard(sid).await {
                 Some(a) => a,
                 None => {
                     ::zeroclaw_log::record!(
@@ -1787,14 +1852,22 @@ impl RpcDispatcher {
             }
         }
 
-        let _guard = self
+        let chat_mode = self
             .ctx
             .sessions
-            .session_queue
-            .acquire(sid)
+            .chat_mode(sid)
             .await
-            .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
-
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+        let checkpoint_store = if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+            Some(
+                self.ctx
+                    .acp_session_store
+                    .clone()
+                    .ok_or_else(|| rpc_err(INTERNAL_ERROR, "ACP session store is not available"))?,
+            )
+        } else {
+            None
+        };
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
         self.ctx.sessions.touch(sid).await;
@@ -1805,13 +1878,36 @@ impl RpcDispatcher {
                 .with_attrs(::serde_json::json!({ "session_id": sid })),
             "turn dispatch: registered cancel token, starting turn"
         );
-
-        let chat_mode = self
-            .ctx
-            .sessions
-            .chat_mode(sid)
-            .await
-            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+        let checkpoint_error = Arc::new(tokio::sync::Mutex::new(None::<String>));
+        let checkpoint_turn_id = if let Some(store) = checkpoint_store {
+            let turn_id = uuid::Uuid::new_v4().to_string();
+            let session_id = sid.to_string();
+            let turn_id_for_store = turn_id.clone();
+            let initial = vec![ConversationMessage::Chat(ChatMessage::user(&prompt))];
+            let persisted = tokio::task::spawn_blocking(move || {
+                store.begin_turn_checkpoint(&session_id, &turn_id_for_store, &initial)
+            })
+            .await;
+            let error = match persisted {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(join) => Some(join.to_string()),
+            };
+            if let Some(error) = error {
+                self.ctx.sessions.take_cancel_cause(sid);
+                self.ctx
+                    .sessions
+                    .remove_cancel_token(sid, cancel_generation);
+                self.ctx.sessions.remove(sid).await;
+                return Err(rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to begin ACP turn checkpoint: {error}"),
+                ));
+            }
+            Some(turn_id)
+        } else {
+            None
+        };
         // Capture live attribution fields and max_context_tokens for the turn span.
         // Zerocode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
@@ -1864,7 +1960,10 @@ impl RpcDispatcher {
             )
             .with_agent_alias(&attribution_agent_alias)
         });
-        let outcome = execute_turn(
+        let checkpoint_turn_id_for_events = checkpoint_turn_id.clone();
+        let checkpoint_error_for_events = Arc::clone(&checkpoint_error);
+        let checkpoint_cancel = cancel.clone();
+        let mut outcome = execute_turn(
             agent,
             prompt.clone(),
             cancel,
@@ -1881,6 +1980,9 @@ impl RpcDispatcher {
                 let sid = sid_owned.clone();
                 let acp_token_store = acp_token_store.clone();
                 let sessions_for_plan = sessions_for_plan.clone();
+                let checkpoint_turn_id = checkpoint_turn_id_for_events.clone();
+                let checkpoint_error = Arc::clone(&checkpoint_error_for_events);
+                let checkpoint_cancel = checkpoint_cancel.clone();
                 async move {
                     if let (
                         Some(store),
@@ -1899,13 +2001,30 @@ impl RpcDispatcher {
                     }
                     persist_plan_if_any(&sessions_for_plan, acp_token_store.as_ref(), &sid, &event)
                         .await;
-                    if let Some(n) = notification_for_turn_event(&sid, &event, max_ctx) {
-                        let _ = rpc.send_raw(n).await;
+                    if let Err(error) = persist_checkpoint_event_before_notification(
+                        acp_token_store.as_ref(),
+                        checkpoint_turn_id.as_deref(),
+                        &sid,
+                        &event,
+                        &rpc,
+                        max_ctx,
+                    )
+                    .await
+                    {
+                        *checkpoint_error.lock().await = Some(error);
+                        checkpoint_cancel.cancel();
                     }
                 }
             },
         )
         .await;
+
+        let checkpoint_write_error = checkpoint_error.lock().await.take();
+        if let Some(error) = checkpoint_write_error.as_ref() {
+            outcome = Err(crate::rpc::turn::TurnError::AgentError(format!(
+                "ACP turn checkpoint failed: {error}"
+            )));
+        }
 
         // Drain the cancel cause BEFORE removing the token (removal clears the
         // cause map). Every cancel firing site records its cause before firing;
@@ -1914,6 +2033,40 @@ impl RpcDispatcher {
         self.ctx
             .sessions
             .remove_cancel_token(sid, cancel_generation);
+
+        if matches!(chat_mode, crate::rpc::types::ChatMode::Acp) {
+            let checkpoint_result = if let Some(error) = checkpoint_write_error.clone() {
+                Err(error)
+            } else if let (Some(store), Some(turn_id)) = (
+                self.ctx.acp_session_store.as_ref(),
+                checkpoint_turn_id.as_deref(),
+            ) {
+                finish_acp_checkpoint(store, sid, turn_id, &outcome).await
+            } else {
+                Ok(AcpCheckpointFinish::Finalized)
+            };
+            match checkpoint_result {
+                Ok(AcpCheckpointFinish::Finalized) => {}
+                Ok(AcpCheckpointFinish::RecoveryRequired) => {
+                    self.ctx.sessions.remove(sid).await;
+                }
+                Err(detail) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Write)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"session_id": sid, "error": detail})),
+                        "Failed to persist ACP turn"
+                    );
+                    // Force the next prompt through queue-owned durable recovery;
+                    // the in-memory agent may contain history that was not committed.
+                    self.ctx.sessions.remove(sid).await;
+                    outcome = Err(crate::rpc::turn::TurnError::AgentError(format!(
+                        "Failed to persist ACP turn: {detail}"
+                    )));
+                }
+            }
+        }
 
         // ── Durable turn-verdict audit row ───────────────────────────────
         // Every turn termination writes one attributed row to the ACP session
@@ -1984,36 +2137,19 @@ impl RpcDispatcher {
             });
         }
 
-        match chat_mode {
-            crate::rpc::types::ChatMode::Acp => {
-                if let Some(ref store) = self.ctx.acp_session_store
-                    && let Some(detail) = persist_acp_turn(store, sid, &outcome).await
-                {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"session_id": sid, "error": detail})),
-                        "Failed to persist ACP turn"
-                    );
+        if matches!(chat_mode, crate::rpc::types::ChatMode::Chat)
+            && let Some(ref backend) = self.ctx.session_backend
+        {
+            let key = format!("rpc_{sid}");
+            let _ = backend.append(&key, &ChatMessage::user(&prompt));
+            match &outcome {
+                Ok(TurnOutcome::Completed { text, .. }) => {
+                    let _ = backend.append(&key, &ChatMessage::assistant(text));
                 }
-            }
-            crate::rpc::types::ChatMode::Chat => {
-                if let Some(ref backend) = self.ctx.session_backend {
-                    let key = format!("rpc_{sid}");
-                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
-                    match &outcome {
-                        Ok(TurnOutcome::Completed { text, .. }) => {
-                            let _ = backend.append(&key, &ChatMessage::assistant(text));
-                        }
-                        Ok(TurnOutcome::Cancelled { partial_text, .. })
-                            if !partial_text.is_empty() =>
-                        {
-                            let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
-                        }
-                        _ => {}
-                    }
+                Ok(TurnOutcome::Cancelled { partial_text, .. }) if !partial_text.is_empty() => {
+                    let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
                 }
+                _ => {}
             }
         }
 
@@ -2398,76 +2534,84 @@ impl RpcDispatcher {
 
     async fn handle_session_messages(&self, params: &Value) -> RpcResult {
         let req: SessionMessagesParams = parse_params(params)?;
-        let backend = self
-            .ctx
-            .session_backend
-            .as_ref()
-            .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
-
-        // Try the raw id first (channel sessions store as-is), then
-        // prefixed variants for RPC/gateway-originated sessions.
-        let candidates = [
-            req.session_id.clone(),
-            format!("rpc_{}", req.session_id),
-            format!("gw_{}", req.session_id),
-        ];
-        let mut raw: Vec<zeroclaw_api::model_provider::ChatMessage> = Vec::new();
-        for key in &candidates {
-            let loaded = backend.load(key);
-            if !loaded.is_empty() {
-                raw = loaded;
-                break;
+        let mut messages: Vec<MessageEntry> = Vec::new();
+        let mut acp_session_found = false;
+        if let Some(store) = self.ctx.acp_session_store.clone()
+            && store.contains_session(&req.session_id).map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to identify ACP session: {error}"),
+                )
+            })?
+        {
+            acp_session_found = true;
+            let _guard = self
+                .ctx
+                .sessions
+                .session_queue
+                .acquire(&req.session_id)
+                .await
+                .map_err(|error| rpc_err(SESSION_BUSY, format!("Session busy: {error}")))?;
+            if self.ctx.sessions.get_agent(&req.session_id).await.is_none()
+                && !self.ctx.sessions.has_inflight_turn(&req.session_id)
+            {
+                recover_acp_checkpoint(Arc::clone(&store), &req.session_id)
+                    .await
+                    .map_err(|error| {
+                        rpc_err(
+                            INTERNAL_ERROR,
+                            format!("Failed to recover interrupted ACP turn: {error}"),
+                        )
+                    })?;
+            }
+            if let Some(data) = store.load_session(&req.session_id).map_err(|error| {
+                rpc_err(
+                    INTERNAL_ERROR,
+                    format!("Failed to load ACP session messages: {error}"),
+                )
+            })? {
+                messages = conversation_message_entries(&data.messages);
             }
         }
 
-        if raw.is_empty()
-            && let Some(store) = self.ctx.acp_session_store.as_ref()
-        {
-            match store.load_session(&req.session_id) {
-                Ok(Some(data)) => {
-                    raw = data
-                        .messages
+        if !acp_session_found {
+            let backend = self
+                .ctx
+                .session_backend
+                .as_ref()
+                .ok_or_else(|| rpc_err(INTERNAL_ERROR, "Session persistence is disabled"))?;
+            // Try the raw id first (channel sessions store as-is), then
+            // prefixed variants for RPC/gateway-originated sessions.
+            let candidates = [
+                req.session_id.clone(),
+                format!("rpc_{}", req.session_id),
+                format!("gw_{}", req.session_id),
+            ];
+            for key in &candidates {
+                let loaded = backend.load(key);
+                if !loaded.is_empty() {
+                    messages = loaded
                         .into_iter()
-                        .filter_map(|m| {
-                            match m {
-                            zeroclaw_api::model_provider::ConversationMessage::Chat(c) => Some(c),
-                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
-                                text: Some(t),
-                                ..
-                            } if !t.is_empty() => {
-                                Some(zeroclaw_api::model_provider::ChatMessage::assistant(t))
-                            }
-                            zeroclaw_api::model_provider::ConversationMessage::AssistantToolCalls {
-                                ..
-                            }
-                            | zeroclaw_api::model_provider::ConversationMessage::ToolResults(_) => {
-                                None
-                            }
-                        }
+                        .map(|message| MessageEntry {
+                            role: message.role,
+                            content: message.content,
+                            kind: MessageEntryKind::Message,
+                            tool_call_id: None,
+                            tool_name: None,
+                            tool_input: None,
+                            tool_output: None,
                         })
                         .collect();
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    return Err(rpc_err(
-                        INTERNAL_ERROR,
-                        format!("Failed to load ACP session messages: {e}"),
-                    ));
+                    break;
                 }
             }
         }
 
-        let total = raw.len();
+        let total = messages.len();
         let limit = req.limit.unwrap_or(total);
         let end = req.before_index.map(|i| i.min(total)).unwrap_or(total);
         let start = end.saturating_sub(limit);
-        let messages: Vec<MessageEntry> = raw[start..end]
-            .iter()
-            .map(|m| MessageEntry {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
-            .collect();
+        let messages = messages[start..end].to_vec();
 
         to_result(SessionMessagesResult {
             session_id: req.session_id,
@@ -4754,29 +4898,224 @@ fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: 
     cfg.effective_max_context_tokens(agent_alias) as u64
 }
 
-/// Persist the exact turn delta captured before structured history trimming.
-/// Empty and failed turns intentionally remain no-ops.
-async fn persist_acp_turn(
+fn checkpoint_fragment_for_event(event: &TurnEvent) -> Option<ConversationMessage> {
+    match event {
+        TurnEvent::Chunk { delta } => {
+            Some(ConversationMessage::Chat(ChatMessage::assistant(delta)))
+        }
+        TurnEvent::ToolCall { id, name, args } => {
+            let call = ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: serde_json::to_string(args).unwrap_or_else(|_| "null".to_string()),
+                extra_content: None,
+            };
+            Some(ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![call],
+                reasoning_content: None,
+            })
+        }
+        TurnEvent::ToolResult {
+            id, name, output, ..
+        } => {
+            let content =
+                zeroclaw_infra::acp_session_store::AcpSessionStore::bounded_tool_output(output);
+            Some(ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: id.clone(),
+                content,
+                tool_name: name.clone(),
+            }]))
+        }
+        _ => None,
+    }
+}
+
+fn conversation_message_entries(messages: &[ConversationMessage]) -> Vec<MessageEntry> {
+    let mut entries = Vec::new();
+    let mut tool_entry_by_id = std::collections::HashMap::new();
+    for message in messages {
+        match message {
+            ConversationMessage::Chat(chat) => entries.push(MessageEntry {
+                role: chat.role.clone(),
+                content: chat.content.clone(),
+                kind: MessageEntryKind::Message,
+                tool_call_id: None,
+                tool_name: None,
+                tool_input: None,
+                tool_output: None,
+            }),
+            ConversationMessage::AssistantToolCalls {
+                text, tool_calls, ..
+            } => {
+                if let Some(text) = text.as_ref().filter(|text| !text.is_empty()) {
+                    entries.push(MessageEntry {
+                        role: "assistant".to_string(),
+                        content: text.clone(),
+                        kind: MessageEntryKind::Message,
+                        tool_call_id: None,
+                        tool_name: None,
+                        tool_input: None,
+                        tool_output: None,
+                    });
+                }
+                for call in tool_calls {
+                    let index = entries.len();
+                    tool_entry_by_id.insert(call.id.clone(), index);
+                    entries.push(MessageEntry {
+                        role: "assistant".to_string(),
+                        content: format!("Tool call: {}\n{}", call.name, call.arguments),
+                        kind: MessageEntryKind::ToolCall,
+                        tool_call_id: Some(call.id.clone()),
+                        tool_name: Some(call.name.clone()),
+                        tool_input: Some(
+                            serde_json::from_str(&call.arguments)
+                                .unwrap_or_else(|_| Value::String(call.arguments.clone())),
+                        ),
+                        tool_output: None,
+                    });
+                }
+            }
+            ConversationMessage::ToolResults(results) => {
+                for result in results {
+                    if let Some(entry) = tool_entry_by_id
+                        .remove(&result.tool_call_id)
+                        .and_then(|index| entries.get_mut(index))
+                    {
+                        let output =
+                            zeroclaw_infra::acp_session_store::AcpSessionStore::bounded_tool_output(
+                                &result.content,
+                            );
+                        entry.tool_output = Some(output.clone());
+                        entry.content.push_str("\nResult:\n");
+                        entry.content.push_str(&output);
+                    } else {
+                        let output =
+                            zeroclaw_infra::acp_session_store::AcpSessionStore::bounded_tool_output(
+                                &result.content,
+                            );
+                        entries.push(MessageEntry {
+                            role: "tool".to_string(),
+                            content: format!(
+                                "Tool result: {}\n{}",
+                                if result.tool_name.is_empty() {
+                                    "unknown"
+                                } else {
+                                    &result.tool_name
+                                },
+                                output
+                            ),
+                            kind: MessageEntryKind::ToolResult,
+                            tool_call_id: Some(result.tool_call_id.clone()),
+                            tool_name: (!result.tool_name.is_empty())
+                                .then(|| result.tool_name.clone()),
+                            tool_input: None,
+                            tool_output: Some(output),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    entries
+}
+
+async fn recover_acp_checkpoint(
+    store: Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
+    session_id: &str,
+) -> Result<(), String> {
+    let session_id = session_id.to_string();
+    let marker = crate::i18n::get_required_cli_string("turn-stream-interrupted");
+    match tokio::task::spawn_blocking(move || store.recover_turn_checkpoint(&session_id, &marker))
+        .await
+    {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(join) => Err(join.to_string()),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcpCheckpointFinish {
+    Finalized,
+    RecoveryRequired,
+}
+
+async fn finish_acp_checkpoint(
     store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
     session_id: &str,
+    turn_id: &str,
     outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
-) -> Option<String> {
+) -> Result<AcpCheckpointFinish, String> {
     let messages = match outcome {
         Ok(TurnOutcome::Completed { messages, .. })
         | Ok(TurnOutcome::Cancelled { messages, .. })
             if !messages.is_empty() =>
         {
-            messages.clone()
+            Some(messages.clone())
         }
-        _ => return None,
+        Ok(TurnOutcome::Cancelled { .. }) => return Ok(AcpCheckpointFinish::RecoveryRequired),
+        _ => None,
     };
     let store = Arc::clone(store);
     let session_id = session_id.to_string();
-    match tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(error.to_string()),
-        Err(join) => Some(join.to_string()),
+    let turn_id = turn_id.to_string();
+    match tokio::task::spawn_blocking(move || match messages {
+        Some(messages) => store.finalize_turn_checkpoint(&session_id, &turn_id, &messages),
+        None => store.discard_turn_checkpoint(&session_id, &turn_id),
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(AcpCheckpointFinish::Finalized),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(join) => Err(join.to_string()),
     }
+}
+
+async fn persist_checkpoint_event_before_notification(
+    acp_store: Option<&Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>>,
+    turn_id: Option<&str>,
+    session_id: &str,
+    event: &TurnEvent,
+    rpc: &Arc<RpcOutbound>,
+    max_context_tokens: Option<u64>,
+) -> Result<(), String> {
+    let notification = notification_for_turn_event(session_id, event, max_context_tokens);
+    let checkpoint_write = async {
+        if let (Some(store), Some(turn_id)) = (acp_store, turn_id)
+            && let Some(fragment) = checkpoint_fragment_for_event(event)
+        {
+            let store = Arc::clone(store);
+            let sid_for_store = session_id.to_string();
+            let turn_id = turn_id.to_string();
+            let persisted = tokio::task::spawn_blocking(move || {
+                store.append_turn_checkpoint(&sid_for_store, &turn_id, &[fragment])
+            })
+            .await;
+            let error = match persisted {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(join) => Some(join.to_string()),
+            };
+            if let Some(error) = error {
+                return Err(error);
+            }
+        }
+        Ok(())
+    };
+    send_after_checkpoint_write(checkpoint_write, notification, Arc::clone(rpc)).await
+}
+
+async fn send_after_checkpoint_write(
+    checkpoint_write: impl std::future::Future<Output = Result<(), String>>,
+    notification: Option<String>,
+    rpc: Arc<RpcOutbound>,
+) -> Result<(), String> {
+    checkpoint_write.await?;
+    if let Some(notification) = notification {
+        let _ = rpc.send_raw(notification).await;
+    }
+    Ok(())
 }
 
 /// Persist a `TurnEvent::Plan` before it is emitted, so a racing
@@ -6261,6 +6600,306 @@ mod tests {
         let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
         let (tx, _rx) = tokio::sync::mpsc::channel(64);
         RpcDispatcher::new(ctx, tx, "test-peer-approval:pid=1".into())
+    }
+
+    #[test]
+    fn checkpoint_projection_keeps_visible_events_without_reasoning() {
+        let chunk = checkpoint_fragment_for_event(&TurnEvent::Chunk {
+            delta: "checking".to_string(),
+        });
+        let call = checkpoint_fragment_for_event(&TurnEvent::ToolCall {
+            id: "call-1".to_string(),
+            name: "shell".to_string(),
+            args: serde_json::json!({"command": "pwd"}),
+        });
+        let result = checkpoint_fragment_for_event(&TurnEvent::ToolResult {
+            id: "call-1".to_string(),
+            name: "shell".to_string(),
+            output: "/tmp".to_string(),
+            artifact: None,
+        });
+        assert!(
+            checkpoint_fragment_for_event(&TurnEvent::Thinking {
+                delta: "hidden".to_string(),
+            })
+            .is_none()
+        );
+        assert!(matches!(
+            chunk,
+            Some(ConversationMessage::Chat(chat)) if chat.role == "assistant" && chat.content == "checking"
+        ));
+        assert!(matches!(
+            call,
+            Some(ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls,
+                reasoning_content: None,
+            }) if tool_calls[0].id == "call-1"
+        ));
+        assert!(matches!(
+            result,
+            Some(ConversationMessage::ToolResults(results))
+                if results[0].tool_call_id == "call-1" && results[0].content == "/tmp"
+        ));
+    }
+
+    #[test]
+    fn checkpoint_projection_bounds_tool_output() {
+        let output = "x".repeat(16 * 1024 + 10);
+        let fragment = checkpoint_fragment_for_event(&TurnEvent::ToolResult {
+            id: "call-1".to_string(),
+            name: "shell".to_string(),
+            output,
+            artifact: None,
+        });
+        assert!(matches!(
+            fragment,
+            Some(ConversationMessage::ToolResults(results))
+                if results[0].content.ends_with("…[truncated]")
+                    && results[0].content.len()
+                        <= 16 * 1024 + "…[truncated]".len()
+        ));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_notification_waits_for_write() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let checkpoint_write = async move {
+            started_tx.send(()).unwrap();
+            release_rx.await.unwrap();
+            Ok::<(), String>(())
+        };
+
+        let task = zeroclaw_spawn::spawn!(send_after_checkpoint_write(
+            checkpoint_write,
+            Some(r#"{"type":"ready"}"#.into()),
+            Arc::clone(&rpc),
+        ));
+        started_rx.await.unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "notification must wait for the write"
+        );
+
+        release_tx.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(rx.try_recv().unwrap(), r#"{"type":"ready"}"#);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_events_restore_transcript_and_provider_safe_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let session_id = "checkpoint-safe-history";
+        let turn_id = "turn-safe-history";
+        let initial = [ConversationMessage::Chat(ChatMessage::user("question"))];
+        store.create_session(session_id, "agent", "/tmp").unwrap();
+        store
+            .begin_turn_checkpoint(session_id, turn_id, &initial)
+            .unwrap();
+
+        let events = [
+            (
+                TurnEvent::Chunk {
+                    delta: "partial".into(),
+                },
+                "agent_message_chunk",
+            ),
+            (
+                TurnEvent::ToolCall {
+                    id: "paired".into(),
+                    name: "shell".into(),
+                    args: json!({"command": "pwd"}),
+                },
+                "tool_call",
+            ),
+            (
+                TurnEvent::ToolResult {
+                    id: "paired".into(),
+                    name: "shell".into(),
+                    output: "/tmp".into(),
+                    artifact: None,
+                },
+                "tool_result",
+            ),
+            (
+                TurnEvent::ToolCall {
+                    id: "orphan".into(),
+                    name: "shell".into(),
+                    args: json!({"command": "whoami"}),
+                },
+                "tool_call",
+            ),
+        ];
+        for (event, wire_type) in events {
+            persist_checkpoint_event_before_notification(
+                Some(&store),
+                Some(turn_id),
+                session_id,
+                &event,
+                &rpc,
+                None,
+            )
+            .await
+            .unwrap();
+            let notification: Value = serde_json::from_str(&rx.try_recv().unwrap()).unwrap();
+            assert_eq!(notification["params"]["type"], wire_type);
+        }
+
+        assert!(
+            store
+                .recover_turn_checkpoint(session_id, "interrupted")
+                .unwrap()
+        );
+        let restored = store.load_session(session_id).unwrap().unwrap();
+        assert!(restored.messages.iter().any(|message| matches!(
+            message,
+            ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls.iter().any(|call| call.id == "orphan")
+        )));
+        assert!(restored.messages.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat)
+                if chat.role == "system" && chat.content == "interrupted"
+        )));
+
+        let safe = zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(
+            &restored.messages,
+        );
+        assert_eq!(safe.len(), 3);
+        assert!(matches!(
+            &safe[0],
+            ConversationMessage::Chat(chat)
+                if chat.role == "user" && chat.content == "question"
+        ));
+        assert!(matches!(
+            &safe[1],
+            ConversationMessage::AssistantToolCalls { text, tool_calls, .. }
+                if text.as_deref() == Some("partial")
+                    && tool_calls.len() == 1
+                    && tool_calls[0].id == "paired"
+        ));
+        assert!(matches!(
+            &safe[2],
+            ConversationMessage::ToolResults(results)
+                if results.len() == 1
+                    && results[0].tool_call_id == "paired"
+                    && results[0].content == "/tmp"
+        ));
+        assert!(!safe.iter().any(|message| matches!(
+            message,
+            ConversationMessage::AssistantToolCalls { tool_calls, .. }
+                if tool_calls.iter().any(|call| call.id == "orphan")
+        )));
+        assert!(!safe.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(chat) if chat.role == "system"
+        )));
+    }
+
+    #[tokio::test]
+    async fn failed_checkpoint_write_does_not_notify() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let session_id = "checkpoint-write-failure";
+        store.create_session(session_id, "agent", "/tmp").unwrap();
+        store
+            .begin_turn_checkpoint(session_id, "turn-live", &[])
+            .unwrap();
+
+        let error = persist_checkpoint_event_before_notification(
+            Some(&store),
+            Some("stale-turn"),
+            session_id,
+            &TurnEvent::Chunk {
+                delta: "must-not-emit".into(),
+            },
+            &rpc,
+            None,
+        )
+        .await
+        .expect_err("a stale turn ID must fail the checkpoint append");
+        assert_eq!(error, "ACP turn checkpoint identity mismatch");
+        assert!(
+            rx.try_recv().is_err(),
+            "failed writes must not notify clients"
+        );
+    }
+
+    #[test]
+    fn restored_history_separates_faithful_replay_from_provider_safe_seed() {
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("question")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("partial".to_string()),
+                tool_calls: vec![ToolCall {
+                    id: "unfinished".to_string(),
+                    name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::Chat(ChatMessage::system("interrupted")),
+        ];
+
+        let replay = conversation_message_entries(&messages);
+        assert!(
+            replay
+                .iter()
+                .any(|entry| entry.kind == MessageEntryKind::ToolCall)
+        );
+        assert!(replay.iter().any(|entry| entry.role == "system"));
+
+        let seed =
+            zeroclaw_infra::acp_session_store::AcpSessionStore::provider_safe_history(&messages);
+        assert!(seed.iter().all(|message| match message {
+            ConversationMessage::AssistantToolCalls { .. } => false,
+            ConversationMessage::Chat(ChatMessage { role, .. }) if role == "system" => false,
+            _ => true,
+        }));
+        assert!(seed.iter().any(|message| matches!(
+            message,
+            ConversationMessage::Chat(ChatMessage { role, content })
+                if role == "assistant" && content == "partial"
+        )));
+    }
+
+    #[test]
+    fn restored_tool_exchange_is_one_paginated_entry() {
+        let messages = vec![
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: "{\"command\":\"pwd\"}".to_string(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "shell".to_string(),
+                content: "/tmp".to_string(),
+            }]),
+        ];
+
+        let replay = conversation_message_entries(&messages);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].kind, MessageEntryKind::ToolCall);
+        assert_eq!(replay[0].tool_output.as_deref(), Some("/tmp"));
+        assert!(replay[0].content.contains("shell"));
+        assert!(replay[0].content.contains("/tmp"));
     }
 
     #[test]
@@ -7803,7 +8442,16 @@ mod tests {
             messages: new_messages.clone(),
         });
 
-        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+        store
+            .begin_turn_checkpoint(sid, "turn-1", &new_messages[..1])
+            .unwrap();
+        store
+            .append_turn_checkpoint(sid, "turn-1", &new_messages[1..])
+            .unwrap();
+        assert_eq!(
+            finish_acp_checkpoint(&store, sid, "turn-1", &outcome).await,
+            Ok(AcpCheckpointFinish::Finalized)
+        );
 
         let restored = store.load_session(sid).unwrap().unwrap();
         assert_eq!(restored.messages.len(), 52);
@@ -7814,7 +8462,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_persistence_skips_empty_and_failed_turns() {
+    async fn acp_persistence_preserves_hard_cancel_and_discards_failed_turns() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
@@ -7825,13 +8473,30 @@ mod tests {
             partial_text: String::new(),
             messages: Vec::new(),
         });
-        assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
+        let initial = [ConversationMessage::Chat(ChatMessage::user("question"))];
+        store
+            .begin_turn_checkpoint(sid, "turn-cancelled", &initial)
+            .unwrap();
+        assert_eq!(
+            finish_acp_checkpoint(&store, sid, "turn-cancelled", &empty).await,
+            Ok(AcpCheckpointFinish::RecoveryRequired)
+        );
+        assert!(store.recover_turn_checkpoint(sid, "interrupted").unwrap());
+        assert_eq!(store.load_session(sid).unwrap().unwrap().messages.len(), 2);
 
+        let failed_sid = "failed-turn";
+        store.create_session(failed_sid, "agent", "/tmp").unwrap();
+        store
+            .begin_turn_checkpoint(failed_sid, "turn-failed", &initial)
+            .unwrap();
         let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
-        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+        assert_eq!(
+            finish_acp_checkpoint(&store, failed_sid, "turn-failed", &failed).await,
+            Ok(AcpCheckpointFinish::Finalized)
+        );
         assert!(
             store
-                .load_session(sid)
+                .load_session(failed_sid)
                 .unwrap()
                 .unwrap()
                 .messages
@@ -8077,7 +8742,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
+    async fn session_messages_prefers_canonical_acp_store_on_backend_collision() {
         use serde_json::from_value;
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
         use zeroclaw_providers::{ToolCall, ToolResultMessage};
@@ -8138,15 +8803,9 @@ mod tests {
             )
             .expect("append turn");
 
-        // Sanity: the unified backend really is empty for this id under any
-        // candidate key. If this ever changes the test below stops being a
-        // regression for the ACP-store fallback.
-        for key in [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")] {
-            assert!(
-                chat_backend.load(&key).is_empty(),
-                "precondition: unified backend has no rows for {key}"
-            );
-        }
+        chat_backend
+            .append(sid, &ChatMessage::assistant("stale backend collision"))
+            .expect("seed colliding unified backend row");
 
         let result = dispatcher
             .handle_session_messages_for_test(&json!({ "session_id": sid }))
@@ -8157,12 +8816,12 @@ mod tests {
 
         assert_eq!(parsed.session_id, sid);
         assert_eq!(
-            parsed.total, 3,
+            parsed.total, 5,
             "ACP-backed sessions must report their full replayable message count"
         );
         assert_eq!(
             parsed.messages.len(),
-            3,
+            5,
             "ACP-backed sessions must replay their persisted messages, not a blank transcript"
         );
         assert_eq!(parsed.messages[0].role, "user");
@@ -8175,8 +8834,22 @@ mod tests {
              on that row, so dropping it would lose visible turns from the \
              replayed transcript"
         );
-        assert_eq!(parsed.messages[2].role, "assistant");
-        assert_eq!(parsed.messages[2].content, "ack from prior turn");
+        assert_eq!(parsed.messages[2].kind, MessageEntryKind::ToolCall);
+        assert_eq!(
+            parsed.messages[2].tool_output.as_deref(),
+            Some("log contents")
+        );
+        assert_eq!(parsed.messages[3].kind, MessageEntryKind::ToolCall);
+        assert_eq!(parsed.messages[3].tool_output.as_deref(), Some("no errors"));
+        assert_eq!(parsed.messages[4].role, "assistant");
+        assert_eq!(parsed.messages[4].content, "ack from prior turn");
+        assert!(
+            parsed
+                .messages
+                .iter()
+                .all(|entry| !entry.content.contains("stale backend collision")),
+            "a colliding generic backend row must not override canonical ACP history"
+        );
     }
 
     #[tokio::test]
@@ -8218,7 +8891,8 @@ mod tests {
             "post-reap the session must be absent from memory"
         );
 
-        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        let _guard = sessions.session_queue.acquire(sid).await.unwrap();
+        let recovered = dispatcher.rehydrate_reaped_session_under_guard(sid).await;
         assert!(
             recovered.is_some(),
             "a reaped session with a live durable row must rehydrate to a \
@@ -8277,6 +8951,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_acp_resume_leaves_pending_checkpoint_for_later_recovery() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+
+        let sid = "acp-live-checkpoint-001";
+        let params = json!({
+            "agent_alias": "test-agent",
+            "exclude_memory": true,
+            "chat_mode": "acp",
+            "session_id": sid,
+        });
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("initial session/new should succeed");
+        acp_store
+            .begin_turn_checkpoint(
+                sid,
+                "turn-live",
+                &[ConversationMessage::Chat(ChatMessage::user("question"))],
+            )
+            .unwrap();
+        acp_store
+            .append_turn_checkpoint(
+                sid,
+                "turn-live",
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "partial answer",
+                ))],
+            )
+            .unwrap();
+
+        dispatcher
+            .handle_session_new_for_test(&params)
+            .await
+            .expect("live session/new should preserve existing resume behavior");
+        assert!(
+            acp_store
+                .load_session(sid)
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty(),
+            "a live session owner must prevent checkpoint promotion"
+        );
+
+        assert!(sessions.remove(sid).await);
+        assert!(
+            acp_store
+                .recover_turn_checkpoint(sid, "stream interrupted")
+                .unwrap(),
+            "the skipped checkpoint must remain available after the live owner exits"
+        );
+        let restored = acp_store.load_session(sid).unwrap().unwrap();
+        assert!(matches!(
+            &restored.messages[..],
+            [
+                ConversationMessage::Chat(user),
+                ConversationMessage::Chat(assistant),
+                ConversationMessage::Chat(marker),
+            ] if user.role == "user"
+                && assistant.content == "partial answer"
+                && marker.role == "system"
+                && marker.content == "stream interrupted"
+        ));
+    }
+
+    #[tokio::test]
     async fn reaped_acp_session_rehydrates_without_memory_tools() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = make_acp_test_config(&tmp);
@@ -8297,8 +9042,9 @@ mod tests {
         // Reap the in-memory session, leaving the durable row to rehydrate from.
         assert!(sessions.remove(sid).await, "reap must remove the session");
 
+        let _guard = sessions.session_queue.acquire(sid).await.unwrap();
         let recovered = dispatcher
-            .rehydrate_reaped_session(sid)
+            .rehydrate_reaped_session_under_guard(sid)
             .await
             .expect("a reaped ACP session must rehydrate to a working agent");
 
@@ -8354,7 +9100,8 @@ mod tests {
             "session/kill must preserve durable history"
         );
 
-        let recovered = dispatcher.rehydrate_reaped_session(sid).await;
+        let _guard = sessions.session_queue.acquire(sid).await.unwrap();
+        let recovered = dispatcher.rehydrate_reaped_session_under_guard(sid).await;
         assert!(
             recovered.is_none(),
             "admin-killed ACP sessions must stay killed instead of rehydrating \

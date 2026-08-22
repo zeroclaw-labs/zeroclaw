@@ -3,11 +3,13 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use std::path::Path;
 use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage, ToolCall, ToolResultMessage};
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_log::{Action, EventOutcome};
+
+const MAX_PERSISTED_TOOL_OUTPUT_BYTES: usize = 16 * 1024;
 
 /// Internal discriminator for `acp_tool_calls.event_kind`. The 'in' row
 /// records the call args; the 'out' row records the result. Two append-only
@@ -124,7 +126,20 @@ impl AcpSessionStore {
                  payload    TEXT,
                  created_at TEXT NOT NULL
              );
-             CREATE INDEX IF NOT EXISTS idx_acp_session_events_session ON acp_session_events(session_id, id);",
+             CREATE INDEX IF NOT EXISTS idx_acp_session_events_session ON acp_session_events(session_id, id);
+
+             CREATE TABLE IF NOT EXISTS acp_turn_checkpoints (
+                 session_id    INTEGER PRIMARY KEY REFERENCES acp_sessions(id) ON DELETE CASCADE,
+                 turn_id       TEXT NOT NULL
+             );
+
+             CREATE TABLE IF NOT EXISTS acp_turn_checkpoint_events (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id INTEGER NOT NULL REFERENCES acp_turn_checkpoints(session_id) ON DELETE CASCADE,
+                 payload    TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_acp_turn_checkpoint_events_session
+                 ON acp_turn_checkpoint_events(session_id, id);",
         )
         .context("Failed to create ACP session schema")?;
 
@@ -495,31 +510,13 @@ impl AcpSessionStore {
         Ok(out)
     }
 
-    /// Append all ConversationMessages from one completed turn, decomposing
-    /// AssistantToolCalls / ToolResults variants into the appropriate tables.
-    /// Single transaction.
-    pub fn append_turn(&self, session_uuid: &str, messages: &[ConversationMessage]) -> Result<()> {
-        if messages.is_empty() {
-            return Ok(());
-        }
-
-        let now = Utc::now().to_rfc3339();
-        let mut conn = self.conn.lock();
-
-        // Resolve the integer session_id once. Fail loudly if the UUID is
-        // unknown — we want an error here, not orphaned inserts.
-        let session_id: i64 = conn
-            .query_row(
-                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
-                params![session_uuid],
-                |row| row.get(0),
-            )
-            .with_context(|| format!("unknown session_uuid: {session_uuid}"))?;
-
-        let tx = conn
-            .transaction()
-            .context("Failed to begin append_turn transaction")?;
-
+    fn append_messages(
+        tx: &Transaction<'_>,
+        session_uuid: &str,
+        session_id: i64,
+        messages: &[ConversationMessage],
+        now: &str,
+    ) -> Result<()> {
         // Track the most recent assistant message_id so a following
         // ToolResults variant can attach its 'out' rows back to it.
         let mut last_assistant_msg_id: Option<i64> = None;
@@ -633,8 +630,387 @@ impl AcpSessionStore {
         )
         .context("Failed to update last_activity")?;
 
+        Ok(())
+    }
+
+    fn session_id(conn: &Connection, session_uuid: &str) -> Result<i64> {
+        conn.query_row(
+            "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+            params![session_uuid],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("unknown session_uuid: {session_uuid}"))
+    }
+
+    pub fn contains_session(&self, session_uuid: &str) -> Result<bool> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM acp_sessions WHERE session_uuid = ?1)",
+            params![session_uuid],
+            |row| row.get(0),
+        )
+        .context("Failed to check ACP session existence")
+    }
+
+    /// Append all ConversationMessages from one completed turn in one transaction.
+    pub fn append_turn(&self, session_uuid: &str, messages: &[ConversationMessage]) -> Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin append_turn transaction")?;
+        let messages = Self::bounded_transcript_messages(messages);
+        Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
+
         tx.commit().context("Failed to commit append_turn")?;
         Ok(())
+    }
+
+    pub fn begin_turn_checkpoint(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin ACP turn checkpoint transaction")?;
+        tx.execute(
+            "INSERT INTO acp_turn_checkpoints (session_id, turn_id) VALUES (?1, ?2)",
+            params![session_id, turn_id],
+        )
+        .context("Failed to begin ACP turn checkpoint")?;
+        Self::append_checkpoint_events(&tx, session_id, messages)?;
+        tx.commit()
+            .context("Failed to commit ACP turn checkpoint")?;
+        Ok(())
+    }
+
+    pub fn append_turn_checkpoint(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin ACP turn checkpoint append")?;
+        let active_turn: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read ACP turn checkpoint identity")?;
+        anyhow::ensure!(
+            active_turn.as_deref() == Some(turn_id),
+            "ACP turn checkpoint identity mismatch"
+        );
+        Self::append_checkpoint_events(&tx, session_id, messages)?;
+        tx.commit()
+            .context("Failed to commit ACP turn checkpoint append")?;
+        Ok(())
+    }
+
+    fn append_checkpoint_events(
+        tx: &Transaction<'_>,
+        session_id: i64,
+        messages: &[ConversationMessage],
+    ) -> Result<()> {
+        for message in Self::bounded_transcript_messages(messages) {
+            let payload = serde_json::to_string(&message)
+                .context("Failed to serialize ACP turn checkpoint event")?;
+            tx.execute(
+                "INSERT INTO acp_turn_checkpoint_events (session_id, payload) VALUES (?1, ?2)",
+                params![session_id, payload],
+            )
+            .context("Failed to append ACP turn checkpoint event")?;
+        }
+        Ok(())
+    }
+
+    pub fn discard_turn_checkpoint(&self, session_uuid: &str, turn_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let changed = conn
+            .execute(
+                "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id, turn_id],
+            )
+            .context("Failed to discard ACP turn checkpoint")?;
+        anyhow::ensure!(changed == 1, "ACP turn checkpoint identity mismatch");
+        Ok(())
+    }
+
+    pub fn finalize_turn_checkpoint(
+        &self,
+        session_uuid: &str,
+        turn_id: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let session_id = Self::session_id(&conn, session_uuid)?;
+        let tx = conn
+            .transaction()
+            .context("Failed to begin ACP turn finalization")?;
+        let active_turn: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read ACP turn checkpoint identity")?;
+        anyhow::ensure!(
+            active_turn.as_deref() == Some(turn_id),
+            "ACP turn checkpoint identity mismatch"
+        );
+        let messages = Self::bounded_transcript_messages(messages);
+        Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
+        tx.execute(
+            "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
+            params![session_id, turn_id],
+        )
+        .context("Failed to delete finalized ACP turn checkpoint")?;
+        tx.commit()
+            .context("Failed to commit ACP turn finalization")?;
+        Ok(())
+    }
+
+    pub fn recover_turn_checkpoint(
+        &self,
+        session_uuid: &str,
+        interruption_marker: &str,
+    ) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Failed to begin ACP turn checkpoint recovery")?;
+        let session_id = tx
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to find ACP session for checkpoint recovery")?;
+        let Some(session_id) = session_id else {
+            return Ok(false);
+        };
+        let killed_at: Option<String> = tx
+            .query_row(
+                "SELECT killed_at FROM acp_sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .context("Failed to read ACP session killed marker")?;
+        if killed_at.is_some() {
+            return Ok(false);
+        }
+        let checkpoint_turn_id: Option<String> = tx
+            .query_row(
+                "SELECT turn_id FROM acp_turn_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to read ACP turn checkpoint")?;
+        let Some(checkpoint_turn_id) = checkpoint_turn_id else {
+            return Ok(false);
+        };
+        let mut statement = tx
+            .prepare(
+                "SELECT payload FROM acp_turn_checkpoint_events
+                 WHERE session_id = ?1 ORDER BY id ASC",
+            )
+            .context("Failed to prepare ACP turn checkpoint event read")?;
+        let payloads = statement
+            .query_map(params![session_id], |row| row.get::<_, String>(0))
+            .context("Failed to read ACP turn checkpoint events")?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Failed to collect ACP turn checkpoint events")?;
+        drop(statement);
+        let fragments = payloads
+            .into_iter()
+            .map(|payload| {
+                serde_json::from_str::<ConversationMessage>(&payload)
+                    .context("Failed to deserialize ACP turn checkpoint event")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut messages =
+            Self::bounded_transcript_messages(&Self::fold_checkpoint_fragments(fragments));
+        messages.push(ConversationMessage::Chat(ChatMessage::system(
+            interruption_marker,
+        )));
+        Self::append_messages(&tx, session_uuid, session_id, &messages, &now)?;
+        let changed = tx
+            .execute(
+                "DELETE FROM acp_turn_checkpoints WHERE session_id = ?1 AND turn_id = ?2",
+                params![session_id, checkpoint_turn_id],
+            )
+            .context("Failed to delete recovered ACP turn checkpoint")?;
+        anyhow::ensure!(changed == 1, "ACP turn checkpoint identity mismatch");
+        tx.commit()
+            .context("Failed to commit ACP turn checkpoint recovery")?;
+        Ok(true)
+    }
+
+    fn fold_checkpoint_fragments(fragments: Vec<ConversationMessage>) -> Vec<ConversationMessage> {
+        let mut messages = Vec::new();
+        for fragment in fragments {
+            match fragment {
+                ConversationMessage::Chat(chat) if chat.role == "assistant" => {
+                    if let Some(ConversationMessage::Chat(previous)) = messages.last_mut()
+                        && previous.role == "assistant"
+                    {
+                        previous.content.push_str(&chat.content);
+                    } else {
+                        messages.push(ConversationMessage::Chat(chat));
+                    }
+                }
+                ConversationMessage::AssistantToolCalls {
+                    mut text,
+                    tool_calls,
+                    reasoning_content,
+                } => {
+                    if text.is_none()
+                        && let Some(ConversationMessage::Chat(previous)) = messages.last()
+                        && previous.role == "assistant"
+                    {
+                        text = messages.pop().and_then(|message| match message {
+                            ConversationMessage::Chat(chat) => {
+                                (!chat.content.is_empty()).then_some(chat.content)
+                            }
+                            _ => None,
+                        });
+                    }
+                    if let Some(ConversationMessage::AssistantToolCalls {
+                        tool_calls: previous_calls,
+                        ..
+                    }) = messages.last_mut()
+                    {
+                        previous_calls.extend(tool_calls);
+                    } else {
+                        messages.push(ConversationMessage::AssistantToolCalls {
+                            text,
+                            tool_calls,
+                            reasoning_content,
+                        });
+                    }
+                }
+                ConversationMessage::ToolResults(results) => {
+                    if let Some(ConversationMessage::ToolResults(previous)) = messages.last_mut() {
+                        previous.extend(results);
+                    } else {
+                        messages.push(ConversationMessage::ToolResults(results));
+                    }
+                }
+                other => messages.push(other),
+            }
+        }
+        messages
+    }
+
+    /// Apply the transcript's existing display/storage bound to native tool
+    /// results before they enter a checkpoint or canonical ACP history.
+    pub fn bounded_transcript_messages(
+        messages: &[ConversationMessage],
+    ) -> Vec<ConversationMessage> {
+        messages
+            .iter()
+            .cloned()
+            .map(|message| match message {
+                ConversationMessage::ToolResults(mut results) => {
+                    for result in &mut results {
+                        result.content = Self::bounded_tool_output(&result.content);
+                    }
+                    ConversationMessage::ToolResults(results)
+                }
+                other => other,
+            })
+            .collect()
+    }
+
+    pub fn bounded_tool_output(output: &str) -> String {
+        if output.len() <= MAX_PERSISTED_TOOL_OUTPUT_BYTES {
+            return output.to_string();
+        }
+        let mut end = MAX_PERSISTED_TOOL_OUTPUT_BYTES;
+        while end > 0 && !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…[truncated]", &output[..end])
+    }
+
+    /// Produce provider-safe ACP history while preserving client-visible text.
+    /// Only an immediately adjacent tool-call/result pair is retained, and one
+    /// result is kept for each call id. Recovery markers stay transcript-only.
+    pub fn provider_safe_history(messages: &[ConversationMessage]) -> Vec<ConversationMessage> {
+        let mut repaired = Vec::new();
+        let mut index = 0;
+        while index < messages.len() {
+            match &messages[index] {
+                ConversationMessage::Chat(chat) if chat.role == "system" => {
+                    index += 1;
+                }
+                ConversationMessage::Chat(_) => {
+                    repaired.push(messages[index].clone());
+                    index += 1;
+                }
+                ConversationMessage::AssistantToolCalls {
+                    text,
+                    tool_calls,
+                    reasoning_content,
+                } => {
+                    let adjacent_results =
+                        messages.get(index + 1).and_then(|message| match message {
+                            ConversationMessage::ToolResults(results) => Some(results),
+                            _ => None,
+                        });
+                    let mut paired_calls = Vec::new();
+                    let mut paired_results = Vec::new();
+                    if let Some(results) = adjacent_results {
+                        for call in tool_calls {
+                            if let Some(result) =
+                                results.iter().find(|result| result.tool_call_id == call.id)
+                            {
+                                paired_calls.push(call.clone());
+                                paired_results.push(result.clone());
+                            }
+                        }
+                    }
+
+                    if paired_calls.is_empty() {
+                        if let Some(text) = text.as_ref().filter(|text| !text.is_empty()) {
+                            repaired.push(ConversationMessage::Chat(ChatMessage::assistant(text)));
+                        }
+                    } else {
+                        repaired.push(ConversationMessage::AssistantToolCalls {
+                            text: text.clone(),
+                            tool_calls: paired_calls,
+                            reasoning_content: reasoning_content.clone(),
+                        });
+                        repaired.push(ConversationMessage::ToolResults(paired_results));
+                    }
+                    index += if adjacent_results.is_some() { 2 } else { 1 };
+                }
+                ConversationMessage::ToolResults(_) => {
+                    index += 1;
+                }
+            }
+        }
+        repaired
     }
 
     pub fn set_token_count(&self, session_uuid: &str, token_count: u64) -> Result<()> {
@@ -917,7 +1293,7 @@ mod tests {
     }
 
     #[test]
-    fn new_creates_all_four_tables() {
+    fn new_creates_all_tables() {
         let (_tmp, store) = open_store();
         let conn = store.conn.lock();
         for table in [
@@ -925,6 +1301,8 @@ mod tests {
             "acp_messages",
             "acp_tool_calls",
             "acp_session_events",
+            "acp_turn_checkpoints",
+            "acp_turn_checkpoint_events",
         ] {
             let name: String = conn
                 .query_row(
@@ -1035,6 +1413,438 @@ mod tests {
         assert!(matches!(
             &data.messages[1],
             ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi"
+        ));
+    }
+
+    #[test]
+    fn interrupted_checkpoint_recovers_once_with_marker() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("checkpoint-session", "default", "/tmp/workspace")
+            .unwrap();
+        let initial = vec![ConversationMessage::Chat(ChatMessage::user("question"))];
+        store
+            .begin_turn_checkpoint("checkpoint-session", "turn-1", &initial)
+            .unwrap();
+        store
+            .append_turn_checkpoint(
+                "checkpoint-session",
+                "turn-1",
+                &[ConversationMessage::Chat(ChatMessage::assistant(
+                    "partial ",
+                ))],
+            )
+            .unwrap();
+        store
+            .append_turn_checkpoint(
+                "checkpoint-session",
+                "turn-1",
+                &[ConversationMessage::Chat(ChatMessage::assistant("answer"))],
+            )
+            .unwrap();
+
+        assert!(
+            store
+                .recover_turn_checkpoint("checkpoint-session", "stream interrupted")
+                .unwrap()
+        );
+        assert!(
+            !store
+                .recover_turn_checkpoint("checkpoint-session", "stream interrupted")
+                .unwrap()
+        );
+        let restored = store.load_session("checkpoint-session").unwrap().unwrap();
+        assert!(matches!(
+            &restored.messages[..],
+            [
+                ConversationMessage::Chat(user),
+                ConversationMessage::Chat(assistant),
+                ConversationMessage::Chat(marker),
+            ] if user.role == "user"
+                && assistant.content == "partial answer"
+                && marker.role == "system"
+                && marker.content == "stream interrupted"
+        ));
+    }
+
+    #[test]
+    fn interruption_boundaries_restore_transcript_and_provider_safe_history() {
+        struct Case {
+            name: &'static str,
+            fragments: Vec<ConversationMessage>,
+            expected_transcript_tool_counts: (usize, usize),
+            expected_tool_exchange: bool,
+        }
+
+        let tool_call = || ToolCall {
+            id: "call-1".to_string(),
+            name: "shell".to_string(),
+            arguments: r#"{"command":"pwd"}"#.to_string(),
+            extra_content: None,
+        };
+        let assistant = ConversationMessage::Chat(ChatMessage::assistant("checking"));
+        let call = ConversationMessage::AssistantToolCalls {
+            text: None,
+            tool_calls: vec![tool_call()],
+            reasoning_content: None,
+        };
+        let result = ConversationMessage::ToolResults(vec![ToolResultMessage {
+            tool_call_id: "call-1".to_string(),
+            tool_name: "shell".to_string(),
+            content: "/tmp/workspace".to_string(),
+        }]);
+        let cases = [
+            Case {
+                name: "assistant-text",
+                fragments: vec![assistant.clone()],
+                expected_transcript_tool_counts: (0, 0),
+                expected_tool_exchange: false,
+            },
+            Case {
+                name: "tool-call",
+                fragments: vec![assistant.clone(), call.clone()],
+                expected_transcript_tool_counts: (1, 0),
+                expected_tool_exchange: false,
+            },
+            Case {
+                name: "tool-result",
+                fragments: vec![assistant, call, result],
+                expected_transcript_tool_counts: (1, 1),
+                expected_tool_exchange: true,
+            },
+        ];
+
+        for case in cases {
+            let (_tmp, store) = open_store();
+            let session_id = format!("checkpoint-{}", case.name);
+            store
+                .create_session(&session_id, "default", "/tmp/workspace")
+                .unwrap();
+            store
+                .begin_turn_checkpoint(
+                    &session_id,
+                    "turn-1",
+                    &[ConversationMessage::Chat(ChatMessage::user("question"))],
+                )
+                .unwrap();
+            for fragment in case.fragments {
+                store
+                    .append_turn_checkpoint(&session_id, "turn-1", &[fragment])
+                    .unwrap();
+            }
+
+            assert!(
+                store
+                    .recover_turn_checkpoint(&session_id, "stream interrupted")
+                    .unwrap(),
+                "{} checkpoint should recover",
+                case.name
+            );
+            let restored = store.load_session(&session_id).unwrap().unwrap();
+            assert!(
+                matches!(
+                    restored.messages.last(),
+                    Some(ConversationMessage::Chat(marker))
+                        if marker.role == "system" && marker.content == "stream interrupted"
+                ),
+                "{} transcript should end with the interruption marker",
+                case.name
+            );
+            assert!(
+                restored.messages.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat)
+                        if chat.role == "assistant" && chat.content == "checking"
+                ) || matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls { text: Some(text), .. }
+                        if text == "checking"
+                )),
+                "{} transcript should retain visible assistant text",
+                case.name
+            );
+            let transcript_tool_counts =
+                restored
+                    .messages
+                    .iter()
+                    .fold((0, 0), |(calls, results), message| match message {
+                        ConversationMessage::AssistantToolCalls { .. } => (calls + 1, results),
+                        ConversationMessage::ToolResults(_) => (calls, results + 1),
+                        ConversationMessage::Chat(_) => (calls, results),
+                    });
+            assert_eq!(
+                transcript_tool_counts, case.expected_transcript_tool_counts,
+                "{} transcript should retain every visible tool boundary",
+                case.name
+            );
+
+            let provider_history = AcpSessionStore::provider_safe_history(&restored.messages);
+            assert!(
+                provider_history.iter().all(|message| !matches!(
+                    message,
+                    ConversationMessage::Chat(chat) if chat.role == "system"
+                )),
+                "{} provider history should exclude the interruption marker",
+                case.name
+            );
+            assert!(
+                matches!(
+                    provider_history.first(),
+                    Some(ConversationMessage::Chat(user))
+                        if user.role == "user" && user.content == "question"
+                ),
+                "{} provider history should retain the accepted prompt",
+                case.name
+            );
+            assert!(
+                provider_history.iter().any(|message| matches!(
+                    message,
+                    ConversationMessage::Chat(chat)
+                        if chat.role == "assistant" && chat.content == "checking"
+                ) || matches!(
+                    message,
+                    ConversationMessage::AssistantToolCalls { text: Some(text), .. }
+                        if text == "checking"
+                )),
+                "{} provider history should retain visible assistant text",
+                case.name
+            );
+            let tool_call_count = provider_history
+                .iter()
+                .filter(|message| matches!(message, ConversationMessage::AssistantToolCalls { .. }))
+                .count();
+            let tool_result_count = provider_history
+                .iter()
+                .filter(|message| matches!(message, ConversationMessage::ToolResults(_)))
+                .count();
+            assert_eq!(
+                (tool_call_count, tool_result_count),
+                if case.expected_tool_exchange {
+                    (1, 1)
+                } else {
+                    (0, 0)
+                },
+                "{} provider history should contain only a complete tool exchange",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn missing_session_has_no_checkpoint_to_recover() {
+        let (_tmp, store) = open_store();
+
+        assert!(
+            !store
+                .recover_turn_checkpoint("missing-session", "stream interrupted")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn checkpoint_turn_id_mismatch_cannot_append_or_finalize() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("checkpoint-identity", "default", "/tmp/workspace")
+            .unwrap();
+        let messages = vec![ConversationMessage::Chat(ChatMessage::user("question"))];
+        store
+            .begin_turn_checkpoint("checkpoint-identity", "turn-current", &messages)
+            .unwrap();
+
+        assert!(
+            store
+                .append_turn_checkpoint("checkpoint-identity", "turn-stale", &messages)
+                .is_err()
+        );
+        assert!(
+            store
+                .finalize_turn_checkpoint("checkpoint-identity", "turn-stale", &messages)
+                .is_err()
+        );
+        assert!(
+            store
+                .recover_turn_checkpoint("checkpoint-identity", "interrupted")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn failed_checkpoint_finalization_preserves_recoverable_fragments() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("checkpoint-finalize", "default", "/tmp/workspace")
+            .unwrap();
+        let initial = vec![ConversationMessage::Chat(ChatMessage::user("question"))];
+        store
+            .begin_turn_checkpoint("checkpoint-finalize", "turn-1", &initial)
+            .unwrap();
+        store
+            .append_turn_checkpoint(
+                "checkpoint-finalize",
+                "turn-1",
+                &[ConversationMessage::Chat(ChatMessage::assistant("partial"))],
+            )
+            .unwrap();
+
+        let invalid_terminal = vec![ConversationMessage::ToolResults(vec![ToolResultMessage {
+            tool_call_id: "missing".to_string(),
+            tool_name: "shell".to_string(),
+            content: "orphan".to_string(),
+        }])];
+        assert!(
+            store
+                .finalize_turn_checkpoint("checkpoint-finalize", "turn-1", &invalid_terminal,)
+                .is_err()
+        );
+        assert!(
+            store
+                .recover_turn_checkpoint("checkpoint-finalize", "interrupted")
+                .unwrap()
+        );
+        let restored = store.load_session("checkpoint-finalize").unwrap().unwrap();
+        assert!(matches!(
+            &restored.messages[..],
+            [
+                ConversationMessage::Chat(user),
+                ConversationMessage::Chat(assistant),
+                ConversationMessage::Chat(marker),
+            ] if user.role == "user"
+                && assistant.content == "partial"
+                && marker.role == "system"
+        ));
+    }
+
+    #[test]
+    fn killed_session_checkpoint_is_not_promoted() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("checkpoint-killed", "default", "/tmp/workspace")
+            .unwrap();
+        let initial = [ConversationMessage::Chat(ChatMessage::user("question"))];
+        store
+            .begin_turn_checkpoint("checkpoint-killed", "turn-1", &initial)
+            .unwrap();
+        assert!(store.mark_session_killed("checkpoint-killed").unwrap());
+
+        assert!(
+            !store
+                .recover_turn_checkpoint("checkpoint-killed", "interrupted")
+                .unwrap()
+        );
+        assert!(
+            store
+                .load_session("checkpoint-killed")
+                .unwrap()
+                .unwrap()
+                .messages
+                .is_empty()
+        );
+        assert!(
+            store
+                .append_turn_checkpoint("checkpoint-killed", "turn-1", &[])
+                .is_ok(),
+            "the untouched checkpoint should retain its turn identity"
+        );
+    }
+
+    #[test]
+    fn provider_safe_history_requires_adjacent_exact_tool_pairs() {
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::system("interrupted")),
+            ConversationMessage::AssistantToolCalls {
+                text: Some("partial".to_string()),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "paired".to_string(),
+                        name: "shell".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    },
+                    ToolCall {
+                        id: "orphan".to_string(),
+                        name: "shell".to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    },
+                ],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                ToolResultMessage {
+                    tool_call_id: "paired".to_string(),
+                    tool_name: "shell".to_string(),
+                    content: "first".to_string(),
+                },
+                ToolResultMessage {
+                    tool_call_id: "paired".to_string(),
+                    tool_name: "shell".to_string(),
+                    content: "duplicate".to_string(),
+                },
+            ]),
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "orphan".to_string(),
+                tool_name: "shell".to_string(),
+                content: "misplaced".to_string(),
+            }]),
+        ];
+
+        let repaired = AcpSessionStore::provider_safe_history(&messages);
+        assert_eq!(repaired.len(), 2);
+        assert!(matches!(
+            &repaired[0],
+            ConversationMessage::AssistantToolCalls { text, tool_calls, .. }
+                if text.as_deref() == Some("partial")
+                    && tool_calls.len() == 1
+                    && tool_calls[0].id == "paired"
+        ));
+        assert!(matches!(
+            &repaired[1],
+            ConversationMessage::ToolResults(results)
+                if results.len() == 1
+                    && results[0].tool_call_id == "paired"
+                    && results[0].content == "first"
+        ));
+    }
+
+    #[test]
+    fn bounded_transcript_messages_caps_terminal_tool_output() {
+        let messages = [
+            ConversationMessage::AssistantToolCalls {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    arguments: "{}".to_string(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![ToolResultMessage {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "shell".to_string(),
+                content: "x".repeat(MAX_PERSISTED_TOOL_OUTPUT_BYTES + 10),
+            }]),
+        ];
+        let bounded = AcpSessionStore::bounded_transcript_messages(&messages);
+        assert!(matches!(
+            &bounded[1],
+            ConversationMessage::ToolResults(results)
+                if results[0].content.ends_with("…[truncated]")
+                    && results[0].content.len()
+                        <= MAX_PERSISTED_TOOL_OUTPUT_BYTES + "…[truncated]".len()
+        ));
+
+        let (_tmp, store) = open_store();
+        store
+            .create_session("bounded-terminal", "default", "/tmp/workspace")
+            .unwrap();
+        store.append_turn("bounded-terminal", &messages).unwrap();
+        let restored = store.load_session("bounded-terminal").unwrap().unwrap();
+        assert!(matches!(
+            &restored.messages[1],
+            ConversationMessage::ToolResults(results)
+                if results[0].content.ends_with("…[truncated]")
         ));
     }
 
