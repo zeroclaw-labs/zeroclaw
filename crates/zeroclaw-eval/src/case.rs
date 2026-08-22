@@ -83,6 +83,37 @@ pub struct TraceExpects {
     /// Regex patterns the final response must match.
     #[serde(default)]
     pub response_matches: Vec<String>,
+    /// Lower bound on the number of tool calls.
+    #[serde(default)]
+    pub min_tool_calls: Option<usize>,
+    /// Exact number of tool calls the run must have made. Unlike `tools_used`
+    /// (existential) and `max_tool_calls` (upper bound), this fails when a
+    /// dispatch the fixture claims is missing.
+    #[serde(default)]
+    pub exact_tool_calls: Option<usize>,
+    /// Substrings that must appear in the arguments dispatched to a tool.
+    #[serde(default)]
+    pub tool_arguments_contain: Vec<ToolPayloadExpect>,
+    /// Substrings that must appear in the result a tool returned.
+    #[serde(default)]
+    pub tool_results_contain: Vec<ToolPayloadExpect>,
+}
+
+/// An expectation over one dispatched tool call's argument or result payload.
+///
+/// `call_index` selects which call to inspect: when omitted, the check passes if
+/// *any* call to `tool` carries `needle`; when set, it grades that specific call
+/// (0-based, counted across calls to the named tool in dispatch order), which is
+/// how a fixture asserts ordering — e.g. call 0 carried `alpha`, call 1 `beta`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToolPayloadExpect {
+    /// Tool name whose payload is inspected.
+    pub tool: String,
+    /// Substring the payload must contain.
+    pub needle: String,
+    /// Optional 0-based index among calls to `tool`, in dispatch order.
+    #[serde(default)]
+    pub call_index: Option<usize>,
 }
 
 impl LlmTrace {
