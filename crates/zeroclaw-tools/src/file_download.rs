@@ -118,6 +118,38 @@ impl FileDownloadTool {
         }
     }
 
+    /// Construct with a policy resolver that returns the atomic SSRF snapshot
+    /// from the canonical config at use time (a single `live.read()` in the
+    /// runtime wiring). The resolver is called on each dispatch, so a live
+    /// `config/set` that adds or removes an internal CDN entry or a declared
+    /// NAT64 prefix takes effect on the next call instead of the
+    /// construction-time snapshot. The channel daemon wires the live `Config`
+    /// handle here; one-shot callers use the snapshot
+    /// [`Self::new_with_persistence`].
+    ///
+    /// The single-policy shape means `allowed_private_hosts` and
+    /// `nat64_prefixes` always come from the same config generation on one
+    /// dispatch, so a streaming `config/set` cannot split the two fields across
+    /// generations. The tool therefore never holds a second policy copy that can
+    /// go stale, per the repository's single-source-of-truth rule (AGENTS.md).
+    pub fn new_with_persistence_and_resolver<F>(
+        security: Arc<SecurityPolicy>,
+        config: FileDownloadConfig,
+        persistent_writes: bool,
+        policy_resolver: F,
+    ) -> Self
+    where
+        F: Fn() -> FileDownloadSsrfPolicy + Send + Sync + 'static,
+    {
+        Self {
+            security,
+            config,
+            policy_resolver: Arc::new(policy_resolver),
+            endpoint_resolver: default_endpoint_resolver(),
+            persistent_writes,
+        }
+    }
+
     /// Construct with an explicit DNS resolver seam, mirroring
     /// [`Self::new_with_persistence`]. Tests inject a counting or
     /// forbidding resolver to prove a rejected dispatch performs zero resolver
