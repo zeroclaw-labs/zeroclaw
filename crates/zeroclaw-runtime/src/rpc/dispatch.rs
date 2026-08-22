@@ -785,11 +785,9 @@ impl RpcDispatcher {
         }
     }
 
-    /// Fine-grained agent selector for `session/new`, plus the fail-closed
-    /// posture for per-tool selectors: agent sessions are not yet
-    /// principal-aware inside the tool loop, so a principal whose tool
-    /// selector is constrained (neither `admin` nor the explicit `"*"`)
-    /// is refused a session rather than silently un-enforced.
+    /// Fine-grained agent selector for `session/new`. The principal's tool
+    /// selector composes separately through
+    /// [`Self::principal_tool_narrowing`] at agent assembly.
     fn selector_session_agent(&self, alias: &str) -> Result<(), JsonRpcError> {
         let Some(auth) = self.auth.as_ref() else {
             return Err(rpc_err(AUTH_REQUIRED, "First call must be 'initialize'"));
@@ -800,22 +798,28 @@ impl RpcDispatcher {
                 format!("Principal is not entitled to agent {alias:?}"),
             ));
         }
-        let tools_unrestricted = auth.grants.admin
+        Ok(())
+    }
+
+    /// The per-run tool narrowing derived from the bound principal's
+    /// selector, applied at agent assembly (composition by intersection
+    /// with the agent's own policy): `None` = unrestricted (`admin` or the
+    /// explicit `"*"`), `Some(list)` keeps only the named tools, and an
+    /// empty list yields a tool-less session. Bound at session creation;
+    /// later selector changes reach NEW sessions, while revoking the
+    /// session grants cuts off existing ones at the per-operation gate.
+    fn principal_tool_narrowing(&self) -> Option<Vec<String>> {
+        let auth = self.auth.as_ref()?;
+        if auth.grants.admin
             || auth
                 .grants
                 .allowed_tools
                 .iter()
-                .any(|t| t == zeroclaw_api::grants::WILDCARD);
-        if !tools_unrestricted {
-            return Err(rpc_err(
-                FORBIDDEN,
-                "This principal's tool selector is constrained, and per-tool \
-                 enforcement inside agent sessions lands with the session-assembly \
-                 slice: grant allowed_tools = [\"*\"] or admin until then (fail \
-                 closed, never silently un-enforced)",
-            ));
+                .any(|t| t == zeroclaw_api::grants::WILDCARD)
+        {
+            return None;
         }
-        Ok(())
+        Some(auth.grants.allowed_tools.clone())
     }
 
     /// TUI ID assigned during initialize, if any.
@@ -1811,6 +1815,7 @@ impl RpcDispatcher {
             tui_env,
             self.ctx.sop_engine.clone(),
             self.ctx.sop_audit.clone(),
+            self.principal_tool_narrowing(),
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
@@ -2300,6 +2305,7 @@ impl RpcDispatcher {
             tui_env,
             self.ctx.sop_engine.clone(),
             self.ctx.sop_audit.clone(),
+            self.principal_tool_narrowing(),
         )
         .await
         .ok()?;
@@ -6005,14 +6011,15 @@ mod tests {
                 zeroclaw_api::grants::Verb::Create,
             )
             .expect("coarse grant passes after refresh");
-        // ...and the selector then fails closed on the constrained tools.
-        let denied = alice
+        // ...and the constrained tool selector now composes as per-session
+        // narrowing instead of refusing the session.
+        alice
             .selector_session_agent("any-agent")
-            .expect_err("constrained tool selector refuses sessions");
-        assert!(
-            denied.message.contains("session-assembly"),
-            "{}",
-            denied.message
+            .expect("constrained tools narrow the session, not refuse it");
+        assert_eq!(
+            alice.principal_tool_narrowing(),
+            Some(vec!["calculator".to_string()]),
+            "the named selector becomes the per-run tool narrowing"
         );
 
         // bob (operator): wildcard agents + wildcard tools pass.
@@ -6044,6 +6051,73 @@ mod tests {
             .await
             .expect("bob authenticates");
         assert!(bob.selector_session_agent("any-agent").is_ok());
+        assert_eq!(
+            bob.principal_tool_narrowing(),
+            None,
+            "an explicit \"*\" selector is unrestricted"
+        );
+    }
+
+    #[tokio::test]
+    async fn constrained_principal_session_is_narrowed_not_refused() {
+        use zeroclaw_config::schema::{PermissionProfileConfig, UserConfig};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.permission_profiles.insert(
+            "narrow".into(),
+            PermissionProfileConfig {
+                allowed_agents: vec!["*".into()],
+                allowed_tools: vec!["calculator".into()],
+                grants: std::collections::HashMap::from([(
+                    zeroclaw_api::grants::Resource::Sessions,
+                    vec![
+                        zeroclaw_api::grants::Verb::Create,
+                        zeroclaw_api::grants::Verb::Execute,
+                    ],
+                )]),
+                ..PermissionProfileConfig::default()
+            },
+        );
+        config.users.insert(
+            "alice".into(),
+            UserConfig {
+                principal_id: None,
+                uid: Some(4242),
+                permission_profiles: vec!["narrow".into()],
+            },
+        );
+        let (dispatcher, sessions) = make_acp_test_dispatcher(config);
+        let mut dispatcher = dispatcher.with_transport(
+            crate::rpc::transport::TransportKind::Local,
+            crate::security::auth_provider::Credential::Peercred { uid: 4242 },
+        );
+        dispatcher
+            .handle_initialize(&json!({}))
+            .await
+            .expect("constrained roster principal authenticates");
+
+        let result = dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "narrowed-001",
+            }))
+            .await;
+        assert!(
+            result.is_ok(),
+            "a constrained tool selector must narrow, not refuse: {:?}",
+            result.err()
+        );
+
+        let agent_arc = sessions
+            .get_agent("narrowed-001")
+            .await
+            .expect("session registered");
+        let agent = agent_arc.lock().await;
+        let tool_names = agent.tool_names();
+        assert!(
+            tool_names.iter().all(|t| *t == "calculator"),
+            "only the granted tool may survive assembly; got: {tool_names:?}"
+        );
     }
 
     #[test]

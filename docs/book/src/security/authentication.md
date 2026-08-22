@@ -79,11 +79,13 @@ Profiles are deny-by-default: an unlisted resource is refused, an empty
 selector list grants no instances, and broad access requires the explicit
 `"*"` selector or `admin = true`. Multiple profiles merge by union.
 
-One current limitation is deliberate: per-tool selectors are not yet
-enforced inside agent sessions, so a principal whose `allowed_tools` is
-constrained (neither `admin` nor `"*"`) is **refused** `session/new`
-rather than silently under-enforced. Grant `allowed_tools = ["*"]` until
-the session-assembly change lands.
+Tool selectors compose by intersection at agent assembly: a session
+created by a constrained principal only receives the tools its
+`allowed_tools` names (an empty list yields a tool-less session), on top
+of whatever the agent's own risk profile allows. The narrowing binds when
+the session is created; selector changes apply to new sessions, while
+revoking a principal's session grants cuts off its existing sessions at
+the per-operation gate.
 
 ## Breaking change: remote WSS requires authentication
 
