@@ -926,6 +926,9 @@ turn-model-fallback-notice = ⚡ { $requested_model } ({ $requested_provider }) 
 # Shown at the end of agent output when the tool call loop exhausted its
 # iteration budget and the agent cannot continue without exceeding limits.
 turn-max-iterations-reached = *Turn stopped: reached maximum tool iterations ({ $max_iterations }).*
+# Shown when in-loop context recovery could not trim the history far enough to
+# retry, and the turn must end on the context-window-exceeded error.
+turn-context-exhausted = *Turn stopped: the conversation exceeded the model's context window and could not be reduced further. Start a new conversation or shorten the request.*
 # Breadcrumb injected into history where older turns were dropped to fit the
 # context budget; user-visible across channels, WS, RPC, ACP.
 history-trim-breadcrumb = [earlier turns omitted to fit the context window]

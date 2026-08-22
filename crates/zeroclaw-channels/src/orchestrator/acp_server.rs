@@ -21,7 +21,7 @@ use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_config::schema::Config;
 use zeroclaw_infra::acp_session_store::AcpSessionStore;
-use zeroclaw_runtime::agent::agent::{Agent, TurnEvent};
+use zeroclaw_runtime::agent::agent::{Agent, TurnEvent, TurnTerminalReason};
 use zeroclaw_runtime::tools::CanvasStore;
 
 use super::acp_embedded;
@@ -1564,7 +1564,12 @@ impl AcpServer {
                         cost_context,
                         session
                             .agent
-                            .turn_streamed(&prompt, event_tx, Some(cancel_token))
+                            .turn_streamed_with_steering_state(
+                                &prompt,
+                                event_tx,
+                                Some(cancel_token),
+                                None,
+                            )
                             .instrument(span),
                     ),
                 )
@@ -1673,7 +1678,7 @@ impl AcpServer {
         // Per ACP spec: a cancelled turn must respond with stopReason "cancelled",
         // not an error. Detect via ToolLoopCancelled propagated through anyhow.
         let was_cancelled = match &turn_result {
-            Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(e),
+            Err(e) => zeroclaw_runtime::agent::loop_::is_tool_loop_cancelled(&e.error),
             Ok(_) => false,
         };
 
@@ -1693,46 +1698,47 @@ impl AcpServer {
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
-        let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
-            let (diagnostic, rpc_error) = acp_turn_failure(&e);
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error": diagnostic,
-                })),
-                "ACP session/prompt turn failed"
-            );
-            rpc_error
-        })?;
+        let (result_text, new_turn_msgs) = match turn_result {
+            Ok(outcome) => (outcome.response, outcome.new_messages),
+            Err(e) => {
+                let (diagnostic, rpc_error) = acp_turn_failure(&e.error);
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "error": diagnostic,
+                            "terminal": e.terminal_reason.is_some(),
+                        })),
+                    "ACP session/prompt turn failed"
+                );
+                // The runtime owns the terminal notice and appends it to the
+                // typed failed-turn delta, but it is intentionally not a
+                // TurnEvent. Forward that canonical message to the active ACP
+                // caller before returning the transport error. The terminal
+                // reason is the provenance guard: ordinary provider failures
+                // must not replay their last assistant message here.
+                if let Some(notification) = terminal_notice_notification(
+                    &session_id,
+                    e.terminal_reason,
+                    &e.new_messages,
+                ) {
+                    self.write_notification(&notification).await;
+                }
+
+                // Persist the terminal delta BEFORE returning the transport
+                // error. The failed user turn, any partial/tool history and the
+                // terminal notice are all in `new_messages`; returning first
+                // (the old `?`) skipped the success-only persistence path below
+                // and left the durable session unable to recover the turn on
+                // resume, even though the live in-memory agent still had it.
+                self.persist_turn_messages(&session_id, e.new_messages).await;
+                return Err(rpc_error);
+            }
+        };
 
         // Persist new messages on successful, non-cancelled turns.
-        if let Some(store) = &self.store
-            && !new_turn_msgs.is_empty()
-        {
-            let store = store.clone();
-            let sid = session_id.clone();
-            let msgs = new_turn_msgs;
-            let persisted =
-                tokio::task::spawn_blocking(move || store.append_turn(&sid, &msgs)).await;
-            let error = match persisted {
-                Ok(Ok(())) => None,
-                Ok(Err(e)) => Some(e.to_string()),
-                Err(join) => Some(join.to_string()),
-            };
-            if let Some(detail) = error {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_category(::zeroclaw_log::EventCategory::Channel)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "error": detail,
-                        })),
-                    "Failed to persist turn; session continues in memory"
-                );
-            }
-        }
+        self.persist_turn_messages(&session_id, new_turn_msgs).await;
 
         // Durably persist the latest TodoWrite plan for this turn so it
         // replays on session/resume (best-effort; the live emission above
@@ -1812,6 +1818,46 @@ impl AcpServer {
             .lock()
             .expect("cancel_tokens lock poisoned — invariant: all guarded critical sections are short, infallible HashMap ops")
             .remove(session_id);
+    }
+
+    /// Best-effort durable persistence of a turn's message delta.
+    ///
+    /// Shared by the success and failure paths so a failed turn keeps the same
+    /// durability guarantee as a successful one: the user turn, any partial or
+    /// tool history and a terminal notice must survive close/restart/resume.
+    /// Persistence failures are logged, never propagated — the live session
+    /// continues in memory and the transport response is unaffected.
+    async fn persist_turn_messages(
+        &self,
+        session_id: &str,
+        msgs: Vec<zeroclaw_providers::ConversationMessage>,
+    ) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if msgs.is_empty() {
+            return;
+        }
+        let store = store.clone();
+        let sid = session_id.to_string();
+        let persisted = tokio::task::spawn_blocking(move || store.append_turn(&sid, &msgs)).await;
+        let error = match persisted {
+            Ok(Ok(())) => None,
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(join) => Some(join.to_string()),
+        };
+        if let Some(detail) = error {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_category(::zeroclaw_log::EventCategory::Channel)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "error": detail,
+                    })),
+                "Failed to persist turn; session continues in memory"
+            );
+        }
     }
 
     fn prompt_result(session_id: String, stop_reason: &'static str, text: String) -> Value {
@@ -2491,6 +2537,31 @@ fn notification_for_turn_event(session_id: &str, event: &TurnEvent) -> Option<Js
              ACP has no session/update notification for token usage"
         ),
     })
+}
+
+fn terminal_notice_notification(
+    session_id: &str,
+    terminal_reason: Option<TurnTerminalReason>,
+    new_messages: &[ConversationMessage],
+) -> Option<JsonRpcNotification> {
+    if terminal_reason != Some(TurnTerminalReason::ContextExhausted) {
+        return None;
+    }
+
+    let notice = new_messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            ConversationMessage::Chat(chat) if chat.role == "assistant" => Some(&chat.content),
+            _ => None,
+        })?;
+
+    notification_for_turn_event(
+        session_id,
+        &TurnEvent::Chunk {
+            delta: notice.clone(),
+        },
+    )
 }
 
 fn history_notifications_for_message(
@@ -5310,6 +5381,165 @@ mod tests {
             "agent_message_chunk"
         );
         assert_eq!(n1["params"]["update"]["content"]["text"], "hi there");
+    }
+
+    struct ContextExhaustedModelProvider;
+
+    #[async_trait::async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for ContextExhaustedModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Err(anyhow::Error::msg("maximum context length exceeded"))
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for ContextExhaustedModelProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "context-exhausted-test"
+        }
+    }
+
+    /// Drive a real context-exhausted Agent turn through the ACP prompt
+    /// boundary. The active caller must receive the runtime-authored notice
+    /// before the transport error, and the same single notice must remain
+    /// durable across a server restart plus `session/load` replay.
+    #[tokio::test]
+    async fn context_exhausted_prompt_notifies_live_caller_and_survives_restart() {
+        let cwd = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(cwd.path()).unwrap());
+        let session_id = "sess-context-exhausted-boundary";
+        let prompt = "please summarize everything";
+        let notice = zeroclaw_runtime::i18n::get_required_cli_string("turn-context-exhausted");
+        store
+            .create_session(session_id, "test-agent", &cwd.path().to_string_lossy())
+            .unwrap();
+
+        let agent = Agent::builder()
+            .model_provider(Box::new(ContextExhaustedModelProvider))
+            .tools(Vec::new())
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(zeroclaw_runtime::observability::NoopObserver))
+            .tool_dispatcher(Box::new(
+                zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .model_name("context-test-model".to_string())
+            .model_provider_name("context-exhausted-test".to_string())
+            .agent_alias("test-agent".to_string())
+            .workspace_dir(cwd.path().to_path_buf())
+            .build()
+            .expect("test agent must build");
+
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let server = Arc::new(AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        ));
+        server.sessions.lock().await.insert(
+            session_id.to_string(),
+            Arc::new(Mutex::new(Session {
+                agent,
+                created_at: Instant::now(),
+                last_active: Instant::now(),
+                agent_alias: "test-agent".to_string(),
+                model_provider: "context-exhausted-test".to_string(),
+                model: "context-test-model".to_string(),
+                workspace_dir: cwd.path().to_string_lossy().into_owned(),
+            })),
+        );
+
+        let error = server
+            .handle_session_prompt(
+                &serde_json::json!({
+                    "sessionId": session_id,
+                    "prompt": [{"type": "text", "text": prompt}]
+                }),
+                &serde_json::json!(1),
+            )
+            .await
+            .expect_err("context exhaustion must retain the transport error");
+        assert_eq!(error.code, INTERNAL_ERROR);
+
+        let mut live_notices = Vec::new();
+        while let Ok(message) = writer_rx.try_recv() {
+            let value: Value = serde_json::from_str(&message).unwrap();
+            if value["params"]["update"]["sessionUpdate"] == "agent_message_chunk" {
+                live_notices.push(
+                    value["params"]["update"]["content"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(live_notices, vec![notice.clone()]);
+
+        let persisted = store
+            .load_session(session_id)
+            .unwrap()
+            .expect("failed turn must remain durable");
+        let persisted_chat: Vec<_> = persisted
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                ConversationMessage::Chat(chat) => {
+                    Some((chat.role.as_str(), chat.content.as_str()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(persisted_chat.len(), 2, "unexpected persisted delta");
+        assert_eq!(persisted_chat[0].0, "user");
+        assert!(
+            persisted_chat[0].1.ends_with(prompt),
+            "runtime timestamping must retain the original prompt: {persisted_chat:?}"
+        );
+        assert_eq!(persisted_chat[1], ("assistant", notice.as_str()));
+
+        drop(server);
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<String>(64);
+        let restarted = AcpServer::new_with_writer_and_store(
+            make_test_config(cwd.path()),
+            AcpServerConfig::default(),
+            writer_tx,
+            Arc::clone(&store),
+        );
+        restarted
+            .handle_session_load(&serde_json::json!({
+                "sessionId": session_id,
+                "cwd": cwd.path().to_string_lossy()
+            }))
+            .await
+            .expect("session/load must succeed after restart");
+
+        let mut replayed = Vec::new();
+        while let Ok(message) = writer_rx.try_recv() {
+            let value: Value = serde_json::from_str(&message).unwrap();
+            if let Some(text) = value["params"]["update"]["content"]["text"].as_str() {
+                replayed.push(text.to_string());
+            }
+        }
+        assert_eq!(replayed.len(), 2, "unexpected replay: {replayed:?}");
+        assert!(
+            replayed[0].ends_with(prompt),
+            "replay must retain the timestamped user prompt: {replayed:?}"
+        );
+        assert_eq!(replayed[1], notice);
     }
 
     #[tokio::test]
