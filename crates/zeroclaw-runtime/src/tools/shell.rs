@@ -48,6 +48,9 @@ impl Drop for ChildGroupGuard {
                 .with_attrs(::serde_json::json!({ "pgid": pgid, "signal": "SIGKILL" })),
             "shell tool reaping child process group"
         );
+        // SAFETY: `pgid` was published only after the spawned child created
+        // its own process group; a negative PID targets that group, and this
+        // best-effort signal call passes no pointers.
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
         }
@@ -150,8 +153,16 @@ fn decode_output(bytes: &[u8]) -> String {
     use windows::Win32::Globalization::GetACP;
     use windows::Win32::System::Console::GetConsoleOutputCP;
 
-    let cp = unsafe { GetConsoleOutputCP() };
-    let cp = if cp == 0 { unsafe { GetACP() } } else { cp };
+    // SAFETY: both Win32 functions are parameter-free code-page queries. A
+    // zero console code page selects the documented system ANSI fallback.
+    let cp = unsafe {
+        let console_cp = GetConsoleOutputCP();
+        if console_cp == 0 {
+            GetACP()
+        } else {
+            console_cp
+        }
+    };
 
     decode_output_with_code_page(bytes, cp)
 }
