@@ -406,6 +406,22 @@ pub enum ConnectionState {
     Disconnected { reason: String },
 }
 
+fn record_disconnect(
+    state: &Arc<Mutex<ConnectionState>>,
+    rpc: &Arc<RpcOutbound>,
+    reason: impl Into<String>,
+) {
+    let reason = reason.into();
+    *state.lock().unwrap_or_else(|e| e.into_inner()) = ConnectionState::Disconnected {
+        reason: reason.clone(),
+    };
+    rpc.fail_all_pending(JsonRpcError {
+        code: jsonrpc::error_codes::INTERNAL_ERROR,
+        message: reason,
+        data: None,
+    });
+}
+
 /// The TUI and daemon are built from the same package version and do not
 /// promise cross-version wire compatibility.
 #[derive(Debug)]
@@ -683,15 +699,15 @@ impl RpcClient {
                 buf.clear();
                 match reader.read_line(&mut buf).await {
                     Ok(0) => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: "EOF (daemon closed connection)".to_string(),
-                        };
+                        record_disconnect(
+                            &conn_state_for_reader,
+                            &rpc_for_reader,
+                            "EOF (daemon closed connection)",
+                        );
                         break;
                     }
                     Err(e) => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: e.to_string(),
-                        };
+                        record_disconnect(&conn_state_for_reader, &rpc_for_reader, e.to_string());
                         break;
                     }
                     Ok(_) => {}
@@ -839,22 +855,21 @@ impl RpcClient {
                         let reason = frame
                             .map(|f| f.reason.to_string())
                             .unwrap_or_else(|| "server closed connection".to_string());
-                        *conn_state_for_reader.lock().unwrap() =
-                            ConnectionState::Disconnected { reason };
+                        record_disconnect(&conn_state_for_reader, &rpc_for_reader, reason);
                         break;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
                     Some(Ok(Message::Binary(_))) => continue,
                     Some(Err(e)) => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: e.to_string(),
-                        };
+                        record_disconnect(&conn_state_for_reader, &rpc_for_reader, e.to_string());
                         break;
                     }
                     None => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: "EOF (WSS connection closed)".to_string(),
-                        };
+                        record_disconnect(
+                            &conn_state_for_reader,
+                            &rpc_for_reader,
+                            "EOF (WSS connection closed)",
+                        );
                         break;
                     }
                 }
