@@ -4,7 +4,7 @@
 //! parent and stays inside the parent's permissions envelope.
 
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
 use zeroclaw_config::policy::SecurityPolicy;
@@ -40,6 +40,12 @@ pub struct SubAgentSpawn {
     pub parent_alias: String,
     pub parent_policy: Arc<SecurityPolicy>,
     pub parent_allowed_agent_aliases: HashSet<String>,
+    /// Names of the MCP servers configured for the parent agent. Used to
+    /// classify `<server>__<tool>` names as MCP tools (which the runtime
+    /// auto-admits under a non-empty allowlist) versus same-shaped names from
+    /// other tool families, so `ensure_no_escalation_beyond` models effective
+    /// tool access correctly.
+    pub mcp_servers: BTreeSet<String>,
 }
 
 impl SubAgentSpawn {
@@ -77,17 +83,24 @@ impl SubAgentSpawn {
             .collect();
         parent_allowed_agent_aliases.insert(agent_alias.to_string());
 
+        let mcp_servers: BTreeSet<String> = config
+            .mcp_servers_for_agent(agent_alias)
+            .into_iter()
+            .map(|server| server.name)
+            .collect();
+
         Ok(Self {
             parent_alias: agent_alias.to_string(),
             parent_policy,
             parent_allowed_agent_aliases,
+            mcp_servers,
         })
     }
 
     pub fn build(self, overrides: SubAgentOverrides) -> Result<SubAgentContext> {
         let policy = if let Some(mut child_policy) = overrides.policy {
             child_policy
-                .ensure_no_escalation_beyond(&self.parent_policy)
+                .ensure_no_escalation_beyond(&self.parent_policy, &self.mcp_servers)
                 .map_err(|violation| {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -244,6 +257,65 @@ mod tests {
             .expect("narrowing to {} is a valid subset");
         assert_eq!(ctx.allowed_agent_aliases.len(), 1);
         assert!(ctx.allowed_agent_aliases.contains("alpha"));
+    }
+
+    #[test]
+    fn build_rejects_tool_override_that_escalates_beyond_parent() {
+        // A non-MCP `__` tool (e.g. an HTTP skill) the parent does not grant is
+        // an escalation: the violation must surface from build() before any
+        // SubAgentContext is constructed. `filesystem` is a configured MCP
+        // server here, but `weather_skill` is not, so the tool is exact-matched.
+        let spawn = SubAgentSpawn {
+            parent_alias: "alpha".into(),
+            parent_policy: Arc::new(SecurityPolicy {
+                allowed_tools: Some(vec!["spawn_subagent".into()]),
+                ..SecurityPolicy::default()
+            }),
+            parent_allowed_agent_aliases: HashSet::from(["alpha".to_string()]),
+            mcp_servers: BTreeSet::from(["filesystem".to_string()]),
+        };
+        let child_policy = SecurityPolicy {
+            allowed_tools: Some(vec!["weather_skill__get_weather".into()]),
+            ..(*spawn.parent_policy).clone()
+        };
+
+        let err = spawn
+            .build(SubAgentOverrides {
+                policy: Some(child_policy),
+                ..SubAgentOverrides::default()
+            })
+            .expect_err("tool-escalating override must be rejected");
+        assert!(
+            err.to_string().contains("weather_skill__get_weather"),
+            "expected the escalating tool in the error chain, got: {err}"
+        );
+    }
+
+    #[test]
+    fn build_accepts_tool_override_that_narrows_parent() {
+        // A child that narrows the parent's tool allowlist validates and yields
+        // a SubAgentContext bound to the narrowed policy.
+        let spawn = SubAgentSpawn {
+            parent_alias: "alpha".into(),
+            parent_policy: Arc::new(SecurityPolicy {
+                allowed_tools: Some(vec!["spawn_subagent".into(), "file_read".into()]),
+                ..SecurityPolicy::default()
+            }),
+            parent_allowed_agent_aliases: HashSet::from(["alpha".to_string()]),
+            mcp_servers: BTreeSet::from(["filesystem".to_string()]),
+        };
+        let child_policy = SecurityPolicy {
+            allowed_tools: Some(vec!["file_read".into()]),
+            ..(*spawn.parent_policy).clone()
+        };
+
+        let ctx = spawn
+            .build(SubAgentOverrides {
+                policy: Some(child_policy),
+                ..SubAgentOverrides::default()
+            })
+            .expect("narrowing the tool allowlist must be accepted");
+        assert_eq!(ctx.policy.allowed_tools, Some(vec!["file_read".to_string()]));
     }
 
     #[test]
