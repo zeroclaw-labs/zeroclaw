@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::Semaphore;
@@ -242,12 +242,18 @@ impl HailoOllamaModelProvider {
             value.set_sensitive(true);
             self.request_headers.insert(AUTHORIZATION, value);
         }
+        let mut seen_header_names = HashSet::with_capacity(extra_headers.len());
         for (name, value) in extra_headers {
             let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
                 anyhow::Error::msg(format!(
                     "Hailo-Ollama extra header name `{name}` is invalid"
                 ))
             })?;
+            if !seen_header_names.insert(header_name.clone()) {
+                anyhow::bail!(
+                    "Hailo-Ollama duplicate extra header names are not allowed because HTTP header names are case-insensitive"
+                );
+            }
             if has_api_key && header_name == AUTHORIZATION {
                 anyhow::bail!(
                     "Hailo-Ollama cannot combine api_key with an Authorization extra header"
