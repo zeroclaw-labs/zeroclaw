@@ -1592,11 +1592,15 @@ impl ReliableModelProvider {
         );
     }
 
-    fn log_cooldown_skip(&self, provider_name: &str) {
+    fn log_cooldown_skip(&self, provider_name: &str, model: &str) {
         ::zeroclaw_log::record!(
             DEBUG,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"model_provider": provider_name})),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "model_provider": provider_name,
+                    "model": model,
+                })
+            ),
             "Skipping model_provider during rate-limit cooldown"
         );
     }
@@ -1751,8 +1755,9 @@ impl ModelProvider for ReliableModelProvider {
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
+                let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
-                    self.log_cooldown_skip(provider_name);
+                    self.log_cooldown_skip(provider_name, served_model);
                     Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
@@ -1774,7 +1779,7 @@ impl ModelProvider for ReliableModelProvider {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
                                         provider_name,
-                                        current_model,
+                                        served_model,
                                         attempt,
                                         &mut backoff_ms,
                                     )
@@ -1784,14 +1789,13 @@ impl ModelProvider for ReliableModelProvider {
                                 self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
                                 break;
                             }
-                            let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
                                 || model_slot != 0
@@ -1849,7 +1853,7 @@ impl ModelProvider for ReliableModelProvider {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
                                         provider_name,
-                                        current_model,
+                                        served_model,
                                         attempt,
                                         &mut backoff_ms,
                                     )
@@ -1859,7 +1863,7 @@ impl ModelProvider for ReliableModelProvider {
                                 self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
                                     false,
                                 );
@@ -1930,7 +1934,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_failure_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             &error_detail,
                                             &diagnostic,
                                         )
@@ -1942,7 +1946,7 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 break;
                             }
@@ -1959,7 +1963,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_retry_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             attempt + 1,
                                             wait,
                                             failure_reason,
@@ -1983,7 +1987,7 @@ impl ModelProvider for ReliableModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(provider_exhausted_attrs(
                             provider_name,
-                            current_model,
+                            served_model,
                             last_error_detail.as_deref(),
                             last_diagnostic.as_ref(),
                         )),
@@ -2020,8 +2024,9 @@ impl ModelProvider for ReliableModelProvider {
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 let provider_name = entry.display_name.as_str();
+                let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
-                    self.log_cooldown_skip(provider_name);
+                    self.log_cooldown_skip(provider_name, served_model);
                     Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
@@ -2043,7 +2048,7 @@ impl ModelProvider for ReliableModelProvider {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
                                         provider_name,
-                                        current_model,
+                                        served_model,
                                         attempt,
                                         &mut backoff_ms,
                                     )
@@ -2053,14 +2058,13 @@ impl ModelProvider for ReliableModelProvider {
                                 self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
                                     false,
                                 );
                                 final_cause_is_semantic_empty = true;
                                 break;
                             }
-                            let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
                                 || model_slot != 0
@@ -2119,7 +2123,7 @@ impl ModelProvider for ReliableModelProvider {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
                                         provider_name,
-                                        current_model,
+                                        served_model,
                                         attempt,
                                         &mut backoff_ms,
                                     )
@@ -2129,7 +2133,7 @@ impl ModelProvider for ReliableModelProvider {
                                 self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
                                     false,
                                 );
@@ -2152,7 +2156,7 @@ impl ModelProvider for ReliableModelProvider {
                                 if dropped > 0 {
                                     record_provider_context_truncation();
                                     context_truncated = true;
-                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
@@ -2213,7 +2217,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_failure_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             &error_detail,
                                             &diagnostic,
                                         )
@@ -2225,7 +2229,7 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 break;
                             }
@@ -2242,7 +2246,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_retry_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             attempt + 1,
                                             wait,
                                             failure_reason,
@@ -2266,7 +2270,7 @@ impl ModelProvider for ReliableModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(provider_exhausted_attrs(
                             provider_name,
-                            current_model,
+                            served_model,
                             last_error_detail.as_deref(),
                             last_diagnostic.as_ref(),
                         )),
@@ -2385,8 +2389,9 @@ impl ModelProvider for ReliableModelProvider {
                     continue;
                 }
                 let provider_name = entry.display_name.as_str();
+                let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
-                    self.log_cooldown_skip(provider_name);
+                    self.log_cooldown_skip(provider_name, served_model);
                     Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
@@ -2419,7 +2424,7 @@ impl ModelProvider for ReliableModelProvider {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
                                         provider_name,
-                                        current_model,
+                                        served_model,
                                         attempt,
                                         &mut backoff_ms,
                                     )
@@ -2429,7 +2434,7 @@ impl ModelProvider for ReliableModelProvider {
                                 self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
                                     false,
                                 );
@@ -2441,7 +2446,6 @@ impl ModelProvider for ReliableModelProvider {
                             {
                                 combine_response_usage(&mut resp, Some(usage));
                             }
-                            let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
                                 || model_slot != 0
@@ -2500,7 +2504,7 @@ impl ModelProvider for ReliableModelProvider {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
                                         provider_name,
-                                        current_model,
+                                        served_model,
                                         attempt,
                                         &mut backoff_ms,
                                     )
@@ -2510,7 +2514,7 @@ impl ModelProvider for ReliableModelProvider {
                                 self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
                                     false,
                                 );
@@ -2532,7 +2536,7 @@ impl ModelProvider for ReliableModelProvider {
                                 if dropped > 0 {
                                     record_provider_context_truncation();
                                     context_truncated = true;
-                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
@@ -2593,7 +2597,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_failure_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             &error_detail,
                                             &diagnostic,
                                         )
@@ -2605,7 +2609,7 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 break;
                             }
@@ -2622,7 +2626,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_retry_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             attempt + 1,
                                             wait,
                                             failure_reason,
@@ -2646,7 +2650,7 @@ impl ModelProvider for ReliableModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(provider_exhausted_attrs(
                             provider_name,
-                            current_model,
+                            served_model,
                             last_error_detail.as_deref(),
                             last_diagnostic.as_ref(),
                         )),
@@ -2683,8 +2687,9 @@ impl ModelProvider for ReliableModelProvider {
                     continue;
                 }
                 let provider_name = entry.display_name.as_str();
+                let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
-                    self.log_cooldown_skip(provider_name);
+                    self.log_cooldown_skip(provider_name, served_model);
                     Self::record_cooldown_skip_failure(&mut failures, self.max_retries + 1);
                     continue;
                 }
@@ -2722,7 +2727,7 @@ impl ModelProvider for ReliableModelProvider {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
                                         provider_name,
-                                        current_model,
+                                        served_model,
                                         attempt,
                                         &mut backoff_ms,
                                     )
@@ -2732,7 +2737,7 @@ impl ModelProvider for ReliableModelProvider {
                                 self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
                                     false,
                                 );
@@ -2744,7 +2749,6 @@ impl ModelProvider for ReliableModelProvider {
                             {
                                 combine_response_usage(&mut resp, Some(usage));
                             }
-                            let served_model = entry.served_model(current_model);
                             if attempt > 0
                                 || served_model != model
                                 || model_slot != 0
@@ -2803,7 +2807,7 @@ impl ModelProvider for ReliableModelProvider {
                                     self.backoff_after_empty_completion(
                                         &mut failures,
                                         provider_name,
-                                        current_model,
+                                        served_model,
                                         attempt,
                                         &mut backoff_ms,
                                     )
@@ -2813,7 +2817,7 @@ impl ModelProvider for ReliableModelProvider {
                                 self.record_empty_completion_failure(
                                     &mut failures,
                                     provider_name,
-                                    current_model,
+                                    served_model,
                                     attempt,
                                     false,
                                 );
@@ -2835,7 +2839,7 @@ impl ModelProvider for ReliableModelProvider {
                                 if dropped > 0 {
                                     record_provider_context_truncation();
                                     context_truncated = true;
-                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": *current_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
+                                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"model_provider": provider_name, "model": served_model, "dropped": dropped, "remaining": effective_messages.len()})), "Context window exceeded; truncated history and retrying");
                                     continue; // Retry with truncated messages (counts as an attempt)
                                 }
                                 // No complete older turn can be removed safely.
@@ -2896,7 +2900,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_failure_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             &error_detail,
                                             &diagnostic,
                                         )
@@ -2908,7 +2912,7 @@ impl ModelProvider for ReliableModelProvider {
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
-                                self.cool_down_rate_limited_provider(entry, current_model, &e);
+                                self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
                                 break;
                             }
@@ -2925,7 +2929,7 @@ impl ModelProvider for ReliableModelProvider {
                                     .with_attrs(
                                         provider_retry_attrs(
                                             provider_name,
-                                            current_model,
+                                            served_model,
                                             attempt + 1,
                                             wait,
                                             failure_reason,
@@ -2949,7 +2953,7 @@ impl ModelProvider for ReliableModelProvider {
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                         .with_attrs(provider_exhausted_attrs(
                             provider_name,
-                            current_model,
+                            served_model,
                             last_error_detail.as_deref(),
                             last_diagnostic.as_ref(),
                         )),
@@ -3003,7 +3007,7 @@ impl ModelProvider for ReliableModelProvider {
             }
 
             if self.provider_should_skip_for_cooldown(entry) {
-                self.log_cooldown_skip(provider_name);
+                self.log_cooldown_skip(provider_name, entry.served_model(model));
                 continue;
             }
 
@@ -3101,7 +3105,7 @@ impl ModelProvider for ReliableModelProvider {
             }
 
             if self.provider_should_skip_for_cooldown(entry) {
-                self.log_cooldown_skip(provider_name);
+                self.log_cooldown_skip(provider_name, entry.served_model(model));
                 continue;
             }
 
@@ -3189,7 +3193,7 @@ impl ModelProvider for ReliableModelProvider {
             }
 
             if self.provider_should_skip_for_cooldown(entry) {
-                self.log_cooldown_skip(provider_name);
+                self.log_cooldown_skip(provider_name, entry.served_model(model));
                 continue;
             }
 
@@ -3279,6 +3283,46 @@ mod tests {
     use futures_util::StreamExt;
     use std::sync::Arc;
     use zeroclaw_api::tool::ToolSpec;
+
+    fn drain_captured_events(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+    ) -> Vec<serde_json::Value> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    fn assert_captured_model(
+        events: &[serde_json::Value],
+        message: &str,
+        provider: &str,
+        served_model: &str,
+    ) {
+        let matching: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.get("message").and_then(|value| value.as_str()) == Some(message)
+                    && event
+                        .get("attributes")
+                        .and_then(|attrs| attrs.get("model_provider"))
+                        .and_then(|value| value.as_str())
+                        == Some(provider)
+            })
+            .collect();
+        assert!(
+            !matching.is_empty(),
+            "missing structured log for {provider}: {message}"
+        );
+
+        for event in matching {
+            let attrs = event
+                .get("attributes")
+                .expect("structured log must include attributes");
+            assert_eq!(
+                attrs.get("model").and_then(|value| value.as_str()),
+                Some(served_model),
+                "wrong model attribution in {message}: {attrs}"
+            );
+        }
+    }
 
     struct MockModelProvider {
         calls: Arc<AtomicUsize>,
@@ -3662,6 +3706,311 @@ mod tests {
             fallback.is_none(),
             "primary pinned entry serving the requested model is not a fallback"
         );
+    }
+
+    /// A pinned entry's physical model belongs in operator diagnostics while
+    /// the terminal aggregate remains bounded and free of route identity.
+    #[tokio::test]
+    async fn pinned_empty_completion_logs_served_model_but_aggregate_stays_safe() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "gemini",
+                "gemini.mock",
+                "mock",
+                "gemini-3-flash",
+                Box::new(EmptyThenTextMock {
+                    calls: Arc::clone(&calls),
+                    empty_until_attempt: usize::MAX,
+                    response: "never",
+                }),
+            )],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let err = model_provider
+            .chat(request, "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect_err("a pinned entry stuck on empty completions must not succeed");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        let text = err.to_string();
+        assert!(text.contains("event 1 (retry 1/2): empty_response"));
+        assert!(
+            !text.contains("gemini"),
+            "aggregate leaked provider identity: {text}"
+        );
+        assert!(
+            !text.contains("gemini-3-flash") && !text.contains("deepseek-v4-flash"),
+            "aggregate leaked model identity: {text}"
+        );
+        assert_captured_model(
+            &events,
+            "Empty completion; retrying",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_captured_model(
+            &events,
+            "Empty completion; retries exhausted",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pinned_retry_and_exhaustion_logs_use_served_model() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "gemini",
+                "gemini.mock",
+                "mock",
+                "gemini-3-flash",
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "temporary provider outage",
+                }),
+            )],
+            1,
+            1,
+        );
+
+        let err = model_provider
+            .chat_with_system(None, "hello", "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect_err("a pinned entry stuck on a retryable error must not succeed");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        let text = err.to_string();
+        assert!(
+            !text.contains("gemini")
+                && !text.contains("gemini-3-flash")
+                && !text.contains("deepseek-v4-flash")
+                && !text.contains("temporary provider outage"),
+            "aggregate leaked physical attempt details: {text}"
+        );
+        assert_captured_model(
+            &events,
+            "ModelProvider call failed, retrying",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_captured_model(
+            &events,
+            "Exhausted retries, trying next model_provider/model",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pinned_non_retryable_log_uses_served_model() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "gemini",
+                "gemini.mock",
+                "mock",
+                "gemini-3-flash",
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: usize::MAX,
+                    response: "never",
+                    error: "HTTP 400 invalid request",
+                }),
+            )],
+            2,
+            1,
+        );
+
+        let err = model_provider
+            .chat_with_system(None, "hello", "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect_err("a pinned entry with a non-retryable error must fail");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        let text = err.to_string();
+        assert!(!text.contains("HTTP 400 invalid request"));
+        assert!(!text.contains("gemini-3-flash"));
+        assert_captured_model(
+            &events,
+            "Non-retryable error, moving on",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_captured_model(
+            &events,
+            "Exhausted retries, trying next model_provider/model",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn pinned_context_truncation_log_uses_served_model() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![ReliableModelProviderEntry::new_pinned(
+                "gemini",
+                "gemini.mock",
+                "mock",
+                "gemini-3-flash",
+                Box::new(ContextOverflowMock {
+                    calls: Arc::clone(&calls),
+                    fail_until_attempt: 1,
+                    post_context_error: None,
+                    message_counts: parking_lot::Mutex::new(Vec::new()),
+                }),
+            )],
+            1,
+            1,
+        );
+        let messages = vec![
+            ChatMessage::system("system prompt"),
+            ChatMessage::user("old request"),
+            ChatMessage::assistant("old response"),
+            ChatMessage::user("current request"),
+        ];
+
+        let result = model_provider
+            .chat_with_history(&messages, "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect("the truncated retry should recover");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        assert_eq!(result, "recovered after truncation");
+        assert_captured_model(
+            &events,
+            "Context window exceeded; truncated history and retrying",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn pinned_rate_limit_and_cooldown_logs_use_each_served_model() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let rate_limited_calls = Arc::new(AtomicUsize::new(0));
+        let skipped_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = ReliableModelProvider::new_with_entries(
+            "mock",
+            vec![
+                ReliableModelProviderEntry::new_pinned(
+                    "gemini",
+                    "gemini.mock",
+                    "mock",
+                    "gemini-3-flash",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&rate_limited_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "HTTP 429 Too Many Requests, Retry-After: 30",
+                    }),
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "gemini",
+                    "gemini.mock",
+                    "mock",
+                    "gemini-2-flash",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&skipped_calls),
+                        fail_until_attempt: 0,
+                        response: "should be skipped",
+                        error: "unused",
+                    }),
+                ),
+                ReliableModelProviderEntry::new_pinned(
+                    "anthropic",
+                    "anthropic.mock",
+                    "mock",
+                    "claude-fallback",
+                    Box::new(MockModelProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "recovered",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            1,
+            1,
+        );
+
+        let result = model_provider
+            .simple_chat("hello", "deepseek-v4-flash", Some(0.0))
+            .await
+            .expect("the downstream fallback should recover");
+        let events = drain_captured_events(&mut rx);
+        zeroclaw_log::clear_broadcast_hook();
+
+        assert_eq!(result, "recovered");
+        assert_captured_model(
+            &events,
+            "ModelProvider rate-limited; trying next provider",
+            "gemini",
+            "gemini-3-flash",
+        );
+        assert_captured_model(
+            &events,
+            "Skipping model_provider during rate-limit cooldown",
+            "gemini",
+            "gemini-2-flash",
+        );
+        assert_eq!(rate_limited_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(skipped_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     /// Returns an empty completion (blank `chat_with_system` text, which the
