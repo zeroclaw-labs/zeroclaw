@@ -505,7 +505,6 @@ fn inject_workspace_file(
             if trimmed.is_empty() {
                 return;
             }
-            let _ = writeln!(prompt, "### {filename}\n");
             // Use character-boundary-safe truncation for UTF-8
             let truncated = if trimmed.chars().count() > max_chars {
                 trimmed
@@ -520,7 +519,7 @@ fn inject_workspace_file(
                 prompt.push_str(truncated);
                 let _ = writeln!(
                     prompt,
-                    "\n\n[... truncated at {max_chars} chars — use `read` for full file]\n"
+                    "\n\n[... {filename} truncated at {max_chars} chars — use `read {filename}` for full file]\n"
                 );
             } else {
                 prompt.push_str(trimmed);
@@ -529,7 +528,7 @@ fn inject_workspace_file(
         }
         Err(_) => {
             // Missing-file marker (matches OpenClaw behavior)
-            let _ = writeln!(prompt, "### {filename}\n\n[File not found: {filename}]\n");
+            let _ = writeln!(prompt, "[File not found: {filename}]\n");
         }
     }
 }
