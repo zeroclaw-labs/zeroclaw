@@ -7552,6 +7552,11 @@ pub struct BrowserConfig {
     /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
+    /// Timeout in seconds for agent-browser CLI commands (default: 60).
+    /// Bounds every `browser` tool action on the `agent_browser` backend so a
+    /// wedged CLI cannot hang an agent turn indefinitely.
+    #[serde(default = "default_browser_timeout_secs")]
+    pub timeout_secs: u64,
     /// Show browser window for agent_browser backend. When unset, inherits AGENT_BROWSER_HEADED.
     #[serde(default)]
     pub headed: Option<bool>,
@@ -7588,6 +7593,10 @@ fn default_browser_backend() -> String {
     "agent_browser".into()
 }
 
+fn default_browser_timeout_secs() -> u64 {
+    60
+}
+
 fn default_browser_webdriver_url() -> String {
     "http://127.0.0.1:9515".into()
 }
@@ -7599,6 +7608,7 @@ impl Default for BrowserConfig {
             allowed_domains: vec!["*".into()],
             session_name: None,
             backend: default_browser_backend(),
+            timeout_secs: default_browser_timeout_secs(),
             headed: None,
             native_headless: default_true(),
             native_webdriver_url: default_browser_webdriver_url(),
@@ -30082,6 +30092,7 @@ default_temperature = 0.7
         assert!(b.enabled);
         assert_eq!(b.allowed_domains, vec!["*".to_string()]);
         assert_eq!(b.backend, "agent_browser");
+        assert_eq!(b.timeout_secs, 60);
         assert_eq!(b.headed, None);
         assert!(b.native_headless);
         assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
@@ -30101,6 +30112,7 @@ default_temperature = 0.7
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
             session_name: None,
             backend: "auto".into(),
+            timeout_secs: 45,
             headed: Some(true),
             native_headless: false,
             native_webdriver_url: "http://localhost:4444".into(),
@@ -30122,6 +30134,7 @@ default_temperature = 0.7
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
         assert_eq!(parsed.backend, "auto");
+        assert_eq!(parsed.timeout_secs, 45);
         assert_eq!(parsed.headed, Some(true));
         assert!(!parsed.native_headless);
         assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
