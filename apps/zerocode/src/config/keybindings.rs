@@ -46,6 +46,7 @@ fn fill_defaults<A: RebindableActions>(map: &mut HashMap<String, Vec<Chord>>) {
 
 /// Every rebindable action key — used by the completeness test and to
 /// size preset maps.
+#[cfg(test)]
 fn all_action_keys() -> Vec<String> {
     all_defaults().into_keys().collect()
 }

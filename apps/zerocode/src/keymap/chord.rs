@@ -279,7 +279,6 @@ fn strip_redundant_shift(code: KeyCode, mut m: KeyModifiers) -> KeyModifiers {
     m
 }
 
-#[allow(dead_code)]
 fn render_keycode(code: &KeyCode) -> String {
     match code {
         KeyCode::Char(c) => c.to_string(),

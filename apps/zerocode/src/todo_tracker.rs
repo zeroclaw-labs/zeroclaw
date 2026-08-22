@@ -4,7 +4,6 @@ use crate::wire::{ConfigFieldEntry, PlanEntry, PlanStatus};
 
 /// Where the tracker renders relative to the Code pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum TodoLocation {
     Bottom,
     Left,
@@ -27,7 +26,6 @@ impl TodoLocation {
 /// `config/list` at pane init. Defaults mirror the schema defaults so a
 /// fetch failure or absent section still yields correct behavior.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
 pub(crate) struct TodoTrackerSettings {
     pub enabled: bool,
     pub enabled_at_start: bool,
@@ -49,7 +47,6 @@ impl Default for TodoTrackerSettings {
 }
 
 impl TodoTrackerSettings {
-    #[allow(dead_code)]
     pub(crate) fn from_config_fields(fields: &[ConfigFieldEntry]) -> Self {
         let mut s = Self::default();
         for f in fields {
@@ -91,7 +88,6 @@ impl TodoTrackerSettings {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct TodoTracker {
     entries: Vec<PlanEntry>,
     visible: bool,
@@ -104,7 +100,6 @@ pub(crate) struct TodoTracker {
     max_height: u16,
 }
 
-#[allow(dead_code)]
 impl TodoTracker {
     /// Construct from parsed `[todotracker]` settings.
     pub(crate) fn from_settings(settings: TodoTrackerSettings) -> Self {
@@ -164,6 +159,7 @@ impl TodoTracker {
         self.enabled && self.visible
     }
 
+    #[cfg(test)]
     pub(crate) fn entries(&self) -> &[PlanEntry] {
         &self.entries
     }

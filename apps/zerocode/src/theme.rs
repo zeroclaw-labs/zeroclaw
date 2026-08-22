@@ -1,7 +1,6 @@
 //! ZeroClaw TUI colour palette and style helpers.
 //! Shared between the onboarding UI (lib target) and the main chat TUI (binary
 //! target). Not every helper is used by both targets.
-#![allow(dead_code)]
 
 use std::sync::{LazyLock, RwLock};
 
@@ -183,6 +182,7 @@ pub(crate) fn selection_bg() -> Color {
 
 /// The active theme's canvas colour. `Color::Reset` means "inherit the
 /// terminal" — the app-level backdrop skips painting in that case.
+#[cfg(test)]
 pub(crate) fn background() -> Color {
     active().background
 }

@@ -9,11 +9,6 @@
 //! bytes. The TUI uses it both for client-issued requests
 //! (`session/turn`, `quickstart/apply`, …) and for routing
 //! daemon-originated notifications.
-//!
-//! Constants in `error_codes` cover the full set the daemon may emit
-//! — some are only consumed by error-routing branches that may not
-//! exercise every code today.
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -29,9 +24,7 @@ pub const OUTBOUND_ID_PREFIX: &str = "zc-out-";
 // ── Wire field name constants ────────────────────────────────────
 
 pub mod field {
-    pub const JSONRPC: &str = "jsonrpc";
     pub const METHOD: &str = "method";
-    pub const PARAMS: &str = "params";
     pub const ID: &str = "id";
     pub const RESULT: &str = "result";
     pub const ERROR: &str = "error";
@@ -97,25 +90,11 @@ pub struct JsonRpcError {
 // ── Error codes ──────────────────────────────────────────────────
 
 pub mod error_codes {
-    pub const PARSE_ERROR: i32 = -32700;
-    pub const INVALID_REQUEST: i32 = -32600;
     pub const METHOD_NOT_FOUND: i32 = -32601;
-    pub const INVALID_PARAMS: i32 = -32602;
     pub const INTERNAL_ERROR: i32 = -32603;
 
+    #[cfg(test)]
     pub const SESSION_NOT_FOUND: i32 = -32000;
-    pub const SESSION_LIMIT_REACHED: i32 = -32001;
-    pub const SESSION_BUSY: i32 = -32002;
-    pub const AUTH_REQUIRED: i32 = -32010;
-    pub const VERSION_MISMATCH: i32 = -32011;
-
-    pub const FS_NOT_FOUND: i32 = 4001;
-    pub const FS_PERMISSION_DENIED: i32 = 4002;
-    pub const FS_INVALID_PATH: i32 = 4003;
-
-    pub const FS_NOT_FOUND_STR: &str = "fs.not_found";
-    pub const FS_PERMISSION_DENIED_STR: &str = "fs.permission_denied";
-    pub const FS_INVALID_PATH_STR: &str = "fs.invalid_path";
 }
 
 pub const ACP_PROTOCOL_VERSION: u64 = 1;
@@ -155,10 +134,6 @@ impl RpcOutbound {
             pending: std::sync::Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(0),
         }
-    }
-
-    pub async fn send_raw(&self, json: String) -> bool {
-        self.writer_tx.send(json).await.is_ok()
     }
 
     /// Write a JSON-RPC response (success or error) keyed to a
@@ -251,9 +226,5 @@ impl RpcOutbound {
             };
             let _ = tx.send(payload);
         }
-    }
-
-    pub fn pending_count(&self) -> usize {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }

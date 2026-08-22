@@ -1,7 +1,6 @@
 //! Local zerocode client configuration: theme and keybindings.
 //! Always read from the local `<config_dir>/zerocode-config.toml`, independent
 //! of the connection target. Layering: defaults -> file -> `ZEROCODE_*` env.
-#![allow(dead_code)]
 
 pub mod keybindings;
 

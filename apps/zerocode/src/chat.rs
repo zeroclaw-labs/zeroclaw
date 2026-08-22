@@ -730,7 +730,6 @@ impl Chat {
         let pending = match shape {
             crate::wire::ElicitationShape::Single { choices, .. } => PendingElicitation {
                 request_id: req.id,
-                session_id: params.session_id,
                 message: params.message,
                 choices: choices.into_iter().map(|c| c.title).collect(),
                 multi: false,
@@ -748,7 +747,6 @@ impl Chat {
                 let n = choices.len();
                 PendingElicitation {
                     request_id: req.id,
-                    session_id: params.session_id,
                     message: params.message,
                     choices: choices.into_iter().map(|c| c.title).collect(),
                     multi: true,
@@ -5106,12 +5104,6 @@ pub struct PendingApproval {
 pub struct PendingElicitation {
     /// JSON-RPC request id to respond to. Echoed verbatim.
     pub request_id: serde_json::Value,
-    /// Session this elicitation belongs to. Captured at install time so a
-    /// future mouse handler (or a cross-session correctness assert) can
-    /// confirm the modal still targets the active session. Read indirectly
-    /// today via the install-time match in `try_install_elicitation`.
-    #[allow(dead_code)]
-    pub session_id: String,
     /// Prompt text shown above the choice list.
     pub message: String,
     /// User-visible choice titles, in wire order. The `choice-N` const
@@ -12355,7 +12347,6 @@ mod tests {
     fn single_elicitation() -> PendingElicitation {
         PendingElicitation {
             request_id: serde_json::json!("elicit-1"),
-            session_id: "sess-1".to_string(),
             message: "Pick a fruit".to_string(),
             choices: vec![
                 "Apple".to_string(),
@@ -12373,7 +12364,6 @@ mod tests {
     fn multi_elicitation() -> PendingElicitation {
         PendingElicitation {
             request_id: serde_json::json!(42),
-            session_id: "sess-1".to_string(),
             message: "Pick toppings".to_string(),
             choices: vec![
                 "Cheese".to_string(),

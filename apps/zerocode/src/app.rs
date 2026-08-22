@@ -161,7 +161,6 @@ enum Mode {
     Chat,
     Logs,
     Quickstart,
-    #[allow(dead_code)]
     Sop,
 }
 
