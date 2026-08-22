@@ -14177,6 +14177,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-tool-secret-plugin-fixture"
+version = "0.0.0"
+dependencies = [
+ "serde_json",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "zeroclaw-tool-timeout-fixture"
 version = "0.0.0"
 dependencies = [

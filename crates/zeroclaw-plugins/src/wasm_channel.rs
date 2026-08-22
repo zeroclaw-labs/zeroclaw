@@ -9,11 +9,11 @@ use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
     MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
 };
 use crate::component::{
-    PluginState, PluginStoreSpec, WarmPluginState, call_channel, call_store, engine,
-    load_component, wt, wt_instantiate,
+    PluginState, PluginStoreSpec, WarmPluginState, call_channel, call_channel_store, call_store,
+    engine, load_component, wt, wt_instantiate,
 };
-use crate::config::{PluginConfigResolver, ResolvedPluginConfig};
 use crate::endpoint::PluginChannelEndpoint;
+use crate::services::PluginHostServices;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
@@ -36,6 +36,9 @@ pub struct WasmChannel {
     state: Mutex<WarmPluginState<ChannelPlugin>>,
     factory: ChannelInstanceFactory,
     inbound: InboundQueue,
+    // Static component metadata, fixed for one admitted logical binding.
+    // Changing the external account or these capabilities requires rebuilding
+    // the channel; point-of-use config refresh is only for that same binding.
     cached_self_handle: Option<String>,
     cached_self_addressed_mention: Option<String>,
     cached_multi_message_delay_ms: u64,
@@ -44,15 +47,14 @@ pub struct WasmChannel {
 
 struct ChannelInstanceFactory {
     component: Component,
-    /// Generation-scoped `configure` snapshot. Resolved and validated once at
-    /// construction under the scope's `ConfigRead` grant and replayed verbatim
-    /// when an interrupted instance is reconstructed, so a rebuilt instance can
-    /// never observe different config than the one whose cached metadata it
-    /// must match. When the grant is present this may hold channel secrets in
-    /// plaintext for exactly as long as the owning [`WasmChannel`] lives:
-    /// there is no live config handle to refresh, so a config reload must
-    /// rebuild the channel, which discards this snapshot with it.
-    config: ResolvedPluginConfig,
+    /// Required host-service bundle carrying the live config resolver. A
+    /// rebuilt instance re-runs the no-arg `configure()` and re-resolves
+    /// config and secrets through these services at each point of use, so an
+    /// interrupted instance is reconstructed against the same canonical config
+    /// source rather than a captured plaintext snapshot. The reinstantiation
+    /// metadata check still guards against the external account or capabilities
+    /// drifting under a rebuilt instance.
+    services: PluginHostServices,
     limits: crate::component::PluginLimits,
 }
 
@@ -107,19 +109,21 @@ impl WasmChannel {
     pub async fn from_wasm(
         endpoint: PluginChannelEndpoint,
         wasm_path: &Path,
-        config: &PluginConfigResolver,
+        services: &PluginHostServices,
         limits: crate::component::PluginLimits,
     ) -> Result<Self> {
         // Resolve and validate the operator config before any guest code is
         // loaded, so an invalid section rejects registration rather than
-        // reaching a running instance (master), and keep the resolved view as
-        // the generation-scoped snapshot the factory replays when it rebuilds
-        // an interrupted instance (this PR).
-        let config = config.resolve(endpoint.scope())?;
+        // reaching a running instance. Config then stays host-owned and is
+        // served live through point-of-use imports; the factory replays the
+        // no-arg `configure()` against these same services when it rebuilds an
+        // interrupted instance, so a rebuilt instance re-resolves config
+        // rather than replaying a captured plaintext snapshot.
+        services.resolve_config(endpoint.scope())?;
         let inbound = InboundQueue::default();
         let factory = ChannelInstanceFactory {
             component: load_component(wasm_path)?,
-            config,
+            services: services.clone(),
             limits,
         };
         let instance = factory.instantiate(&endpoint, inbound.clone()).await?;
@@ -177,7 +181,7 @@ impl ChannelInstanceFactory {
         inbound: InboundQueue,
     ) -> Result<ChannelInstance> {
         let mut store = crate::component::new_store(
-            PluginStoreSpec::new(endpoint.scope().clone(), self.limits)
+            PluginStoreSpec::new(endpoint.scope().clone(), self.services.clone(), self.limits)
                 .with_granted_http()
                 .with_inbound(inbound),
         );
@@ -191,17 +195,15 @@ impl ChannelInstanceFactory {
             )
         })?;
 
-        // Hand the plugin its resolved config once, before any other call. The
-        // section is withheld unless the admitted scope grants `ConfigRead`, matching
-        // the tool-plugin `__config` rule, so a plugin without the permission is
-        // configured with an empty object rather than another channel's secrets.
-        self.config.ensure_scope(store.data().scope())?;
-        let config_json = serde_json::to_string(self.config.as_json())?;
-        call_store!(store, async |store: &mut Store<PluginState>| {
+        // Let the plugin initialize before static discovery. Config stays
+        // host-owned and is served live through the point-of-use imports in
+        // this channel-service frame, so the plugin resolves config and secrets
+        // itself rather than receiving them as a `configure` argument.
+        call_channel_store!(store, async |store: &mut Store<PluginState>| {
             wt(
                 bindings
                     .zeroclaw_plugin_channel()
-                    .call_configure(store, &config_json)
+                    .call_configure(store)
                     .await,
                 "channel.configure trapped",
             )?
@@ -846,6 +848,7 @@ impl Channel for WasmChannel {
 mod tests {
     use super::*;
     use crate::PluginCapability;
+    use crate::config::PluginConfigResolver;
 
     #[test]
     fn media_round_trip() {
@@ -886,20 +889,22 @@ mod tests {
     async fn channel_validates_config_before_loading_guest_code() {
         let scope = crate::instance::test_scope(PluginCapability::Channel, "main", []);
         let endpoint = PluginChannelEndpoint::new(scope, "plugin").unwrap();
-        let config = PluginConfigResolver::new(|_| {
+        let services = PluginHostServices::new(PluginConfigResolver::new(|_| {
             Err(crate::error::PluginError::InvalidConfig(
                 "invalid-before-load".to_string(),
             ))
-        });
-        let error = WasmChannel::from_wasm(
+        }));
+        let result = WasmChannel::from_wasm(
             endpoint,
             Path::new("/path/that/must/not/exist.wasm"),
-            &config,
+            &services,
             crate::component::test_limits(0),
         )
-        .await
-        .err()
-        .expect("invalid config must reject registration");
+        .await;
+        let error = match result {
+            Ok(_) => panic!("invalid config must reject registration"),
+            Err(error) => error,
+        };
 
         assert!(error.to_string().contains("invalid-before-load"));
     }

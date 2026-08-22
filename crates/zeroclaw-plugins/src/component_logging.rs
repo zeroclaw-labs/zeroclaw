@@ -235,6 +235,9 @@ macro_rules! impl_host {
                 level: bindings::$world::zeroclaw::plugin::logging::LogLevel,
                 event: bindings::$world::zeroclaw::plugin::logging::PluginEvent,
             ) {
+                if !self.charge_host_call() {
+                    return;
+                }
                 use bindings::$world::zeroclaw::plugin::logging::{
                     LogLevel, PluginAction, PluginOutcome,
                 };
@@ -316,6 +319,9 @@ impl bindings::channel::zeroclaw::plugin::inbound::Host for PluginState {
     async fn inbound_poll(
         &mut self,
     ) -> Option<bindings::channel::zeroclaw::plugin::inbound::HostInboundMessage> {
+        if !self.charge_host_call() {
+            return None;
+        }
         self.inbound().poll().map(|m| {
             bindings::channel::zeroclaw::plugin::inbound::HostInboundMessage {
                 id: m.id,
@@ -333,6 +339,9 @@ impl bindings::channel::zeroclaw::plugin::inbound::Host for PluginState {
     }
 
     async fn inbound_pending(&mut self) -> u32 {
+        if !self.charge_host_call() {
+            return 0;
+        }
         self.inbound().pending()
     }
 }

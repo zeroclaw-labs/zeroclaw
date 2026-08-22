@@ -20,10 +20,11 @@ use std::process::Command;
 use std::sync::OnceLock;
 
 use zeroclaw_plugins::component::PluginLimits;
-use zeroclaw_plugins::config::resolve_plugin_config;
+use zeroclaw_plugins::config::{PluginConfigResolver, resolve_plugin_config};
 use zeroclaw_plugins::error::PluginError;
 use zeroclaw_plugins::instance::PluginInstanceScope;
 use zeroclaw_plugins::runtime;
+use zeroclaw_plugins::services::PluginHostServices;
 use zeroclaw_plugins::{PluginCapability, PluginManifest, PluginPermission};
 
 /// Build the in-tree tool fixture once per test binary and return its component.
@@ -121,10 +122,25 @@ fn operator_section() -> HashMap<String, String> {
     ])
 }
 
+/// The host-service bundle a store is built with.
+///
+/// The host resolves this plugin's section from canonical state on every call
+/// rather than handing the store a materialized snapshot, so the config a guest
+/// observes is whatever the resolver returns at the moment it executes.
+fn host_services(
+    manifest: PluginManifest,
+    configured: Option<HashMap<String, String>>,
+) -> PluginHostServices {
+    PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+        resolve_plugin_config(&manifest, scope, configured.as_ref())
+    }))
+}
+
 #[tokio::test]
 async fn reference_plugin_reports_metadata() {
-    let (_, scope) = context([]);
-    let mut plugin = runtime::create_plugin(&fixture(), &scope, test_limits())
+    let (manifest, scope) = context([]);
+    let services = host_services(manifest, None);
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
     let meta = runtime::call_tool_metadata(&mut plugin)
@@ -150,13 +166,12 @@ async fn reference_plugin_reports_metadata() {
 #[tokio::test]
 async fn reference_plugin_materializes_typed_config_with_grant() {
     let (manifest, scope) = context([PluginPermission::ConfigRead]);
-    let mut plugin = runtime::create_plugin(&fixture(), &scope, test_limits())
+    let services = host_services(manifest, Some(operator_section()));
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
-    let config = resolve_plugin_config(&manifest, &scope, Some(&operator_section()))
-        .expect("materialize the operator section against the manifest schema");
-    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#, &config)
+    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#)
         .await
         .expect("execute config-echo tool");
 
@@ -176,13 +191,12 @@ async fn reference_plugin_materializes_typed_config_with_grant() {
 #[tokio::test]
 async fn reference_plugin_jails_config_without_grant() {
     let (manifest, scope) = context([]);
-    let mut plugin = runtime::create_plugin(&fixture(), &scope, test_limits())
+    let services = host_services(manifest, Some(operator_section()));
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
-    let config = resolve_plugin_config(&manifest, &scope, Some(&operator_section()))
-        .expect("withheld config resolves to an empty object, not an error");
-    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#, &config)
+    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#)
         .await
         .expect("execute config-echo tool");
 
@@ -197,16 +211,14 @@ async fn reference_plugin_jails_config_without_grant() {
 #[tokio::test]
 async fn reference_plugin_strips_caller_forged_config_section() {
     let (manifest, scope) = context([]);
-    let mut plugin = runtime::create_plugin(&fixture(), &scope, test_limits())
+    let services = host_services(manifest, None);
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
-    let config =
-        resolve_plugin_config(&manifest, &scope, None).expect("withheld config resolves empty");
     let result = runtime::call_execute(
         &mut plugin,
         br#"{"text":"hi","__config":{"label":"forged","max_len":99}}"#,
-        &config,
     )
     .await
     .expect("execute config-echo tool");
@@ -222,12 +234,12 @@ async fn reference_plugin_strips_caller_forged_config_section() {
 #[tokio::test]
 async fn reference_plugin_applies_defaults_without_config() {
     let (manifest, scope) = context([PluginPermission::ConfigRead]);
-    let mut plugin = runtime::create_plugin(&fixture(), &scope, test_limits())
+    let services = host_services(manifest, None);
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
-    let config = resolve_plugin_config(&manifest, &scope, None).expect("resolve empty config");
-    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#, &config)
+    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#)
         .await
         .expect("execute config-echo tool");
 
@@ -243,7 +255,8 @@ async fn reference_plugin_host_rejects_ill_typed_operator_value() {
     let (manifest, scope) = context([PluginPermission::ConfigRead]);
     // Instantiating first proves the rejection is not an artifact of a plugin
     // that never loaded: the component is live and simply never gets called.
-    let mut plugin = runtime::create_plugin(&fixture(), &scope, test_limits())
+    let services = host_services(manifest.clone(), Some(operator_section()));
+    let mut plugin = runtime::create_plugin(&fixture(), &scope, &services, test_limits())
         .await
         .expect("instantiate tool fixture");
 
@@ -280,9 +293,7 @@ async fn reference_plugin_host_rejects_ill_typed_operator_value() {
 
     // The guest is still callable with a valid section, so the rejections above
     // were the config path failing, not the component.
-    let config = resolve_plugin_config(&manifest, &scope, Some(&operator_section()))
-        .expect("a well-typed section still resolves");
-    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#, &config)
+    let result = runtime::call_execute(&mut plugin, br#"{"text":"hello world"}"#)
         .await
         .expect("execute config-echo tool");
     assert_eq!(
@@ -301,11 +312,10 @@ async fn reference_plugin_rejects_work_past_fuel_budget() {
         call_timeout: std::time::Duration::from_secs(30),
     };
     let (manifest, scope) = context([]);
-    match runtime::create_plugin(&fixture(), &scope, starved).await {
+    let services = host_services(manifest, None);
+    match runtime::create_plugin(&fixture(), &scope, &services, starved).await {
         Ok(mut plugin) => {
-            let config =
-                resolve_plugin_config(&manifest, &scope, None).expect("resolve empty config");
-            let result = runtime::call_execute(&mut plugin, br#"{"text":"hello"}"#, &config).await;
+            let result = runtime::call_execute(&mut plugin, br#"{"text":"hello"}"#).await;
             assert!(
                 result.is_err(),
                 "a 1-unit fuel budget must trap execution, got {result:?}"
@@ -327,8 +337,9 @@ async fn reference_plugin_traps_when_memory_capped() {
         max_instances: 64,
         call_timeout: std::time::Duration::from_secs(30),
     };
-    let (_, scope) = context([]);
-    let outcome = runtime::create_plugin(&fixture(), &scope, capped).await;
+    let (manifest, scope) = context([]);
+    let services = host_services(manifest, None);
+    let outcome = runtime::create_plugin(&fixture(), &scope, &services, capped).await;
     assert!(
         outcome.is_err(),
         "a 1-byte memory cap must reject instantiation, got ok"
