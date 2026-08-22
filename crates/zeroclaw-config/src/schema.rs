@@ -8151,21 +8151,23 @@ impl Default for BackupConfig {
 
 // ── Data Retention ──────────────────────────────────────────────
 
-/// Data retention and purge configuration (`[data_retention]` section).
+/// Workspace retention preview and storage-statistics configuration
+/// (`[data_retention]` section). Confirmed purge is currently unavailable.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "data_retention"]
 pub struct DataRetentionConfig {
-    /// Enable the `data_management` tool.
+    /// Enable the read-only `data_management` retention-preview tool.
     #[serde(default)]
     pub enabled: bool,
-    /// Days of data to retain before purge eligibility.
+    /// Days of data to retain before preview eligibility.
     #[serde(default = "default_retention_days")]
     pub retention_days: u64,
-    /// Preview what would be deleted without actually removing anything.
+    /// Reserved compatibility field. Confirmed purge is currently unavailable,
+    /// and tool calls default to preview mode.
     #[serde(default)]
     pub dry_run: bool,
-    /// Limit retention enforcement to specific data categories (empty = all).
+    /// Reserved compatibility field. Category filtering is not currently applied.
     #[serde(default)]
     pub categories: Vec<String>,
 }

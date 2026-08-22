@@ -34,7 +34,7 @@ tool-cron-remove = Eliminar un trabajo cron por id
 tool-cron-run = Forzar la ejecución de un trabajo cron inmediatamente y registrar el historial de ejecuciones
 tool-cron-runs = Listar el historial de ejecuciones recientes de un trabajo cron
 tool-cron-update = Parchear un trabajo cron existente (programación, comando, prompt, habilitado, entrega, modelo, etc.)
-tool-data-management = Retención, purga y estadísticas de almacenamiento de datos del espacio de trabajo
+tool-data-management = Vista previa de retención y estadísticas de almacenamiento del espacio de trabajo
 tool-delegate = Delegar una subtarea a un agente especializado. Use cuando: una tarea se beneficia de un modelo diferente (p. ej. resumen rápido, razonamiento profundo, generación de código). El subagente ejecuta un único prompt de forma predeterminada; con agentic=true puede iterar con un bucle de llamadas a herramientas filtrado.
 tool-file-edit = Editar un archivo reemplazando una coincidencia exacta de cadena con nuevo contenido
 tool-file-download = Descarga un archivo desde el endpoint remoto configurado y lo escribe en el espacio de trabajo del agente. Proporciona el identificador del documento que se va a obtener y una ruta de destino relativa al espacio de trabajo; la URL del endpoint está fijada por la configuración del host y nunca es controlada por el modelo. Los bytes se transmiten directamente al disco y no se cargan en el contexto del modelo. Devuelve el estado HTTP, el número de bytes escritos y la ruta de destino.

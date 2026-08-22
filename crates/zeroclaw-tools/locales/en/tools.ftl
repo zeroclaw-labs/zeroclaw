@@ -60,7 +60,7 @@ tool-cron-runs = List recent run history for a cron job
 
 tool-cron-update = Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)
 
-tool-data-management = Workspace data retention, purge, and storage statistics
+tool-data-management = Workspace retention preview and storage statistics
 
 tool-delegate = Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt by default; with agentic=true it can iterate with a filtered tool-call loop.
 
@@ -93,6 +93,35 @@ tool-file-download-success = Downloaded { $written } bytes to { $dest_path } ({ 
 tool-file-read = Read file contents with line numbers. Supports partial reading via offset and limit. Binary and image files are rejected (use the image_info tool for images). Set encoding="base64" to return raw bytes base64-encoded (for binary files such as .pdf/.xlsx/.docx); offset/limit are ignored in that mode.
 
 tool-file-write = Write contents to a file in the workspace
+tool-file-write-error-path-blocked = Path blocked by security policy: '{ $path }'
+tool-file-write-error-missing-parent = Invalid path: missing parent directory
+tool-file-write-error-no-existing-parent = Failed to resolve an existing parent directory
+tool-file-write-error-parent-binding = Failed to resolve the file-write parent path: '{ $path }'
+tool-file-write-error-missing-name = Invalid path: missing file name
+tool-file-write-error-runtime-config = Runtime configuration files cannot be changed with file_write: '{ $path }'
+tool-file-write-error-capability-binding = Failed to bind the file-write parent to an authorized directory
+tool-file-write-error-symlink = Refusing to write through a symlink: '{ $path }'
+tool-filesystem-boundary-error-symlink = Refusing to follow a symlink at '{ $path }'
+tool-filesystem-boundary-error-contained = Path must be relative and contained: '{ $path }'
+tool-filesystem-boundary-error-not-directory = Path component is not a directory: '{ $path }'
+tool-filesystem-boundary-error-not-regular = Refusing to open a non-regular file: '{ $path }'
+tool-data-management-error-purge-disabled = Confirmed purge is unavailable; use dry_run to preview eligible files
+tool-data-management-error-read-blocked = Workspace path is not readable under the security policy: '{ $path }'
+tool-backup-error-max-keep = Backup retention max_keep must be at least 1
+tool-backup-error-action-blocked = Backup mutation is blocked by the security policy
+tool-backup-error-source-overlap = Backup source cannot contain the backup output directory: '{ $path }'
+tool-backup-error-rotation-platform = Backup rotation is unavailable on this platform because recursive deletion cannot preserve the verified directory-handle boundary
+tool-backup-error-not-found = Backup not found: '{ $name }'
+tool-backup-error-integrity = Integrity check failed
+tool-backup-error-non-utf8 = Backup contains a non-UTF-8 entry name
+tool-backup-error-contained = Backup path must stay within the workspace: '{ $path }'
+tool-backup-error-invalid-name = Invalid backup name: '{ $name }'
+tool-backup-error-symlink = Refusing to traverse a symlink in backup data: '{ $path }'
+tool-backup-error-not-directory = Backup path is not a directory: '{ $path }'
+tool-backup-error-is-directory = Backup file destination is a directory: '{ $path }'
+tool-backup-error-special-file = Refusing to traverse a special file in backup data: '{ $path }'
+tool-backup-error-read-blocked = Workspace path is not readable under the security policy: '{ $path }'
+tool-backup-error-write-blocked = Backup destination is not writable under the security policy: '{ $path }'
 
 tool-git-operations = Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls.
 tool-git-operations-error-not-in-repo = Not in a Git repository at '{ $path }'. Choose a path inside a Git worktree, pass 'path' for a repository subdirectory, or initialize a repository before running git_operations.

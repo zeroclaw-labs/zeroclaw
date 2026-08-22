@@ -18,6 +18,8 @@ anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"
 cap-std = "4"
+cap-fs-ext = "4"
+rustix = { version = "1", features = ["fs"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 directories = "6.0"
 futures-util = { version = "0.3", default-features = false }
@@ -45,13 +47,15 @@ toml = "1.0"
 urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 which = "8.0"
-
 async-imap = { version = "0.11", features = ["runtime-tokio"], default-features = false }
 mail-parser = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1.14.0"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 webpki-roots = "1.0.6"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [features]
 default = []

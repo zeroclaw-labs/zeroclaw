@@ -34,7 +34,7 @@ tool-cron-remove = 按 id 移除一个 cron 任务
 tool-cron-run = 立即强制运行一个 cron 任务并记录运行历史
 tool-cron-runs = 列出某个 cron 任务的近期运行历史
 tool-cron-update = 修补现有的 cron 任务（schedule、command、prompt、enabled、delivery、model 等）
-tool-data-management = 工作区数据保留、清除和存储统计
+tool-data-management = 工作区保留预览和存储统计
 tool-delegate = 将子任务委托给专门的 agent。适用场景：某项任务受益于不同的模型（例如快速摘要、深度推理、代码生成）。默认情况下子 agent 运行单个提示词；当 agentic=true 时，它可以通过经过筛选的工具调用循环进行迭代。
 tool-file-edit = 通过将精确匹配的字符串替换为新内容来编辑文件
 tool-file-download = 从配置的远程端点下载文件并将其写入代理的工作区。提供要获取的文档标识符和工作区相对目标路径；端点 URL 由主机配置固定，永远不受模型控制。字节直接流式写入磁盘，不会加载到模型上下文中。返回 HTTP 状态、写入的字节数和目标路径。
