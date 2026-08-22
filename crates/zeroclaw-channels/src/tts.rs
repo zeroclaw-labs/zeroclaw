@@ -1016,7 +1016,9 @@ impl TtsManager {
                 "google" => GoogleTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
                 "edge" => EdgeTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
                 "piper" => Ok(Box::new(PiperTtsProvider::new(alias, instance)) as _),
-                _ => unreachable!("TtsProviders typed slots cover all 5 families"),
+                _ => Err(anyhow::Error::msg(format!(
+                    "unsupported typed TTS family: {family}"
+                ))),
             };
             match result {
                 Ok(p) => {

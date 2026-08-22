@@ -12570,7 +12570,8 @@ pub async fn start_channels(
             max_tool_iterations: config.effective_max_tool_iterations(agent_alias.as_str()),
             min_relevance_score: config.memory.min_relevance_score,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),

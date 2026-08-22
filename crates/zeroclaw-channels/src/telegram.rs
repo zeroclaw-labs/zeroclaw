@@ -1340,7 +1340,9 @@ impl TelegramChannel {
         let voice_peer_resolver = self.voice_peer_resolver.clone();
         let api_base = self.api_base.clone();
         let bot_token = self.bot_token.clone();
-        let tts_manager = self.tts_manager.clone().unwrap();
+        let Some(tts_manager) = self.tts_manager.clone() else {
+            return;
+        };
 
         if immediate {
             // Finalize path: text is already the final answer — no debounce.
@@ -2865,7 +2867,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                     continue;
                 }
                 // Default: escape HTML entities
-                let ch = line[i..].chars().next().unwrap();
+                let Some(ch) = line[i..].chars().next() else {
+                    break;
+                };
                 match ch {
                     '<' => line_out.push_str("&lt;"),
                     '>' => line_out.push_str("&gt;"),
