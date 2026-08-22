@@ -1,10 +1,10 @@
 # Multi-Model Setup
 
-A walkthrough of the common patterns for using multiple model providers: per-agent dispatch, cost tiering, local-first with hosted backup, API key rotation, and rate-limit handling.
+A walkthrough of the common patterns for using multiple model providers: per-agent dispatch, hint routes, cost tiering, local-first with hosted backup, non-streaming provider fallback, rate-limit handling, and streaming recovery.
 
 > **Reference material** for the provider system lives in:
 > - [Model Providers → Overview](../providers/overview.md): what providers are, configuration shape
-> - [Model Providers → Routing](../providers/routing.md): per-agent dispatch and OpenRouter
+> - [Model Providers → Routing](../providers/routing.md): agent dispatch, hint routes, and provider fallback
 > - [Model Providers → Catalog](../providers/catalog.md): every provider's config shape
 
 ## When to use multi-model setup
@@ -15,25 +15,33 @@ Multi-model configuration is useful for:
 2. **Capability routing**: vision-capable model for image-bearing channels, reasoning model for research workflows
 3. **Local-first development**: local Ollama for development, hosted endpoint for production
 4. **Per-team isolation**: different teams use different agents with different model_providers and credentials
-5. **Rate-limit handling**: rotate through API keys on `429` (rate limit) responses
+5. **Non-streaming rate-limit handling**: move to another configured provider profile after a retryable `429`
 
 ## Core idea: per-agent dispatch
 
-Each `[agents.<alias>]` entry points at exactly one `[providers.models.<type>.<alias>]`. If the model goes down, the agent goes down; the operator routes affected channels to a different agent. See [Routing](../providers/routing.md) for the full pattern.
+Each `[agents.<alias>]` entry starts from one `[providers.models.<type>.<alias>]`. That provider profile can declare alternate models with `fallback_models` and other provider profiles with `fallback`. See [Routing](../providers/routing.md) for the full pattern.
 
 To run multiple models, run multiple agents, each binding to one model provider. Each channel binds to one agent at a time. To move a channel to a different agent, edit the `channels` list on the agent that should pick it up; `Config::validate()` makes sure references resolve at startup.
 
-## Cross-vendor reliability: use OpenRouter
+## Cross-provider reliability
 
-OpenRouter is treated as a single first-class provider. It handles vendor fan-out and uptime behind one endpoint. If your goal is "one provider goes down, automatically use another", that's OpenRouter's job, not ZeroClaw's. The runtime sees one provider; OpenRouter does the cross-vendor work upstream.
+For non-streaming calls, ZeroClaw can walk an ordered fallback graph across provider profiles. Each fallback profile keeps its own endpoint, credentials, model, headers, capability overrides, and nested fallback declarations. The runtime retries or advances according to the error classification and profile cooldown state.
 
-## Same-vendor retry
+OpenRouter remains a first-class provider and can perform vendor selection behind one endpoint. It is an optional external routing layer, not a requirement for ZeroClaw's first-party fallback.
 
-For transient errors (network blip, 503, timeout) against the *same* provider, ZeroClaw retries with exponential backoff, configurable globally under `reliability` (defaults: 2 retries, 500 ms initial backoff). These are inside-one-provider retries.
+## Non-streaming retry and fallback
 
-## API key rotation
+For transient errors such as a network failure, `503`, or timeout, a non-streaming call retries with bounded exponential backoff, configurable globally under `reliability` (defaults: 2 retries, 500 ms initial backoff). After an entry is exhausted, the reliable wrapper advances through the profile's `fallback_models` and fallback profiles.
 
-For providers that frequently encounter rate limits, supply additional API keys on the provider entry that ZeroClaw rotates through on `429` responses. The primary `api_key` is always tried first; extras are rotated on rate-limit errors. All keys must belong to the same provider account class; this is rate-limit smoothing, not multi-tenant key juggling.
+## Streaming recovery boundary
+
+A streaming call selects the first eligible, non-cooling entry that supports the required stream capabilities. It does not advance to another entry after that stream starts. If the stream fails before visible output reaches an immutable consumer, the runtime retries the whole call through the non-streaming path, which can walk the fallback graph. Once visible output exists, the runtime preserves the partial response and does not replay the request or switch providers. See [Provider routing lifecycle](../architecture/provider-routing-lifecycle.md#streaming-and-replay-boundary) for the complete contract.
+
+## API key rotation limitation
+
+Do not rely on `reliability.api_keys` for credential failover. On a retryable rate limit, the reliable wrapper selects and logs an alternate key, but the `ModelProvider` trait cannot apply it to the already constructed provider. The retry still uses the original credential. [Issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) tracks this limitation.
+
+Use separate provider profiles with their own credentials, or an external routing service, when credential-level failover is required.
 
 ## Local development with hosted alternative
 
@@ -97,13 +105,13 @@ Run two agents and route channels to the appropriate tier. The `delegate` tool l
 
 The frontline agent handles every inbound message on Haiku. When it needs deeper reasoning, it calls the `delegate` tool with `agent = "heavy"`; because both agents share the `trusted` risk profile and that profile allows delegation, the heavier agent picks up the sub-task on Opus.
 
-## Error handling
+## Non-streaming error handling
 
-Inside-one-provider retries trigger on:
+For non-streaming calls, retryable failures include:
 
 1. **Timeout**: provider did not respond within the configured timeout
 2. **Connection error**: network or DNS failure
-3. **Rate limit (429)**: triggers API key rotation first; if all keys exhausted, fails up to the channel
+3. **Rate limit (429)**: places the provider profile on a temporary in-memory cooldown and advances when another entry exists
 4. **Service unavailable (503)**: temporary service issue
 
 Retries are NOT triggered by:
@@ -112,11 +120,11 @@ Retries are NOT triggered by:
 2. **Permanent auth failure**: invalid API key format
 3. **Model output errors**: the model responded but returned an error payload
 
-When all retries are exhausted on a single provider, the failure surfaces to the calling channel. There is no automatic cross-provider retry, that's the point of using OpenRouter or splitting traffic across multiple agents.
+When every materialized entry is exhausted or cooling down, the failure surfaces to the calling channel with the collected attempt failures.
 
 ## Debugging
 
-Persisted logs (`"rolling"` is the default) capture retry and key-rotation behaviour. Then query traces:
+Persisted logs (`"rolling"` is the default) capture retry, cooldown, and fallback behavior. Then query traces:
 
 <div class="os-tabs-src">
 
@@ -133,12 +141,13 @@ zeroclaw doctor traces --contains "model_provider"
 ## Best practices
 
 1. **One agent per routing intent.** If two channels need different model behavior, name two agents.
-2. **Use OpenRouter for cross-vendor reliability.** Cross-vendor "if Claude fails, try OpenAI" is OpenRouter's job; configure it as one provider and let its endpoint handle the fan-out.
-3. **Keep API key rotation pools homogeneous.** All keys in `[reliability] api_keys` should be from the same provider account, this is rate-limit smoothing, not multi-tenancy.
-4. **Smoke-test each agent in isolation.** `zeroclaw agent -a <alias>` runs an agent without channel plumbing in the way.
-5. **Document agent intent.** Add `# comment` lines explaining which channels each agent serves and why.
-6. **Inject secrets via env, not inline.** `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `api_key` at startup; see [Environment variables](../reference/env-vars.md).
-7. **Separate dev and prod agents.** Each environment gets its own `[agents.<alias>]` entry bound to its own channels.
+2. **Give fallback profiles explicit ownership.** Keep each endpoint, credential, model, and capability override on the profile that serves it.
+3. **Treat OpenRouter as an optional routing layer.** Use it when server-side vendor selection is useful; use ZeroClaw fallback profiles when the runtime should own the order.
+4. **Do not rely on `reliability.api_keys`.** Use separately constructed profiles until [issue #9190](https://github.com/zeroclaw-labs/zeroclaw/issues/9190) is fixed.
+5. **Smoke-test each agent in isolation.** `zeroclaw agent -a <alias>` runs an agent without channel plumbing in the way.
+6. **Document agent intent.** Add `# comment` lines explaining which channels each agent serves and why.
+7. **Inject secrets via env, not inline.** `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` sets `api_key` at startup; see [Environment variables](../reference/env-vars.md).
+8. **Separate dev and prod agents.** Each environment gets its own `[agents.<alias>]` entry bound to its own channels.
 
 ## Credential resolution
 
@@ -148,7 +157,7 @@ Each provider entry resolves credentials in this order:
 2. **Secrets store** at `~/.zeroclaw/secrets`.
 3. **Generic env override**: `ZEROCLAW_providers__models__<type>__<alias>__api_key=...` at startup. If your shell already exports `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, or a similar vendor-default name, bridge it into this schema-mirror variable before startup unless the provider family explicitly documents a native runtime env bridge. See [Environment variables](../reference/env-vars.md) for the full grammar and bridge examples.
 
-Credentials are not shared between providers, set them per provider entry.
+Credentials are not shared between provider profiles; set them per profile. A route-level `model_routes[].api_key` is a higher-precedence override when its routed target is constructed. Route targets are deduplicated by `model_provider`, so the first matching route credential can construct the provider shared by several hints. Prefer profile-owned credentials when routes share a target.
 
 ## Related Documentation
 

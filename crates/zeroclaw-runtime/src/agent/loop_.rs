@@ -158,6 +158,26 @@ pub use super::history::{
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
 
+/// The single autosave decision for a turn's user-side text, shared by both
+/// store sites in this file so the gates cannot drift apart.
+///
+/// Order matters for meaning, not correctness: the origin gate
+/// (`should_autosave_origin`) is the load-bearing check — scheduled and
+/// parent-composed origins are known internal synthetic producers, whatever
+/// their text looks like. The content filter remains as a backstop for
+/// synthetic shapes that arrive on autosave-eligible origins (e.g. replayed
+/// histories).
+fn should_autosave_user_message(
+    auto_save: bool,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+    content: &str,
+) -> bool {
+    auto_save
+        && zeroclaw_memory::should_autosave_origin(origin)
+        && content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
+        && !zeroclaw_memory::should_skip_autosave_content(content)
+}
+
 pub(crate) const MAX_INTERACTIVE_INPUT_BYTES: usize = 1024 * 1024; // 1 MiB
 
 /// Result of [`read_capped_line`].
@@ -488,11 +508,15 @@ pub(crate) fn compute_excluded_mcp_tools(
 
 pub fn native_tool_specs_present_for_turn(
     model_provider: &dyn ModelProvider,
+    model: &str,
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
     activated_tools: Option<&Arc<Mutex<crate::tools::ActivatedToolSet>>>,
 ) -> Result<bool> {
-    if !model_provider.supports_native_tools() {
+    if !model_provider
+        .capabilities_for_model(model)
+        .native_tool_calling
+    {
         return Ok(false);
     }
 
@@ -597,10 +621,14 @@ pub(crate) fn build_system_prompt_for_turn(
     inject_memory: bool,
     show_tool_calls: bool,
     thinking_prefix: Option<&str>,
+    shell_profile: Option<&zeroclaw_api::runtime_traits::ShellProfile>,
 ) -> Result<String> {
-    let native_tools = model_provider.supports_native_tools();
+    let native_tools = model_provider
+        .capabilities_for_model(model_name)
+        .native_tool_calling;
     let native_tool_specs_present = native_tool_specs_present_for_turn(
         model_provider,
+        model_name,
         tools_registry,
         excluded_tools,
         activated_tools,
@@ -634,6 +662,7 @@ pub(crate) fn build_system_prompt_for_turn(
         max_system_prompt_chars,
         inject_memory,
         show_tool_calls,
+        shell_profile,
     );
 
     if expose_text_tool_protocol {
@@ -964,11 +993,13 @@ pub(crate) use super::turn::{
     maybe_inject_channel_delivery_defaults, resolve_display_text,
 };
 pub use super::turn::{
-    DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback, ModelSwitchRequested,
-    PROGRESS_MIN_INTERVAL_MS, ProgressEvent, ResolvedAgentExecution, ResolvedIo,
-    ResolvedModelAccess, ResolvedRuntimeKnobs, SopStepReassembly, StreamDelta, ToolLoop,
-    ToolLoopCancelled, drain_steering_messages, is_model_switch_requested, is_tool_loop_cancelled,
-    run_tool_call_loop, scrub_credentials,
+    DRAFT_PLACEHOLDER, DraftEvent, LoopKnobs, MaxIterationBehavior, ModelSwitchCallback,
+    ModelSwitchRequested, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, REASONING_FULL_PREFIX,
+    ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
+    SopStepReassembly, StreamDelta, THINKING_STATUS_PREFIX, ToolLoop, ToolLoopCancelled,
+    drain_steering_messages, is_model_switch_requested, is_thinking_status_text,
+    is_tool_loop_cancelled, run_tool_call_loop, scrub_credentials, thinking_status_label_round,
+    thinking_status_round, thinking_status_text,
 };
 
 /// Build the tool instruction block for the system prompt so the LLM knows
@@ -1130,6 +1161,30 @@ fn api_key_and_uri_for_provider(
     )
 }
 
+/// Project a typed terminal-completion failure only at the direct CLI boundary.
+///
+/// The typed error's `Display` remains the stable diagnostic used by provider
+/// and runtime telemetry. CLI delivery is the presentation boundary, where the
+/// corresponding Fluent message is required instead.
+fn project_cli_terminal_completion_error(error: anyhow::Error) -> anyhow::Error {
+    let Some(user_message) = crate::agent::terminal_completion_error_message(&error, None) else {
+        return error;
+    };
+    let diagnostic = error.to_string();
+    ::zeroclaw_log::record!(
+        ERROR,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+            .with_attrs(::serde_json::json!({
+                "error": diagnostic,
+                "error_key": "terminal_completion",
+            })),
+        "CLI agent turn failed"
+    );
+    anyhow::Error::msg(user_message)
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn run(
     config: Config,
@@ -1275,12 +1330,13 @@ pub async fn run(
         // available on this path (CLI agent run). No channel map is wired on this
         // path, so the approval route adapter is the no-op (log-only); the daemon
         // path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
                 &config.data_dir,
+                &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
             );
@@ -1655,6 +1711,7 @@ pub async fn run(
             true,
             config.channels.show_tool_calls,
             None,
+            runtime.shell_profile().as_ref(),
         )?;
 
         // ── Approval manager (supervised mode) ───────────────────────
@@ -1749,6 +1806,7 @@ pub async fn run(
                 true,
                 config.channels.show_tool_calls,
                 thinking_params.system_prompt_prefix.as_deref(),
+                runtime.shell_profile().as_ref(),
             )?;
 
             let excluded_tool_names: HashSet<&str> =
@@ -1774,11 +1832,9 @@ pub async fn run(
                 return Ok(final_output);
             }
 
-            // Auto-save user message to memory (skip short/trivial messages)
-            if config.memory.auto_save
-                && effective_msg.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                && !zeroclaw_memory::should_skip_autosave_content(&effective_msg)
-            {
+            // Auto-save user message to memory (skip autonomous origins
+            // and short/trivial or synthetic messages).
+            if should_autosave_user_message(config.memory.auto_save, origin, &effective_msg) {
                 let user_key = autosave_memory_key("user_msg");
                 let store_start = std::time::Instant::now();
                 let store_result = mem
@@ -1870,6 +1926,7 @@ pub async fn run(
                         true,
                         config.channels.show_tool_calls,
                         thinking_params.system_prompt_prefix.as_deref(),
+                        runtime.shell_profile().as_ref(),
                     )?;
                 }
                 match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -1888,7 +1945,7 @@ pub async fn run(
                                     ResolvedIo {
                                         tools_registry: &tools_registry,
                                         observer: observer.as_ref(),
-                                        silent: false,
+                                        silent: !interactive,
                                         approval: approval_manager.as_ref(),
                                         multimodal_config: &config.multimodal,
                                         config: Some(&config),
@@ -1999,7 +2056,7 @@ pub async fn run(
 
                             continue;
                         }
-                        return Err(e);
+                        return Err(project_cli_terminal_completion_error(e));
                     }
                 }
             }
@@ -2292,11 +2349,9 @@ pub async fn run(
                     continue;
                 }
 
-                // Auto-save conversation turns (skip short/trivial messages)
-                if config.memory.auto_save
-                    && effective_input.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
-                    && !zeroclaw_memory::should_skip_autosave_content(&effective_input)
-                {
+                // Auto-save conversation turns (skip autonomous origins
+                // and short/trivial or synthetic messages).
+                if should_autosave_user_message(config.memory.auto_save, origin, &effective_input) {
                     let user_key = autosave_memory_key("user_msg");
                     let store_start = std::time::Instant::now();
                     let store_result = mem
@@ -2378,6 +2433,18 @@ pub async fn run(
                                 print!("{text}");
                                 let _ = std::io::stdout().flush();
                             }
+                            StreamDelta::Reasoning(_) => {}
+                            tool_event @ (StreamDelta::ToolStart { .. }
+                            | StreamDelta::ToolComplete { .. }) => {
+                                if let Some(text) = tool_event.legacy_status() {
+                                    if is_tty {
+                                        let _ = write!(std::io::stderr(), "\x1b[2m{text}\x1b[0m");
+                                    } else {
+                                        eprint!("{text}");
+                                    }
+                                    let _ = std::io::stderr().flush();
+                                }
+                            }
                         }
                     }
                 });
@@ -2415,6 +2482,7 @@ pub async fn run(
                             true,
                             config.channels.show_tool_calls,
                             thinking_params.system_prompt_prefix.as_deref(),
+                            runtime.shell_profile().as_ref(),
                         )?;
                     }
                     match zeroclaw_api::NATIVE_THINKING_OVERRIDE
@@ -2663,7 +2731,8 @@ pub async fn run(
                                 }
                             }
 
-                            eprintln!("\nError: {e}\n");
+                            let error = project_cli_terminal_completion_error(e);
+                            eprintln!("\nError: {error}\n");
                             break String::new();
                         }
                     }
@@ -2870,12 +2939,13 @@ pub async fn process_message(
         // available on this path (process_message CLI agent). No channel map is
         // wired here, so the approval route adapter is the no-op (log-only); the
         // daemon path injects a real channel-delivering adapter.
-        let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+        let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
             let sop_mem: Arc<dyn zeroclaw_memory::Memory> =
                 zeroclaw_memory::create_memory_for_agent(&config, agent_alias, None).await?;
             let (engine, audit) = crate::sop::build_sop_engine(
                 config.sop.clone(),
                 &config.data_dir,
+                &config.install_root_dir(),
                 sop_mem,
                 Default::default(),
             );
@@ -3116,9 +3186,12 @@ pub async fn process_message(
         } else {
             None
         };
-        let native_tools = model_provider.supports_native_tools();
+        let native_tools = model_provider
+            .capabilities_for_model(&model_name)
+            .native_tool_calling;
         let native_tool_specs_present = native_tool_specs_present_for_turn(
             model_provider.as_ref(),
+            &model_name,
             &tools_registry,
             &excluded_tools,
             activated_handle_pm.as_ref(),
@@ -3145,6 +3218,7 @@ pub async fn process_message(
                 eff_max_system_prompt_chars,
                 false,
                 config.channels.show_tool_calls,
+                runtime.shell_profile().as_ref(),
             );
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
@@ -3331,6 +3405,64 @@ mod tests {
         make_query_summary, maybe_inject_channel_delivery_defaults,
         save_interactive_session_history, seed_channel_handles, truncate_tool_result,
     };
+
+    /// One decision, four gates. The origin gate is the load-bearing one:
+    /// the heartbeat session-context shape defeats the content filter (it no
+    /// longer starts with `[Heartbeat Task`), and only the origin check
+    /// stops it. Interactive remains autosave-eligible for that same text,
+    /// which pins that the fix keys on trusted caller provenance, not on
+    /// smarter content sniffing or human-authorship detection.
+    #[test]
+    fn autosave_decision_keys_on_origin_before_content() {
+        use zeroclaw_api::ingress::TurnOrigin;
+
+        let leaked_heartbeat_shape = "[Recent conversation history — use this for context \
+             when composing your message] (last message ~5 minutes ago)\nUser: how was the \
+             deploy?\n\n[Heartbeat Task | high] check the build";
+
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Daemon, leaked_heartbeat_shape),
+            "a heartbeat turn must not autosave its synthetic prompt, whatever its shape"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Cron, "[cron:job-1 build] check"),
+            "cron prompts stay suppressed (origin now, prefix as backstop)"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::SubTurn, leaked_heartbeat_shape),
+            "known parent-composed sub-turn text is not autosave-eligible"
+        );
+
+        assert!(
+            should_autosave_user_message(true, TurnOrigin::Interactive, leaked_heartbeat_shape),
+            "interactive provenance remains autosave-eligible regardless of prompt shape"
+        );
+        assert!(
+            should_autosave_user_message(
+                true,
+                TurnOrigin::Channel,
+                "please remember I prefer staged rollouts"
+            ),
+            "channel provenance remains autosave-eligible even when a peer may be automated"
+        );
+
+        assert!(
+            !should_autosave_user_message(false, TurnOrigin::Interactive, leaked_heartbeat_shape),
+            "auto_save off wins over everything"
+        );
+        assert!(
+            !should_autosave_user_message(true, TurnOrigin::Interactive, "short msg"),
+            "the length floor is unchanged"
+        );
+        assert!(
+            !should_autosave_user_message(
+                true,
+                TurnOrigin::Interactive,
+                "[cron:job-1 build] check the build status now"
+            ),
+            "the content backstop still filters synthetic shapes on user origins"
+        );
+    }
 
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::{ToolDispatchContext, execute_one_tool};
@@ -4059,6 +4191,25 @@ mod tests {
                 }
             }
         };
+    }
+
+    #[test]
+    fn direct_cli_terminal_completion_projection_localizes_delivery() {
+        let error =
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
+        let diagnostic = error.to_string();
+
+        let projected = super::project_cli_terminal_completion_error(error);
+
+        assert_eq!(
+            projected.to_string(),
+            crate::agent::semantic_empty_terminal_completion_message(None),
+            "both direct CLI boundaries must deliver the Fluent terminal-completion message"
+        );
+        assert_eq!(
+            diagnostic, "provider completed without final text or tool calls",
+            "the diagnostic supplied to the CLI boundary must remain stable for telemetry"
+        );
     }
 
     struct NonVisionModelProvider {
@@ -10100,7 +10251,12 @@ This is an example, not an invocation."#;
             deltas.iter().all(|delta| match delta {
                 StreamDelta::Status(text) | StreamDelta::Text(text) =>
                     !text.contains("private chain of thought") && !text.contains("<think>"),
-                StreamDelta::Lifecycle(_) => true,
+                StreamDelta::Reasoning(text) => {
+                    !text.contains("private chain of thought") && !text.contains("<think>")
+                }
+                StreamDelta::ToolStart { .. }
+                | StreamDelta::ToolComplete { .. }
+                | StreamDelta::Lifecycle(_) => true,
             }),
             "draft deltas must not expose inline think tags: {deltas:?}"
         );
@@ -10199,6 +10355,8 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {}
             }
         }
 
@@ -10291,6 +10449,8 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {}
             }
         }
 
@@ -10464,6 +10624,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10550,6 +10711,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10587,6 +10749,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10627,6 +10790,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10667,6 +10831,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10751,6 +10916,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10833,6 +10999,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -10918,6 +11085,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -11006,6 +11174,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -11089,6 +11258,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -11175,6 +11345,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -11277,6 +11448,8 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {}
             }
         }
 
@@ -11634,6 +11807,7 @@ This is an example, not an invocation."#;
             Some(&tx),
             None, // event_tx
             true,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should finish");
@@ -11749,6 +11923,8 @@ This is an example, not an invocation."#;
                 StreamDelta::Text(text) => {
                     visible_deltas.push_str(&text);
                 }
+                StreamDelta::Reasoning(_) => {}
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {}
             }
         }
 
@@ -12931,9 +13107,14 @@ Let me check the result."#;
         let tools_registry: Vec<Box<dyn crate::tools::Tool>> =
             vec![Box::new(CountingTool::new("shell", invocations))];
 
-        let native_tool_specs_present =
-            super::native_tool_specs_present_for_turn(&provider, &tools_registry, &[], None)
-                .expect("native spec availability should be derivable");
+        let native_tool_specs_present = super::native_tool_specs_present_for_turn(
+            &provider,
+            "test-model",
+            &tools_registry,
+            &[],
+            None,
+        )
+        .expect("native spec availability should be derivable");
         assert!(native_tool_specs_present);
 
         let system_prompt = build_system_prompt_with_mode(
@@ -12971,6 +13152,7 @@ Let me check the result."#;
 
         let native_tool_specs_present = super::native_tool_specs_present_for_turn(
             &provider,
+            "test-model",
             &tools_registry,
             &excluded_tools,
             None,
@@ -13005,9 +13187,14 @@ Let me check the result."#;
         ));
 
         let no_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
-        let native_tool_specs_present =
-            super::native_tool_specs_present_for_turn(&provider, &no_tools, &[], None)
-                .expect("native spec availability should be derivable");
+        let native_tool_specs_present = super::native_tool_specs_present_for_turn(
+            &provider,
+            "test-model",
+            &no_tools,
+            &[],
+            None,
+        )
+        .expect("native spec availability should be derivable");
 
         assert!(
             !native_tool_specs_present,
@@ -13061,6 +13248,7 @@ Let me check the result."#;
             true,
             false,
             None,
+            None,
         )
         .expect("startup prompt should build");
         assert!(startup_prompt.contains(NATIVE_TOOLS_TASK_FRAMING));
@@ -13092,6 +13280,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("no-tools turn prompt should build");
@@ -13127,6 +13316,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("tools turn prompt should build");
@@ -13194,6 +13384,7 @@ Let me check the result."#;
             usize::MAX,
             true,
             false,
+            None,
             None,
         )
         .expect("compact-mode text prompt should build");
@@ -13458,6 +13649,7 @@ Let me check the result."#;
             None,
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should succeed");
@@ -13552,6 +13744,7 @@ Let me check the result."#;
             None,
             None, // event_tx
             false,
+            zeroclaw_config::schema::StreamReasoningMode::Status,
         )
         .await
         .expect("streaming should succeed");
@@ -14159,8 +14352,12 @@ Let me check the result."#;
         let all_deltas: String = deltas
             .iter()
             .map(|d| match d {
-                StreamDelta::Status(t) | StreamDelta::Text(t) => t.as_str(),
-                StreamDelta::Lifecycle(_) => "",
+                StreamDelta::Status(t) | StreamDelta::Text(t) => t.clone(),
+                StreamDelta::Reasoning(_) => String::new(),
+                StreamDelta::ToolStart { .. } | StreamDelta::ToolComplete { .. } => {
+                    d.legacy_status().unwrap_or_default()
+                }
+                StreamDelta::Lifecycle(_) => String::new(),
             })
             .collect();
 
@@ -14340,71 +14537,68 @@ Let me check the result."#;
         assert!(summary.session_cost_usd > 0.0);
     }
 
-    /// The local budget gate rejects the turn before any provider request is
-    /// made, so the user must not be told the agent is waiting on a model.
-    /// `WaitingOnModel` is announced by `announce_llm_request`, which must run
-    /// after `enforce_tool_loop_budget`, never before it.
     #[tokio::test]
-    async fn budget_rejection_emits_no_waiting_on_model_lifecycle() {
+    async fn recovered_rejected_usage_is_billed_without_replacing_accepted_context_usage() {
         use super::{
             TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
             run_tool_call_loop,
         };
-        use crate::agent::turn::events::StreamDelta;
-        use crate::cost::CostTracker;
-        use crate::observability::noop::NoopObserver;
-        use std::collections::HashMap;
-        use zeroclaw_api::channel::ProgressEvent;
+        use zeroclaw_api::agent::TurnEvent;
+        use zeroclaw_providers::reliable::ReliableModelProvider;
 
-        let turn_id = uuid::Uuid::new_v4().to_string();
-        // If the gate were bypassed this provider would answer, so a passing
-        // assertion cannot be explained by the provider simply not replying.
-        let model_provider = ScriptedModelProvider {
-            responses: Arc::new(Mutex::new(VecDeque::from([ChatResponse {
-                text: Some("done".to_string()),
-                tool_calls: Vec::new(),
-                usage: None,
-                reasoning_content: None,
-            }]))),
-            capabilities: ProviderCapabilities::default(),
+        let rejected = ChatResponse {
+            text: Some("   ".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
         };
-        let observer = NoopObserver;
-        let workspace = tempfile::TempDir::new().unwrap();
-        let cost_config = zeroclaw_config::schema::CostConfig {
-            enabled: true,
-            daily_limit_usd: 0.01,
-            ..zeroclaw_config::schema::CostConfig::default()
+        let accepted = ChatResponse {
+            text: Some("accepted response".to_string()),
+            tool_calls: Vec::new(),
+            usage: Some(zeroclaw_providers::traits::TokenUsage {
+                input_tokens: Some(80),
+                output_tokens: Some(7),
+                cached_input_tokens: None,
+            }),
+            reasoning_content: None,
         };
-        let tracker = Arc::new(CostTracker::new(cost_config, workspace.path()).unwrap());
-        // Put the tracker over its daily limit before the turn starts.
-        tracker
-            .record_usage(zeroclaw_config::cost::TokenUsage {
-                model: "mock-model".to_string(),
-                input_tokens: 1,
-                output_tokens: 1,
-                cached_input_tokens: 0,
-                total_tokens: 2,
-                cost_usd: 5.0,
-                pricing_available: true,
-                timestamp: chrono::Utc::now(),
-            })
-            .unwrap();
-
-        let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(HashMap::new()));
-        let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
-        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(16);
+        let provider = ReliableModelProvider::new(
+            "reliable-test",
+            vec![(
+                "scripted".to_string(),
+                Box::new(ScriptedModelProvider {
+                    responses: Arc::new(Mutex::new(VecDeque::from([rejected, accepted]))),
+                    capabilities: ProviderCapabilities::default(),
+                }) as Box<dyn ModelProvider>,
+            )],
+            1,
+            1,
+        );
+        let observer = CapturingObserver::default();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let usage_ctx = ToolLoopCostTrackingContext::usage_only();
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("earlier question"),
+            ChatMessage::assistant("earlier answer"),
+            ChatMessage::user("current question"),
+        ];
 
         let result = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
-                Some(ctx),
+                Some(usage_ctx.clone()),
                 run_tool_call_loop(ToolLoop {
                     parent_agent_alias: None,
                     sop_reassembly: None,
                     exec: ResolvedAgentExecution {
                         model_access: ResolvedModelAccess {
-                            model_provider: &model_provider,
-                            provider_name: "mock-provider",
-                            model: "mock-model",
+                            model_provider: &provider,
+                            provider_name: "reliable-test",
+                            model: "test-model",
                             temperature: Some(0.0),
                         },
                         tools_registry: &[],
@@ -14423,7 +14617,7 @@ Let me check the result."#;
                         strict_tool_parsing: false,
                         parallel_tools: false,
                         max_tool_result_chars: 0,
-                        context_token_budget: 0,
+                        context_token_budget: 100,
                         receipt_generator: None,
                         knobs: &LoopKnobs::default(),
                     },
@@ -14431,35 +14625,71 @@ Let me check the result."#;
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
-                    on_delta: Some(delta_tx),
+                    on_delta: None,
                     shared_budget: None,
                     channel: None,
                     collected_receipts: None,
-                    event_tx: None,
+                    event_tx: Some(event_tx),
                     steering: None,
                     new_messages_out: None,
                     image_cache: None,
                     memory: None,
                     ingress: IngressContext::sub_turn(),
                     agent_alias: None,
-                    turn_id: &turn_id,
+                    turn_id: "recovered-usage-test",
                 }),
             )
-            .await;
+            .await
+            .expect("reliable recovery should produce the accepted response");
 
-        assert!(
-            result.is_err(),
-            "an exhausted budget must reject the turn, got {result:?}"
+        assert_eq!(result, "accepted response");
+        let usage = usage_ctx.snapshot_turn_usage();
+        assert_eq!(usage.input_tokens, 160, "both billed attempts are retained");
+        assert_eq!(usage.output_tokens, 12);
+        assert_eq!(
+            usage.last_input_tokens, 80,
+            "only the accepted response may set the context-window fill"
         );
-        let mut lifecycle = Vec::new();
-        while let Ok(delta) = delta_rx.try_recv() {
-            if let StreamDelta::Lifecycle(event) = delta {
-                lifecycle.push(event);
+        assert!(
+            history
+                .iter()
+                .any(|message| message.content == "earlier question"),
+            "the accepted 80-token context fill must not trim existing history"
+        );
+
+        let events = observer.events.lock();
+        let responses: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ObserverEvent::LlmResponse {
+                    success: true,
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => Some((*input_tokens, *output_tokens)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(responses, vec![(Some(80), Some(7))]);
+        drop(events);
+
+        let mut usage_events = Vec::new();
+        let mut history_trimmed = false;
+        while let Ok(event) = event_rx.try_recv() {
+            match event {
+                TurnEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    ..
+                } => usage_events.push((input_tokens, output_tokens)),
+                TurnEvent::HistoryTrimmed { .. } => history_trimmed = true,
+                _ => {}
             }
         }
+        assert_eq!(usage_events, vec![(Some(80), Some(7))]);
         assert!(
-            !lifecycle.contains(&ProgressEvent::WaitingOnModel),
-            "a budget-rejected turn never calls the provider, so it must not announce a model wait: {lifecycle:?}"
+            !history_trimmed,
+            "recovered rejected usage must not trim history"
         );
     }
 
@@ -14549,14 +14779,16 @@ Let me check the result."#;
     }
 
     #[tokio::test]
-    async fn cost_tracking_enforces_budget() {
+    async fn budget_rejection_emits_no_waiting_on_model_lifecycle() {
         use super::{
             TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoop, ToolLoopCostTrackingContext,
             run_tool_call_loop,
         };
+        use crate::agent::turn::events::StreamDelta;
         use crate::cost::CostTracker;
         use crate::observability::noop::NoopObserver;
         use std::collections::HashMap;
+        use zeroclaw_api::channel::ProgressEvent;
 
         let turn_id = uuid::Uuid::new_v4().to_string();
         let model_provider =
@@ -14589,6 +14821,7 @@ Let me check the result."#;
         pricing.insert("mock-provider".to_string(), model_pricing);
         let ctx = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), Arc::new(pricing));
         let mut history = vec![ChatMessage::system("test"), ChatMessage::user("hello")];
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel(16);
 
         let err = TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(
@@ -14627,7 +14860,7 @@ Let me check the result."#;
                     channel_name: "test",
                     channel_reply_target: None,
                     cancellation_token: None,
-                    on_delta: None,
+                    on_delta: Some(delta_tx),
                     shared_budget: None,
                     channel: None,
                     collected_receipts: None,
@@ -14649,6 +14882,16 @@ Let me check the result."#;
         assert!(
             err.to_string().contains("Budget exceeded"),
             "error should mention budget: {err}"
+        );
+        let mut lifecycle = Vec::new();
+        while let Ok(delta) = delta_rx.try_recv() {
+            if let StreamDelta::Lifecycle(event) = delta {
+                lifecycle.push(event);
+            }
+        }
+        assert!(
+            !lifecycle.contains(&ProgressEvent::WaitingOnModel),
+            "a budget-rejected turn never calls the provider, so it must not announce a model wait: {lifecycle:?}"
         );
     }
 
@@ -15600,6 +15843,164 @@ Let me check the result."#;
             "direct agent turns must honor runtime_profiles.*.max_tool_iterations \
              instead of the skipped AliasedAgentConfig::resolved default"
         );
+    }
+
+    #[test]
+    fn single_shot_run_routes_narration_by_interactive_mode() {
+        fn run_helper(interactive: bool) -> std::process::Output {
+            let current_exe = std::env::current_exe().expect("current test binary path");
+            std::process::Command::new(current_exe)
+                .args([
+                    "single_shot_narration_boundary_helper_8760",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(
+                    "ZEROCLAW_TEST_SINGLE_SHOT_INTERACTIVE",
+                    if interactive { "1" } else { "0" },
+                )
+                .output()
+                .expect("helper test process should run")
+        }
+
+        let non_interactive = run_helper(false);
+        let non_interactive_stderr = String::from_utf8_lossy(&non_interactive.stderr);
+        assert!(
+            non_interactive.status.success(),
+            "non-interactive helper failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            non_interactive.status.code(),
+            String::from_utf8_lossy(&non_interactive.stdout),
+            non_interactive_stderr
+        );
+        assert!(
+            !non_interactive_stderr.contains("single-shot narration sentinel"),
+            "non-interactive narration leaked to stderr:\n{non_interactive_stderr}"
+        );
+
+        let interactive = run_helper(true);
+        let interactive_stderr = String::from_utf8_lossy(&interactive.stderr);
+        assert!(
+            interactive.status.success(),
+            "interactive helper failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
+            interactive.status.code(),
+            String::from_utf8_lossy(&interactive.stdout),
+            interactive_stderr
+        );
+        assert!(
+            interactive_stderr.contains("single-shot narration sentinel"),
+            "interactive narration was not routed to stderr:\n{interactive_stderr}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "subprocess helper for single-shot stderr boundary regression"]
+    async fn single_shot_narration_boundary_helper_8760() {
+        use axum::{Json, Router, routing::post};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, RiskProfileConfig};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move |Json(_body): Json<serde_json::Value>| {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    Json(if call == 0 {
+                        serde_json::json!({
+                            "choices": [{
+                                "message": {
+                                    "content": "single-shot narration sentinel",
+                                    "tool_calls": [{
+                                        "id": "call-1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "missing_test_tool",
+                                            "arguments": "{}"
+                                        }
+                                    }]
+                                }
+                            }]
+                        })
+                    } else {
+                        serde_json::json!({
+                            "choices": [{"message": {"content": "final answer"}}]
+                        })
+                    })
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test provider");
+        let mock_addr = listener.local_addr().expect("test provider address");
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test provider serves");
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).expect("workspace directory");
+        let mut config = zeroclaw_config::schema::Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        let provider = config
+            .providers
+            .models
+            .ensure("custom", "default")
+            .expect("custom provider slot");
+        provider.api_key = Some("test-key".to_string());
+        provider.model = Some("test-model".to_string());
+        provider.uri = Some(format!("http://{mock_addr}"));
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.risk_profiles.insert(
+            "test-profile".to_string(),
+            RiskProfileConfig {
+                level: crate::security::AutonomyLevel::Full,
+                ..RiskProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let interactive = std::env::var("ZEROCLAW_TEST_SINGLE_SHOT_INTERACTIVE")
+            .expect("interactive mode env")
+            == "1";
+        let response = super::run(
+            config,
+            "test-agent",
+            Some("run a tool".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            interactive,
+            Some(tmp.path().join("session.json")),
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await
+        .expect("single-shot run should finish");
+        assert_eq!(response, "final answer");
+
+        server_handle.abort();
     }
 
     #[tokio::test]

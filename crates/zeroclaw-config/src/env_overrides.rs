@@ -254,6 +254,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walker_resolves_grok_cli_stdout_limit() {
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(
+            "ZEROCLAW_providers__models__grok_cli__default__max_acp_stdout_bytes",
+            "8388608",
+        );
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(
+            applied
+                .paths
+                .contains("providers.models.grok_cli.default.max_acp_stdout_bytes"),
+        );
+        assert_eq!(
+            config
+                .providers
+                .models
+                .grok_cli
+                .get("default")
+                .and_then(|entry| entry.max_acp_stdout_bytes),
+            Some(8_388_608)
+        );
+    }
+
+    #[tokio::test]
     async fn walker_accepts_alias_with_underscore() {
         let _guard = super::env_test_lock().await;
         let _v1 = EnvVarGuard::set(

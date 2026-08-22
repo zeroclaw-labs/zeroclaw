@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{mpsc, oneshot};
 
@@ -11,8 +12,10 @@ use tokio::sync::{mpsc, oneshot};
 /// JSON-RPC protocol version string. Used in every frame's `jsonrpc` field.
 pub const JSONRPC_VERSION: &str = "2.0";
 
-/// Prefix for server-originated outbound request IDs, disjoint from any
-/// client-issued id space.
+/// Prefix for locally originated outbound request IDs.
+///
+/// Both peers may use this prefix, so correlation is directional rather than
+/// globally unique across the socket.
 pub const OUTBOUND_ID_PREFIX: &str = "zc-out-";
 
 // ── Wire field name constants ────────────────────────────────────
@@ -28,6 +31,167 @@ pub mod field {
 }
 
 // ── Wire types ───────────────────────────────────────────────────
+
+/// A validated inbound JSON-RPC 2.0 frame.
+#[derive(Debug)]
+pub enum JsonRpcFrame {
+    Request(JsonRpcRequest),
+    Response {
+        id: Value,
+        result: Result<Value, JsonRpcError>,
+    },
+}
+
+/// Direction inferred from the members of an invalid JSON-RPC envelope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonRpcFrameErrorKind {
+    Request,
+    Response,
+    Ambiguous,
+}
+
+/// A semantic JSON-RPC envelope error that preserves its inferred direction.
+#[derive(Debug)]
+pub struct JsonRpcFrameError {
+    kind: JsonRpcFrameErrorKind,
+    request_id: Option<Value>,
+    message: String,
+}
+
+impl JsonRpcFrameError {
+    pub fn kind(&self) -> JsonRpcFrameErrorKind {
+        self.kind
+    }
+
+    /// A valid ID may be echoed only when the invalid frame is request-shaped.
+    pub fn request_id(&self) -> Option<&Value> {
+        self.request_id.as_ref()
+    }
+}
+
+impl fmt::Display for JsonRpcFrameError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for JsonRpcFrameError {}
+
+impl JsonRpcFrame {
+    /// Validate a syntactically valid JSON value while retaining the direction
+    /// needed by transports to handle malformed envelopes safely.
+    pub fn from_value(mut value: Value) -> Result<Self, JsonRpcFrameError> {
+        let (kind, request_id) = invalid_frame_context(&value);
+        let invalid = |message: &str| JsonRpcFrameError {
+            kind,
+            request_id: request_id.clone(),
+            message: message.to_string(),
+        };
+
+        let obj = value
+            .as_object_mut()
+            .ok_or_else(|| invalid("JsonRpcFrame must be a JSON object"))?;
+
+        match obj.remove(field::JSONRPC) {
+            Some(Value::String(version)) if version == JSONRPC_VERSION => {}
+            Some(Value::String(_)) => return Err(invalid("jsonrpc field must equal 2.0")),
+            Some(_) => return Err(invalid("jsonrpc field must be a string")),
+            None => return Err(invalid("missing field jsonrpc")),
+        }
+
+        let method = obj.remove(field::METHOD);
+        let params = obj.remove(field::PARAMS);
+        let id = obj.remove(field::ID);
+        let result = obj.remove(field::RESULT);
+        let error = obj.remove(field::ERROR);
+
+        if let Some(method) = method {
+            let Value::String(method) = method else {
+                return Err(invalid("method field must be a string"));
+            };
+            if result.is_some() || error.is_some() {
+                return Err(invalid("request frames cannot contain result or error"));
+            }
+            if id.as_ref().is_some_and(|id| !is_valid_jsonrpc_id(id)) {
+                return Err(invalid("id must be a string, number, or null"));
+            }
+            if params
+                .as_ref()
+                .is_some_and(|params| !params.is_object() && !params.is_array())
+            {
+                return Err(invalid("params must be an object or array when present"));
+            }
+            return Ok(Self::Request(JsonRpcRequest {
+                jsonrpc: JSONRPC_VERSION.to_string(),
+                method,
+                params: params.unwrap_or_default(),
+                id,
+            }));
+        }
+
+        if params.is_some() {
+            return Err(invalid("response frames cannot contain params"));
+        }
+        let id = id.ok_or_else(|| invalid("missing field id"))?;
+        if !is_valid_jsonrpc_id(&id) {
+            return Err(invalid("id must be a string, number, or null"));
+        }
+
+        match (result, error) {
+            (Some(result), None) => Ok(Self::Response {
+                id,
+                result: Ok(result),
+            }),
+            (None, Some(error)) => Ok(Self::Response {
+                id,
+                result: Err(
+                    serde_json::from_value(error).map_err(|error| invalid(&error.to_string()))?
+                ),
+            }),
+            (Some(_), Some(_)) => Err(invalid(
+                "response frames must not contain both result and error",
+            )),
+            (None, None) => Err(invalid(
+                "frame must contain a method or exactly one response member",
+            )),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonRpcFrame {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error;
+        Self::from_value(Value::deserialize(deserializer)?).map_err(D::Error::custom)
+    }
+}
+
+fn invalid_frame_context(value: &Value) -> (JsonRpcFrameErrorKind, Option<Value>) {
+    let Some(obj) = value.as_object() else {
+        return (JsonRpcFrameErrorKind::Ambiguous, None);
+    };
+    let has_response_member = obj.contains_key(field::RESULT) || obj.contains_key(field::ERROR);
+
+    let kind = match (obj.get(field::METHOD), has_response_member) {
+        (Some(Value::String(_)), false) => JsonRpcFrameErrorKind::Request,
+        (None, true) => JsonRpcFrameErrorKind::Response,
+        _ => JsonRpcFrameErrorKind::Ambiguous,
+    };
+    let request_id = (kind == JsonRpcFrameErrorKind::Request)
+        .then(|| {
+            obj.get(field::ID)
+                .filter(|id| is_valid_jsonrpc_id(id))
+                .cloned()
+        })
+        .flatten();
+    (kind, request_id)
+}
+
+fn is_valid_jsonrpc_id(id: &Value) -> bool {
+    matches!(id, Value::String(_) | Value::Number(_) | Value::Null)
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct JsonRpcRequest {
@@ -217,26 +381,34 @@ impl RpcOutbound {
         })
     }
 
-    /// Route an inbound JSON-RPC response to its pending caller.
+    /// Route an already validated JSON-RPC response to its pending caller.
+    /// Returns whether a matching pending request existed.
+    pub fn dispatch_validated_response(
+        &self,
+        id_str: &str,
+        result: std::result::Result<Value, JsonRpcError>,
+    ) -> bool {
+        let responder = self
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id_str);
+        let Some(tx) = responder else {
+            return false;
+        };
+        let _ = tx.send(result);
+        true
+    }
+
+    /// Route a response assembled by an internal caller.
     pub fn dispatch_response(
         &self,
         id_str: &str,
         result: Option<Value>,
         error: Option<JsonRpcError>,
     ) {
-        let responder = self
-            .pending
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(id_str);
-        if let Some(tx) = responder {
-            let payload = if let Some(err) = error {
-                Err(err)
-            } else {
-                Ok(result.unwrap_or(Value::Null))
-            };
-            let _ = tx.send(payload);
-        }
+        let result = error.map_or_else(|| Ok(result.unwrap_or(Value::Null)), Err);
+        let _ = self.dispatch_validated_response(id_str, result);
     }
 
     /// Number of in-flight outbound requests awaiting responses.
@@ -412,6 +584,199 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn frame_parses_success_response() {
+        let json = r#"{"jsonrpc":"2.0","id":"zc-out-5","result":{"answer":42}}"#;
+        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
+
+        let JsonRpcFrame::Response { id, result } = frame else {
+            panic!("expected response");
+        };
+        assert_eq!(id, json!("zc-out-5"));
+        assert_eq!(result.unwrap(), json!({"answer": 42}));
+    }
+
+    #[test]
+    fn frame_parses_error_response() {
+        let json =
+            r#"{"jsonrpc":"2.0","id":"zc-out-3","error":{"code":-32601,"message":"not found"}}"#;
+        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
+
+        let JsonRpcFrame::Response { id, result } = frame else {
+            panic!("expected response");
+        };
+        assert_eq!(id, json!("zc-out-3"));
+        assert_eq!(result.unwrap_err().code, -32601);
+    }
+
+    #[test]
+    fn frame_parses_request_with_string_id() {
+        let json = r#"{"jsonrpc":"2.0","method":"ping","params":{"v":1},"id":"client-1"}"#;
+        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
+
+        let JsonRpcFrame::Request(req) = frame else {
+            panic!("expected request");
+        };
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.params, json!({"v": 1}));
+        assert_eq!(req.id, Some(json!("client-1")));
+    }
+
+    #[test]
+    fn frame_parses_request_with_numeric_id() {
+        // Numeric IDs are valid per JSON-RPC 2.0 and must not be silently dropped.
+        let json = r#"{"jsonrpc":"2.0","method":"ping","id":42}"#;
+        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
+
+        let JsonRpcFrame::Request(req) = frame else {
+            panic!("expected request");
+        };
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.id, Some(json!(42)));
+    }
+
+    #[test]
+    fn frame_parses_notification_without_id() {
+        let json = r#"{"jsonrpc":"2.0","method":"log","params":{"msg":"hello"}}"#;
+        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
+
+        let JsonRpcFrame::Request(req) = frame else {
+            panic!("expected notification");
+        };
+        assert_eq!(req.method, "log");
+        assert_eq!(req.params, json!({"msg": "hello"}));
+        assert!(req.id.is_none());
+    }
+
+    #[test]
+    fn frame_parses_request_without_params() {
+        let json = r#"{"jsonrpc":"2.0","method":"ping","id":1}"#;
+        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
+
+        let JsonRpcFrame::Request(req) = frame else {
+            panic!("expected request");
+        };
+        assert_eq!(req.method, "ping");
+        assert_eq!(req.params, Value::Null);
+    }
+
+    #[test]
+    fn frame_explicit_null_result_is_valid_response() {
+        let json = r#"{"jsonrpc":"2.0","id":"x","result":null}"#;
+        let frame: JsonRpcFrame = serde_json::from_str(json).unwrap();
+
+        let JsonRpcFrame::Response { result, .. } = frame else {
+            panic!("expected response");
+        };
+        assert_eq!(result.unwrap(), Value::Null);
+    }
+
+    #[test]
+    fn frame_missing_jsonrpc_field_fails_deserialization() {
+        // jsonrpc field has no serde(default) so it must be present.
+        let json = r#"{"method":"ping","id":1}"#;
+        let result: Result<JsonRpcFrame, _> = serde_json::from_str(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn frame_rejects_invalid_envelopes() {
+        let invalid = [
+            r#"{"jsonrpc":"1.0","method":"ping","id":1}"#,
+            r#"{"jsonrpc":"2.0"}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"ping","id":1,"result":true}"#,
+            r#"{"jsonrpc":"2.0","method":"ping","params":true,"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"ping","params":null,"id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","result":true}"#,
+            r#"{"jsonrpc":"2.0","id":{"nested":1},"result":true}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":true,"params":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":"bad","message":"bad"}}"#,
+        ];
+
+        for json in invalid {
+            assert!(
+                serde_json::from_str::<JsonRpcFrame>(json).is_err(),
+                "invalid frame accepted: {json}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_frame_errors_preserve_direction_and_safe_request_id() {
+        let cases = [
+            (Value::Null, JsonRpcFrameErrorKind::Ambiguous, None),
+            (
+                json!({"jsonrpc":"2.0","method":null,"id":7}),
+                JsonRpcFrameErrorKind::Ambiguous,
+                None,
+            ),
+            (
+                json!({"jsonrpc":"2.0","method":"status","params":null}),
+                JsonRpcFrameErrorKind::Request,
+                None,
+            ),
+            (
+                json!({"jsonrpc":"2.0","method":null,"id":null}),
+                JsonRpcFrameErrorKind::Ambiguous,
+                None,
+            ),
+            (
+                json!({"jsonrpc":"2.0","method":null,"id":7,"result":true}),
+                JsonRpcFrameErrorKind::Ambiguous,
+                None,
+            ),
+            (
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":"zc-out-0",
+                    "result":true,
+                    "error":{"code":-1,"message":"bad"}
+                }),
+                JsonRpcFrameErrorKind::Response,
+                None,
+            ),
+            (
+                json!({"id":"zc-out-0","result":true}),
+                JsonRpcFrameErrorKind::Response,
+                None,
+            ),
+            (
+                json!({"jsonrpc":"1.0","id":"zc-out-0","result":true}),
+                JsonRpcFrameErrorKind::Response,
+                None,
+            ),
+            (
+                json!({
+                    "jsonrpc":"2.0",
+                    "id":null,
+                    "result":true,
+                    "error":{"code":-1,"message":"bad"}
+                }),
+                JsonRpcFrameErrorKind::Response,
+                None,
+            ),
+            (
+                json!({"jsonrpc":"2.0","method":"status","id":9,"result":true}),
+                JsonRpcFrameErrorKind::Ambiguous,
+                None,
+            ),
+            (
+                json!({"jsonrpc":"2.0","id":11}),
+                JsonRpcFrameErrorKind::Ambiguous,
+                None,
+            ),
+        ];
+
+        for (value, kind, request_id) in cases {
+            let error = JsonRpcFrame::from_value(value).expect_err("invalid frame");
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.request_id(), request_id.as_ref());
+        }
+    }
+
+    #[test]
     fn request_new_sets_version_and_wraps_id() {
         let req = JsonRpcRequest::new("ping", json!({"x": 1}), json!(7));
         assert_eq!(req.jsonrpc, JSONRPC_VERSION);
@@ -427,6 +792,11 @@ mod tests {
         assert_eq!(req.method, "m");
         assert_eq!(req.params, Value::Null);
         assert_eq!(req.id, Some(json!(1)));
+    }
+
+    #[test]
+    fn request_rejects_missing_method() {
+        assert!(serde_json::from_str::<JsonRpcRequest>(r#"{"jsonrpc":"2.0","id":1}"#).is_err());
     }
 
     #[test]

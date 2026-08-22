@@ -13,6 +13,64 @@ struct StartupReadiness {
     socket_ready: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum SocketStartupState {
+    #[default]
+    Pending,
+    Ready,
+    Fatal(String),
+}
+
+#[derive(Clone)]
+struct SocketStartupTracker {
+    state_tx: tokio::sync::watch::Sender<SocketStartupState>,
+}
+
+impl SocketStartupTracker {
+    fn new() -> (Self, tokio::sync::watch::Receiver<SocketStartupState>) {
+        let (state_tx, state_rx) = tokio::sync::watch::channel(SocketStartupState::Pending);
+        (Self { state_tx }, state_rx)
+    }
+
+    fn reporter(&self, inner: Option<SocketReadinessReporter>) -> Option<SocketReadinessReporter> {
+        let state_tx = self.state_tx.clone();
+        Some(SocketReadinessReporter::new(move || {
+            state_tx.send_if_modified(|state| {
+                if matches!(state, SocketStartupState::Pending) {
+                    *state = SocketStartupState::Ready;
+                    true
+                } else {
+                    false
+                }
+            });
+            if let Some(inner) = &inner {
+                inner.report_ready();
+            }
+        }))
+    }
+
+    fn record_error(&self, error: &anyhow::Error) {
+        if !is_addr_in_use(error) {
+            return;
+        }
+
+        self.state_tx.send_if_modified(|state| {
+            if matches!(state, SocketStartupState::Pending) {
+                *state = SocketStartupState::Fatal(format!("{error:#}"));
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+fn is_addr_in_use(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
+}
+
 #[derive(Clone)]
 pub struct GatewayReadinessReporter(std::sync::Arc<dyn Fn(std::net::SocketAddr) + Send + Sync>);
 
@@ -471,6 +529,7 @@ pub async fn run(
     } else {
         (None, None)
     };
+    let (socket_startup_tracker, socket_startup_rx) = SocketStartupTracker::new();
     let mut gateway_required = false;
     let mut socket_required = false;
 
@@ -721,6 +780,7 @@ pub async fn run(
         let socket_cancel = channels_cancel.clone();
         let count = socket_client_count.clone();
         let socket_readiness_tx = startup_readiness_tx.clone();
+        let startup_tracker = socket_startup_tracker.clone();
         handles.push(spawn_component_supervisor(
             "socket",
             initial_backoff,
@@ -733,9 +793,15 @@ pub async fn run(
                 let count = count.clone();
                 let (readiness_attempt, readiness_reporter) =
                     StartupReadinessAttempt::socket(socket_readiness_tx.clone());
+                let readiness_reporter = startup_tracker.reporter(readiness_reporter);
+                let startup_tracker = startup_tracker.clone();
                 async move {
                     let _readiness_attempt = readiness_attempt;
-                    start(ctx, cancel, count, readiness_reporter).await
+                    let result = start(ctx, cancel, count, readiness_reporter).await;
+                    if let Err(error) = &result {
+                        startup_tracker.record_error(error);
+                    }
+                    result
                 }
             },
         ));
@@ -839,39 +905,61 @@ pub async fn run(
         );
     }
 
-    record_daemon_started(&config, &host, port);
+    // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C), reload (in-process channel),
+    // or an unrecoverable initial socket ownership conflict.
+    let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count);
+    tokio::pin!(exit);
 
-    // Wait for shutdown (SIGINT/SIGTERM/Ctrl+C) or reload (in-process channel).
-    let exit = if startup_feedback_enabled {
-        let exit = wait_for_exit_signal(reload_rx, ephemeral, socket_client_count);
-        tokio::pin!(exit);
-        let readiness =
-            await_startup_readiness(startup_readiness_rx, gateway_required, socket_required);
-        tokio::pin!(readiness);
-
+    let startup_result = if socket_required {
+        let socket_startup = await_socket_startup(socket_startup_rx);
+        tokio::pin!(socket_startup);
         tokio::select! {
             biased;
-            exit = &mut exit => exit?,
-            readiness = &mut readiness => {
-                if let Some(readiness) = readiness
-                    && stderr_is_interactive_foreground()
-                {
-                    let mut stderr = std::io::stderr().lock();
-                    let _ = echo_daemon_ready_to_terminal(&config, readiness, &mut stderr);
-                }
-                exit.await?
-            }
+            exit = &mut exit => exit.map(Some),
+            startup = &mut socket_startup => startup.map(|()| None),
         }
     } else {
-        wait_for_exit_signal(reload_rx, ephemeral, socket_client_count).await?
+        Ok(None)
     };
-    crate::health::mark_component_error(
-        "daemon",
-        match exit {
-            DaemonExit::Shutdown => "shutdown requested",
-            DaemonExit::Reload => "reload requested",
-        },
-    );
+
+    let exit_result = match startup_result {
+        Err(error) => Err(error),
+        Ok(Some(exit)) => Ok(exit),
+        Ok(None) if startup_feedback_enabled => {
+            record_daemon_started(&config, &host, port);
+            let readiness =
+                await_startup_readiness(startup_readiness_rx, gateway_required, socket_required);
+            tokio::pin!(readiness);
+
+            tokio::select! {
+                biased;
+                exit = &mut exit => exit,
+                readiness = &mut readiness => {
+                    if let Some(readiness) = readiness
+                        && stderr_is_interactive_foreground()
+                    {
+                        let mut stderr = std::io::stderr().lock();
+                        let _ = echo_daemon_ready_to_terminal(&config, readiness, &mut stderr);
+                    }
+                    exit.await
+                }
+            }
+        }
+        Ok(None) => {
+            record_daemon_started(&config, &host, port);
+            exit.await
+        }
+    };
+    match &exit_result {
+        Ok(exit) => crate::health::mark_component_error(
+            "daemon",
+            match exit {
+                DaemonExit::Shutdown => "shutdown requested",
+                DaemonExit::Reload => "reload requested",
+            },
+        ),
+        Err(error) => crate::health::mark_component_error("daemon", format!("{error:#}")),
+    }
 
     channels_cancel.cancel();
 
@@ -903,7 +991,7 @@ pub async fn run(
         libc::malloc_trim(0);
     }
 
-    Ok(exit)
+    exit_result
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
@@ -946,6 +1034,23 @@ async fn await_startup_readiness(
             .ok()
             .map(|state| *state),
         None => Some(StartupReadiness::default()),
+    }
+}
+
+async fn await_socket_startup(
+    mut state_rx: tokio::sync::watch::Receiver<SocketStartupState>,
+) -> Result<()> {
+    match state_rx
+        .wait_for(|state| !matches!(state, SocketStartupState::Pending))
+        .await
+        .map(|state| state.clone())
+    {
+        Ok(SocketStartupState::Ready) => Ok(()),
+        Ok(SocketStartupState::Fatal(message)) => {
+            Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, message).into())
+        }
+        Ok(SocketStartupState::Pending) => unreachable!("wait_for excludes pending state"),
+        Err(_) => Ok(()),
     }
 }
 
@@ -1177,53 +1282,75 @@ type HeartbeatMcpRegistryTestHook = std::sync::Arc<
 static HEARTBEAT_MCP_REGISTRY_TEST_HOOK: std::sync::Mutex<Option<HeartbeatMcpRegistryTestHook>> =
     std::sync::Mutex::new(None);
 
-/// Serializes daemon heartbeat MCP registry tests that can observe
-/// the process-global hook. Hook-using tests and tests that need the
-/// real connection path must both hold this mutex; otherwise a
-/// real-path test can consume another test's injected registry.
+/// Serializes the regression tests for the daemon heartbeat MCP
+/// registry hook. The hook itself is process-global, so a
+/// test that installs the hook, runs assertions, and then resets
+/// cannot safely interleave with another test doing the same: a
+/// concurrent `reset_heartbeat_mcp_registry_test_hook` would clear
+/// the hook before the first test observes it, and a concurrent
+/// `set_heartbeat_mcp_registry_test_hook` from another test would
+/// swap in a hook whose counter Arc belongs to the other test. To
+/// keep the regression tests deterministic, every test that calls the
+/// hookable connection helper takes this mutex for the entire duration
+/// of that work. Hook-installing tests use
+/// [`HeartbeatMcpRegistryTestHookGuard`]; real-connection tests take
+/// the lock without installing a hook.
 #[cfg(test)]
-static HEARTBEAT_MCP_REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static HEARTBEAT_MCP_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[cfg(test)]
-fn lock_unpoisoned_test_mutex<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+async fn lock_heartbeat_mcp_registry_test_state() -> tokio::sync::MutexGuard<'static, ()> {
+    HEARTBEAT_MCP_REGISTRY_TEST_LOCK.lock().await
 }
 
-/// RAII guard that reserves the process-global heartbeat registry
-/// hook boundary for either an injected-hook test or a real-path
-/// test. Construction takes the global serial lock and sets the hook
-/// to the requested state. `Drop` clears the hook before releasing
-/// the serial lock.
+/// RAII guard that ties a test-only MCP registry hook installation
+/// to the global serialising lock. Construction takes the global
+/// mutex, installs the supplied hook, and returns a guard whose
+/// `Drop` clears the hook and releases the mutex. Tests that need
+/// the MCP registry hook to be observed by the daemon MUST hold
+/// this guard for the duration of the work that depends on it;
+/// otherwise a parallel test could clobber the hook (or reset it
+/// while the current test is still running) and the assertion would
+/// see a stale or absent hook.
 #[cfg(test)]
 pub(crate) struct HeartbeatMcpRegistryTestHookGuard {
-    serial_lock: Option<std::sync::MutexGuard<'static, ()>>,
+    serial_lock: Option<tokio::sync::MutexGuard<'static, ()>>,
 }
 
 #[cfg(test)]
 impl HeartbeatMcpRegistryTestHookGuard {
-    fn reserve(hook: Option<HeartbeatMcpRegistryTestHook>) -> Self {
-        let serial_lock = lock_unpoisoned_test_mutex(&HEARTBEAT_MCP_REGISTRY_TEST_LOCK);
-        *lock_unpoisoned_test_mutex(&HEARTBEAT_MCP_REGISTRY_TEST_HOOK) = hook;
+    /// Install `hook` under the global serialising lock and return a
+    /// guard whose `Drop` clears the hook and releases the lock.
+    async fn install(hook: HeartbeatMcpRegistryTestHook) -> Self {
+        // Hold the serial lock before mutating the hook global so a
+        // concurrent test cannot observe a torn state (hook swapped
+        // halfway, or reset between this test's set and use).
+        let serial_lock = lock_heartbeat_mcp_registry_test_state().await;
+        let mut guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
+            .lock()
+            .expect("heartbeat MCP registry test hook lock should not be poisoned");
+        *guard = Some(hook);
+        // Drop the hook global mutex immediately — the serial lock
+        // is what prevents another test from racing with us now, and
+        // the hook global only needs its inner value read once per
+        // helper invocation.
+        drop(guard);
         Self {
             serial_lock: Some(serial_lock),
         }
-    }
-
-    fn install(hook: HeartbeatMcpRegistryTestHook) -> Self {
-        Self::reserve(Some(hook))
-    }
-
-    fn without_hook() -> Self {
-        Self::reserve(None)
     }
 }
 
 #[cfg(test)]
 impl Drop for HeartbeatMcpRegistryTestHookGuard {
     fn drop(&mut self) {
-        *lock_unpoisoned_test_mutex(&HEARTBEAT_MCP_REGISTRY_TEST_HOOK) = None;
+        // Clear the hook first (still under the serial lock taken by
+        // `install`) so the next test sees a clean slate.
+        if let Ok(mut guard) = HEARTBEAT_MCP_REGISTRY_TEST_HOOK.lock() {
+            *guard = None;
+        }
+        // Releasing the serial lock last allows the next waiting
+        // test to proceed only after our hook is gone.
         drop(self.serial_lock.take());
     }
 }
@@ -1239,20 +1366,10 @@ impl Drop for HeartbeatMcpRegistryTestHookGuard {
 /// Spinning off a detached future that outlives the guard will leave
 /// the hook pointing at a stale closure and is not supported.
 #[cfg(test)]
-pub(crate) fn set_heartbeat_mcp_registry_test_hook(
+pub(crate) async fn set_heartbeat_mcp_registry_test_hook(
     hook: HeartbeatMcpRegistryTestHook,
 ) -> HeartbeatMcpRegistryTestHookGuard {
-    HeartbeatMcpRegistryTestHookGuard::install(hook)
-}
-
-/// Reserve the heartbeat registry hook boundary with no hook installed.
-///
-/// Real-connection tests must hold this guard while calling
-/// `connect_heartbeat_mcp_registry` so a concurrent injected-hook test
-/// cannot replace their connection path.
-#[cfg(test)]
-fn heartbeat_mcp_registry_without_test_hook() -> HeartbeatMcpRegistryTestHookGuard {
-    HeartbeatMcpRegistryTestHookGuard::without_hook()
+    HeartbeatMcpRegistryTestHookGuard::install(hook).await
 }
 
 /// Snapshot the current test hook (cloned). Returns `None` when no
@@ -1260,7 +1377,9 @@ fn heartbeat_mcp_registry_without_test_hook() -> HeartbeatMcpRegistryTestHookGua
 /// during the registry-construction phase of the heartbeat worker.
 #[cfg(test)]
 fn current_heartbeat_mcp_registry_test_hook() -> Option<HeartbeatMcpRegistryTestHook> {
-    let guard = lock_unpoisoned_test_mutex(&HEARTBEAT_MCP_REGISTRY_TEST_HOOK);
+    let guard = HEARTBEAT_MCP_REGISTRY_TEST_HOOK
+        .lock()
+        .expect("heartbeat MCP registry test hook lock should not be poisoned");
     guard.as_ref().cloned()
 }
 
@@ -2352,32 +2471,6 @@ mod tests {
         config
     }
 
-    #[test]
-    fn heartbeat_test_mutex_recovers_after_poisoning() {
-        let mutex = std::sync::Arc::new(std::sync::Mutex::new(()));
-        let mutex_for_thread = std::sync::Arc::clone(&mutex);
-
-        let panic_result = std::thread::spawn(move || {
-            let _guard = mutex_for_thread.lock().expect("local mutex starts healthy");
-            panic!("poison the local test mutex");
-        })
-        .join();
-
-        assert!(panic_result.is_err(), "worker thread must panic");
-        let _recovered = lock_unpoisoned_test_mutex(&mutex);
-    }
-
-    #[test]
-    fn heartbeat_no_hook_guard_reserves_shared_test_boundary() {
-        let _guard = heartbeat_mcp_registry_without_test_hook();
-
-        assert!(current_heartbeat_mcp_registry_test_hook().is_none());
-        assert!(matches!(
-            HEARTBEAT_MCP_REGISTRY_TEST_LOCK.try_lock(),
-            Err(std::sync::TryLockError::WouldBlock)
-        ));
-    }
-
     fn add_agent_with_workspace(config: &mut Config, agent_alias: &str, workspace_dir: PathBuf) {
         let agent = zeroclaw_config::schema::AliasedAgentConfig {
             workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
@@ -3415,6 +3508,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn initial_socket_addr_in_use_fails_daemon_startup() {
+        use std::io;
+        use tokio::time::{Duration, timeout};
+
+        for startup_feedback_enabled in [false, true] {
+            let tmp = TempDir::new().unwrap();
+            let config = test_config(&tmp);
+
+            let mut registry = DaemonRegistry::new();
+            registry.register_socket(Box::new(move |_ctx, _cancel, _client_count, _readiness| {
+                Box::pin(async move {
+                    Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "local IPC endpoint lifecycle is already owned",
+                    )
+                    .into())
+                })
+            }));
+
+            let error = timeout(
+                Duration::from_secs(2),
+                run(
+                    config,
+                    "127.0.0.1".to_string(),
+                    0,
+                    registry,
+                    false,
+                    startup_feedback_enabled,
+                ),
+            )
+            .await
+            .expect("initial socket ownership conflict should fail daemon startup promptly")
+            .expect_err("daemon startup should fail on an initially owned socket");
+
+            assert!(
+                error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::AddrInUse),
+                "daemon should return the startup socket ownership error with startup_feedback_enabled={startup_feedback_enabled}, got: {error:#}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn socket_addr_in_use_after_readiness_stays_supervised() {
+        use std::io;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::time::{Duration, timeout};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.reliability.channel_initial_backoff_secs = 1;
+        config.reliability.channel_max_backoff_secs = 1;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_socket = attempts.clone();
+
+        let mut registry = DaemonRegistry::new();
+        registry.register_socket(Box::new(move |_ctx, _cancel, client_count, readiness| {
+            let attempts = attempts_for_socket.clone();
+            Box::pin(async move {
+                let attempt = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if let Some(readiness) = readiness {
+                    readiness.report_ready();
+                }
+                if attempt == 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "socket failed after it was already serving",
+                    )
+                    .into());
+                }
+
+                client_count.store(1, Ordering::SeqCst);
+                let client_count_for_drop = client_count.clone();
+                zeroclaw_spawn::spawn!(async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    client_count_for_drop.store(0, Ordering::SeqCst);
+                });
+                std::future::pending::<Result<()>>().await
+            })
+        }));
+
+        let exit = timeout(
+            Duration::from_secs(8),
+            run(config, "127.0.0.1".to_string(), 0, registry, true, true),
+        )
+        .await
+        .expect("daemon should remain supervised after a post-readiness socket error")
+        .expect("daemon run should succeed after supervised socket restart");
+
+        assert_eq!(exit, DaemonExit::Shutdown);
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 2,
+            "socket supervisor should retry after a post-readiness AddrInUse"
+        );
+    }
+
+    #[tokio::test]
     async fn scheduler_cooperative_shutdown_observed_through_daemon_reload() {
         use tokio::time::{Duration, timeout};
 
@@ -3781,7 +3974,8 @@ mod tests {
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&shared_for_hook_clone)
-            }));
+            }))
+            .await;
 
         // (a) Simulate worker boot: the daemon calls
         //     `connect_heartbeat_mcp_registry` exactly once.
@@ -3911,7 +4105,8 @@ mod tests {
         use std::sync::Arc;
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
 
-        let _test_hook_guard = heartbeat_mcp_registry_without_test_hook();
+        let _test_state_lock = lock_heartbeat_mcp_registry_test_state().await;
+
         // `pgrep -f` matches the full command line. The
         // `@modelcontextprotocol/server-filesystem` package runs as
         // a node script whose absolute path contains this literal
@@ -4121,7 +4316,8 @@ mod tests {
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&shared_for_hook_clone)
-            }));
+            }))
+            .await;
 
         let worker_shared = connect_heartbeat_mcp_registry(&config, agent_alias, None)
             .await
@@ -4202,7 +4398,8 @@ mod tests {
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&shared_for_hook_clone)
-            }));
+            }))
+            .await;
 
         // ── Worker boot: connect ONCE ──────────────────────────────
         // Mirrors `run_heartbeat_worker`'s pre-loop call. The fix
@@ -4307,7 +4504,8 @@ mod tests {
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&shared_for_hook_clone)
-            }));
+            }))
+            .await;
 
         // 5 invocations → counter must reach 5. A buggy helper that
         // memoised the first call's Arc would leave the counter at 1,
@@ -4524,7 +4722,8 @@ mod tests {
                     .unwrap()
                     .push(servers.iter().map(|s| s.name.clone()).collect());
                 std::sync::Arc::clone(&empty_registry)
-            }));
+            }))
+            .await;
 
         const TICKS: usize = 5;
         for tick in 0..TICKS {
@@ -4564,7 +4763,8 @@ mod tests {
     async fn connect_heartbeat_mcp_registry_returns_none_when_all_healthy() {
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig};
 
-        let _test_hook_guard = heartbeat_mcp_registry_without_test_hook();
+        let _test_state_lock = lock_heartbeat_mcp_registry_test_state().await;
+
         let a_handle = make_test_server_handle("server-a");
         let current = std::sync::Arc::new(crate::tools::McpRegistry::for_test_with_server_handles(
             vec![("server-a".to_string(), a_handle)],
@@ -4813,44 +5013,33 @@ mod tests {
     /// reconnect branch from the production helper will fail this
     /// test (not silently let the dead child leak across ticks).
     ///
-    /// Unix-only: the fixture writes a Bash script, chmods it via
-    /// `PermissionsExt`, and invokes `kill`. The test is gated under
-    /// `#[cfg(unix)]` so the repository's Windows `cargo test
-    /// --no-run` target for `zeroclaw-runtime` stays green.
+    /// Unix-only: the fixture symlinks to a checked-in stdio MCP server
+    /// script and invokes `kill`. The test is gated under `#[cfg(unix)]`
+    /// so the repository's Windows `cargo test --no-run` target for
+    /// `zeroclaw-runtime` stays green.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn heartbeat_worker_reconnects_after_stdio_child_exits() {
-        use std::os::unix::fs::PermissionsExt;
         use zeroclaw_config::schema::{AliasedAgentConfig, McpBundleConfig, McpServerConfig};
 
-        let _test_hook_guard = heartbeat_mcp_registry_without_test_hook();
+        // This test must not observe a hook installed by a concurrent
+        // heartbeat-registry regression test while it connects the real child.
+        let _test_state_lock = lock_heartbeat_mcp_registry_test_state().await;
         let tmp = TempDir::new().unwrap();
 
-        // ── 1. Build a tiny stdio MCP server script ──────────────────────
+        // ── 1. Point at a tiny stdio MCP server script ───────────────────
+        //    Symlink to a checked-in fixture instead of writing a fresh
+        //    executable inside this already-multithreaded test process:
+        //    a concurrently forked child can inherit the write
+        //    descriptor and make the subsequent exec fail with
+        //    ETXTBSY. Creating a symlink does not open an executable
+        //    for writing, so it removes that race.
         let pid_path = tmp.path().join("pid");
         let server_path = tmp.path().join("mcp-server.sh");
-        std::fs::write(
-        &server_path,
-        format!(
-            r#"#!/usr/bin/env bash
-echo $$ > "{}"
-while IFS= read -r line; do
-  case "$line" in
-    *'"method":"initialize"'*)
-      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":"2024-11-05","capabilities":{{"tools":{{}}}},"serverInfo":{{"name":"reconnect-test","version":"0.1.0"}}}}}}'
-      ;;
-    *'"method":"tools/list"'*)
-      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"tools":[]}}}}'
-      ;;
-  esac
-done
-"#,
-            pid_path.display(),
-        ),
-    )
-    .expect("write server script");
-        std::fs::set_permissions(&server_path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod +x");
+        let fixture_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mcp-server.sh");
+        std::os::unix::fs::symlink(&fixture_path, &server_path)
+            .expect("symlink mcp server fixture");
 
         // ── 2. Build a config that grants this stdio server ─────────────
         let mut config = test_config(&tmp);
@@ -4979,7 +5168,8 @@ done
             set_heartbeat_mcp_registry_test_hook(Arc::new(move |_alias, _servers| {
                 construct_count_for_hook.fetch_add(1, Ordering::SeqCst);
                 Arc::clone(&complete_registry_for_hook)
-            }));
+            }))
+            .await;
 
         // (1) Worker boot — single pre-loop call.
         let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =
@@ -5156,7 +5346,8 @@ done
                     .expect("returned_ptrs mutex not poisoned")
                     .push(ptr);
                 next
-            }));
+            }))
+            .await;
 
         // (1) Worker boot — single pre-loop call. Hook returns the
         //     EMPTY registry (call #0).
@@ -5445,7 +5636,8 @@ done
                     );
                 }
                 seq.remove(0)
-            }));
+            }))
+            .await;
 
         // Boot — hook call #0 returns the empty registry.
         let mut shared_mcp_registry: Option<Arc<crate::tools::McpRegistry>> =

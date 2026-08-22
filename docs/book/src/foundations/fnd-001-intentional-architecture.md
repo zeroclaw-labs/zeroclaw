@@ -1,9 +1,9 @@
 # FND-001: Intentional Architecture: ZeroClaw Microkernel Transition
 
-> Starting v0.7.0 · Type: Architecture · Rev. 4
+> Starting v0.7.0 · Type: Architecture · Rev. 10
 >
-> **Canonical reference** · Ratified by the team · Rev. 4
-> Discussion thread and full revision history: [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)
+> **Canonical reference** · Ratified by the team · Rev. 10
+> Original RFC discussion and draft history: [#5574](https://github.com/zeroclaw-labs/zeroclaw/issues/5574)
 
 ---
 
@@ -37,6 +37,18 @@
 | 3 | 2026-04-10 | Terminology correction per implementation feedback from PR #5559: "kernel" → "runtime" for the agent orchestration layer throughout; "kernel" now refers specifically to the irreducible foundation (`--no-default-features` build); §4.1 updated to describe the explicit two-layer architecture (foundation + runtime); §4.2–§4.3 dependency diagram and component map updated to show `zeroclaw-runtime`; Phase 2 renamed from "The Kernel" to "The Runtime"; binary size targets reframed as aspirational north stars with measured progress tracking rather than hard gates; §7 updated with actual Phase 1 measurement (6.6 MB foundation build) and explicit note that architectural decomposition enables optimization but optimization is a dedicated second pass |
 | 4 | 2026-06-02 | Updated §5.2 to target `wasm32-wasip2` to enable WIT files. Updated Phase 2 §D2 to replace Extism with wasmtime to enable ARM32 targets and WIT files |
 | 5 | 2026-06-29 | Amended §4.4.2 to replace the single always-on `plugins-wasm` row with the three-flag execution-backend taxonomy (`plugins-wasm` host plus `plugins-wasm-cranelift` / `plugins-wasm-pulley` backends), completing the RFC #6943 deconfliction |
+| 6 | 2026-06-30 | Removed the desktop installer from the release-artifact matrix, target architecture, roadmap, and success criteria ([#8544](https://github.com/zeroclaw-labs/zeroclaw/pull/8544)) |
+| 7 | 2026-07-04 | Restored the desktop installer and its release, architecture, roadmap, and success-criteria obligations ([#8565](https://github.com/zeroclaw-labs/zeroclaw/pull/8565)) |
+| 8 | 2026-07-20 | Made root `AGENTS.md` the compact project contract, routed maintained detail through the architecture map and coding-agent guidelines, and prevented crate policy from weakening project safety, privacy, or authorization requirements ([#9050](https://github.com/zeroclaw-labs/zeroclaw/pull/9050)) |
+| 9 | 2026-08-11 | Removed WATI from the current-state gateway inventory and v0.9.0 plugin-migration target after the channel was retired in [#9571](https://github.com/zeroclaw-labs/zeroclaw/pull/9571); the generic webhook/plugin boundary remains unchanged |
+| 10 | 2026-08-19 | Removed `aardvark-sys` and `zeroclaw-robot-kit` from the workspace-inheritance and independent-release guidance after both crates were retired in [#9853](https://github.com/zeroclaw-labs/zeroclaw/pull/9853); the published 0.1.0 releases stay on crates.io and are unaffected |
+
+Revision numbers in this canonical document follow the ratified repository
+history. The linked RFC issue also labels a configuration-discipline edit as
+draft Rev. 4, but that text was not included when this foundation document was
+ratified in [#5911](https://github.com/zeroclaw-labs/zeroclaw/pull/5911).
+Current configuration authority and environment-override behavior are documented
+in [Config lifecycle](../architecture/config-lifecycle.md) and [Environment Variables](../reference/env-vars.md).
 
 ---
 
@@ -108,7 +120,7 @@ The entire ZeroClaw codebase currently lives in a single Rust crate. This means:
 
 - A Telegram channel and the core agent loop are compiled from the same source tree whether you use Telegram or not
 - The web dashboard (a full React application) is embedded in the binary using `rust-embed`, making every binary include the web UI even for users who only ever use the CLI
-- The gateway HTTP server contains webhook handlers for WhatsApp, WATI, Linq, Nextcloud Talk, and Gmail, meaning specific channel integrations are baked into the web server
+- The gateway HTTP server contains webhook handlers for WhatsApp, Linq, Nextcloud Talk, and Gmail, meaning specific channel integrations are baked into the web server
 - Every one of the 70+ tools is compiled into the binary, regardless of which tools a user will ever call
 - The only mechanism for excluding code is a Cargo feature flag, which requires users to have a Rust development environment and recompile from source
 
@@ -123,7 +135,7 @@ These are measured facts from the current codebase, not estimates:
 | File | Lines | What It Does | What It Should Do |
 |---|---|---|---|
 | `src/agent/loop_.rs` | ~9,500 | Tool call parsing, streaming, history, cost tracking, model routing, memory, credential scrubbing, context building | Orchestrate a single agent turn |
-| `src/gateway/mod.rs` | ~2,260 | Web server + React app server + WhatsApp webhooks + WATI webhooks + Linq webhooks + Nextcloud webhooks + Gmail webhooks + pairing + rate limiting + WebAuthn | Serve the web dashboard API |
+| `src/gateway/mod.rs` | ~2,260 | Web server + React app server + WhatsApp webhooks + Linq webhooks + Nextcloud webhooks + Gmail webhooks + pairing + rate limiting + WebAuthn | Serve the web dashboard API |
 | `src/providers/mod.rs` | ~3,750 | Factory + 40+ provider implementations + OAuth flows + credential resolution + error scrubbing | Route to a provider |
 | `src/tools/mod.rs` | `all_tools_with_runtime()` at L387–L1066 | Instantiate all 70+ tools unconditionally | Register the tools the user configured |
 
@@ -268,12 +280,11 @@ All application crates, the kernel, the gateway, tool plugin crates, channel plu
 - It reflects ZeroClaw's identity as a **product**, not a library ecosystem
 - The WIT interface version, not the Rust crate version, is the actual plugin ABI contract (see §5.2)
 
-Three crate classes are intentionally excluded from workspace inheritance and maintain independent versions on their own cadence:
+Two crate classes are intentionally excluded from workspace inheritance and maintain independent versions on their own cadence:
 
 | Crate | Reason for independence |
 |---|---|
 | `zeroclaw-api` | Starts at `0.1.0`; its `1.0.0` release is a formal milestone deliverable of v1.0.0, signalling a stable Rust trait surface for plugin SDK authors |
-| `aardvark-sys`, `zeroclaw-robot-kit` | Hardware library crates with their own user audiences and maintenance cadences; not application components |
 | WIT interface files (`wit/*.wit`) | Versioned via `@since` and `@unstable` annotations per the WASI component model spec; these are the primary plugin ABI contract and are independent of Cargo semver entirely |
 
 ---
@@ -306,7 +317,7 @@ Stability tiers are **promoted, never demoted** through a deliberate team decisi
 
 ##### Release automation
 
-Releases use [`release-plz`](https://release-plz.eplant.org/), which opens a release PR on push to `master`, bumps the workspace version, and generates a changelog from conventional commit titles. `release-plz` natively understands workspace inheritance and handles the crate publication order automatically. Crates with independent versions (`zeroclaw-api`, hardware library crates) are managed separately using the same tool's per-crate configuration.
+Releases use [`release-plz`](https://release-plz.eplant.org/), which opens a release PR on push to `master`, bumps the workspace version, and generates a changelog from conventional commit titles. `release-plz` natively understands workspace inheritance and handles the crate publication order automatically. The independently versioned `zeroclaw-api` crate is managed separately using the same tool's per-crate configuration.
 
 #### 4.4.2 Release Artifacts
 
@@ -394,7 +405,6 @@ Current (wrong):
           ├── Web UI server (serves React app)
           ├── REST/WS/SSE API
           ├── WhatsApp webhook handler  ← this is a channel, not a web server
-          ├── WATI webhook handler      ← this is a channel, not a web server
           ├── Linq webhook handler      ← this is a channel, not a web server
           ├── Nextcloud webhook handler ← this is a channel, not a web server
           └── Gmail push handler        ← this is a channel, not a web server
@@ -685,7 +695,7 @@ Move `src/gateway/` to a new `crates/zeroclaw-gw/` crate with its own binary. It
 
 ##### D4: Migrate channel webhook handlers out of the gateway
 
-The WhatsApp, WATI, Linq, Nextcloud Talk, and Gmail webhook handlers currently in `gateway/mod.rs` move to their respective channel plugins. The gateway provides a generic webhook registration API: a channel plugin, when loaded, registers its webhook path prefix and its handler function. The gateway routes incoming webhooks to the registered handler. The gateway no longer knows about WhatsApp.
+The WhatsApp, Linq, Nextcloud Talk, and Gmail webhook handlers currently in `gateway/mod.rs` move to their respective channel plugins. The gateway provides a generic webhook registration API: a channel plugin, when loaded, registers its webhook path prefix and its handler function. The gateway routes incoming webhooks to the registered handler. The gateway no longer knows about WhatsApp.
 
 ##### D5: Formalize the Tauri sidecar relationship
 
@@ -696,7 +706,7 @@ Update `apps/tauri/` to bundle `zeroclaw-gw` as a Tauri sidecar binary. The Taur
 - Kernel binary (release) does not contain any web assets or HTTP server code
 - `zeroclaw-gw` starts, connects to the kernel via IPC, and serves the web dashboard
 - Removing `zeroclaw-gw` does not break the kernel or any channel plugins
-- WhatsApp, WATI, Linq, Nextcloud Talk, and Gmail channel code has moved to plugin crates
+- WhatsApp, Linq, Nextcloud Talk, and Gmail channel code has moved to plugin crates
 - Tauri desktop app bundles and starts both binaries correctly
 
 ---
