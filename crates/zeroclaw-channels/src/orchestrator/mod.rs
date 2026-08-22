@@ -2913,6 +2913,26 @@ fn build_scope_override_summary(
     )
 }
 
+fn is_bare_model_picker_command(content: &str) -> bool {
+    let mut parts = content.split_whitespace();
+    let Some(command) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+    let mut command_parts = command.split('@');
+    let base = command_parts.next().unwrap_or_default();
+    let bot_name = command_parts.next();
+    command_parts.next().is_none()
+        && base.eq_ignore_ascii_case("/model")
+        && bot_name.is_none_or(|name| !name.is_empty())
+}
+
+fn scrub_native_model_picker_error(error: &anyhow::Error) -> String {
+    zeroclaw_runtime::security::scrub(&error.to_string())
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -2929,6 +2949,48 @@ async fn handle_runtime_command_if_needed(
     let sender_key = conversation_history_key(msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
+
+    if command == ChannelRuntimeCommand::ShowModel && is_bare_model_picker_command(&msg.content) {
+        let request = zeroclaw_api::channel::ChannelModelPickerRequest {
+            requesting_user: msg.sender.clone(),
+            requesting_user_id: msg.platform_sender_id.clone().unwrap_or_default(),
+            reply_target: msg.reply_target.clone(),
+            thread_ts: msg.thread_ts.clone(),
+            channel_alias: msg
+                .channel_alias
+                .clone()
+                .unwrap_or_else(|| msg.channel.clone()),
+            owner_agent_alias: ctx.agent_alias.as_str().to_string(),
+            current_model_provider: current.model_provider.clone(),
+            current_model: current.model.clone(),
+            model_routes: ctx
+                .model_routes
+                .iter()
+                .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
+                    hint: route.hint.clone(),
+                    model_provider: route.model_provider.clone(),
+                    model: route.model.clone(),
+                })
+                .collect(),
+        };
+        match channel.present_model_picker(&request).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(err) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "channel": msg.channel.as_str(),
+                            "channel_alias": request.channel_alias.as_str(),
+                            "error": scrub_native_model_picker_error(&err),
+                        })),
+                    "Native model picker failed; falling back to text response"
+                );
+            }
+        }
+    }
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
@@ -14343,6 +14405,54 @@ temperature = 0.3
         name: &'static str,
     }
 
+    #[derive(Default)]
+    struct ModelPickerRecordingChannel {
+        requests: tokio::sync::Mutex<Vec<zeroclaw_api::channel::ChannelModelPickerRequest>>,
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ModelPickerRecordingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Telegram,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "main"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for ModelPickerRecordingChannel {
+        fn name(&self) -> &str {
+            "telegram"
+        }
+
+        async fn send(&self, message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn present_model_picker(
+            &self,
+            request: &zeroclaw_api::channel::ChannelModelPickerRequest,
+        ) -> anyhow::Result<bool> {
+            self.requests.lock().await.push(request.clone());
+            Ok(true)
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for NamedMockChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -25403,6 +25513,26 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(parse_runtime_command("telegram", "/clear all"), None);
     }
 
+    #[test]
+    fn native_model_picker_is_limited_to_the_bare_model_command() {
+        assert!(is_bare_model_picker_command("/model"));
+        assert!(is_bare_model_picker_command(" /MODEL@zeroclaw_bot "));
+        assert!(!is_bare_model_picker_command("/model fast"));
+        assert!(!is_bare_model_picker_command("/model --help"));
+        assert!(!is_bare_model_picker_command("/models"));
+    }
+
+    #[test]
+    fn native_model_picker_errors_are_scrubbed_before_logging() {
+        let error = anyhow::Error::msg(
+            "request failed for https://api.telegram.org/bot123456:ABC-def_GHI/sendMessage",
+        );
+        let scrubbed = scrub_native_model_picker_error(&error);
+
+        assert!(scrubbed.contains("[REDACTED_BOT_TOKEN]"));
+        assert!(!scrubbed.contains("123456:ABC-def_GHI"));
+    }
+
     // Build a ChannelRuntimeContext with a Config that has peer_groups
     // populated for the agent-scope authorization tests below. Mirrors
     // `channel_runtime_context_for_defaults_test` but lets the caller
@@ -25773,6 +25903,423 @@ BTC is currently around $65,000 based on latest tool output."#
             content: "/model --agent gpt-4o".into(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn bare_model_picker_command_uses_current_session_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "message-7".into(),
+            sender: "test_user".into(),
+            platform_sender_id: Some("123".into()),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            thread_ts: Some("thread-9".into()),
+            content: "/model".into(),
+            ..Default::default()
+        };
+        let sender_key = conversation_history_key(&msg);
+        ctx.route_overrides.lock().unwrap().insert(
+            sender_key,
+            ChannelRouteSelection {
+                model_provider: "anthropic.work".into(),
+                model: "claude-sonnet-4-5".into(),
+                api_key: None,
+            },
+        );
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let handled = handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await;
+
+        assert!(handled);
+        assert!(channel_impl.sent_messages.lock().await.is_empty());
+        let requests = channel_impl.requests.lock().await;
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].requesting_user, "test_user");
+        assert_eq!(requests[0].requesting_user_id, "123");
+        assert_eq!(requests[0].reply_target, "chat-42");
+        assert_eq!(requests[0].thread_ts.as_deref(), Some("thread-9"));
+        assert_eq!(requests[0].channel_alias, "main");
+        assert_eq!(requests[0].owner_agent_alias, "agentX");
+        assert_eq!(requests[0].current_model_provider, "anthropic.work");
+        assert_eq!(requests[0].current_model, "claude-sonnet-4-5");
+        assert_eq!(requests[0].model_routes.len(), 1);
+        assert_eq!(requests[0].model_routes[0].hint, "fast");
+        assert_eq!(requests[0].model_routes[0].model_provider, "anthropic.work");
+        assert_eq!(requests[0].model_routes[0].model, "claude-sonnet-4-5");
+    }
+
+    #[tokio::test]
+    async fn model_picker_selection_command_keeps_existing_session_semantics() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "message-8".into(),
+            sender: "test_user".into(),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model fast".into(),
+            ..Default::default()
+        };
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let handled = handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await;
+
+        assert!(handled);
+        assert!(channel_impl.requests.lock().await.is_empty());
+        assert_eq!(channel_impl.sent_messages.lock().await.len(), 1);
+        let route = ctx
+            .route_overrides
+            .lock()
+            .unwrap()
+            .get(&conversation_history_key(&msg))
+            .cloned()
+            .expect("selection remains a per-sender session override");
+        assert_eq!(route.model_provider, "anthropic.work");
+        assert_eq!(route.model, "claude-sonnet-4-5");
+    }
+
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn telegram_model_picker_username_change_updates_only_current_sender_session() {
+        use wiremock::matchers::{body_partial_json, method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn wait_for_request(server: &MockServer, suffix: &str) {
+            for _ in 0..200 {
+                if server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.url.path().ends_with(suffix))
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("timed out waiting for Telegram request ending in {suffix}");
+        }
+
+        fn callback_update(
+            update_id: i64,
+            callback_id: &str,
+            callback_data: &str,
+        ) -> serde_json::Value {
+            serde_json::json!({
+                "update_id": update_id,
+                "callback_query": {
+                    "id": callback_id,
+                    "from": { "id": 123, "username": "renamed_user" },
+                    "message": {
+                        "message_id": 77,
+                        "message_thread_id": 9,
+                        "chat": { "id": -10042 }
+                    },
+                    "data": callback_data,
+                }
+            })
+        }
+
+        async fn mount_listener_mocks(
+            server: &MockServer,
+            update: serde_json::Value,
+            edit_path: &str,
+        ) {
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/getUpdates$"))
+                .and(body_partial_json(serde_json::json!({ "timeout": 0 })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": []
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/getUpdates$"))
+                .and(body_partial_json(serde_json::json!({ "timeout": 30 })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": [update]
+                })))
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/setMyCommands$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(edit_path))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": true
+                })))
+                .expect(1)
+                .mount(server)
+                .await;
+        }
+
+        fn callback_for_button(
+            requests: &[wiremock::Request],
+            endpoint: &str,
+            label: &str,
+        ) -> String {
+            let request = requests
+                .iter()
+                .rev()
+                .find(|request| request.url.path().ends_with(endpoint))
+                .expect("Telegram keyboard edit request");
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["reply_markup"]["inline_keyboard"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|row| row.as_array().unwrap())
+                .find(|button| {
+                    button["text"]
+                        .as_str()
+                        .is_some_and(|text| text.contains(label))
+                })
+                .and_then(|button| button["callback_data"].as_str())
+                .expect("matching model-picker button")
+                .to_string()
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 77 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let mut picker_config = Config::default();
+        picker_config.channels.telegram.insert(
+            "main".into(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        picker_config.providers.models.openai.insert(
+            "primary".into(),
+            zeroclaw_config::schema::OpenAIModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("gpt-current".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        picker_config.providers.models.anthropic.insert(
+            "work".into(),
+            zeroclaw_config::schema::AnthropicModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("claude-sonnet-4-5".into()),
+                    ..Default::default()
+                },
+            },
+        );
+        picker_config.agents.insert(
+            "assistant".into(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["telegram.main".into()],
+                model_provider: "openai.primary".into(),
+                ..Default::default()
+            },
+        );
+        picker_config.model_routes = vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }];
+        let picker_routes = picker_config
+            .model_routes
+            .iter()
+            .map(|route| zeroclaw_api::channel::ChannelModelPickerRoute {
+                hint: route.hint.clone(),
+                model_provider: route.model_provider.clone(),
+                model: route.model.clone(),
+            })
+            .collect();
+        let telegram = Arc::new(
+            TelegramChannel::new(
+                "test-token".into(),
+                "main",
+                Arc::new(|| vec!["123".into()]),
+                false,
+            )
+            .with_persistence(Arc::new(RwLock::new(picker_config)))
+            .with_api_base(server.uri()),
+        );
+        let picker_request = zeroclaw_api::channel::ChannelModelPickerRequest {
+            requesting_user: "original_user".into(),
+            requesting_user_id: "123".into(),
+            reply_target: "-10042:9".into(),
+            thread_ts: Some("9".into()),
+            channel_alias: "main".into(),
+            owner_agent_alias: "assistant".into(),
+            current_model_provider: "openai.primary".into(),
+            current_model: "gpt-current".into(),
+            model_routes: picker_routes,
+        };
+        assert!(
+            telegram
+                .present_model_picker(&picker_request)
+                .await
+                .unwrap()
+        );
+        let provider_callback = callback_for_button(
+            &server.received_requests().await.unwrap(),
+            "editMessageText",
+            "anthropic.work",
+        );
+
+        server.reset().await;
+        mount_listener_mocks(
+            &server,
+            callback_update(1, "open-provider", &provider_callback),
+            r"/bot[^/]+/editMessageText$",
+        )
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let navigation_channel = Arc::clone(&telegram);
+        let navigation_tx = tx.clone();
+        let navigation_listener =
+            zeroclaw_spawn::spawn!(async move { navigation_channel.listen(navigation_tx).await });
+        wait_for_request(&server, "editMessageText").await;
+        wait_for_request(&server, "answerCallbackQuery").await;
+        navigation_listener.abort();
+        let _ = navigation_listener.await;
+        assert!(
+            rx.try_recv().is_err(),
+            "navigation must not queue a command"
+        );
+        let selection_callback = callback_for_button(
+            &server.received_requests().await.unwrap(),
+            "editMessageText",
+            "claude-sonnet-4-5",
+        );
+
+        server.reset().await;
+        mount_listener_mocks(
+            &server,
+            callback_update(2, "select-model", &selection_callback),
+            r"/bot[^/]+/editMessageReplyMarkup$",
+        )
+        .await;
+        let selection_channel = Arc::clone(&telegram);
+        let selection_listener =
+            zeroclaw_spawn::spawn!(async move { selection_channel.listen(tx).await });
+        let queued = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("Telegram selection callback must reach the runtime queue")
+            .expect("runtime queue must remain open");
+        wait_for_request(&server, "editMessageReplyMarkup").await;
+        wait_for_request(&server, "answerCallbackQuery").await;
+        selection_listener.abort();
+        let _ = selection_listener.await;
+
+        assert_eq!(queued.sender, "renamed_user");
+        assert_eq!(queued.platform_sender_id.as_deref(), Some("123"));
+        assert_eq!(queued.content, "/model fast");
+        assert_eq!(queued.thread_ts.as_deref(), Some("9"));
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "assistant",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let mut original_sender_message = queued.clone();
+        original_sender_message.sender = "original_user".into();
+        let original_key = conversation_history_key(&original_sender_message);
+        let current_key = conversation_history_key(&queued);
+        ctx.route_overrides.lock().unwrap().insert(
+            original_key.clone(),
+            ChannelRouteSelection {
+                model_provider: "openrouter.default".into(),
+                model: "original-session-model".into(),
+                api_key: None,
+            },
+        );
+        let response_channel = Arc::new(ModelPickerRecordingChannel::default());
+        let response_channel_trait: Arc<dyn Channel> = response_channel.clone();
+
+        assert!(
+            handle_runtime_command_if_needed(&ctx, &queued, Some(&response_channel_trait)).await
+        );
+
+        let overrides = ctx.route_overrides.lock().unwrap();
+        assert_ne!(original_key, current_key);
+        assert_eq!(overrides.len(), 2);
+        assert_eq!(overrides[&original_key].model, "original-session-model");
+        assert_eq!(overrides[&current_key].model_provider, "anthropic.work");
+        assert_eq!(overrides[&current_key].model, "claude-sonnet-4-5");
     }
 
     #[tokio::test]
@@ -27808,6 +28355,7 @@ BTC is currently around $65,000 based on latest tool output."#
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-1".to_string(),
                 sender: "alice".to_string(),
+                platform_sender_id: None,
                 reply_target: "chat-image".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),
@@ -29655,6 +30203,7 @@ This is an example JSON object for profile settings."#;
             zeroclaw_api::channel::ChannelMessage {
                 id: "msg-image-route".to_string(),
                 sender: "alice".to_string(),
+                platform_sender_id: None,
                 reply_target: "chat-image-route".to_string(),
                 content: "please inspect this".to_string(),
                 channel: "test-channel".into(),

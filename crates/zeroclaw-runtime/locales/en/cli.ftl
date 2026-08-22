@@ -1147,6 +1147,17 @@ channel-telegram-approval-ack-approved = Approved
 channel-telegram-approval-ack-always-approved = Always approved
 channel-telegram-approval-ack-denied = Denied
 channel-telegram-approval-ack-unknown = Unknown action
+channel-telegram-model-picker-provider-title = Current: { $provider } / { $model }
+    Choose a provider:
+channel-telegram-model-picker-model-title = Choose a model from { $provider }:
+channel-telegram-model-picker-previous = ◀ Previous
+channel-telegram-model-picker-next = Next ▶
+channel-telegram-model-picker-back = ◀ Back
+channel-telegram-model-picker-cancel = Cancel
+channel-telegram-model-picker-cancelled = Cancelled
+channel-telegram-model-picker-queued = Switching model…
+channel-telegram-model-picker-rejected = This model picker is no longer valid.
+channel-telegram-model-picker-unavailable = Model switching is temporarily unavailable. Try again.
 channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow
