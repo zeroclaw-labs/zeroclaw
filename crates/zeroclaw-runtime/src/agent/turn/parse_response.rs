@@ -50,19 +50,22 @@ pub(crate) fn build_native_assistant_history(
         serde_json::Value::String(text.trim().to_string())
     };
 
-    let mut obj = serde_json::json!({
-        "content": content,
-        "tool_calls": calls_json,
-    });
+    let mut obj = serde_json::Map::from_iter([
+        ("content".to_string(), content),
+        (
+            "tool_calls".to_string(),
+            serde_json::Value::Array(calls_json),
+        ),
+    ]);
 
     if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
+        obj.insert(
             "reasoning_content".to_string(),
             serde_json::Value::String(rc.to_string()),
         );
     }
 
-    obj.to_string()
+    serde_json::Value::Object(obj).to_string()
 }
 
 pub(crate) fn resolve_display_text(

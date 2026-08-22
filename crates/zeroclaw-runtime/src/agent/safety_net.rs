@@ -330,12 +330,20 @@ async fn safety_net_streaming_event_sequence_for_tool_turn() {
         pos_tool_call < pos_tool_result,
         "ToolCall must precede its ToolResult"
     );
-    let (call_id, result_id) = match (&events[pos_tool_call], &events[pos_tool_result]) {
-        (TurnEvent::ToolCall { id: c, .. }, TurnEvent::ToolResult { id: r, .. }) => {
-            (c.clone(), r.clone())
-        }
-        _ => unreachable!(),
-    };
+    let call_id = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a ToolCall event must carry an id");
+    let result_id = events
+        .iter()
+        .find_map(|event| match event {
+            TurnEvent::ToolResult { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .expect("a ToolResult event must carry an id");
     assert_eq!(call_id, "tc-1");
     assert_eq!(
         call_id, result_id,

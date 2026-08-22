@@ -4689,7 +4689,7 @@ fn response_id_key(id: &Value) -> Option<String> {
         Value::String(id) => Some(id.clone()),
         Value::Number(id) => Some(id.to_string()),
         Value::Null => None,
-        _ => unreachable!("validated JSON-RPC ID"),
+        _ => None,
     }
 }
 

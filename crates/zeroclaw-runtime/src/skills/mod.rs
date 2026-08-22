@@ -1865,9 +1865,20 @@ pub fn skills_to_tools_with_context_and_runtime(
                         tools.push(t);
                     }
                 }
-                // `is_registered_skill_tool_kind` above admits only the kinds
-                // dispatched here, so any other kind was already skipped.
-                other => unreachable!("registered skill kind '{other}' not dispatched"),
+                // Keep this fail-closed if the admission list and dispatcher
+                // ever drift apart: an unsupported tool is safer skipped than
+                // allowed to abort agent startup.
+                other => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "Registered skill tool kind '{other}' for {}.{} has no dispatcher, skipping",
+                            skill.name, tool.name
+                        )
+                    );
+                }
             }
         }
     }

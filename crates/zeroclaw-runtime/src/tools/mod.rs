@@ -1403,18 +1403,15 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(git_forge_tool));
 
     // Channel room-management tool — always registered; owns its own late-bound channel map.
-    let channel_room_handle: Option<PerToolChannelHandle> =
-        Some(Arc::new(RwLock::new(HashMap::new())));
-    let channel_room_tool = ChannelRoomTool::new(
-        security.clone(),
-        channel_room_handle.as_ref().cloned().unwrap(),
-    );
+    let channel_room_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let channel_room_handle = Some(Arc::clone(&channel_room_tool_handle));
+    let channel_room_tool = ChannelRoomTool::new(security.clone(), channel_room_tool_handle);
     tool_arcs.push(Arc::new(channel_room_tool));
 
     // Interactive ask_user tool — always registered; owns its own late-bound channel map.
-    let ask_user_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
-    let ask_user_tool =
-        AskUserTool::new(security.clone(), ask_user_handle.as_ref().cloned().unwrap());
+    let ask_user_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let ask_user_handle = Some(Arc::clone(&ask_user_tool_handle));
+    let ask_user_tool = AskUserTool::new(security.clone(), Arc::clone(&ask_user_tool_handle));
     tool_arcs.push(Arc::new(ask_user_tool));
 
     {
@@ -1427,17 +1424,18 @@ pub fn all_tools_with_runtime(
         };
         tool_arcs.push(Arc::new(SendViaTool::new(
             security.clone(),
-            ask_user_handle.as_ref().cloned().unwrap(),
+            ask_user_tool_handle,
             agent_peer_groups,
         )));
     }
 
     // Human escalation tool — always registered; owns its own late-bound channel map.
-    let escalate_handle: Option<PerToolChannelHandle> = Some(Arc::new(RwLock::new(HashMap::new())));
+    let escalate_tool_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+    let escalate_handle = Some(Arc::clone(&escalate_tool_handle));
     let escalate_tool = EscalateToHumanTool::new(
         security.clone(),
         root_config.escalation.alert_channels.clone(),
-        escalate_handle.as_ref().cloned().unwrap(),
+        escalate_tool_handle,
     );
     tool_arcs.push(Arc::new(escalate_tool));
 

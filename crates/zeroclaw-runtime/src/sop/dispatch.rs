@@ -710,10 +710,15 @@ async fn dispatch_sop_event_filtered(
                             reason,
                         });
                     }
-                    // `has_retryable_defer` was false, so no `Defer` remains here.
-                    SopAdmission::Defer { .. } => unreachable!(
-                        "a retryable Defer would have returned via the has_retryable_defer branch"
-                    ),
+                    // `has_retryable_defer` was computed from this same vector,
+                    // but keep the fallback safe if this loop is refactored:
+                    // surface backpressure so the durable delivery is retried.
+                    SopAdmission::Defer { reason } => {
+                        results.push(DispatchResult::Deferred {
+                            sop_name: sop_name.clone(),
+                            reason,
+                        });
+                    }
                 }
             }
 
