@@ -1,0 +1,29 @@
+[package]
+name = "zeroclaw-bootstrap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bootstrap install launcher — identifies, verifies, and installs ZeroClaw on a host where it is absent, then hands off to `zeroclaw control --mcp`."
+publish = false
+
+[lib]
+name = "zeroclaw_bootstrap"
+path = "src/lib.rs"
+
+[dependencies]
+# The target/artifact mapping is generated from the canonical release registry.
+# Hand-maintaining a second target list here would give the published-target
+# fact two definitions that can drift apart.
+zeroclaw-dist.workspace = true
+clap = { version = "4.5", features = ["derive"] }
+flate2 = "1"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+sha2 = "0.10"
+tar = "0.4"
+zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
+
+[dev-dependencies]
+tempfile = "3.26"
