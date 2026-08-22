@@ -1354,6 +1354,10 @@ pub fn all_tools_with_runtime(
             security.clone(),
             root_config.file_download.clone(),
             persistent_writes,
+            // The canonical host-level NAT64 prefix fact, honored by the other
+            // networking tools; the `file_download` config no longer carries a
+            // duplicate `nat64_prefixes` list.
+            root_config.security.nat64_prefixes.clone(),
         )));
     }
 
