@@ -518,7 +518,7 @@ impl LogLevel {
 enum EvalCommands {
     /// Run a suite of evaluation cases.
     Run {
-        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        /// Directory of `*.json` trace fixtures (defaults to `evals/regression`).
         #[arg(long)]
         suite: Option<String>,
 
@@ -1058,8 +1058,8 @@ expectations. No network calls, fully deterministic. Exits non-zero if any case 
 so it can gate CI.
 
 Examples:
-  zeroclaw eval run                                  # replay ./evals
-  zeroclaw eval run --suite evals --format json")]
+  zeroclaw eval run                                  # replay ./evals/regression
+  zeroclaw eval run --suite evals/regression --format json")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -5389,10 +5389,12 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
                 let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                if !report.all_passed() {
-                    std::process::exit(1);
+                // Only a failing suite needs the hard exit to carry a non-zero
+                // status; a passing run returns normally so shutdown runs.
+                match report.exit_code() {
+                    0 => Ok(()),
+                    code => std::process::exit(code),
                 }
-                Ok(())
             }
         },
 
