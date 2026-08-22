@@ -380,8 +380,19 @@ impl Tool for SendViaTool {
                 }
             }
         } else {
-            // No target → same channel, use explicit modality (already validated non-None above)
-            (None, explicit_modality.unwrap(), None)
+            // No target → same channel. Keep this branch total even if the
+            // validation above is later rearranged.
+            let Some(modality) = explicit_modality else {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::json(json!({
+                        "status": "rejected",
+                        "reason": "modality is required when target and body are absent"
+                    })),
+                    error: None,
+                });
+            };
+            (None, modality, None)
         };
 
         let entry = TurnRoutingEntry {

@@ -290,7 +290,7 @@ impl ImageGenTool {
             return read_generated_image_body(response).await;
         }
 
-        unreachable!("redirect loop exits through success or redirect limit")
+        anyhow::bail!("Generated image redirect limit exceeded")
     }
 
     /// Read an API key from the environment.
