@@ -36,7 +36,10 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 - **Read access**: restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
 - **Write access**: restricted to the workspace and `/tmp`.
-- **Forbidden paths**: anything listed in `[risk_profiles.<alias>].forbidden_paths`.
+- **Forbidden paths**: absolute component-prefix rules from
+  `[risk_profiles.<alias>].forbidden_paths`. Competing allow and deny prefixes
+  use most-specific-match precedence, with deny winning ties; see
+  [Autonomy path rules](./autonomy.md#path-rules).
 
 ### Network
 
