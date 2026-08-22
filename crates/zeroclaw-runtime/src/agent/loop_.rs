@@ -59,32 +59,42 @@ pub async fn load_peripheral_tools(
 /// Channel map factory type — builds `channel_key → Arc<dyn Channel>` map.
 /// Injected by the binary so `zeroclaw-runtime` doesn't depend on
 /// `zeroclaw-channels`.
-type ChannelMapFn = Box<
-    dyn Fn()
-            -> std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>
-        + Send
-        + Sync,
->;
+type ChannelMap =
+    std::collections::HashMap<String, std::sync::Arc<dyn zeroclaw_api::channel::Channel>>;
+type ChannelMapFactory = dyn Fn(&zeroclaw_config::schema::Config, &str) -> ChannelMap + Send + Sync;
+type ChannelMapFn = Box<ChannelMapFactory>;
+type ApprovalChannelMapFactory =
+    dyn Fn(&zeroclaw_config::schema::Config) -> ChannelMap + Send + Sync;
+type ApprovalChannelMapFn = Box<ApprovalChannelMapFactory>;
 
 /// Channel map factory, injected by the binary.
 static CHANNEL_MAP_FN: std::sync::OnceLock<ChannelMapFn> = std::sync::OnceLock::new();
+static APPROVAL_CHANNEL_MAP_FN: std::sync::OnceLock<ApprovalChannelMapFn> =
+    std::sync::OnceLock::new();
 
 /// Register the channel map factory. Called once at startup by the binary.
 pub fn register_channel_map_fn(f: ChannelMapFn) {
     let _ = CHANNEL_MAP_FN.set(f);
 }
 
-pub(crate) fn seed_channel_handles(
+/// Register the route-aware channel factory used only by distinct-approver
+/// bridges. Approval routes may intentionally target a channel owned by a
+/// different agent, so this map must remain separate from ordinary tool maps.
+pub fn register_approval_channel_map_fn(f: ApprovalChannelMapFn) {
+    let _ = APPROVAL_CHANNEL_MAP_FN.set(f);
+}
+
+pub(crate) fn seed_channel_handles_with_factory(
+    factory: &ChannelMapFactory,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
     ask_user_handle: &Option<tools::PerToolChannelHandle>,
     channel_room_handle: &Option<tools::PerToolChannelHandle>,
     reaction_handle: &tools::PerToolChannelHandle,
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> usize {
-    let Some(factory) = CHANNEL_MAP_FN.get() else {
-        return 0;
-    };
-    let map = factory();
+    let map = factory(config, agent_alias);
     if map.is_empty() {
         return 0;
     }
@@ -109,13 +119,46 @@ pub(crate) fn seed_channel_handles(
     count
 }
 
-pub(crate) fn live_channel_registry() -> Option<tools::PerToolChannelHandle> {
-    let factory = CHANNEL_MAP_FN.get()?;
-    let map = factory();
+pub(crate) fn seed_channel_handles(
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+    ask_user_handle: &Option<tools::PerToolChannelHandle>,
+    channel_room_handle: &Option<tools::PerToolChannelHandle>,
+    reaction_handle: &tools::PerToolChannelHandle,
+    poll_handle: &Option<tools::PerToolChannelHandle>,
+    escalate_handle: &Option<tools::PerToolChannelHandle>,
+) -> usize {
+    let Some(factory) = CHANNEL_MAP_FN.get() else {
+        return 0;
+    };
+    seed_channel_handles_with_factory(
+        factory.as_ref(),
+        config,
+        agent_alias,
+        ask_user_handle,
+        channel_room_handle,
+        reaction_handle,
+        poll_handle,
+        escalate_handle,
+    )
+}
+
+pub(crate) fn approval_channel_registry_with_factory(
+    factory: &ApprovalChannelMapFactory,
+    config: &zeroclaw_config::schema::Config,
+) -> Option<tools::PerToolChannelHandle> {
+    let map = factory(config);
     if map.is_empty() {
         return None;
     }
     Some(Arc::new(parking_lot::RwLock::new(map)))
+}
+
+pub(crate) fn live_approval_channel_registry(
+    config: &zeroclaw_config::schema::Config,
+) -> Option<tools::PerToolChannelHandle> {
+    let factory = APPROVAL_CHANNEL_MAP_FN.get()?;
+    approval_channel_registry_with_factory(factory.as_ref(), config)
 }
 use crate::agent::TurnMeta;
 use crate::observability::{self, Observer, ObserverEvent};
@@ -1417,6 +1460,8 @@ pub async fn run(
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
+            &config,
+            agent_alias,
             &ask_user_handle,
             &channel_room_handle,
             &reaction_handle,
@@ -3023,6 +3068,8 @@ pub async fn process_message(
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
+            &config,
+            agent_alias,
             &ask_user_handle,
             &channel_room_handle,
             &reaction_handle,
@@ -3336,7 +3383,7 @@ pub async fn process_message(
         }
 
         let routed_approval_channel = risk_profile.approval_route.as_ref().and_then(|route| {
-            live_channel_registry().map(|handles| {
+            live_approval_channel_registry(&config).map(|handles| {
                 crate::agent::agent::RoutedApprovalChannel::new(handles, route.clone())
             })
         });
@@ -3401,9 +3448,10 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, estimate_history_tokens, load_interactive_session_history,
-        make_query_summary, maybe_inject_channel_delivery_defaults,
-        save_interactive_session_history, seed_channel_handles, truncate_tool_result,
+        apply_text_tool_prompt_policy, approval_channel_registry_with_factory,
+        estimate_history_tokens, load_interactive_session_history, make_query_summary,
+        maybe_inject_channel_delivery_defaults, save_interactive_session_history,
+        seed_channel_handles_with_factory, truncate_tool_result,
     };
 
     /// One decision, four gates. The origin gate is the load-bearing one:
@@ -3553,11 +3601,15 @@ mod tests {
     #[test]
     fn seed_channel_handles_populates_channel_room_handle() {
         let channel = Arc::new(SeedMockChannel) as Arc<dyn Channel>;
-        super::register_channel_map_fn(Box::new(move || {
+        let selected_agent = Arc::new(RwLock::new(None));
+        let observed_agent = Arc::clone(&selected_agent);
+        let factory = move |_: &zeroclaw_config::schema::Config, agent_alias: &str| {
+            *observed_agent.write() = Some(agent_alias.to_string());
             let mut map = HashMap::new();
             map.insert("matrix.default".to_string(), Arc::clone(&channel));
             map
-        }));
+        };
+        let config = zeroclaw_config::schema::Config::default();
 
         let ask_user_handle = Arc::new(RwLock::new(HashMap::new()));
         let channel_room_handle = Arc::new(RwLock::new(HashMap::new()));
@@ -3565,7 +3617,10 @@ mod tests {
         let poll_handle = Arc::new(RwLock::new(HashMap::new()));
         let escalate_handle = Arc::new(RwLock::new(HashMap::new()));
 
-        let count = seed_channel_handles(
+        let count = seed_channel_handles_with_factory(
+            &factory,
+            &config,
+            "test-agent",
             &Some(Arc::clone(&ask_user_handle)),
             &Some(Arc::clone(&channel_room_handle)),
             &reaction,
@@ -3574,11 +3629,74 @@ mod tests {
         );
 
         assert_eq!(count, 1);
+        assert_eq!(selected_agent.read().as_deref(), Some("test-agent"));
         assert!(ask_user_handle.read().contains_key("matrix.default"));
         assert!(channel_room_handle.read().contains_key("matrix.default"));
         assert!(reaction.read().contains_key("matrix.default"));
         assert!(poll_handle.read().contains_key("matrix.default"));
         assert!(escalate_handle.read().contains_key("matrix.default"));
+    }
+
+    #[tokio::test]
+    async fn approval_registry_reaches_route_only_channel_without_exposing_it_to_tools() {
+        let approval_requests = Arc::new(AtomicUsize::new(0));
+        let approver =
+            Arc::new(ApprovingChannel::new(Arc::clone(&approval_requests))) as Arc<dyn Channel>;
+        let config = zeroclaw_config::schema::Config::default();
+        let tool_factory =
+            |_config: &zeroclaw_config::schema::Config, _agent_alias: &str| HashMap::new();
+        let approval_factory = move |_config: &zeroclaw_config::schema::Config| {
+            HashMap::from([("discord.ops".to_string(), Arc::clone(&approver))])
+        };
+        let reaction = Arc::new(RwLock::new(HashMap::new()));
+
+        seed_channel_handles_with_factory(
+            &tool_factory,
+            &config,
+            "worker",
+            &None,
+            &None,
+            &reaction,
+            &None,
+            &None,
+        );
+        assert!(
+            !reaction.read().contains_key("discord.ops"),
+            "route-only approver must stay out of ordinary tool handles"
+        );
+
+        let approval_handles = approval_channel_registry_with_factory(&approval_factory, &config)
+            .expect("route-aware approval registry should contain the ops channel");
+        let route = zeroclaw_config::autonomy::ApprovalRoute {
+            approver_channel: "discord.ops".to_string(),
+            timeout_secs: 1,
+            ..Default::default()
+        };
+        let request = ChannelApprovalRequest {
+            tool_name: "file_write".to_string(),
+            arguments_summary: "write test file".to_string(),
+            raw_arguments: None,
+        };
+
+        let result = crate::agent::agent::resolve_routed_approval(
+            &approval_handles,
+            &route,
+            "operator",
+            &request,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                crate::agent::agent::RoutedApproval::Decided {
+                    response: ChannelApprovalResponse::Approve,
+                    source: ::zeroclaw_api::channel::ApprovalSource::Operator,
+                    ..
+                }
+            ),
+            "route-only ops channel should provide the approval decision"
+        );
+        assert_eq!(approval_requests.load(Ordering::SeqCst), 1);
     }
 
     // ── maybe_inject_channel_delivery_defaults tests ──────────────

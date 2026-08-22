@@ -3864,8 +3864,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
             // Register channel map factory for late-bound tool handle population.
             zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new({
-                let config_clone = config.clone();
-                move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::build_channel_map_for_agent(
+                        config,
+                        agent_alias,
+                    )
+                }
+            }));
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|config| {
+                zeroclaw_channels::orchestrator::build_channel_map(config)
             }));
 
             Box::pin(agent::run(
@@ -4222,6 +4229,20 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 Box::new(zeroclaw_channels::cli::CliChannel::new("cli"))
             }));
 
+            // RPC sessions reuse the channel clients owned by the daemon. The
+            // current config snapshot still filters each agent's capabilities,
+            // while channel reloads replace the shared live registry.
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_channel_map_fn(Box::new(
+                |config, agent_alias| {
+                    zeroclaw_channels::orchestrator::live_channel_map_for_agent(config, agent_alias)
+                },
+            ));
+            #[cfg(feature = "agent-runtime")]
+            zeroclaw_runtime::agent::loop_::register_approval_channel_map_fn(Box::new(|_| {
+                zeroclaw_channels::orchestrator::live_channel_map()
+            }));
+
             // Wire peripheral tools from zeroclaw-hardware
             #[cfg(feature = "hardware")]
             zeroclaw_runtime::agent::loop_::register_peripheral_tools_fn(Box::new(|config| {
@@ -4255,6 +4276,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 gate_security_posture(&current_config, allow_degraded_security)?;
             let startup_feedback_enabled = !cli.verbose;
             loop {
+                zeroclaw_channels::orchestrator::prepare_live_channel_registry(
+                    current_config.channels.has_any_enabled(),
+                );
                 if startup_feedback_enabled && daemon::stderr_is_interactive_foreground() {
                     let mut stderr = std::io::stderr().lock();
                     let _ = daemon::echo_daemon_starting_to_terminal(&mut stderr);
@@ -4376,6 +4400,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
                     Box::pin(async move {
+                        if !zeroclaw_channels::orchestrator::wait_for_live_channel_registry(&cancel)
+                            .await
+                        {
+                            return Ok(());
+                        }
                         zeroclaw_runtime::rpc::local::run_local_listener(
                             ctx,
                             cancel,
@@ -4388,6 +4417,11 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 registry.register_wss(Box::new(|ctx, cancel, client_count| {
                     Box::pin(async move {
+                        if !zeroclaw_channels::orchestrator::wait_for_live_channel_registry(&cancel)
+                            .await
+                        {
+                            return Ok(());
+                        }
                         let wss_cfg = ctx.config.read().wss.clone();
                         if !wss_cfg.enabled {
                             // WSS disabled — park until cancelled.

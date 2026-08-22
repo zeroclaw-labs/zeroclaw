@@ -131,13 +131,54 @@ use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy};
 use zeroclaw_runtime::tools::{self, Tool};
 use zeroclaw_runtime::util::truncate_with_ellipsis;
 
-type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
+type LiveChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
-/// Live channel registry consulted by `deliver_announcement` so cron sends reuse the
-/// authenticated channel instance (Matrix E2EE can't tolerate per-send session restore).
-/// Replaced wholesale by each `start_channels` call.
-static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
+/// Live channel registry shared by delivery and late-bound agent tool handles so they
+/// reuse authenticated channel instances. Replaced wholesale by each `start_channels` call.
+static LIVE_CHANNEL_REGISTRY: std::sync::RwLock<Option<LiveChannelRegistry>> =
     std::sync::RwLock::new(None);
+static LIVE_CHANNEL_REGISTRY_READY: AtomicBool = AtomicBool::new(true);
+static LIVE_CHANNEL_REGISTRY_NOTIFY: tokio::sync::Notify = tokio::sync::Notify::const_new();
+
+#[cfg(test)]
+static LIVE_CHANNEL_REGISTRY_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Reset live channel state before a daemon generation starts. RPC listeners wait
+/// for publication when channels are expected, avoiding permanently under-seeded sessions.
+pub fn prepare_live_channel_registry(expect_channels: bool) {
+    LIVE_CHANNEL_REGISTRY_READY.store(!expect_channels, Ordering::Release);
+    *LIVE_CHANNEL_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = None;
+    if !expect_channels {
+        LIVE_CHANNEL_REGISTRY_NOTIFY.notify_waiters();
+    }
+}
+
+fn publish_live_channel_registry(registry: Option<LiveChannelRegistry>) {
+    *LIVE_CHANNEL_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = registry;
+    LIVE_CHANNEL_REGISTRY_READY.store(true, Ordering::Release);
+    LIVE_CHANNEL_REGISTRY_NOTIFY.notify_waiters();
+}
+
+/// Wait until the current daemon generation has either published its channels or
+/// established that no live channels are available.
+pub async fn wait_for_live_channel_registry(cancel: &CancellationToken) -> bool {
+    tokio::select! {
+        () = async {
+            loop {
+                let notified = LIVE_CHANNEL_REGISTRY_NOTIFY.notified();
+                if LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire) {
+                    return;
+                }
+                notified.await;
+            }
+        } => true,
+        () = cancel.cancelled() => false,
+    }
+}
 
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
@@ -9744,10 +9785,13 @@ pub(crate) fn composite_channel_key(name: &str, alias: Option<&str>) -> String {
     }
 }
 
-fn configured_channel_map(configured: &[ConfiguredChannel]) -> HashMap<String, Arc<dyn Channel>> {
+fn configured_channel_map<'a>(
+    configured: impl IntoIterator<Item = &'a ConfiguredChannel>,
+) -> HashMap<String, Arc<dyn Channel>> {
+    let configured: Vec<_> = configured.into_iter().collect();
     let mut map: HashMap<String, Arc<dyn Channel>> = HashMap::new();
     let mut name_counts: HashMap<&str, usize> = HashMap::new();
-    for cc in configured {
+    for cc in &configured {
         *name_counts.entry(cc.channel.name()).or_insert(0) += 1;
     }
     for cc in configured {
@@ -9884,11 +9928,11 @@ impl ActiveChannelAliases {
 
     /// Computes the canonical channel-binding view used by collection and
     /// startup checks. Disabled owners never activate channels, while an
-    /// explicit SOP approval route keeps its delivery channel live without
-    /// assigning it to an agent.
+    /// explicit SOP or risk-profile approval route keeps its delivery channel
+    /// live without assigning it to an agent.
     fn compute(config: &Config) -> Self {
         let configured_channel_aliases = config.channels_by_alias();
-        let approval_route_bindings = config
+        let sop_approval_channels = config
             .sop
             .approval
             .policies
@@ -9902,7 +9946,17 @@ impl ActiveChannelAliases {
             .filter_map(|route| {
                 route.and_then(zeroclaw_runtime::sop::approval::channel_route::parse_approval_route)
             })
-            .flat_map(|(channel_key, _)| {
+            .map(|(channel_key, _)| channel_key);
+        let risk_profile_approval_channels = config
+            .agents
+            .iter()
+            .filter(|(_, agent)| agent.enabled)
+            .filter_map(|(alias, _)| config.risk_profile_for_agent(alias))
+            .filter_map(|profile| profile.approval_route.as_ref())
+            .map(|route| route.approver_channel.as_str());
+        let approval_route_bindings = sop_approval_channels
+            .chain(risk_profile_approval_channels)
+            .flat_map(|channel_key| {
                 if channel_key.contains('.') {
                     return vec![channel_key.to_string()];
                 }
@@ -9941,6 +9995,103 @@ pub fn build_channel_map(
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
     configured_channel_map(&configured)
+}
+
+fn configured_channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+    configured: &[ConfiguredChannel],
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let available = configured_channel_map(configured);
+    channel_map_for_agent(config, agent_alias, &available)
+}
+
+fn channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+    available: &HashMap<String, Arc<dyn Channel>>,
+) -> HashMap<String, Arc<dyn Channel>> {
+    let Some(agent) = config.agents.get(agent_alias).filter(|agent| agent.enabled) else {
+        return HashMap::new();
+    };
+    if config
+        .agents
+        .values()
+        .all(|agent| agent.channels.is_empty())
+    {
+        return available.clone();
+    }
+
+    let mut selected = HashMap::new();
+    for binding in &agent.channels {
+        let binding = binding.as_str();
+        for (key, channel) in available {
+            let matches = key == binding
+                || (!binding.contains('.')
+                    && key
+                        .strip_prefix(binding)
+                        .is_some_and(|suffix| suffix.starts_with('.')));
+            if matches {
+                selected.insert(key.clone(), Arc::clone(channel));
+            }
+        }
+    }
+
+    let mut singleton_by_type: HashMap<String, Option<Arc<dyn Channel>>> = HashMap::new();
+    for (key, channel) in &selected {
+        let Some((channel_type, _)) = key.split_once('.') else {
+            continue;
+        };
+        singleton_by_type
+            .entry(channel_type.to_string())
+            .and_modify(|singleton| *singleton = None)
+            .or_insert_with(|| Some(Arc::clone(channel)));
+    }
+    for (channel_type, channel) in singleton_by_type {
+        if let Some(channel) = channel {
+            selected.entry(channel_type).or_insert(channel);
+        }
+    }
+
+    selected
+}
+
+/// Build the configured channel registry visible to one agent's tools.
+/// Explicit bindings are an authorization boundary; the legacy all-channel
+/// fallback applies only when no agent declares any channel binding.
+pub fn build_channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let config_arc = Arc::new(RwLock::new(config.clone()));
+    let configured = collect_configured_channels(&config_arc, "", &[], None, None);
+    configured_channel_map_for_agent(config, agent_alias, &configured)
+}
+
+/// Return the daemon's live configured channels visible to one agent's tools.
+/// The returned map clones only `Arc` handles; it never reconstructs channel clients.
+pub fn live_channel_map_for_agent(
+    config: &Config,
+    agent_alias: &str,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    let registry = LIVE_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    registry
+        .as_deref()
+        .map(|available| channel_map_for_agent(config, agent_alias, available))
+        .unwrap_or_default()
+}
+
+/// Return the daemon's full live registry for routed approval delivery.
+pub fn live_channel_map() -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    LIVE_CHANNEL_REGISTRY
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .cloned()
+        .unwrap_or_default()
 }
 
 pub fn register_channels_for_tools(
@@ -11981,6 +12132,7 @@ pub async fn start_channels(
         .filter(|(_, a)| a.enabled)
         .any(|(_, a)| runtime_defaults_from_config(&config, a.model_provider.as_str()).is_ok());
     if !any_agent_provider_resolves {
+        publish_live_channel_registry(None);
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -12431,6 +12583,7 @@ pub async fn start_channels(
                 .map(|cc| Arc::clone(&cc.channel))
                 .collect();
             if channels.is_empty() {
+                publish_live_channel_registry(None);
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -12487,9 +12640,7 @@ pub async fn start_channels(
 
             // Composite-key registry (see `composite_channel_key`).
             let cbn = Arc::new(configured_channel_map(&configured_channels));
-            *CRON_CHANNEL_REGISTRY
-                .write()
-                .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cbn));
+            publish_live_channel_registry(Some(Arc::clone(&cbn)));
 
             let in_flight = max_in_flight_messages_for_config(channels.len(), &config.channels);
             println!("  🚦 In-flight message limit: {in_flight}");
@@ -12762,7 +12913,7 @@ pub async fn deliver_announcement(
     // channel instance when available — critical for Matrix E2EE which
     // must reuse the authenticated client rather than re-running session
     // restore per delivery.
-    let registry_snapshot = CRON_CHANNEL_REGISTRY
+    let registry_snapshot = LIVE_CHANNEL_REGISTRY
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .clone();
@@ -14493,6 +14644,200 @@ temperature = 0.3
             !map.contains_key("discord"),
             "bare key would be ambiguous for multiple aliases"
         );
+    }
+
+    #[test]
+    fn configured_channel_map_for_agent_enforces_explicit_bindings() {
+        let alpha = mock_channel("discord");
+        let beta = mock_channel("discord");
+        let configured = vec![
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("alpha".to_string()),
+                channel: Arc::clone(&alpha),
+            },
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("beta".to_string()),
+                channel: Arc::clone(&beta),
+            },
+        ];
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.alpha".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "beta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.beta".into()],
+                ..Default::default()
+            },
+        );
+
+        let map = configured_channel_map_for_agent(&config, "alpha", &configured);
+
+        assert!(Arc::ptr_eq(map.get("discord.alpha").unwrap(), &alpha));
+        assert!(Arc::ptr_eq(map.get("discord").unwrap(), &alpha));
+        assert!(!map.contains_key("discord.beta"));
+    }
+
+    #[test]
+    fn configured_channel_map_for_agent_preserves_legacy_fallback() {
+        let alpha = mock_channel("discord");
+        let beta = mock_channel("discord");
+        let configured = vec![
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("alpha".to_string()),
+                channel: Arc::clone(&alpha),
+            },
+            ConfiguredChannel {
+                display_name: "Discord",
+                alias: Some("beta".to_string()),
+                channel: Arc::clone(&beta),
+            },
+        ];
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "disabled".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec![],
+                ..Default::default()
+            },
+        );
+
+        let map = configured_channel_map_for_agent(&config, "legacy", &configured);
+
+        assert!(Arc::ptr_eq(map.get("discord.alpha").unwrap(), &alpha));
+        assert!(Arc::ptr_eq(map.get("discord.beta").unwrap(), &beta));
+        assert!(!map.contains_key("discord"));
+        assert!(
+            configured_channel_map_for_agent(&config, "disabled", &configured).is_empty(),
+            "legacy fallback must not grant channels to a disabled agent"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn live_channel_map_factory_reuses_daemon_registry_on_tokio_worker() {
+        struct RestoreLiveRegistry {
+            registry: Option<LiveChannelRegistry>,
+            ready: bool,
+        }
+
+        impl Drop for RestoreLiveRegistry {
+            fn drop(&mut self) {
+                *LIVE_CHANNEL_REGISTRY
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner()) = self.registry.take();
+                LIVE_CHANNEL_REGISTRY_READY.store(self.ready, Ordering::Release);
+                LIVE_CHANNEL_REGISTRY_NOTIFY.notify_waiters();
+            }
+        }
+
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
+        let worker = mock_channel("discord");
+        let ops = mock_channel("discord");
+        let registry = Arc::new(HashMap::from([
+            ("discord.worker".to_string(), Arc::clone(&worker)),
+            ("discord.ops".to_string(), Arc::clone(&ops)),
+        ]));
+        let previous_registry = LIVE_CHANNEL_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let previous_ready = LIVE_CHANNEL_REGISTRY_READY.load(Ordering::Acquire);
+        let _restore = RestoreLiveRegistry {
+            registry: previous_registry,
+            ready: previous_ready,
+        };
+        prepare_live_channel_registry(true);
+
+        let cancelled = CancellationToken::new();
+        let cancelled_wait = {
+            let cancelled = cancelled.clone();
+            zeroclaw_spawn::spawn!(async move { wait_for_live_channel_registry(&cancelled).await })
+        };
+        tokio::task::yield_now().await;
+        cancelled.cancel();
+        assert!(!cancelled_wait.await.unwrap());
+
+        let pending = CancellationToken::new();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(20),
+                wait_for_live_channel_registry(&pending)
+            )
+            .await
+            .is_err(),
+            "RPC factory must wait until the daemon publishes its live registry"
+        );
+
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                ..Default::default()
+            },
+        );
+
+        let cancel = CancellationToken::new();
+        let factory_config = config.clone();
+        let factory = zeroclaw_spawn::spawn!(async move {
+            assert!(wait_for_live_channel_registry(&cancel).await);
+            (
+                live_channel_map_for_agent(&factory_config, "worker"),
+                live_channel_map(),
+            )
+        });
+        publish_live_channel_registry(Some(registry));
+        let (tool_map, approval_map) = factory
+            .await
+            .expect("daemon channel-map factory should not overflow its Tokio worker");
+
+        assert!(Arc::ptr_eq(
+            tool_map.get("discord.worker").unwrap(),
+            &worker
+        ));
+        assert!(Arc::ptr_eq(tool_map.get("discord").unwrap(), &worker));
+        assert!(!tool_map.contains_key("discord.ops"));
+        assert!(!tool_map.contains_key("telegram"));
+        assert!(Arc::ptr_eq(approval_map.get("discord.ops").unwrap(), &ops));
+
+        let replacement = mock_channel("discord");
+        prepare_live_channel_registry(true);
+        publish_live_channel_registry(Some(Arc::new(HashMap::from([(
+            "discord.worker".to_string(),
+            Arc::clone(&replacement),
+        )]))));
+        let replacement_map = live_channel_map_for_agent(&config, "worker");
+        assert!(Arc::ptr_eq(
+            replacement_map.get("discord.worker").unwrap(),
+            &replacement
+        ));
+        assert!(!Arc::ptr_eq(
+            replacement_map.get("discord.worker").unwrap(),
+            &worker
+        ));
     }
 
     #[test]
@@ -28731,6 +29076,61 @@ This is an example JSON object for profile settings."#;
 
     #[cfg(feature = "channel-discord")]
     #[test]
+    fn risk_profile_approval_route_is_live_only_in_approval_map() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["discord.worker".into()],
+                risk_profile: "worker-risk".into(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "worker-risk".to_string(),
+            zeroclaw_config::schema::RiskProfileConfig {
+                approval_route: Some(zeroclaw_config::autonomy::ApprovalRoute {
+                    approver_channel: "discord.ops".to_string(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "worker".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "worker-token".to_string(),
+                ..Default::default()
+            },
+        );
+        config.channels.discord.insert(
+            "ops".to_string(),
+            zeroclaw_config::schema::DiscordConfig {
+                enabled: true,
+                bot_token: "ops-token".to_string(),
+                ..Default::default()
+            },
+        );
+
+        let approval_map = build_channel_map(&config);
+        let worker_tool_map = build_channel_map_for_agent(&config, "worker");
+
+        assert!(
+            approval_map.contains_key("discord.ops"),
+            "the worker risk profile's distinct approver must be live"
+        );
+        assert!(worker_tool_map.contains_key("discord.worker"));
+        assert!(
+            !worker_tool_map.contains_key("discord.ops"),
+            "approval-only channel must not become an ordinary worker tool capability"
+        );
+    }
+
+    #[cfg(feature = "channel-discord")]
+    #[test]
     fn bare_approval_route_collects_the_sole_enabled_alias() {
         let mut config = Config::default();
         config.agents.clear();
@@ -33079,6 +33479,7 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "channel-lark")]
     async fn deliver_announcement_routes_lark_to_lark_arm() {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         // Both names must enter the merged lark|feishu arm. Falling through
         // to `unsupported delivery channel` would mean the schema enum and
         // the match arm have drifted apart.
@@ -33106,6 +33507,7 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "channel-email")]
     async fn deliver_announcement_routes_email_to_email_arm() {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         let config = zeroclaw_config::schema::Config::default();
 
         let err = deliver_announcement(&config, "email.default", "user@example.com", None, "hi")
@@ -33125,6 +33527,7 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn deliver_announcement_routes_whatsapp_to_whatsapp_arm() {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         let config = zeroclaw_config::schema::Config::default();
 
         let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
@@ -33144,6 +33547,7 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "whatsapp-web")]
     async fn deliver_announcement_rejects_whatsapp_non_web_config_clearly() {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         let mut config = zeroclaw_config::schema::Config::default();
         config.channels.whatsapp.insert(
             "default".to_string(),
@@ -33180,6 +33584,7 @@ Done."#;
     #[tokio::test]
     #[cfg(feature = "channel-lark")]
     async fn deliver_announcement_rejects_feishu_value_when_use_feishu_false() {
+        let _registry_guard = LIVE_CHANNEL_REGISTRY_TEST_LOCK.lock().await;
         // Reject (not warn): otherwise the message silently lands on the
         // Lark endpoint despite the user explicitly naming Feishu.
         let mut config = zeroclaw_config::schema::Config::default();

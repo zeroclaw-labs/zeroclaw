@@ -150,6 +150,9 @@ pub async fn run_local_listener(
         "RPC local IPC listening"
     );
 
+    let connections_cancel = cancel.child_token();
+    let mut connections = tokio::task::JoinSet::new();
+    let mut listener_result: Result<()> = Ok(());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -159,6 +162,16 @@ pub async fn run_local_listener(
                     "RPC local IPC shutting down"
                 );
                 break;
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("RPC local IPC connection task failed: {error}")
+                    );
+                }
             }
             accept = platform::accept(&mut listener, &path) => {
                 let stream = match accept {
@@ -178,21 +191,26 @@ pub async fn run_local_listener(
                             tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
                             continue;
                         }
-                        return Err(e).context("local IPC accept error");
+                        listener_result = Err(e).context("local IPC accept error");
+                        break;
                     }
                 };
 
                 let ctx = ctx.clone();
                 let count = client_count.clone();
+                let connection_cancel = connections_cancel.clone();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                zeroclaw_spawn::spawn!(async move {
+                connections.spawn(async move {
                     let mut transport = LocalTransport::new(stream);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
-                    dispatcher.run(&mut transport).await;
+                    tokio::select! {
+                        _ = connection_cancel.cancelled() => {}
+                        _ = dispatcher.run(&mut transport) => {}
+                    }
 
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
@@ -221,7 +239,19 @@ pub async fn run_local_listener(
         }
     }
 
-    Ok(())
+    connections_cancel.cancel();
+    while let Some(completed) = connections.join_next().await {
+        if let Err(error) = completed {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("RPC local IPC connection task failed during shutdown: {error}")
+            );
+        }
+    }
+
+    listener_result
 }
 
 // ── Platform shims ───────────────────────────────────────────────
@@ -1245,8 +1275,8 @@ mod tests {
         let server_cancel = cancel.clone();
         let server_ctx = ctx.clone();
         let server_count = count.clone();
-        zeroclaw_spawn::spawn!(async move {
-            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, server_count, None).await
         });
 
         wait_for_socket(&sock_path).await;
@@ -1264,6 +1294,49 @@ mod tests {
         wait_for_client_count(&count, 0).await;
 
         cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("listener should stop after cancellation")
+            .expect("listener task should not panic")
+            .expect("listener should stop cleanly");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_closes_and_joins_accepted_local_clients() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server_count = count.clone();
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_local_listener(server_ctx, server_cancel, server_count, None).await
+        });
+        wait_for_socket(&sock_path).await;
+
+        let (mut reader, _writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+        assert_eq!(ctx.tui_registry.list().len(), 1);
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("listener should join accepted clients after cancellation")
+            .expect("listener task should not panic")
+            .expect("listener should stop cleanly");
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        assert!(ctx.tui_registry.list().is_empty());
+        let mut line = String::new();
+        let bytes = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .expect("cancelled client should observe EOF")
+            .expect("client read should not fail");
+        assert_eq!(bytes, 0, "cancelled connection should be closed");
     }
 
     #[cfg(windows)]

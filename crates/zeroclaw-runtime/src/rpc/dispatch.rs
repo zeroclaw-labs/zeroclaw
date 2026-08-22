@@ -478,6 +478,16 @@ fn session_should_initialize_mcp(chat_mode: &crate::rpc::types::ChatMode) -> boo
     !matches!(chat_mode, crate::rpc::types::ChatMode::Acp)
 }
 
+#[cfg(test)]
+type TestChannelMapFn = Arc<
+    dyn Fn(
+            &Config,
+            &str,
+        ) -> std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
+        + Send
+        + Sync,
+>;
+
 /// Per-connection dispatcher. Shared state lives in [`RpcContext`].
 pub struct RpcDispatcher {
     ctx: Arc<RpcContext>,
@@ -489,6 +499,8 @@ pub struct RpcDispatcher {
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
+    #[cfg(test)]
+    channel_map_factory: Option<TestChannelMapFn>,
 }
 
 impl RpcDispatcher {
@@ -500,6 +512,8 @@ impl RpcDispatcher {
             tui_id: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
+            #[cfg(test)]
+            channel_map_factory: None,
         }
     }
 
@@ -518,6 +532,53 @@ impl RpcDispatcher {
         Arc::clone(&self.rpc)
     }
 
+    #[cfg(test)]
+    pub fn set_channel_map_factory_for_test<F>(&mut self, factory: F)
+    where
+        F: Fn(
+                &Config,
+                &str,
+            )
+                -> std::collections::HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.channel_map_factory = Some(Arc::new(factory));
+    }
+
+    fn seed_rpc_channel_handles(
+        &self,
+        agent: &crate::agent::agent::Agent,
+        config: &Config,
+        agent_alias: &str,
+    ) -> usize {
+        let handles = agent.channel_handles();
+        #[cfg(test)]
+        if let Some(factory) = self.channel_map_factory.as_deref() {
+            return crate::agent::loop_::seed_channel_handles_with_factory(
+                factory,
+                config,
+                agent_alias,
+                &handles.ask_user,
+                &handles.channel_room,
+                &handles.reaction,
+                &handles.poll,
+                &handles.escalate,
+            );
+        }
+
+        crate::agent::loop_::seed_channel_handles(
+            config,
+            agent_alias,
+            &handles.ask_user,
+            &handles.channel_room,
+            &handles.reaction,
+            &handles.poll,
+            &handles.escalate,
+        )
+    }
+
     /// Construct a pre-authenticated dispatcher sharing the same context and
     /// RPC outbound as `self`. Used to run long-lived methods (e.g.
     /// `session/prompt`) in a spawned task so the read loop remains live.
@@ -529,6 +590,8 @@ impl RpcDispatcher {
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
+            #[cfg(test)]
+            channel_map_factory: self.channel_map_factory.clone(),
         }
     }
 
@@ -1202,6 +1265,8 @@ impl RpcDispatcher {
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
 
+        self.seed_rpc_channel_handles(&agent, &config, &req.agent_alias);
+
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
             session_id.clone(),
@@ -1647,6 +1712,7 @@ impl RpcDispatcher {
             }
         };
 
+        let config = self.ctx.config.read().clone();
         let cwd_path = Some(std::path::Path::new(&data.workspace_dir));
         let tui_env = self
             .tui_id
@@ -1667,6 +1733,8 @@ impl RpcDispatcher {
         )
         .await
         .ok()?;
+
+        self.seed_rpc_channel_handles(&agent, &config, &data.agent_alias);
 
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
@@ -4908,6 +4976,74 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
+    struct RpcSeedTestChannel;
+
+    impl zeroclaw_api::attribution::Attributable for RpcSeedTestChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Git)
+        }
+
+        fn alias(&self) -> &str {
+            "configured"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::channel::Channel for RpcSeedTestChannel {
+        fn name(&self) -> &str {
+            "git"
+        }
+
+        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn seed_test_channel_factory(dispatcher: &mut RpcDispatcher) {
+        dispatcher.set_channel_map_factory_for_test(|config, agent_alias| {
+            config
+                .agents
+                .get(agent_alias)
+                .into_iter()
+                .flat_map(|agent| &agent.channels)
+                .map(|channel| {
+                    (
+                        channel.to_string(),
+                        Arc::new(RpcSeedTestChannel) as Arc<dyn zeroclaw_api::channel::Channel>,
+                    )
+                })
+                .collect()
+        });
+    }
+
+    async fn assert_rpc_and_configured_channels(
+        agent: Arc<tokio::sync::Mutex<crate::agent::agent::Agent>>,
+        expected: &str,
+        absent: &str,
+    ) {
+        let agent = agent.lock().await;
+        let reaction = agent.channel_handles().reaction.read();
+        assert!(
+            reaction.contains_key(expected),
+            "configured channel {expected} must be available to git_forge"
+        );
+        assert!(
+            reaction.contains_key("rpc"),
+            "the synthetic RPC back-channel must remain registered"
+        );
+        assert!(
+            !reaction.contains_key(absent),
+            "channel {absent} absent from the selected agent config must not be synthesized"
+        );
+    }
+
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
     }
@@ -8077,6 +8213,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acp_session_new_seeds_configured_channels_alongside_rpc() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.agents.get_mut("test-agent").unwrap().channels = vec!["git.configured".into()];
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        seed_test_channel_factory(&mut dispatcher);
+
+        let sid = "acp-channel-seed-new";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        let agent = sessions
+            .get_agent(sid)
+            .await
+            .expect("session/new must register a live agent");
+        assert_rpc_and_configured_channels(agent, "git.configured", "git.missing").await;
+    }
+
+    #[tokio::test]
     async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
         use serde_json::from_value;
         use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
@@ -8229,6 +8393,44 @@ mod tests {
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
         );
+    }
+
+    #[tokio::test]
+    async fn reaped_acp_session_reseeds_configured_channels_alongside_rpc() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = make_acp_test_config(&tmp);
+        config.agents.get_mut("test-agent").unwrap().channels = vec!["git.before-reload".into()];
+        let data_dir = config.data_dir.clone();
+        let (mut dispatcher, sessions, _chat_backend, _acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        seed_test_channel_factory(&mut dispatcher);
+
+        let sid = "acp-channel-seed-rehydrate";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "exclude_memory": true,
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should succeed");
+        assert!(sessions.remove(sid).await, "reap must remove the session");
+
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .unwrap()
+            .channels = vec!["git.after-reload".into()];
+
+        let agent = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("durable ACP session should rehydrate");
+        assert_rpc_and_configured_channels(agent, "git.after-reload", "git.before-reload").await;
     }
 
     #[tokio::test]

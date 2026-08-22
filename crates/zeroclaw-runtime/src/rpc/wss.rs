@@ -203,6 +203,9 @@ pub async fn run_wss_listener(
         "RPC WSS listener started"
     );
 
+    let connections_cancel = cancel.child_token();
+    let mut connections = tokio::task::JoinSet::new();
+    let mut listener_result: Result<()> = Ok(());
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -212,6 +215,16 @@ pub async fn run_wss_listener(
                     "RPC WSS listener shutting down"
                 );
                 break;
+            }
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!("RPC WSS connection task failed: {error}")
+                    );
+                }
             }
             accept = listener.accept() => {
                 let (tcp_stream, remote_addr) = match accept {
@@ -231,52 +244,62 @@ pub async fn run_wss_listener(
                             tokio::time::sleep(Duration::from_millis(ACCEPT_ERROR_BACKOFF_MS)).await;
                             continue;
                         }
-                        return Err(e).context("WSS accept error");
+                        listener_result = Err(e).context("WSS accept error");
+                        break;
                     }
                 };
 
                 let ctx = ctx.clone();
                 let count = client_count.clone();
                 let acceptor = tls_acceptor.clone();
+                let connection_cancel = connections_cancel.clone();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
-                zeroclaw_spawn::spawn!(async move {
-                    // TLS handshake.
-                    let tls_stream = match acceptor.accept(tcp_stream).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!("WSS TLS handshake failed from {remote_addr}: {e}")
-                            );
-                            count.fetch_sub(1, Ordering::Relaxed);
-                            return;
-                        }
-                    };
+                connections.spawn(async move {
+                    let ws_stream = tokio::select! {
+                        _ = connection_cancel.cancelled() => None,
+                        ws_stream = async {
+                            let tls_stream = match acceptor.accept(tcp_stream).await {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                        &format!("WSS TLS handshake failed from {remote_addr}: {e}")
+                                    );
+                                    return None;
+                                }
+                            };
 
-                    // WebSocket upgrade.
-                    let ws_stream = match tokio_tungstenite::accept_async(tls_stream).await {
-                        Ok(ws) => ws,
-                        Err(e) => {
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!("WSS WebSocket upgrade failed from {remote_addr}: {e}")
-                            );
-                            count.fetch_sub(1, Ordering::Relaxed);
-                            return;
-                        }
+                            match tokio_tungstenite::accept_async(tls_stream).await {
+                                Ok(ws) => Some(ws),
+                                Err(e) => {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                        &format!("WSS WebSocket upgrade failed from {remote_addr}: {e}")
+                                    );
+                                    None
+                                }
+                            }
+                        } => ws_stream,
+                    };
+                    let Some(ws_stream) = ws_stream else {
+                        count.fetch_sub(1, Ordering::Relaxed);
+                        return;
                     };
 
                     let mut transport = WssTransport::new(ws_stream, remote_addr);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
-                    dispatcher.run(&mut transport).await;
+                    tokio::select! {
+                        _ = connection_cancel.cancelled() => {}
+                        _ = dispatcher.run(&mut transport) => {}
+                    }
 
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
@@ -305,7 +328,19 @@ pub async fn run_wss_listener(
         }
     }
 
-    Ok(())
+    connections_cancel.cancel();
+    while let Some(completed) = connections.join_next().await {
+        if let Err(error) = completed {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("RPC WSS connection task failed during shutdown: {error}")
+            );
+        }
+    }
+
+    listener_result
 }
 
 #[cfg(test)]
@@ -333,5 +368,95 @@ mod accept_error_tests {
         assert!(!is_recoverable_accept_error(&Error::from(
             ErrorKind::InvalidInput
         )));
+    }
+}
+
+#[cfg(test)]
+mod connection_tests {
+    use super::*;
+    use crate::rpc::session::SessionStore;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
+    use tokio::io::AsyncReadExt;
+    use zeroclaw_infra::session_queue::SessionActorQueue;
+
+    fn test_ctx(tmp: &std::path::Path) -> Arc<RpcContext> {
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.to_path_buf(),
+            config_path: tmp.join("config.toml"),
+            ..Default::default()
+        };
+        let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(SessionStore::new(64, session_queue));
+        RpcContext::minimal(config, sessions)
+    }
+
+    fn test_tls_acceptor(tmp: &std::path::Path) -> TlsAcceptor {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let CertifiedKey { cert, key_pair } =
+            generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert_path = tmp.join("cert.pem");
+        let key_path = tmp.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, key_pair.serialize_pem()).unwrap();
+        build_tls_acceptor(cert_path.to_str().unwrap(), key_path.to_str().unwrap()).unwrap()
+    }
+
+    async fn wait_for_client_count(count: &Arc<AtomicUsize>, expected: usize) {
+        for _ in 0..250 {
+            if count.load(Ordering::Relaxed) == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!(
+            "client count never reached {expected}; last observed {}",
+            count.load(Ordering::Relaxed)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_and_joins_inflight_wss_handshake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path());
+        let acceptor = test_tls_acceptor(tmp.path());
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bind_addr = probe.local_addr().unwrap();
+        drop(probe);
+
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let server_cancel = cancel.clone();
+        let server_count = count.clone();
+        let server = zeroclaw_spawn::spawn!(async move {
+            run_wss_listener(ctx, server_cancel, server_count, acceptor, bind_addr).await
+        });
+
+        let mut client = None;
+        for _ in 0..50 {
+            match TcpStream::connect(bind_addr).await {
+                Ok(stream) => {
+                    client = Some(stream);
+                    break;
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        let mut client = client.expect("WSS listener never accepted a TCP client");
+        wait_for_client_count(&count, 1).await;
+
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("WSS listener should join an in-flight handshake after cancellation")
+            .expect("WSS listener task should not panic")
+            .expect("WSS listener should stop cleanly");
+
+        assert_eq!(count.load(Ordering::Relaxed), 0);
+        let mut byte = [0_u8; 1];
+        let bytes = tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte))
+            .await
+            .expect("cancelled WSS client should observe EOF")
+            .expect("client read should not fail");
+        assert_eq!(bytes, 0, "cancelled WSS connection should be closed");
     }
 }
