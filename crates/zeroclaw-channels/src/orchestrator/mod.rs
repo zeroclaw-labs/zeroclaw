@@ -4689,6 +4689,26 @@ fn spawn_supervised_listener(
     )
 }
 
+/// Record one health observation for a supervised listener.
+///
+/// The supervisor cannot see whether a channel's API calls are succeeding — it
+/// only knows that `listen()` has not returned. A channel that polls a broken
+/// endpoint forever keeps the listener future alive, so treating "still
+/// listening" as "healthy" reports `ok` for a channel that has never connected,
+/// and re-clearing `last_error` on every tick erases a real failure within one
+/// heartbeat interval.
+///
+/// So ask the channel instead. `Channel::health_check` defaults to `true`, so a
+/// channel that does not override it is recorded exactly as before; one that
+/// does gets to say it is not connected.
+async fn mark_listener_health(ch: &dyn Channel, component: &str) {
+    if ch.health_check().await {
+        zeroclaw_runtime::health::mark_component_ok(component);
+    } else {
+        zeroclaw_runtime::health::mark_component_error(component, "channel reported unhealthy");
+    }
+}
+
 fn spawn_supervised_listener_with_health_interval(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -4716,7 +4736,7 @@ fn spawn_supervised_listener_with_health_interval(
             let max_backoff = max_backoff_secs.max(backoff);
 
             loop {
-                zeroclaw_runtime::health::mark_component_ok(&component);
+                mark_listener_health(&*ch, &component).await;
                 let mut health = tokio::time::interval(health_interval);
                 health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let result = {
@@ -4727,7 +4747,7 @@ fn spawn_supervised_listener_with_health_interval(
                         tokio::select! {
                             () = cancel.cancelled() => return,
                             _ = health.tick() => {
-                                zeroclaw_runtime::health::mark_component_ok(&component);
+                                mark_listener_health(&*ch, &component).await;
                             }
                             result = &mut listen_future => break result,
                         }
@@ -29072,6 +29092,49 @@ This is an example JSON object for profile settings."#;
         err: Mutex<Option<anyhow::Error>>,
     }
 
+    /// A channel whose listener stays alive while every API call fails — the
+    /// reported shape where Telegram long-polls a bad bot token and absorbs
+    /// the 404 without ever returning from `listen`.
+    struct NeverConnectsChannel {
+        name: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NeverConnectsChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for NeverConnectsChannel {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tx.closed().await;
+            Ok(())
+        }
+
+        async fn health_check(&self) -> bool {
+            false
+        }
+    }
+
     impl ::zeroclaw_api::attribution::Attributable for AlwaysFailChannel {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
             ::zeroclaw_api::attribution::Role::Channel(
@@ -29195,6 +29258,51 @@ This is an example JSON object for profile settings."#;
                 .contains("listen boom")
         );
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_does_not_report_ok_for_a_channel_that_never_connected() {
+        // A live listener is not evidence of a working channel. A bad bot
+        // token leaves Telegram long-polling and swallowing 404s forever, and
+        // the supervisor used to keep stamping `ok` on every heartbeat.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("test-never-connects-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let channel: Arc<dyn Channel> = Arc::new(NeverConnectsChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(70)).await;
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+
+        assert_eq!(
+            component["status"], "error",
+            "a channel that has never connected must not report ok; got {component}"
+        );
+        assert!(
+            component["last_ok"].is_null(),
+            "last_ok must not advance while every API call fails; got {component}"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        assert!(calls.load(Ordering::SeqCst) >= 1);
+        drop(rx);
     }
 
     #[tokio::test]
