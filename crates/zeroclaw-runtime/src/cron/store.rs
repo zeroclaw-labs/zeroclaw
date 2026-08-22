@@ -1241,7 +1241,16 @@ pub fn sync_declarative_jobs(
             let expression = schedule_cron_expression(&schedule).unwrap_or_default();
             let schedule_json = serde_json::to_string(&schedule)?;
             let job_type = &decl.job_type;
-            let session_target = decl.session_target.as_deref().unwrap_or("isolated");
+            // Persist the canonical enum, not the raw config string. `try_parse`
+            // trims and lowercases; the stored-row `parse` path does not, so a
+            // value like `"  MAIN  "` would otherwise reload as Isolated.
+            let session_target = match decl.session_target.as_deref() {
+                Some(raw) => SessionTarget::try_parse(raw).map_err(|err| {
+                    anyhow::Error::msg(format!("Declarative cron job '{id}': {err}"))
+                })?,
+                None => SessionTarget::Isolated,
+            };
+            let session_target = session_target.as_str();
             let delivery = match &decl.delivery {
                 Some(d) => convert_delivery_decl(d),
                 None => DeliveryConfig::default(),
@@ -1424,6 +1433,11 @@ fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Resul
                 "Declarative cron job '{id}': invalid job_type '{other}', expected 'shell' or 'agent'"
             );
         }
+    }
+
+    if let Some(raw) = decl.session_target.as_deref() {
+        SessionTarget::try_parse(raw)
+            .map_err(|err| anyhow::Error::msg(format!("Declarative cron job '{id}': {err}")))?;
     }
 
     Ok(())
@@ -3140,6 +3154,77 @@ mod tests {
                 .to_string()
                 .contains("shell_output_format")
         );
+    }
+
+    #[test]
+    fn sync_validates_session_target() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_agent_decl("bad-session", "0 2 * * *", "do stuff");
+        decl.session_target = Some("shared".to_string());
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "unknown session_target must be rejected like an unknown job_type"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("session_target"), "got {err}");
+        assert!(err.contains("isolated"), "got {err}");
+        assert!(err.contains("main"), "got {err}");
+    }
+
+    #[test]
+    fn sync_agent_job_persists_session_target_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["main-session"]);
+
+        let (id, mut decl) = make_agent_decl("main-session", "*/15 * * * *", "continue the thread");
+        decl.session_target = Some("main".to_string());
+        let decls = decls_map(vec![(id, decl)]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job = get_job(&config, "main-session").unwrap();
+        assert_eq!(job.session_target, SessionTarget::Main);
+    }
+
+    #[test]
+    fn sync_agent_job_persists_canonical_session_target_from_whitespace_padded_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["padded-main"]);
+
+        let (id, mut decl) = make_agent_decl("padded-main", "*/15 * * * *", "continue the thread");
+        decl.session_target = Some("  MAIN  ".to_string());
+        let decls = decls_map(vec![(id, decl)]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Reload through the stored-row parser, which does not trim. A raw
+        // `"  MAIN  "` column would come back Isolated and the scheduler
+        // would start a fresh session instead of main.
+        let job = get_job(&config, "padded-main").unwrap();
+        assert_eq!(job.session_target, SessionTarget::Main);
+    }
+
+    #[test]
+    fn sync_validates_session_target_on_shell_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_shell_decl("bad-shell-session", "0 2 * * *", "echo ok");
+        decl.session_target = Some("shared".to_string());
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "unknown session_target must fail closed for shell declarations too"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("session_target"), "got {err}");
     }
 
     #[test]
