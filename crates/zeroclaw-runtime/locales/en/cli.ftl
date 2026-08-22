@@ -1124,6 +1124,19 @@ sop-rpc-decision-unauthorized = The RPC principal is not authorized to resolve t
 sop-rpc-policy-missing = SOP approval policy '{$name}' is not configured.
 sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 
+# ── Evaluation harness ──
+cli-eval-failed-case-records =   failed-case records: {$dir}/
+cli-eval-flaky-unconfirmed-regression =   flaky (unconfirmed regression): {$id}
+cli-eval-baseline-comparison =   baseline comparison:
+cli-eval-comparison-new = new
+cli-eval-comparison-removed = removed (warn) - in baseline, absent now
+cli-eval-comparison-unverifiable = changed - refresh baseline
+cli-eval-comparison-improvement = improvement
+cli-eval-comparison-flaky-unconfirmed = flaky (unconfirmed regression)
+cli-eval-comparison-regression = REGRESSION ({$categories})
+cli-eval-comparison-unchanged-tokens = unchanged (tokens {$pct}%)
+cli-eval-comparison-unchanged = unchanged
+cli-eval-judge-gate-diagnostic =   warning: [eval].judge_gate is set but judge grades stay diagnostic: {$reason}
 # ── Runtime command construction — shell and skill shell tools ──
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}

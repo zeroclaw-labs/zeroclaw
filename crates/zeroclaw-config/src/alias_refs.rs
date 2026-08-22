@@ -364,6 +364,15 @@ fn scrub_model_provider_refs(cfg: &mut Config, target: &str) {
         .retain(|r| r.model_provider.trim() != target);
     cfg.embedding_routes
         .retain(|r| r.model_provider.trim() != target);
+    // Eval harness provider refs: optional scalars (empty = feature off), so a
+    // deleted alias clears them rather than leaving a dangling ref that
+    // `Config::validate()` would reject on the next load.
+    if cfg.eval.live_provider.trim() == target {
+        cfg.eval.live_provider = crate::providers::ModelProviderRef::default();
+    }
+    if cfg.eval.judge_provider.trim() == target {
+        cfg.eval.judge_provider = crate::providers::ModelProviderRef::default();
+    }
 }
 
 fn delete_agent(
@@ -833,6 +842,16 @@ fn rewrite_model_provider_refs(
     if embed_touched {
         dirty.push("embedding_routes".to_string());
     }
+    // Eval harness provider refs — retarget and mark dirty so the save layer
+    // persists the rewrite (otherwise a rename bricks the saved config).
+    if cfg.eval.live_provider.trim() == old_target {
+        cfg.eval.live_provider = new_target.as_str().into();
+        dirty.push("eval.live_provider".to_string());
+    }
+    if cfg.eval.judge_provider.trim() == old_target {
+        cfg.eval.judge_provider = new_target.as_str().into();
+        dirty.push("eval.judge_provider".to_string());
+    }
     dirty
 }
 
@@ -1056,6 +1075,23 @@ fn collect_provider_refs(
                         route.model_provider.as_str(),
                     ));
                 }
+            }
+            // Eval harness provider refs are optional scalars (empty = feature
+            // off), so they are SOFT and clear on delete — same treatment as the
+            // other typed optional provider refs above.
+            if cfg.eval.live_provider.trim() == target {
+                sites.push(RefSite::soft(
+                    "eval.live_provider".to_string(),
+                    ScrubAction::ClearOptional,
+                    cfg.eval.live_provider.as_str(),
+                ));
+            }
+            if cfg.eval.judge_provider.trim() == target {
+                sites.push(RefSite::soft(
+                    "eval.judge_provider".to_string(),
+                    ScrubAction::ClearOptional,
+                    cfg.eval.judge_provider.as_str(),
+                ));
             }
         }
         // TTS / transcription preferences are optional scalars (empty = opt-out),
@@ -2637,6 +2673,110 @@ mod tests {
             "fallback rewritten"
         );
         assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    // ── eval harness provider refs (eval.live_provider / eval.judge_provider) ──
+    // These are typed provider refs that `Config::validate()` rejects when
+    // dangling, so all three walkers must know about them: otherwise a routine
+    // rename or delete saves a config the next startup refuses to load.
+
+    #[test]
+    fn collect_finds_eval_provider_refs() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.eval.live_provider = "anthropic.default".into();
+        cfg.eval.judge_provider = "anthropic.default".into();
+
+        let kind = provider_kind("anthropic");
+        let sites = find_all_references(&cfg, &kind, "default");
+        let paths: Vec<&str> = sites.iter().map(|s| s.path.as_str()).collect();
+        assert!(
+            paths.contains(&"eval.live_provider"),
+            "eval.live_provider must be collected: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"eval.judge_provider"),
+            "eval.judge_provider must be collected: {paths:?}"
+        );
+        // Optional scalars: soft, cleared on delete (never a hard blocker).
+        for site in sites.iter().filter(|s| s.path.starts_with("eval.")) {
+            assert_eq!(site.strength, RefStrength::Soft, "{}", site.path);
+            assert_eq!(site.action, ScrubAction::ClearOptional, "{}", site.path);
+        }
+    }
+
+    #[test]
+    fn rename_provider_rewrites_eval_live_provider() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.eval.live_provider = "anthropic.default".into();
+
+        let kind = provider_kind("anthropic");
+        let report =
+            rename_with_cascade(&mut cfg, &kind, "default", "prod").expect("rename succeeds");
+        assert_eq!(cfg.eval.live_provider.as_str(), "anthropic.prod");
+        assert!(
+            report.dirty_paths.iter().any(|p| p == "eval.live_provider"),
+            "the rewrite must be marked dirty so the save layer persists it: {:?}",
+            report.dirty_paths
+        );
+        assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn rename_provider_rewrites_eval_judge_provider() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.eval.judge_provider = "anthropic.default".into();
+
+        let kind = provider_kind("anthropic");
+        let report =
+            rename_with_cascade(&mut cfg, &kind, "default", "prod").expect("rename succeeds");
+        assert_eq!(cfg.eval.judge_provider.as_str(), "anthropic.prod");
+        assert!(
+            report
+                .dirty_paths
+                .iter()
+                .any(|p| p == "eval.judge_provider"),
+            "the rewrite must be marked dirty so the save layer persists it: {:?}",
+            report.dirty_paths
+        );
+        assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn delete_provider_scrubs_eval_provider_refs() {
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.eval.live_provider = "anthropic.default".into();
+        cfg.eval.judge_provider = "anthropic.default".into();
+
+        let kind = provider_kind("anthropic");
+        let report = delete_with_cascade(&mut cfg, &kind, "default", CascadePolicy::RefuseOnHard)
+            .expect("soft eval refs must not block the delete");
+        let applied: Vec<&str> = report.applied.iter().map(|s| s.path.as_str()).collect();
+        assert!(applied.contains(&"eval.live_provider"), "{applied:?}");
+        assert!(applied.contains(&"eval.judge_provider"), "{applied:?}");
+        assert!(
+            cfg.eval.live_provider.is_empty(),
+            "delete must clear the dangling eval.live_provider"
+        );
+        assert!(
+            cfg.eval.judge_provider.is_empty(),
+            "delete must clear the dangling eval.judge_provider"
+        );
+        assert!(find_all_references(&cfg, &kind, "default").is_empty());
+    }
+
+    #[test]
+    fn delete_provider_scrubs_whitespace_padded_eval_refs() {
+        // scrub must trim exactly like find/validate, else a padded ref survives
+        // the cascade and the post-condition (or later validation) trips.
+        let mut cfg = cfg_with_provider("anthropic", "default");
+        cfg.eval.live_provider = "  anthropic.default  ".into();
+        cfg.eval.judge_provider = " anthropic.default ".into();
+
+        let kind = provider_kind("anthropic");
+        delete_with_cascade(&mut cfg, &kind, "default", CascadePolicy::RefuseOnHard)
+            .expect("padded eval refs scrubbed, post-condition passes");
+        assert!(cfg.eval.live_provider.is_empty());
+        assert!(cfg.eval.judge_provider.is_empty());
     }
 
     #[test]

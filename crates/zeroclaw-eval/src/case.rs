@@ -9,18 +9,41 @@ use std::path::{Path, PathBuf};
 pub struct LlmTrace {
     /// Identifier for the trace (surfaced in reports).
     pub model_name: String,
+    /// Optional stable report identity. When set, reports and receipts use this
+    /// instead of `model_name`; readers should go through [`LlmTrace::display_id`].
+    #[serde(default)]
+    pub id: Option<String>,
     /// Conversation turns, replayed in order.
     pub turns: Vec<TraceTurn>,
     /// Declarative expectations graded against the run.
     #[serde(default)]
     pub expects: TraceExpects,
+    /// Pre-run environment preparation for the case (live mode).
+    #[serde(default)]
+    pub setup: Option<CaseSetup>,
+    /// Tool names this case requests. Live mode only; ignored in replay.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+}
+
+/// Pre-run environment preparation for a case.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaseSetup {
+    /// Files written into the case's temp workspace before the run.
+    /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
+    #[serde(default)]
+    pub workspace_files: std::collections::BTreeMap<String, String>,
 }
 
 /// A single conversation turn (user input + scripted LLM response steps).
+///
+/// `steps` is optional: replay cases script every LLM round-trip, while live
+/// cases must omit them (the real provider produces the responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceTurn {
     pub user_input: String,
-    pub steps: Vec<TraceStep>,
+    #[serde(default)]
+    pub steps: Option<Vec<TraceStep>>,
 }
 
 /// A single LLM response step within a turn.
@@ -83,17 +106,174 @@ pub struct TraceExpects {
     /// Regex patterns the final response must match.
     #[serde(default)]
     pub response_matches: Vec<String>,
+    /// End-state checks against the case workspace after the run.
+    #[serde(default)]
+    pub workspace: Option<WorkspaceExpects>,
+    /// Resource ceilings for the run.
+    #[serde(default)]
+    pub budget: Option<BudgetExpects>,
+    /// JSON-pointer checks against the final response parsed as JSON.
+    #[serde(default)]
+    pub response_json: std::collections::BTreeMap<String, serde_json::Value>,
+    /// Per-dimension LLM-judge rubrics. Diagnostic unless the judge is gated and
+    /// calibrated.
+    #[serde(default)]
+    pub judge: Vec<JudgeRubric>,
+}
+
+impl TraceExpects {
+    /// Whether this case declares at least one check that does not depend on the
+    /// LLM judge. Used to reject judge-only cases, which cannot gate.
+    pub fn has_deterministic_check(&self) -> bool {
+        !self.response_contains.is_empty()
+            || !self.response_not_contains.is_empty()
+            || !self.tools_used.is_empty()
+            || !self.tools_not_used.is_empty()
+            || self.max_tool_calls.is_some()
+            || self.all_tools_succeeded.is_some()
+            || !self.response_matches.is_empty()
+            || self.workspace.is_some()
+            || self.budget.is_some()
+            || !self.response_json.is_empty()
+    }
+}
+
+fn default_judge_threshold() -> f64 {
+    0.7
+}
+
+/// One judged dimension of a run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeRubric {
+    /// Short dimension name, e.g. "helpfulness" — one dimension per entry.
+    pub name: String,
+    /// The rubric for THIS dimension only.
+    pub rubric: String,
+    /// Pass threshold on the judge's 0.0–1.0 score. Uncalibrated default.
+    #[serde(default = "default_judge_threshold")]
+    pub threshold: f64,
+    /// Include a rendered transcript (tool calls + results), not just the final
+    /// response, so state-dependent rubrics can't be gamed by prose.
+    #[serde(default)]
+    pub include_transcript: bool,
+}
+
+/// End-state checks against the case workspace after the run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WorkspaceExpects {
+    /// Workspace-relative paths that must exist as a regular file after the run
+    /// (a directory at the path does not satisfy the check).
+    #[serde(default)]
+    pub file_exists: Vec<String>,
+    /// Workspace-relative paths at which nothing (file or directory) may exist
+    /// after the run.
+    #[serde(default)]
+    pub file_absent: Vec<String>,
+    /// Path -> substrings that must appear in that file.
+    #[serde(default)]
+    pub file_contains: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+/// Resource ceilings for the run (all optional; each present bound is one
+/// inclusive check, `actual <= max`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BudgetExpects {
+    /// Max accumulated input tokens reported by the provider.
+    #[serde(default)]
+    pub max_input_tokens: Option<u64>,
+    /// Max accumulated output tokens reported by the provider.
+    #[serde(default)]
+    pub max_output_tokens: Option<u64>,
+    /// Max total tokens (input + output).
+    #[serde(default)]
+    pub max_total_tokens: Option<u64>,
+    /// Max wall-clock duration of the turns loop, in milliseconds.
+    #[serde(default)]
+    pub max_duration_ms: Option<u64>,
+    /// Max number of LLM responses (model round-trips) during the run.
+    #[serde(default)]
+    pub max_llm_calls: Option<u32>,
 }
 
 impl LlmTrace {
-    /// Load a trace from a JSON file.
+    /// The identity used in reports and receipts: the explicit `id` when set,
+    /// otherwise `model_name`.
+    pub fn display_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.model_name)
+    }
+
+    /// Load a trace from a JSON file, rejecting fixtures whose expectations are
+    /// not usable as a gate.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("reading trace fixture {}", path.display()))?;
         let trace: LlmTrace = serde_json::from_str(&content)
             .with_context(|| format!("parsing trace fixture {}", path.display()))?;
+        trace
+            .validate()
+            .with_context(|| format!("invalid trace fixture {}", path.display()))?;
         Ok(trace)
     }
+
+    /// Reject fixtures a run could not honestly grade.
+    ///
+    /// Two authoring errors are fatal here rather than silently green later:
+    /// a judge threshold outside the documented `0.0..=1.0` (a `threshold` of
+    /// `NaN` or `2.0` makes the dimension unpassable/unfailable), and a
+    /// judge-only case (a case whose ONLY expectation is `judge`, which passes
+    /// vacuously with `score() == 1.0` whenever no judge provider is configured
+    /// or the judge stays diagnostic).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for rubric in &self.expects.judge {
+            anyhow::ensure!(
+                rubric.threshold.is_finite() && (0.0..=1.0).contains(&rubric.threshold),
+                "judge rubric {:?} has threshold {} which is not a finite value in 0.0..=1.0",
+                rubric.name,
+                rubric.threshold
+            );
+        }
+        if !self.expects.judge.is_empty() && !self.expects.has_deterministic_check() {
+            anyhow::bail!(
+                "case {:?} declares only judge rubrics; every judge case must also declare at \
+                 least one deterministic check (response, tool, workspace, or budget), otherwise \
+                 it passes vacuously when the judge is absent or diagnostic",
+                self.display_id()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// SHA-256 hex of the case's canonical JSON, used as the receipt's comparability
+/// key. `serde_json` emits object keys in sorted (BTreeMap) order because nothing
+/// in this workspace enables `preserve_order`, so the hash is stable across
+/// re-serialization (guarded by `canonical_json_is_key_sorted`).
+pub fn case_hash(trace: &LlmTrace) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let canonical = serde_json::to_string(&serde_json::to_value(trace)?)?;
+    let digest = Sha256::digest(canonical.as_bytes());
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Validate that `path` is a safe workspace-relative path: non-empty, not absolute,
+/// and free of any `..` component. Used before writing setup files or grading
+/// workspace paths, so a case cannot read or write outside its sandbox.
+pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("workspace path must not be empty");
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                anyhow::bail!("workspace path {path:?} must not contain a `..` component");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                anyhow::bail!("workspace path {path:?} must be relative, not absolute");
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
@@ -166,6 +346,91 @@ mod tests {
         assert!(t.expects.max_tool_calls.is_none());
     }
 
+    fn trace(json: &str) -> LlmTrace {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn judge_rubric_threshold_out_of_range_fails_load() {
+        for bad in ["1.5", "-0.1"] {
+            let t = trace(&format!(
+                r#"{{"model_name":"t","turns":[],"expects":{{"response_contains":["x"],
+                    "judge":[{{"name":"h","rubric":"r","threshold":{bad}}}]}}}}"#
+            ));
+            let err = t
+                .validate()
+                .expect_err("an out-of-range threshold must fail suite load");
+            assert!(
+                err.to_string().contains("0.0..=1.0"),
+                "unexpected error: {err}"
+            );
+        }
+        // The inclusive bounds are valid.
+        for ok in ["0.0", "1.0"] {
+            let t = trace(&format!(
+                r#"{{"model_name":"t","turns":[],"expects":{{"response_contains":["x"],
+                    "judge":[{{"name":"h","rubric":"r","threshold":{ok}}}]}}}}"#
+            ));
+            t.validate().expect("boundary thresholds are valid");
+        }
+    }
+
+    #[test]
+    fn judge_only_case_fails_load() {
+        // A case whose only expectation is `judge` reports passed()==true and
+        // score()==1.0 when no judge provider is configured — a false green.
+        let t = trace(
+            r#"{"model_name":"t","turns":[],"expects":{"judge":[{"name":"h","rubric":"r"}]}}"#,
+        );
+        let err = t
+            .validate()
+            .expect_err("a judge-only case must be rejected at load");
+        assert!(
+            err.to_string().contains("only judge rubrics"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn judge_case_with_a_deterministic_check_loads() {
+        for det in [
+            r#""response_contains":["x"]"#,
+            r#""tools_used":["echo"]"#,
+            r#""max_tool_calls":1"#,
+            r#""all_tools_succeeded":true"#,
+            r#""budget":{"max_total_tokens":10}"#,
+            r#""workspace":{"file_exists":["a.txt"]}"#,
+            r#""response_json":{"/a":1}"#,
+            r#""response_matches":["x"]"#,
+            r#""response_not_contains":["y"]"#,
+            r#""tools_not_used":["shell"]"#,
+        ] {
+            let t = trace(&format!(
+                r#"{{"model_name":"t","turns":[],"expects":{{{det},
+                    "judge":[{{"name":"h","rubric":"r"}}]}}}}"#
+            ));
+            t.validate().unwrap_or_else(|e| {
+                panic!("{det} should satisfy the deterministic-check rule: {e}")
+            });
+        }
+    }
+
+    #[test]
+    fn from_file_rejects_an_invalid_fixture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.json");
+        std::fs::write(
+            &path,
+            r#"{"model_name":"bad","turns":[],"expects":{"judge":[{"name":"h","rubric":"r"}]}}"#,
+        )
+        .unwrap();
+        let err = LlmTrace::from_file(&path).expect_err("invalid fixtures must not load");
+        assert!(
+            format!("{err:#}").contains("only judge rubrics"),
+            "unexpected error: {err:#}"
+        );
+    }
+
     #[test]
     fn from_file_reads_and_parses_trace() {
         let path = std::env::temp_dir().join("zeroclaw_eval_case_from_file_test.json");
@@ -173,6 +438,72 @@ mod tests {
         let t = LlmTrace::from_file(&path).unwrap();
         assert_eq!(t.model_name, "demo");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn display_id_prefers_id_then_falls_back_to_model_name() {
+        let with_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","id":"case-7","turns":[]}"#).unwrap();
+        assert_eq!(with_id.display_id(), "case-7");
+        let without_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        assert_eq!(without_id.display_id(), "m");
+    }
+
+    #[test]
+    fn turn_steps_default_to_none_when_omitted() {
+        let t: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        assert!(t.turns[0].steps.is_none());
+    }
+
+    #[test]
+    fn canonical_json_is_key_sorted() {
+        // Guard: if anyone enables serde_json's `preserve_order`, this fails,
+        // alerting that case_hash would stop being canonical.
+        let v = serde_json::json!({ "b": 1, "a": 2 });
+        assert_eq!(serde_json::to_string(&v).unwrap(), r#"{"a":2,"b":1}"#);
+    }
+
+    #[test]
+    fn case_hash_stable_across_reserialization() {
+        let trace: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        // Re-parse from a re-serialized form; the hash must be identical.
+        let reserialized: LlmTrace =
+            serde_json::from_str(&serde_json::to_string(&trace).unwrap()).unwrap();
+        assert_eq!(
+            case_hash(&trace).unwrap(),
+            case_hash(&reserialized).unwrap()
+        );
+    }
+
+    #[test]
+    fn case_hash_changes_on_case_edit() {
+        let a: LlmTrace = serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        let b: LlmTrace = serde_json::from_str(r#"{"model_name":"m2","turns":[]}"#).unwrap();
+        assert_ne!(case_hash(&a).unwrap(), case_hash(&b).unwrap());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_absolute() {
+        assert!(validate_workspace_rel_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_empty() {
+        assert!(validate_workspace_rel_path("").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_parent_component() {
+        assert!(validate_workspace_rel_path("../secret").is_err());
+        assert!(validate_workspace_rel_path("sub/../../secret").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_accepts_nested_relative() {
+        assert!(validate_workspace_rel_path("sub/dir/file.txt").is_ok());
     }
 
     #[test]

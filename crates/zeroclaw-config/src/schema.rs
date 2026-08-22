@@ -20936,6 +20936,38 @@ impl Config {
             }
         }
 
+        // Eval harness provider refs — dotted `providers.models` references, or
+        // empty to opt out. Validated at the top level (not per agent) because
+        // they are global `[eval]` fields, mirroring the per-agent typed
+        // provider-ref checks below.
+        let eval_provider_refs: &[(&str, &str)] = &[
+            ("eval.live_provider", self.eval.live_provider.trim()),
+            ("eval.judge_provider", self.eval.judge_provider.trim()),
+        ];
+        for (field, value) in eval_provider_refs {
+            if value.is_empty() {
+                continue;
+            }
+            match value.split_once('.') {
+                Some((ty, inner)) if !ty.is_empty() && !inner.is_empty() => {
+                    let exists = self
+                        .get_map_keys(&format!("providers.models.{ty}"))
+                        .is_some_and(|keys| keys.iter().any(|k| k == inner));
+                    if !exists {
+                        validation_bail!(
+                            DanglingReference,
+                            (*field).to_string(),
+                            "{field} = {value:?} but providers.models.{ty}.{inner} is not configured",
+                        );
+                    }
+                }
+                _ => validation_bail!(
+                    InvalidFormat,
+                    (*field).to_string(),
+                    "{field} must be dotted form `<type>.<alias>` (got {value:?})",
+                ),
+            }
+        }
         let mut lucid_aliases: Vec<&String> = self.storage.lucid.keys().collect();
         lucid_aliases.sort();
         for alias in lucid_aliases {
@@ -39457,6 +39489,198 @@ allowed_users = []
             msg.contains("runtime_profiles.fast.context_compression.summary_provider")
                 && msg.contains("providers.models.custom.nope is not configured"),
             "expected DanglingReference for profile summary_provider, got: {msg}"
+        );
+    }
+
+    fn eval_live_provider_config(live_provider: &str) -> Config {
+        let toml = format!(
+            r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            live_provider = "{live_provider}"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#
+        );
+        toml::from_str(&toml).unwrap()
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_eval_live_provider_bad_format() {
+        let cfg = eval_live_provider_config("notdotted");
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("non-dotted live_provider must fail")
+        );
+        assert!(
+            msg.contains("eval.live_provider") && msg.contains("dotted form"),
+            "expected InvalidFormat for eval.live_provider, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_eval_live_provider_dangling_alias() {
+        let cfg = eval_live_provider_config("custom.does-not-exist");
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("dangling live_provider must fail")
+        );
+        assert!(
+            msg.contains("eval.live_provider")
+                && msg.contains("providers.models.custom.does-not-exist is not configured"),
+            "expected DanglingReference for eval.live_provider, got: {msg}"
+        );
+    }
+
+    /// The regression that actually bricks a config: rename the provider alias the
+    /// eval harness points at, serialize, reload, and validate. Before the alias
+    /// walkers knew about `eval.*_provider`, the saved TOML kept the old alias and
+    /// the next startup refused to load it — with no in-product recovery.
+    #[tokio::test]
+    async fn save_reload_after_alias_rename_keeps_eval_refs_valid() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            live_provider = "custom.default"
+            judge_provider = "custom.default"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = crate::alias_refs::AliasKind::Provider {
+            category: crate::alias_refs::ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        crate::alias_refs::rename_with_cascade(&mut cfg, &kind, "default", "prod")
+            .expect("provider rename succeeds");
+
+        // Round-trip through the serialized form, exactly as a save + next startup would.
+        let saved = toml::to_string(&cfg).expect("serialize renamed config");
+        let reloaded: Config = toml::from_str(&saved).expect("reloaded config must parse");
+        assert_eq!(reloaded.eval.live_provider.as_str(), "custom.prod");
+        assert_eq!(reloaded.eval.judge_provider.as_str(), "custom.prod");
+        reloaded
+            .validate()
+            .expect("a saved config must still validate after a provider alias rename");
+    }
+
+    /// Deleting the alias must cascade into both eval refs, so the saved config
+    /// does not carry a dangling reference that validation rejects on reload.
+    #[tokio::test]
+    async fn save_reload_after_alias_delete_keeps_eval_refs_valid() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [providers.models.custom.spare]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            live_provider = "custom.spare"
+            judge_provider = "custom.spare"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let mut cfg: Config = toml::from_str(toml).unwrap();
+        cfg.validate().expect("baseline config must validate");
+
+        let kind = crate::alias_refs::AliasKind::Provider {
+            category: crate::alias_refs::ProviderCategory::Models,
+            family: "custom".to_string(),
+        };
+        crate::alias_refs::delete_with_cascade(
+            &mut cfg,
+            &kind,
+            "spare",
+            crate::alias_refs::CascadePolicy::RefuseOnHard,
+        )
+        .expect("soft eval refs must not block the delete");
+
+        let saved = toml::to_string(&cfg).expect("serialize config after delete");
+        let reloaded: Config = toml::from_str(&saved).expect("reloaded config must parse");
+        assert!(reloaded.eval.live_provider.is_empty());
+        assert!(reloaded.eval.judge_provider.is_empty());
+        reloaded
+            .validate()
+            .expect("a saved config must still validate after a provider alias delete");
+    }
+
+    #[tokio::test]
+    async fn config_validate_accepts_empty_eval_live_provider() {
+        // Empty is the opt-out; it must validate.
+        let cfg = eval_live_provider_config("");
+        cfg.validate()
+            .expect("empty eval.live_provider must validate");
+    }
+
+    #[tokio::test]
+    async fn config_validate_rejects_eval_judge_provider_dangling_alias() {
+        let toml = r#"
+            [providers.models.custom.default]
+            api_key = "k"
+            model = "qwen3.6-plus"
+            uri = "https://example.com/v1"
+            wire_api = "chat_completions"
+
+            [risk_profiles.default]
+            level = "supervised"
+
+            [eval]
+            judge_provider = "custom.nope"
+
+            [agents.default]
+            enabled = true
+            model_provider = "custom.default"
+            risk_profile = "default"
+        "#;
+        let cfg: Config = toml::from_str(toml).unwrap();
+        let msg = format!(
+            "{:#}",
+            cfg.validate()
+                .expect_err("dangling judge_provider must fail")
+        );
+        assert!(
+            msg.contains("eval.judge_provider")
+                && msg.contains("providers.models.custom.nope is not configured"),
+            "expected DanglingReference for eval.judge_provider, got: {msg}"
         );
     }
 
