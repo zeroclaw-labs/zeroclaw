@@ -12,9 +12,12 @@ pub(crate) struct Acp {
 }
 
 impl Acp {
-    pub(crate) fn new(rpc: Arc<RpcClient>) -> Self {
+    pub(crate) fn new(
+        rpc: Arc<RpcClient>,
+        inbound_request_claims: Arc<chat::InboundRequestClaims>,
+    ) -> Self {
         Self {
-            inner: chat::Chat::new(rpc, chat::PaneKind::Acp),
+            inner: chat::Chat::new_with_claims(rpc, chat::PaneKind::Acp, inbound_request_claims),
         }
     }
 
@@ -92,6 +95,22 @@ impl Acp {
 
     pub(crate) fn ctx_tokens(&self) -> (Option<u64>, Option<u64>) {
         self.inner.ctx_tokens()
+    }
+
+    pub(crate) fn poll(&mut self) {
+        self.inner.poll();
+    }
+
+    pub(crate) fn refresh_visible_metadata(&mut self) {
+        self.inner.refresh_visible_metadata();
+    }
+
+    pub(crate) fn info_message(&mut self) -> Option<&crate::widgets::InfoMessage> {
+        self.inner.info_message()
+    }
+
+    pub(crate) fn turn_status(&self) -> Option<&crate::turn_status::TurnStatus> {
+        self.inner.turn_status()
     }
 
     pub(crate) fn selected_agent(&self) -> Option<&str> {

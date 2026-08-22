@@ -89,7 +89,10 @@ An unknown `--catalog` value errors with the valid choices.
 
 ## zerocode strings (Fluent, independent)
 
-`apps/zerocode` carries its own self-contained Fluent setup, separate from the runtime catalogues above. The TUI is intentionally decoupled from the rest of the workspace: it has no `zeroclaw-*` crate dependency, and its strings live next to its source rather than under `zeroclaw-runtime/locales/`.
+`apps/zerocode` carries its own self-contained Fluent setup, separate from the
+runtime catalogues above. The TUI depends only on shared boundary types from
+`zeroclaw-api`, never runtime/config/channel/tool implementations, and its
+strings live next to its source rather than under `zeroclaw-runtime/locales/`.
 
 | Where | What |
 |---|---|

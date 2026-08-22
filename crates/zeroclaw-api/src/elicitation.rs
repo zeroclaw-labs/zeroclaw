@@ -68,10 +68,25 @@ pub enum ElicitationMode {
 pub struct ElicitationRequest {
     #[serde(rename = "sessionId")]
     pub session_id: String,
+    /// ZeroClaw correlation extension. ACP clients that do not use it ignore
+    /// the field; zerocode uses it to retire a timed-out prompt on the matching
+    /// ToolResult even when the two frames traverse different queues.
+    #[serde(rename = "toolCallId", skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     pub mode: ElicitationMode,
     pub message: String,
     #[serde(rename = "requestedSchema")]
     pub requested_schema: Value,
+}
+
+/// Return the canonical ID scoped around the currently executing tool call.
+/// Channel adapters use this when constructing a response-bearing request;
+/// `None` means the request was initiated outside the common tool dispatcher.
+pub fn scoped_tool_call_id() -> Option<String> {
+    crate::TOOL_LOOP_TOOL_CALL_ID
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
 }
 
 /// Response to an `elicitation/create` request.
@@ -307,12 +322,14 @@ mod tests {
     fn request_serializes_with_camelcase_keys() {
         let req = ElicitationRequest {
             session_id: "sess_1".to_string(),
+            tool_call_id: Some("call-1".to_string()),
             mode: ElicitationMode::Form,
             message: "Pick one".to_string(),
             requested_schema: json!({ "type": "object" }),
         };
         let v = serde_json::to_value(&req).unwrap();
         assert_eq!(v["sessionId"], "sess_1");
+        assert_eq!(v["toolCallId"], "call-1");
         assert_eq!(v["mode"], "form");
         assert_eq!(v["message"], "Pick one");
         assert!(v["requestedSchema"].is_object());

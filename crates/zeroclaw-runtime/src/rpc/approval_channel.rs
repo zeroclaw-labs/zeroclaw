@@ -17,7 +17,7 @@ use zeroclaw_api::channel::{
 use zeroclaw_api::elicitation::{
     ElicitationCapabilities, ElicitationMode, ElicitationRequest, ElicitationResponse,
     decode_multi_select_accept, decode_single_select_accept, multi_select_schema,
-    single_select_schema,
+    scoped_tool_call_id, single_select_schema,
 };
 use zeroclaw_api::jsonrpc::RpcOutbound;
 
@@ -221,6 +221,7 @@ impl RpcApprovalChannel {
     ) -> anyhow::Result<Option<String>> {
         let req = ElicitationRequest {
             session_id: self.session_id.clone(),
+            tool_call_id: scoped_tool_call_id(),
             mode: ElicitationMode::Form,
             message: question.to_string(),
             requested_schema: single_select_schema(choices),
@@ -261,6 +262,7 @@ impl RpcApprovalChannel {
     ) -> anyhow::Result<Option<Vec<String>>> {
         let req = ElicitationRequest {
             session_id: self.session_id.clone(),
+            tool_call_id: scoped_tool_call_id(),
             mode: ElicitationMode::Form,
             message: question.to_string(),
             requested_schema: multi_select_schema(choices, min_items, max_items),
@@ -456,16 +458,20 @@ mod tests {
 
         let rpc_for_response = Arc::clone(&rpc);
         let task = zeroclaw_spawn::spawn!(async move {
-            ch.request_choice(
-                "Pick one",
-                &[
-                    "Apple".to_string(),
-                    "Banana".to_string(),
-                    "Cherry".to_string(),
-                ],
-                Duration::from_secs(2),
-            )
-            .await
+            zeroclaw_api::TOOL_LOOP_TOOL_CALL_ID
+                .scope(
+                    Some("call-1".to_string()),
+                    ch.request_choice(
+                        "Pick one",
+                        &[
+                            "Apple".to_string(),
+                            "Banana".to_string(),
+                            "Cherry".to_string(),
+                        ],
+                        Duration::from_secs(2),
+                    ),
+                )
+                .await
         });
 
         // Read the outbound request frame.
@@ -478,6 +484,7 @@ mod tests {
             .expect("request must carry a string id");
         let params = &frame["params"];
         assert_eq!(params["sessionId"], "sess-1");
+        assert_eq!(params["toolCallId"], "call-1");
         assert_eq!(params["mode"], "form");
         assert_eq!(params["message"], "Pick one");
         let one_of = &params["requestedSchema"]["properties"]["choice"]["oneOf"];

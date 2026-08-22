@@ -165,21 +165,41 @@ impl RpcOutbound {
     /// server-originated request id. Used by the TUI when the daemon
     /// invokes a method on us (e.g. `elicitation/create`) and we need
     /// to ship back an `Accept` / `Decline` / `Cancel`.
-    pub async fn respond(
-        &self,
+    fn response_body(
         id: Value,
         result: std::result::Result<Value, JsonRpcError>,
-    ) -> bool {
+    ) -> std::result::Result<String, String> {
         let resp = JsonRpcResponse {
             jsonrpc: JSONRPC_VERSION,
             result: result.as_ref().ok().cloned(),
             error: result.err(),
             id,
         };
-        match serde_json::to_string(&resp) {
-            Ok(s) => self.writer_tx.send(s).await.is_ok(),
-            Err(_) => false,
-        }
+        serde_json::to_string(&resp).map_err(|error| format!("failed to encode response: {error}"))
+    }
+
+    pub async fn respond(
+        &self,
+        id: Value,
+        result: std::result::Result<Value, JsonRpcError>,
+    ) -> std::result::Result<(), String> {
+        let body = Self::response_body(id, result)?;
+        self.writer_tx
+            .send(body)
+            .await
+            .map_err(|_| "writer task is closed".to_string())
+    }
+
+    pub fn try_respond(
+        &self,
+        id: Value,
+        result: std::result::Result<Value, JsonRpcError>,
+    ) -> std::result::Result<(), String> {
+        let body = Self::response_body(id, result)?;
+        self.writer_tx.try_send(body).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => "writer queue is full".to_string(),
+            mpsc::error::TrySendError::Closed(_) => "writer task is closed".to_string(),
+        })
     }
 
     pub async fn notify(&self, method: &'static str, params: Value) {
