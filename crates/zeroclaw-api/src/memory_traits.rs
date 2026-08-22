@@ -676,6 +676,13 @@ pub trait Memory: Send + Sync + crate::attribution::Attributable {
 #[async_trait]
 pub trait MemoryStrategy: Send + Sync {
     /// Consolidate a conversation turn into long-term memory.
+    ///
+    /// `origin` is the turn's provenance ([`crate::ingress::TurnOrigin`]).
+    /// Implementations use it to gate origin-sensitive classification —
+    /// notably, the `preference` memory subtype is only honored for
+    /// user-authored origins. Callers must pass the origin of the turn that
+    /// produced `user_message`, not the origin of the consolidation call
+    /// itself.
     async fn consolidate_turn(
         &self,
         user_message: &str,
@@ -683,6 +690,7 @@ pub trait MemoryStrategy: Send + Sync {
         provider: &dyn crate::model_provider::ModelProvider,
         model: &str,
         temperature: Option<f64>,
+        origin: crate::ingress::TurnOrigin,
     ) -> anyhow::Result<()>;
 
     /// Run memory governance (cleanup, archiving, background consolidation).

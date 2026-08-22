@@ -42,6 +42,7 @@ impl MemoryStrategy for DefaultMemoryStrategy {
         provider: &dyn ModelProvider,
         model: &str,
         temperature: Option<f64>,
+        origin: zeroclaw_api::ingress::TurnOrigin,
     ) -> anyhow::Result<()> {
         zeroclaw_memory::consolidation::consolidate_turn(
             provider,
@@ -51,6 +52,7 @@ impl MemoryStrategy for DefaultMemoryStrategy {
             &self.memory_config,
             user_message,
             assistant_response,
+            origin,
         )
         .await
     }

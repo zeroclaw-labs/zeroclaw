@@ -10,6 +10,7 @@ use crate::policy_gate;
 use crate::traits::{
     Memory, MemoryCategory, MemoryEntry, MemoryKind, SemanticSubtype, StoreOptions,
 };
+use zeroclaw_api::ingress::TurnOrigin;
 use zeroclaw_api::model_provider::ModelProvider;
 use zeroclaw_config::schema::MemoryConfig;
 use zeroclaw_providers::ProviderDispatch;
@@ -73,6 +74,7 @@ pub async fn consolidate_turn(
     memory_config: &MemoryConfig,
     user_message: &str,
     assistant_response: &str,
+    origin: TurnOrigin,
 ) -> anyhow::Result<()> {
     let turn_text = format!(
         "User: {}\nAssistant: {}",
@@ -158,6 +160,23 @@ pub async fn consolidate_turn(
     if let Some(ref update) = result.memory_update
         && !update.trim().is_empty()
     {
+        // Provenance clause (see `classify::kind_of_core`): a model-emitted
+        // preference label on a turn no person authored is recorded as a
+        // plain fact. Logged so an operator wondering why an update lost
+        // its preference tag can see the decision, not just its result.
+        if memory_config.types.enabled
+            && !origin.user_authored()
+            && result.kind.as_deref().map(classify::parse_semantic_subtype)
+                == Some(SemanticSubtype::Preference)
+        {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"origin": format!("{origin:?}")})),
+                "memory consolidation downgraded preference to fact: turn is not user-authored"
+            );
+        }
+
         let mem_key = format!("core_{}", uuid::Uuid::new_v4());
 
         // Compute importance score heuristically.
@@ -202,7 +221,7 @@ pub async fn consolidate_turn(
                             memory_config
                                 .types
                                 .enabled
-                                .then(|| classify::kind_of_core(&result))
+                                .then(|| classify::kind_of_core(&result, origin))
                         }),
                         pinned: survivor.pinned,
                         tenant_id: survivor.tenant_id.clone(),
@@ -249,7 +268,7 @@ pub async fn consolidate_turn(
             kind: memory_config
                 .types
                 .enabled
-                .then(|| classify::kind_of_core(&result)),
+                .then(|| classify::kind_of_core(&result, origin)),
             ..StoreOptions::default()
         };
         memory
@@ -748,6 +767,15 @@ mod tests {
         memory: &dyn Memory,
         config: &MemoryConfig,
     ) -> anyhow::Result<()> {
+        run_consolidation_from(TurnOrigin::Interactive, provider, memory, config).await
+    }
+
+    async fn run_consolidation_from(
+        origin: TurnOrigin,
+        provider: &ScriptedProvider,
+        memory: &dyn Memory,
+        config: &MemoryConfig,
+    ) -> anyhow::Result<()> {
         consolidate_turn(
             provider,
             "test-model",
@@ -756,8 +784,69 @@ mod tests {
             config,
             "How do we deploy?",
             "We use a staged rollout.",
+            origin,
         )
         .await
+    }
+
+    const PREFERENCE_RESPONSE: &str = r#"{"history_entry": "Talked deploy style.", "memory_update": "Prefers staged rollouts over big-bang deploys.", "kind": "preference", "facts": [], "trend": null}"#;
+
+    /// Reads back the kind actually persisted for the primary Core write.
+    fn stored_core_kind(memory: &RecordingMemory) -> Option<MemoryKind> {
+        let writes = memory.writes.lock();
+        writes
+            .iter()
+            .find_map(|write| match write {
+                RecordedWrite::StoreWithOptions { key, options, .. }
+                    if key.starts_with("core_") && !key.starts_with("core_fact_") =>
+                {
+                    Some(options.kind.clone())
+                }
+                _ => None,
+            })
+            .expect("primary Core write")
+    }
+
+    /// The provenance clause, end to end: the same model output is stored
+    /// with preference authority when a person typed the turn and without
+    /// it when no person did. Drives the real `consolidate_turn`, so the
+    /// clause cannot silently detach from the store path.
+    #[tokio::test]
+    async fn preference_from_the_model_is_stored_as_fact_on_autonomous_turns() {
+        let config = MemoryConfig {
+            types: MemoryTypesConfig { enabled: true },
+            ..MemoryConfig::default()
+        };
+
+        for (origin, expected) in [
+            (
+                TurnOrigin::Interactive,
+                MemoryKind::Semantic(SemanticSubtype::Preference),
+            ),
+            (
+                TurnOrigin::Channel,
+                MemoryKind::Semantic(SemanticSubtype::Preference),
+            ),
+            (
+                TurnOrigin::Daemon,
+                MemoryKind::Semantic(SemanticSubtype::Fact),
+            ),
+            (
+                TurnOrigin::Cron,
+                MemoryKind::Semantic(SemanticSubtype::Fact),
+            ),
+        ] {
+            let provider = ScriptedProvider::new(PREFERENCE_RESPONSE);
+            let memory = RecordingMemory::default();
+            run_consolidation_from(origin, &provider, &memory, &config)
+                .await
+                .unwrap();
+            assert_eq!(
+                stored_core_kind(&memory),
+                Some(expected.clone()),
+                "{origin:?}: stored kind must reflect turn provenance"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1378,6 +1467,7 @@ mod consolidate_turn_tests {
             cfg,
             "user message",
             "assistant response",
+            TurnOrigin::Interactive,
         )
         .await
     }
@@ -1473,6 +1563,7 @@ mod consolidate_turn_tests {
             &MemoryConfig::default(),
             "please review [IMAGE:/home/user/private/cat.png]",
             "described the picture in [DOCUMENT:/tmp/notes.pdf]",
+            TurnOrigin::Interactive,
         )
         .await
         .unwrap();
