@@ -415,9 +415,13 @@ jobs:
       - name: Run plugins lib unit tests
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
         run: cargo test --locked -p zeroclaw-plugins --no-default-features --features plugins-wasm-cranelift --lib
-      - name: Run runtime live-config plugin regression
+      - name: Run runtime live-config plugin regressions
         if: steps.changed.outputs.run == 'true' && matrix.features == 'plugins-wasm-cranelift'
-        run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib live_agent_plugin_tool_observes_config_reload_after_construction
+        # Module filter, not a single test name: agent::plugin_live_config holds
+        # every production-constructor live-config regression (direct Agent and
+        # independently delegated registries today), and a filter pinned to one
+        # test name silently skips the others.
+        run: cargo test --locked -p zeroclaw-runtime --features plugins-wasm-cranelift --lib agent::plugin_live_config
 
   msrv:
     name: MSRV (declared floor)
