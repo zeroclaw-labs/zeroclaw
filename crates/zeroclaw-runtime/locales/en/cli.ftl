@@ -1046,6 +1046,29 @@ cli-alias-owned-state-unavailable = note: config references were updated, but th
 cli-bundle-not-configured = skill bundle '{$alias}' is not configured
 cli-bundle-rename-failed = rename failed: {$error}
 
+# ── Agent bundle export — zeroclaw agents export ──
+cli-agent-export-dest-not-a-dir = destination {$path} exists and is not a directory
+cli-agent-export-dest-not-empty = destination {$path} is not empty — pass --force to replace its contents
+cli-agent-export-dest-no-parent = destination {$path} has no parent directory to stage the bundle beside
+cli-agent-export-dest-contains-workspace = destination {$path} contains the agent workspace {$workspace} — exporting there would replace the workspace itself
+cli-agent-export-dest-inside-workspace = destination {$path} is inside the agent workspace {$workspace} — choose a path outside it
+cli-agent-export-dest-contains-skills = destination {$path} contains skill bundle `{$alias}` at {$source} — exporting there would replace the skills the bundle carries
+cli-agent-export-dest-inside-skills = destination {$path} is inside skill bundle `{$alias}` at {$source} — choose a path outside it
+cli-agent-export-restore-failed = failed to publish the bundle to {$path} ({$error}), and the previous bundle could not be moved back — it is at {$retired}
+cli-agent-export-written = exported agent `{$alias}` to {$path} ({$files} workspace file(s), {$kib} KiB)
+cli-agent-export-skills-carried = {"  "}{$files} skill file(s) carried from {$bundles} skill bundle(s)
+cli-agent-export-others-skipped = {"  "}{$count} special file(s) skipped — sockets, FIFOs, and devices are host state, not content a bundle can carry
+cli-agent-export-symlinks-skipped = {"  "}{$count} symlink(s) skipped — links are not followed into a bundle
+cli-agent-export-risk-header = ⚠️  {$count} capability grant(s) an importing operator must accept:
+cli-agent-export-risk-entry = {"  "}[{$kind}] {$path} — {$detail}
+cli-agent-export-secrets-header = 🔑 {$count} credential(s) were scrubbed and must be supplied on import:
+cli-agent-export-secrets-entry = {"  "}{$path}
+cli-agent-export-dropped-header = ℹ️  {$count} item(s) could not travel and were left behind:
+cli-agent-export-dropped-entry = {"  "}{$path} ({$reason}) — {$detail}
+cli-agent-export-scrub-scope = ⚠️  Scrubbing blanks the fields the schema marks secret. It is not credential detection: other config values travel as written, so a token in an MCP server's url, or a credential in its command or args, is carried and repeated in the manifest's risk flags.
+cli-agent-export-content-not-scrubbed = ⚠️  {$count} carried file(s) are copied as-is. Scrubbing covers config.toml only: workspace and skill content is never scanned for secrets, so a .env file, a token in a note, or a credential in a git remote will be contained in the export.
+cli-agent-export-review-hint = Review config.toml, zeroclaw-agent.toml, and the files the bundle carries before sharing it.
+
 # ── Skill-bundle CLI — zeroclaw skills bundle {add,remove,rename} (#7468 / #7175) ──
 cli-bundle-exists = skill bundle '{$alias}' already exists (no change)
 cli-bundle-created = created skill_bundles.{$alias} (dir: {$dir})

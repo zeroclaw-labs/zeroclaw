@@ -124,6 +124,17 @@ tar = "0.4"
 # Temp files (update pipeline rollback)
 tempfile = "3.26"
 
+# Capability-scoped directory handles (beneath/no-follow). Used by the agent-bundle
+# export to walk a live, agent-writable workspace without re-opening paths by name.
+# Already built through zeroclaw-runtime and zeroclaw-tools, which bind their
+# workspace reads the same way — zero added compile/binary cost for default builds.
+cap-std = "4"
+# `follow(FollowSymlinks::No)` and `open_dir_nofollow`, which cap-std itself does not
+# expose. The export needs the open to refuse a symlink outright, not merely keep it
+# beneath the root: an in-root link would otherwise defeat the bundle's own content
+# exclusions. Thin trait layer over the cap-std/cap-primitives already compiled above.
+cap-fs-ext = "4"
+
 # Zip extraction (plugin registry, self-update archives)
 zip = { version = "8.1", default-features = false, features = ["deflate-flate2"] }
 

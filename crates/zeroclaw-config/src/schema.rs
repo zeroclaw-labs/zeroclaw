@@ -19244,7 +19244,7 @@ const SAVE_PRESERVE_KEYS: &[&str] = &["schema_version"];
 /// instead of running every section header directly after the
 /// previous line (`toml::to_string_pretty` doesn't gap between a
 /// trailing scalar and the next section header).
-fn ensure_blank_line_before_sections(toml: &str) -> String {
+pub(crate) fn ensure_blank_line_before_sections(toml: &str) -> String {
     let mut out = String::with_capacity(toml.len() + 64);
     let mut prev_line_blank = true; // start of file counts as blank
     for line in toml.lines() {
@@ -19268,7 +19268,7 @@ fn ensure_blank_line_before_sections(toml: &str) -> String {
 /// HashMap-keyed sub-trees (e.g. `agents`, `providers.models.<family>`)
 /// are not in the typed default tree, so their operator-added aliases
 /// pass through this filter unchanged.
-fn prune_default_values(actual: &mut toml::Table, defaults: &toml::Table) {
+pub(crate) fn prune_default_values(actual: &mut toml::Table, defaults: &toml::Table) {
     let keys: Vec<String> = actual.keys().cloned().collect();
     for key in keys {
         if SAVE_PRESERVE_KEYS.contains(&key.as_str()) {
