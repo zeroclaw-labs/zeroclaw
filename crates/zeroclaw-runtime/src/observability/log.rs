@@ -65,7 +65,7 @@ impl Observer for LogObserver {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"tool": tool, "duration_ms": ms, "success": success})), "tool.call");
             }
-            ObserverEvent::TurnComplete => {
+            ObserverEvent::TurnComplete | ObserverEvent::TurnCompleteAttributed { .. } => {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),

@@ -7,6 +7,7 @@ use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
 use std::time::Duration;
+use zeroclaw_api::observability_traits::ObserverEvent;
 
 pub(crate) enum ApprovalGateOutcome {
     Proceed { approved: bool },
@@ -36,6 +37,15 @@ pub(crate) async fn gate_tool_approval(
             arguments: tool_args.clone(),
         };
 
+        let arguments_summary = crate::approval::summarize_args(tool_args);
+        let event = ObserverEvent::AuthorizationRequested {
+            tool_name: tool_name.to_string(),
+            arguments_summary: arguments_summary.clone(),
+            channel: Some(ctx.channel_name.to_string()),
+            turn_id: Some(ctx.turn_id.to_string()),
+        };
+        ctx.observer.record_event(&event);
+
         // Interactive CLI: prompt the operator.
         // Non-interactive (channels): try the channel's inline
         // approval (e.g. Telegram inline keyboard) before falling
@@ -44,7 +54,7 @@ pub(crate) async fn gate_tool_approval(
             let attributed = if let Some(ch) = ctx.channel {
                 let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
                     tool_name: request.tool_name.clone(),
-                    arguments_summary: crate::approval::summarize_args(&request.arguments),
+                    arguments_summary: arguments_summary.clone(),
                     raw_arguments: Some(request.arguments.clone()),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
@@ -107,6 +117,14 @@ pub(crate) async fn gate_tool_approval(
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
         mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
+
+        let event = ObserverEvent::AuthorizationResponded {
+            tool_name: tool_name.to_string(),
+            granted: matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always),
+            channel: Some(ctx.channel_name.to_string()),
+            turn_id: Some(ctx.turn_id.to_string()),
+        };
+        ctx.observer.record_event(&event);
 
         if decision == ApprovalResponse::No {
             // This string is fed back to the MODEL, so it states the outcome and
@@ -218,3 +236,6 @@ pub(crate) async fn gate_tool_approval(
         approved: approval_requirement == ApprovalRequirement::Approved,
     }
 }
+
+#[cfg(all(test, unix))]
+mod herdr_tests;

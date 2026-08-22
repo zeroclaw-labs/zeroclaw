@@ -2823,7 +2823,10 @@ impl Agent {
                 self.history.push(cached_msg);
                 let notice = self.trim_history(Some(&turn_id));
                 forward_history_trim_notice(&event_tx, notice).await;
-                self.observer.record_event(&ObserverEvent::TurnComplete);
+                self.observer
+                    .record_event(&ObserverEvent::TurnCompleteAttributed {
+                        turn_id: turn_id.clone(),
+                    });
                 committed_response.push_str(&cached);
                 return Ok(StreamedTurnSuccess {
                     response: committed_response,
@@ -3109,7 +3112,10 @@ impl Agent {
                             cache.put(key, &effective_model, &response, usage.output_tokens as u32);
                     }
 
-                    self.observer.record_event(&ObserverEvent::TurnComplete);
+                    self.observer
+                        .record_event(&ObserverEvent::TurnCompleteAttributed {
+                            turn_id: turn_id.clone(),
+                        });
                     let committed_response =
                         self.append_receipts_block(committed_response, receipt_scope.as_ref());
                     let committed_response = Self::append_model_fallback_notice(

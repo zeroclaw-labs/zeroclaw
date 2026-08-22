@@ -393,6 +393,7 @@ impl Observer for OtelObserver {
                 span.end();
             }
             ObserverEvent::TurnComplete
+            | ObserverEvent::TurnCompleteAttributed { .. }
             | ObserverEvent::CacheHit { .. }
             | ObserverEvent::CacheMiss { .. } => {}
             ObserverEvent::MemoryRecall {

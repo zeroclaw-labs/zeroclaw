@@ -255,6 +255,8 @@ pub enum ObserverEvent {
     },
     /// The agent produced a final answer for the current user message.
     TurnComplete,
+    /// The agent produced a final answer for the identified turn.
+    TurnCompleteAttributed { turn_id: String },
     /// A message was sent or received through a channel.
     ChannelMessage {
         /// Channel name (e.g., `"telegram"`, `"discord"`).
@@ -312,6 +314,25 @@ pub enum ObserverEvent {
         reason: String,
         channel: Option<String>,
         agent_alias: Option<String>,
+        turn_id: Option<String>,
+    },
+    /// User authorization is required for a tool/action.
+    ///
+    /// Emitted when the agent needs explicit user approval before executing
+    /// a tool (e.g., in supervised mode when a tool is not auto-approved).
+    AuthorizationRequested {
+        tool_name: String,
+        arguments_summary: String,
+        channel: Option<String>,
+        turn_id: Option<String>,
+    },
+    /// User responded to an authorization request.
+    ///
+    /// Emitted when the user responds to an authorization request (Yes/No/Always/ReplaceWith).
+    AuthorizationResponded {
+        tool_name: String,
+        granted: bool,
+        channel: Option<String>,
         turn_id: Option<String>,
     },
 }

@@ -54,7 +54,7 @@ impl Observer for VerboseObserver {
                 let ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
                 eprintln!("< Tool {tool} (success={success}, duration_ms={ms})");
             }
-            ObserverEvent::TurnComplete => {
+            ObserverEvent::TurnComplete | ObserverEvent::TurnCompleteAttributed { .. } => {
                 eprintln!("< Complete");
             }
             _ => {}
