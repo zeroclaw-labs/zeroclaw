@@ -1030,6 +1030,7 @@ cli-alias-impact-blocker = ✗ {$path} (hard reference)
 cli-alias-impact-scrub = • {$path} (would be scrubbed)
 cli-alias-no-changes = No changes made. Re-run with --yes to apply (or --dry-run to preview).
 cli-alias-warn-workspace-archive = warning: workspace archive failed: {$error}
+cli-alias-knowledge-purge-skipped = knowledge purge skipped; owned rows remain because the recovery export/archive failed: {$error}
 cli-alias-owned-cascaded = owned-state cascaded: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions} → {$archive}
 cli-alias-owned-repointed = owned-state re-pointed: memory {$memory} · cron {$cron} · acp {$acp} · sessions {$sessions}
 cli-alias-warn-workspace-move = warning: workspace move failed: {$error}

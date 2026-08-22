@@ -33,11 +33,15 @@ Each agent has its own `Arc<dyn Memory>` instance. The factory (`zeroclaw_memory
 
 Cross-backend cross-agent memory is not supported: the schema validator at config load rejects `read_memory_from` entries that point at a sibling on a different backend.
 
+The knowledge graph (the `[knowledge]` tool store) follows the same attribution model on one install-wide SQLite file. Every node and edge carries the writing agent's alias in an `owner_agent` column; the tool binds the calling agent's identity at registration and scopes every action to rows that agent owns plus rows owned by aliases in the agent's `workspace.read_knowledge_from` allowlist. That allowlist is validated like `read_memory_from` (no self-reference, no dangling alias) but has no backend-compatibility rule because the knowledge store is a single shared file rather than a per-agent backend.
+
+Pre-attribution rows have no owner and fail closed. Startup assigns them automatically when exactly one agent is enabled. In a multi-agent install, the tool remains unavailable until `knowledge.legacy_owner_agent` names an enabled agent; after assignment, normal allowlists control any sharing.
+
 ## Rename and delete lifecycle
 
 Use the gateway dashboard's agent controls or the dedicated `zeroclaw agents` CLI for rename and delete. In the standard build with `gateway` and `agent-runtime` enabled, both surfaces run the reference and owned-state cascades; directly removing or re-keying `agents.<alias>` in TOML or through a generic config setter does not. A reduced-feature CLI still updates config references but warns that owned state was not cascaded, so use a build with both features enabled for lifecycle operations.
 
-Both operations make the config change durable before running owned-state side effects. Rename rewrites config references first, then moves the default per-alias workspace and re-points memory, cron, ACP, and session state. Delete first refuses hard references and live ACP sessions, then removes the config entry and soft references before attempting workspace archival, owned-state export and cleanup, and session-attribution clearing.
+Both operations make the config change durable before running owned-state side effects. Rename rewrites config references first, then moves the default per-alias workspace and re-points memory, knowledge graph, cron, ACP, and session state. Delete first refuses hard references and live ACP sessions, then removes the config entry and soft references before attempting workspace archival, memory and knowledge export and cleanup, and session-attribution clearing.
 
 The post-persist side effects are best-effort and report surfaced failures, but archive-file write failures may appear only in gateway logs. Rename warnings call for retrying the same gateway API rename to converge residue left under the old alias. After deletion, verify the archive contents and logs before relying on the archive for recovery. Automated restore is not supported.
 

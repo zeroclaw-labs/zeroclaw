@@ -47,6 +47,12 @@ The schema validator at config load enforces:
 1. Every member's `channels` list includes the group's `channel` (an agent that doesn't listen there can't peer there).
 2. Every member is a configured agent (no dangling references).
 3. `read_memory_from` does not point at the agent itself.
+4. `read_knowledge_from` names only configured siblings and never the agent itself.
+
+If an existing knowledge database predates per-agent attribution, a single enabled
+agent inherits it automatically. With multiple enabled agents, set
+`knowledge.legacy_owner_agent` to the enabled agent that should own those rows;
+until then the `knowledge` tool fails closed and is not registered.
 
 ## Inspect the install
 
@@ -64,7 +70,7 @@ Use the rename control for the agent under **Config > Agents** in the gateway da
 zeroclaw agents rename researcher analyst
 ```
 
-Both surfaces rewrite references to the alias, persist the config, move the default per-alias workspace, and re-point owned memory, cron, ACP, and session state. Custom workspace paths do not move because they are not derived from the alias. The reserved `default` alias cannot be renamed from or to.
+Both surfaces rewrite references to the alias, persist the config, move the default per-alias workspace, and re-point owned memory, knowledge graph, cron, ACP, and session state. Custom workspace paths do not move because they are not derived from the alias. The reserved `default` alias cannot be renamed from or to.
 
 Read any warnings in the response. The config rename commits before workspace and owned-state migration, so warnings identify a side effect that still needs attention. The same gateway API rename request can be reissued to retry residue left under the old alias.
 
@@ -85,8 +91,8 @@ zeroclaw agents delete researcher --yes
 The owned-state cascade attempts to:
 
 - move the configured workspace into the deletion archive;
-- write exported memory, cron, and ACP data under `cascade/`;
-- purge the agent's memory rows and cron jobs;
+- write exported memory, knowledge graph, cron, and ACP data under `cascade/`;
+- purge the agent's memory and knowledge rows and cron jobs;
 - remove its non-live ACP sessions;
 - clear agent attribution from retained conversation sessions; and
 - write `manifest.json` with counts and surfaced warnings.

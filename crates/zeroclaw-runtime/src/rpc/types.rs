@@ -706,6 +706,8 @@ rpc_type! {
         pub path: String,
         pub key: String,
         pub deleted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub owned_state: Option<crate::agent_owned_state::OwnedStateReport>,
     }
 }
 
