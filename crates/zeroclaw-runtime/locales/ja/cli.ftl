@@ -507,6 +507,7 @@ cli-no-command = コマンドが指定されていません。
 cli-press-enter = 終了するにはEnterキーを押してください...
 cli-quickstart-title = クイックスタート — 1つの動作するエージェントをエンドツーエンドで作成します。
 cli-quickstart-needs-tty = クイックスタートは対話式で、stdin と stderr にターミナルが必要です。対話式シェルから実行するか、ヘッドレス設定には `zeroclaw config set <path> <value>` を使用してください。
+cli-quickstart-terminal-size-unknown = クイックスタートはターミナルのサイズを判定できなかったため、チェックリストが収まるか確認できません。サイズを報告するターミナルから実行するか、ヘッドレス設定には `zeroclaw config set <path> <value>` を使用してください。
 cli-quickstart-cancelled = クイックスタートをキャンセルしました。設定は書き込まれていません。
 cli-quickstart-incomplete = {"  "}すべてのセレクターがまだ入力されていません。
 cli-quickstart-create-agent = ── エージェントを作成

@@ -487,6 +487,74 @@ mod tests {
     }
 
     #[test]
+    fn quickstart_terminal_size_errors_format_from_english_fluent() {
+        let width_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-narrow",
+            &[("min_width", "3"), ("width", "2")],
+        );
+        assert_eq!(
+            width_message,
+            "Quickstart needs a terminal at least 3 columns wide; the current terminal is 2 columns. Widen the terminal and try again."
+        );
+
+        let height_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-too-short",
+            &[("height", "8"), ("min_height", "9")],
+        );
+        assert_eq!(
+            height_message,
+            "Quickstart needs a terminal at least 9 rows tall; the current terminal is 8 rows. Make the terminal taller and try again."
+        );
+
+        let resized_message = get_english_cli_string_with_args(
+            "cli-quickstart-terminal-resized",
+            &[
+                ("initial_width", "40"),
+                ("initial_height", "9"),
+                ("current_width", "4"),
+                ("current_height", "9"),
+            ],
+        );
+        assert_eq!(
+            resized_message,
+            "The terminal changed from 40x9 to 4x9 while the Quickstart checklist was open. Reopen the checklist to continue."
+        );
+
+        assert_eq!(
+            get_english_cli_string_with_args("cli-quickstart-empty-checklist", &[]),
+            "Quickstart cannot open an empty checklist."
+        );
+    }
+
+    #[test]
+    fn quickstart_terminal_size_unknown_is_defined_in_every_locale() {
+        // The checklist fails closed when `Term::size_checked()` returns None.
+        // That path is only reachable through this key, so a locale missing it
+        // would render the raw `{key}` placeholder to the user at exactly the
+        // moment we are refusing to draw an unverifiable menu.
+        for (source, locale) in channel_approval_locale_sources() {
+            let message =
+                format_ftl_message(source, locale, "cli-quickstart-terminal-size-unknown", &[])
+                    .unwrap_or_else(|| {
+                        panic!("{locale}: cli-quickstart-terminal-size-unknown should be defined")
+                    });
+            assert!(
+                !message.trim().is_empty(),
+                "{locale}: cli-quickstart-terminal-size-unknown should not be empty"
+            );
+            assert!(
+                !message.contains('{'),
+                "{locale}: the message takes no arguments; got {message:?}"
+            );
+        }
+
+        assert_eq!(
+            get_english_cli_string_with_args("cli-quickstart-terminal-size-unknown", &[]),
+            "Quickstart could not determine the terminal size, so it cannot verify the checklist fits. Run it from a terminal that reports its dimensions, or use `zeroclaw config set <path> <value>` for headless configuration."
+        );
+    }
+
+    #[test]
     fn telegram_command_menu_descriptions_are_translated_per_locale() {
         // Pin the exact English wording as an independent oracle: the
         // telegram.rs tests now resolve their expectations through this same

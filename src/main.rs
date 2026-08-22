@@ -176,6 +176,225 @@ fn quickstart_row(key: &str, glyph: &str, summary: &str) -> String {
 }
 
 #[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_MIN_WIDTH: usize = 20;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_ROW_OVERHEAD: usize = 3;
+
+#[cfg(feature = "agent-runtime")]
+const QUICKSTART_SELECTOR_VERTICAL_OVERHEAD: usize = 2;
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_row_budget(terminal_width: usize) -> Option<usize> {
+    if terminal_width < QUICKSTART_SELECTOR_MIN_WIDTH {
+        return None;
+    }
+    terminal_width.checked_sub(QUICKSTART_SELECTOR_ROW_OVERHEAD)
+}
+
+/// Resolve the terminal dimensions the Quickstart checklist will be fitted to.
+///
+/// `console::Term::size()` silently substitutes `(24, 80)` when the size query
+/// fails, so a narrow terminal whose size is unavailable would otherwise get
+/// rows fitted for 77 columns — reintroducing the exact overflow class this
+/// change exists to prevent. Unknown dimensions therefore take the same
+/// fail-closed path as a too-narrow terminal.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_terminal_size(term: &console::Term) -> Option<(u16, u16)> {
+    term.size_checked()
+}
+
+/// Whether a sampled terminal size is usable for fitting the checklist.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_size_is_usable(size: Option<(u16, u16)>) -> bool {
+    size.is_some()
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_min_height(item_count: usize) -> usize {
+    item_count.saturating_add(QUICKSTART_SELECTOR_VERTICAL_OVERHEAD)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_fits_height(terminal_height: usize, item_count: usize) -> bool {
+    terminal_height >= quickstart_selector_min_height(item_count)
+}
+
+#[cfg(feature = "agent-runtime")]
+fn fit_quickstart_selector_row(row: &str, budget: usize) -> String {
+    let normalized: String = row
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if normalized.len() <= budget && console::measure_text_width(&normalized) <= budget {
+        return normalized;
+    }
+    if budget == 0 {
+        return String::new();
+    }
+
+    let marker = if budget >= "…".len() { "…" } else { "." };
+    let byte_budget = budget - marker.len();
+    let width_budget = budget - console::measure_text_width(marker);
+    let mut fitted = String::with_capacity(budget);
+    for ch in normalized.chars() {
+        fitted.push(ch);
+        if fitted.len() > byte_budget || console::measure_text_width(&fitted) > width_budget {
+            fitted.pop();
+            break;
+        }
+    }
+    fitted.push_str(marker);
+    fitted
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_resize_error(
+    initial_size: (u16, u16),
+    current_size: (u16, u16),
+) -> anyhow::Error {
+    let (initial_height, initial_width) = initial_size;
+    let (current_height, current_width) = current_size;
+    anyhow::Error::msg(qta(
+        "cli-quickstart-terminal-resized",
+        &[
+            ("initial_width", &initial_width.to_string()),
+            ("initial_height", &initial_height.to_string()),
+            ("current_width", &current_width.to_string()),
+            ("current_height", &current_height.to_string()),
+        ],
+    ))
+}
+
+/// Decide whether an interaction may continue at the size sampled now.
+///
+/// Returns `Err` both when the terminal changed size and when its size became
+/// unavailable: an unknown size is not evidence that the geometry still
+/// matches, and `Term::size()`'s fabricated `(24, 80)` fallback could even
+/// compare *equal* to the initial sample on an 80x24 terminal that has since
+/// lost its size query. Unknown therefore fails closed, like a resize.
+#[cfg(feature = "agent-runtime")]
+fn quickstart_selector_recheck_size(
+    initial_size: (u16, u16),
+    current_size: Option<(u16, u16)>,
+) -> Result<()> {
+    match current_size {
+        Some(current) if current == initial_size => Ok(()),
+        Some(current) => Err(quickstart_selector_resize_error(initial_size, current)),
+        None => Err(anyhow::Error::msg(qta(
+            "cli-quickstart-terminal-size-unknown",
+            &[],
+        ))),
+    }
+}
+
+/// Render the fixed-size Quickstart checklist without dialoguer paging.
+///
+/// The terminal dimensions sampled for fitting are part of this interaction's
+/// contract. Every input event rechecks them before navigation or selection;
+/// a resize clears the stale rendering and exits instead of allowing a redraw
+/// with strings fitted for a different width or a newly paged height.
+#[cfg(feature = "agent-runtime")]
+fn interact_quickstart_selector(
+    term: &console::Term,
+    labels: &[String],
+    prompt: &str,
+    initial_size: (u16, u16),
+) -> Result<Option<usize>> {
+    if labels.is_empty() {
+        bail!(qta("cli-quickstart-empty-checklist", &[]));
+    }
+    let current_size = quickstart_selector_terminal_size(term);
+    quickstart_selector_recheck_size(initial_size, current_size)?;
+
+    fn render(
+        term: &console::Term,
+        labels: &[String],
+        prompt: &str,
+        selected: usize,
+    ) -> std::io::Result<()> {
+        term.write_line(&format!("? {prompt}"))?;
+        for (index, label) in labels.iter().enumerate() {
+            let marker = if index == selected { ">" } else { " " };
+            term.write_line(&format!("{marker} {label}"))?;
+        }
+        term.flush()
+    }
+
+    fn clear(term: &console::Term, labels: &[String]) -> std::io::Result<()> {
+        term.clear_last_lines(labels.len().saturating_add(1))
+    }
+
+    term.hide_cursor()?;
+    let interaction = (|| -> Result<Option<usize>> {
+        let mut selected = 0;
+        render(term, labels, prompt, selected)?;
+
+        loop {
+            let key = term.read_key()?;
+            let current_size = quickstart_selector_terminal_size(term);
+            if let Err(error) = quickstart_selector_recheck_size(initial_size, current_size) {
+                // Scoped cleanup: erase only the rows this selector drew.
+                // `clear_screen()` would also wipe unrelated scrollback the
+                // user did not ask us to destroy.
+                clear(term, labels)?;
+                return Err(error);
+            }
+
+            match key {
+                console::Key::ArrowDown | console::Key::Tab | console::Key::Char('j') => {
+                    clear(term, labels)?;
+                    selected = (selected + 1) % labels.len();
+                    render(term, labels, prompt, selected)?;
+                }
+                console::Key::ArrowUp | console::Key::BackTab | console::Key::Char('k') => {
+                    clear(term, labels)?;
+                    selected = selected.checked_sub(1).unwrap_or(labels.len() - 1);
+                    render(term, labels, prompt, selected)?;
+                }
+                console::Key::Enter | console::Key::Char(' ') => {
+                    clear(term, labels)?;
+                    return Ok(Some(selected));
+                }
+                console::Key::Escape | console::Key::Char('q') => {
+                    clear(term, labels)?;
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+    })();
+    let cursor = term.show_cursor().and_then(|()| term.flush());
+    match (interaction, cursor) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+        (Ok(selection), Ok(())) => Ok(selection),
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuickstartChecklistAction {
+    Provider,
+    Risk,
+    Memory,
+    Channels,
+    PeerGroups,
+    Agent,
+    Create,
+    Quit,
+}
+
+#[cfg(feature = "agent-runtime")]
+fn quickstart_action_for_pick(
+    choices: &[(QuickstartChecklistAction, String)],
+    pick: Option<usize>,
+) -> QuickstartChecklistAction {
+    pick.and_then(|index| choices.get(index).map(|(action, _)| *action))
+        .unwrap_or(QuickstartChecklistAction::Quit)
+}
+
+#[cfg(feature = "agent-runtime")]
 fn quickstart_step_label(step: zeroclaw_runtime::quickstart::QuickstartStep) -> String {
     t(step.label_key(), step.label())
 }
@@ -1435,19 +1654,6 @@ async fn run_quickstart_cli(
         }
     }
 
-    // ── Main checklist loop ─────────────────────────────────────
-    #[derive(Clone, Copy)]
-    enum Action {
-        Provider,
-        Risk,
-        Memory,
-        Channels,
-        PeerGroups,
-        Agent,
-        Create,
-        Quit,
-    }
-
     println!();
     println!(
         "{}",
@@ -1537,74 +1743,120 @@ async fn run_quickstart_cli(
         };
 
         let risk_summary = preset_summary(&form.risk);
-        let mut labels: Vec<String> = vec![
-            quickstart_row(
-                "cli-quickstart-row-model-provider",
-                glyph(form.provider_done()),
-                &provider_summary,
+        let mut choices: Vec<(QuickstartChecklistAction, String)> = vec![
+            (
+                QuickstartChecklistAction::Provider,
+                quickstart_row(
+                    "cli-quickstart-row-model-provider",
+                    glyph(form.provider_done()),
+                    &provider_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-risk-profile",
-                glyph(form.risk_done()),
-                &risk_summary,
+            (
+                QuickstartChecklistAction::Risk,
+                quickstart_row(
+                    "cli-quickstart-row-risk-profile",
+                    glyph(form.risk_done()),
+                    &risk_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-memory",
-                glyph(form.memory_done()),
-                &memory_summary,
+            (
+                QuickstartChecklistAction::Memory,
+                quickstart_row(
+                    "cli-quickstart-row-memory",
+                    glyph(form.memory_done()),
+                    &memory_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-channels",
-                glyph(form.channels_done()),
-                &channels_summary,
+            (
+                QuickstartChecklistAction::Channels,
+                quickstart_row(
+                    "cli-quickstart-row-channels",
+                    glyph(form.channels_done()),
+                    &channels_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-peer-groups",
-                glyph(form.peer_groups_done()),
-                &peer_groups_summary,
+            (
+                QuickstartChecklistAction::PeerGroups,
+                quickstart_row(
+                    "cli-quickstart-row-peer-groups",
+                    glyph(form.peer_groups_done()),
+                    &peer_groups_summary,
+                ),
             ),
-            quickstart_row(
-                "cli-quickstart-row-agent-identity",
-                glyph(form.agent_done()),
-                &agent_summary,
+            (
+                QuickstartChecklistAction::Agent,
+                quickstart_row(
+                    "cli-quickstart-row-agent-identity",
+                    glyph(form.agent_done()),
+                    &agent_summary,
+                ),
             ),
         ];
         let create_enabled = form.all_done();
-        labels.push(if create_enabled {
-            t("cli-quickstart-create-agent", "── Create agent")
-        } else {
-            t(
-                "cli-quickstart-create-agent-locked",
-                "── Create agent (locked — fill every selector first)",
-            )
-        });
+        choices.push((
+            QuickstartChecklistAction::Create,
+            if create_enabled {
+                t("cli-quickstart-create-agent", "── Create agent")
+            } else {
+                t(
+                    "cli-quickstart-create-agent-locked",
+                    "── Create agent (locked — fill every selector first)",
+                )
+            },
+        ));
 
-        let actions = [
-            Action::Provider,
-            Action::Risk,
-            Action::Memory,
-            Action::Channels,
-            Action::PeerGroups,
-            Action::Agent,
-            Action::Create,
-        ];
+        let term = console::Term::stderr();
+        // Fail closed when the size query fails: `Term::size()` would hand back
+        // a fabricated 80x24 and fit rows for a terminal we cannot see.
+        let Some(terminal_size) = quickstart_selector_terminal_size(&term) else {
+            anyhow::bail!("{}", qta("cli-quickstart-terminal-size-unknown", &[]));
+        };
+        let (terminal_height, terminal_width) = terminal_size;
+        let terminal_height = usize::from(terminal_height);
+        let terminal_width = usize::from(terminal_width);
+        let Some(row_budget) = quickstart_selector_row_budget(terminal_width) else {
+            let terminal_width = terminal_width.to_string();
+            let min_width = QUICKSTART_SELECTOR_MIN_WIDTH.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-narrow",
+                    &[("width", &terminal_width), ("min_width", &min_width)],
+                )
+            );
+        };
+        let labels: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, row_budget))
+            .collect();
+        let min_height = quickstart_selector_min_height(labels.len());
+        if !quickstart_selector_fits_height(terminal_height, labels.len()) {
+            let terminal_height = terminal_height.to_string();
+            let min_height = min_height.to_string();
+            anyhow::bail!(
+                "{}",
+                qta(
+                    "cli-quickstart-terminal-too-short",
+                    &[("height", &terminal_height), ("min_height", &min_height)],
+                )
+            );
+        }
 
-        let pick = FuzzySelect::new()
-            .with_prompt(t(
+        let prompt = fit_quickstart_selector_row(
+            &t(
                 "cli-quickstart-open-selector-prompt",
                 "Open a selector (Enter), or pick Create. Esc to quit.",
-            ))
-            .items(&labels)
-            .default(0)
-            .max_length(labels.len())
-            .interact_opt()?;
-        let action = match pick {
-            Some(i) => actions[i],
-            None => Action::Quit, // Esc on the main checklist quits.
-        };
+            ),
+            row_budget,
+        );
+        // Keep this checklist non-searchable and non-paged, and fail closed if
+        // its fitted terminal dimensions change while it is active.
+        let pick = interact_quickstart_selector(&term, &labels, &prompt, terminal_size)?;
+        let action = quickstart_action_for_pick(&choices, pick);
 
         match action {
-            Action::Quit => {
+            QuickstartChecklistAction::Quit => {
                 println!(
                     "{}",
                     t(
@@ -1614,7 +1866,7 @@ async fn run_quickstart_cli(
                 );
                 return Ok(());
             }
-            Action::Create => {
+            QuickstartChecklistAction::Create => {
                 if !create_enabled {
                     println!(
                         "{}",
@@ -1627,7 +1879,7 @@ async fn run_quickstart_cli(
                 }
                 break;
             }
-            Action::Provider => {
+            QuickstartChecklistAction::Provider => {
                 // Step 1: pick Existing or Fresh, when there are
                 // existing providers to choose from.
                 let mut mode_labels: Vec<String> = Vec::new();
@@ -1793,7 +2045,7 @@ async fn run_quickstart_cli(
                     fields: field_buf,
                 });
             }
-            Action::Risk => {
+            QuickstartChecklistAction::Risk => {
                 let chosen = pick_preset(
                     &t("cli-quickstart-risk-profile-prompt", "Risk profile"),
                     RISK_PRESETS
@@ -1809,7 +2061,7 @@ async fn run_quickstart_cli(
                     });
                 }
             }
-            Action::Memory => {
+            QuickstartChecklistAction::Memory => {
                 let kinds: [MemoryChoice; 6] = [
                     MemoryChoice::Sqlite,
                     MemoryChoice::Markdown,
@@ -1847,7 +2099,7 @@ async fn run_quickstart_cli(
                 };
                 form.memory = Some(kinds[i]);
             }
-            Action::Channels => {
+            QuickstartChecklistAction::Channels => {
                 // Channels sub-flow: list current drafts + Add / Done.
                 loop {
                     let mut items: Vec<String> = form
@@ -2003,7 +2255,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::PeerGroups => {
+            QuickstartChecklistAction::PeerGroups => {
                 // Available channel refs: staged channels (this run) +
                 // unassigned channels already in config. Refs already
                 // covered by a staged peer-group are filtered out.
@@ -2119,7 +2371,7 @@ async fn run_quickstart_cli(
                     break;
                 }
             }
-            Action::Agent => {
+            QuickstartChecklistAction::Agent => {
                 let default_name = form
                     .agent
                     .as_ref()
@@ -8334,6 +8586,369 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn fit_quickstart_selector_row_respects_byte_and_display_budgets() {
+        let short = "[ ] Memory — not yet chosen";
+        assert_eq!(fit_quickstart_selector_row(short, 80), short);
+
+        let rows = [
+            "[✓] Model provider — Anthropic (alias: main, model: claude-sonnet-4-5)",
+            "[✓] モデルプロバイダー — Anthropic（モデル：長い名前）",
+            "[✓] 模型提供方 — 提供商与模型摘要",
+            "emoji 👩‍💻 and combining e\u{301} text",
+            "line one\nline two\twith controls",
+        ];
+        for row in rows {
+            for budget in 0..=64 {
+                let fitted = fit_quickstart_selector_row(row, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
+
+        let long = rows[0];
+        assert_eq!(fit_quickstart_selector_row(long, 0), "");
+        assert_eq!(fit_quickstart_selector_row(long, 1), ".");
+        assert_eq!(fit_quickstart_selector_row(long, 2), "[.");
+        assert!(fit_quickstart_selector_row(long, 40).ends_with('…'));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_budget_rejects_unsafe_terminal_widths() {
+        assert!(
+            (0..QUICKSTART_SELECTOR_MIN_WIDTH)
+                .all(|width| quickstart_selector_row_budget(width).is_none())
+        );
+        assert_eq!(quickstart_selector_row_budget(20), Some(17));
+        assert_eq!(quickstart_selector_row_budget(21), Some(18));
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_minimum_width_keeps_actions_identifiable() {
+        let budget = quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).unwrap();
+        let rows = [
+            ("[ ] Model provider — not yet chosen", "[ ] Model"),
+            ("[ ] Risk profile — not yet chosen", "[ ] Risk"),
+            ("[ ] Memory — not yet chosen", "[ ] Memory"),
+            ("[ ] Channels (0) — not yet chosen", "[ ] Channels"),
+            ("[ ] Peer groups — not yet chosen", "[ ] Peer"),
+            ("[ ] Agent identity — not yet chosen", "[ ] Agent"),
+            ("── Create agent", "── Create"),
+        ];
+
+        for (row, identifiable_prefix) in rows {
+            let fitted = fit_quickstart_selector_row(row, budget);
+            assert!(
+                fitted.starts_with(identifiable_prefix),
+                "{fitted:?} does not identify {row:?}"
+            );
+        }
+    }
+
+    /// The checklist rows exactly as a committed locale ships them.
+    ///
+    /// The identifiability guarantee is about the strings users actually see,
+    /// so these are read from the committed catalogues rather than retyped:
+    /// a hand-written approximation can stay distinguishable at a width where
+    /// the real, longer, column-padded row has already collapsed.
+    #[cfg(feature = "agent-runtime")]
+    fn quickstart_checklist_rows_for_locale(cli_ftl: &str) -> Vec<String> {
+        const ROW_KEYS: [&str; 6] = [
+            "cli-quickstart-row-model-provider",
+            "cli-quickstart-row-risk-profile",
+            "cli-quickstart-row-memory",
+            "cli-quickstart-row-channels",
+            "cli-quickstart-row-peer-groups",
+            "cli-quickstart-row-agent-identity",
+        ];
+
+        let value_for = |key: &str| -> String {
+            cli_ftl
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("{key} = ")))
+                .unwrap_or_else(|| panic!("{key} should be defined in the catalogue"))
+                .to_string()
+        };
+
+        let mut rows: Vec<String> = ROW_KEYS
+            .iter()
+            .map(|key| {
+                value_for(key)
+                    .replace("{$glyph}", "[ ]")
+                    .replace("{$summary}", "not yet chosen")
+            })
+            .collect();
+        rows.push(value_for("cli-quickstart-create-agent"));
+        rows
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_accepted_widths_keep_every_action_distinguishable() {
+        // The blocker this guards: a width floor chosen only for arithmetic
+        // safety left widths 3 and 4 "supported" while every fitted row
+        // collapsed to "" or ".", producing an interactive menu in which the
+        // user could not tell Provider from Risk from Create — and could
+        // commit real config chosen blind. Accepting a width must therefore
+        // mean the rows stay individually readable, in every locale we ship,
+        // not merely that the budget subtraction did not underflow.
+        let locales: [(&str, &str); 5] = [
+            (
+                "en",
+                include_str!("../crates/zeroclaw-runtime/locales/en/cli.ftl"),
+            ),
+            (
+                "es",
+                include_str!("../crates/zeroclaw-runtime/locales/es/cli.ftl"),
+            ),
+            (
+                "fr",
+                include_str!("../crates/zeroclaw-runtime/locales/fr/cli.ftl"),
+            ),
+            (
+                "ja",
+                include_str!("../crates/zeroclaw-runtime/locales/ja/cli.ftl"),
+            ),
+            (
+                "zh-CN",
+                include_str!("../crates/zeroclaw-runtime/locales/zh-CN/cli.ftl"),
+            ),
+        ];
+
+        for (locale, cli_ftl) in locales {
+            let rows = quickstart_checklist_rows_for_locale(cli_ftl);
+            assert_eq!(rows.len(), 7, "{locale}: expected seven checklist rows");
+
+            for width in 0..=120usize {
+                let Some(budget) = quickstart_selector_row_budget(width) else {
+                    continue;
+                };
+
+                let fitted: Vec<String> = rows
+                    .iter()
+                    .map(|row| fit_quickstart_selector_row(row, budget))
+                    .collect();
+
+                for (row, label) in rows.iter().zip(&fitted) {
+                    assert!(
+                        !label.is_empty(),
+                        "{locale}: width {width} accepted but {row:?} fits to an empty label"
+                    );
+                    assert!(
+                        label.chars().any(|ch| ch.is_alphanumeric()),
+                        "{locale}: width {width} accepted but {row:?} fits to {label:?}, \
+                         which carries no readable text"
+                    );
+                }
+
+                let distinct: std::collections::HashSet<&str> =
+                    fitted.iter().map(String::as_str).collect();
+                assert_eq!(
+                    distinct.len(),
+                    fitted.len(),
+                    "{locale}: width {width} accepted but the fitted rows are not all \
+                     distinguishable: {fitted:?}"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_rejects_widths_that_erase_action_labels() {
+        // The specific widths the previous floor blessed. At width 3 the row
+        // budget was 0 and every label fitted to ""; at width 4 the budget was
+        // 1 and every label fitted to ".". Both must now be rejected before
+        // any interaction can start.
+        let rows = quickstart_checklist_rows_for_locale(include_str!(
+            "../crates/zeroclaw-runtime/locales/en/cli.ftl"
+        ));
+
+        for width in [0usize, 1, 2, 3, 4, 5, 10, 19] {
+            assert_eq!(
+                quickstart_selector_row_budget(width),
+                None,
+                "width {width} must be rejected, not fitted"
+            );
+        }
+
+        // Demonstrate what acceptance at those widths would have meant, so the
+        // rejection above is anchored to the user-visible failure rather than
+        // to an arbitrary constant.
+        for (collapsed_budget, expected) in [(0usize, ""), (1, ".")] {
+            let fitted: std::collections::HashSet<String> = rows
+                .iter()
+                .map(|row| fit_quickstart_selector_row(row, collapsed_budget))
+                .collect();
+            assert_eq!(
+                fitted,
+                std::collections::HashSet::from([expected.to_string()]),
+                "budget {collapsed_budget} collapses every action to {expected:?}"
+            );
+        }
+
+        assert!(
+            quickstart_selector_row_budget(QUICKSTART_SELECTOR_MIN_WIDTH).is_some(),
+            "the floor itself must remain usable"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_height_prevents_paging_suffixes() {
+        let item_count = 7;
+        let min_height = quickstart_selector_min_height(item_count);
+
+        assert_eq!(min_height, 9);
+        assert!((0..min_height).all(|height| !quickstart_selector_fits_height(height, item_count)));
+        assert!(quickstart_selector_fits_height(min_height, item_count));
+        assert!(quickstart_selector_fits_height(min_height + 1, item_count));
+        assert_eq!(
+            quickstart_selector_min_height(usize::MAX),
+            usize::MAX,
+            "the terminal guard must not wrap on an unexpected item count"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_prompt_stays_within_final_terminal_budget() {
+        let prompts = [
+            "Open a selector (Enter), or pick Create. Esc to quit.",
+            "選択肢を開くには Enter、終了するには Esc を押してください。",
+            "Open a selector\nwithout adding a physical terminal row.",
+        ];
+
+        for terminal_width in [20, 40, 80] {
+            let budget = quickstart_selector_row_budget(terminal_width).unwrap();
+            for prompt in prompts {
+                let fitted = fit_quickstart_selector_row(prompt, budget);
+                assert!(
+                    fitted.len() <= budget,
+                    "{fitted:?} uses {} bytes with budget {budget}",
+                    fitted.len()
+                );
+                assert!(
+                    console::measure_text_width(&fitted) <= budget,
+                    "{fitted:?} uses {} columns with budget {budget}",
+                    console::measure_text_width(&fitted)
+                );
+                assert!(
+                    fitted.chars().all(|ch| !ch.is_control()),
+                    "{fitted:?} contains a terminal control character"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_unknown_terminal_size_fails_closed() {
+        // `console::Term::size()` silently substitutes (24, 80) when the size
+        // query fails, so a narrow terminal with an unavailable size would get
+        // rows fitted for 77 columns. The checklist must resolve its geometry
+        // through the checked query and treat "unknown" as unusable.
+        assert!(
+            !quickstart_selector_size_is_usable(None),
+            "an unknown terminal size must not be accepted for fitting"
+        );
+        assert!(
+            quickstart_selector_size_is_usable(Some((24, 80))),
+            "a reported size must still be accepted"
+        );
+
+        // A real 80x24 terminal and the fabricated fallback are indistinguishable
+        // once `size()` has flattened them, which is exactly why the checked
+        // query is the one wired into the selector.
+        let term = console::Term::stderr();
+        assert_eq!(
+            quickstart_selector_terminal_size(&term),
+            term.size_checked(),
+            "the selector must resolve geometry through the checked size query"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selector_recheck_rejects_resize_and_unknown_size() {
+        let initial = (24u16, 80u16);
+
+        assert!(
+            quickstart_selector_recheck_size(initial, Some(initial)).is_ok(),
+            "an unchanged size must allow the interaction to continue"
+        );
+
+        let resized = quickstart_selector_recheck_size(initial, Some((24, 40)))
+            .expect_err("a changed size must abort the interaction");
+        assert!(
+            resized.to_string().contains("40"),
+            "the resize error should name the new width; got {resized}"
+        );
+
+        // The important half: unknown is not evidence the geometry still
+        // matches. Without the checked query this branch would compare the
+        // fabricated (24, 80) against the initial sample, find them equal, and
+        // keep redrawing rows fitted for a terminal it can no longer see.
+        let unknown = quickstart_selector_recheck_size(initial, None)
+            .expect_err("an unavailable size must abort the interaction");
+        assert_eq!(
+            unknown.to_string(),
+            qta("cli-quickstart-terminal-size-unknown", &[]),
+            "unknown size must surface the localized size-unknown error"
+        );
+    }
+
+    #[cfg(feature = "agent-runtime")]
+    #[test]
+    fn quickstart_selection_maps_by_index_when_fitted_labels_are_identical() {
+        let actions = [
+            QuickstartChecklistAction::Provider,
+            QuickstartChecklistAction::Risk,
+            QuickstartChecklistAction::Memory,
+            QuickstartChecklistAction::Channels,
+            QuickstartChecklistAction::PeerGroups,
+            QuickstartChecklistAction::Agent,
+            QuickstartChecklistAction::Create,
+        ];
+        let choices: Vec<(QuickstartChecklistAction, String)> = actions
+            .iter()
+            .copied()
+            .map(|action| (action, "same row".to_string()))
+            .collect();
+        let fitted: Vec<String> = choices
+            .iter()
+            .map(|(_, label)| fit_quickstart_selector_row(label, 0))
+            .collect();
+        assert!(fitted.windows(2).all(|pair| pair[0] == pair[1]));
+
+        for (index, expected) in actions.into_iter().enumerate() {
+            assert_eq!(quickstart_action_for_pick(&choices, Some(index)), expected);
+        }
+        assert_eq!(
+            quickstart_action_for_pick(&choices, None),
+            QuickstartChecklistAction::Quit
+        );
+        assert_eq!(
+            quickstart_action_for_pick(&choices, Some(choices.len())),
+            QuickstartChecklistAction::Quit
+        );
+    }
 
     #[test]
     #[cfg(feature = "agent-runtime")]

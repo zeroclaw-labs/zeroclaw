@@ -506,6 +506,7 @@ cli-no-command = 未提供命令。
 cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
 cli-quickstart-needs-tty = Quickstart 是交互式流程，需要 stdin 和 stderr 连接到终端。请从交互式 shell 中运行，或使用 `zeroclaw config set <path> <value>` 进行无头配置。
+cli-quickstart-terminal-size-unknown = Quickstart 无法确定终端尺寸，因此无法验证清单能否完整显示。请在会报告尺寸的终端中运行，或使用 `zeroclaw config set <path> <value>` 进行无头配置。
 cli-quickstart-cancelled = 已取消 quickstart。未写入配置。
 cli-quickstart-incomplete = {"  "}尚未填写所有选择器。
 cli-quickstart-create-agent = ── 创建 agent
