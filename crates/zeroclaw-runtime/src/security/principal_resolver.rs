@@ -1,4 +1,4 @@
-//! The RFC #7141 shared principal resolver: ONE place that maps a
+//! The RFC 7141 shared principal resolver: ONE place that maps a
 //! provider-verified [`AuthenticatedIdentity`] to a canonical [`Principal`]
 //! and its currently-configured grants.
 //!

@@ -1,4 +1,4 @@
-//! The RFC #7141 identity contract: what an auth provider outputs
+//! The RFC 7141 identity contract: what an auth provider outputs
 //! ([`AuthenticatedIdentity`]) and what the shared resolver turns it into
 //! (the canonical [`Principal`]).
 //!
