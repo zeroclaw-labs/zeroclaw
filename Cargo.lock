@@ -13745,6 +13745,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "shellexpand",
+ "shlex",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

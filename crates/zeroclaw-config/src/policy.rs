@@ -863,23 +863,171 @@ fn workspace_prefixed_relative_suffix(path: &Path, workspace_dir: &Path) -> Opti
 /// Skip leading environment variable assignments (e.g. `FOO=bar cmd args`).
 /// Returns the remainder starting at the first non-assignment word.
 fn skip_env_assignments(s: &str) -> &str {
-    let mut rest = s;
+    let mut rest = s.trim_start();
     loop {
-        let Some(word) = rest.split_whitespace().next() else {
+        let len = shell_word_len(rest);
+        if len == 0 {
             return rest;
-        };
-        // Environment assignment: contains '=' and starts with a letter or underscore
-        if word.contains('=')
-            && word
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        {
-            // Advance past this word
-            rest = rest[word.len()..].trim_start();
+        }
+        // Quote-aware `word` keeps `FOO="a b"` whole, so a spaced quoted value
+        // cannot leave `b"` behind as the apparent executable.
+        if is_env_assignment(&rest[..len]) {
+            rest = rest[len..].trim_start();
         } else {
             return rest;
         }
+    }
+}
+
+/// True when `word` is a shell environment assignment prefix — both the plain
+/// `NAME=value` form and the Bash append form `NAME+=value`. `NAME` starts with
+/// a letter or underscore and is otherwise alnum/underscore. Recognizing the
+/// append form matters for security: `NAME+=value git commit` is a valid
+/// assignment-prefixed command, so if it were not treated as an assignment the
+/// `NAME+=value` token would be misread as the executable and hide the real
+/// `git` verb from the risk classifier.
+fn is_env_assignment(word: &str) -> bool {
+    let Some(eq) = word.find('=') else {
+        return false;
+    };
+    // Accept the Bash append-assignment operator `+=` by trimming a single
+    // trailing `+` off the name before validating it.
+    let name = word[..eq].strip_suffix('+').unwrap_or(&word[..eq]);
+    !name.is_empty()
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Byte length of the first shell word in the already left-trimmed `s`, honoring
+/// single/double quotes and backslash escapes so a quoted value containing
+/// spaces (`"a b"`, `FOO="a b"`) is a single word. 0 when `s` is empty; an
+/// unterminated quote runs to the end of `s`.
+fn shell_word_len(s: &str) -> usize {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+    for (i, ch) in s.char_indices() {
+        match quote {
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '\'' {
+                    quote = QuoteState::Single;
+                } else if ch == '"' {
+                    quote = QuoteState::Double;
+                } else if ch.is_whitespace() {
+                    return i;
+                }
+            }
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+        }
+    }
+    s.len()
+}
+
+/// Byte length of the leading shell-redirection operator in `tok`, if the token
+/// begins with one. Recognizes an optional leading file-descriptor number
+/// followed by a redirection operator (`>`, `>>`, `<`, `<<`, `<<<`, `<>`, `>&`,
+/// `<&`, `>|`) plus the fd-less `&>` / `&>>` forms. The returned length lets the
+/// caller tell a bare operator (`>` — its target is a separate token) from a
+/// self-contained one (`>/dev/null`, `2>&1` — target attached).
+fn redirection_prefix_len(tok: &str) -> Option<usize> {
+    let bytes = tok.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    let rest = &tok[i..];
+    // `&>` / `&>>` take no leading fd number.
+    if i == 0 {
+        if rest.starts_with("&>>") {
+            return Some(3);
+        }
+        if rest.starts_with("&>") {
+            return Some(2);
+        }
+    }
+    // Longest operators first so `>>` is not read as `>`.
+    for op in ["<<<", "<<", ">>", "<>", ">&", "<&", ">|", ">", "<"] {
+        if rest.starts_with(op) {
+            return Some(i + op.len());
+        }
+    }
+    None
+}
+
+/// Strip leading shell redirections (and their operand targets) from a single
+/// command segment so executable discovery sees the real command rather than a
+/// redirect operator: `> /dev/null git commit` -> `git commit`,
+/// `>&1 git commit` -> `git commit`, `< in git log` -> `git log`. Trailing
+/// redirections are left in place — they do not hide the executable. Shared by
+/// the allowlist check and the risk classifier so a leading redirection cannot
+/// pass one gate while hiding the command from the other. Returns a suffix slice
+/// of `segment`.
+fn strip_leading_redirections(segment: &str) -> &str {
+    let mut rest = segment.trim_start();
+    loop {
+        let tok_len = shell_word_len(rest);
+        if tok_len == 0 {
+            break;
+        }
+        let tok = &rest[..tok_len];
+        let Some(op_len) = redirection_prefix_len(tok) else {
+            break;
+        };
+        // Advance past the redirection token itself.
+        rest = rest[tok_len..].trim_start();
+        // A bare operator (the whole token IS the operator) consumes its target
+        // as the following word; a self-contained form (`>/dev/null`, `2>&1`)
+        // carries its target inside the token, so there is nothing to consume.
+        // The quote-aware word length keeps a spaced quoted target (`> "a b"`)
+        // as one operand; the guard stops a second redirection operator from
+        // being eaten, so `> > x` keeps failing closed rather than swallowing both.
+        if op_len == tok.len() {
+            let opnd_len = shell_word_len(rest);
+            if opnd_len > 0 && redirection_prefix_len(&rest[..opnd_len]).is_none() {
+                rest = rest[opnd_len..].trim_start();
+            }
+        }
+    }
+    rest
+}
+
+/// Resolve the effective command segment past any *interleaved* leading
+/// environment assignments and shell redirections, so every approval gate
+/// discovers the executable the shell would actually run — not an assignment or
+/// a redirect operator. `FOO=bar > /dev/null git commit`,
+/// `> /dev/null FOO=bar git commit`, and `> "spaced name" git commit` all
+/// resolve to `git commit`. Quote-aware; trailing redirections are left in
+/// place. Shared by the risk classifier and both allowlist checks so a prefix
+/// cannot hide the command from one gate while another still sees it. A
+/// prefix-only segment resolves to `""` (no real executable) — callers treat
+/// that as "no command present" rather than accepting the raw prefix token.
+fn strip_command_prefix(segment: &str) -> &str {
+    let mut rest = segment.trim_start();
+    loop {
+        let next = strip_leading_redirections(skip_env_assignments(rest));
+        if next.len() == rest.len() {
+            return next;
+        }
+        rest = next;
     }
 }
 
@@ -1931,6 +2079,260 @@ fn powershell_named_risk(base: &str) -> Option<CommandRiskLevel> {
     None
 }
 
+/// True when a command segment carries an unquoted brace/glob expansion
+/// metacharacter (`{ * ? [`).
+///
+/// `shlex` models quoting but not brace or pathname expansion, so a segment like
+/// `git -C {.,commit}` tokenizes differently than the argument vector bash runs.
+/// The git classifier uses this quote-aware scan to fail closed rather than trust
+/// tokens the shell would rewrite. Metacharacters inside single/double quotes or
+/// escaped are literal and do not count.
+fn contains_unquoted_expansion_metachar(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+                // Brace/glob metacharacters are literal inside double quotes.
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                match ch {
+                    '\\' => escaped = true,
+                    '\'' => quote = QuoteState::Single,
+                    '"' => quote = QuoteState::Double,
+                    '{' | '*' | '?' | '[' => return true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// True if the segment contains a `<` or `>` that is quoted or escaped — a literal
+/// path character rather than a shell redirect. `shlex::split` strips the quotes, so
+/// `git_effective_args` would misread the resulting token (`repo>` from `-C "repo>"`)
+/// as a redirect and drop the following token, losing the real verb and classifying a
+/// write as Low. When this is present the caller fails closed, because a trustworthy
+/// argv cannot be rebuilt from quote-stripped tokens. An unquoted `<` / `>` is a genuine
+/// redirect and is left to `git_effective_args`.
+fn contains_quoted_redirect_char(command: &str) -> bool {
+    let mut quote = QuoteState::None;
+    let mut escaped = false;
+
+    for ch in command.chars() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '<' || ch == '>' {
+                    return true; // literal inside single quotes
+                }
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::Double => {
+                if ch == '<' || ch == '>' {
+                    return true; // literal inside double quotes, regardless of escaping
+                }
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
+                if ch == '"' {
+                    quote = QuoteState::None;
+                }
+            }
+            QuoteState::None => {
+                if escaped {
+                    escaped = false;
+                    if ch == '<' || ch == '>' {
+                        return true; // backslash-escaped redirect char is a literal
+                    }
+                    continue;
+                }
+                match ch {
+                    '\\' => escaped = true,
+                    '\'' => quote = QuoteState::Single,
+                    '"' => quote = QuoteState::Double,
+                    // Unquoted `<` / `>` is a real redirect; handled by git_effective_args.
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Resolve the real `git` subcommand, skipping leading global options:
+/// `-C <path>`, `-c <cfg>`, `--git-dir[=]<p>`, `--work-tree[=]<p>`,
+/// `--namespace <n>`, `--super-prefix <p>`, `--config-env <n>`,
+/// `--exec-path[=<p>]`, the `--opt=value` glued form, and value-less flags.
+///
+/// Agents have no `cd`, so they address repositories with `git -C <path> <verb>`.
+/// Reading the verb as `args.first()` then returns the global option instead of
+/// the subcommand, which misclassifies write-git as Low and lets it skip the
+/// medium-risk approval gate.
+fn git_subcommand(args: &[String]) -> Option<&str> {
+    // Options that consume the NEXT token as a value (space-separated form).
+    // `-C` folds to `-c` under the case-insensitive check below; both take
+    // a value, so either way the value token is skipped.
+    const TAKES_VALUE: &[&str] = &[
+        "-c",
+        "--git-dir",
+        "--work-tree",
+        "--namespace",
+        "--super-prefix",
+        "--config-env",
+        "--exec-path",
+    ];
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if !a.starts_with('-') {
+            return Some(a); // first non-option token is the subcommand
+        }
+        if a.contains('=') {
+            i += 1; // `--opt=value` / `-C=...` glued form consumes nothing extra
+            continue;
+        }
+        if TAKES_VALUE.contains(&a.to_ascii_lowercase().as_str()) {
+            i += 2; // skip the option and its value
+            continue;
+        }
+        i += 1; // value-less flag
+    }
+    None
+}
+
+/// Rebuild a git segment's real argument vector from `shlex` tokens, dropping the
+/// shell redirections `shlex` mis-tokenizes as ordinary words.
+///
+/// `shlex` models quoting but not redirections, so `git -C /repo 2>/dev/null
+/// commit` tokenizes to `[git, -C, /repo, 2>/dev/null, commit]`. The shell removes
+/// `2>/dev/null` from the argv before exec, but leaving it in place makes
+/// `git_subcommand` skip `-C` and its value and then read the redirection token —
+/// the first thing that does not start with `-` — as the subcommand, missing the
+/// real `commit`. Removing redirections (a leading fd-number prefix with its
+/// target, the `> file` two-token form, and fd merges like `2>&1`) makes the
+/// classifier's argv match the shell's. A real word glued ahead of a redirect
+/// (`commit>log`) keeps its prefix so the verb still resolves; a bare fd number
+/// does not. Tokens are lower-cased to match `git_subcommand`.
+fn git_effective_args(tokens: Vec<String>) -> Vec<String> {
+    fn prefix_arg(prefix: &str) -> Option<String> {
+        let prefix = prefix.trim();
+        (!prefix.is_empty() && !prefix.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| prefix.to_string())
+    }
+
+    let mut args = Vec::new();
+    let mut drop_next_target = false;
+    for token in tokens.into_iter().skip(1) {
+        if drop_next_target {
+            drop_next_target = false; // this token is a redirect target, not argv
+            continue;
+        }
+        let token = token.to_ascii_lowercase();
+        let (keep, prefix, drop_next) = match parse_redirection_argument(&token) {
+            RedirectionArgument::None => (true, None, false),
+            RedirectionArgument::Target { prefix, .. } | RedirectionArgument::FdOnly { prefix } => {
+                (false, prefix_arg(prefix), false)
+            }
+            RedirectionArgument::NeedsNextToken { prefix } => (false, prefix_arg(prefix), true),
+        };
+        if keep {
+            args.push(token);
+        } else if let Some(prefix) = prefix {
+            args.push(prefix);
+        }
+        drop_next_target = drop_next;
+    }
+    args
+}
+
+/// Shell-aware Medium-risk classification of a single `git` command segment.
+///
+/// The risk classifier word-splits each segment on whitespace, which fragments a
+/// quoted or escaped global-option value: `git -C "/repo with spaces" commit`
+/// naively tokenizes to `-C`, `"/repo`, `with`, `spaces"`, `commit`, so the verb
+/// reads as `with` and misses the real `commit` — letting a write skip the
+/// medium-risk approval gate. Re-tokenize the segment with shell quoting rules so
+/// the value stays a single token and the subcommand the shell would actually run
+/// is resolved. A segment that cannot be tokenized (unbalanced quotes) is treated
+/// conservatively as a write, so a malformed command can never slip under the gate.
+///
+/// `shlex` models quoting but NOT brace/pathname expansion, so its tokens can
+/// differ from the shell's real argument vector: bash expands `git -C {.,commit}`
+/// to `git -C . commit`, injecting a write verb the tokens never show. When the
+/// segment carries any unquoted expansion metacharacter we cannot certify the
+/// resolved subcommand, so we fail closed to a write (Medium). It also does not
+/// model redirections, so `git_effective_args` strips them first — otherwise a
+/// redirect placed before the verb (`git -C /repo 2>/dev/null commit`) would be
+/// read as the subcommand and let the write classify Low.
+fn git_segment_is_write(segment: &str) -> bool {
+    if contains_unquoted_expansion_metachar(segment) {
+        return true; // unmodeled shell expansion → effective verb unknown → Medium
+    }
+    if contains_quoted_redirect_char(segment) {
+        // A quoted or escaped `<` / `>` is a literal path character, but `shlex` strips
+        // the quotes, so the resulting token (e.g. `repo>` from `-C "repo>"`) is
+        // indistinguishable from a real redirect. `git_effective_args` would then drop
+        // the following token as a redirect target and lose the real verb, classifying a
+        // write as Low. We cannot rebuild a trustworthy argv from quote-stripped tokens
+        // here, so fail closed to a write (Medium).
+        return true;
+    }
+    let Some(tokens) = shlex::split(segment) else {
+        return true; // ambiguous parse → conservative Medium
+    };
+    // tokens[0] is the `git` executable; classify the verb the shell would run,
+    // past any leading global options and shell redirections.
+    let args = git_effective_args(tokens);
+    git_subcommand(&args).is_some_and(|verb| {
+        matches!(
+            verb,
+            "commit"
+                | "push"
+                | "reset"
+                | "clean"
+                | "rebase"
+                | "merge"
+                | "cherry-pick"
+                | "revert"
+                | "branch"
+                | "checkout"
+                | "switch"
+                | "tag"
+        )
+    })
+}
+
 fn generic_segment_risk(
     base: &str,
     args: &[String],
@@ -1996,29 +2398,15 @@ fn generic_segment_risk(
     }
 
     match base {
-        "git" => Some(
-            if args.first().is_some_and(|verb| {
-                matches!(
-                    verb.as_str(),
-                    "commit"
-                        | "push"
-                        | "reset"
-                        | "clean"
-                        | "rebase"
-                        | "merge"
-                        | "cherry-pick"
-                        | "revert"
-                        | "branch"
-                        | "checkout"
-                        | "switch"
-                        | "tag"
-                )
-            }) {
-                CommandRiskLevel::Medium
-            } else {
-                CommandRiskLevel::Low
-            },
-        ),
+        // Resolve the git verb from shell-aware tokens (skipping global options
+        // and redirections, failing closed on unmodeled expansion) instead of
+        // `args.first()`, which reads a leading `-C`/redirect as the subcommand
+        // and lets a write skip the medium-risk gate. See `git_segment_is_write`.
+        "git" => Some(if git_segment_is_write(joined_segment) {
+            CommandRiskLevel::Medium
+        } else {
+            CommandRiskLevel::Low
+        }),
         "npm" | "pnpm" | "yarn" => Some(
             if args.first().is_some_and(|verb| {
                 matches!(
@@ -2060,7 +2448,11 @@ impl SecurityPolicy {
         let mut saw_medium = false;
 
         for segment in split_unquoted_segments(command) {
-            let cmd_part = skip_env_assignments(&segment);
+            // Resolve the executable past interleaved leading env assignments and
+            // redirections (quote-aware) so `> /dev/null FOO=bar git commit` is
+            // classified on `git`, not `FOO=bar` or `>`. Both allowlist checks
+            // strip the same prefix so no gate can be bypassed while another sees it.
+            let cmd_part = strip_command_prefix(&segment);
             let mut words = cmd_part.split_whitespace();
             let Some(base_raw) = words.next() else {
                 continue;
@@ -2290,7 +2682,7 @@ impl SecurityPolicy {
     fn is_command_explicitly_allowed(&self, command: &str) -> bool {
         let segments = split_unquoted_segments(command);
         for segment in &segments {
-            let cmd_part = skip_env_assignments(segment);
+            let cmd_part = strip_command_prefix(segment);
             let mut words = cmd_part.split_whitespace();
             let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
             let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
@@ -2319,9 +2711,12 @@ impl SecurityPolicy {
             }
         }
 
-        // At least one real command must be present.
+        // At least one real command must be present past any prefix — a
+        // redirection-only segment (`> /dev/null`) must not count, or a leading
+        // redirect would make the whole command look explicitly allowed
+        // regardless of the allowlist.
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
+            let s = strip_command_prefix(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
         })
     }
@@ -2466,9 +2861,13 @@ impl SecurityPolicy {
         // Split on unquoted command separators and validate each sub-command.
         let segments = split_unquoted_segments(command);
         for segment in &segments {
-            // Strip leading env var assignments (e.g. FOO=bar cmd)
-            let cmd_part = skip_env_assignments(segment);
-
+            // Resolve the executable past interleaved leading env assignments and
+            // redirections (quote-aware), so a redirect or assignment placed
+            // before the command (`> /dev/null FOO=bar git commit`) cannot hide
+            // the real executable from the allowlist. The risk classifier and the
+            // explicit-high-risk-allow check strip the same prefix so no gate can
+            // be bypassed while another still sees the command.
+            let cmd_part = strip_command_prefix(segment);
             let mut words = cmd_part.split_whitespace();
             let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
             // Strip inline redirections from the executable token, e.g.
@@ -2505,9 +2904,10 @@ impl SecurityPolicy {
             }
         }
 
-        // At least one command must be present
+        // At least one real command must be present past any prefix — a
+        // redirection-only segment (`> /dev/null`) is not a command.
         segments.iter().any(|s| {
-            let s = skip_env_assignments(s.trim());
+            let s = strip_command_prefix(s.trim());
             s.split_whitespace().next().is_some_and(|w| !w.is_empty())
         })
     }
@@ -2672,7 +3072,7 @@ impl SecurityPolicy {
         };
 
         for segment in split_unquoted_segments(command) {
-            let cmd_part = skip_env_assignments(&segment);
+            let cmd_part = strip_command_prefix(&segment);
             let mut words = cmd_part.split_whitespace();
             let Some(executable) = words.next() else {
                 continue;
@@ -4218,6 +4618,402 @@ mod tests {
         assert_eq!(
             p.command_risk_level("touch file.txt"),
             CommandRiskLevel::Medium
+        );
+    }
+
+    #[test]
+    fn command_risk_medium_for_write_git_behind_global_options() {
+        // Regression: agents address repos via `git -C <path> <verb>`
+        // (no `cd`), so the verb must be resolved past leading global options.
+        // Otherwise write-git slips from Medium to Low and skips the approval gate.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            ..SecurityPolicy::default()
+        };
+        for cmd in [
+            "git -C /repo commit -m x",
+            "git -C /repo push",
+            "git --git-dir=/r/.git push",
+            "git --git-dir /r/.git reset --hard HEAD~1",
+            "git --no-pager -C /repo branch -D dev",
+        ] {
+            assert_eq!(
+                p.command_risk_level(cmd),
+                CommandRiskLevel::Medium,
+                "write-git behind global options must stay Medium: {cmd}"
+            );
+        }
+        // Read-git behind the same global options stays Low.
+        assert_eq!(
+            p.command_risk_level("git -C /repo status"),
+            CommandRiskLevel::Low
+        );
+    }
+
+    #[test]
+    fn git_subcommand_skips_global_options() {
+        let v = |s: &str| {
+            let args: Vec<String> = s
+                .split_whitespace()
+                .map(|w| w.to_ascii_lowercase())
+                .collect();
+            git_subcommand(&args).map(str::to_string)
+        };
+        assert_eq!(v("commit -m x").as_deref(), Some("commit"));
+        assert_eq!(v("-C /repo commit").as_deref(), Some("commit"));
+        assert_eq!(v("--git-dir=/r/.git push").as_deref(), Some("push"));
+        assert_eq!(v("--git-dir /r/.git push").as_deref(), Some("push"));
+        assert_eq!(v("-c user.name=x status").as_deref(), Some("status"));
+        assert_eq!(v("--no-pager -C /repo log").as_deref(), Some("log"));
+        assert_eq!(v("-C /repo").as_deref(), None); // options only, no subcommand
+        assert_eq!(v("").as_deref(), None);
+    }
+
+    #[test]
+    fn quoted_path_write_git_is_gated_at_the_enforcement_boundary() {
+        // The write verb hides behind a quoted (or escaped) `-C` / `--git-dir`
+        // value that naive whitespace splitting fragments. Drive the real
+        // approval decision through `validate_command_execution`, not just
+        // helper tokens: an unapproved quoted-path write must be REJECTED, the
+        // approved form must classify Medium, and the matching quoted-path read
+        // must stay Low and need no approval. This proves the classifier is
+        // wired to the enforcement boundary.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            // Preconditions the medium gate depends on (also the defaults):
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        for write in [
+            r#"git -C "/repo with spaces" commit -m x"#,
+            r"git -C /repo\ with\ spaces commit",
+            r#"git --git-dir "/r with spaces/.git" push"#,
+        ] {
+            assert!(
+                p.validate_command_execution(write, false).is_err(),
+                "unapproved quoted/escaped-path write-git must be rejected: {write}"
+            );
+            assert_eq!(
+                p.validate_command_execution(write, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved quoted/escaped-path write-git must classify Medium: {write}"
+            );
+        }
+
+        // The corresponding quoted-path read stays Low and needs no approval.
+        assert_eq!(
+            p.validate_command_execution(r#"git -C "/repo with spaces" status"#, false),
+            Ok(CommandRiskLevel::Low),
+            "quoted-path read-git must remain Low"
+        );
+    }
+
+    #[test]
+    fn shell_expansion_write_git_is_gated_at_the_enforcement_boundary() {
+        // `shlex::split` models quoting but not brace/glob expansion, so the shell
+        // can run a different argument vector than the tokens show: bash expands
+        // `git -C {.,commit}` to `git -C . commit`, promoting `commit` into the
+        // subcommand slot. The classifier must fail closed on any unmodeled
+        // unquoted expansion so this write cannot skip the medium-risk gate.
+        // Drive the real approval decision through `validate_command_execution`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        for expand in [
+            "git -C {.,commit}",  // brace expands to `git -C . commit`
+            "git {log,commit}",   // brace expands to inject `commit`
+            "git -C {.,push} -f", // brace expands to `git -C . push -f`
+        ] {
+            assert!(
+                p.validate_command_execution(expand, false).is_err(),
+                "unapproved shell-expansion write-git must be rejected: {expand}"
+            );
+            assert_eq!(
+                p.validate_command_execution(expand, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved shell-expansion write-git must classify Medium: {expand}"
+            );
+        }
+
+        // At the classifier level, any unquoted brace/glob makes the effective
+        // verb unknowable, so even a read-looking segment fails closed to Medium
+        // — a glob can shift the pre-verb region (`git -C * commit`) exactly like
+        // a brace does.
+        for expand in ["git -C * commit", "git log -- *.rs", "git ??? status"] {
+            assert_eq!(
+                p.command_risk_level(expand),
+                CommandRiskLevel::Medium,
+                "unquoted shell expansion in a git segment must classify Medium: {expand}"
+            );
+        }
+
+        // Quoting suppresses expansion in the shell, so a quoted glob in a read
+        // pathspec is not treated as an injection and stays Low.
+        assert_eq!(
+            p.validate_command_execution(r#"git log --oneline -- "*.rs""#, false),
+            Ok(CommandRiskLevel::Low),
+            "quoted read-git pathspec glob must remain Low"
+        );
+    }
+
+    #[test]
+    fn redirection_write_git_is_gated_at_the_enforcement_boundary() {
+        // `shlex` tokenizes shell redirections as ordinary words, so a redirect
+        // placed BEFORE the verb (`git -C /repo 2>/dev/null commit`) would be read
+        // as the subcommand and let the write skip the medium-risk gate. The
+        // classifier must strip redirections so its argv matches the shell's:
+        // pre-verb and post-verb writes both classify Medium, while a read that
+        // merely redirects its output stays Low. Drive the real approval decision
+        // through `validate_command_execution`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        for write in [
+            "git -C /repo 2>/dev/null commit", // pre-verb redirect glued to its target
+            "git -C /repo 2>&1 commit",        // pre-verb fd merge
+            "git 2> /dev/null push",           // pre-verb redirect, space-split target
+            "git -C /repo commit 2>&1",        // post-verb redirect is still a write
+        ] {
+            assert!(
+                p.validate_command_execution(write, false).is_err(),
+                "unapproved write-git with a redirect must be rejected: {write}"
+            );
+            assert_eq!(
+                p.validate_command_execution(write, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved write-git with a redirect must classify Medium: {write}"
+            );
+        }
+
+        // A read that only redirects its output is not a write and stays Low.
+        for read in [
+            "git -C /repo status 2>/dev/null",
+            "git log 2>&1",
+            "git status 2> /dev/null",
+        ] {
+            assert_eq!(
+                p.validate_command_execution(read, false),
+                Ok(CommandRiskLevel::Low),
+                "read-git with a redirect must remain Low: {read}"
+            );
+        }
+    }
+
+    #[test]
+    fn leading_redirection_write_git_is_gated_at_the_enforcement_boundary() {
+        // A redirection placed BEFORE the executable (`> /dev/null git commit`)
+        // hides `git` from executable discovery at both gates: the allowlist read
+        // `>` as the command token, stripped it to an empty string, and `continue`d
+        // without ever validating `git` or its args; the risk classifier
+        // independently saw `>` as the base and never ran git-write detection,
+        // returning Low. An unapproved git write then slipped past the medium-risk
+        // gate as `Ok(Low)`. Both gates must normalize leading redirections and
+        // discover the real `git` executable. Drive the real approval decision
+        // through `validate_command_execution`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        for write in [
+            "> /dev/null git commit", // leading output redirect, space-split target
+            ">&1 git commit",         // leading fd merge (self-contained)
+            "< /dev/null git commit", // leading input redirect from a safe source
+        ] {
+            assert!(
+                p.validate_command_execution(write, false).is_err(),
+                "unapproved write-git behind a leading redirect must be rejected: {write}"
+            );
+            assert_eq!(
+                p.validate_command_execution(write, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved write-git behind a leading redirect must classify Medium: {write}"
+            );
+        }
+
+        // The real executable stays subject to the allowlist: with `git` absent,
+        // a leading redirect must not smuggle it past the empty-executable skip.
+        let no_git = SecurityPolicy {
+            allowed_commands: vec!["ls".into()],
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        };
+        assert!(
+            no_git
+                .validate_command_execution("> /dev/null git status", false)
+                .is_err(),
+            "a leading redirect must not smuggle a non-allowlisted executable past the allowlist"
+        );
+
+        // A read behind a leading redirect is still correctly identified as git
+        // and stays Low — the fix normalizes the head without inflating risk.
+        assert_eq!(
+            p.validate_command_execution("< /dev/null git status", false),
+            Ok(CommandRiskLevel::Low),
+            "leading-redirect read-git must remain Low"
+        );
+    }
+
+    #[test]
+    fn interleaved_prefix_and_quoted_redirect_do_not_bypass_the_git_or_high_risk_gates() {
+        // Environment assignments and redirections can INTERLEAVE before the
+        // executable, and a redirect target or an assignment value can be a quoted
+        // string with spaces. Single-pass or whitespace-split prefix stripping
+        // leaves the wrong token (`FOO=bar`, or `b"` from `> "a b"`) as the
+        // apparent executable, so the shell runs the real command while the policy
+        // classifies the decoy. The prefix resolver must be interleaved AND
+        // quote-aware, and every gate must use it. Drive the real approval
+        // decision through `validate_command_execution`.
+        let git = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+
+        for write in [
+            "> /dev/null FOO=bar git commit", // redirect then assignment
+            "FOO=bar > /dev/null git commit", // assignment then redirect
+            "FOO=bar 2>&1 BAZ=qux git push",  // interleaved, multiple
+            r#"FOO="a b" git commit"#,        // quoted assignment value with a space
+            "NAME+=bar git commit",           // Bash append-assignment prefix
+            "> /dev/null PATH+=x git commit", // append-assignment after a redirect
+        ] {
+            assert!(
+                git.validate_command_execution(write, false).is_err(),
+                "unapproved write-git behind an interleaved/quoted prefix must be rejected: {write}"
+            );
+            assert_eq!(
+                git.validate_command_execution(write, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved write-git behind an interleaved/quoted prefix must classify Medium (never Low): {write}"
+            );
+        }
+
+        // A leading redirect to a non-device target (quoted or spaced) is rejected
+        // earlier by the output-redirect safety gate, so it never reaches the
+        // git-write classification. Confirm that boundary still holds — the prefix
+        // resolver must not turn an unsafe redirect into an allowed command.
+        for unsafe_redir in [r#"> "a b" git commit"#, r#"FOO=x > "c d" git commit"#] {
+            assert!(
+                git.validate_command_execution(unsafe_redir, true).is_err(),
+                "a leading redirect to a non-device file must be rejected: {unsafe_redir}"
+            );
+        }
+
+        // The real executable stays subject to the allowlist: with `git` absent,
+        // the interleaved/quoted prefix must not smuggle it through.
+        let no_git = SecurityPolicy {
+            allowed_commands: vec!["ls".into()],
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        };
+        for smuggle in ["> /dev/null FOO=bar git status", r#"FOO="a b" git status"#] {
+            assert!(
+                no_git.validate_command_execution(smuggle, false).is_err(),
+                "interleaved/quoted prefix must not smuggle a non-allowlisted executable: {smuggle}"
+            );
+        }
+
+        // A read behind the same prefix shapes stays Low — the resolver finds
+        // `git` without inflating risk.
+        for read in ["> /dev/null FOO=bar git status", r#"FOO="a b" git status"#] {
+            assert_eq!(
+                git.validate_command_execution(read, false),
+                Ok(CommandRiskLevel::Low),
+                "read-git behind an interleaved/quoted prefix must stay Low: {read}"
+            );
+        }
+
+        // High-risk equivalent: a leading redirection must not smuggle a command
+        // that is only wildcard-allowed (not EXPLICITLY listed) past the
+        // high-risk-block exemption under Full autonomy. The main allowlist admits
+        // it via `*`, but `is_command_explicitly_allowed` must resolve the real
+        // `rm` and refuse the exemption, so the block still fires.
+        let full_wildcard = SecurityPolicy {
+            allowed_commands: vec!["*".into()],
+            autonomy: AutonomyLevel::Full,
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        for high in ["> /dev/null rm -rf /", "FOO=bar > /dev/null rm -rf /"] {
+            assert!(
+                full_wildcard
+                    .validate_command_execution(high, false)
+                    .is_err(),
+                "leading redirect must not exempt a wildcard-only high-risk command from the block: {high}"
+            );
+        }
+
+        // The exemption still works for a genuinely, explicitly allowlisted
+        // high-risk command behind a safe leading redirect — the executable is
+        // really discovered and matched, not skipped.
+        let full_rm = SecurityPolicy {
+            allowed_commands: vec!["rm".into()],
+            autonomy: AutonomyLevel::Full,
+            block_high_risk_commands: true,
+            ..SecurityPolicy::default()
+        };
+        assert_eq!(
+            full_rm.validate_command_execution("> /dev/null rm -rf /tmp/x", false),
+            Ok(CommandRiskLevel::High),
+            "an explicitly allowed high-risk command behind a safe redirect stays exempted"
+        );
+    }
+
+    #[test]
+    fn quoted_redirect_char_write_git_is_gated_at_the_enforcement_boundary() {
+        // `shlex` strips quotes, so a quoted `<` / `>` in a global-option value
+        // (`git -C "repo>" commit`) becomes a bare `repo>` token that the redirect
+        // rebuild misreads as a redirect — dropping the real `commit` and classifying
+        // the write Low, while the shell treats `repo>` as a literal directory and runs
+        // the write. The classifier must fail closed on a quoted or escaped redirect
+        // character. Drive the real approval decision through `validate_command_execution`.
+        let p = SecurityPolicy {
+            allowed_commands: vec!["git".into()],
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+
+        for write in [
+            r#"git -C "repo>" commit"#,   // quoted `>` in -C value (double quotes)
+            r#"git -C 'repo>' commit"#,   // quoted `>` in -C value (single quotes)
+            r#"git --git-dir "d>" push"#, // quoted `>` in --git-dir value
+            r#"git -C "repo<" commit"#,   // quoted `<` in -C value
+            r"git -C repo\> commit",      // backslash-escaped `>` (literal)
+        ] {
+            assert!(
+                p.validate_command_execution(write, false).is_err(),
+                "unapproved write-git behind a quoted redirect char must be rejected: {write}"
+            );
+            assert_eq!(
+                p.validate_command_execution(write, true),
+                Ok(CommandRiskLevel::Medium),
+                "approved write-git behind a quoted redirect char must classify Medium: {write}"
+            );
+        }
+
+        // A read whose global-option value merely contains a quoted redirect char is
+        // classified Medium too — the deliberate fail-closed direction, since the
+        // quote-stripped token cannot be proven a literal rather than a redirect.
+        assert_eq!(
+            p.validate_command_execution(r#"git -C "repo>" status"#, true),
+            Ok(CommandRiskLevel::Medium),
+            "read-git behind a quoted redirect char fails closed to Medium"
         );
     }
 
