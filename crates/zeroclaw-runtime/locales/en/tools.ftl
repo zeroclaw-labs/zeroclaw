@@ -148,6 +148,10 @@ tool-pushover = Send a Pushover notification to your device. Requires PUSHOVER_T
 
 tool-schedule = Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"{"}"mode":"announce","channel":"discord","to":"<channel_id>"{"}"}.
 
+tool-sessions-send-param-session-id = The target session ID (for example, telegram__user123). Gateway dashboard sessions are owned by the gateway API and are not accepted by this tool.
+tool-sessions-send-error-gateway-owned = Gateway dashboard sessions are owned by the gateway lifecycle and cannot be changed with sessions_send. Use the authenticated POST /api/sessions/<id>/messages operation.
+tool-sessions-send-error-not-found = Session '{ $session_id }' not found. Use sessions_list or sessions_current to choose an existing session.
+
 tool-screenshot = Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data.
 tool-browser-screenshot-error-path-not-allowed = Screenshot path '{ $path }' is not in the workspace allowlist
 tool-browser-screenshot-error-parent-not-exist = Screenshot path '{ $path }' parent directory '{ $parent }' does not exist

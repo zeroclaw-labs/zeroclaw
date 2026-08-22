@@ -1438,6 +1438,12 @@ mod tests {
             cancel_tokens: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            session_turn_versions: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            session_lifecycle: std::sync::Arc::new(
+                crate::session_lifecycle::SessionLifecycle::new(),
+            ),
             pending_reload: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             sop_engine: None,

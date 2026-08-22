@@ -337,7 +337,9 @@ impl Tool for SessionsSendTool {
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "The target session ID (e.g. telegram__user123). Gateway dashboard sessions may be addressed by their dashboard ID or by gw_<id>."
+                    "description": crate::i18n::get_required_tool_string(
+                        "tool-sessions-send-param-session-id"
+                    )
                 },
                 "message": {
                     "type": "string",
@@ -400,17 +402,34 @@ impl Tool for SessionsSendTool {
             });
         }
 
+        // Gateway session incarnations, deletion, transcript completeness, and
+        // turn versions are owned by `zeroclaw-gateway::SessionLifecycle`.
+        // This generic tool has only a storage backend, so accepting a full
+        // gateway key here would create an unfenced writer. The authenticated
+        // gateway session-message API is the authority-aware mutation surface.
+        if session_id.trim().starts_with("gw_") {
+            return Ok(gateway_session_owned_result());
+        }
+
         let Some(target_session_key) =
             resolve_existing_session_key(self.backend.as_ref(), session_id)
         else {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
-                error: Some(format!(
-                    "Session '{session_id}' not found. Use sessions_list or sessions_current to choose an existing session. Gateway dashboard sessions are stored as 'gw_<session_id>'."
+                error: Some(crate::i18n::get_required_tool_string_with_args(
+                    "tool-sessions-send-error-not-found",
+                    &[("session_id", session_id)],
                 )),
             });
         };
+
+        // A dashboard display ID can resolve to the same gateway-owned key.
+        // Reject after resolution as well as before it so neither public input
+        // form can bypass the lifecycle authority.
+        if target_session_key.starts_with("gw_") {
+            return Ok(gateway_session_owned_result());
+        }
 
         let chat_msg = zeroclaw_api::model_provider::ChatMessage::user(message);
 
@@ -435,6 +454,16 @@ impl Tool for SessionsSendTool {
                 error: Some(format!("Failed to send message: {e}")),
             }),
         }
+    }
+}
+
+fn gateway_session_owned_result() -> ToolResult {
+    ToolResult {
+        success: false,
+        output: ToolOutput::default(),
+        error: Some(crate::i18n::get_required_tool_string(
+            "tool-sessions-send-error-gateway-owned",
+        )),
     }
 }
 
@@ -1098,13 +1127,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_to_gateway_session_accepts_dashboard_session_id() {
+    async fn send_rejects_gateway_session_while_detached_turn_completes() {
         let (_tmp, backend) = test_backend();
         backend
-            .append(
-                "gw_operator-1",
-                &ChatMessage::assistant("Existing dashboard message"),
-            )
+            .append("gw_operator-1", &ChatMessage::user("Detached turn prompt"))
             .unwrap();
         let tool = SessionsSendTool::new(backend.clone(), test_security());
 
@@ -1116,14 +1142,69 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success);
-        assert!(result.output.contains("gw_operator-1"));
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("gateway lifecycle"));
+
+        // The gateway-owned completion remains the only writer that extends
+        // the transcript; the generic tool did not interleave a user message.
+        backend
+            .append(
+                "gw_operator-1",
+                &ChatMessage::assistant("Detached turn completed"),
+            )
+            .unwrap();
 
         let gateway_messages = backend.load("gw_operator-1");
         assert_eq!(gateway_messages.len(), 2);
-        assert_eq!(gateway_messages[1].role, "user");
-        assert_eq!(gateway_messages[1].content, "Wake up");
+        assert_eq!(gateway_messages[1].role, "assistant");
+        assert_eq!(gateway_messages[1].content, "Detached turn completed");
         assert!(backend.load("operator-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_rejects_gateway_session_after_delete_without_recreating_it() {
+        let (_tmp, backend) = test_backend();
+        backend
+            .append("gw_deleted", &ChatMessage::assistant("Existing message"))
+            .unwrap();
+        assert!(backend.delete_session("gw_deleted").unwrap());
+        let tool = SessionsSendTool::new(backend.clone(), test_security());
+
+        let result = tool
+            .execute(json!({
+                "session_id": "gw_deleted",
+                "message": "Recreate the transcript"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("gateway lifecycle"));
+        assert!(!backend.session_exists("gw_deleted"));
+        assert!(backend.load("gw_deleted").is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_rejects_gateway_session_with_poisoned_transcript() {
+        let (_tmp, backend) = test_backend();
+        backend
+            .append("gw_poisoned", &ChatMessage::user("Partial turn"))
+            .unwrap();
+        backend.mark_transcript_incomplete("gw_poisoned").unwrap();
+        let tool = SessionsSendTool::new(backend.clone(), test_security());
+
+        let result = tool
+            .execute(json!({
+                "session_id": "poisoned",
+                "message": "Extend the partial transcript"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("gateway lifecycle"));
+        assert_eq!(backend.load("gw_poisoned").len(), 1);
+        assert!(backend.transcript_incomplete("gw_poisoned").unwrap());
     }
 
     #[tokio::test]
@@ -1232,6 +1313,11 @@ mod tests {
                 .unwrap()
                 .contains(&json!("message"))
         );
+        let session_id_description = schema["properties"]["session_id"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(session_id_description.contains("not accepted"));
+        assert!(session_id_description.contains("gateway API"));
     }
 
     // ── SessionsCurrentTool tests ──────────────────────────────────

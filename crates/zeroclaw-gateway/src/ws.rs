@@ -350,6 +350,10 @@ async fn handle_socket(
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    // The connection-scoped Agent and every mutation it prepares belong to
+    // this one incarnation. A delete requires a fresh connection/Agent rather
+    // than letting the old in-memory history mutate a recreated session.
+    let connection_incarnation = state.session_lifecycle.deletion_generation(&session_key);
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
@@ -373,6 +377,20 @@ async fn handle_socket(
             None
         }
     };
+    // Snapshot the session's turn-completion version *before* loading
+    // history below. This connection holds no `session_queue` permit yet,
+    // so this read and the `backend.load` below are not atomic with any
+    // other connection's turn — but `bump_turn_version` only ever runs
+    // *after* that turn's messages are fully persisted (see its call sites
+    // in `process_chat_message`), on every completion path. So a version
+    // this read can observe is always already reflected in whatever
+    // `backend.load` returns: the ordering below can only make our loaded
+    // messages as-new-as-or-newer-than `seen_version` implies, never
+    // staler. Worst case a redundant rehydrate on the first prompt; never a
+    // wrongly-skipped one.
+    let mut seen_version: u64 = current_turn_version(&state.session_turn_versions, &session_key);
+    let mut seen_persistence_generation =
+        state.session_lifecycle.persistence_generation(&session_key);
     let mut resumed = false;
     let mut message_count: usize = 0;
     let mut effective_name: Option<String> = None;
@@ -384,20 +402,25 @@ async fn handle_socket(
             stored_messages = messages;
             resumed = true;
         }
-        // Set session name if provided (non-empty) on connect
-        if let Some(ref name) = session_name
-            && !name.is_empty()
-        {
-            let _ = backend.set_session_name(&session_key, name);
-            effective_name = Some(name.clone());
-        }
+        // Handshake metadata belongs to the connection's incarnation. Keep
+        // both upserts behind lifecycle authority so an old connection cannot
+        // recreate SQLite metadata after DELETE established a new incarnation.
+        let _ =
+            state
+                .session_lifecycle
+                .with_incarnation(&session_key, connection_incarnation, || {
+                    if let Some(ref name) = session_name
+                        && !name.is_empty()
+                    {
+                        let _ = backend.set_session_name(&session_key, name);
+                        effective_name = Some(name.clone());
+                    }
+                    let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
+                });
         // If no name was provided via query param, load the stored name
         if effective_name.is_none() {
             effective_name = backend.get_session_name(&session_key).unwrap_or(None);
         }
-        // Stamp the agent alias so future /api/sessions queries and
-        // per-agent filters can attribute this session to its agent.
-        let _ = backend.set_session_agent_alias(&session_key, &agent_alias);
     }
 
     // Send session_start message to client
@@ -598,6 +621,20 @@ async fn handle_socket(
         if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(text) {
             if parsed["type"].as_str() == Some("message") {
                 if let Some(content) = first_chat_message_content(text) {
+                    // Capture the deletion generation *before* awaiting the
+                    // permit: the comparison after acquisition is what
+                    // distinguishes "deleted while I queued" from "this
+                    // session has simply never been written to disk yet".
+                    let deletion_generation = connection_incarnation;
+                    // Acquire the permit *first*: only once we hold it is it
+                    // guaranteed that any other connection's turn for this
+                    // session has fully finished (cancel token removed,
+                    // version bumped, messages persisted — see the bump
+                    // site in `process_chat_message`). A liveness snapshot
+                    // taken before the acquire (the previous approach) is
+                    // TOCTOU-prone: it can read "not live" because A hasn't
+                    // registered its cancel token yet, even though A holds
+                    // the permit and will complete before we get it.
                     let _session_guard = match state.session_queue.acquire(&session_key).await {
                         Ok(guard) => guard,
                         Err(e) => {
@@ -610,6 +647,60 @@ async fn handle_socket(
                             return;
                         }
                     };
+                    // The session may have been deleted while this prompt
+                    // sat behind another turn on the permit above. Reject it
+                    // rather than starting provider/tool execution for a
+                    // session that no longer exists.
+                    if session_deleted_while_queued(&state, &session_key, deletion_generation) {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                                "cli-ws-session-deleted"
+                            ),
+                            "code": "SESSION_DELETED"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        return;
+                    }
+                    if reject_prompt_after_failed_persistence(
+                        &state,
+                        &mut agent,
+                        &session_key,
+                        &mut seen_persistence_generation,
+                    ) {
+                        let err = serde_json::json!({
+                            "type": "error",
+                            "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                                "cli-ws-session-persistence-poisoned"
+                            ),
+                            "code": "SESSION_PERSISTENCE_FAILED"
+                        });
+                        let _ = sender.send(Message::Text(err.to_string().into())).await;
+                        return;
+                    }
+                    // Rehydrate iff a turn (this connection's own earlier
+                    // one, or a different connection's) has completed since
+                    // our `Agent` was last known current. The `seen_version`
+                    // update that matters lives after `process_chat_message`
+                    // below, unconditionally: it always re-derives the
+                    // correct value (whether or not we rehydrated here, and
+                    // even on `process_chat_message`'s early-return path,
+                    // where no bump happens and it just re-reads the
+                    // unchanged version), so there is nothing to track in
+                    // between.
+                    if current_turn_version(&state.session_turn_versions, &session_key)
+                        != seen_version
+                        && let Some(ref backend) = state.session_backend
+                        && let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                            dropped_messages,
+                            kept_turns,
+                            reason,
+                        }) =
+                            rehydrate_agent_from_backend(backend.as_ref(), &mut agent, &session_key)
+                    {
+                        let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                    }
                     process_chat_message(
                         &state,
                         &mut agent,
@@ -622,9 +713,14 @@ async fn handle_socket(
                         &content,
                         &session_key,
                         &session_id,
+                        deletion_generation,
                         auth_subject.as_deref(),
                     )
                     .await;
+                    // This connection's own turn just bumped the version;
+                    // track it so the next prompt on this connection does
+                    // not redundantly rehydrate.
+                    seen_version = current_turn_version(&state.session_turn_versions, &session_key);
                 }
             } else {
                 let unknown_type = parsed["type"].as_str().unwrap_or("unknown");
@@ -768,7 +864,16 @@ async fn handle_socket(
                     continue;
                 }
 
-                // Acquire session lock to serialize concurrent turns
+                // Capture the deletion generation *before* awaiting the
+                // permit — see the first-message path for why comparing
+                // generations, not probing existence, is what separates a
+                // deleted session from a not-yet-written one.
+                let deletion_generation = connection_incarnation;
+                // Acquire the permit *first* — see the comment at the other
+                // `session_queue.acquire` call site above (the first-message
+                // path) for why a pre-acquire liveness snapshot is TOCTOU-prone
+                // and why checking the turn-completion version under the
+                // permit closes that window.
                 let _session_guard = match state.session_queue.acquire(&session_key).await {
                     Ok(guard) => guard,
                     Err(e) => {
@@ -781,6 +886,53 @@ async fn handle_socket(
                         continue;
                     }
                 };
+                // The session may have been deleted while this prompt sat
+                // behind another turn on the permit above. Reject it rather
+                // than starting provider/tool execution for a session that
+                // no longer exists.
+                if session_deleted_while_queued(&state, &session_key, deletion_generation) {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                            "cli-ws-session-deleted"
+                        ),
+                        "code": "SESSION_DELETED"
+                    });
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
+                if reject_prompt_after_failed_persistence(
+                    &state,
+                    &mut agent,
+                    &session_key,
+                    &mut seen_persistence_generation,
+                ) {
+                    let err = serde_json::json!({
+                        "type": "error",
+                        "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                            "cli-ws-session-persistence-poisoned"
+                        ),
+                        "code": "SESSION_PERSISTENCE_FAILED"
+                    });
+                    let _ = sender.send(Message::Text(err.to_string().into())).await;
+                    continue;
+                }
+                // Rehydrate iff a turn has completed since our `Agent` was
+                // last known current. See the matching comment at the other
+                // `session_queue.acquire` call site for why the
+                // `seen_version` update that matters is the unconditional
+                // one after `process_chat_message` below, not here.
+                if current_turn_version(&state.session_turn_versions, &session_key) != seen_version
+                    && let Some(ref backend) = state.session_backend
+                    && let Some(zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                        dropped_messages,
+                        kept_turns,
+                        reason,
+                    }) = rehydrate_agent_from_backend(backend.as_ref(), &mut agent, &session_key)
+                {
+                    let frame = history_trimmed_ws_frame(dropped_messages, kept_turns, &reason);
+                    let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                }
 
                 process_chat_message(
                     &state,
@@ -794,9 +946,14 @@ async fn handle_socket(
                     &content,
                     &session_key,
                     &session_id,
-                        auth_subject.as_deref(),
+                    deletion_generation,
+                    auth_subject.as_deref(),
                 )
                 .await;
+                // This connection's own turn just bumped the version; track
+                // it so the next prompt on this connection does not
+                // redundantly rehydrate.
+                seen_version = current_turn_version(&state.session_turn_versions, &session_key);
             }
 
             // ── Broadcast event (cron/heartbeat results) ──────────────
@@ -897,18 +1054,46 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
+/// What happened when a completion path tried to persist its turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PersistOutcome {
+    /// Every message was written. Safe to advance the turn version.
+    Persisted,
+    /// The session was deleted during this turn. Nothing was written and
+    /// nothing must be: no append, no version bump, no epoch recreation.
+    SkippedDeleted,
+    /// At least one `append()` failed. The transcript is partial and must not
+    /// be certified as authoritative.
+    Failed,
+}
+
+/// Persist `messages` to `backend`, scoped to the incarnation that started
+/// this turn.
+///
+/// The caller holds the session's lifecycle authority through this function
+/// and the matching version/failure disposition.
+/// Deletion is therefore decided atomically by the lifecycle owner before
+/// this helper runs, never by backend absence. An existence probe is wrong in
+/// both directions here:
+///
+/// * A brand-new JSONL session has no file until its first `append()`, so
+///   "absent" would classify the very first completed turn of every new
+///   session as deleted and silently drop its messages.
+/// * A session deleted mid-turn is also absent, and the previous code returned
+///   "success" for that case, which let `bump_turn_version_after_persistence`
+///   recreate the epoch entry `DELETE` had just evicted. An existence check
+///   followed by `append()` could also race `DELETE` and recreate the JSONL
+///   file outright, because `SessionStore::append` opens with `.create(true)`.
+///
+/// DELETE uses the same per-session authority through backend removal and
+/// version eviction, so it cannot land mid-loop or between the append and
+/// version publication.
 fn persist_conversation_messages(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
     messages: &[zeroclaw_providers::ConversationMessage],
-) {
-    // if the user deleted the session between the turn starting and
-    // the post-turn persistence, don't resurrect it. The `aborted` / `done`
-    // / `error` frames are still sent to the client; we just refuse to
-    // re-create the row that `DELETE /api/sessions/{id}` just wiped.
-    if !backend.session_exists(session_key) {
-        return;
-    }
+) -> PersistOutcome {
+    let mut all_persisted = true;
     for message in messages {
         let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
             continue;
@@ -916,8 +1101,148 @@ fn persist_conversation_messages(
         if message.role == "system" {
             continue;
         }
-        let _ = backend.append(session_key, message);
+        if let Err(e) = backend.append(session_key, message) {
+            all_persisted = false;
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "session_key": session_key,
+                        "error": format!("{e}"),
+                    })),
+                "failed to persist conversation message"
+            );
+        }
     }
+    if all_persisted {
+        PersistOutcome::Persisted
+    } else {
+        PersistOutcome::Failed
+    }
+}
+
+/// Run a transcript mutation behind a durable intent marker.
+///
+/// The marker is written before the first message can change and cleared only
+/// after the whole mutation reports success. A process crash, partial append,
+/// or marker-clear failure therefore leaves a restart-visible poison marker.
+fn persist_with_transcript_intent(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    persist: impl FnOnce() -> PersistOutcome,
+) -> PersistOutcome {
+    if let Err(error) = backend.mark_transcript_incomplete(session_key) {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "session_key": session_key,
+                    "error": format!("{error}"),
+                })),
+            "failed to persist transcript intent marker"
+        );
+        return PersistOutcome::Failed;
+    }
+
+    let outcome = persist();
+    if outcome != PersistOutcome::Persisted {
+        return outcome;
+    }
+
+    if let Err(error) = backend.clear_transcript_incomplete(session_key) {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "session_key": session_key,
+                    "error": format!("{error}"),
+                })),
+            "failed to clear transcript intent marker"
+        );
+        return PersistOutcome::Failed;
+    }
+
+    PersistOutcome::Persisted
+}
+
+/// Bump `session_key`'s turn-completion version according to how persistence
+/// actually resolved.
+///
+/// * `Persisted` — advance the version.
+/// * `SkippedDeleted` — do nothing at all. Recording a persistence failure
+///   here would be wrong (nothing failed) and bumping would recreate the
+///   epoch entry `DELETE` evicted.
+/// * `Failed` — withhold the bump *and* record the failure, so the next
+///   writer cannot mistake an unchanged version for "no turn completed".
+fn bump_turn_version_after_persistence(
+    session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    session_key: &str,
+    outcome: PersistOutcome,
+    disposition: &mut crate::session_lifecycle::SessionDisposition<'_>,
+) {
+    match outcome {
+        PersistOutcome::Persisted => {
+            bump_turn_version(session_turn_versions, session_key);
+        }
+        PersistOutcome::SkippedDeleted => {
+            // Deliberately inert: no append happened, no version may be
+            // certified, and the evicted epoch entry must stay evicted.
+        }
+        PersistOutcome::Failed => {
+            // Record the failure as well as withholding the bump. An unchanged
+            // version reads to a queued connection as "no turn completed", so it
+            // would skip rehydration and run against history the failed append
+            // was meant to extend.
+            disposition.record_persistence_failure();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"session_key": session_key})),
+                "not bumping turn-completion version after failed conversation persistence"
+            );
+        }
+    }
+}
+
+/// Hold the session incarnation authoritative through backend persistence and
+/// the matching turn-version/failure disposition.
+///
+/// DELETE uses the same per-session lifecycle mutex through backend removal
+/// and version eviction. It therefore happens wholly before this closure
+/// (which skips the mutation) or wholly after it (which removes the completed
+/// mutation); it cannot recreate storage or an epoch between a generation
+/// check and write.
+fn complete_turn_persistence(
+    lifecycle: &crate::session_lifecycle::SessionLifecycle,
+    session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    session_key: &str,
+    incarnation: crate::session_lifecycle::DeletionGeneration,
+    backend: Option<&dyn zeroclaw_infra::session_backend::SessionBackend>,
+    terminal_state: Option<(&str, Option<&str>)>,
+    persist: impl FnOnce() -> PersistOutcome,
+) -> PersistOutcome {
+    lifecycle
+        .with_completion(session_key, incarnation, |disposition| {
+            let outcome = match backend {
+                Some(backend) => persist_with_transcript_intent(backend, session_key, persist),
+                None => persist(),
+            };
+            if let (Some(backend), Some((state, turn_id))) = (backend, terminal_state) {
+                let _ = backend.set_session_state(session_key, state, turn_id);
+            }
+            bump_turn_version_after_persistence(
+                session_turn_versions,
+                session_key,
+                outcome,
+                disposition,
+            );
+            outcome
+        })
+        .unwrap_or(PersistOutcome::SkippedDeleted)
 }
 
 fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
@@ -928,6 +1253,218 @@ fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessag
                 if message.role == "assistant"
         )
     })
+}
+
+/// Fail closed when the WebSocket viewer can no longer answer supervised-mode
+/// tool prompts. Detaching the viewer must not cancel the whole turn, but it
+/// also must not leave an approval parked until its normal timeout or allow a
+/// later response from a dead connection to authorize the tool.
+fn deny_pending_ws_approvals(pending_approvals: &PendingApprovals) -> usize {
+    let pending: Vec<_> = pending_approvals.lock().drain().collect();
+    let count = pending.len();
+    for (_, response_tx) in pending {
+        let _ = response_tx.send(ChannelApprovalResponse::Deny);
+    }
+    count
+}
+
+fn detach_ws_viewer(client_attached: &mut bool, pending_approvals: &PendingApprovals) -> usize {
+    *client_attached = false;
+    deny_pending_ws_approvals(pending_approvals)
+}
+
+/// Outcome of trying to claim a session for a new turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TurnRegistration {
+    /// The token is now the canonical one for this session; run the turn.
+    Registered,
+    /// Another turn already holds this session.
+    TurnActive,
+    /// `DELETE` bumped the deletion generation after this prompt captured
+    /// its incarnation. The turn must not start.
+    SessionDeleted,
+}
+
+/// Register the canonical cancellation token for a session without replacing
+/// an already-running turn, and only while the caller's `incarnation` is still
+/// the live one. A second WebSocket may reconnect to the same session while
+/// the original turn is detached, so replacement would make the abort and
+/// session-state endpoints observe the wrong turn.
+///
+/// The deletion-generation check happens *inside* the `cancel_tokens` critical
+/// section, which is what makes it atomic with respect to
+/// `handle_api_session_delete`. That handler bumps the generation while
+/// holding this same `cancel_tokens` lock, so the two can no longer interleave:
+/// previously a DELETE could land after a prompt's post-acquire generation
+/// check but before it registered, see no live token to cancel, remove the
+/// session, and leave the socket free to start provider/tool execution for a
+/// session that no longer exists.
+///
+/// Lock order is `cancel_tokens` then `SessionLifecycle::authority`, matching
+/// `handle_api_session_delete`; both sites must keep that order.
+fn register_turn_if_current(
+    cancel_tokens: &std::sync::Mutex<
+        std::collections::HashMap<String, tokio_util::sync::CancellationToken>,
+    >,
+    lifecycle: &crate::session_lifecycle::SessionLifecycle,
+    session_key: &str,
+    incarnation: crate::session_lifecycle::DeletionGeneration,
+    cancel_token: tokio_util::sync::CancellationToken,
+) -> TurnRegistration {
+    use std::collections::hash_map::Entry;
+
+    let mut tokens = cancel_tokens.lock().expect("cancel_tokens lock poisoned");
+    // Re-check under the lock DELETE also takes. A generation bump between
+    // the caller's post-acquire check and this point means the session was
+    // destroyed while this prompt was still starting up.
+    if lifecycle.deleted_since(session_key, incarnation) {
+        return TurnRegistration::SessionDeleted;
+    }
+    match tokens.entry(session_key.to_string()) {
+        Entry::Vacant(entry) => {
+            entry.insert(cancel_token);
+            TurnRegistration::Registered
+        }
+        Entry::Occupied(_) => TurnRegistration::TurnActive,
+    }
+}
+
+/// True when `DELETE /api/sessions/{id}` removed this session while the
+/// caller sat queued on the `session_queue` permit.
+///
+/// Compares the deletion generation captured *before* the wait against the
+/// current one, rather than probing the backend for existence. An existence
+/// probe cannot express this: `SessionStore::session_exists` is a file-presence
+/// check and a JSONL session file is not created until its first append, so
+/// "absent" covers both *deleted* and *never written yet*. Probing therefore
+/// rejected the first prompt of every new session as `SESSION_DELETED`.
+///
+/// Generation comparison also catches delete-then-recreate, where the session
+/// exists at both ends of the wait but the caller's history is stale anyway.
+fn session_deleted_while_queued(
+    state: &AppState,
+    session_key: &str,
+    captured: crate::session_lifecycle::DeletionGeneration,
+) -> bool {
+    state.session_lifecycle.deleted_since(session_key, captured)
+}
+
+/// Reject a queued prompt whose session has a turn that failed to persist.
+///
+/// Withholding the turn-version bump on a failed append keeps a queued
+/// connection from *believing* a turn completed, but that is not by itself
+/// protective: with the version unchanged, the queued connection's
+/// `seen_version` comparison comes out equal, so it skips rehydration and
+/// runs its prompt against pre-turn history — precisely the transcript the
+/// failed append was supposed to extend. The result would be a silently
+/// divergent conversation rather than a visible error.
+///
+/// The gateway cannot prove that a backend load repairs missing messages, so
+/// it fails every prompt for the poisoned incarnation. An Agent that predates
+/// the failure is re-seeded once for display consistency, but old and newly
+/// prepared writers remain rejected until durable delete/recreate. Returns
+/// `true` when the caller should reject the prompt.
+fn reject_prompt_after_failed_persistence(
+    state: &AppState,
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    session_key: &str,
+    seen_generation: &mut crate::session_lifecycle::PersistenceGeneration,
+) -> bool {
+    let current_generation = state.session_lifecycle.persistence_generation(session_key);
+    let durable_incomplete = state.session_backend.as_ref().is_some_and(|backend| {
+        backend
+            .transcript_incomplete(session_key)
+            .unwrap_or_else(|error| {
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({
+                            "session_key": session_key,
+                            "error": format!("{error}"),
+                        })),
+                    "failed to read transcript intent marker"
+                );
+                true
+            })
+    });
+    if !state.session_lifecycle.persistence_poisoned(session_key) && !durable_incomplete {
+        return false;
+    }
+    // Re-seed an Agent that predates the failure for display consistency, but
+    // never interpret that load as transcript repair. New and old writers both
+    // remain rejected until delete/recreate establishes a fresh incarnation.
+    if current_generation != *seen_generation {
+        if let Some(ref backend) = state.session_backend {
+            let _ = rehydrate_agent_from_backend(backend.as_ref(), agent, session_key);
+        }
+        *seen_generation = current_generation;
+    }
+    true
+}
+
+/// Rehydrate a connection-scoped `Agent`'s history from the session backend.
+///
+/// Called under the `session_queue` permit, once this connection has
+/// observed (via `AppState::session_turn_versions`) that some turn — its own
+/// earlier one, or a different connection's — has completed since this
+/// `Agent`'s history was last known current. `process_chat_message` bumps
+/// the version, removes the cancel token, and persists the turn's messages
+/// all before it returns and releases the permit its caller holds, so by the
+/// time this runs, `backend.load` is guaranteed to be the authoritative,
+/// up-to-date transcript. Clearing and reseeding (rather than appending)
+/// avoids duplicating whatever this connection's `Agent` already held and
+/// guarantees the next turn runs against post-turn history, never a stale
+/// snapshot captured earlier (at connect time, or after this connection's
+/// own last turn).
+fn rehydrate_agent_from_backend(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    agent: &mut zeroclaw_runtime::agent::Agent,
+    session_key: &str,
+) -> Option<zeroclaw_api::agent::TurnEvent> {
+    let messages = backend.load(session_key);
+    agent.clear_history();
+    agent.seed_history_with_event(&messages)
+}
+
+/// Read `session_key`'s current turn-completion version — 0 if no turn has
+/// ever completed for this session. See `AppState::session_turn_versions`
+/// for the bump site and the invariant this backs.
+fn current_turn_version(
+    session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    session_key: &str,
+) -> u64 {
+    session_turn_versions
+        .lock()
+        .expect("session_turn_versions lock poisoned")
+        .get(session_key)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Bump `session_key`'s turn-completion version by one.
+///
+/// Must be called on every `process_chat_message` completion path — but
+/// only *after* that path's backend persistence (if any) has finished, never
+/// before. A connection's connect-time `current_turn_version` read (see
+/// `handle_socket`) happens without holding the `session_queue` permit, so
+/// it can race an in-flight turn's completion; the only thing that keeps
+/// that race safe is the invariant "a version this bumps to is never
+/// observable before the messages behind it are persisted". Bumping before
+/// persistence would let a new connection read the bumped version, then
+/// load history that doesn't include this turn yet, and be indistinguishable
+/// from a connection that *did* rehydrate onto current history even though
+/// its seed is stale — silently resurrecting the pre-A-history bug this
+/// version scheme exists to close.
+pub(crate) fn bump_turn_version(
+    session_turn_versions: &std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    session_key: &str,
+) {
+    let mut versions = session_turn_versions
+        .lock()
+        .expect("session_turn_versions lock poisoned");
+    let next = versions.get(session_key).copied().unwrap_or(0) + 1;
+    versions.insert(session_key.to_string(), next);
 }
 
 fn history_trimmed_ws_frame(
@@ -985,12 +1522,19 @@ fn is_observability_telemetry(event: &serde_json::Value) -> bool {
 /// Process a single chat message through the agent and send the response.
 /// Uses [`Agent::turn_streamed`] so that intermediate text chunks, tool calls,
 /// and tool results are forwarded to the WebSocket client in real time.
+// Generic over the transport halves (rather than tied to axum's concrete
+// `SplitSink<WebSocket, _>` / `SplitStream<WebSocket>`) so the two production
+// call sites in `handle_socket` are unaffected, but the session-queue /
+// cancel-token / rehydration logic below can be driven directly by tests with
+// in-process fakes — a real two-socket regression needs two independent
+// `process_chat_message` calls racing on the same `AppState`, which a real
+// WebSocket transport cannot orchestrate deterministically.
 #[allow(clippy::too_many_arguments)]
-async fn process_chat_message(
+async fn process_chat_message<Snk, Rcv, RcvErr>(
     state: &AppState,
     agent: &mut zeroclaw_runtime::agent::Agent,
-    sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
-    receiver: &mut futures_util::stream::SplitStream<WebSocket>,
+    sender: &mut Snk,
+    receiver: &mut Rcv,
     approval_event_rx: &mut tokio::sync::mpsc::Receiver<zeroclaw_api::agent::TurnEvent>,
     pending_approvals: &PendingApprovals,
     ping_interval: &mut Option<tokio::time::Interval>,
@@ -998,10 +1542,20 @@ async fn process_chat_message(
     content: &str,
     session_key: &str,
     session_id: &str,
+    // Deletion generation captured by the caller *before* it awaited the
+    // session-queue permit. Re-checked atomically with cancel-token
+    // registration so a DELETE landing in that window refuses the turn
+    // instead of letting it start unstoppable. Completion later acquires the
+    // same lifecycle authority and holds it through persistence plus version
+    // disposition, so a completing turn cannot recreate deleted state.
+    incarnation: crate::session_lifecycle::DeletionGeneration,
     // Transport-authenticated approval subject (paired-token hash), threaded so a
     // mid-turn SOP approval frame carries the same identity as the top-level path.
     auth_subject: Option<&str>,
-) {
+) where
+    Snk: futures_util::Sink<Message> + Unpin,
+    Rcv: futures_util::Stream<Item = Result<Message, RcvErr>> + Unpin,
+{
     use futures_util::StreamExt as _;
     use zeroclaw_runtime::agent::TurnEvent;
 
@@ -1031,6 +1585,60 @@ async fn process_chat_message(
         cfg.effective_max_context_tokens(&turn_alias) as u64
     };
 
+    // The cancellation-token map is the canonical process-local authority for
+    // a live turn. Register atomically before publishing any start side effects;
+    // a reconnected WebSocket must not replace the original token.
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    match register_turn_if_current(
+        &state.cancel_tokens,
+        state.session_lifecycle.as_ref(),
+        session_key,
+        incarnation,
+        cancel_token.clone(),
+    ) {
+        TurnRegistration::Registered => {}
+        TurnRegistration::TurnActive => {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-ws-session-turn-active"
+                ),
+                "code": "SESSION_TURN_ACTIVE"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
+        TurnRegistration::SessionDeleted => {
+            // DELETE landed between the caller's post-acquire generation
+            // check and this registration. Refuse before any provider or
+            // tool call runs for a session the operator destroyed.
+            let err = serde_json::json!({
+                "type": "error",
+                "message": zeroclaw_runtime::i18n::get_required_cli_string(
+                    "cli-ws-session-deleted"
+                ),
+                "code": "SESSION_DELETED"
+            });
+            let _ = sender.send(Message::Text(err.to_string().into())).await;
+            return;
+        }
+    }
+
+    // A detached turn (viewer disconnected) is no longer observed by any
+    // client-facing select arm, so without this it would keep running
+    // provider/tool calls straight through a gateway shutdown. Subscribe to
+    // the same listener watch channel `run_gateway`'s accept loop uses and
+    // cancel this turn exactly like an explicit abort when it fires — the
+    // existing `was_cancelled` handling below then persists partial output
+    // and releases the token/permit the same way it always has. Check the
+    // already-shut-down case up front: a fresh `subscribe()` only observes
+    // *future* changes, so a turn that starts after shutdown was signalled
+    // would otherwise never see it.
+    let mut shutdown_rx = state.shutdown_tx.subscribe();
+    if *shutdown_rx.borrow() {
+        cancel_token.cancel();
+    }
+
     // Broadcast agent_start event
     let _ = state.event_tx.send(serde_json::json!({
         "type": "agent_start",
@@ -1040,22 +1648,13 @@ async fn process_chat_message(
 
     // Set session state to running
     let turn_id = uuid::Uuid::new_v4().to_string();
-    if let Some(ref backend) = state.session_backend {
-        let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
-    }
-
-    // ── Cancellation token lifecycle ─────────────────────────────
-    // Create a token before the turn starts so the abort endpoint
-    // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled).
-    let cancel_token = tokio_util::sync::CancellationToken::new();
-    {
-        state
-            .cancel_tokens
-            .lock()
-            .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
-    }
+    let _ = state
+        .session_lifecycle
+        .with_incarnation(session_key, incarnation, || {
+            if let Some(ref backend) = state.session_backend {
+                let _ = backend.set_session_state(session_key, "running", Some(&turn_id));
+            }
+        });
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -1111,6 +1710,9 @@ async fn process_chat_message(
     let mut last_input_tokens: Option<u64> = None;
     let forward_fut = async {
         let mut cancel_drained = false;
+        let mut client_attached = true;
+        let mut approval_events_open = true;
+        let mut shutdown_drained = false;
         loop {
             tokio::select! {
                 biased;
@@ -1123,7 +1725,32 @@ async fn process_chat_message(
                     // a ToolLoopCancelled error which closes event_rx and
                     // breaks this loop on the `event_rx.recv()` arm below.
                 }
-                client_msg = receiver.next() => {
+                _ = shutdown_rx.changed(), if !shutdown_drained => {
+                    // Disable this arm after the first observed change —
+                    // `shutdown_tx` only ever flips false -> true once per
+                    // process lifetime, so a second `changed()` would just
+                    // await forever, but disabling keeps the biased ordering
+                    // above cheap to reason about (never re-polled once
+                    // resolved, same as the `cancel_token` arm).
+                    shutdown_drained = true;
+                    if *shutdown_rx.borrow() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({"session_key": session_key})),
+                            "gateway shutdown observed; cancelling live turn"
+                        );
+                        cancel_token.cancel();
+                    }
+                }
+                client_msg = receiver.next(), if client_attached => {
+                    // A WebSocket is a viewer/controller for the turn, not its
+                    // owner. Route changes, browser sleep, and transient
+                    // network loss therefore detach the client without firing
+                    // the turn's cancellation token. Disable this select arm
+                    // after detach so a closed stream cannot recreate the
+                    // immediately-ready hot loop; `event_rx` remains active and
+                    // is drained until the agent finishes naturally.
                     let text = match client_msg {
                         Some(Ok(Message::Text(text))) => text,
                         Some(Ok(Message::Ping(payload))) => {
@@ -1135,8 +1762,21 @@ async fn process_chat_message(
                         }
                         Some(Ok(Message::Pong(_))) => continue,
                         Some(Ok(Message::Close(_))) | Some(Err(_)) | None => {
-                            cancel_token.cancel();
-                            break;
+                            let denied =
+                                detach_ws_viewer(&mut client_attached, pending_approvals);
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_attrs(::serde_json::json!({
+                                    "session_key": session_key,
+                                    "pending_approvals_denied": denied,
+                                })),
+                                "WebSocket viewer detached; agent turn continues"
+                            );
+                            continue;
                         }
                         _ => continue,
                     };
@@ -1216,14 +1856,26 @@ async fn process_chat_message(
                         _ => {}
                     }
                 }
-                approval = approval_event_rx.recv() => {
-                    let Some(event) = approval else { continue };
+                approval = approval_event_rx.recv(), if approval_events_open => {
+                    let Some(event) = approval else {
+                        // Disable a closed receiver: `recv()` would otherwise
+                        // remain immediately ready and starve `event_rx` in
+                        // this biased select while the turn winds down.
+                        approval_events_open = false;
+                        continue;
+                    };
                     if let TurnEvent::ApprovalRequest {
                         request_id,
                         tool_name,
                         arguments_summary,
                         timeout_secs,
                     } = event {
+                        if !client_attached {
+                            if let Some(tx) = pending_approvals.lock().remove(&request_id) {
+                                let _ = tx.send(ChannelApprovalResponse::Deny);
+                            }
+                            continue;
+                        }
                         let frame = serde_json::json!({
                             "type": "approval_request",
                             "request_id": request_id,
@@ -1231,16 +1883,22 @@ async fn process_chat_message(
                             "arguments_summary": arguments_summary,
                             "timeout_secs": timeout_secs,
                         });
-                        let _ = sender.send(Message::Text(frame.to_string().into())).await;
+                        if sender.send(Message::Text(frame.to_string().into())).await.is_err() {
+                            detach_ws_viewer(&mut client_attached, pending_approvals);
+                        }
                     }
                 }
-                _ = tick_websocket_ping(ping_interval) => {
+                _ = tick_websocket_ping(ping_interval), if client_attached => {
+                    // Keepalive is a viewer concern, so a failed ping means
+                    // the socket is gone — not that the turn should die. Take
+                    // the same detach path the other send failures in this
+                    // loop take, and disable the arm afterwards so a dead
+                    // sender cannot spin an immediately-ready hot loop.
                     if sender.send(Message::Ping(Vec::new().into())).await.is_err() {
-                        cancel_token.cancel();
-                        break;
+                        detach_ws_viewer(&mut client_attached, pending_approvals);
                     }
                 }
-                    event_opt = event_rx.recv() => {
+                event_opt = event_rx.recv() => {
                     let Some(event) = event_opt else { break };
                     let ws_msg = match event {
                         TurnEvent::Usage {
@@ -1278,13 +1936,21 @@ async fn process_chat_message(
                             tool_name,
                             arguments_summary,
                             timeout_secs,
-                        } => serde_json::json!({
-                            "type": "approval_request",
-                            "request_id": request_id,
-                            "tool": tool_name,
-                            "arguments_summary": arguments_summary,
-                            "timeout_secs": timeout_secs,
-                        }),
+                        } => {
+                            if !client_attached {
+                                if let Some(tx) = pending_approvals.lock().remove(&request_id) {
+                                    let _ = tx.send(ChannelApprovalResponse::Deny);
+                                }
+                                continue;
+                            }
+                            serde_json::json!({
+                                "type": "approval_request",
+                                "request_id": request_id,
+                                "tool": tool_name,
+                                "arguments_summary": arguments_summary,
+                                "timeout_secs": timeout_secs,
+                            })
+                        }
                         TurnEvent::HistoryTrimmed {
                             dropped_messages,
                             kept_turns,
@@ -1295,13 +1961,31 @@ async fn process_chat_message(
                             "entries": entries,
                         }),
                     };
-                    let _ = sender.send(Message::Text(ws_msg.to_string().into())).await;
+                    if client_attached
+                        && sender
+                            .send(Message::Text(ws_msg.to_string().into()))
+                            .await
+                            .is_err()
+                    {
+                        detach_ws_viewer(&mut client_attached, pending_approvals);
+                    }
                 }
             }
         }
     };
 
     let (result, ()) = tokio::join!(turn_fut, forward_fut);
+
+    // Enter the finalizing state *before* dropping the cancel token, so the
+    // session is continuously authoritative: the token covers streaming, this
+    // guard covers persistence and turn-version disposition, and they overlap
+    // rather than leaving an `idle` gap for the session-state endpoint to
+    // expose. The guard releases on drop, so every early return and error
+    // path below still clears it.
+    let _finalizing = crate::session_lifecycle::FinalizingGuard::new(
+        state.session_lifecycle.as_ref(),
+        session_key,
+    );
 
     // ── Remove cancel token (turn finished) ──────────────────────
     {
@@ -1312,6 +1996,18 @@ async fn process_chat_message(
             .remove(session_key);
     }
 
+    // The turn-completion version (`AppState::session_turn_versions`) is
+    // bumped once on each completion path below (cancelled / success /
+    // error) via `bump_turn_version_after_persistence`, which only advances
+    // the version *after* that path's backend persistence has both finished
+    // and succeeded — a connection's connect-time version read does not hold
+    // the `session_queue` permit (see `handle_socket`), so it can race an
+    // in-flight turn; bumping before persistence finishes would let it
+    // observe the new version while the messages behind it are still
+    // unpersisted, and bumping despite a failed/partial `append()` would let
+    // it adopt that partial write as the authoritative transcript. See
+    // `bump_turn_version`'s doc comment for the full ordering invariant.
+
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.
     let was_cancelled = match &result {
@@ -1320,17 +2016,55 @@ async fn process_chat_message(
     };
 
     if was_cancelled {
-        if let Some(ref backend) = state.session_backend {
-            let still_exists = backend.session_exists(session_key);
-            if still_exists {
-                match &result {
-                    Err(error) if !error.new_messages.is_empty() => {
-                        persist_conversation_messages(
-                            backend.as_ref(),
-                            session_key,
-                            &error.new_messages,
-                        );
-                        if !has_assistant_chat_message(&error.new_messages) {
+        complete_turn_persistence(
+            state.session_lifecycle.as_ref(),
+            &state.session_turn_versions,
+            session_key,
+            incarnation,
+            state.session_backend.as_deref(),
+            Some(("idle", None)),
+            || {
+                let mut outcome = PersistOutcome::Persisted;
+                if let Some(ref backend) = state.session_backend {
+                    match &result {
+                        Err(error) if !error.new_messages.is_empty() => {
+                            outcome = persist_conversation_messages(
+                                backend.as_ref(),
+                                session_key,
+                                &error.new_messages,
+                            );
+                            if !has_assistant_chat_message(&error.new_messages) {
+                                let marker = zeroclaw_runtime::i18n::get_required_cli_string(
+                                    "turn-interrupted-by-user",
+                                );
+                                let truncated = if accumulated_text.is_empty() {
+                                    marker
+                                } else {
+                                    format!("{accumulated_text}\n\n{marker}")
+                                };
+                                let assistant_msg =
+                                    zeroclaw_providers::ChatMessage::assistant(&truncated);
+                                if let Err(e) = backend.append(session_key, &assistant_msg) {
+                                    outcome = PersistOutcome::Failed;
+                                    ::zeroclaw_log::record!(
+                                        ERROR,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Fail
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({
+                                                "session_key": session_key,
+                                                "error": format!("{e}"),
+                                            })
+                                        ),
+                                        "failed to persist interrupted-turn marker message"
+                                    );
+                                }
+                            }
+                        }
+                        _ => {
                             let marker = zeroclaw_runtime::i18n::get_required_cli_string(
                                 "turn-interrupted-by-user",
                             );
@@ -1341,42 +2075,34 @@ async fn process_chat_message(
                             };
                             let assistant_msg =
                                 zeroclaw_providers::ChatMessage::assistant(&truncated);
-                            // Re-check before the raw append — the user can
-                            // delete the session between the outer check and
-                            // here; `persist_conversation_messages` already
-                            // re-checks internally.
-                            if backend.session_exists(session_key) {
-                                let _ = backend.append(session_key, &assistant_msg);
+                            if let Err(e) = backend.append(session_key, &assistant_msg) {
+                                outcome = PersistOutcome::Failed;
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(
+                                        ::serde_json::json!({
+                                            "session_key": session_key,
+                                            "error": format!("{e}"),
+                                        })
+                                    ),
+                                    "failed to persist interrupted-turn marker message"
+                                );
                             }
                         }
                     }
-                    _ => {
-                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        );
-                        let truncated = if accumulated_text.is_empty() {
-                            marker
-                        } else {
-                            format!("{accumulated_text}\n\n{marker}")
-                        };
-                        let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
-                        }
-                    }
                 }
-            }
-        }
+                outcome
+            },
+        );
 
         // Inform the client the turn was aborted
         let aborted = serde_json::json!({ "type": "aborted" });
         let _ = sender.send(Message::Text(aborted.to_string().into())).await;
-
-        if let Some(ref backend) = state.session_backend
-            && backend.session_exists(session_key)
-        {
-            let _ = backend.set_session_state(session_key, "idle", None);
-        }
 
         // Broadcast agent_end event
         let _ = state.event_tx.send(serde_json::json!({
@@ -1407,9 +2133,26 @@ async fn process_chat_message(
 
     match result {
         Ok(outcome) => {
-            if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
-            }
+            complete_turn_persistence(
+                state.session_lifecycle.as_ref(),
+                &state.session_turn_versions,
+                session_key,
+                incarnation,
+                state.session_backend.as_deref(),
+                Some(("idle", None)),
+                || {
+                    state
+                        .session_backend
+                        .as_ref()
+                        .map_or(PersistOutcome::Persisted, |backend| {
+                            persist_conversation_messages(
+                                backend.as_ref(),
+                                session_key,
+                                &outcome.new_messages,
+                            )
+                        })
+                },
+            );
 
             // Fire-and-forget memory consolidation so facts from WS sessions
             // are extracted to long-term memory (Daily + Core categories).
@@ -1479,11 +2222,6 @@ async fn process_chat_message(
             });
             let _ = sender.send(Message::Text(done.to_string().into())).await;
 
-            // Set session state to idle
-            if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "idle", None);
-            }
-
             // Broadcast agent_end event
             let _ = state.event_tx.send(serde_json::json!({
                 "type": "agent_end",
@@ -1513,16 +2251,30 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
-            if let Some(ref backend) = state.session_backend
-                && !e.new_messages.is_empty()
-            {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
-            }
-
-            // Set session state to error
-            if let Some(ref backend) = state.session_backend {
-                let _ = backend.set_session_state(session_key, "error", Some(&turn_id));
-            }
+            complete_turn_persistence(
+                state.session_lifecycle.as_ref(),
+                &state.session_turn_versions,
+                session_key,
+                incarnation,
+                state.session_backend.as_deref(),
+                Some(("error", Some(turn_id.as_str()))),
+                || {
+                    if e.new_messages.is_empty() {
+                        PersistOutcome::Persisted
+                    } else {
+                        state.session_backend.as_ref().map_or(
+                            PersistOutcome::Persisted,
+                            |backend| {
+                                persist_conversation_messages(
+                                    backend.as_ref(),
+                                    session_key,
+                                    &e.new_messages,
+                                )
+                            },
+                        )
+                    }
+                },
+            );
 
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1614,6 +2366,7 @@ mod tests {
         routing::{get, post},
     };
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+    use zeroclaw_infra::session_backend::SessionBackend as _;
 
     #[test]
     fn ws_terminal_failure_uses_localized_message_without_reclassifying_diagnostic() {
@@ -2006,14 +2759,331 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
-    fn sop_ws_error_frames_resolve_via_fluent() {
-        // The SOP WebSocket error frames are UI-surfaced and route through the
-        // embedded en/cli.ftl. A renamed/typo'd key would silently ship the
-        // missing-key fallback `{cli-sop-ws-...}` to the browser; guard against it.
+    fn second_connection_cannot_replace_the_running_turn_cancel_token() {
+        let tokens = std::sync::Mutex::new(std::collections::HashMap::new());
+        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
+        let generation = lifecycle.deletion_generation("gw_session");
+        let original = tokio_util::sync::CancellationToken::new();
+        let reconnect = tokio_util::sync::CancellationToken::new();
+
+        assert_eq!(
+            register_turn_if_current(
+                &tokens,
+                &lifecycle,
+                "gw_session",
+                generation,
+                original.clone()
+            ),
+            TurnRegistration::Registered
+        );
+        assert_eq!(
+            register_turn_if_current(
+                &tokens,
+                &lifecycle,
+                "gw_session",
+                generation,
+                reconnect.clone()
+            ),
+            TurnRegistration::TurnActive
+        );
+
+        let authoritative = tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_session")
+            .cloned()
+            .expect("original token must remain registered");
+        authoritative.cancel();
+
+        assert!(original.is_cancelled());
+        assert!(!reconnect.is_cancelled());
+    }
+
+    /// The start-window race B1 closes.
+    ///
+    /// A prompt captures its incarnation, passes its post-acquire deletion
+    /// check, and *then* registers its cancellation token. `DELETE` does not
+    /// acquire the session-queue permit, so it can land in that gap: it finds
+    /// no live token to cancel, removes the session, and returns — leaving the
+    /// socket free to register and run provider/tool calls for a session the
+    /// operator just destroyed.
+    ///
+    /// `register_turn_if_current` re-checks the generation *inside* the
+    /// `cancel_tokens` critical section, so the interleaving is no longer
+    /// possible: the late registration observes the bump and refuses.
+    #[test]
+    fn delete_between_post_acquire_check_and_token_registration_does_not_start_turn() {
+        let tokens = std::sync::Mutex::new(std::collections::HashMap::new());
+        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
+        let session_key = "gw_deleted_before_registration";
+
+        // The prompt captures its incarnation and passes its post-acquire
+        // check, exactly as `handle_socket` does.
+        let incarnation = lifecycle.deletion_generation(session_key);
+
+        // DELETE lands in the gap between that check and registration.
+        lifecycle.record_deletion(session_key);
+
+        let cancel_token = tokio_util::sync::CancellationToken::new();
+        assert_eq!(
+            register_turn_if_current(
+                &tokens,
+                &lifecycle,
+                session_key,
+                incarnation,
+                cancel_token.clone(),
+            ),
+            TurnRegistration::SessionDeleted,
+            "a DELETE after the post-acquire check must refuse the turn, not admit it"
+        );
+        assert!(
+            !tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned")
+                .contains_key(session_key),
+            "a refused turn must leave no cancellation token behind: a registered \
+             token for a deleted session is exactly the untracked, unstoppable turn \
+             this guard exists to prevent"
+        );
+        assert!(
+            !cancel_token.is_cancelled(),
+            "the turn never started, so nothing should have been cancelled — the \
+             caller must refuse on SessionDeleted before spawning the turn future"
+        );
+    }
+
+    /// Registration must still succeed on the happy path, so the guard above
+    /// cannot be satisfied by simply refusing everything.
+    #[test]
+    fn registration_succeeds_when_no_delete_intervened() {
+        let tokens = std::sync::Mutex::new(std::collections::HashMap::new());
+        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
+        let session_key = "gw_live_session";
+        let incarnation = lifecycle.deletion_generation(session_key);
+
+        assert_eq!(
+            register_turn_if_current(
+                &tokens,
+                &lifecycle,
+                session_key,
+                incarnation,
+                tokio_util::sync::CancellationToken::new(),
+            ),
+            TurnRegistration::Registered
+        );
+        assert!(
+            tokens
+                .lock()
+                .expect("cancel_tokens lock poisoned")
+                .contains_key(session_key),
+            "an admitted turn must be cancellable by DELETE"
+        );
+    }
+
+    /// The completion-window half of B1, against the production JSONL backend.
+    ///
+    /// `SessionStore::append` opens with `.create(true)`, so a turn unwinding
+    /// after `DELETE` recreates the session file outright if it is allowed to
+    /// append. The incarnation check — not an existence probe — is what stops
+    /// it: an existence probe races the same way, since it must be followed by
+    /// the append it is guarding.
+    #[test]
+    fn delete_between_final_existence_check_and_append_does_not_recreate_storage() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store");
+        let session_key = format!("{GW_SESSION_PREFIX}doomed-session");
+
+        store
+            .append(&session_key, &ChatMessage::user("first turn"))
+            .expect("seed append");
+        assert!(
+            store.session_exists(&session_key),
+            "precondition: the session file exists before deletion"
+        );
+
+        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
+        let incarnation = lifecycle.deletion_generation(&session_key);
+        let versions = std::sync::Mutex::new(std::collections::HashMap::new());
+
+        // The operator deletes mid-turn: generation bump plus backend wipe.
+        lifecycle.record_deletion(&session_key);
+        store.delete_session(&session_key).expect("delete session");
+        assert!(
+            !store.session_exists(&session_key),
+            "precondition: DELETE removed the backing file"
+        );
+
+        // The turn now unwinds and tries to persist.
+        let outcome = complete_turn_persistence(
+            &lifecycle,
+            &versions,
+            &session_key,
+            incarnation,
+            Some(&store),
+            None,
+            || {
+                persist_conversation_messages(
+                    &store,
+                    &session_key,
+                    &[
+                        ConversationMessage::Chat(ChatMessage::user("second turn")),
+                        ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
+                    ],
+                )
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            PersistOutcome::SkippedDeleted,
+            "a turn completing after DELETE must report SkippedDeleted"
+        );
+        assert!(
+            !store.session_exists(&session_key),
+            "the unwinding turn must not recreate storage the operator destroyed: \
+             SessionStore::append opens with create(true), so any append here \
+             resurrects the session file"
+        );
+    }
+
+    /// The other direction of the same bug: backend absence is *not* deletion.
+    ///
+    /// A brand-new JSONL session has no file until its first `append()`, so
+    /// an absence-based deletion signal classified the first completed turn of
+    /// every new session as deleted and silently dropped its messages. The
+    /// production backend is used deliberately — a test backend that marks
+    /// sessions known before the first append cannot express this state.
+    #[test]
+    fn first_completed_turn_on_a_real_new_jsonl_session_persists_its_messages() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store =
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store");
+        let session_key = format!("{GW_SESSION_PREFIX}first-turn-session");
+
+        assert!(
+            !store.session_exists(&session_key),
+            "precondition: a new JSONL session has no file until its first append; \
+             if this becomes false the bug this test guards is unreachable"
+        );
+
+        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
+        let incarnation = lifecycle.deletion_generation(&session_key);
+        let versions = std::sync::Mutex::new(std::collections::HashMap::new());
+
+        let outcome = complete_turn_persistence(
+            &lifecycle,
+            &versions,
+            &session_key,
+            incarnation,
+            Some(&store),
+            None,
+            || {
+                persist_conversation_messages(
+                    &store,
+                    &session_key,
+                    &[
+                        ConversationMessage::Chat(ChatMessage::user("hello")),
+                        ConversationMessage::Chat(ChatMessage::assistant("hi there")),
+                    ],
+                )
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            PersistOutcome::Persisted,
+            "a session that was never deleted must persist its first turn"
+        );
+        assert!(
+            !store.transcript_incomplete(&session_key).unwrap(),
+            "a fully persisted turn must clear its durable intent marker"
+        );
+
+        let persisted = store.load(&session_key);
+        let transcript: Vec<(String, String)> = persisted
+            .iter()
+            .map(|m| (m.role.clone(), m.content.clone()))
+            .collect();
+        assert!(
+            transcript
+                .iter()
+                .any(|(role, content)| role == "user" && content == "hello"),
+            "the user message of the first turn must reach disk, got {transcript:?}"
+        );
+        assert!(
+            transcript
+                .iter()
+                .any(|(role, content)| role == "assistant" && content == "hi there"),
+            "the assistant reply of the first turn must reach disk, got {transcript:?}"
+        );
+    }
+
+    /// `SkippedDeleted` must be wholly inert at the version-bump seam.
+    ///
+    /// `DELETE` evicts the session's `session_turn_versions` entry. If a turn
+    /// unwinding afterwards is allowed to bump, it recreates that epoch entry
+    /// for a session that no longer exists, and a later session reusing the
+    /// key inherits a phantom completed-turn version.
+    #[test]
+    fn deleted_turn_completion_does_not_recreate_version_state() {
+        let versions = std::sync::Mutex::new(std::collections::HashMap::new());
+        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
+        let session_key = "gw_evicted_epoch";
+
+        // A turn completed earlier, then DELETE evicted the epoch entry.
+        bump_turn_version(&versions, session_key);
+        versions
+            .lock()
+            .expect("session_turn_versions lock poisoned")
+            .remove(session_key);
+
+        let incarnation = lifecycle.deletion_generation(session_key);
+        let persistence_generation = lifecycle.persistence_generation(session_key);
+        lifecycle.record_deletion(session_key);
+        complete_turn_persistence(
+            &lifecycle,
+            &versions,
+            session_key,
+            incarnation,
+            None,
+            None,
+            || PersistOutcome::Persisted,
+        );
+
+        assert!(
+            !versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key(session_key),
+            "a turn completing after DELETE must not recreate the epoch entry \
+             DELETE evicted"
+        );
+
+        // And it must not be mistaken for a persistence failure either: nothing
+        // failed, so no queued writer should be told to reseed.
+        assert_eq!(
+            lifecycle.persistence_generation(session_key),
+            persistence_generation,
+            "SkippedDeleted is not a persistence failure and must not record one"
+        );
+    }
+
+    #[test]
+    fn ws_error_frames_resolve_via_fluent() {
+        // WebSocket error frames are UI-surfaced and route through the embedded
+        // en/cli.ftl. A renamed/typo'd key would silently ship the missing-key
+        // fallback to the browser; guard against it.
         for key in [
             "cli-sop-ws-invalid-approval",
             "cli-sop-ws-engine-lock-poisoned",
             "cli-sop-ws-subsystem-disabled",
+            "cli-ws-session-deleted",
+            "cli-ws-session-persistence-poisoned",
         ] {
             let s = zeroclaw_runtime::i18n::get_required_cli_string(key);
             assert!(
@@ -2393,13 +3463,14 @@ data: {\"type\":\"message_stop\"}\n\n",
         );
     }
 
-    // The mid-turn `client_msg` arm in `forward_fut`
-    // must (a) classify stream-end / close / error frames as "client gone"
-    // and (b) cancel the turn token so `tokio::join!(turn_fut, forward_fut)`
-    // can return — a bare `continue` hot-loops the select forever.
+    // Regression coverage for detached viewers. The mid-turn `client_msg` arm
+    // in `forward_fut` must classify stream-end / close / error frames as a
+    // detach. The production arm then disables itself while continuing to
+    // drain turn events; a bare `continue` would hot-loop, while cancellation
+    // would incorrectly stop work merely because its viewer disappeared.
     #[derive(Debug, PartialEq, Eq)]
     enum DisconnectAction {
-        Break,
+        Detach,
         Continue,
         ProcessText,
     }
@@ -2410,22 +3481,22 @@ data: {\"type\":\"message_stop\"}\n\n",
         use axum::extract::ws::Message;
         match msg {
             Some(Ok(Message::Text(_))) => DisconnectAction::ProcessText,
-            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => DisconnectAction::Break,
+            Some(Ok(Message::Close(_))) | Some(Err(_)) | None => DisconnectAction::Detach,
             _ => DisconnectAction::Continue,
         }
     }
 
     #[test]
-    fn mid_turn_client_msg_breaks_on_stream_end_close_or_err() {
+    fn mid_turn_client_msg_detaches_on_stream_end_close_or_err() {
         use axum::extract::ws::Message;
-        assert_eq!(classify_client_msg(None), DisconnectAction::Break);
+        assert_eq!(classify_client_msg(None), DisconnectAction::Detach);
         assert_eq!(
             classify_client_msg(Some(Ok(Message::Close(None)))),
-            DisconnectAction::Break,
+            DisconnectAction::Detach,
         );
         assert_eq!(
             classify_client_msg(Some(Err("io"))),
-            DisconnectAction::Break,
+            DisconnectAction::Detach,
         );
         assert_eq!(
             classify_client_msg(Some(Ok(Message::Ping(Default::default())))),
@@ -2438,14 +3509,67 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
-    fn mid_turn_disconnect_cancel_unblocks_joined_turn() {
+    fn mid_turn_detach_does_not_cancel_the_turn() {
         let token = tokio_util::sync::CancellationToken::new();
         let clone_for_turn = token.clone();
+        let pending = new_pending_approvals();
+        let mut client_attached = true;
         assert!(!clone_for_turn.is_cancelled());
-        token.cancel();
+        let action = classify_client_msg(None);
+        assert_eq!(action, DisconnectAction::Detach);
+        detach_ws_viewer(&mut client_attached, &pending);
+        assert!(!client_attached);
         assert!(
-            clone_for_turn.is_cancelled(),
-            "cloned token (held by turn_fut via agent.turn_streamed) must observe cancellation"
+            !clone_for_turn.is_cancelled(),
+            "transport detach must leave the turn's explicit cancellation token live"
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_viewer_keeps_bounded_turn_events_draining() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let pending = new_pending_approvals();
+        let mut client_attached = true;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+
+        detach_ws_viewer(&mut client_attached, &pending);
+        let producer = zeroclaw_spawn::spawn!(async move {
+            event_tx.send("first").await.unwrap();
+            event_tx.send("second").await.unwrap();
+        });
+
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(1), async move {
+            let mut events = Vec::new();
+            while let Some(event) = event_rx.recv().await {
+                events.push(event);
+            }
+            events
+        })
+        .await
+        .expect("detached forward path must keep draining until the producer closes");
+
+        producer.await.unwrap();
+        assert_eq!(drained, vec!["first", "second"]);
+        assert!(!token.is_cancelled());
+    }
+
+    #[test]
+    fn detached_viewer_denies_all_pending_approvals() {
+        let pending = new_pending_approvals();
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let (second_tx, second_rx) = tokio::sync::oneshot::channel();
+        pending.lock().insert("first".into(), first_tx);
+        pending.lock().insert("second".into(), second_tx);
+
+        assert_eq!(deny_pending_ws_approvals(&pending), 2);
+        assert!(pending.lock().is_empty());
+        assert_eq!(
+            first_rx.blocking_recv().unwrap(),
+            ChannelApprovalResponse::Deny
+        );
+        assert_eq!(
+            second_rx.blocking_recv().unwrap(),
+            ChannelApprovalResponse::Deny
         );
     }
 
@@ -2470,6 +3594,7 @@ data: {\"type\":\"message_stop\"}\n\n",
 
     struct DeletedSessionBackend {
         append_calls: std::sync::Mutex<Vec<String>>,
+        state_calls: std::sync::Mutex<Vec<(String, String, Option<String>)>>,
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for DeletedSessionBackend {
@@ -2497,6 +3622,19 @@ data: {\"type\":\"message_stop\"}\n\n",
             // The user deleted the session between cancel and append.
             false
         }
+        fn set_session_state(
+            &self,
+            session_key: &str,
+            state: &str,
+            turn_id: Option<&str>,
+        ) -> std::io::Result<()> {
+            self.state_calls.lock().unwrap().push((
+                session_key.to_string(),
+                state.to_string(),
+                turn_id.map(str::to_string),
+            ));
+            Ok(())
+        }
     }
 
     #[test]
@@ -2504,19 +3642,362 @@ data: {\"type\":\"message_stop\"}\n\n",
         use zeroclaw_providers::{ChatMessage, ConversationMessage};
         let backend = DeletedSessionBackend {
             append_calls: std::sync::Mutex::new(Vec::new()),
+            state_calls: std::sync::Mutex::new(Vec::new()),
         };
         let messages = vec![
             ConversationMessage::Chat(ChatMessage::user("hi")),
             ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
         ];
 
-        persist_conversation_messages(&backend, "gw_deleted", &messages);
+        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
+        let incarnation = lifecycle.deletion_generation("gw_deleted");
+        lifecycle.record_deletion("gw_deleted");
 
+        let versions = std::sync::Mutex::new(std::collections::HashMap::new());
+        let outcome = complete_turn_persistence(
+            &lifecycle,
+            &versions,
+            "gw_deleted",
+            incarnation,
+            None,
+            None,
+            || persist_conversation_messages(&backend, "gw_deleted", &messages),
+        );
+
+        assert_eq!(
+            outcome,
+            PersistOutcome::SkippedDeleted,
+            "a deletion during the turn must be reported as SkippedDeleted, not as success"
+        );
         assert!(
             backend.append_calls.lock().unwrap().is_empty(),
-            "persist_conversation_messages must not resurrect a session whose \
-             session_exists() returned false (see #7126)"
+            "persist_conversation_messages must not resurrect a session deleted \
+             during the turn (see #7126)"
         );
+    }
+
+    #[test]
+    fn deleted_turn_cannot_write_any_terminal_state_into_a_new_incarnation() {
+        let backend = DeletedSessionBackend {
+            append_calls: std::sync::Mutex::new(Vec::new()),
+            state_calls: std::sync::Mutex::new(Vec::new()),
+        };
+        let lifecycle = crate::session_lifecycle::SessionLifecycle::new();
+        let session_key = "gw_terminal_state_recreated";
+        let old_incarnation = lifecycle.deletion_generation(session_key);
+        lifecycle.record_deletion(session_key);
+        let versions = std::sync::Mutex::new(std::collections::HashMap::new());
+
+        for (state, turn_id) in [
+            ("idle", None),
+            ("idle", Some("cancelled-turn")),
+            ("error", Some("failed-turn")),
+        ] {
+            assert_eq!(
+                complete_turn_persistence(
+                    &lifecycle,
+                    &versions,
+                    session_key,
+                    old_incarnation,
+                    Some(&backend),
+                    Some((state, turn_id)),
+                    || PersistOutcome::Persisted,
+                ),
+                PersistOutcome::SkippedDeleted
+            );
+        }
+
+        assert!(
+            backend.state_calls.lock().unwrap().is_empty(),
+            "cancelled, successful, and failed old turns must not mutate recreated metadata"
+        );
+    }
+
+    /// A `SessionBackend` whose `append` fails from a configurable call
+    /// index onward, standing in for a real backend that partially writes a
+    /// turn's messages before an I/O error (disk full, DB lock timeout, ...).
+    struct PartiallyFailingAppendBackend {
+        appended: std::sync::Mutex<Vec<String>>,
+        call_count: std::sync::atomic::AtomicUsize,
+        fail_at_call: usize,
+        incomplete: std::sync::atomic::AtomicBool,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for PartiallyFailingAppendBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            let call = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call >= self.fail_at_call {
+                return Err(std::io::Error::other("simulated partial-append failure"));
+            }
+            self.appended.lock().unwrap().push(format!(
+                "{session_key}:{}:{}",
+                message.role, message.content
+            ));
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn mark_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn clear_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+        fn transcript_incomplete(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(self.incomplete.load(std::sync::atomic::Ordering::SeqCst))
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            true
+        }
+    }
+
+    /// `persist_conversation_messages` must
+    /// report a partial write instead of silently discarding the `append()`
+    /// error, so its caller can gate the turn-completion version bump on it.
+    #[test]
+    fn persist_conversation_messages_reports_failure_on_partial_append() {
+        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+        let backend = PartiallyFailingAppendBackend {
+            appended: std::sync::Mutex::new(Vec::new()),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_at_call: 1, // the user message persists; the assistant reply fails
+            incomplete: std::sync::atomic::AtomicBool::new(false),
+        };
+        let messages = vec![
+            ConversationMessage::Chat(ChatMessage::user("hi")),
+            ConversationMessage::Chat(ChatMessage::assistant("reply")),
+        ];
+
+        let outcome = persist_conversation_messages(&backend, "gw_partial", &messages);
+
+        assert_eq!(
+            outcome,
+            PersistOutcome::Failed,
+            "a failed append must be reported to the caller, not swallowed"
+        );
+        assert_eq!(
+            backend.appended.lock().unwrap().len(),
+            1,
+            "the message that did succeed is still best-effort persisted"
+        );
+    }
+
+    /// A partial/failed `append()` during
+    /// turn completion must not advance `session_turn_versions` — otherwise
+    /// a queued or reconnecting connection can observe the bumped version,
+    /// clear its `Agent` history, and rehydrate onto a transcript that is
+    /// missing the messages the failed append never wrote.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn version_is_not_bumped_after_partial_append_failure() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(PartiallyFailingAppendBackend {
+            appended: std::sync::Mutex::new(Vec::new()),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_at_call: 1, // the user message persists; the assistant reply fails
+            incomplete: std::sync::atomic::AtomicBool::new(false),
+        });
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "partial-append-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let persistence_before = state.session_lifecycle.persistence_generation(&session_key);
+
+        let mut agent = queue_test_agent(Box::new(ImmediateModelProvider("reply-content")));
+        let mut sender = CollectSink(Vec::new());
+        let mut receiver =
+            futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+        let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+        let pending = new_pending_approvals();
+
+        process_chat_message(
+            &state,
+            &mut agent,
+            &mut sender,
+            &mut receiver,
+            &mut approval_rx,
+            &pending,
+            &mut None,
+            &None,
+            "prompt-with-partial-persistence-failure",
+            &session_key,
+            session_id,
+            state.session_lifecycle.deletion_generation(&session_key),
+            None,
+        )
+        .await;
+
+        // The turn itself still completes and reports success to the
+        // client — a persistence failure must not be surfaced as a turn
+        // failure.
+        let done = sender.0.iter().any(|frame| {
+            serde_json::from_str::<serde_json::Value>(frame)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("done")
+        });
+        assert!(
+            done,
+            "the turn itself must still complete and notify the client: {:?}",
+            sender.0
+        );
+
+        assert_eq!(
+            current_turn_version(&state.session_turn_versions, &session_key),
+            0,
+            "session_turn_versions must not advance after a failed/partial append"
+        );
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .unwrap()
+                .get(&session_key)
+                .is_none(),
+            "the turn must still release its cancel token even though persistence failed"
+        );
+        assert_ne!(
+            state.session_lifecycle.persistence_generation(&session_key),
+            persistence_before,
+            "the failed append must be recorded so the next writer can be stopped"
+        );
+        assert!(
+            backend.transcript_incomplete(&session_key).unwrap(),
+            "the failure must leave a restart-visible transcript marker"
+        );
+    }
+
+    /// The withheld version bump alone does not protect the next writer: an
+    /// unchanged version reads to a queued connection as "no turn
+    /// completed", so it skips rehydration and would run against the
+    /// pre-turn history the failed append was meant to extend. The next
+    /// prompt must instead be rejected, and the connection's `Agent`
+    /// re-seeded from what the backend actually holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_prompts_each_reject_after_failed_persistence() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(PartiallyFailingAppendBackend {
+            appended: std::sync::Mutex::new(Vec::new()),
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+            fail_at_call: 1,
+            incomplete: std::sync::atomic::AtomicBool::new(false),
+        });
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "reject-after-failed-persistence";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        // Sockets B and C were both seeded before socket A's turn failed to
+        // persist fully. Each retains its own observed generation.
+        let mut seen_generation_b = state.session_lifecycle.persistence_generation(&session_key);
+        let mut seen_generation_c = seen_generation_b;
+        let incarnation = state.session_lifecycle.deletion_generation(&session_key);
+        state
+            .session_lifecycle
+            .with_completion(&session_key, incarnation, |disposition| {
+                disposition.record_persistence_failure();
+            })
+            .expect("session incarnation should still be current");
+
+        // Socket B is a *different* connection whose `seen_version` matches
+        // the (correctly un-bumped) current version, so the rehydrate check
+        // below would not fire on its own.
+        let seen_version_b = current_turn_version(&state.session_turn_versions, &session_key);
+        assert_eq!(
+            seen_version_b, 0,
+            "precondition: the failed append must not have bumped the version"
+        );
+
+        let mut agent_b = queue_test_agent(Box::new(ImmediateModelProvider("b-reply")));
+        let rejected = reject_prompt_after_failed_persistence(
+            &state,
+            &mut agent_b,
+            &session_key,
+            &mut seen_generation_b,
+        );
+
+        assert!(
+            rejected,
+            "a prompt queued behind a turn that failed to persist must be rejected, \
+             not silently run against stale history"
+        );
+        let mut agent_c = queue_test_agent(Box::new(ImmediateModelProvider("c-reply")));
+        assert!(
+            reject_prompt_after_failed_persistence(
+                &state,
+                &mut agent_c,
+                &session_key,
+                &mut seen_generation_c,
+            ),
+            "socket C must independently observe the same failure after socket B rehydrates"
+        );
+        assert!(
+            reject_prompt_after_failed_persistence(
+                &state,
+                &mut agent_b,
+                &session_key,
+                &mut seen_generation_b,
+            ),
+            "rehydrating cannot certify that missing messages were repaired"
+        );
+
+        let mut prepared_after_failure =
+            state.session_lifecycle.persistence_generation(&session_key);
+        let mut agent_d = queue_test_agent(Box::new(ImmediateModelProvider("d-reply")));
+        assert!(
+            reject_prompt_after_failed_persistence(
+                &state,
+                &mut agent_d,
+                &session_key,
+                &mut prepared_after_failure,
+            ),
+            "a connection prepared after the failure must inherit the poisoned disposition"
+        );
+    }
+
+    #[test]
+    fn durable_marker_rejects_prompt_after_lifecycle_restart() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let backend = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let session_key = "gw_restart_poison";
+        backend
+            .mark_transcript_incomplete(session_key)
+            .expect("persist incomplete marker");
+
+        // A freshly constructed AppState stands in for a daemon restart: its
+        // in-process generation is zero, so only the backend marker can reject.
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend);
+        let mut seen_generation = state.session_lifecycle.persistence_generation(session_key);
+        let mut agent = queue_test_agent(Box::new(ImmediateModelProvider("reply")));
+
+        assert!(reject_prompt_after_failed_persistence(
+            &state,
+            &mut agent,
+            session_key,
+            &mut seen_generation,
+        ));
     }
 
     /// A `Sink<Message>` that just collects the text frames sent to it, so a handler
@@ -2602,6 +4083,1298 @@ data: {\"type\":\"message_stop\"}\n\n",
             run_status(&state).as_deref(),
             Some("WaitingApproval"),
             "the gate is cleared once an authorized WS member approves"
+        );
+    }
+
+    // ── Production-boundary two-socket regression ────────────────────────
+    //
+    // A prompt B arriving while turn A is live must
+    // (1) be queued/attached rather than run concurrently with A, (2) run
+    // against A's completed history once it does run — never the pre-A
+    // snapshot its connection-scoped `Agent` was seeded with at connect
+    // time — and (3) never displace A's cancel token as the session's abort
+    // authority while A is still live. Unlike the `register_cancel_token`
+    // map-helper tests above, this drives the real `process_chat_message`
+    // (the same function both `handle_socket` call sites use), the real
+    // `AppState::session_queue` / `cancel_tokens` / `session_turn_versions`,
+    // and the real `current_turn_version` / `bump_turn_version` /
+    // `rehydrate_agent_from_backend` added for this fix, from two
+    // independent tasks racing on one shared session — the interleaving a
+    // real two-socket reconnect produces, driven deterministically instead
+    // of by timing.
+
+    /// In-memory `SessionBackend` that also tracks which sessions have a
+    /// `set_session_state` (turn started) or `append` call, mirroring the
+    /// SQLite backend's `session_metadata` row: a session can be "known" —
+    /// and therefore eligible for `persist_conversation_messages` — before
+    /// its first message is appended.
+    #[derive(Default)]
+    struct QueueTestSessionBackend {
+        messages: std::sync::Mutex<
+            std::collections::HashMap<String, Vec<zeroclaw_providers::ChatMessage>>,
+        >,
+        known: std::sync::Mutex<std::collections::HashSet<String>>,
+        incomplete: std::sync::Mutex<std::collections::HashSet<String>>,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for QueueTestSessionBackend {
+        fn load(&self, session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.messages
+                .lock()
+                .unwrap()
+                .get(session_key)
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn append(
+            &self,
+            session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            self.messages
+                .lock()
+                .unwrap()
+                .entry(session_key.to_string())
+                .or_default()
+                .push(message.clone());
+            self.known.lock().unwrap().insert(session_key.to_string());
+            Ok(())
+        }
+        fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap()
+                .get_mut(session_key)
+                .is_some_and(|v| v.pop().is_some()))
+        }
+        fn mark_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .lock()
+                .unwrap()
+                .insert(session_key.to_string());
+            self.known.lock().unwrap().insert(session_key.to_string());
+            Ok(())
+        }
+        fn clear_transcript_incomplete(&self, session_key: &str) -> std::io::Result<()> {
+            self.incomplete.lock().unwrap().remove(session_key);
+            Ok(())
+        }
+        fn transcript_incomplete(&self, session_key: &str) -> std::io::Result<bool> {
+            Ok(self.incomplete.lock().unwrap().contains(session_key))
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            self.messages.lock().unwrap().keys().cloned().collect()
+        }
+        fn session_exists(&self, session_key: &str) -> bool {
+            self.known.lock().unwrap().contains(session_key)
+        }
+        fn set_session_state(
+            &self,
+            session_key: &str,
+            _state: &str,
+            _turn_id: Option<&str>,
+        ) -> std::io::Result<()> {
+            self.known.lock().unwrap().insert(session_key.to_string());
+            Ok(())
+        }
+        fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
+            self.messages.lock().unwrap().remove(session_key);
+            self.incomplete.lock().unwrap().remove(session_key);
+            Ok(self.known.lock().unwrap().remove(session_key))
+        }
+    }
+
+    /// Stands in for turn A: its reply never arrives on its own, so the test
+    /// can hold A "mid-turn" deterministically and then interrupt it with a
+    /// real abort rather than guessing at timing.
+    struct StuckModelProvider;
+
+    #[async_trait::async_trait]
+    impl zeroclaw_providers::ModelProvider for StuckModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            std::future::pending::<()>().await;
+            unreachable!("this future is only ever dropped via cancellation")
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for StuckModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "StuckModelProvider"
+        }
+    }
+
+    /// Stands in for turn B: replies immediately, so any delay it observes
+    /// comes entirely from `session_queue` contention, not the model call.
+    struct ImmediateModelProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl zeroclaw_providers::ModelProvider for ImmediateModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(self.0.to_string())
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for ImmediateModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "ImmediateModelProvider"
+        }
+    }
+
+    /// A connection-scoped `Agent`, built the way each WebSocket builds its
+    /// own — fresh, empty history — but with an in-process model_provider
+    /// instead of a live-config-resolved HTTP one, so the turn itself is
+    /// deterministic and network-free.
+    fn queue_test_agent(
+        model_provider: Box<dyn zeroclaw_providers::ModelProvider>,
+    ) -> zeroclaw_runtime::agent::Agent {
+        zeroclaw_runtime::agent::Agent::builder()
+            .model_provider(model_provider)
+            .tools(Vec::new())
+            .memory(std::sync::Arc::new(zeroclaw_memory::NoneMemory::new(
+                "none",
+            )))
+            .observer(std::sync::Arc::new(
+                zeroclaw_runtime::observability::NoopObserver,
+            ))
+            .tool_dispatcher(Box::new(
+                zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
+            ))
+            .workspace_dir(std::env::temp_dir())
+            .build()
+            .expect("test agent builds with a minimal in-process model_provider")
+    }
+
+    async fn queue_test_response_json(response: axum::response::Response) -> serde_json::Value {
+        use http_body_util::BodyExt as _;
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body")
+            .to_bytes();
+        serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    /// Common post-conditions for both two-socket regressions below: A's
+    /// abort lands on the exact token A registered, B rehydrates onto A's
+    /// completed history (never the pre-A snapshot), the persisted
+    /// transcript orders A's turn before B's, both turns release their
+    /// cancel token, and B's own turn still runs to completion.
+    fn assert_b_rehydrated_after_a_aborted(
+        state: &AppState,
+        backend: &QueueTestSessionBackend,
+        session_key: &str,
+        agent_b: &zeroclaw_runtime::agent::Agent,
+        sender_b: &CollectSink,
+    ) {
+        let agent_b_saw_prompt_a = agent_b.history().iter().any(|m| {
+            matches!(
+                m,
+                zeroclaw_providers::ConversationMessage::Chat(c) if c.content.contains("prompt-A")
+            )
+        });
+        assert!(
+            agent_b_saw_prompt_a,
+            "B's rehydrated Agent must carry turn A's completed history: {:?}",
+            agent_b.history()
+        );
+
+        let persisted = backend.load(session_key);
+        let persisted_text: Vec<&str> = persisted.iter().map(|m| m.content.as_str()).collect();
+        let a_index = persisted_text
+            .iter()
+            .position(|c| c.contains("prompt-A"))
+            .expect("backend must hold A's prompt");
+        let b_index = persisted_text
+            .iter()
+            .position(|c| c.contains("prompt-B"))
+            .expect("backend must hold B's prompt");
+        assert!(
+            a_index < b_index,
+            "A's turn must precede B's in the persisted transcript: {persisted_text:?}"
+        );
+
+        assert!(
+            state.cancel_tokens.lock().unwrap().is_empty(),
+            "both turns must release their cancel token on completion"
+        );
+
+        let b_completed = sender_b.0.iter().any(|frame| {
+            serde_json::from_str::<serde_json::Value>(frame)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("done")
+        });
+        assert!(
+            b_completed,
+            "B's own turn must still run to completion after rehydration: {:?}",
+            sender_b.0
+        );
+    }
+
+    /// Benign interleaving: B does not arrive until A has already registered
+    /// as the session's live turn (mirrors a straightforward "second prompt
+    /// while the first is running" reconnect).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn queued_prompt_rehydrates_from_post_turn_a_history_and_keeps_a_abort_authority() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(QueueTestSessionBackend::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "shared-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let mut agent_a = queue_test_agent(Box::new(StuckModelProvider));
+        let mut agent_b = queue_test_agent(Box::new(ImmediateModelProvider("B-reply")));
+
+        // ── Turn A: the first prompt for this session, seeded before it existed ──
+        let state_a = state.clone();
+        let session_key_a = session_key.clone();
+        let turn_a_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+
+            assert!(
+                !state_a
+                    .cancel_tokens
+                    .lock()
+                    .unwrap()
+                    .contains_key(&session_key_a),
+                "turn A is the first prompt for this session"
+            );
+            let _guard = state_a
+                .session_queue
+                .acquire(&session_key_a)
+                .await
+                .expect("A acquires the session lock uncontested");
+
+            process_chat_message(
+                &state_a,
+                &mut agent_a,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &mut None,
+                &None,
+                "prompt-A",
+                &session_key_a,
+                "shared-session",
+                state_a
+                    .session_lifecycle
+                    .deletion_generation(&session_key_a),
+                None,
+            )
+            .await;
+
+            (agent_a, sender)
+        });
+
+        // Wait for A to register as live: its `chat_with_system` call is now
+        // parked mid-turn (it never resolves on its own). This spin is only
+        // ever used to make the *benign* ordering deterministic (B arrives
+        // strictly after A is live) — the racy-interleaving test below
+        // deliberately does not use anything like it.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .contains_key(&session_key)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turn A never registered as live"
+            );
+            tokio::task::yield_now().await;
+        }
+        let token_during_a = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get(&session_key)
+            .cloned()
+            .expect("A's cancel token is registered while A is live");
+        assert!(!token_during_a.is_cancelled(), "A has not been aborted yet");
+
+        // ── Prompt B arrives while A is live ──
+        let state_b = state.clone();
+        let session_key_b = session_key.clone();
+        let turn_b_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+
+            // Connect-time snapshot: this connection has never seen a turn
+            // complete for this session.
+            let seen_version_b =
+                current_turn_version(&state_b.session_turn_versions, &session_key_b);
+
+            let _guard = state_b
+                .session_queue
+                .acquire(&session_key_b)
+                .await
+                .expect("B eventually acquires the lock once A releases it");
+
+            let rehydrated = current_turn_version(&state_b.session_turn_versions, &session_key_b)
+                != seen_version_b;
+            if rehydrated && let Some(ref backend) = state_b.session_backend {
+                rehydrate_agent_from_backend(backend.as_ref(), &mut agent_b, &session_key_b);
+            }
+
+            process_chat_message(
+                &state_b,
+                &mut agent_b,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &mut None,
+                &None,
+                "prompt-B",
+                &session_key_b,
+                "shared-session",
+                state_b
+                    .session_lifecycle
+                    .deletion_generation(&session_key_b),
+                None,
+            )
+            .await;
+
+            (agent_b, sender, rehydrated)
+        });
+
+        // ── Property 1: B is queued/attached behind A, never run concurrently ──
+        // `queue_depth` counts every live `acquire` attempt, including the one
+        // currently holding the permit: 1 == only A (holding); 2 == A holding
+        // + B waiting behind it. It can never observe B running concurrently
+        // with A, since B's own `acquire` has not yet resolved.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "B never reached the session queue"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            state.session_queue.queue_depth(&session_key).await,
+            2,
+            "B must be queued behind A (A holding + B waiting), not running concurrently with it"
+        );
+        assert_eq!(
+            state.cancel_tokens.lock().unwrap().len(),
+            1,
+            "only A's turn may hold registered abort authority while B is queued"
+        );
+
+        // ── Property 3: B cannot displace A's abort authority ──
+        // B is still queued and has registered no token of its own, so an
+        // abort issued right now can only ever land on A's token — there is
+        // categorically nothing for B to have displaced.
+        let abort_response = crate::api::handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let abort_json = queue_test_response_json(abort_response).await;
+        assert_eq!(abort_json["status"], "aborted");
+        assert!(
+            token_during_a.is_cancelled(),
+            "the abort must cancel the exact token instance A registered"
+        );
+
+        // A's turn now unwinds via cancellation and releases the session
+        // permit; B's queued acquire can proceed.
+        let (_agent_a, _sender_a) = turn_a_handle.await.expect("turn A task does not panic");
+        let (agent_b, sender_b, rehydrated) =
+            turn_b_handle.await.expect("turn B task does not panic");
+        assert!(
+            rehydrated,
+            "B must have rehydrated after observing a turn complete while it waited"
+        );
+
+        // ── Property 2: B never runs from the pre-A history it was seeded
+        // with at connect time ──
+        assert_b_rehydrated_after_a_aborted(&state, &backend, &session_key, &agent_b, &sender_b);
+    }
+
+    /// The gateway shutdown watch channel
+    /// (`AppState::shutdown_tx`, observed by `run_gateway`'s accept loop) was
+    /// not observed anywhere inside a live turn, so a detached turn (viewer
+    /// already gone) would keep running provider/tool calls straight through
+    /// a graceful shutdown. Shutdown must cancel a live turn the same way an
+    /// explicit abort does, so it unwinds, persists partial output, and
+    /// releases its token/permit instead of outliving the process trying to
+    /// stop it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_cancels_a_detached_turn() {
+        let state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let session_id = "shutdown-detached-turn";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let mut agent = queue_test_agent(Box::new(StuckModelProvider));
+
+        let state_for_turn = state.clone();
+        let session_key_for_turn = session_key.clone();
+        let turn_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            // Already-empty stream: the very first `receiver.next()` poll
+            // resolves to `None`, exactly like a viewer that disconnected
+            // before this turn even started — the detached-turn case
+            // shutdown cancellation has to cover.
+            let mut receiver =
+                futures_util::stream::empty::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+
+            process_chat_message(
+                &state_for_turn,
+                &mut agent,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &mut None,
+                &None,
+                "prompt-detached-then-shutdown",
+                &session_key_for_turn,
+                "shutdown-detached-turn",
+                state_for_turn
+                    .session_lifecycle
+                    .deletion_generation(&session_key_for_turn),
+                None,
+            )
+            .await;
+
+            sender
+        });
+
+        // Wait for the turn to register as live before signalling shutdown.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .contains_key(&session_key)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turn never registered as live"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        state
+            .shutdown_tx
+            .send(true)
+            .expect("the live turn's own subscribe() keeps at least one receiver alive");
+
+        let sender = tokio::time::timeout(std::time::Duration::from_secs(5), turn_handle)
+            .await
+            .expect(
+                "the detached turn must end once shutdown is observed, not hang forever \
+                 waiting on a provider call nobody will ever answer",
+            )
+            .expect("turn task does not panic");
+
+        assert!(
+            state
+                .cancel_tokens
+                .lock()
+                .unwrap()
+                .get(&session_key)
+                .is_none(),
+            "the cancel token must be released once shutdown-triggered cancellation unwinds"
+        );
+        let aborted = sender.0.iter().any(|frame| {
+            serde_json::from_str::<serde_json::Value>(frame)
+                .ok()
+                .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(str::to_string))
+                .as_deref()
+                == Some("aborted")
+        });
+        assert!(
+            aborted,
+            "shutdown must cancel the turn the same way an explicit abort does: {:?}",
+            sender.0
+        );
+    }
+
+    /// `DELETE /api/sessions/{id}` cancels the
+    /// *currently registered* live token, but a prompt already queued behind
+    /// that turn on `session_queue` has not registered a token of its own
+    /// yet. Without an explicit check, that queued prompt is free to acquire
+    /// the permit A just released and start provider/tool execution for a
+    /// session an operator just deleted. `session_deleted_while_queued` —
+    /// the exact guard `handle_socket` calls between acquiring the permit
+    /// and calling `process_chat_message` — must observe the deletion.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn no_queued_prompt_starts_after_delete() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(QueueTestSessionBackend::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "deleted-while-queued";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let mut agent_a = queue_test_agent(Box::new(StuckModelProvider));
+
+        // ── Turn A: live, holding the session_queue permit ──
+        let state_a = state.clone();
+        let session_key_a = session_key.clone();
+        let turn_a_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+            let _guard = state_a
+                .session_queue
+                .acquire(&session_key_a)
+                .await
+                .expect("A acquires the session lock uncontested");
+
+            process_chat_message(
+                &state_a,
+                &mut agent_a,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &mut None,
+                &None,
+                "prompt-A",
+                &session_key_a,
+                "deleted-while-queued",
+                state_a
+                    .session_lifecycle
+                    .deletion_generation(&session_key_a),
+                None,
+            )
+            .await;
+
+            (agent_a, sender)
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .contains_key(&session_key)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turn A never registered as live"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // ── Prompt B queues behind A, then checks the same guard
+        // `handle_socket` runs right after its own `acquire()` resolves ──
+        let state_b = state.clone();
+        let session_key_b = session_key.clone();
+        // Captured before B starts waiting, matching `handle_socket`.
+        let generation_b = state.session_lifecycle.deletion_generation(&session_key);
+        let b_handle = ::zeroclaw_spawn::spawn!(async move {
+            let _guard = state_b
+                .session_queue
+                .acquire(&session_key_b)
+                .await
+                .expect("B eventually acquires the lock once A releases it");
+            session_deleted_while_queued(&state_b, &session_key_b, generation_b)
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "B never reached the session queue"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // ── Delete the session while A is live and B is queued behind it ──
+        let delete_response = crate::api::handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let delete_json = queue_test_response_json(delete_response).await;
+        assert_eq!(delete_json["deleted"], true);
+
+        // A's turn now unwinds via the delete-triggered cancellation and
+        // releases the permit; B's queued acquire can proceed.
+        let (_agent_a, _sender_a) = turn_a_handle.await.expect("turn A task does not panic");
+        let b_saw_deleted = b_handle.await.expect("B's task does not panic");
+
+        assert!(
+            b_saw_deleted,
+            "a prompt queued behind a deleted session's turn must observe the \
+             deletion via session_deleted_while_queued before handle_socket \
+             would otherwise call process_chat_message for it"
+        );
+        assert!(
+            backend.load(&session_key).is_empty(),
+            "no queued prompt may have appended to the deleted session"
+        );
+    }
+
+    /// Racy interleaving: B's decision to wait behind A is forced by queue
+    /// position alone — B enqueues on `session_queue` *before A has
+    /// registered any cancel token at all* (A is still queued too, behind a
+    /// permit the test primes and holds). This is the TOCTOU the fix
+    /// removes: the old design snapshotted `cancel_tokens` for liveness
+    /// *before* calling `acquire`, so a snapshot taken in this exact window
+    /// (A enqueued but not yet registered) would read "not live" and skip
+    /// rehydration even though A wins the permit and completes before B
+    /// does. The fix makes the rehydrate decision strictly *after*
+    /// `acquire` resolves, comparing a monotonic per-session version — a
+    /// point that cannot be reached until the connection actually holds the
+    /// permit, by which time any prior turn for this session is
+    /// unconditionally finished (see the version bump next to the
+    /// cancel-token removal in `process_chat_message`). So this test
+    /// forces B to enqueue with zero information about A's state, and
+    /// still expects the same three properties.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_prompt_still_rehydrates_from_post_turn_a_history_and_keeps_a_abort_authority() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(QueueTestSessionBackend::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "raced-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let mut agent_a = queue_test_agent(Box::new(StuckModelProvider));
+        let mut agent_b = queue_test_agent(Box::new(ImmediateModelProvider("B-reply")));
+
+        // Prime the session's one permit so neither A nor B can win the
+        // `acquire` race until the test releases it below. `Semaphore` is
+        // documented FIFO, so this lets the test control *queue order*
+        // deterministically (A enqueues first, B second) without ever
+        // consulting `cancel_tokens` — the one piece of state the old,
+        // buggy design leaned on and that this test must not depend on.
+        let priming_guard = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("test primes the session permit");
+
+        let state_a = state.clone();
+        let session_key_a = session_key.clone();
+        let turn_a_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+
+            // No pre-acquire check of any kind — the fix removed the last
+            // one (`session_turn_is_live`). A just enqueues.
+            let _guard = state_a
+                .session_queue
+                .acquire(&session_key_a)
+                .await
+                .expect("A eventually wins the primed permit");
+
+            process_chat_message(
+                &state_a,
+                &mut agent_a,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &mut None,
+                &None,
+                "prompt-A",
+                &session_key_a,
+                "raced-session",
+                state_a
+                    .session_lifecycle
+                    .deletion_generation(&session_key_a),
+                None,
+            )
+            .await;
+
+            (agent_a, sender)
+        });
+
+        // Wait for A to actually enqueue behind the primed permit (2 ==
+        // priming guard holding + A waiting). Purely a `session_queue`
+        // accounting check — nothing here touches `cancel_tokens`.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A never enqueued behind the primed permit"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // Spawn B *immediately* — no wait for A's cancel token, because
+        // there isn't one: A is still queued behind the priming guard,
+        // nowhere near `register_cancel_token`. This is the racy
+        // interleaving: B's `acquire` call is issued while A has registered
+        // nothing at all.
+        let state_b = state.clone();
+        let session_key_b = session_key.clone();
+        let turn_b_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+
+            let seen_version_b =
+                current_turn_version(&state_b.session_turn_versions, &session_key_b);
+
+            let _guard = state_b
+                .session_queue
+                .acquire(&session_key_b)
+                .await
+                .expect("B eventually wins the permit after A");
+
+            let rehydrated = current_turn_version(&state_b.session_turn_versions, &session_key_b)
+                != seen_version_b;
+            if rehydrated && let Some(ref backend) = state_b.session_backend {
+                rehydrate_agent_from_backend(backend.as_ref(), &mut agent_b, &session_key_b);
+            }
+
+            process_chat_message(
+                &state_b,
+                &mut agent_b,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &mut None,
+                &None,
+                "prompt-B",
+                &session_key_b,
+                "raced-session",
+                state_b
+                    .session_lifecycle
+                    .deletion_generation(&session_key_b),
+                None,
+            )
+            .await;
+
+            (agent_b, sender, rehydrated)
+        });
+
+        // Wait for both A and B to be enqueued behind the priming guard
+        // (3 == priming holding + A waiting + B waiting) — B has issued its
+        // `acquire` call while A is nowhere near registering a cancel
+        // token (A hasn't even won the permit yet).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "B never enqueued behind A"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            state.cancel_tokens.lock().unwrap().is_empty(),
+            "neither A nor B has registered a cancel token yet — both are still queued \
+             behind the primed permit, which is exactly the window the old \
+             pre-acquire liveness snapshot got wrong"
+        );
+
+        // Release the primed permit: FIFO means A (enqueued first) wins it,
+        // not B — this is the only ordering guarantee the test relies on,
+        // and it comes from `session_queue`'s documented fairness, not from
+        // observing A's internal state.
+        drop(priming_guard);
+
+        // A wins the race and registers legitimately (a consequence of the
+        // race resolving, not something the test orchestrates).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.cancel_tokens.lock().unwrap().is_empty() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "A never won the primed permit and registered"
+            );
+            tokio::task::yield_now().await;
+        }
+        let token_during_a = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get(&session_key)
+            .cloned()
+            .expect("A's cancel token is registered once A wins the permit");
+        assert!(!token_during_a.is_cancelled(), "A has not been aborted yet");
+
+        // ── Property 1: B is queued/attached behind A, never run concurrently ──
+        assert_eq!(
+            state.session_queue.queue_depth(&session_key).await,
+            2,
+            "B must be queued behind A (A holding + B waiting), not running concurrently with it"
+        );
+        assert_eq!(
+            state.cancel_tokens.lock().unwrap().len(),
+            1,
+            "only A's turn may hold registered abort authority while B is queued"
+        );
+
+        // ── Property 3: B cannot displace A's abort authority ──
+        let abort_response = crate::api::handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let abort_json = queue_test_response_json(abort_response).await;
+        assert_eq!(abort_json["status"], "aborted");
+        assert!(
+            token_during_a.is_cancelled(),
+            "the abort must cancel the exact token instance A registered"
+        );
+
+        let (_agent_a, _sender_a) = turn_a_handle.await.expect("turn A task does not panic");
+        let (agent_b, sender_b, rehydrated) =
+            turn_b_handle.await.expect("turn B task does not panic");
+        assert!(
+            rehydrated,
+            "B must rehydrate even though its own pre-acquire state (none) said nothing \
+             about A — the version check under the permit must catch what a pre-acquire \
+             liveness snapshot would have missed"
+        );
+
+        // ── Property 2: B never runs from the pre-A history it was seeded
+        // with at connect time ──
+        assert_b_rehydrated_after_a_aborted(&state, &backend, &session_key, &agent_b, &sender_b);
+    }
+
+    /// Connect-time variant of the same TOCTOU: a *new* connection's
+    /// connect-time snapshot (`seen_version` read, then `backend.load` —
+    /// mirrored here exactly as `handle_socket` does it, ws.rs:~345/~351)
+    /// happens without holding the `session_queue` permit, so it can race a
+    /// concurrently-completing turn. The bug this closes: bumping the
+    /// version *before* persisting would let this snapshot observe the new
+    /// version while the messages behind it are not yet in the backend —
+    /// then load stale (pre-turn) history and seed an `Agent` that looks
+    /// exactly as current as a correctly-rehydrated one, permanently.
+    ///
+    /// The fix makes that ordering structurally impossible rather than just
+    /// less likely: `bump_turn_version` runs strictly after that path's
+    /// persistence, on the same synchronous call path with no `.await`
+    /// between them (see the three call sites in `process_chat_message`),
+    /// so any observer's happens-before chain through the `session_backend`
+    /// lock and the `session_turn_versions` lock can only ever see
+    /// messages-before-version, never the reverse. There is no `.await`
+    /// point between persist and bump to pin a test to without
+    /// instrumenting production code (out of scope here), so this test
+    /// does not force the exact instruction-level interleaving; instead,
+    /// per the documented fallback for that case, it:
+    /// (1) runs an independent sampler that polls (version, backend
+    ///     content) many times on a real multi-thread runtime throughout
+    ///     turn A's completion and asserts the dangerous order — version
+    ///     bumped, A's message not yet in the backend — is never observed;
+    /// (2) has a connection C perform the exact connect-time two-step
+    ///     concurrently with A's completion, with nothing pinning it to any
+    ///     particular instant, and proves C's first prompt still lands on
+    ///     A's fully-persisted history regardless of what that snapshot
+    ///     caught — the post-acquire version compare is the safety net for
+    ///     whatever the connect-time snapshot missed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_time_snapshot_never_outraces_persistence_before_version_bump() {
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let backend = std::sync::Arc::new(QueueTestSessionBackend::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let session_id = "connect-race-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        let mut agent_a = queue_test_agent(Box::new(StuckModelProvider));
+
+        // ── Turn A: registers, then sits parked mid-turn until aborted. ──
+        let state_a = state.clone();
+        let session_key_a = session_key.clone();
+        let turn_a_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut sender = CollectSink(Vec::new());
+            let mut receiver =
+                futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+            let (_approval_tx, mut approval_rx) = tokio::sync::mpsc::channel(4);
+            let pending = new_pending_approvals();
+            let _guard = state_a
+                .session_queue
+                .acquire(&session_key_a)
+                .await
+                .expect("A acquires the session lock uncontested");
+            process_chat_message(
+                &state_a,
+                &mut agent_a,
+                &mut sender,
+                &mut receiver,
+                &mut approval_rx,
+                &pending,
+                &mut None,
+                &None,
+                "prompt-A",
+                &session_key_a,
+                "connect-race-session",
+                state_a
+                    .session_lifecycle
+                    .deletion_generation(&session_key_a),
+                None,
+            )
+            .await;
+            (agent_a, sender)
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !state
+            .cancel_tokens
+            .lock()
+            .unwrap()
+            .contains_key(&session_key)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "turn A never registered as live"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        // ── (1) Independent sampler: polls (version, backend content) many
+        // times across A's completion and keeps every distinct pair. ──
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sampler_state = state.clone();
+        let sampler_session_key = session_key.clone();
+        let sampler_backend = backend.clone();
+        let sampler_stop = stop.clone();
+        let sampler_handle = ::zeroclaw_spawn::spawn!(async move {
+            let mut samples: Vec<(u64, bool)> = Vec::new();
+            let sampler_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            // Not an unconditional spin: stops a little after the caller
+            // signals turn A is done (or the deadline trips), so samples
+            // span before/during/after completion without running forever.
+            let mut extra_after_stop = 50;
+            loop {
+                let version = current_turn_version(
+                    &sampler_state.session_turn_versions,
+                    &sampler_session_key,
+                );
+                let has_prompt_a = sampler_backend
+                    .load(&sampler_session_key)
+                    .iter()
+                    .any(|m| m.content.contains("prompt-A"));
+                samples.push((version, has_prompt_a));
+                if sampler_stop.load(std::sync::atomic::Ordering::Acquire) {
+                    extra_after_stop -= 1;
+                    if extra_after_stop == 0 {
+                        break;
+                    }
+                }
+                if tokio::time::Instant::now() >= sampler_deadline {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            samples
+        });
+
+        // ── (2) Connection C performs the exact connect-time two-step,
+        // concurrently with A's completion, with nothing pinning it to any
+        // particular instant relative to A's persist/bump. ──
+        let state_c = state.clone();
+        let session_key_c = session_key.clone();
+        let connect_handle = ::zeroclaw_spawn::spawn!(async move {
+            // Mirrors ws.rs:~345 / ~351 exactly: read the version, *then*
+            // load history — this connection holds no permit at this point.
+            let seen_version_c =
+                current_turn_version(&state_c.session_turn_versions, &session_key_c);
+            let stored_messages_c = state_c
+                .session_backend
+                .as_ref()
+                .expect("backend configured")
+                .load(&session_key_c);
+            (seen_version_c, stored_messages_c)
+        });
+
+        // Abort A while the sampler and C's connect-time snapshot are
+        // racing its completion.
+        let abort_response = crate::api::handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let abort_json = queue_test_response_json(abort_response).await;
+        assert_eq!(abort_json["status"], "aborted");
+
+        let (_agent_a, _sender_a) = turn_a_handle.await.expect("turn A task does not panic");
+        let (seen_version_c, stored_messages_c) = connect_handle
+            .await
+            .expect("C's connect-time snapshot task does not panic");
+
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let samples = sampler_handle.await.expect("sampler task does not panic");
+
+        // ── Assertion (1): the dangerous ordering is never observed —
+        // version bumped without A's message yet visible in the backend.
+        // Fold C's own snapshot in too: it is just one more
+        // (version, backend-content) pair, taken at a real, uncontrolled
+        // instant during A's completion. ──
+        let stored_c_has_prompt_a = stored_messages_c
+            .iter()
+            .any(|m| m.content.contains("prompt-A"));
+        let all_samples: Vec<(u64, bool)> = samples
+            .iter()
+            .copied()
+            .chain(std::iter::once((seen_version_c, stored_c_has_prompt_a)))
+            .collect();
+        let violations: Vec<&(u64, bool)> = all_samples
+            .iter()
+            .filter(|&&(version, has_prompt_a)| version > 0 && !has_prompt_a)
+            .collect();
+        assert!(
+            violations.is_empty(),
+            "observed the session's turn-completion version bumped before A's \
+             message was visible in the backend: {violations:?} (out of {} samples)",
+            all_samples.len()
+        );
+        assert!(
+            all_samples.iter().any(|&(v, _)| v > 0),
+            "the sampler never observed the post-bump state at all in this run — \
+             widen its window; this run did not actually exercise the invariant"
+        );
+
+        // ── Assertion (2): C's own first prompt still lands on A's complete
+        // history, regardless of what its connect-time snapshot caught. ──
+        let mut agent_c = queue_test_agent(Box::new(ImmediateModelProvider("C-reply")));
+        if !stored_messages_c.is_empty() {
+            agent_c.seed_history_with_event(&stored_messages_c);
+        }
+        let mut sender_c = CollectSink(Vec::new());
+        let mut receiver_c =
+            futures_util::stream::pending::<Result<Message, std::convert::Infallible>>();
+        let (_approval_tx, mut approval_rx_c) = tokio::sync::mpsc::channel(4);
+        let pending_c = new_pending_approvals();
+        let _guard_c = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("C acquires the session lock once A has fully released it");
+        if current_turn_version(&state.session_turn_versions, &session_key) != seen_version_c
+            && let Some(ref backend_ref) = state.session_backend
+        {
+            rehydrate_agent_from_backend(backend_ref.as_ref(), &mut agent_c, &session_key);
+        }
+        process_chat_message(
+            &state,
+            &mut agent_c,
+            &mut sender_c,
+            &mut receiver_c,
+            &mut approval_rx_c,
+            &pending_c,
+            &mut None,
+            &None,
+            "prompt-C",
+            &session_key,
+            "connect-race-session",
+            state.session_lifecycle.deletion_generation(&session_key),
+            None,
+        )
+        .await;
+
+        let agent_c_saw_prompt_a = agent_c.history().iter().any(|m| {
+            matches!(
+                m,
+                zeroclaw_providers::ConversationMessage::Chat(c) if c.content.contains("prompt-A")
+            )
+        });
+        assert!(
+            agent_c_saw_prompt_a,
+            "C's Agent must reflect turn A's completed history before C's own \
+             prompt runs, regardless of what C's connect-time snapshot caught: {:?}",
+            agent_c.history()
+        );
+    }
+
+    /// A brand-new JSONL-backed session must be able to run its first prompt.
+    ///
+    /// `SessionStore::session_exists` is a file-presence check and the session
+    /// file is not created until the first append, so a guard built on that
+    /// probe reports "absent" for a session that was never deleted — rejecting
+    /// the opening prompt of every new session as `SESSION_DELETED`. The
+    /// production JSONL backend is used deliberately: a custom test backend
+    /// that pre-creates its sessions cannot express this state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn first_prompt_on_a_new_jsonl_session_is_not_treated_as_deleted() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let state = state;
+
+        let session_key = format!("{GW_SESSION_PREFIX}brand-new-session");
+
+        // Mirror the handshake: the alias write is a no-op for this backend,
+        // so no file exists yet.
+        let _ = store.set_session_agent_alias(&session_key, "default");
+        assert!(
+            !store.session_exists(&session_key),
+            "precondition: a new JSONL session has no file until its first append; \
+             if this ever becomes false the bug this test guards is unreachable \
+             and the test is no longer meaningful"
+        );
+
+        // Exactly what `handle_socket` does: capture before waiting, compare
+        // after acquiring.
+        let generation = state.session_lifecycle.deletion_generation(&session_key);
+        let _guard = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("uncontended acquire");
+
+        assert!(
+            !session_deleted_while_queued(&state, &session_key, generation),
+            "a session that was never deleted must not be reported as deleted just \
+             because its backing file has not been written yet"
+        );
+    }
+
+    /// A queued writer must still observe a deletion when the session is
+    /// recreated before it wakes: existence is restored, but the writer's
+    /// view of history is stale either way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn delete_then_recreate_still_rejects_the_queued_prompt() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let state = state;
+
+        let session_id = "recycled-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        store
+            .append(&session_key, &zeroclaw_providers::ChatMessage::user("seed"))
+            .expect("seed append");
+
+        let generation = state.session_lifecycle.deletion_generation(&session_key);
+
+        let delete_response = crate::api::handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            queue_test_response_json(delete_response).await["deleted"],
+            true
+        );
+
+        // Recreate it, so a file-presence probe would report the session as
+        // perfectly healthy.
+        store
+            .append(
+                &session_key,
+                &zeroclaw_providers::ChatMessage::user("recreated"),
+            )
+            .expect("recreate append");
+        assert!(store.session_exists(&session_key));
+
+        assert!(
+            session_deleted_while_queued(&state, &session_key, generation),
+            "delete-then-recreate must invalidate a writer that queued before the \
+             delete, even though the session exists again"
+        );
+    }
+
+    /// The session must not read as `idle` between the end of streaming and
+    /// the completion of persistence: that is precisely the window a
+    /// reconnecting dashboard uses to hydrate its transcript.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_state_reports_running_while_a_turn_is_finalizing() {
+        let state = crate::api::test_state(zeroclaw_config::schema::Config::default());
+        let session_id = "finalizing-session";
+        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+
+        // No cancel token is registered — the stream has ended. Only the
+        // finalizing hold stands between the client and a premature `idle`.
+        let finalizing = crate::session_lifecycle::FinalizingGuard::new(
+            state.session_lifecycle.as_ref(),
+            &session_key,
+        );
+
+        let response = crate::api::handle_api_session_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let json = queue_test_response_json(response).await;
+        assert_eq!(
+            json["state"], "running",
+            "a turn that has stopped streaming but not finished persisting must not \
+             be advertised as idle: {json:?}"
+        );
+
+        drop(finalizing);
+
+        let response = crate::api::handle_api_session_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let json = queue_test_response_json(response).await;
+        assert_eq!(
+            json["state"], "idle",
+            "once persistence settles the session must become idle again: {json:?}"
         );
     }
 }

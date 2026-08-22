@@ -3,7 +3,7 @@ import type { ApprovalDecision, PendingApproval, WsMessage } from '@/types/api';
 import { WebSocketClient, getOrCreateSessionId } from '@/lib/ws';
 import { generateUUID } from '@/lib/uuid';
 import { t } from '@/lib/i18n';
-import { getProp, putProp, resolveAliasSource, listProps, getStatus, getSessionMessages, abortSession, deleteSession } from '@/lib/api';
+import { ApiError, HttpError, UnauthorizedError, getProp, putProp, resolveAliasSource, listProps, getStatus, getSessionMessages, getSessionState, abortSession, deleteSession } from '@/lib/api';
 import { primeModelProviderCatalog, modelProviderDisplayName } from '@/lib/modelProviders';
 import { resolveAvailableModels } from './modelPicker.logic';
 import type { ToolCallInfo } from '@/components/ToolCallCard';
@@ -14,6 +14,13 @@ import {
   type TurnStreamFrame,
   type TurnStreamState,
 } from '@/contexts/turnStream.logic';
+import {
+  hydrationFailureOutcome,
+  recoveryFailureOutcome,
+  recoveryMessageKey,
+  shouldBlockSending,
+  shouldOfferRecoveryAction,
+} from '@/contexts/sessionRecovery.logic';
 import {
   loadChatHistory,
   mapServerMessagesToPersisted,
@@ -81,6 +88,14 @@ interface AgentContextValue {
   // Context window tracking (from "done" WS frames). See #7311.
   contextMaxTokens: number | null;
   contextInputTokens: number | null;
+  /**
+   * Label for the recovery affordance shown when detached-turn recovery gives
+   * up, or null when recovery succeeded. Non-null means the composer is
+   * blocked and only this action can unblock it.
+   */
+  recoveryActionLabel: string | null;
+  /** Re-run detached-turn recovery after it failed. */
+  retryRecovery: () => void;
 }
 
 const AgentContext = createContext<AgentContextValue | null>(null);
@@ -92,6 +107,20 @@ export function useAgent() {
 }
 
 const MODEL_SWITCH_TIMEOUT_MS = 10_000;
+const SESSION_RECOVERY_POLL_MS = 500;
+const SESSION_RECOVERY_MAX_POLL_MS = 4_000;
+const SESSION_RECOVERY_MAX_FAILURES = 6;
+
+function sessionRecoveryStatus(error: unknown): number | null {
+  if (
+    error instanceof ApiError
+    || error instanceof HttpError
+    || error instanceof UnauthorizedError
+  ) {
+    return error.status;
+  }
+  return null;
+}
 
 function friendlyAgentError(message?: string): string {
   const raw = message?.trim() || t('agent.unknown_error');
@@ -125,12 +154,19 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [typing, setTyping] = useState(false);
+  // Set when detached-turn recovery gives up. Sending stays blocked, so this
+  // is the only affordance that can return the session to a usable state —
+  // without it the composer is locked until the page is reloaded.
+  const [recoveryAction, setRecoveryAction] = useState<
+    { label: string; wsVersion: number } | null
+  >(null);
   const [streamingContent, setStreamingContent] = useState('');
   const [streamingThinking, setStreamingThinking] = useState('');
   const [currentModel, setCurrentModel] = useState<string | null>(null);
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [modelLoading, setModelLoading] = useState(false);
   const [modelInfoVersion, setModelInfoVersion] = useState(0);
+  const [socketGeneration, setSocketGeneration] = useState(0);
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   // Context window tracking (from "done" WS frames). See #7311.
   const [contextMaxTokens, setContextMaxTokens] = useState<number | null>(null);
@@ -144,6 +180,8 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
   const pendingModelSwitchRef = useRef<string | null>(null);
   const switchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsVersionRef = useRef(0);
+  const recoveryGenerationRef = useRef(0);
+  const recoveryVerifiedRef = useRef(false);
   const localMessageMutationVersionRef = useRef(0);
 
   // Prime the model-provider catalog once so error formatting can resolve
@@ -483,6 +521,131 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     }
   }, [foldTurnStream]);
 
+  // A reconnect can land while the prior connection's turn is still running.
+  // The gateway deliberately keeps that detached turn alive, so this freshly
+  // constructed socket's Agent was seeded before the final messages existed.
+  // Stay read-only until the canonical session state reaches idle, hydrate the
+  // committed transcript, then recycle the socket exactly once so its Agent is
+  // rebuilt from that completed history.
+  const recoverDetachedTurn = useCallback(async (wsVersion: number) => {
+    const recoveryGeneration = ++recoveryGenerationRef.current;
+    const isCurrent = () => (
+      wsVersion === wsVersionRef.current
+      && recoveryGeneration === recoveryGenerationRef.current
+    );
+
+    // Set this before the first await. React batches it with `connected=true`
+    // from onOpen, so a freshly remounted chat never exposes a writable input
+    // while its session-state request is still in flight.
+    setTyping(true);
+    // Any prior lockout affordance belongs to a superseded attempt.
+    setRecoveryAction(null);
+
+    let recoveryFailures = 0;
+    let recoveryDelayMs = SESSION_RECOVERY_POLL_MS;
+    const readSessionState = async () => {
+      while (isCurrent()) {
+        try {
+          const state = await getSessionState(sessionIdRef.current);
+          recoveryFailures = 0;
+          recoveryDelayMs = SESSION_RECOVERY_POLL_MS;
+          return state;
+        } catch (recoveryError) {
+          recoveryFailures += 1;
+          const outcome = recoveryFailureOutcome({
+            status: sessionRecoveryStatus(recoveryError),
+            failures: recoveryFailures,
+            maxFailures: SESSION_RECOVERY_MAX_FAILURES,
+          });
+          if (outcome) {
+            if (isCurrent()) {
+              setError(t(recoveryMessageKey(outcome.reason)));
+              // Sending stays fail-closed while lifecycle state is unknown,
+              // but the block must not be a dead end: no frame will ever
+              // arrive on this socket to clear it, because the replacement
+              // socket was never attached to the detached turn. Pair the
+              // block with an explicit retry so the session is recoverable
+              // without a page reload.
+              setTyping(shouldBlockSending(outcome));
+              setRecoveryAction(
+                shouldOfferRecoveryAction(outcome)
+                  ? { label: t('agent.session_recovery_retry'), wsVersion }
+                  : null,
+              );
+            }
+            return null;
+          }
+          await new Promise<void>((resolve) => {
+            setTimeout(resolve, recoveryDelayMs);
+          });
+          recoveryDelayMs = Math.min(
+            recoveryDelayMs * 2,
+            SESSION_RECOVERY_MAX_POLL_MS,
+          );
+        }
+      }
+      return null;
+    };
+
+    let sessionState = await readSessionState();
+    if (!sessionState || !isCurrent()) return;
+    if (sessionState.state === 'running') {
+      setPendingApproval(null);
+
+      while (isCurrent() && sessionState.state === 'running') {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, SESSION_RECOVERY_POLL_MS);
+        });
+        if (!isCurrent()) return;
+        sessionState = await readSessionState();
+        if (!sessionState) return;
+      }
+    }
+    if (!isCurrent()) return;
+
+    try {
+      const res = await getSessionMessages(sessionIdRef.current);
+      if (!isCurrent()) return;
+      if (res.session_persistence) {
+        localMessageMutationVersionRef.current += 1;
+        setMessages(persistedToUiMessages(mapServerMessagesToPersisted(res.messages)));
+      }
+    } catch {
+      // The turn is already complete, so the local transcript is missing
+      // whatever it produced — stale, not merely incomplete. Accepting that
+      // silently would let a follow-up prompt be composed against history
+      // the operator never saw, so surface it as a retryable recovery state.
+      if (isCurrent()) {
+        const outcome = hydrationFailureOutcome();
+        setError(t(recoveryMessageKey(outcome.reason)));
+        setTyping(shouldBlockSending(outcome));
+        setRecoveryAction(
+          shouldOfferRecoveryAction(outcome)
+            ? { label: t('agent.session_recovery_retry'), wsVersion }
+            : null,
+        );
+      }
+      return;
+    }
+
+    // Route the recovery cleanup through the canonical reducer instead of
+    // resetting removed per-turn refs directly, so turnStreamStateRef stays
+    // the single owner of stream state.
+    foldTurnStream({ type: 'reset' });
+    setStreamingContent('');
+    setStreamingThinking('');
+
+    if (isCurrent() && !recoveryVerifiedRef.current) {
+      // Keep typing=true across the recycle. The replacement socket will run
+      // this same state check and clear it only after confirming idle, so no
+      // prompt can slip through the stale Agent between hydration and cleanup.
+      recoveryVerifiedRef.current = true;
+      setSocketGeneration((generation) => generation + 1);
+    } else if (isCurrent()) {
+      setTyping(false);
+    }
+  }, [foldTurnStream]);
+
   // Wire up a WebSocketClient instance with version-guarded callbacks.
   const attachSocketCallbacks = useCallback((ws: WebSocketClient) => {
     const version = ++wsVersionRef.current;
@@ -491,6 +654,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       if (version !== wsVersionRef.current) return;
       setConnected(true);
       setError(null);
+      void recoverDetachedTurn(version);
 
       // If we just reconnected after a model switch, apply the pending model now.
       if (pendingModelSwitchRef.current) {
@@ -512,6 +676,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       // not survive the close.
       setPendingApproval(null);
       if (version !== wsVersionRef.current) return;
+      recoveryVerifiedRef.current = false;
       setConnected(false);
 
       if (pendingModelSwitchRef.current) {
@@ -545,7 +710,7 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
       if (version !== wsVersionRef.current) return;
       handleWsMessage(msg);
     };
-  }, [handleWsMessage]);
+  }, [handleWsMessage, recoverDetachedTurn]);
 
   // WebSocket bound to the configured agent. Re-keys (via the outer
   // <AgentProvider key={alias}>) when the alias changes.
@@ -556,9 +721,17 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     wsRef.current = ws;
 
     return () => {
+      recoveryGenerationRef.current += 1;
+      // Socket-generation recovery deliberately replaces this connection.
+      // Detach callbacks before closing so its expected Close frame cannot
+      // reset `recoveryVerifiedRef` and trigger an infinite recycle loop.
+      ws.onOpen = null;
+      ws.onClose = null;
+      ws.onError = null;
+      ws.onMessage = null;
       ws.disconnect();
     };
-  }, [attachSocketCallbacks, agentAlias]);
+  }, [attachSocketCallbacks, agentAlias, socketGeneration]);
 
   // Fetch current model and available models from config.
   useEffect(() => {
@@ -890,6 +1063,15 @@ export function AgentProvider({ agentAlias, children }: AgentProviderProps) {
     // Context window tracking (from "done" WS frames). See #7311.
     contextMaxTokens,
     contextInputTokens,
+    recoveryActionLabel: recoveryAction?.label ?? null,
+    retryRecovery: () => {
+      // Re-run recovery against the live socket. `recoverDetachedTurn` bumps
+      // the recovery generation, so a stale attempt cannot resurrect the
+      // lockout after this one supersedes it.
+      setError(null);
+      setRecoveryAction(null);
+      void recoverDetachedTurn(wsVersionRef.current);
+    },
   };
 
   return <AgentContext.Provider value={value}>{children}</AgentContext.Provider>;

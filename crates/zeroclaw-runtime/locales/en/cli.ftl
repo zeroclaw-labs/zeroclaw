@@ -1161,3 +1161,8 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+
+# ── Gateway WebSocket lifecycle ──
+cli-ws-session-turn-active = This session already has a running turn. Wait for it to finish or abort it before sending another message.
+cli-ws-session-deleted = This session was deleted after this connection opened. Reopen the chat before sending another message.
+cli-ws-session-persistence-poisoned = A previous turn could not be saved, so this session's transcript may be incomplete. Delete and recreate the session before sending another message.

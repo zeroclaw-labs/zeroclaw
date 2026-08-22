@@ -1725,6 +1725,38 @@ fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> Strin
     id.to_string()
 }
 
+/// Resolve one existing REST-write target and capture its lifecycle snapshot
+/// as a single authority operation.
+///
+/// `resolve_gateway_session_key` is appropriate for read-only lookups, but a
+/// writer cannot first observe existence and only later capture a generation:
+/// DELETE could land between those steps. Probe each candidate while holding
+/// that candidate's lifecycle authority, preserving the same exact-key-first
+/// resolution contract without pairing facts from different incarnations.
+fn capture_existing_gateway_writer(
+    state: &AppState,
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    id: &str,
+) -> Option<(
+    String,
+    crate::session_lifecycle::DeletionGeneration,
+    crate::session_lifecycle::PersistenceGeneration,
+)> {
+    let mut candidates = vec![id.to_string()];
+    if !id.starts_with("gw_") {
+        candidates.push(format!("gw_{id}"));
+    }
+    for session_key in candidates {
+        if let Some((deletion, persistence)) = state
+            .session_lifecycle
+            .capture_existing_writer(&session_key, || backend.session_exists(&session_key))
+        {
+            return Some((session_key, deletion, persistence));
+        }
+    }
+    None
+}
+
 /// Display session id used by WebSocket `?session_id=` / event filters.
 fn gateway_display_session_id(session_key: &str) -> &str {
     session_key.strip_prefix("gw_").unwrap_or(session_key)
@@ -1797,14 +1829,15 @@ pub async fn handle_api_session_message_post(
             .into_response();
     };
 
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-    if !backend.session_exists(&session_key) {
+    let Some((session_key, deletion_generation, persistence_generation)) =
+        capture_existing_gateway_writer(&state, backend.as_ref(), &id)
+    else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response();
-    }
+    };
 
     let _session_guard = match state.session_queue.acquire(&session_key).await {
         Ok(guard) => guard,
@@ -1824,13 +1857,87 @@ pub async fn handle_api_session_message_post(
         }
     };
 
+    // Validate both lifecycle generations under the authority retained
+    // through append and version publication. DELETE and a prior turn's
+    // failed-persistence disposition cannot land between this check and the
+    // mutation below.
     let message = zeroclaw_providers::ChatMessage::assistant(&body.content);
-    if let Err(e) = backend.append(&session_key, &message) {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to append session message: {e}")})),
-        )
-            .into_response();
+    let mutation = state.session_lifecycle.with_write(
+        &session_key,
+        deletion_generation,
+        persistence_generation,
+        || {
+            backend
+                .transcript_incomplete(&session_key)
+                .unwrap_or_else(|error| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "session_key": session_key,
+                                "error": format!("{error}"),
+                            })),
+                        "failed to read transcript intent marker"
+                    );
+                    true
+                })
+        },
+        |disposition| {
+            let mutation = (|| {
+                backend.mark_transcript_incomplete(&session_key)?;
+                backend.append(&session_key, &message)?;
+                backend.clear_transcript_incomplete(&session_key)?;
+
+                // This append mutated the persisted transcript, so any
+                // connection-scoped `Agent` holding the pre-append history is now
+                // stale. Publish the new epoch under the same lifecycle authority
+                // as the append.
+                crate::ws::bump_turn_version(&state.session_turn_versions, &session_key);
+                Ok::<(), std::io::Error>(())
+            })();
+            if mutation.is_err() {
+                disposition.record_persistence_failure();
+            }
+            mutation
+        },
+    );
+    match mutation {
+        Err(crate::session_lifecycle::MutationRejection::Deleted) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Session was deleted while this request was queued"})),
+            )
+                .into_response();
+        }
+        Err(crate::session_lifecycle::MutationRejection::PersistenceChanged) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "A prior turn failed to persist while this request was queued"
+                })),
+            )
+                .into_response();
+        }
+        Err(crate::session_lifecycle::MutationRejection::PersistencePoisoned) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "This session has an incomplete transcript; delete and recreate it before writing"
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    serde_json::json!({"error": format!("Failed to append session message: {e}")}),
+                ),
+            )
+                .into_response();
+        }
+        Ok(Ok(())) => {}
     }
 
     // Match WS `?session_id=` / `event_matches_session` (display id), not the
@@ -1879,34 +1986,77 @@ pub async fn handle_api_session_delete(
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
-    let token = state
+    // Take the cancel-token lock and record the deletion under it, then
+    // evict the token — all in one critical section. `register_turn_if_current`
+    // re-checks the deletion generation inside this same lock, so a prompt
+    // that passed its post-acquire check can no longer slip in and register a
+    // token after DELETE has looked for one: either it registers first (and we
+    // cancel it below) or it observes the bumped generation and refuses.
+    // Lock order is `cancel_tokens` then `SessionLifecycle::authority`; the
+    // registration path uses the same order.
+    //
+    // The bump necessarily precedes `backend.delete_session` — it is what
+    // closes the race, so it cannot wait for the backend result. That means a
+    // backend delete that then fails (or finds nothing) leaves the generation
+    // advanced and queued writers rejected. That is deliberate and matches
+    // what this handler already did with the cancellation token, which was
+    // likewise cancelled before the backend call: once the live turn has been
+    // killed on the operator's behalf, admitting a queued writer as if
+    // nothing happened is the worse failure.
+    let mut tokens = state
         .cancel_tokens
         .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
-    if let Some(token) = token {
-        token.cancel();
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
-            "cancelled in-flight turn for deleted session"
-        );
-    }
+        .expect("cancel_tokens lock poisoned");
+    state
+        .session_lifecycle
+        .with_deletion(&session_key, |disposition| {
+            // Remove the token under the same lock used by registration, then
+            // release that map before cancellation and backend I/O. The
+            // per-session lifecycle authority remains held for the whole closure.
+            let token = tokens.remove(&session_key);
+            drop(tokens);
+            if let Some(token) = token {
+                token.cancel();
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"session_key": session_key})),
+                    "cancelled in-flight turn for deleted session"
+                );
+            }
 
-    match backend.delete_session(&session_key) {
-        Ok(true) => Json(serde_json::json!({"deleted": true, "session_id": id})).into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
-        )
-            .into_response(),
-    }
+            match backend.delete_session(&session_key) {
+                Ok(true) => {
+                    // Durable removal is the only repair operation that proves the
+                    // partial transcript is gone. The next connection therefore
+                    // starts a clean incarnation rather than inheriting poison.
+                    disposition.establish_fresh_incarnation();
+                    // Evict the epoch this session accumulated in
+                    // `session_turn_versions` — it otherwise retains a completed
+                    // session's key forever. A queued prompt is independently
+                    // rejected before it can run.
+                    state
+                        .session_turn_versions
+                        .lock()
+                        .expect("session_turn_versions lock poisoned")
+                        .remove(&session_key);
+                    // Finalization holds belong to the session that went away.
+                    // The deletion generation is deliberately retained.
+                    state.session_lifecycle.forget_finalizing(&session_key);
+                    Json(serde_json::json!({"deleted": true, "session_id": id})).into_response()
+                }
+                Ok(false) => (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "Session not found"})),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
+                )
+                    .into_response(),
+            }
+        })
 }
 
 /// PUT /api/sessions/{id} — rename a gateway session
@@ -1937,22 +2087,43 @@ pub async fn handle_api_session_rename(
             .into_response();
     }
 
-    let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
-
-    // Verify the session exists before renaming
-    if !backend.session_exists(&session_key) {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response();
+    // Rename is a metadata mutation owned by one incarnation. `set_session_name`
+    // is a real `UPDATE session_metadata` on the SQLite backend, so a rename
+    // that observed the old session as existing and then mutated after a
+    // delete/recreate would retitle the new incarnation. Unlike a queued
+    // writer, this handler has no permit to re-validate against, so it holds
+    // the session authority across both the existence probe and the mutation:
+    // DELETE, which takes the same authority, cannot land in between.
+    //
+    // Candidate order matches `resolve_gateway_session_key` — exact key first,
+    // then the `gw_` form — so the resolution contract is unchanged.
+    let mut candidates = vec![id.to_string()];
+    if !id.starts_with("gw_") {
+        candidates.push(format!("gw_{id}"));
     }
 
-    match backend.set_session_name(&session_key, name) {
-        Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
-        Err(e) => (
+    let mut renamed = None;
+    for session_key in candidates {
+        renamed = state.session_lifecycle.with_existing_incarnation(
+            &session_key,
+            || backend.session_exists(&session_key),
+            || backend.set_session_name(&session_key, name),
+        );
+        if renamed.is_some() {
+            break;
+        }
+    }
+
+    match renamed {
+        Some(Ok(())) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
+        Some(Err(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response(),
     }
@@ -2002,20 +2173,73 @@ pub async fn handle_api_session_state(
         return e.into_response();
     }
 
-    let Some(ref backend) = state.session_backend else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session persistence is disabled"})),
-        )
-            .into_response();
+    // A turn is authoritative from the moment it registers a cancel token
+    // until its messages are persisted and its turn version is resolved.
+    // Those two phases are disjoint: the token is dropped as soon as the
+    // stream ends, while persistence runs after. Treating only the token as
+    // "running" exposes an `idle` window over a transcript that is still
+    // mid-write, which is exactly when a reconnecting dashboard hydrates.
+    //
+    // The probe is keyed the way `ws.rs` registers turns — always
+    // `gw_{display id}` — which is not always the key the durable row lives
+    // under. `resolve_gateway_session_key` may hand back a bare id when the
+    // backend already stores one, so deriving the token key from the display
+    // id keeps the live-turn lookup aligned with the writer instead of
+    // silently missing a running turn.
+    let turn_is_live = |session_key: &str| {
+        let token_key = format!("gw_{}", gateway_display_session_id(session_key));
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .contains_key(&token_key)
+            || state.session_lifecycle.is_finalizing(&token_key)
     };
 
+    // Without a durable session backend, the existing cancellation-token map
+    // is still the process-local authority for whether a turn is live. Return
+    // that on-demand view so reconnecting clients can remain read-only until a
+    // detached turn finishes; do not invent a second session-state store.
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "session_id": id,
+            "state": if turn_is_live(&id) { "running" } else { "idle" },
+            "session_persistence": false,
+        }))
+        .into_response();
+    };
+
+    // Resolve the durable key the same way the other session endpoints do, so
+    // the persisted row and the live-turn probe describe one session.
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
+    let turn_is_live = turn_is_live(&session_key);
     match backend.get_session_state(&session_key) {
         Ok(Some(ss)) => {
+            // The persisted row is a best-effort mirror written by
+            // `process_chat_message`'s `running` / `idle` `set_session_state`
+            // calls, whose errors are intentionally swallowed (a turn must
+            // not fail because a state write did). That means it can lag or
+            // go stale in both directions: a failed `running` write can leave
+            // it reporting `idle` while a token is still live (the dashboard
+            // would then unlock and recycle its socket mid-turn), and a
+            // failed `idle` write can leave it reporting `running` forever
+            // after the token is gone (the dashboard would then poll
+            // forever). `turn_is_live` — read straight from the in-process
+            // cancellation-token map — is reconciled against the persisted
+            // row rather than trusted blindly: a live token always wins, and
+            // a persisted `running` row backed by no live token is
+            // downgraded to `idle` instead of taken at face value.
+            let effective_state = if turn_is_live {
+                "running".to_string()
+            } else if ss.state == "running" {
+                "idle".to_string()
+            } else {
+                ss.state.clone()
+            };
             let mut resp = serde_json::json!({
                 "session_id": id,
-                "state": ss.state,
+                "state": effective_state,
+                "session_persistence": true,
             });
             if let Some(turn_id) = ss.turn_id {
                 resp["turn_id"] = serde_json::Value::String(turn_id);
@@ -2025,11 +2249,17 @@ pub async fn handle_api_session_state(
             }
             Json(resp).into_response()
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "Session not found"})),
-        )
-            .into_response(),
+        // The state endpoint is intentionally total for an authenticated,
+        // well-formed session id. A missing durable row is a new/idle session
+        // unless its existing process-local turn token says otherwise. This
+        // lets the dashboard distinguish that normal case from a transient
+        // lookup failure without adding another lifecycle store.
+        Ok(None) => Json(serde_json::json!({
+            "session_id": id,
+            "state": if turn_is_live { "running" } else { "idle" },
+            "session_persistence": true,
+        }))
+        .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
@@ -2329,6 +2559,10 @@ pub(crate) mod tests {
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            session_turn_versions: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
+            session_lifecycle: Arc::new(crate::session_lifecycle::SessionLifecycle::new()),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             tui_registry: None,
             reload_tx: None,
@@ -2357,6 +2591,169 @@ pub(crate) mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[tokio::test]
+    async fn session_state_without_persistence_is_derived_from_live_turn_token() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_id = "detached-turn";
+        let session_key = format!("gw_{session_id}");
+
+        let idle = handle_api_session_state(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        let idle = response_json(idle).await;
+        assert_eq!(idle["state"], "idle");
+        assert_eq!(idle["session_persistence"], false);
+
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(session_key, tokio_util::sync::CancellationToken::new());
+
+        let running =
+            handle_api_session_state(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let running = response_json(running).await;
+        assert_eq!(running["state"], "running");
+        assert_eq!(running["session_persistence"], false);
+    }
+
+    /// A `SessionBackend` whose `get_session_state` always returns a fixed
+    /// row, standing in for a real backend after a best-effort
+    /// `set_session_state` write silently failed (see `process_chat_message`,
+    /// whose `running` / `idle` writes discard their own errors).
+    struct StaleStateBackend {
+        state: zeroclaw_infra::session_backend::SessionState,
+    }
+
+    impl SessionBackend for StaleStateBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn session_exists(&self, _session_key: &str) -> bool {
+            true
+        }
+        fn get_session_state(
+            &self,
+            _session_key: &str,
+        ) -> std::io::Result<Option<zeroclaw_infra::session_backend::SessionState>> {
+            Ok(Some(zeroclaw_infra::session_backend::SessionState {
+                state: self.state.state.clone(),
+                turn_id: self.state.turn_id.clone(),
+                turn_started_at: self.state.turn_started_at,
+            }))
+        }
+    }
+
+    /// A failed best-effort `running` write in
+    /// `process_chat_message` (its error is intentionally swallowed) must
+    /// not make the session-state endpoint report a live turn as idle — the
+    /// dashboard would otherwise unlock and let the operator submit into a
+    /// turn that is still running. The live cancellation-token map must win
+    /// over the stale persisted row.
+    #[tokio::test]
+    async fn handle_api_session_state_trusts_live_token_over_stale_persisted_idle() {
+        let backend = Arc::new(StaleStateBackend {
+            state: zeroclaw_infra::session_backend::SessionState {
+                state: "idle".to_string(),
+                turn_id: None,
+                turn_started_at: None,
+            },
+        });
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend);
+        let session_id = "stale-idle-live-turn";
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(
+                format!("gw_{session_id}"),
+                tokio_util::sync::CancellationToken::new(),
+            );
+
+        let response =
+            handle_api_session_state(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let response = response_json(response).await;
+
+        assert_eq!(
+            response["state"], "running",
+            "a live cancel token must override a stale persisted \"idle\" row: {response:?}"
+        );
+    }
+
+    /// A failed best-effort `idle` write must
+    /// not make the session-state endpoint report `running` forever once the
+    /// live token is gone — the dashboard's recovery loop would otherwise
+    /// poll forever waiting for a turn that already finished.
+    #[tokio::test]
+    async fn handle_api_session_state_does_not_poll_forever_after_failed_idle_write() {
+        let backend = Arc::new(StaleStateBackend {
+            state: zeroclaw_infra::session_backend::SessionState {
+                state: "running".to_string(),
+                turn_id: Some("stale-turn".to_string()),
+                turn_started_at: None,
+            },
+        });
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend);
+        let session_id = "stale-running-no-live-turn";
+        // No entry in `cancel_tokens`: the turn this persisted row describes
+        // has already finished in this process.
+
+        let response =
+            handle_api_session_state(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let response = response_json(response).await;
+
+        assert_eq!(
+            response["state"], "idle",
+            "a stale persisted \"running\" row with no live token must not poll forever: {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_session_abort_still_cancels_a_detached_turn() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let session_id = "detached-abort";
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(format!("gw_{session_id}"), token.clone());
+
+        let response =
+            handle_api_session_abort(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let response = response_json(response).await;
+
+        assert_eq!(response["status"], "aborted");
+        assert!(token.is_cancelled());
     }
 
     #[tokio::test]
@@ -3255,6 +3652,116 @@ pub(crate) mod tests {
         state
     }
 
+    /// `session_turn_versions` must be updated on *every*
+    /// transcript mutation path, not just turn completion. This handler
+    /// appends an operator message to the persisted transcript, so a
+    /// connection-scoped `Agent` holding the pre-append history is now
+    /// stale. Without a version bump it never rehydrates, and its next
+    /// turn runs from history missing this message.
+    #[tokio::test]
+    async fn session_message_post_bumps_turn_version_so_stale_agents_rehydrate() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-2",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let version_before = state
+            .session_turn_versions
+            .lock()
+            .expect("session_turn_versions lock poisoned")
+            .get("gw_operator-2")
+            .copied()
+            .unwrap_or(0);
+
+        let response = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-2".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "operator note"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let version_after = state
+            .session_turn_versions
+            .lock()
+            .expect("session_turn_versions lock poisoned")
+            .get("gw_operator-2")
+            .copied()
+            .unwrap_or(0);
+
+        assert!(
+            version_after > version_before,
+            "appending to the transcript must bump the turn version so a \
+             connection holding pre-append history rehydrates before its next \
+             turn; got {version_before} -> {version_after}"
+        );
+    }
+
+    /// A rejected append must not certify history that was never written:
+    /// the version bump has to follow the successful `append`, not precede it.
+    #[tokio::test]
+    async fn session_message_post_does_not_bump_turn_version_for_rejected_message() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> = Arc::new(SessionStore::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-3",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        // Empty content is rejected before any append happens.
+        let response = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-3".to_string()),
+            Json(
+                serde_json::from_value::<SessionMessagePostBody>(serde_json::json!({
+                    "content": "   "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert!(
+            state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .get("gw_operator-3")
+                .is_none(),
+            "a rejected message must not bump the turn version"
+        );
+    }
+
     #[tokio::test]
     async fn session_message_post_persists_and_broadcasts_to_session() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3732,6 +4239,245 @@ pub(crate) mod tests {
         assert_eq!(json["name"], "alpha desk");
     }
 
+    /// Records which session incarnation each metadata write landed on.
+    ///
+    /// The existence probe blocks once, on request, so a DELETE can be raced
+    /// into the window between "this session exists" and "rename it".
+    struct IncarnationRecordingBackend {
+        incarnation: std::sync::atomic::AtomicU64,
+        probe_entered: std::sync::atomic::AtomicBool,
+        release_probe: std::sync::atomic::AtomicBool,
+        probe_gate_armed: std::sync::atomic::AtomicBool,
+        /// (incarnation observed at write time, name) for every rename.
+        renames: std::sync::Mutex<Vec<(u64, String)>>,
+    }
+
+    impl IncarnationRecordingBackend {
+        fn new() -> Self {
+            Self {
+                incarnation: std::sync::atomic::AtomicU64::new(0),
+                probe_entered: std::sync::atomic::AtomicBool::new(false),
+                release_probe: std::sync::atomic::AtomicBool::new(false),
+                probe_gate_armed: std::sync::atomic::AtomicBool::new(true),
+                renames: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for IncarnationRecordingBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            Vec::new()
+        }
+
+        fn append(
+            &self,
+            _session_key: &str,
+            _message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(false)
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            vec!["gw_operator-1".to_string()]
+        }
+
+        fn session_exists(&self, session_key: &str) -> bool {
+            // Only the rename's own probe is gated; DELETE's key resolution
+            // must stay free to run so it can race the window.
+            if session_key == "gw_operator-1"
+                && self
+                    .probe_gate_armed
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                self.probe_entered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                while !self.release_probe.load(std::sync::atomic::Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+            }
+            session_key == "gw_operator-1"
+        }
+
+        fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
+            self.incarnation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(true)
+        }
+
+        fn set_session_name(&self, _session_key: &str, name: &str) -> std::io::Result<()> {
+            let incarnation = self.incarnation.load(std::sync::atomic::Ordering::SeqCst);
+            self.renames
+                .lock()
+                .unwrap()
+                .push((incarnation, name.to_string()));
+            Ok(())
+        }
+    }
+
+    /// A rename must apply to the incarnation it resolved, never the next one.
+    ///
+    /// `set_session_name` is a real `UPDATE session_metadata` on the SQLite
+    /// backend, not a no-op, so a rename that observes the old session as
+    /// existing and only then mutates would retitle whatever was recreated
+    /// under the same key. The handler holds the session authority across the
+    /// existence probe and the mutation, and DELETE takes that same authority,
+    /// so the two cannot interleave.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn session_rename_applies_to_the_incarnation_it_resolved() {
+        let backend = std::sync::Arc::new(IncarnationRecordingBackend::new());
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+
+        let rename_state = state.clone();
+        let rename = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_rename(
+                State(rename_state),
+                HeaderMap::new(),
+                Path("operator-1".to_string()),
+                Json(serde_json::json!({ "name": "renamed" })),
+            )
+            .await
+            .into_response()
+        });
+
+        // Wait until the rename is inside its existence probe — the exact
+        // window a delete would have to slip through.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !backend
+            .probe_entered
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the rename never reached its existence probe"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let delete_state = state.clone();
+        let delete = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_delete(
+                State(delete_state),
+                HeaderMap::new(),
+                Path("operator-1".to_string()),
+            )
+            .await
+            .into_response()
+        });
+
+        // Give the delete every chance to advance the incarnation while the
+        // rename sits in the window. Under the authority it cannot; the
+        // rename below therefore still writes to incarnation 0.
+        let settle = tokio::time::Instant::now() + Duration::from_millis(250);
+        while tokio::time::Instant::now() < settle {
+            tokio::task::yield_now().await;
+        }
+
+        backend
+            .release_probe
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let rename_status = rename.await.expect("rename task does not panic").status();
+        assert_eq!(
+            delete.await.expect("delete task does not panic").status(),
+            StatusCode::OK,
+            "the delete itself must succeed"
+        );
+
+        assert_eq!(rename_status, StatusCode::OK);
+        let renames = backend.renames.lock().unwrap().clone();
+        assert_eq!(
+            renames,
+            vec![(0, "renamed".to_string())],
+            "the rename must land on the incarnation it resolved, not one \
+             established by a delete that raced its existence probe"
+        );
+    }
+
+    /// A rename issued against a session that was deleted and recreated under
+    /// the same key targets the live incarnation, not the one it replaced.
+    #[tokio::test]
+    async fn session_rename_after_delete_and_recreate_titles_the_live_incarnation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("first incarnation"),
+            )
+            .unwrap();
+        backend
+            .set_session_name("gw_operator-1", "original")
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+
+        let delete_response = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(delete_response.status(), StatusCode::OK);
+        assert!(
+            !backend.session_exists("gw_operator-1"),
+            "the delete must remove the first incarnation"
+        );
+
+        // A rename with no session to resolve is refused rather than
+        // recreating metadata for a key that no longer exists.
+        let orphan = handle_api_session_rename(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(serde_json::json!({ "name": "orphan" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(orphan.status(), StatusCode::NOT_FOUND);
+        assert!(
+            !backend.session_exists("gw_operator-1"),
+            "a refused rename must not create session metadata"
+        );
+
+        backend
+            .append(
+                "gw_operator-1",
+                &zeroclaw_providers::ChatMessage::assistant("second incarnation"),
+            )
+            .unwrap();
+
+        let response = handle_api_session_rename(
+            State(state),
+            HeaderMap::new(),
+            Path("operator-1".to_string()),
+            Json(serde_json::json!({ "name": "current" })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            backend
+                .get_session_name("gw_operator-1")
+                .unwrap()
+                .as_deref(),
+            Some("current"),
+            "the live incarnation takes the new name"
+        );
+    }
+
     #[tokio::test]
     async fn session_state_accepts_full_session_key_and_underscore_display_id() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -3754,6 +4500,19 @@ pub(crate) mod tests {
             .set_session_state("gw_team_alpha", "running", Some("turn-1"))
             .unwrap();
         let state = test_state_with_session_backend(config, backend);
+        // A persisted `running` row is only reported as running while a live
+        // turn backs it, so register the cancel token `ws.rs` would hold for
+        // this session. Without it the reconciliation below would correctly
+        // downgrade the row to `idle` and this test would stop exercising key
+        // resolution at all.
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(
+                "gw_team_alpha".to_string(),
+                tokio_util::sync::CancellationToken::new(),
+            );
 
         let full_key_response = handle_api_session_state(
             State(state.clone()),
@@ -3781,6 +4540,73 @@ pub(crate) mod tests {
             "state handler must accept underscore display ids from the sessions list"
         );
         assert_eq!(display_json["turn_id"], "turn-1");
+    }
+
+    /// `resolve_gateway_session_key` can return a bare id when the backend
+    /// already stores the session unprefixed, but `ws.rs` always registers its
+    /// cancellation token under `gw_{display id}`. Probing the token map with
+    /// the resolved key would then miss a live turn and report `idle` over a
+    /// transcript that is still mid-write — the exact window this PR closes.
+    #[tokio::test]
+    async fn session_state_finds_live_turn_when_backend_key_is_unprefixed() {
+        struct UnprefixedBackend;
+
+        impl SessionBackend for UnprefixedBackend {
+            fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+                Vec::new()
+            }
+            fn append(
+                &self,
+                _session_key: &str,
+                _message: &zeroclaw_providers::ChatMessage,
+            ) -> std::io::Result<()> {
+                Ok(())
+            }
+            fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+                Ok(false)
+            }
+            fn list_sessions(&self) -> Vec<String> {
+                Vec::new()
+            }
+            /// Only the unprefixed key exists, so resolution keeps the bare id.
+            fn session_exists(&self, session_key: &str) -> bool {
+                !session_key.starts_with("gw_")
+            }
+            fn get_session_state(
+                &self,
+                _session_key: &str,
+            ) -> std::io::Result<Option<zeroclaw_infra::session_backend::SessionState>>
+            {
+                Ok(Some(zeroclaw_infra::session_backend::SessionState {
+                    state: "idle".to_string(),
+                    turn_id: None,
+                    turn_started_at: None,
+                }))
+            }
+        }
+
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(Arc::new(UnprefixedBackend));
+        let session_id = "unprefixed-live-turn";
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .insert(
+                format!("gw_{session_id}"),
+                tokio_util::sync::CancellationToken::new(),
+            );
+
+        let response =
+            handle_api_session_state(State(state), HeaderMap::new(), Path(session_id.to_string()))
+                .await
+                .into_response();
+        let response = response_json(response).await;
+
+        assert_eq!(
+            response["state"], "running",
+            "live-turn probe must follow the ws token key even when the durable key is unprefixed: {response:?}"
+        );
     }
 
     #[tokio::test]
@@ -5481,5 +6307,421 @@ pub(crate) mod tests {
                 .unwrap();
             assert_eq!(status_of(router, req).await, StatusCode::OK);
         }
+    }
+
+    /// A REST message append that queued behind a turn must not resurrect a
+    /// session deleted during that wait.
+    ///
+    /// The endpoint's existence check runs *before* it waits on the session
+    /// permit, so on its own it says nothing about what happened during the
+    /// wait. Appending anyway recreates the transcript an operator removed
+    /// and, through the turn-version bump that follows, restores the epoch
+    /// entry `handle_api_session_delete` evicted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_rest_append_does_not_resurrect_a_deleted_session() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let state = state;
+
+        let session_id = "rest-queued-delete";
+        let session_key = format!("gw_{session_id}");
+        store
+            .append(&session_key, &zeroclaw_providers::ChatMessage::user("seed"))
+            .expect("seed append");
+
+        // Hold the permit so the append below must queue, then delete the
+        // session while it waits — the exact interleaving the guard covers.
+        let held = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("test primes the permit");
+
+        let state_writer = state.clone();
+        let writer = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_message_post(
+                State(state_writer),
+                HeaderMap::new(),
+                axum::extract::Path("rest-queued-delete".to_string()),
+                Json(SessionMessagePostBody {
+                    content: "appended after delete".to_string(),
+                }),
+            )
+            .await
+            .into_response()
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the REST append never reached the session queue"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let delete_response = handle_api_session_delete(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(
+            delete_response.status(),
+            StatusCode::OK,
+            "the delete itself must succeed"
+        );
+
+        drop(held);
+        let response = writer.await.expect("writer task does not panic");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "an append that queued across a delete must be rejected"
+        );
+        assert!(
+            store.load(&session_key).is_empty(),
+            "the deleted transcript must not be recreated by a queued append"
+        );
+        assert!(
+            !state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key(&session_key),
+            "the evicted epoch entry must not be resurrected by a queued append"
+        );
+    }
+
+    /// A REST writer prepared before another turn's partial persistence must
+    /// independently reject after it acquires the session permit. A WebSocket
+    /// rehydrating from the same failure cannot consume this evidence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_rest_append_rejects_changed_persistence_generation() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let state = state;
+
+        let session_id = "rest-queued-persistence-failure";
+        let session_key = format!("gw_{session_id}");
+        store
+            .append(&session_key, &zeroclaw_providers::ChatMessage::user("seed"))
+            .expect("seed append");
+
+        let held = state
+            .session_queue
+            .acquire(&session_key)
+            .await
+            .expect("test primes the permit");
+        let state_writer = state.clone();
+        let writer = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_message_post(
+                State(state_writer),
+                HeaderMap::new(),
+                axum::extract::Path(session_id.to_string()),
+                Json(SessionMessagePostBody {
+                    content: "must not append".to_string(),
+                }),
+            )
+            .await
+            .into_response()
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.session_queue.queue_depth(&session_key).await < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the REST append never reached the session queue"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let incarnation = state.session_lifecycle.deletion_generation(&session_key);
+        state
+            .session_lifecycle
+            .with_completion(&session_key, incarnation, |disposition| {
+                disposition.record_persistence_failure();
+            })
+            .expect("session incarnation remains current");
+        drop(held);
+
+        let response = writer.await.expect("writer task does not panic");
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let transcript = store.load(&session_key);
+        assert_eq!(transcript.len(), 1, "the stale REST writer must not append");
+        assert_eq!(transcript[0].content, "seed");
+        assert!(
+            !state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key(&session_key),
+            "a rejected stale writer must not publish a turn version"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_append_prepared_after_failure_still_rejects_poisoned_transcript() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let session_id = "rest-current-persistence-failure";
+        let session_key = format!("gw_{session_id}");
+        store
+            .append(
+                &session_key,
+                &zeroclaw_providers::ChatMessage::user("partial"),
+            )
+            .expect("seed partial transcript");
+
+        let incarnation = state.session_lifecycle.deletion_generation(&session_key);
+        state
+            .session_lifecycle
+            .with_completion(&session_key, incarnation, |disposition| {
+                disposition.record_persistence_failure();
+            })
+            .expect("session incarnation remains current");
+
+        let response = handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+            Json(SessionMessagePostBody {
+                content: "must remain rejected".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            store.load(&session_key).len(),
+            1,
+            "a writer prepared after failure must not extend the poisoned transcript"
+        );
+        assert!(
+            !state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key(&session_key),
+            "a poisoned write must not certify a new transcript version"
+        );
+    }
+
+    #[tokio::test]
+    async fn rest_append_rejects_durable_poison_after_lifecycle_restart() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let store = std::sync::Arc::new(
+            zeroclaw_infra::session_store::SessionStore::new(tmp.path()).expect("session store"),
+        );
+        let session_id = "rest-restart-persistence-failure";
+        let session_key = format!("gw_{session_id}");
+        store
+            .append(
+                &session_key,
+                &zeroclaw_providers::ChatMessage::user("partial"),
+            )
+            .expect("seed partial transcript");
+        store
+            .mark_transcript_incomplete(&session_key)
+            .expect("persist incomplete marker");
+
+        // Fresh lifecycle state represents the daemon after a restart.
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(store.clone());
+        let response = handle_api_session_message_post(
+            State(state),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+            Json(SessionMessagePostBody {
+                content: "must remain rejected".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(store.load(&session_key).len(), 1);
+        assert!(store.transcript_incomplete(&session_key).unwrap());
+    }
+
+    struct BlockingRestAppendBackend {
+        messages: std::sync::Mutex<Vec<zeroclaw_providers::ChatMessage>>,
+        known: std::sync::atomic::AtomicBool,
+        incomplete: std::sync::atomic::AtomicBool,
+        append_entered: std::sync::atomic::AtomicBool,
+        release_append: std::sync::atomic::AtomicBool,
+    }
+
+    impl zeroclaw_infra::session_backend::SessionBackend for BlockingRestAppendBackend {
+        fn load(&self, _session_key: &str) -> Vec<zeroclaw_providers::ChatMessage> {
+            self.messages.lock().unwrap().clone()
+        }
+
+        fn append(
+            &self,
+            _session_key: &str,
+            message: &zeroclaw_providers::ChatMessage,
+        ) -> std::io::Result<()> {
+            if message.content == "blocked append" {
+                self.append_entered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                while !self
+                    .release_append
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    std::thread::yield_now();
+                }
+            }
+            self.known.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.messages.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+
+        fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(self.messages.lock().unwrap().pop().is_some())
+        }
+
+        fn mark_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clear_transcript_incomplete(&self, _session_key: &str) -> std::io::Result<()> {
+            self.incomplete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn transcript_incomplete(&self, _session_key: &str) -> std::io::Result<bool> {
+            Ok(self.incomplete.load(std::sync::atomic::Ordering::SeqCst))
+        }
+
+        fn list_sessions(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn session_exists(&self, _session_key: &str) -> bool {
+            self.known.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn delete_session(&self, _session_key: &str) -> std::io::Result<bool> {
+            let existed = self.known.swap(false, std::sync::atomic::Ordering::SeqCst);
+            self.incomplete
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            self.messages.lock().unwrap().clear();
+            Ok(existed)
+        }
+    }
+
+    /// DELETE cannot land after the REST writer's lifecycle validation but
+    /// before append/version publication. It waits for that atomic mutation,
+    /// then removes both the transcript and the just-published epoch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn delete_serializes_with_rest_append_and_version_publication() {
+        let backend = std::sync::Arc::new(BlockingRestAppendBackend {
+            messages: std::sync::Mutex::new(vec![zeroclaw_providers::ChatMessage::user("seed")]),
+            known: std::sync::atomic::AtomicBool::new(true),
+            incomplete: std::sync::atomic::AtomicBool::new(false),
+            append_entered: std::sync::atomic::AtomicBool::new(false),
+            release_append: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut state = test_state(zeroclaw_config::schema::Config::default());
+        state.session_backend = Some(backend.clone());
+        let state = state;
+        let session_id = "rest-delete-authority";
+        let session_key = format!("gw_{session_id}");
+
+        let writer_state = state.clone();
+        let writer = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_message_post(
+                State(writer_state),
+                HeaderMap::new(),
+                axum::extract::Path(session_id.to_string()),
+                Json(SessionMessagePostBody {
+                    content: "blocked append".to_string(),
+                }),
+            )
+            .await
+            .into_response()
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !backend
+            .append_entered
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "append never started"
+            );
+            tokio::task::yield_now().await;
+        }
+
+        let delete_state = state.clone();
+        let delete = ::zeroclaw_spawn::spawn!(async move {
+            handle_api_session_delete(
+                State(delete_state),
+                HeaderMap::new(),
+                axum::extract::Path(session_id.to_string()),
+            )
+            .await
+            .into_response()
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match state.cancel_tokens.try_lock() {
+                Err(std::sync::TryLockError::WouldBlock) => break,
+                Ok(tokens) => drop(tokens),
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("cancel_tokens lock poisoned")
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "DELETE never reached the lifecycle authority boundary"
+            );
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !delete.is_finished(),
+            "DELETE must wait for the writer's held lifecycle authority"
+        );
+
+        backend
+            .release_append
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            writer.await.expect("writer task does not panic").status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            delete.await.expect("delete task does not panic").status(),
+            StatusCode::OK
+        );
+        assert!(!backend.session_exists(&session_key));
+        assert!(backend.load(&session_key).is_empty());
+        assert!(
+            !state
+                .session_turn_versions
+                .lock()
+                .expect("session_turn_versions lock poisoned")
+                .contains_key(&session_key),
+            "DELETE must evict the version published by the serialized writer"
+        );
     }
 }

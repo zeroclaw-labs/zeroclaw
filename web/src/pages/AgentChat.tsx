@@ -122,6 +122,8 @@ export function AgentChatInner({
     respondToApproval,
     contextMaxTokens,
     contextInputTokens,
+    recoveryActionLabel,
+    retryRecovery,
   } = useAgent();
 
   const { draft, saveDraft, clearDraft } = useDraft(`${DRAFT_KEY_PREFIX}.${agentAlias}`);
@@ -465,7 +467,24 @@ export function AgentChatInner({
       {error && (
         <div className="px-4 py-2 border-b border-status-error/20 bg-status-error/10 text-status-error flex items-center gap-2 text-sm animate-fade-in">
           <AlertCircle className="h-4 w-4 shrink-0" />
-          {error}
+          <span className="min-w-0">{error}</span>
+          {/*
+            Recovery failure leaves the composer blocked against sending, and
+            no socket frame will ever arrive to clear it — the replacement
+            socket was never attached to the detached turn. This button is the
+            only path back to a usable session short of a page reload, so it
+            renders next to the message that explains the block.
+          */}
+          {recoveryActionLabel && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="ml-auto shrink-0"
+              onClick={retryRecovery}
+            >
+              {recoveryActionLabel}
+            </Button>
+          )}
         </div>
       )}
 

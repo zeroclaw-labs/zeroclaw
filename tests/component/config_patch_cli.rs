@@ -122,6 +122,8 @@ fn test_state(config: Config) -> AppState {
         #[cfg(feature = "webauthn")]
         webauthn: None,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        session_turn_versions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        session_lifecycle: Arc::new(gateway::session_lifecycle::SessionLifecycle::new()),
         pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         tui_registry: None,
         sop_engine: None,
