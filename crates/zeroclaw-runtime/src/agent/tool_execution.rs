@@ -140,6 +140,7 @@ pub(crate) async fn execute_one_tool(
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
     event_tx: Option<&Sender<TurnEvent>>,
 ) -> Result<ToolExecutionOutcome> {
+    ensure_tool_not_cancelled(cancellation_token)?;
     let full_args = call_arguments.to_string();
     let tool_call_id_owned = tool_call_id.map(str::to_string);
     observer.record_event(&ObserverEvent::ToolCallStart {
@@ -273,12 +274,17 @@ pub(crate) async fn execute_one_tool(
             .await;
     }
 
+    // Resolution and event publication above may have followed a synchronous
+    // stretch that outlived the owning deadline. This is the final checkpoint
+    // before invoking arbitrary tool code.
+    ensure_tool_not_cancelled(cancellation_token)?;
     let tool_future = tool
         .execute(call_arguments.clone())
         .instrument(tool_span.clone());
     let execute = async {
         if let Some(token) = cancellation_token {
             tokio::select! {
+                biased;
                 () = token.cancelled() => Err::<_, anyhow::Error>(ToolLoopCancelled.into()),
                 result = tool_future => Ok(result),
             }
@@ -455,6 +461,13 @@ pub(crate) async fn execute_one_tool(
     outcome
 }
 
+fn ensure_tool_not_cancelled(cancellation_token: Option<&CancellationToken>) -> Result<()> {
+    if cancellation_token.is_some_and(CancellationToken::is_cancelled) {
+        return Err(ToolLoopCancelled.into());
+    }
+    Ok(())
+}
+
 // ── Parallel / sequential decision ───────────────────────────────────────
 
 pub fn should_execute_tools_in_parallel(
@@ -567,12 +580,15 @@ pub(crate) async fn execute_tools_sequential(
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolDispatchContext, execute_one_tool, resolved_tool_provenance};
+    use super::{
+        ToolDispatchContext, execute_one_tool, is_tool_loop_cancelled, resolved_tool_provenance,
+    };
     use crate::observability::noop::NoopObserver;
     use crate::tools::ActivatedToolSet;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use tokio_util::sync::CancellationToken;
     use zeroclaw_api::tool::Tool;
 
     /// Minimal tool that records invocations. Used to verify that the
@@ -711,6 +727,50 @@ mod tests {
             invocations.load(Ordering::SeqCst),
             1,
             "recovered activated tool should have been invoked exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_does_not_cross_tool_boundary() {
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "counting-tool",
+            Arc::clone(&invocations),
+        ))];
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "cancelled-turn-id",
+            channel_name: "test",
+        };
+
+        let error = execute_one_tool(
+            "counting-tool",
+            serde_json::json!({}),
+            None,
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            Some(&cancellation),
+            None,
+            None,
+        )
+        .await
+        .err()
+        .expect("a pre-cancelled turn must not execute a tool");
+
+        assert!(is_tool_loop_cancelled(&error));
+        assert_eq!(
+            invocations.load(Ordering::SeqCst),
+            0,
+            "the tool must not be called after cancellation"
         );
     }
 

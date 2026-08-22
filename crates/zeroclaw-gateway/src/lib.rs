@@ -816,6 +816,7 @@ pub async fn run_gateway(
                 sop_engine.clone(),
                 sop_audit.clone(),
                 None,
+                None,
             );
             let assembled = scoped::ScopedToolRegistry::assemble(scoped::ScopedAssembly {
                 config: &config,
@@ -949,6 +950,7 @@ pub async fn run_gateway(
             None,
             sop_engine.clone(),
             sop_audit.clone(),
+            None,
             None,
         );
         // Same gated seam as the dashboard seed above, so this listing shows

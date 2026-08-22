@@ -22,6 +22,26 @@ use zeroclaw_log::Instrument;
 
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
+// Far higher than the shell cap because multi-turn agent runs with tool calls
+// legitimately run long; this deadline requests cancellation and releases the
+// in-flight lock once the run has stopped, rather than policing normal runtime.
+const AGENT_JOB_TIMEOUT_SECS: u64 = 1800;
+const AGENT_JOB_TIMEOUT_PREFIX: &str = "agent job timed out after ";
+// `purge_isolated_session`'s best-effort backend call (subprocess, network,
+// or lock-contended local store) gets its own short deadline so a stalled
+// backend can never delay `execute_and_persist_job`'s persist/`release_job`
+// critical path. Cleanup is still attempted; exceeding this deadline
+// abandons it (logged) rather than blocking the unbounded lock-release path.
+const ISOLATED_SESSION_PURGE_TIMEOUT: Duration = Duration::from_secs(3);
+// Announcement delivery is awaited by `persist_job_result` *before*
+// `execute_and_persist_job` calls `release_job`, so a channel send that never
+// completes (dead socket, wedged provider, unresponsive HTTP endpoint) would
+// otherwise hold `locked_at` set forever — even after the agent run and its
+// cleanup both returned under their own deadlines. Timeout output is
+// operator-visible rather than a quiet `NO_REPLY`, so announce-mode jobs
+// reliably reach this path. Generous enough for a slow-but-live channel;
+// terminal classification waits until the supervised delivery has stopped.
+const CRON_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 const SCHEDULER_COMPONENT: &str = "scheduler";
 const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_add",
@@ -30,6 +50,301 @@ const CRON_AGENT_DEFAULT_EXCLUDED_TOOLS: &[&str] = &[
     "cron_run",
     "schedule",
 ];
+
+// Test-only seam: lets a scheduler test shorten `CRON_DELIVERY_TIMEOUT` so the
+// never-ready-delivery regression runs in milliseconds instead of the
+// production 30s. Unset in production and in every test that doesn't
+// explicitly scope it; `try_with` then falls back to the real constant.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_DELIVERY_TIMEOUT: Duration;
+}
+
+// Test-only seam: simulates the synchronous, pre-await work that a real
+// `agent::run` can perform before it ever yields — most importantly the
+// PostgreSQL memory backend, which spawns an initializer thread and
+// immediately `join()`s it while that thread connects, initializes schema and
+// runs migrations. Blocking the thread (rather than sleeping asynchronously)
+// is the whole point: it reproduces a future that cannot observe a timer.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PRE_RUN_BLOCK: Duration;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_POST_PRE_RUN_MARKER: Arc<std::sync::atomic::AtomicUsize>;
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_ACTIVE_PRE_RUN_WORKERS: Arc<std::sync::atomic::AtomicUsize>;
+}
+
+#[cfg(test)]
+struct TestActiveWorkerGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+#[cfg(test)]
+impl TestActiveWorkerGuard {
+    fn enter(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestActiveWorkerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// The outcome of [`abandon_best_effort`] when the deadline expires first.
+///
+/// Deliberately NOT named `Cancelled`: reaching this variant means the
+/// supervised work was **abandoned**, not preempted. See
+/// [`abandon_best_effort`] for the full contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Abandoned;
+
+impl std::fmt::Display for Abandoned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("supervised operation exceeded its wall-clock deadline and was abandoned")
+    }
+}
+
+/// Runs best-effort, non-user-visible work under a wall-clock abandonment
+/// deadline that does not depend on `f` ever yielding.
+///
+/// # Why this exists
+///
+/// The obvious shape — `tokio::time::timeout(d, zeroclaw_spawn::spawn!(f))` —
+/// is only a *cooperative* bound. `zeroclaw_spawn::spawn!` expands to
+/// `tokio::spawn` (`crates/zeroclaw-spawn/src/lib.rs`), so the child task and
+/// the parent timer share one worker pool. A section of `f` that blocks
+/// without yielding (the PostgreSQL memory backend spawns an initializer
+/// thread and immediately `join()`s it while it connects, migrates and
+/// initializes schema; `AuditedMemory::purge_session` performs a synchronous
+/// SQLite `execute` under a mutex before its first await) occupies a worker.
+/// If the runtime has one worker, or concurrent cron runs occupy all of them,
+/// no worker is left to poll the timer, the elapsed branch never runs, and the
+/// scheduler's `release_job` stays unreachable — so `locked_at` is pinned until
+/// the daemon restarts. `AbortHandle::abort` does not help: it is cooperative
+/// and cannot preempt a future that is already executing synchronously.
+///
+/// This helper moves `f` off the caller's runtime entirely. It is driven to
+/// completion by a **private current-thread runtime on a dedicated OS thread**,
+/// so however long `f` blocks, it blocks a thread that no timer depends on. The
+/// caller stays parked on a `oneshot` receiver.
+///
+/// The private runtime is load-bearing, not incidental. Driving `f` with
+/// `Handle::block_on` on a `spawn_blocking` thread looks equivalent but
+/// deadlocks under a current-thread runtime (`#[tokio::test]` without
+/// `flavor = "multi_thread"`, and any single-threaded embedding): `block_on`
+/// against a borrowed current-thread handle occupies the one thread that also
+/// has to poll this function's own `timeout`, so the deadline can never fire
+/// and the supervisor hangs exactly as hard as the code it was meant to bound.
+/// Owning a separate runtime keeps the two schedulers independent, which is the
+/// entire point of the boundary.
+///
+/// # Cancellation semantics — abandonment, not preemption
+///
+/// On `Err(Abandoned)` the underlying operation **may still be running**. There
+/// is no way to preempt a thread that is blocked inside synchronous code, and
+/// this function deliberately does not pretend otherwise. It guarantees only
+/// that *the caller* is released at the deadline so it can persist state and
+/// drop its lock. Callers must therefore treat supervised work as abandoned:
+/// safe to walk away from, not known to have stopped. The only production
+/// caller is isolated-session cleanup, which is best-effort and scoped to a
+/// run-unique key. Agent execution and delivery use [`supervise_owned`]
+/// because their user-visible side effects cannot be detached from the
+/// durable owner.
+///
+/// Do not use this for work whose outcome or side effects are user-visible.
+/// Note the boxed-future parameter: it erases the supervised future's type at
+/// this boundary. `agent::run`'s future is deeply nested, and the crate
+/// deliberately carries no raised `recursion_limit`, so taking a bare generic
+/// `F: Future` here overflows type resolution. Callers pass `Box::pin(...)`.
+async fn abandon_best_effort<T>(
+    deadline: Duration,
+    f: std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>,
+) -> Result<T, Abandoned>
+where
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    // A dedicated OS thread with its own current-thread runtime. Deliberately
+    // NOT `spawn_blocking` + `Handle::block_on`: that borrows the caller's
+    // runtime and deadlocks when the caller is current-thread (see the doc
+    // comment). `std::thread::spawn` + a private runtime is independent of the
+    // caller's flavor, so the behaviour is identical under `#[tokio::test]`,
+    // `#[tokio::test(flavor = "multi_thread")]` and the production
+    // `#[tokio::main]` scheduler.
+    let worker = std::thread::Builder::new()
+        .name("cron-supervised".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                // Dropping `tx` without sending makes the caller observe
+                // `Abandoned`, which is the correct outcome: the work never ran.
+                Err(_) => return,
+            };
+            // Result ignored: an `Err` here just means the caller already hit the
+            // deadline and dropped the receiver. Nothing left to report to.
+            let _ = tx.send(rt.block_on(f));
+            // The runtime is dropped here, on this thread. If `f` left work
+            // behind, cleanup costs this thread and not the caller's.
+        });
+
+    // Thread spawn can fail under fd/thread exhaustion. Report it as
+    // abandonment rather than panicking inside the scheduler.
+    let worker = match worker {
+        Ok(worker) => worker,
+        Err(_) => return Err(Abandoned),
+    };
+
+    match time::timeout(deadline, rx).await {
+        Ok(Ok(value)) => Ok(value),
+        // The worker thread died (panicked) without sending. Not a deadline
+        // breach; surfaced as abandonment so callers keep one error path.
+        Ok(Err(_)) => Err(Abandoned),
+        Err(_) => {
+            // Do NOT join `worker`: it may be blocked indefinitely, which is
+            // the whole reason this function exists. Detaching is what makes
+            // the deadline real, and is why the contract is "abandoned".
+            drop(worker);
+            Err(Abandoned)
+        }
+    }
+}
+
+/// Failure modes for supervision that retains ownership until work has stopped.
+#[derive(Debug)]
+enum OwnedSupervisionError {
+    DeadlineExceeded,
+    ThreadSpawn(std::io::Error),
+    RuntimeBuild(std::io::Error),
+    WorkerStopped,
+}
+
+impl std::fmt::Display for OwnedSupervisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DeadlineExceeded => f.write_str("supervised operation exceeded its deadline"),
+            Self::ThreadSpawn(error) => write!(f, "failed to start supervision thread: {error}"),
+            Self::RuntimeBuild(error) => {
+                write!(f, "failed to build supervision runtime: {error}")
+            }
+            Self::WorkerStopped => f.write_str("supervision worker stopped unexpectedly"),
+        }
+    }
+}
+
+enum OwnedWorkerOutcome<T> {
+    Completed(T),
+    CancellationAcknowledged,
+    RuntimeBuild(std::io::Error),
+}
+
+type OwnedOperation<T> = Box<
+    dyn FnOnce(CancellationToken) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>
+        + Send,
+>;
+
+/// Observe a deadline independently without releasing ownership of live work.
+///
+/// The private runtime keeps a synchronously blocking poll from starving the
+/// caller's timer. When the deadline expires, cancellation is signalled to the
+/// operation and its future is dropped at the next yield boundary. Crucially,
+/// this function then waits for the private runtime to shut down before
+/// returning `DeadlineExceeded`. If a poll cannot yield, the durable caller
+/// must keep its claim: Rust cannot safely preempt that thread, and reporting a
+/// terminal timeout while it can still perform tools or delivery would create
+/// two owners for the same work.
+async fn supervise_owned<T>(
+    deadline: Duration,
+    operation: OwnedOperation<T>,
+) -> Result<T, OwnedSupervisionError>
+where
+    T: Send + 'static,
+{
+    let cancellation = CancellationToken::new();
+    let worker_cancellation = cancellation.clone();
+    let (tx, mut rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("cron-owned".into())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = tx.send(OwnedWorkerOutcome::RuntimeBuild(error));
+                    return;
+                }
+            };
+            let operation = operation(worker_cancellation.clone());
+            let outcome = runtime.block_on(async move {
+                tokio::select! {
+                    biased;
+                    () = worker_cancellation.cancelled() => {
+                        OwnedWorkerOutcome::CancellationAcknowledged
+                    },
+                    value = operation => OwnedWorkerOutcome::Completed(value),
+                }
+            });
+            // Sending the acknowledgement only after the operation future is
+            // dropped and the private runtime is shut down is load-bearing:
+            // the durable caller must not release its claim while runtime-owned
+            // provider/tool/delivery work can still make progress.
+            drop(runtime);
+            let _ = tx.send(outcome);
+        })
+        .map_err(OwnedSupervisionError::ThreadSpawn)?;
+
+    let deadline_elapsed = tokio::select! {
+        biased;
+        result = &mut rx => return owned_worker_result(result, false),
+        () = time::sleep(deadline) => true,
+    };
+    debug_assert!(deadline_elapsed);
+    cancellation.cancel();
+    owned_worker_result(rx.await, true)
+}
+
+fn owned_worker_result<T>(
+    result: Result<OwnedWorkerOutcome<T>, tokio::sync::oneshot::error::RecvError>,
+    deadline_elapsed: bool,
+) -> Result<T, OwnedSupervisionError> {
+    match result {
+        Ok(OwnedWorkerOutcome::Completed(_)) if deadline_elapsed => {
+            Err(OwnedSupervisionError::DeadlineExceeded)
+        }
+        Ok(OwnedWorkerOutcome::Completed(value)) => Ok(value),
+        Ok(OwnedWorkerOutcome::CancellationAcknowledged) if deadline_elapsed => {
+            Err(OwnedSupervisionError::DeadlineExceeded)
+        }
+        Ok(OwnedWorkerOutcome::CancellationAcknowledged) | Err(_) => {
+            Err(OwnedSupervisionError::WorkerStopped)
+        }
+        Ok(OwnedWorkerOutcome::RuntimeBuild(error)) => {
+            Err(OwnedSupervisionError::RuntimeBuild(error))
+        }
+    }
+}
+
+/// The deadline applied to announcement delivery while the job claim is held.
+fn delivery_timeout() -> Duration {
+    #[cfg(test)]
+    if let Ok(d) = TEST_DELIVERY_TIMEOUT.try_with(|d| *d) {
+        return d;
+    }
+    CRON_DELIVERY_TIMEOUT
+}
 
 /// Type alias for the optional broadcast sender used to push cron results
 /// to connected dashboard/SSE clients.
@@ -88,7 +403,7 @@ pub fn announce_delivery_decision(output: &str) -> AnnounceDecision {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum CronDeliveryContext {
     Scheduled,
     ToolManual,
@@ -136,7 +451,47 @@ pub async fn deliver_and_classify_run_result(
 ) -> CronDeliveryOutcome {
     let mut status = if success { "ok" } else { "error" }.to_string();
 
-    if let Err(e) = deliver_if_configured(config, job, &output).await {
+    // Bound delivery: this future is awaited while the scheduler still holds
+    // the job's in-flight claim (see `CRON_DELIVERY_TIMEOUT`). It goes through
+    // the ownership-retaining supervisor for the same reason the agent run
+    // does: the deadline is observed independently, but a non-yielding send
+    // keeps the claim until it stops. A yielding stall is cancelled and then
+    // classified like any other delivery failure, so `best_effort` still
+    // decides whether the run degrades or errors. Manual callers hold no
+    // scheduler claim and keep their historical uncapped behavior.
+    let delivery_result = if context == CronDeliveryContext::Scheduled {
+        let d_config = config.clone();
+        let d_job = job.clone();
+        let d_output = output.clone();
+        let deadline = delivery_timeout();
+        match supervise_owned(
+            deadline,
+            Box::new(move |cancellation| {
+                Box::pin(async move {
+                    deliver_if_configured_with_cancellation(
+                        &d_config,
+                        &d_job,
+                        &d_output,
+                        Some(&cancellation),
+                    )
+                    .await
+                })
+            }),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::Error::msg(format!(
+                "scheduled delivery supervision failed: {error}"
+            ))),
+        }
+    } else {
+        // Manual callers hold no scheduler claim. Preserve their historical
+        // behavior instead of imposing the scheduled-worker delivery deadline.
+        deliver_if_configured(config, job, &output).await
+    };
+
+    if let Err(e) = delivery_result {
         // Cron add-time accepts dangling delivery refs (the job's channel
         // may not be provisioned yet); the loudly-logged warn here is
         // the scheduler-side half of that contract. Manual trigger paths
@@ -635,8 +990,12 @@ async fn execute_job_with_retry(
             return (true, last_output);
         }
 
-        if last_output.starts_with("blocked by security policy:") {
-            // Deterministic policy violations are not retryable.
+        if last_output.starts_with("blocked by security policy:")
+            || last_output.starts_with(AGENT_JOB_TIMEOUT_PREFIX)
+        {
+            // Deterministic policy violations and agent-run timeouts are not
+            // retryable: a hung provider/tool will hang again, and retrying
+            // would occupy the job's slot for `retries + 1` full timeouts.
             return (false, last_output);
         }
 
@@ -792,11 +1151,164 @@ async fn execute_and_persist_job(
     (job.id.clone(), success, output)
 }
 
+/// Resolve the wall-clock deadline for an agent cron job's `agent::run`
+/// call: the owning agent's runtime profile `agentic_timeout_secs` override,
+/// falling back to `AGENT_JOB_TIMEOUT_SECS`.
+fn resolve_agent_job_timeout(config: &Config, agent_alias: &str) -> Duration {
+    Duration::from_secs(
+        config
+            .runtime_profile_for_agent(agent_alias)
+            .and_then(|p| p.agentic_timeout_secs)
+            // Config does not validate this per-profile field; a 0 override
+            // would time every job out instantly and non-retryably, so treat
+            // it as unset and fall back to the default.
+            .filter(|&secs| secs > 0)
+            .unwrap_or(AGENT_JOB_TIMEOUT_SECS),
+    )
+}
+
+// Test-only seam: lets a scheduler test substitute the isolated-session
+// purge's `Memory` handle with a deliberately-stalling double, so
+// `ISOLATED_SESSION_PURGE_TIMEOUT` can be exercised deterministically
+// without depending on a real backend's timing. Unset in production and in
+// every test that doesn't explicitly scope it; `try_with` then fails closed
+// to the real `create_memory_for_agent` construction below.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PURGE_MEMORY: Arc<dyn zeroclaw_api::memory_traits::Memory>;
+}
+
+// Test-only seam: simulates a memory backend *construction* that blocks
+// without yielding — the PostgreSQL backend spawns an initializer thread and
+// immediately `join()`s it while it connects, initializes schema and runs
+// migrations, with `connect_timeout_secs` defaulting to `None`. Blocking the
+// thread (rather than sleeping asynchronously) is the point: it reproduces
+// construction that cannot observe a timer. Deterministic where pointing a
+// real backend at an unroutable address would be timing- and
+// environment-dependent.
+#[cfg(test)]
+tokio::task_local! {
+    static TEST_PURGE_CONSTRUCT_BLOCK: Duration;
+}
+
+/// Best-effort purge of an Isolated cron run's per-run memory session. The
+/// Isolated session path (`cron-{run_session_id}`) is unique per run, so a
+/// timed-out run whose dropped agent future may still have an in-flight
+/// blocking sqlite write races only its own abandoned rows; a no-op for
+/// Main-target runs (they share the stable `main` session).
+///
+/// This is called from `run_agent_job_with_timeout`'s timeout and
+/// run-error branches, both of which are still awaited by
+/// `execute_and_persist_job` before it persists the result and calls
+/// `release_job`. A stalled backend (network stall, subprocess hang, lock
+/// contention) must never delay that critical path indefinitely, so the
+/// whole purge attempt — memory construction *and* the backend call — runs
+/// inside one `abandon_best_effort` boundary under
+/// `ISOLATED_SESSION_PURGE_TIMEOUT`. Both halves must be inside it: with the
+/// supported audited wrapper, `AuditedMemory::purge_session` performs a
+/// synchronous SQLite `execute` under a mutex in `log_audit` *before* its
+/// first await, so leaving the call inline under a same-runtime timer would
+/// let a contended `audit.db` starve the cleanup deadline and re-pin
+/// `locked_at`. On timeout the cleanup is abandoned (logged at WARN) rather
+/// than awaited further; the successful, fast-cleanup path is unaffected.
+async fn purge_isolated_session(
+    config: &Config,
+    job: &CronJob,
+    agent_alias: &str,
+    session_path: &std::path::Path,
+) {
+    // Gate before doing any work. A `uses_memory = false` job runs memory-free
+    // end to end (`AgentRunOverrides::memory_free` binds `NoneMemory` and drops
+    // the persistent memory tools), so it has no session to purge. Without this
+    // check such a job would still construct the configured backend and reach
+    // out to Qdrant/PostgreSQL for a session it never wrote — an unnecessary
+    // external call, and an unnecessary way to reach the stall paths above.
+    if !matches!(job.session_target, SessionTarget::Isolated) || !job.uses_memory {
+        return;
+    }
+    let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
+        "cli:{}",
+        session_path.display()
+    ));
+
+    // Owned copies: the supervised future is driven off this task and so must
+    // be `'static`; it cannot borrow `config` / `agent_alias`.
+    let owned_config = config.clone();
+    let owned_alias = agent_alias.to_string();
+    let owned_api_key = config
+        .model_provider_for_agent(agent_alias)
+        .and_then(|e| e.api_key.as_deref().map(str::to_string));
+
+    // Read the task-local here, on the caller's task: task-locals are NOT
+    // inherited across the supervision boundary, so this must be captured
+    // before handing the future over.
+    #[cfg(test)]
+    let test_purge_memory = TEST_PURGE_MEMORY.try_with(Arc::clone).ok();
+    #[cfg(test)]
+    let test_construct_block = TEST_PURGE_CONSTRUCT_BLOCK.try_with(|d| *d).ok();
+
+    let purge = async move {
+        #[cfg(test)]
+        if let Some(d) = test_construct_block {
+            // Stands in for a backend construction that blocks without
+            // yielding; the real call follows the same shape.
+            std::thread::sleep(d);
+        }
+
+        #[cfg(test)]
+        if let Some(mem) = test_purge_memory {
+            let _ = mem.purge_session(&mem_session_key).await;
+            return;
+        }
+
+        let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
+            &owned_config,
+            &owned_alias,
+            owned_api_key.as_deref(),
+        )
+        .await
+        else {
+            // Construction failed; cleanup is best-effort.
+            return;
+        };
+        let _ = mem.purge_session(&mem_session_key).await;
+    };
+
+    if abandon_best_effort(ISOLATED_SESSION_PURGE_TIMEOUT, Box::pin(purge))
+        .await
+        .is_err()
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "job_id": job.id,
+                    "agent": agent_alias,
+                    "timeout_secs": ISOLATED_SESSION_PURGE_TIMEOUT.as_secs(),
+                })),
+            "Cron job: isolated-session purge exceeded its cleanup deadline; abandoning \
+             best-effort cleanup so lock release is not delayed"
+        );
+    }
+}
+
 async fn run_agent_job(
     config: &Config,
     security: &SecurityPolicy,
     agent_alias: &str,
     job: &CronJob,
+) -> (bool, String) {
+    let timeout = resolve_agent_job_timeout(config, agent_alias);
+    run_agent_job_with_timeout(config, security, agent_alias, job, timeout).await
+}
+
+async fn run_agent_job_with_timeout(
+    config: &Config,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    job: &CronJob,
+    timeout: Duration,
 ) -> (bool, String) {
     let subagent_ctx = match crate::subagent::SubAgentSpawn::for_agent(config, agent_alias)
         .and_then(|spawn| spawn.build(crate::subagent::SubAgentOverrides::default()))
@@ -871,26 +1383,120 @@ async fn run_agent_job(
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
-            Box::pin(
-                crate::agent::run(
-                    cron_config,
-                    agent_alias,
-                    Some(prefixed_prompt),
-                    None,
-                    model_override,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.temperature),
-                    vec![],
-                    false,
-                    Some(session_path.clone()),
-                    job.allowed_tools.clone(),
-                    zeroclaw_api::ingress::TurnOrigin::Cron,
-                    run_overrides,
-                )
-                .instrument(subagent_span),
+            // Supervise the run deadline from a boundary that a non-yielding
+            // poll cannot occupy. `agent::run` performs synchronous setup
+            // before its first await point: the PostgreSQL memory backend
+            // spawns an initializer thread and immediately `join()`s it while
+            // that thread connects, initializes schema, and runs migrations
+            // (see `PostgresMemory::initialize_client`), and
+            // `connect_timeout_secs` defaults to `None`.
+            //
+            // Neither an inline `timeout` nor `spawn!` + `timeout` bounds that:
+            // `spawn!` is a bare `tokio::spawn`, so parent timer and child run
+            // share the worker pool, and with one worker (or all workers busy
+            // with concurrent cron runs) nothing is left to poll the timeout
+            // arm — `release_job` below stays unreachable and `locked_at` is
+            // pinned until restart. `supervise_owned` observes the deadline on
+            // a private runtime and requests cancellation there. It retains
+            // the durable claim until that runtime has stopped, so a
+            // non-yielding poll cannot become detached, unowned execution.
+            // Read outside the supervised future: task-locals are not
+            // inherited across spawn boundaries.
+            #[cfg(test)]
+            let pre_run_block = TEST_PRE_RUN_BLOCK.try_with(|d| *d).ok();
+            #[cfg(test)]
+            let post_pre_run_marker = TEST_POST_PRE_RUN_MARKER.try_with(Arc::clone).ok();
+            #[cfg(test)]
+            let active_pre_run_workers = TEST_ACTIVE_PRE_RUN_WORKERS.try_with(Arc::clone).ok();
+            let run_alias = agent_alias.to_string();
+            let run_temperature = config
+                .model_provider_for_agent(agent_alias)
+                .and_then(|e| e.temperature);
+            let run_session_path = session_path.clone();
+            let run_allowed_tools = job.allowed_tools.clone();
+            let supervised = supervise_owned(
+                timeout,
+                Box::new(move |cancellation| {
+                    Box::pin(
+                        async move {
+                            #[cfg(test)]
+                            let _active_worker =
+                                active_pre_run_workers.map(TestActiveWorkerGuard::enter);
+                            #[cfg(test)]
+                            if let Some(d) = pre_run_block {
+                                std::thread::sleep(d);
+                            }
+                            if cancellation.is_cancelled() {
+                                // Return control to the biased supervisor so it
+                                // owns timeout classification; otherwise this
+                                // ready error looks like an ordinary retryable
+                                // agent failure after a blocking poll unwinds.
+                                tokio::task::yield_now().await;
+                                return Err(anyhow::Error::new(
+                                    crate::agent::turn::ToolLoopCancelled,
+                                ));
+                            }
+                            #[cfg(test)]
+                            if let Some(marker) = post_pre_run_marker {
+                                marker.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            crate::agent::loop_::scope_run_cancellation(
+                                cancellation,
+                                Box::pin(crate::agent::run(
+                                    cron_config,
+                                    &run_alias,
+                                    Some(prefixed_prompt),
+                                    None,
+                                    model_override,
+                                    run_temperature,
+                                    vec![],
+                                    false,
+                                    Some(run_session_path),
+                                    run_allowed_tools,
+                                    zeroclaw_api::ingress::TurnOrigin::Cron,
+                                    run_overrides,
+                                )),
+                            )
+                            .await
+                        }
+                        .instrument(subagent_span),
+                    )
+                }),
             )
-            .await
+            .await;
+
+            match supervised {
+                // The run completed within its deadline.
+                Ok(run_result) => run_result,
+                Err(OwnedSupervisionError::DeadlineExceeded) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"job_id": job.id, "timeout_secs": timeout.as_secs()})),
+                        "Cron job: agent run timed out"
+                    );
+                    purge_isolated_session(config, job, agent_alias, &session_path).await;
+                    return (
+                        false,
+                        format!("{AGENT_JOB_TIMEOUT_PREFIX}{}s", timeout.as_secs()),
+                    );
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "job_id": job.id,
+                                "error": error.to_string(),
+                            })),
+                        "Cron job: agent supervision failed"
+                    );
+                    purge_isolated_session(config, job, agent_alias, &session_path).await;
+                    return (false, format!("agent job failed: {error}"));
+                }
+            }
         }
     };
 
@@ -904,23 +1510,7 @@ async fn run_agent_job(
             },
         ),
         Err(e) => {
-            if matches!(job.session_target, SessionTarget::Isolated) {
-                let mem_session_key = zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                    "cli:{}",
-                    session_path.display()
-                ));
-                if let Ok(mem) = zeroclaw_memory::create_memory_for_agent(
-                    config,
-                    agent_alias,
-                    config
-                        .model_provider_for_agent(agent_alias)
-                        .and_then(|e| e.api_key.as_deref()),
-                )
-                .await
-                {
-                    let _ = mem.purge_session(&mem_session_key).await;
-                }
-            }
+            purge_isolated_session(config, job, agent_alias, &session_path).await;
             (false, format!("agent job failed: {e}"))
         }
     }
@@ -1054,6 +1644,18 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
 }
 
 async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+    deliver_if_configured_with_cancellation(config, job, output, None).await
+}
+
+async fn deliver_if_configured_with_cancellation(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        anyhow::bail!("scheduled delivery cancelled before dispatch");
+    }
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
         return Ok(());
@@ -1091,12 +1693,13 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         anyhow::Error::msg("delivery.to is required for announce mode")
     })?;
 
-    deliver_announcement(
+    deliver_announcement_with_cancellation(
         config,
         channel,
         target,
         delivery.thread_id.as_deref(),
         output,
+        cancellation,
     )
     .await
 }
@@ -1131,15 +1734,39 @@ pub async fn deliver_announcement(
     thread_id: Option<&str>,
     output: &str,
 ) -> Result<()> {
+    deliver_announcement_with_cancellation(config, channel, target, thread_id, output, None).await
+}
+
+async fn deliver_announcement_with_cancellation(
+    config: &Config,
+    channel: &str,
+    target: &str,
+    thread_id: Option<&str>,
+    output: &str,
+    cancellation: Option<&CancellationToken>,
+) -> Result<()> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        anyhow::bail!("scheduled delivery cancelled before dispatch");
+    }
     if let Some(f) = DELIVERY_FN.get() {
-        f(
+        let delivery = f(
             config.clone(),
             channel.to_string(),
             target.to_string(),
             thread_id.map(str::to_string),
             output.to_string(),
-        )
-        .await
+        );
+        if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    anyhow::bail!("scheduled delivery cancelled before completion")
+                }
+                result = delivery => result,
+            }
+        } else {
+            delivery.await
+        }
     } else {
         ::zeroclaw_log::record!(
             WARN,
@@ -2201,6 +2828,1450 @@ mod tests {
         assert!(output.contains("read-only"));
     }
 
+    /// Bind a loopback listener that accepts connections but never writes a
+    /// response, simulating a provider whose HTTP request hangs forever.
+    /// Each accepted connection is held open (not reset) well past the
+    /// timeouts under test below, so the client observes a genuine hang
+    /// rather than a fast connection-refused/reset error. The returned
+    /// counter records how many connections were accepted, so a test can
+    /// assert the exact number of provider HTTP attempts.
+    async fn spawn_hanging_server() -> (
+        std::net::SocketAddr,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepts_task = std::sync::Arc::clone(&accepts);
+        ::zeroclaw_spawn::spawn!(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                accepts_task.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ::zeroclaw_spawn::spawn!(async move {
+                    let _stream = stream;
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        (addr, accepts)
+    }
+
+    /// `test_config` with `TEST_AGENT` repointed at a `custom` (openai-compatible)
+    /// model_provider whose `uri` targets `addr`. `openrouter`'s family factory
+    /// hardcodes its base URL and ignores the config `uri` override, so the
+    /// `custom` family is used here specifically because it is the one slot
+    /// that honors `uri` end to end — this is what lets a hung listener stand
+    /// in for a hung provider HTTP call in `agent::run`.
+    async fn test_config_with_hanging_provider(
+        tmp: &TempDir,
+        addr: std::net::SocketAddr,
+    ) -> Config {
+        let mut config = test_config(tmp).await;
+        config.providers.models.custom.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::CustomModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    uri: Some(format!("http://{addr}")),
+                    api_key: Some("test-key".to_string()),
+                    model: Some("test-model".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider =
+            format!("custom.{TEST_AGENT}").into();
+        config
+    }
+
+    #[tokio::test]
+    async fn run_agent_job_with_timeout_reports_timeout_for_hung_provider() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let config = test_config_with_hanging_provider(&tmp, addr).await;
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = test_security(&config);
+
+        // 750ms is generous enough to survive loaded mac/arm64 CI without
+        // preempting a fast-failing run, while keeping the test short.
+        let started = std::time::Instant::now();
+        let (success, output) = Box::pin(run_agent_job_with_timeout(
+            &config,
+            &security,
+            TEST_AGENT,
+            &job,
+            Duration::from_millis(750),
+        ))
+        .await;
+        let elapsed = started.elapsed();
+
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "run_agent_job_with_timeout did not return promptly: {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_and_persist_job_releases_lock_after_agent_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("agent-timeout-release");
+        let (job_id, success, output) = Box::pin(execute_and_persist_job(
+            &config, &security, TEST_AGENT, &job, &component,
+        ))
+        .await;
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+
+        // The lock claimed for this run must be released once the timed-out
+        // run completes, so the job is selectable again on the next poll
+        // instead of being wedged until process restart.
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released after an agent-run timeout"
+        );
+    }
+
+    /// Stands in for a memory backend whose `purge_session` never returns
+    /// (a wedged subprocess, a stalled network call, or lock contention).
+    /// `purge_isolated_session` only ever calls `purge_session` on this
+    /// double, so every other trait method is a trivial stub.
+    #[derive(Default)]
+    struct StallingPurgeMemory {
+        purge_attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StallingPurgeMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "stalling-purge-memory"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ::zeroclaw_api::memory_traits::Memory for StallingPurgeMemory {
+        fn name(&self) -> &str {
+            "stalling-purge-memory"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&::zeroclaw_api::memory_traits::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        /// Never resolves: the stalled backend that
+        /// `ISOLATED_SESSION_PURGE_TIMEOUT` must bound.
+        async fn purge_session(&self, _session_id: &str) -> anyhow::Result<usize> {
+            self.purge_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending::<()>().await;
+            unreachable!("purge_session must never resolve in this test double");
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_and_persist_job_releases_lock_when_isolated_purge_stalls() {
+        // Same setup as `execute_and_persist_job_releases_lock_after_agent_timeout`
+        // (hung provider -> real agent-run timeout -> `purge_isolated_session`),
+        // except the isolated-session purge backend itself now stalls forever.
+        // The local sqlite test backend used by the sibling test purges fast
+        // and so cannot exercise this failure mode; this double proves the
+        // lock-release path stays bounded even when cleanup does not.
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("isolated-purge-stall-release");
+        let stalling_memory: Arc<dyn ::zeroclaw_api::memory_traits::Memory> =
+            Arc::new(StallingPurgeMemory::default());
+
+        let started = std::time::Instant::now();
+        // Also bound the call from outside `execute_and_persist_job`: if
+        // the fix regressed back to an unbounded await on the stalled
+        // purge, this test must fail promptly rather than hang the suite.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            TEST_PURGE_MEMORY.scope(
+                stalling_memory,
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let (job_id, success, output) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "execute_and_persist_job did not return within the outer test bound \
+                 ({elapsed:?}); a stalled isolated-session purge must not block \
+                 persist/release_job"
+            )
+        });
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "execute_and_persist_job did not return promptly despite a stalled \
+             isolated-session purge: {elapsed:?}"
+        );
+
+        // The lock must be released even though the isolated-session purge
+        // backend never returns: cleanup is bounded by
+        // `ISOLATED_SESSION_PURGE_TIMEOUT` and abandoned rather than awaited
+        // indefinitely, so `execute_and_persist_job` still reaches
+        // `persist_job_result`/`release_job`.
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released even when isolated-session cleanup stalls"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn blocked_setup_retains_one_owner_and_stops_before_provider_work() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let post_setup = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let active_workers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let run_config = config.clone();
+        let run_job = job.clone();
+        let run_post_setup = Arc::clone(&post_setup);
+        let run_active_workers = Arc::clone(&active_workers);
+        let component = unique_component("pre-await-owner-retention");
+        let handle = ::zeroclaw_spawn::spawn!(async move {
+            let security = test_security(&run_config);
+            TEST_ACTIVE_PRE_RUN_WORKERS
+                .scope(
+                    run_active_workers,
+                    TEST_POST_PRE_RUN_MARKER.scope(
+                        run_post_setup,
+                        TEST_PRE_RUN_BLOCK.scope(
+                            Duration::from_secs(2),
+                            Box::pin(execute_and_persist_job(
+                                &run_config,
+                                &security,
+                                TEST_AGENT,
+                                &run_job,
+                                &component,
+                            )),
+                        ),
+                    ),
+                )
+                .await
+        });
+
+        // The one-second deadline has fired, but the synthetic setup poll still
+        // owns its thread. The claim must remain held so repeated scheduler
+        // polls cannot accumulate replacement workers for the same job.
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        assert_eq!(
+            active_workers.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one supervised worker should own the blocked attempt"
+        );
+        for _ in 0..3 {
+            assert!(
+                !cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+                "a timed-out but still-running attempt must retain its claim"
+            );
+        }
+
+        let (job_id, success, output) = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the blocked setup should unwind under the outer test bound")
+            .expect("run task joined");
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "a run whose setup blocks past the deadline must be reported as a \
+             timeout, got: {output}"
+        );
+
+        assert_eq!(
+            post_setup.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "provider/tool work after setup must not start once the deadline has fired"
+        );
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a provider connection must not start once the deadline has fired"
+        );
+        assert_eq!(
+            active_workers.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the supervised worker must exit before the claim is released"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "the claim becomes reusable only after the old worker has stopped"
+        );
+    }
+
+    /// Stands in for a memory backend whose `purge_session` blocks its thread
+    /// **synchronously before its first await**, modelling the supported
+    /// audited wrapper: `AuditedMemory::purge_session` calls `log_audit`
+    /// before awaiting the inner backend, and `log_audit` performs a
+    /// synchronous SQLite `execute` under a mutex. `StallingPurgeMemory`
+    /// yields at `pending()` and so cannot cover this shape -- a same-runtime
+    /// timer can still be polled while a future is parked, but not while a
+    /// worker is blocked inside synchronous code.
+    #[derive(Default)]
+    struct SyncBlockingPurgeMemory {
+        purge_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        block_for: Duration,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for SyncBlockingPurgeMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "sync-blocking-purge-memory"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ::zeroclaw_api::memory_traits::Memory for SyncBlockingPurgeMemory {
+        fn name(&self) -> &str {
+            "sync-blocking-purge-memory"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&::zeroclaw_api::memory_traits::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        /// Blocks the calling thread before ever awaiting -- the pre-await
+        /// synchronous write that `ISOLATED_SESSION_PURGE_TIMEOUT` must bound.
+        async fn purge_session(&self, _session_id: &str) -> anyhow::Result<usize> {
+            self.purge_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(self.block_for);
+            Ok(0)
+        }
+    }
+
+    /// Counts construction attempts so a test can assert the backend is never
+    /// built. Purging through it is a hard failure: reaching `purge_session`
+    /// means the `uses_memory` gate did not hold.
+    #[derive(Default)]
+    struct CountingPurgeMemory {
+        purge_attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingPurgeMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "counting-purge-memory"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ::zeroclaw_api::memory_traits::Memory for CountingPurgeMemory {
+        fn name(&self) -> &str {
+            "counting-purge-memory"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(
+            &self,
+            _key: &str,
+        ) -> anyhow::Result<Option<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&::zeroclaw_api::memory_traits::MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: ::zeroclaw_api::memory_traits::MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<::zeroclaw_api::memory_traits::MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn purge_session(&self, _session_id: &str) -> anyhow::Result<usize> {
+            self.purge_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(0)
+        }
+    }
+
+    /// `abandon_best_effort` must honour its deadline on a **current-thread**
+    /// runtime, not just a multi-thread one.
+    ///
+    /// This pins the regression that an earlier implementation shipped: driving
+    /// the supervised future with `Handle::current().block_on(f)` from a
+    /// `spawn_blocking` thread borrows the *caller's* runtime. Under
+    /// `#[tokio::test]` (current-thread) that occupies the single thread which
+    /// also has to poll this function's own `timeout`, so the deadline never
+    /// fires and the supervisor hangs as hard as the work it bounds. Every
+    /// blocker regression for this PR is `flavor = "multi_thread"`, so none of
+    /// them can catch it — but two pre-existing tests in this file are bare
+    /// `#[tokio::test]` and hung indefinitely.
+    ///
+    /// Deliberately a direct unit test of the helper: it fails in seconds
+    /// instead of wedging the suite, and names the property rather than a
+    /// downstream symptom.
+    #[tokio::test]
+    async fn abandon_best_effort_honours_deadline_on_current_thread_runtime() {
+        let started = std::time::Instant::now();
+
+        // Blocks its thread outright — no await, so nothing can preempt it
+        // cooperatively. This is the shape the helper exists to bound.
+        let outcome = abandon_best_effort(
+            Duration::from_millis(200),
+            Box::pin(async {
+                std::thread::sleep(Duration::from_secs(30));
+                "must not be observed"
+            }),
+        )
+        .await;
+
+        let elapsed = started.elapsed();
+        assert!(
+            outcome.is_err(),
+            "a 30s synchronous block must not resolve within a 200ms deadline"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "abandon_best_effort did not honour its deadline on a current-thread \
+             runtime ({elapsed:?}); it must not depend on the caller's runtime flavor"
+        );
+    }
+
+    /// The happy path on a current-thread runtime: a supervised future that
+    /// finishes inside its deadline still returns its value. Without this, the
+    /// test above could pass against a helper that simply always abandons.
+    #[tokio::test]
+    async fn abandon_best_effort_returns_value_on_current_thread_runtime() {
+        let outcome = abandon_best_effort(
+            Duration::from_secs(30),
+            Box::pin(async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                "supervised value"
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            outcome.expect("work completing inside its deadline must return Ok"),
+            "supervised value",
+            "the supervised future's value must be propagated to the caller"
+        );
+    }
+
+    #[tokio::test]
+    async fn supervise_owned_rejects_completion_after_deadline() {
+        let outcome = supervise_owned(
+            Duration::from_millis(50),
+            Box::new(|_cancellation| {
+                Box::pin(async {
+                    // One non-yielding poll crosses the deadline and then
+                    // returns a successful value. Once the caller has
+                    // requested cancellation, that late value must not erase
+                    // the wall-clock timeout or make the run retryable.
+                    std::thread::sleep(Duration::from_millis(200));
+                    7_u8
+                })
+            }),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, Err(OwnedSupervisionError::DeadlineExceeded)),
+            "a completion observed after cancellation must remain a deadline: {outcome:?}"
+        );
+    }
+
+    // One worker on purpose. This is the case the existing two-worker
+    // regression cannot cover: with a single worker, a run that blocks
+    // without yielding occupies the ONLY thread that could poll a
+    // same-runtime timer, so `spawn!` + `timeout` degrades from a
+    // wall-clock bound to a cooperative one exactly when it matters.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn cron_agent_timeout_releases_lock_with_single_worker() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Main,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("single-worker-timeout-release");
+
+        let started = std::time::Instant::now();
+        // Two seconds of synchronous setup against a one-second deadline. The
+        // supervisor observes cancellation independently but retains ownership
+        // until the non-yielding poll returns.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            TEST_PRE_RUN_BLOCK.scope(
+                Duration::from_secs(2),
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let (job_id, success, output) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "execute_and_persist_job did not return within the outer test bound \
+                 ({elapsed:?}); with one worker the deadline must still fire while the \
+                 run's synchronous setup is blocked"
+            )
+        });
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "a run whose setup blocks past the deadline must be reported as a \
+             timeout, got: {output}"
+        );
+        assert!(
+            elapsed >= Duration::from_secs(2),
+            "the claim must not be released while blocked setup can still continue"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "the cancellation checkpoint was not observed after setup returned ({elapsed:?})"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released after a single-worker agent-run timeout"
+        );
+    }
+
+    // Every worker occupied by a synchronously-blocked run. Two workers, four
+    // concurrent blocked runs: even the "spare worker" that the existing
+    // two-worker regression relies on is gone, so a shared-pool timer has
+    // nothing left to poll it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cron_agent_timeout_releases_lock_when_all_workers_occupied() {
+        const CONCURRENT_RUNS: usize = 4;
+
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let mut jobs = Vec::new();
+        for _ in 0..CONCURRENT_RUNS {
+            let job = cron::add_agent_job(
+                &config,
+                TEST_AGENT,
+                None,
+                crate::cron::Schedule::Cron {
+                    expr: "*/5 * * * *".into(),
+                    tz: None,
+                },
+                "Say hello",
+                SessionTarget::Main,
+                None,
+                None,
+                false,
+                None,
+                true,
+            )
+            .unwrap();
+            assert!(
+                cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+                "job should be claimable before the run"
+            );
+            jobs.push(job);
+        }
+
+        let started = std::time::Instant::now();
+        let mut handles = Vec::new();
+        for job in &jobs {
+            let run_config = config.clone();
+            let run_job = job.clone();
+            let component = unique_component("all-workers-timeout-release");
+            handles.push(::zeroclaw_spawn::spawn!(async move {
+                let security = test_security(&run_config);
+                TEST_PRE_RUN_BLOCK
+                    .scope(
+                        Duration::from_secs(2),
+                        Box::pin(execute_and_persist_job(
+                            &run_config,
+                            &security,
+                            TEST_AGENT,
+                            &run_job,
+                            &component,
+                        )),
+                    )
+                    .await
+            }));
+        }
+
+        let mut results = Vec::new();
+        for handle in handles {
+            let joined = tokio::time::timeout(Duration::from_secs(20), handle)
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "a supervised run did not return within the outer test bound; \
+                         with every worker occupied by synchronous setup the deadline \
+                         must still fire"
+                    )
+                })
+                .expect("run task joined");
+            results.push(joined);
+        }
+        let elapsed = started.elapsed();
+
+        for (job, (job_id, success, output)) in jobs.iter().zip(&results) {
+            assert_eq!(*job_id, job.id);
+            assert!(!success);
+            assert!(
+                output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+                "unexpected output: {output}"
+            );
+        }
+
+        // Every attempt has its own private runtime, so all four blocked polls
+        // unwind concurrently while the caller's two-worker pool stays live.
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "runs were only released after their blocking setup completed \
+             ({elapsed:?}); the deadline must hold when all workers are occupied"
+        );
+        for job in &jobs {
+            assert!(
+                cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+                "every job lock must be released when all workers are occupied"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn isolated_purge_releases_lock_when_audit_write_blocks_before_await() {
+        // Blocker: only `create_memory_for_agent` was moved off this task; the
+        // `mem.purge_session` call ran inline inside the future wrapped by
+        // `ISOLATED_SESSION_PURGE_TIMEOUT`. `AuditedMemory::purge_session`
+        // performs a synchronous SQLite write in `log_audit` BEFORE its first
+        // await, so a contended `audit.db` blocks the worker and the cleanup
+        // timer cannot be polled -- re-pinning `locked_at`. `StallingPurgeMemory`
+        // parks at `pending()` and cannot reproduce this.
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("isolated-purge-sync-block-release");
+        let purge_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // 10s of synchronous blocking against the 3s purge deadline.
+        let blocking_memory: Arc<dyn ::zeroclaw_api::memory_traits::Memory> =
+            Arc::new(SyncBlockingPurgeMemory {
+                purge_attempts: std::sync::Arc::clone(&purge_attempts),
+                block_for: Duration::from_secs(10),
+            });
+
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            TEST_PURGE_MEMORY.scope(
+                blocking_memory,
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let (job_id, success, output) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "execute_and_persist_job did not return within the outer test bound \
+                 ({elapsed:?}); a purge that blocks synchronously before its first \
+                 await must not block persist/release_job"
+            )
+        });
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        assert_eq!(
+            purge_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the purge must actually have been attempted, otherwise this test \
+             proves nothing about the deadline"
+        );
+        // 1s run deadline + 3s purge deadline, with slack for loaded CI, but
+        // far below the 10s synchronous block.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the claim was only released after the blocking purge completed \
+             ({elapsed:?}); the cleanup deadline must not depend on the purge \
+             reaching an await point"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released when the purge blocks before its first await"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn isolated_purge_releases_lock_when_backend_construction_blocks() {
+        // Blocker: backend construction was spawned and its `JoinHandle`
+        // dropped on timeout. Dropping a handle detaches the task rather than
+        // cancelling it, so a construction blocked inside a single poll (the
+        // PostgreSQL initializer thread `join()`, whose `connect_timeout_secs`
+        // defaults to `None`) both outlived the cleanup deadline and, with no
+        // spare worker, prevented the timer from firing at all.
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("isolated-purge-construction-block");
+
+        let started = std::time::Instant::now();
+        // 10s of blocking construction against the 3s purge deadline.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(20),
+            TEST_PURGE_CONSTRUCT_BLOCK.scope(
+                Duration::from_secs(10),
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let (job_id, success, output) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "execute_and_persist_job did not return within the outer test bound \
+                 ({elapsed:?}); a blocked backend construction must not hold the claim"
+            )
+        });
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        // 1s run deadline + 3s purge deadline plus CI slack, far below the
+        // 10s blocking construction.
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "the claim was only released after the blocking construction \
+             completed ({elapsed:?}); dropping a JoinHandle detaches the task \
+             rather than cancelling it, so construction must be supervised"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released when backend construction blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn isolated_job_without_memory_does_not_construct_backend() {
+        // `uses_memory = false` runs memory-free end to end (`NoneMemory`, no
+        // persistent memory tools), so there is no session to purge. Before
+        // the gate, `purge_isolated_session` checked only
+        // `SessionTarget::Isolated` and therefore still constructed the
+        // configured backend and reached out to Qdrant/PostgreSQL for a
+        // session the run never wrote.
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            // The whole point: an Isolated job that uses no memory.
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("isolated-no-memory-no-purge");
+        let purge_attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting_memory: Arc<dyn ::zeroclaw_api::memory_traits::Memory> =
+            Arc::new(CountingPurgeMemory {
+                purge_attempts: std::sync::Arc::clone(&purge_attempts),
+            });
+
+        let (job_id, success, output) = TEST_PURGE_MEMORY
+            .scope(
+                counting_memory,
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            )
+            .await;
+
+        assert_eq!(job_id, job.id);
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        assert_eq!(
+            purge_attempts.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a uses_memory = false job must not reach a memory backend at all"
+        );
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must still be released for a memory-free isolated job"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_and_persist_job_releases_lock_when_delivery_stalls() {
+        // Blocker: `persist_job_result` awaits announcement delivery BEFORE
+        // `execute_and_persist_job` calls `release_job`. A `DeliveryFn` that
+        // never resolves (dead socket, wedged provider) would therefore leave
+        // `locked_at` set forever even though the agent run and its purge both
+        // returned under their own deadlines. Starts from a real agent timeout
+        // because timeout output is operator-visible rather than a quiet
+        // `NO_REPLY`, so an announce-mode job reliably reaches delivery.
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let (addr, _accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+
+        let job = cron::add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "Say hello",
+            SessionTarget::Main,
+            None,
+            Some(DeliveryConfig {
+                mode: "announce".to_string(),
+                channel: Some(STALL_CHANNEL.to_string()),
+                to: Some("chat-id".to_string()),
+                thread_id: None,
+                // Not best-effort: proves the bounded path still classifies a
+                // stalled send as a real delivery failure rather than silently
+                // reporting success.
+                best_effort: false,
+            }),
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job should be claimable before the run"
+        );
+
+        let security = test_security(&config);
+        let component = unique_component("delivery-stall-release");
+        let before = STALL_DELIVERY_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let started = std::time::Instant::now();
+        // Outer bound so a regression to an unbounded delivery await fails this
+        // test promptly instead of hanging the suite.
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(10),
+            TEST_DELIVERY_TIMEOUT.scope(
+                Duration::from_millis(250),
+                Box::pin(execute_and_persist_job(
+                    &config, &security, TEST_AGENT, &job, &component,
+                )),
+            ),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let (job_id, success, _output) = outcome.unwrap_or_else(|_| {
+            panic!(
+                "execute_and_persist_job did not return within the outer test bound \
+                 ({elapsed:?}); a stalled delivery must not block release_job"
+            )
+        });
+
+        assert_eq!(job_id, job.id);
+        assert!(
+            !success,
+            "a non-best-effort delivery that never completes must classify the run as failed"
+        );
+        assert!(
+            STALL_DELIVERY_ATTEMPTS.load(std::sync::atomic::Ordering::SeqCst) > before,
+            "delivery was never attempted; this test would vacuously pass"
+        );
+
+        // The point of the fix: the claim is released despite delivery never
+        // completing.
+        assert!(
+            cron::claim_job(&config, &job.id, Utc::now()).unwrap(),
+            "job lock must be released even when announcement delivery stalls"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_job_with_retry_does_not_retry_agent_timeout() {
+        let tmp = TempDir::new().unwrap();
+        let (addr, accepts) = spawn_hanging_server().await;
+        let mut config = test_config_with_hanging_provider(&tmp, addr).await;
+        config
+            .runtime_profiles
+            .get_mut(TEST_AGENT)
+            .unwrap()
+            .agentic_timeout_secs = Some(1);
+        // Retries would otherwise occupy the job's slot for `retries + 1`
+        // full timeouts; a non-retryable timeout must attempt exactly once.
+        config.reliability.scheduler_retries = 2;
+        config.reliability.provider_backoff_ms = 1;
+
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Say hello".into());
+        let security = test_security(&config);
+
+        let (success, output) = Box::pin(execute_job_with_retry(
+            &config, &security, TEST_AGENT, &job, None, false,
+        ))
+        .await;
+
+        assert!(!success);
+        assert!(
+            output.starts_with(AGENT_JOB_TIMEOUT_PREFIX),
+            "unexpected output: {output}"
+        );
+        // Exactly one provider HTTP attempt: `scheduler_retries = 2` would
+        // drive three connections if the timeout were retried.
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "agent timeout must not be retried"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_job_timeout_honors_runtime_profile_override() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                agentic_timeout_secs: Some(7),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            resolve_agent_job_timeout(&config, TEST_AGENT),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn resolve_agent_job_timeout_falls_back_to_default_without_override() {
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig::default(),
+        );
+        config.agents.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            resolve_agent_job_timeout(&config, TEST_AGENT),
+            Duration::from_secs(AGENT_JOB_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn resolve_agent_job_timeout_falls_back_to_default_with_zero_override() {
+        // `agentic_timeout_secs = 0` is not validated away at config load, so
+        // the resolver must treat it as unset rather than an immediate,
+        // non-retryable timeout (an agent-run timeout is deliberately not
+        // retried, unlike shell-job/delegate timeouts elsewhere in the
+        // config surface, so `Some(0)` must never reach `time::timeout` as a
+        // real zero-duration deadline).
+        let mut config = Config::default();
+        config.runtime_profiles.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::RuntimeProfileConfig {
+                agentic_timeout_secs: Some(0),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            TEST_AGENT.to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            resolve_agent_job_timeout(&config, TEST_AGENT),
+            Duration::from_secs(AGENT_JOB_TIMEOUT_SECS)
+        );
+    }
+
     #[tokio::test]
     async fn run_agent_job_blocks_rate_limited() {
         let tmp = TempDir::new().unwrap();
@@ -2710,10 +4781,50 @@ mod tests {
         assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
     }
 
+    #[tokio::test]
+    async fn cancelled_scheduled_delivery_does_not_dispatch() {
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = announce_job();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let before = DELIVERED.load(std::sync::atomic::Ordering::SeqCst);
+
+        let error =
+            deliver_if_configured_with_cancellation(&config, &job, "result", Some(&cancellation))
+                .await
+                .expect_err("a pre-cancelled delivery must not dispatch");
+
+        assert!(error.to_string().contains("cancelled before dispatch"));
+        assert_eq!(
+            DELIVERED.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "the delivery handler must not run after cancellation"
+        );
+    }
+
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// Channel name the recorder counts. Used only by the suppression test.
     const COUNT_CHANNEL: &str = "count-delivery";
+
+    /// Channel name whose delivery future never resolves. Exercises
+    /// `CRON_DELIVERY_TIMEOUT`: a send that never completes must not hold the
+    /// scheduler's in-flight claim open.
+    const STALL_CHANNEL: &str = "stall-delivery";
+    const DELAY_SCHEDULED_CHANNEL: &str = "delay-scheduled-delivery";
+    const DELAY_MANUAL_CHANNEL: &str = "delay-manual-delivery";
+
+    /// Counts how many times the stalling delivery handler was entered, so a
+    /// test can prove delivery was actually attempted (and not skipped by, say,
+    /// the `NO_REPLY` suppression path) before the deadline fired.
+    static STALL_DELIVERY_ATTEMPTS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static DELAY_SCHEDULED_COMPLETIONS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static DELAY_MANUAL_COMPLETIONS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
     fn register_recording_delivery_fn() {
         // Idempotent: register_delivery_fn is a no-op once the OnceLock is set,
@@ -2725,12 +4836,98 @@ mod tests {
                 if channel == "fail-delivery" {
                     anyhow::bail!("synthetic delivery failure");
                 }
+                if channel == STALL_CHANNEL {
+                    STALL_DELIVERY_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::pending::<()>().await;
+                    unreachable!("stalling delivery must never resolve in this test double");
+                }
+                if channel == DELAY_SCHEDULED_CHANNEL {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    DELAY_SCHEDULED_COMPLETIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if channel == DELAY_MANUAL_CHANNEL {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    DELAY_MANUAL_COMPLETIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
                 if channel == COUNT_CHANNEL {
                     DELIVERED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 }
                 Ok(())
             })
         }));
+    }
+
+    fn delayed_announcement_job(channel: &str) -> CronJob {
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".to_string(),
+            channel: Some(channel.to_string()),
+            to: Some("chat-id".to_string()),
+            thread_id: None,
+            best_effort: false,
+        };
+        job
+    }
+
+    #[tokio::test]
+    async fn scheduled_delivery_timeout_prevents_late_completion() {
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = delayed_announcement_job(DELAY_SCHEDULED_CHANNEL);
+        let before = DELAY_SCHEDULED_COMPLETIONS.load(std::sync::atomic::Ordering::SeqCst);
+
+        let outcome = TEST_DELIVERY_TIMEOUT
+            .scope(
+                Duration::from_millis(50),
+                deliver_and_classify_run_result(
+                    &config,
+                    &job,
+                    true,
+                    "result".to_string(),
+                    CronDeliveryContext::Scheduled,
+                ),
+            )
+            .await;
+
+        assert!(!outcome.success, "a non-best-effort timeout is a failure");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            DELAY_SCHEDULED_COMPLETIONS.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "a delivery classified as timed out must not complete later"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_delivery_does_not_inherit_scheduled_claim_deadline() {
+        register_recording_delivery_fn();
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let job = delayed_announcement_job(DELAY_MANUAL_CHANNEL);
+        let before = DELAY_MANUAL_COMPLETIONS.load(std::sync::atomic::Ordering::SeqCst);
+        let started = std::time::Instant::now();
+
+        let outcome = TEST_DELIVERY_TIMEOUT
+            .scope(
+                Duration::from_millis(50),
+                deliver_and_classify_run_result(
+                    &config,
+                    &job,
+                    true,
+                    "result".to_string(),
+                    CronDeliveryContext::ToolManual,
+                ),
+            )
+            .await;
+
+        assert!(outcome.success);
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(
+            DELAY_MANUAL_COMPLETIONS.load(std::sync::atomic::Ordering::SeqCst),
+            before + 1,
+            "manual delivery remains owned by and awaited by its caller"
+        );
     }
 
     fn announce_job() -> CronJob {

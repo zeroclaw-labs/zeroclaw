@@ -790,6 +790,7 @@ impl DelegateTool {
             // lifetime. `None` only when the parent registry itself had no live
             // handle (one-shot callers), which keeps the snapshot fallback.
             self.live_config.clone(),
+            Some(self.cancellation_token.clone()),
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -1708,9 +1709,14 @@ impl DelegateTool {
                     }
                 };
 
+                // Both branches above observe the same token. Under parallel scheduling the
+                // inner agent loop can return its cancellation error before `select!` chooses
+                // the explicit cancellation branch, so derive the terminal state from the
+                // token rather than the wording or capitalization of that error.
+                let cancellation_observed = child_token.is_cancelled();
                 let finished_at = chrono::Utc::now().to_rfc3339();
                 let final_result = match outcome {
-                    Ok(output) => BackgroundDelegateResult {
+                    Ok(output) if !cancellation_observed => BackgroundDelegateResult {
                         task_id: task_id_clone.clone(),
                         agent: agent_name_owned,
                         status: BackgroundTaskStatus::Completed,
@@ -1719,8 +1725,17 @@ impl DelegateTool {
                         started_at,
                         finished_at: Some(finished_at),
                     },
+                    Ok(_) => BackgroundDelegateResult {
+                        task_id: task_id_clone.clone(),
+                        agent: agent_name_owned,
+                        status: BackgroundTaskStatus::Cancelled,
+                        output: None,
+                        error: Some("Cancelled by parent session".to_string()),
+                        started_at,
+                        finished_at: Some(finished_at),
+                    },
                     Err(err) => {
-                        let status = if err.contains("Cancelled") {
+                        let status = if cancellation_observed || err.contains("Cancelled") {
                             BackgroundTaskStatus::Cancelled
                         } else {
                             BackgroundTaskStatus::Failed
@@ -3977,6 +3992,230 @@ mod tests {
         });
 
         (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn start_hanging_chat_server() -> (LocalChatServer, Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let request_count = Arc::clone(&requests);
+        let task = zeroclaw_spawn::spawn!(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                request_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                zeroclaw_spawn::spawn!(async move {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        (LocalChatServer { uri, _task: task }, requests)
+    }
+
+    async fn wait_for_request_count(requests: &std::sync::atomic::AtomicUsize, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while requests.load(std::sync::atomic::Ordering::SeqCst) < expected {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("provider did not receive {expected} request(s)"));
+    }
+
+    struct FactoryCancellationFixture {
+        _tmp: TempDir,
+        tool: Arc<dyn Tool>,
+        cancellation: CancellationToken,
+        workspace_dir: PathBuf,
+    }
+
+    fn factory_cancellation_fixture(model_uri: String) -> FactoryCancellationFixture {
+        use zeroclaw_config::autonomy::{DelegationMode, DelegationPolicy};
+
+        let tmp = TempDir::new().unwrap();
+        let workspace_dir = tmp.path().join("workspace");
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.providers.models.custom.insert(
+            "local".to_string(),
+            CustomModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(model_uri),
+                    model: Some("delegate-cancellation-test".to_string()),
+                    api_key: Some("delegate-cancellation-key".to_string()),
+                    timeout_secs: Some(30),
+                    ..ModelProviderConfig::default()
+                },
+            },
+        );
+        config.risk_profiles.insert(
+            "caller_profile".to_string(),
+            RiskProfileConfig {
+                delegation_policy: DelegationPolicy {
+                    mode: DelegationMode::Allow,
+                },
+                allowed_tools: vec![DelegateTool::NAME.to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .risk_profiles
+            .insert("target_profile".to_string(), RiskProfileConfig::default());
+        config.runtime_profiles.insert(
+            "target_agentic".to_string(),
+            RuntimeProfileConfig {
+                agentic: true,
+                max_tool_iterations: 2,
+                ..RuntimeProfileConfig::default()
+            },
+        );
+        config.agents.insert(
+            "caller".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "caller_profile".into(),
+                delegates: vec![DelegateTargetConfig {
+                    agent: "target".to_string(),
+                    mode: DelegateExecutionMode::Bounded,
+                }],
+                ..AliasedAgentConfig::default()
+            },
+        );
+        config.agents.insert(
+            "target".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.local".into(),
+                risk_profile: "target_profile".into(),
+                runtime_profile: "target_agentic".into(),
+                ..AliasedAgentConfig::default()
+            },
+        );
+
+        let config = Arc::new(config);
+        let security =
+            Arc::new(SecurityPolicy::for_agent(&config, "caller").expect("caller policy resolves"));
+        let risk_profile = config
+            .risk_profiles
+            .get("caller_profile")
+            .expect("caller risk profile")
+            .clone();
+        let memory: Arc<dyn Memory> = Arc::new(zeroclaw_memory::NoneMemory::new("none"));
+        let cancellation = CancellationToken::new();
+        let built = crate::tools::all_tools_with_runtime(
+            Arc::clone(&config),
+            &security,
+            &risk_profile,
+            "caller",
+            Arc::new(DelegateTestRuntime),
+            memory,
+            None,
+            None,
+            &config.browser,
+            &config.http_request,
+            &config.web_fetch,
+            &workspace_dir,
+            &config.agents,
+            None,
+            &config,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            Some(cancellation.clone()),
+        );
+        let tool = built
+            .unfiltered_tool_arcs
+            .into_iter()
+            .find(|tool| tool.name() == DelegateTool::NAME)
+            .expect("delegate tool is registered");
+
+        FactoryCancellationFixture {
+            _tmp: tmp,
+            tool,
+            cancellation,
+            workspace_dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_run_cancellation_stops_background_delegate() {
+        let (_server, requests) = start_hanging_chat_server().await;
+        let fixture = factory_cancellation_fixture(_server.uri.clone());
+        let start = fixture
+            .tool
+            .execute(json!({
+                "agent": "target",
+                "prompt": "wait for cancellation",
+                "background": true
+            }))
+            .await
+            .expect("background delegation starts");
+        assert!(
+            start.success,
+            "background delegation failed to start: {start:?}"
+        );
+        let task_id = start
+            .output
+            .lines()
+            .find(|line| line.starts_with("task_id:"))
+            .expect("background task id")
+            .trim_start_matches("task_id: ")
+            .trim();
+
+        wait_for_request_count(&requests, 1).await;
+        fixture.cancellation.cancel();
+        let result = wait_for_terminal_background_result(&fixture.workspace_dir, task_id).await;
+        assert_eq!(result.status, BackgroundTaskStatus::Cancelled, "{result:?}");
+
+        let settled_requests = requests.load(std::sync::atomic::Ordering::SeqCst);
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            settled_requests,
+            "a cancelled background delegate must not resume provider work"
+        );
+    }
+
+    #[tokio::test]
+    async fn factory_run_cancellation_stops_parallel_delegate() {
+        let (_server, requests) = start_hanging_chat_server().await;
+        let fixture = factory_cancellation_fixture(_server.uri.clone());
+        let tool = Arc::clone(&fixture.tool);
+        let handle = zeroclaw_spawn::spawn!(async move {
+            tool.execute(json!({
+                "parallel": ["target"],
+                "prompt": "wait for cancellation"
+            }))
+            .await
+        });
+
+        wait_for_request_count(&requests, 1).await;
+        fixture.cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("parallel delegation observes cancellation")
+            .expect("parallel delegation task joins")
+            .expect("parallel delegation returns a tool result");
+        assert!(
+            !result.success,
+            "cancelled parallel delegation succeeded: {result:?}"
+        );
+
+        let settled_requests = requests.load(std::sync::atomic::Ordering::SeqCst);
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            settled_requests,
+            "cancelled parallel delegates must not resume provider work"
+        );
     }
 
     async fn start_memory_tool_chat_server(key: &str, content: &str) -> LocalChatServer {

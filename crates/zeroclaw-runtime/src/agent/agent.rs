@@ -1647,6 +1647,9 @@ impl Agent {
             // whole lifetime. One-shot callers pass `None` and keep the
             // documented snapshot fallback.
             live_config.clone(),
+            // No supervised run token on this construction path: cron supplies
+            // its own when it assembles a run-scoped registry.
+            None,
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
@@ -2578,7 +2581,10 @@ impl Agent {
                         .provider_switch_config
                         .as_ref()
                         .and_then(|c| c.config.as_deref())
-                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        .map(|config| crate::agent::turn::SopStepReassembly {
+                            config,
+                            run_cancellation: None,
+                        }),
                 }),
             ),
         );
@@ -3022,7 +3028,10 @@ impl Agent {
                             .provider_switch_config
                             .as_ref()
                             .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                            .map(|config| crate::agent::turn::SopStepReassembly {
+                                config,
+                                run_cancellation: None,
+                            }),
                     }),
                 ),
             );
