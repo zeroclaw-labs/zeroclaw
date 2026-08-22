@@ -331,6 +331,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn walker_resolves_sandbox_policy_leaf_under_a_risk_profile_alias() {
+        // The canonical sandbox fields must be reachable from the same public
+        // surfaces as every other config leaf. This resolves through the
+        // `risk_profiles` map-key section into the nested `sandbox_policy`
+        // struct, which only works while that field carries `#[nested]`.
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(
+            "ZEROCLAW_risk_profiles__default__sandbox_policy__deny_read",
+            "/etc/shadow",
+        );
+
+        let mut config = Config::default();
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(
+            applied
+                .paths
+                .contains("risk_profiles.default.sandbox_policy.deny_read"),
+            "sandbox_policy leaf must resolve as an env-overridable path: {:?}",
+            applied.paths,
+        );
+        assert_eq!(
+            config.risk_profiles["default"].sandbox_policy.deny_read,
+            Some(vec!["/etc/shadow".to_string()]),
+        );
+    }
+
+    #[tokio::test]
     async fn walker_rejects_unknown_path() {
         let _guard = super::env_test_lock().await;
         let _v = EnvVarGuard::set("ZEROCLAW_no__such__field", "x");

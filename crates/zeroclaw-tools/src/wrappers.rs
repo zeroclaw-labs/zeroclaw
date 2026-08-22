@@ -4,10 +4,36 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use zeroclaw_api::attribution::{Attributable, Role, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
-use zeroclaw_config::policy::SecurityPolicy;
+use zeroclaw_config::policy::{SecurityPolicy, canonicalize_best_effort};
 
 /// Type alias for a path-extraction closure used by [`PathGuardedTool`].
 type PathExtractor = dyn Fn(&serde_json::Value) -> Option<String> + Send + Sync;
+
+/// How [`PathGuardedTool`] should interpret and check the string it extracts
+/// from a tool's arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathAccessMode {
+    /// The extracted string is a literal single path the inner tool reads.
+    /// Resolved (workspace-relative join, best-effort canonicalize) and
+    /// checked against the canonical `deny_read`/`allow_read` policy
+    /// (`SecurityPolicy::is_resolved_path_readable`) before the inner tool
+    /// runs — the same check the file tools apply at their own read
+    /// boundary, so a `deny_read` entry holds even for tools that have no
+    /// internal check of their own.
+    Read,
+    /// The extracted string is a literal single path the inner tool
+    /// writes/mutates. Checked against the canonical `deny_write`/`allow_write`
+    /// policy (`SecurityPolicy::is_resolved_path_allowed`).
+    Write,
+    /// The extracted string is not a literal path — a glob pattern or search
+    /// query — so it cannot be resolved/canonicalized as one. Keeps the
+    /// legacy string-level `is_path_allowed` pre-filter unchanged. Every
+    /// tool registered with this mode performs its own precise canonical
+    /// check per resolved match internally (`glob_search`, `content_search`),
+    /// so this mode is a coarse pre-filter only, never the enforcement
+    /// boundary.
+    Legacy,
+}
 
 // ── RateLimitedTool ───────────────────────────────────────────────────────────
 
@@ -83,15 +109,21 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 pub struct PathGuardedTool<T: Tool> {
     inner: T,
     security: Arc<SecurityPolicy>,
+    mode: PathAccessMode,
     /// Optional override: extract a path string from the args JSON.
     extractor: Option<Box<PathExtractor>>,
 }
 
 impl<T: Tool> PathGuardedTool<T> {
-    pub fn new(inner: T, security: Arc<SecurityPolicy>) -> Self {
+    /// `mode` must name how the extracted string should be checked — every
+    /// call site declares it explicitly (see [`PathAccessMode`]) rather than
+    /// defaulting to the legacy string-level check, so adding a new wrapped
+    /// tool forces a conscious choice instead of a silent bypass.
+    pub fn new(inner: T, security: Arc<SecurityPolicy>, mode: PathAccessMode) -> Self {
         Self {
             inner,
             security,
+            mode,
             extractor: None,
         }
     }
@@ -116,6 +148,28 @@ impl<T: Tool> PathGuardedTool<T> {
             }
         }
         None
+    }
+
+    /// Resolve `raw` (workspace-relative join, best-effort canonicalize —
+    /// tolerant of a not-yet-existing write target, matching the pattern
+    /// `file_write`/`file_edit` already use at their own boundary) and check
+    /// it against the canonical policy for `self.mode`. Returns `Some(raw)`
+    /// when the path is denied.
+    async fn check_canonical(&self, raw: &str) -> Option<String> {
+        if raw.contains('\0') {
+            return Some(raw.to_string());
+        }
+        let candidate = self.security.resolve_tool_path(raw);
+        let resolved = match tokio::fs::canonicalize(&candidate).await {
+            Ok(p) => p,
+            Err(_) => canonicalize_best_effort(&candidate),
+        };
+        let allowed = match self.mode {
+            PathAccessMode::Read => self.security.is_resolved_path_readable(&resolved),
+            PathAccessMode::Write => self.security.is_resolved_path_allowed(&resolved),
+            PathAccessMode::Legacy => unreachable!("check_canonical is not called in Legacy mode"),
+        };
+        if allowed { None } else { Some(raw.to_string()) }
     }
 }
 
@@ -156,16 +210,24 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         if let Some(arg) = self.extract_path_string(&args) {
             // For shell command arguments, use the full token-aware scanner.
-            // For plain path values (e.g. "path" or custom extractor), fall back
-            // to the direct path check.
+            // For a literal path in Read/Write mode, resolve and apply the
+            // canonical deny_read/deny_write policy — the same check the
+            // wrapped tool would apply at its own boundary, so a tool with no
+            // internal check of its own is still covered. Legacy mode (glob
+            // patterns, search queries) keeps the string-level pre-filter,
+            // since those strings can't be resolved/canonicalized as a path.
             let blocked = if self.extractor.is_none()
                 && args.get("command").and_then(|v| v.as_str()).is_some()
             {
                 self.security.forbidden_workspace_path_argument(&arg)
-            } else if !self.security.is_path_allowed(&arg) {
-                Some(arg.clone())
+            } else if self.mode == PathAccessMode::Legacy {
+                if !self.security.is_path_allowed(&arg) {
+                    Some(arg.clone())
+                } else {
+                    None
+                }
             } else {
-                None
+                self.check_canonical(&arg).await
             };
 
             if let Some(path) = blocked {
@@ -362,7 +424,7 @@ mod tests {
     #[tokio::test]
     async fn path_guard_allows_safe_path() {
         let (inner, counter) = CountingTool::new();
-        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full));
+        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full), PathAccessMode::Read);
         let result = tool
             .execute(serde_json::json!({"path": "src/main.rs"}))
             .await
@@ -374,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn path_guard_blocks_forbidden_path() {
         let (inner, counter) = CountingTool::new();
-        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full));
+        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full), PathAccessMode::Read);
         let result = tool
             .execute(serde_json::json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
@@ -391,7 +453,7 @@ mod tests {
     #[tokio::test]
     async fn path_guard_no_path_arg_passes_through() {
         let (inner, counter) = CountingTool::new();
-        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full));
+        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full), PathAccessMode::Read);
         // No recognised path field — wrapper must not block.
         let result = tool
             .execute(serde_json::json!({"value": "hello"}))
@@ -404,8 +466,8 @@ mod tests {
     #[tokio::test]
     async fn path_guard_custom_extractor() {
         let (inner, counter) = CountingTool::new();
-        let tool =
-            PathGuardedTool::new(inner, policy(AutonomyLevel::Full)).with_extractor(|args| {
+        let tool = PathGuardedTool::new(inner, policy(AutonomyLevel::Full), PathAccessMode::Read)
+            .with_extractor(|args| {
                 args.get("target")
                     .and_then(|v| v.as_str())
                     .map(String::from)
@@ -419,6 +481,130 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 
+    // ── Canonical read/write enforcement (defense-in-depth boundary) ──────────
+    //
+    // `CountingTool` has no internal path check of its own, so these isolate
+    // the wrapper's own decision — every currently-registered real tool
+    // (file_read, file_write, ...) additionally re-checks internally, which
+    // would mask a regression here if tested only end-to-end through those
+    // tools.
+
+    #[tokio::test]
+    async fn path_guard_read_mode_denies_absolute_workspace_deny_read_target() {
+        // The legacy `is_path_allowed` bug this mode replaces only manifests
+        // for an ABSOLUTE in-workspace path: its `expanded_path.is_absolute()`
+        // branch returns `true` for any in-workspace path before the
+        // forbidden_paths/deny_read check ever runs. A relative arg does not
+        // hit that branch, so the absolute form is the one that actually
+        // exercises the defect.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            forbidden_paths: vec!["secret.txt".to_string()],
+            ..SecurityPolicy::default()
+        });
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, sec, PathAccessMode::Read);
+
+        let absolute = tmp.path().join("secret.txt");
+        let result = tool
+            .execute(serde_json::json!({"path": absolute.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "an absolute in-workspace deny_read target must be refused by the wrapper itself"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "inner must not be called when the wrapper denies the read"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_guard_read_mode_allows_unrelated_absolute_workspace_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            forbidden_paths: vec!["secret.txt".to_string()],
+            ..SecurityPolicy::default()
+        });
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, sec, PathAccessMode::Read);
+
+        let absolute = tmp.path().join("public.txt");
+        let result = tool
+            .execute(serde_json::json!({"path": absolute.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an unrelated target must pass: {:?}",
+            result.error
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn path_guard_write_mode_denies_deny_write_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let denied = tmp.path().join("protected.txt");
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            deny_write: vec![denied],
+            ..SecurityPolicy::default()
+        });
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, sec, PathAccessMode::Write);
+
+        let result = tool
+            .execute(serde_json::json!({"path": "protected.txt"}))
+            .await
+            .unwrap();
+
+        assert!(
+            !result.success,
+            "a deny_write target must be refused by the wrapper itself"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "inner must not be called when the wrapper denies the write"
+        );
+    }
+
+    #[tokio::test]
+    async fn path_guard_write_mode_allows_unrelated_workspace_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let denied = tmp.path().join("protected.txt");
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            deny_write: vec![denied],
+            ..SecurityPolicy::default()
+        });
+        let (inner, counter) = CountingTool::new();
+        let tool = PathGuardedTool::new(inner, sec, PathAccessMode::Write);
+
+        let result = tool
+            .execute(serde_json::json!({"path": "new_file.txt"}))
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "an unrelated target must pass: {:?}",
+            result.error
+        );
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
     // ── Composition test ──────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -428,7 +614,10 @@ mod tests {
         // (and not consume a rate-limit slot).
         let sec = policy(AutonomyLevel::Full);
         let (inner, counter) = CountingTool::new();
-        let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(inner, sec.clone(), PathAccessMode::Read),
+            sec,
+        );
 
         let blocked = tool
             .execute(serde_json::json!({"path": absolute_path_outside_workspace()}))
@@ -626,7 +815,10 @@ mod tests {
             ..SecurityPolicy::default()
         });
         let (inner, counter) = CountingTool::new();
-        let tool = RateLimitedTool::new(PathGuardedTool::new(inner, sec.clone()), sec);
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(inner, sec.clone(), PathAccessMode::Read),
+            sec,
+        );
 
         let blocked = tool
             .execute(serde_json::json!({"path": absolute_path_outside_workspace()}))

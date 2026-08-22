@@ -36,7 +36,54 @@ To force a specific backend, set `sandbox_backend` to one of the literal values 
 
 - **Read access**: restricted to the workspace, `/usr`, `/lib`, `/etc` (read-only), and explicitly-listed extra paths.
 - **Write access**: restricted to the workspace and `/tmp`.
-- **Forbidden paths**: anything listed in `[risk_profiles.<alias>].forbidden_paths`.
+- **Forbidden paths**: anything listed in `[risk_profiles.<alias>].forbidden_paths`, or the newer `sandbox_policy` table below, enforced today at the application layer only (see the [enforcement matrix](#enforcement-matrix-what-actually-enforces-each-field-today) below); no OS sandbox backend consumes these fields yet.
+
+## Sandbox policy (`sandbox_policy`)
+
+`[risk_profiles.<alias>.sandbox_policy]` is the canonical model for filesystem and network restrictions, layered on top of the legacy `workspace_only`/`forbidden_paths`/`allowed_roots` fields on the same risk profile:
+
+```toml
+[risk_profiles.assistant.sandbox_policy]
+# Read: deny-then-allow (default allow everywhere)
+deny_read  = ["~/.ssh", "~/.gnupg", "~/.aws"]
+allow_read = []               # re-allows within denied regions; takes precedence over deny_read
+
+# Write: allow-only (default deny everywhere)
+allow_write = [".", "/tmp"]
+deny_write  = [".env"]        # exceptions within allowed; takes precedence over allow_write
+
+# Network: allow-only via proxy (empty list = no network); not yet enforced, see below
+allowed_domains = ["api.anthropic.com", "*.github.com"]
+denied_domains  = []          # checked first, overrides allowed_domains
+
+# Unix sockets (macOS: per-path allowlist; Linux: seccomp handles it, field ignored)
+allow_unix_sockets = []
+
+# Raw extra bwrap flags (append-only escape hatch, bubblewrap backend only)
+bubblewrap_args = []
+
+# Escape hatch for the mandatory deny-write guardrail list below. Emits a WARN when false.
+mandatory_deny_write_enabled = true
+```
+
+**Precedence**: `allow_read` overrides `deny_read`; `deny_write` overrides `allow_write`; `denied_domains` is checked before `allowed_domains`.
+
+**Field presence matters.** Each of `deny_read`/`allow_read`/`allow_write`/`deny_write` is presence-preserving: omitting a field falls back to the corresponding legacy field (`forbidden_paths` maps to `deny_read`, `allowed_roots` maps to `allow_read`/`allow_write`); an explicit value, even an empty list, or one shaped like the schema default (`allow_write = [".", "/tmp"]`), always wins outright and is never merged with the legacy fallback. `workspace_only = true` on the risk profile always overrides `allow_write` regardless of what `sandbox_policy` sets.
+
+**Mandatory deny-write guardrail.** Regardless of `allow_write`, a default list of paths is always blocked for writes when `mandatory_deny_write_enabled` is `true` (the default): shell configs (`.bashrc`, `.zshrc`, `.profile`, etc.), git hooks and config (`.git/hooks/`, `.git/config`, `.gitconfig`), `.env`, `.mcp.json`, and editor/agent config directories (`.vscode/`, `.idea/`, `.claude/agents/`). Set `mandatory_deny_write_enabled = false` per profile to disable this merge; it emits a WARN log when disabled.
+
+**No config keys are removed.** `forbidden_paths`/`allowed_roots` remain valid indefinitely as compatibility aliases; no action is required for existing configs that never touch `sandbox_policy`.
+
+### Enforcement matrix: what actually enforces each field, today
+
+This is the part operators most often get wrong: setting a `sandbox_policy` field does not by itself mean an OS-level sandbox is confining that access.
+
+| Field | Enforced by | NOT enforced against |
+|---|---|---|
+| `deny_read` / `allow_read` / `allow_write` / `deny_write` | Application-layer path guard (`SecurityPolicy`), regardless of which OS sandbox backend (if any) is active. Two shapes: tools registered behind `PathGuardedTool` (`file_read`, `glob_search`, `content_search`, …) plus each write-capable tool's own exact-target check (`file_write`, `file_edit`); and `git_operations`, which is registered directly and applies the policy at its own operation boundary, enumerating the paths each operation would read (`diff`, `add`) or create, replace, or delete (`checkout`, `stash`, `worktree` add/remove/prune), and refusing the whole operation if any is denied or if the affected set cannot be enumerated. For `stash`, that set covers both halves of an entry: `push` counts the tracked modifications it reverts plus, with `-u`, the untracked files it removes, and `pop` counts the tracked files it restores plus any untracked files the entry was created with. `worktree prune` checks the stale administrative directories it would remove under the repository's common Git directory, not working-tree files. `commit` records already-staged content, and `log`/`branch`/`status` report metadata, so neither reaches file contents | Arbitrary shell/script child-process I/O. A permitted `shell`/`python`/`node` invocation is not confined by these lists on any backend today. No OS sandbox backend (Landlock, Bubblewrap, Seatbelt, Docker, Firejail) receives the resolved policy yet; that is follow-up work per [RFC #6996](https://github.com/zeroclaw-labs/zeroclaw/issues/6996) Phase 2, one PR per backend. |
+| `allowed_domains` / `denied_domains` / `allow_unix_sockets` / `bubblewrap_args` | Nothing yet | Fully inert: accepted by the schema and carried into the resolved policy, but no enforcement surface (application-layer or OS backend) consumes them. Proxy-based network filtering is RFC #6996 Phase 3. |
+
+The runtime logs a one-time WARN, `sandbox_policy denials are enforced for file tools only; shell child processes are not confined`, whenever `deny_read`/`deny_write` are configured, independent of which backend is selected, precisely because no backend forwards the policy yet.
 
 ### Network
 
@@ -99,7 +146,7 @@ The Linux-native path. Zero setup, kernel-enforced, very low overhead. Requires 
 Limitations:
 
 - No network confinement: Landlock only controls filesystem access.
-- `forbidden_paths` is enforced via path-based rules, not inode-based, so a clever symlink can sometimes escape (we resolve links before handing to Landlock to mitigate this).
+- `forbidden_paths`/`sandbox_policy` denials are not forwarded to Landlock yet (see the enforcement matrix above). Landlock's own kernel-enforced filesystem confinement is a fixed allowlist independent of those fields: workspace read/write, `/tmp` read/write, `/usr` and `/bin` read-only. Everything else is denied by the kernel regardless of `forbidden_paths`/`sandbox_policy` config.
 
 ### Bubblewrap (`bwrap`)
 
