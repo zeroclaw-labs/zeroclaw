@@ -971,6 +971,11 @@ sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
 sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
 sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
 
+# ── 终端工具审批 ──
+# ASCII 快捷键与 Rust 响应解析器保持一致。
+cli-approval-request = 🔧 代理想要执行：{$tool}
+cli-approval-prompt = { "   " }[Y] 是 / [N] 否 / [A] 始终允许 {$tool}：{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply

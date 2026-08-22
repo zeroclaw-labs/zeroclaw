@@ -972,6 +972,11 @@ sop-rpc-decision-unauthorized = La identidad RPC no está autorizada para resolv
 sop-rpc-policy-missing = La política de aprobación de SOP '{$name}' no está configurada.
 sop-rpc-policy-unavailable = La política del SOP en espera no está disponible: {$reason}.
 
+# ── Aprobación de herramientas en la terminal ──
+# Los atajos ASCII se mantienen alineados con el analizador de respuestas de Rust.
+cli-approval-request = 🔧 El agente quiere ejecutar: {$tool}
+cli-approval-prompt = { "   " }[Y] Sí / [N] No / [A] Siempre para {$tool}:{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply

@@ -824,6 +824,50 @@ mod tests {
     }
 
     #[test]
+    fn cli_approval_prompt_strings_format_in_all_locales() {
+        let tool = "shell";
+        let cases = [
+            ("cli-approval-request", &["shell"][..]),
+            ("cli-approval-prompt", &["shell", "[Y]", "[N]", "[A]"][..]),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, &[("tool", tool)])
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                if key == "cli-approval-prompt" {
+                    assert!(
+                        value.ends_with(' ') && !value.ends_with("  "),
+                        "{key} in {locale} should end with exactly one space; got: {value:?}"
+                    );
+                }
+            }
+        }
+
+        let english = include_str!("../locales/en/cli.ftl");
+        assert_eq!(
+            format_ftl_message(english, "en", "cli-approval-request", &[("tool", tool)]).as_deref(),
+            Some("🔧 Agent wants to execute: shell")
+        );
+        assert_eq!(
+            format_ftl_message(english, "en", "cli-approval-prompt", &[("tool", tool)]).as_deref(),
+            Some("   [Y]es / [N]o / [A]lways for shell: ")
+        );
+    }
+
+    #[test]
     fn channel_compile_guidance_cli_strings_format_from_fluent() {
         let cases = [
             (

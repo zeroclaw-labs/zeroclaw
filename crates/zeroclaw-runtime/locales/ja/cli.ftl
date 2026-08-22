@@ -972,6 +972,11 @@ sop-rpc-decision-unauthorized = RPC プリンシパルには、この SOP ステ
 sop-rpc-policy-missing = SOP 承認ポリシー '{$name}' が構成されていません。
 sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できません: {$reason}。
 
+# ── ターミナルでのツール承認 ──
+# ASCII ショートカットは Rust 側の応答パーサーと一致させます。
+cli-approval-request = 🔧 エージェントが実行しようとしています: {$tool}
+cli-approval-prompt = { "   " }[Y] はい / [N] いいえ / [A] 常に許可（{$tool}）:{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply

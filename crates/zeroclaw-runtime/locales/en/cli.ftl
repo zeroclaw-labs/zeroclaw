@@ -1129,6 +1129,11 @@ tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
 
+# ── Terminal tool approval ──
+# The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
+cli-approval-request = 🔧 Agent wants to execute: {$tool}
+cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply

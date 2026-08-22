@@ -17,6 +17,7 @@ const SCAN_ROOTS: &[&str] = &[
     "src",
     "crates/zeroclaw-gateway/src",
     "crates/zeroclaw-providers/src/auth",
+    "crates/zeroclaw-runtime/src/approval",
 ];
 const LEGACY_ALLOWLIST: &str = include_str!("cli_fluent_legacy_allowlist.tsv");
 
