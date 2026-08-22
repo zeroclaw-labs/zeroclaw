@@ -1317,9 +1317,14 @@ impl RpcClient {
         &self,
         submission: &crate::wire::BuilderSubmission,
     ) -> Result<QuickstartApplyResult> {
-        self.call(
+        // Apply persists config to disk, may enrich the provider entry over
+        // the network, and can queue behind an in-flight catalog fetch on
+        // the daemon's dispatcher, so it gets the same budget as
+        // `catalog_models` rather than the default call timeout.
+        self.call_with_timeout(
             method::QUICKSTART_APPLY,
             serde_json::json!({ "submission": submission }),
+            std::time::Duration::from_secs(20),
         )
         .await
     }

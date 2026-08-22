@@ -4975,10 +4975,23 @@ pub async fn fetch_context_window(
     }
 }
 
+/// Bound for the best-effort context-window enrichment fetches. These run
+/// inline in flows with their own client-side deadlines (quickstart apply
+/// gives the whole RPC a small budget), so a slow provider endpoint must
+/// degrade to the config fallback instead of stalling the caller.
+const CONTEXT_WINDOW_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn context_window_fetch_client() -> Option<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(CONTEXT_WINDOW_FETCH_TIMEOUT)
+        .build()
+        .ok()
+}
+
 async fn fetch_openrouter_context_window(
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
-    let client = reqwest::Client::new();
+    let client = context_window_fetch_client()?;
     let url = openrouter_context_window_url(config);
     let resp = client
         .get(url.as_ref())
@@ -5014,7 +5027,7 @@ async fn fetch_openai_compatible_context_window(
     provider_type: &str,
     config: &zeroclaw_config::schema::ModelProviderConfig,
 ) -> Option<usize> {
-    let client = reqwest::Client::new();
+    let client = context_window_fetch_client()?;
     let default_uri = default_model_provider_url(provider_type);
     let base_url = config
         .uri

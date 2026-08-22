@@ -339,6 +339,43 @@ async fn consume_pending_quickstart_chat(
     *mode = Mode::Chat;
 }
 
+/// Grace period before respawning an owned ephemeral daemon whose
+/// process still looks alive. An in-place daemon reload rebinds the
+/// socket within a couple of seconds, so a disconnect with a live
+/// daemon process usually means a reload is in flight — respawning
+/// immediately would race it for the socket endpoint.
+const EPHEMERAL_RESPAWN_GRACE: Duration = Duration::from_secs(10);
+
+fn should_respawn_ephemeral(
+    owned_pid: Option<u32>,
+    already_respawned: bool,
+    disconnected_for: Duration,
+    pid_alive: impl Fn(u32) -> bool,
+) -> bool {
+    let Some(pid) = owned_pid else {
+        return false;
+    };
+    if already_respawned {
+        return false;
+    }
+    !pid_alive(pid) || disconnected_for >= EPHEMERAL_RESPAWN_GRACE
+}
+
+/// Probe whether the owned daemon process still exists. `kill(pid, 0)`
+/// succeeds (or fails with EPERM) while the process is alive.
+#[cfg(unix)]
+fn ephemeral_daemon_pid_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Windows has no cheap liveness probe wired up here; report alive so
+/// the grace period governs respawn instead of a spurious kill result.
+#[cfg(not(unix))]
+fn ephemeral_daemon_pid_alive(_pid: u32) -> bool {
+    true
+}
+
 // ── Top-level entry point ────────────────────────────────────────
 
 /// Run the TUI event loop. Owns the full session lifecycle: when the
@@ -354,7 +391,7 @@ pub async fn run(
     reconnect_state: SharedReconnectState,
     config_dir: &std::path::Path,
     target: &crate::ConnectTarget,
-    owns_ephemeral: bool,
+    mut owned_daemon_pid: Option<u32>,
 ) -> Result<()> {
     let mut mode = Mode::Dashboard;
     theme::set_agent_overrides(resolve_agent_overrides(config_dir));
@@ -367,6 +404,7 @@ pub async fn run(
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
     let mut needs_intervention = false;
+    let mut disconnected_at: Option<Instant> = None;
 
     // The live client handle. Reassigned in place on a successful
     // reconnect so every rebuilt pane talks to the recovered daemon.
@@ -587,10 +625,17 @@ pub async fn run(
         }
 
         // Recovery stays inside the responsive event loop. During each disconnected
-        // episode an owned ephemeral daemon is respawned at most once, attached daemons
-        // are never spawned, and both modes keep polling for manual recovery.
+        // episode an owned ephemeral daemon is respawned at most once — only once the
+        // process is confirmed dead or the reload grace period elapses — attached
+        // daemons are never spawned, and both modes keep polling for manual recovery.
         if matches!(rpc.connection_state(), ConnectionState::Disconnected { .. }) {
-            if owns_ephemeral && !ephemeral_respawn_done {
+            let since = *disconnected_at.get_or_insert_with(Instant::now);
+            if should_respawn_ephemeral(
+                owned_daemon_pid,
+                ephemeral_respawn_done,
+                since.elapsed(),
+                ephemeral_daemon_pid_alive,
+            ) {
                 ephemeral_respawn_done = true;
                 if let crate::ConnectTarget::LocalSocket(socket) = target {
                     let _ = crate::spawn_ephemeral_daemon(config_dir, socket);
@@ -636,6 +681,10 @@ pub async fn run(
                                 reconnect_last_attempt = None;
                                 ephemeral_respawn_done = false;
                                 needs_intervention = false;
+                                disconnected_at = None;
+                                if owned_daemon_pid.is_some() {
+                                    owned_daemon_pid = rpc.server_pid;
+                                }
                                 continue;
                             }
                             Err(_) => {
@@ -645,7 +694,7 @@ pub async fn run(
                                 continue;
                             }
                         }
-                    } else if owns_ephemeral && ephemeral_respawn_done {
+                    } else if owned_daemon_pid.is_some() && ephemeral_respawn_done {
                         // The one permitted respawn did not come back — flag
                         // for the user. We keep polling above, so a manual
                         // daemon restart still recovers.
@@ -2157,5 +2206,66 @@ mod tests {
             Some("scout".into())
         );
         assert!(state.lock().unwrap().pending_quickstart_chat.is_none());
+    }
+
+    #[test]
+    fn unowned_session_never_respawns() {
+        assert!(!should_respawn_ephemeral(
+            None,
+            false,
+            Duration::from_secs(3600),
+            |_| false
+        ));
+    }
+
+    #[test]
+    fn owned_dead_daemon_respawns_immediately() {
+        assert!(should_respawn_ephemeral(
+            Some(1),
+            false,
+            Duration::ZERO,
+            |_| false
+        ));
+    }
+
+    #[test]
+    fn owned_live_daemon_waits_out_reload_grace() {
+        assert!(!should_respawn_ephemeral(
+            Some(1),
+            false,
+            EPHEMERAL_RESPAWN_GRACE - Duration::from_millis(1),
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn owned_live_daemon_respawns_after_grace() {
+        assert!(should_respawn_ephemeral(
+            Some(1),
+            false,
+            EPHEMERAL_RESPAWN_GRACE,
+            |_| true
+        ));
+    }
+
+    #[test]
+    fn respawn_happens_at_most_once_per_episode() {
+        assert!(!should_respawn_ephemeral(
+            Some(1),
+            true,
+            Duration::from_secs(3600),
+            |_| false
+        ));
+    }
+
+    #[test]
+    fn ephemeral_respawn_grace_outlasts_daemon_reload_rebind() {
+        assert_eq!(EPHEMERAL_RESPAWN_GRACE, Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_process_probe_reports_alive() {
+        assert!(ephemeral_daemon_pid_alive(std::process::id()));
     }
 }

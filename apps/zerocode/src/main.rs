@@ -348,10 +348,11 @@ async fn run() -> anyhow::Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     // Initial connection (before the terminal is initialized).
-    // `owns_ephemeral` records whether THIS process spawned the daemon
-    // (initial connect failed → we started one). Only an owned ephemeral
-    // daemon may be respawned on disconnect, and then exactly once.
-    let mut owns_ephemeral = false;
+    // `owned_daemon_pid` records the spawned daemon's PID when THIS process
+    // started it (initial connect failed → we started one). Only an owned
+    // ephemeral daemon may be respawned on disconnect, and then exactly once,
+    // gated on the liveness/grace check in app.rs.
+    let mut owned_daemon_pid: Option<u32> = None;
     let rpc = match &target {
         ConnectTarget::LocalSocket(socket) => {
             #[cfg(unix)]
@@ -380,10 +381,11 @@ async fn run() -> anyhow::Result<()> {
 
                     match readiness {
                         Ok(client) => {
-                            owns_ephemeral =
+                            let owns_ephemeral =
                                 reconcile_spawned_daemon_identity(client.server_pid, &mut daemon)?;
                             if owns_ephemeral {
                                 daemon.detach();
+                                owned_daemon_pid = client.server_pid;
                             }
                             client
                         }
@@ -420,7 +422,7 @@ async fn run() -> anyhow::Result<()> {
         &mut term,
         &target,
         &local_config_dir,
-        owns_ephemeral,
+        owned_daemon_pid,
         #[cfg(unix)]
         &mut sigterm,
     )
@@ -440,7 +442,7 @@ async fn run_until_exit(
     term: &mut config_manager::Term,
     target: &ConnectTarget,
     config_dir: &std::path::Path,
-    owns_ephemeral: bool,
+    owned_daemon_pid: Option<u32>,
     #[cfg(unix)] sigterm: &mut tokio::signal::unix::Signal,
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
@@ -455,7 +457,7 @@ async fn run_until_exit(
     #[cfg(unix)]
     {
         tokio::select! {
-            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral) => r.map(|_| ()),
+            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owned_daemon_pid) => r.map(|_| ()),
             _ = sigterm.recv() => Ok(()),
         }
     }
@@ -469,7 +471,7 @@ async fn run_until_exit(
             reconnect_state,
             config_dir,
             target,
-            owns_ephemeral,
+            owned_daemon_pid,
         )
         .await
         .map(|_| ())

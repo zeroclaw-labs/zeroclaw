@@ -73,7 +73,11 @@ pub struct WssTransport {
 }
 
 impl WssTransport {
-    pub fn new(ws: WebSocketStream<TlsStream>, remote_addr: SocketAddr) -> Self {
+    pub fn new(
+        ws: WebSocketStream<TlsStream>,
+        remote_addr: SocketAddr,
+        cancel: CancellationToken,
+    ) -> Self {
         let peer_label = format!("wss:{remote_addr}");
         let (sink, stream) = ws.split();
 
@@ -81,8 +85,15 @@ impl WssTransport {
         let (control_tx, mut control_rx) = mpsc::channel::<Control>(8);
         zeroclaw_spawn::spawn!(async move {
             let mut sink = sink;
+            // Session approval channels and log forwarders retain writer
+            // senders past disconnect, so channel closure alone cannot end
+            // this task. On cancellation, close the sink so the peer sees
+            // a Close frame instead of hanging on an abandoned daemon
+            // iteration.
             loop {
                 let msg = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
                     line = writer_rx.recv() => match line {
                         Some(line) => Message::Text(line.into()),
                         None => break,
@@ -96,6 +107,7 @@ impl WssTransport {
                     break;
                 }
             }
+            let _ = sink.close().await;
         });
 
         Self {
@@ -238,6 +250,7 @@ pub async fn run_wss_listener(
                 let ctx = ctx.clone();
                 let count = client_count.clone();
                 let acceptor = tls_acceptor.clone();
+                let conn_cancel = cancel.clone();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
@@ -272,11 +285,15 @@ pub async fn run_wss_listener(
                         }
                     };
 
-                    let mut transport = WssTransport::new(ws_stream, remote_addr);
+                    let mut transport =
+                        WssTransport::new(ws_stream, remote_addr, conn_cancel.clone());
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
-                    dispatcher.run(&mut transport).await;
+                    tokio::select! {
+                        _ = dispatcher.run(&mut transport) => {}
+                        _ = conn_cancel.cancelled() => {}
+                    }
 
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);

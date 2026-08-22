@@ -65,21 +65,33 @@ pub struct LocalTransport {
 }
 
 impl LocalTransport {
-    pub fn new(stream: LocalStream) -> Self {
+    pub fn new(stream: LocalStream, cancel: CancellationToken) -> Self {
         let peer_label = platform::peer_label_from(&stream);
         let (read_half, write_half) = tokio::io::split(stream);
 
         let (writer_tx, mut writer_rx) = mpsc::channel::<String>(64);
         zeroclaw_spawn::spawn!(async move {
             let mut writer: LocalWriteHalf = write_half;
-            while let Some(mut line) = writer_rx.recv().await {
-                if !line.ends_with('\n') {
-                    line.push('\n');
-                }
-                if writer.write_all(line.as_bytes()).await.is_err() {
-                    break;
+            // Session approval channels and log forwarders retain writer
+            // senders past disconnect, so channel closure alone cannot end
+            // this task. On cancellation, half-close the stream so the peer
+            // reads EOF instead of hanging on an abandoned daemon iteration.
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => break,
+                    line = writer_rx.recv() => {
+                        let Some(mut line) = line else { break };
+                        if !line.ends_with('\n') {
+                            line.push('\n');
+                        }
+                        if writer.write_all(line.as_bytes()).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
+            let _ = writer.shutdown().await;
         });
 
         Self {
@@ -184,15 +196,19 @@ pub async fn run_local_listener(
 
                 let ctx = ctx.clone();
                 let count = client_count.clone();
+                let conn_cancel = cancel.clone();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
                 zeroclaw_spawn::spawn!(async move {
-                    let mut transport = LocalTransport::new(stream);
+                    let mut transport = LocalTransport::new(stream, conn_cancel.clone());
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
                     let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
-                    dispatcher.run(&mut transport).await;
+                    tokio::select! {
+                        _ = dispatcher.run(&mut transport) => {}
+                        _ = conn_cancel.cancelled() => {}
+                    }
 
                     if let Some(tui_id) = dispatcher.tui_id() {
                         ctx.tui_registry.unregister(tui_id);
@@ -645,6 +661,21 @@ mod tests {
         let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
         let sessions = Arc::new(SessionStore::new(64, session_queue));
         RpcContext::minimal(config, sessions)
+    }
+
+    #[cfg(unix)]
+    fn test_ctx_with_event_tx(
+        tmp: &std::path::Path,
+        event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    ) -> Arc<RpcContext> {
+        let config = Config {
+            data_dir: tmp.to_path_buf(),
+            config_path: tmp.join("config.toml"),
+            ..Config::default()
+        };
+        let session_queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(SessionStore::new(64, session_queue));
+        RpcContext::minimal_with_event_tx(config, sessions, event_tx)
     }
 
     fn test_client_count() -> Arc<AtomicUsize> {
@@ -1264,6 +1295,56 @@ mod tests {
         wait_for_client_count(&count, 0).await;
 
         cancel.cancel();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_closes_client_connection_despite_parked_writer_sender() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(16);
+        let ctx = test_ctx_with_event_tx(tmp.path(), event_tx.clone());
+        let sock_path = ctx.config.read().data_dir.join("daemon.sock");
+        let cancel = CancellationToken::new();
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let server_cancel = cancel.clone();
+        let server_ctx = ctx.clone();
+        let server_count = count.clone();
+        zeroclaw_spawn::spawn!(async move {
+            let _ = run_local_listener(server_ctx, server_cancel, server_count, None).await;
+        });
+
+        wait_for_socket(&sock_path).await;
+
+        let (mut reader, mut writer) = do_initialize(&sock_path).await;
+        wait_for_client_count(&count, 1).await;
+
+        // Park a live writer-sender clone inside the detached logs
+        // forwarder task; a cancelled daemon must close the connection
+        // even while this holder keeps the writer channel open.
+        writer
+            .write_all(rpc_request(Method::LogsSubscribe, &serde_json::json!({}), 2).as_bytes())
+            .await
+            .unwrap();
+        let (_frame, result): (_, serde_json::Value) = read_result(&mut reader).await;
+        assert_eq!(result["subscribed"], true);
+
+        cancel.cancel();
+
+        // The client write half stays open: EOF must come purely from the
+        // server-side half-close.
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("cancelled daemon must half-close the client connection");
+        assert_eq!(read.unwrap(), 0, "client should observe EOF, got: {line:?}");
+
+        wait_for_client_count(&count, 0).await;
+
+        drop(writer);
     }
 
     #[cfg(windows)]
