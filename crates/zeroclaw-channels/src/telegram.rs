@@ -7606,24 +7606,46 @@ mod tests {
             .collect()
     }
 
-    /// Poll `mock_server`'s recorded requests until a main-loop `getUpdates`
-    /// call carrying `offset` shows up, or `timeout` elapses.
-    async fn telegram_wait_for_main_loop_offset(
+    /// Upper bound for the "this must not hang" waits in the `listen` tests.
+    ///
+    /// These guards exist to fail a genuine hang, not to assert how quickly
+    /// the long-poll loop runs. `scripts/ci/parallel_runtime_test_gate.sh`
+    /// runs the suite at 16 threads, and under that contention the previous
+    /// 5s and 10s budgets stopped being hang guards and became scheduling
+    /// assertions. Delivery here is sub-second when it is not hung, and the
+    /// slowest path waits through a real retry sequence that completes well
+    /// inside this bound, so ordinary runner load cannot reach it.
+    const LISTEN_HANG_GUARD: Duration = Duration::from_secs(30);
+
+    /// Wait until a main-loop `getUpdates` call carrying `offset` shows up.
+    ///
+    /// Panics with the offsets actually observed. This replaced a `bool`
+    /// return that every caller asserted as "the offset never advanced",
+    /// which is a claim a deadline cannot support: on a loaded runner the
+    /// same `false` means "not yet". `context` names what the offset was
+    /// supposed to move past, so the panic says which step is in question
+    /// without pretending to know why.
+    async fn telegram_expect_main_loop_offset(
         mock_server: &wiremock::MockServer,
         offset: i64,
-        timeout: Duration,
-    ) -> bool {
-        let deadline = tokio::time::Instant::now() + timeout;
+        guard: Duration,
+        context: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + guard;
         loop {
-            let seen = telegram_main_loop_getupdates_bodies(mock_server)
+            let seen: Vec<i64> = telegram_main_loop_getupdates_bodies(mock_server)
                 .await
                 .iter()
-                .any(|b| b.get("offset").and_then(serde_json::Value::as_i64) == Some(offset));
-            if seen {
-                return true;
+                .filter_map(|b| b.get("offset").and_then(serde_json::Value::as_i64))
+                .collect();
+            if seen.contains(&offset) {
+                return;
             }
             if tokio::time::Instant::now() >= deadline {
-                return false;
+                panic!(
+                    "main loop did not request offset {offset} ({context}) within \
+                     {guard:?}; observed offsets {seen:?}"
+                );
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
@@ -7686,7 +7708,7 @@ mod tests {
         let listen_ch = ch.clone();
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
-        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out waiting for the attachment message")
             .expect("channel closed before delivering the attachment message");
@@ -7710,10 +7732,13 @@ mod tests {
             );
         }
 
-        assert!(
-            telegram_wait_for_main_loop_offset(&mock_server, uid + 1, Duration::from_secs(5)).await,
-            "offset never advanced past the update once its retry succeeded"
-        );
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid + 1,
+            LISTEN_HANG_GUARD,
+            "past the update whose retry succeeded",
+        )
+        .await;
 
         handle.abort();
     }
@@ -7748,7 +7773,7 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         let handle = zeroclaw_spawn::spawn!(async move { ch.listen(tx).await });
 
-        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let first = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out waiting for first message")
             .expect("channel closed before first message");
@@ -7758,7 +7783,7 @@ mod tests {
         // `tx.send` observes a closed channel.
         drop(rx);
 
-        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+        let result = tokio::time::timeout(LISTEN_HANG_GUARD, handle)
             .await
             .expect("listen() task timed out")
             .expect("listen() task panicked");
@@ -7820,7 +7845,7 @@ mod tests {
         let listen_ch = ch.clone();
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
-        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out waiting for the authorized message")
             .expect("channel closed before delivering the authorized message");
@@ -7835,11 +7860,13 @@ mod tests {
             "unexpected extra message delivered: {extra:?}"
         );
 
-        assert!(
-            telegram_wait_for_main_loop_offset(&mock_server, uid2 + 1, Duration::from_secs(5))
-                .await,
-            "offset never advanced past the unauthorized update to the next expected value"
-        );
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid2 + 1,
+            LISTEN_HANG_GUARD,
+            "past the unauthorized update to the next expected value",
+        )
+        .await;
 
         handle.abort();
     }
@@ -7912,13 +7939,13 @@ mod tests {
         let listen_ch = ch.clone();
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
-        let first_message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let first_message = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out waiting for the first message")
             .expect("channel closed before delivering the first message");
         assert_eq!(first_message.content, "first");
 
-        let recovered = tokio::time::timeout(Duration::from_secs(15), rx.recv())
+        let recovered = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out waiting for the recovered attachment")
             .expect("channel closed before delivering the recovered attachment");
@@ -7927,7 +7954,7 @@ mod tests {
             "the failed update must recover before the later update, got: {}",
             recovered.content
         );
-        let third_message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let third_message = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out waiting for the later message")
             .expect("channel closed before delivering the later message");
@@ -7942,11 +7969,13 @@ mod tests {
             retry_polls >= 4,
             "expected retries beyond the former three-attempt budget at the blocked offset, got {retry_polls}"
         );
-        assert!(
-            telegram_wait_for_main_loop_offset(&mock_server, uid3 + 1, Duration::from_secs(5))
-                .await,
-            "offset never advanced past the ordered batch after recovery"
-        );
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid3 + 1,
+            LISTEN_HANG_GUARD,
+            "past the ordered batch after recovery",
+        )
+        .await;
 
         handle.abort();
     }
@@ -8025,7 +8054,7 @@ mod tests {
         let listen_ch = ch.clone();
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
-        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out waiting for the authorized message")
             .expect("channel closed before delivering the authorized message");
@@ -8039,11 +8068,13 @@ mod tests {
             "unexpected extra message delivered: {extra:?}"
         );
 
-        assert!(
-            telegram_wait_for_main_loop_offset(&mock_server, uid2 + 1, Duration::from_secs(5))
-                .await,
-            "offset never advanced past the unauthorized update"
-        );
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid2 + 1,
+            LISTEN_HANG_GUARD,
+            "past the unauthorized update",
+        )
+        .await;
 
         handle.abort();
     }
@@ -8117,7 +8148,7 @@ mod tests {
         let listen_ch = ch.clone();
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
-        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out waiting for the queued attachment message")
             .expect("channel closed before delivering the queued attachment message");
@@ -8140,10 +8171,13 @@ mod tests {
             "offset must have stayed at 0 (unadvanced by the probe) for exactly one main-loop retry"
         );
 
-        assert!(
-            telegram_wait_for_main_loop_offset(&mock_server, uid + 1, Duration::from_secs(5)).await,
-            "offset never advanced past the queued update once its retry succeeded"
-        );
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid + 1,
+            LISTEN_HANG_GUARD,
+            "past the queued update whose retry succeeded",
+        )
+        .await;
 
         // The queued update must be delivered exactly once, never twice.
         let extra = tokio::time::timeout(Duration::from_millis(300), rx.recv()).await;
@@ -8238,11 +8272,13 @@ mod tests {
         // A callback is terminal for inbound processing, so the offset must
         // advance past the whole batch; waiting on that also guarantees every
         // answerCallbackQuery has been posted before we inspect them.
-        assert!(
-            telegram_wait_for_main_loop_offset(&mock_server, last_uid + 1, Duration::from_secs(5))
-                .await,
-            "offset never advanced past the callback batch"
-        );
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            last_uid + 1,
+            LISTEN_HANG_GUARD,
+            "past the callback batch",
+        )
+        .await;
 
         let ack_texts: Vec<String> = mock_server
             .received_requests()
@@ -8589,17 +8625,19 @@ mod tests {
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
         // The update behind the permanently rejected one must arrive.
-        let msg = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out: a permanently rejected file id head-of-line blocked the batch")
             .expect("channel closed before delivering the update behind the rejected one");
         assert_eq!(msg.content, "i am behind the bad one");
 
-        assert!(
-            telegram_wait_for_main_loop_offset(&mock_server, uid_good + 1, Duration::from_secs(5))
-                .await,
-            "offset never advanced past the permanently rejected update"
-        );
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid_good + 1,
+            LISTEN_HANG_GUARD,
+            "past the permanently rejected update",
+        )
+        .await;
 
         handle.abort();
     }
@@ -8660,7 +8698,7 @@ mod tests {
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
         // The update is retried, not skipped, and eventually delivered.
-        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out: a transient failure was wrongly skipped instead of retried")
             .expect("channel closed before delivering the retried attachment");
@@ -8746,7 +8784,7 @@ mod tests {
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
         // The update must survive the 408s and arrive after recovery.
-        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+        let msg = tokio::time::timeout(LISTEN_HANG_GUARD, rx.recv())
             .await
             .expect("timed out: a body-less 408 was acknowledged instead of retried")
             .expect("channel closed: the update behind a 408 was silently consumed");
@@ -9135,10 +9173,13 @@ mod tests {
         let listen_ch = Arc::clone(&ch);
         let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
 
-        assert!(
-            telegram_wait_for_main_loop_offset(&mock_server, uid + 1, Duration::from_secs(5)).await,
-            "offset never advanced past the captioned pairing update"
-        );
+        telegram_expect_main_loop_offset(
+            &mock_server,
+            uid + 1,
+            LISTEN_HANG_GUARD,
+            "past the captioned pairing update",
+        )
+        .await;
         assert!(
             tokio::time::timeout(Duration::from_millis(300), rx.recv())
                 .await
