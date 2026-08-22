@@ -219,20 +219,28 @@ pub(crate) async fn prepare_tool_calls(
         }
 
         // ── Approval hook ────────────────────────────────
-        let approved = match gate_tool_approval(ctx, &tool_name, &tool_args, iteration).await {
-            ApprovalGateOutcome::Proceed { approved } => approved,
-            ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
-                // Streaming consumers see the denied/replaced call and its
-                // synthesized result (e.g. a DenyWithEdit replacement) as a
-                // ToolCall/ToolResult pair, as the direct path always did.
-                if let Some(tx) = ctx.event_tx {
-                    emit_tool_call_pair(tx, call, &outcome).await;
-                }
-                ordered_results[idx] =
-                    Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
-                continue;
-            }
+        // The batch position comes from this enumeration, so the card can say
+        // which of the model's calls it is describing. It counts every call in
+        // the batch, not just the ones that need approval.
+        let position = zeroclaw_api::channel::ApprovalPosition {
+            index: u32::try_from(idx + 1).unwrap_or(u32::MAX),
+            total: u32::try_from(tool_calls.len()).unwrap_or(u32::MAX),
         };
+        let approved =
+            match gate_tool_approval(ctx, &tool_name, &tool_args, iteration, position).await {
+                ApprovalGateOutcome::Proceed { approved } => approved,
+                ApprovalGateOutcome::Deny(outcome) | ApprovalGateOutcome::Replace(outcome) => {
+                    // Streaming consumers see the denied/replaced call and its
+                    // synthesized result (e.g. a DenyWithEdit replacement) as a
+                    // ToolCall/ToolResult pair, as the direct path always did.
+                    if let Some(tx) = ctx.event_tx {
+                        emit_tool_call_pair(tx, call, &outcome).await;
+                    }
+                    ordered_results[idx] =
+                        Some((tool_name.clone(), call.tool_call_id.clone(), outcome));
+                    continue;
+                }
+            };
         crate::agent::set_runtime_approved_arg(&tool_name, &mut tool_args, approved);
 
         let signature = tool_call_signature(&tool_name, &tool_args);

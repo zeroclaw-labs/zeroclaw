@@ -4,9 +4,10 @@
 use crate::component::InboundQueue;
 use crate::component::bindings::channel::ChannelPlugin;
 use crate::component::bindings::channel::exports::zeroclaw::plugin::channel::{
-    ApprovalRequest as WitApprovalRequest, ApprovalResponse as WitApprovalResponse,
-    ChannelCapabilities, InboundMessage as WitInboundMessage,
-    MediaAttachment as WitMediaAttachment, SendMessage as WitSendMessage,
+    ApprovalPosition as WitApprovalPosition, ApprovalRequest as WitApprovalRequest,
+    ApprovalResponse as WitApprovalResponse, ChannelCapabilities,
+    InboundMessage as WitInboundMessage, MediaAttachment as WitMediaAttachment,
+    SendMessage as WitSendMessage,
 };
 use crate::component::{
     PluginState, PluginStoreSpec, call_plugin, engine, load_component, wt, wt_instantiate,
@@ -218,6 +219,10 @@ fn to_wit_approval_request(req: &ChannelApprovalRequest) -> WitApprovalRequest {
         tool_name: req.tool_name.clone(),
         arguments_summary: req.arguments_summary.clone(),
         raw_arguments: req.raw_arguments.as_ref().map(|v| v.to_string()),
+        position: req.position.map(|p| WitApprovalPosition {
+            index: p.index,
+            total: p.total,
+        }),
     }
 }
 

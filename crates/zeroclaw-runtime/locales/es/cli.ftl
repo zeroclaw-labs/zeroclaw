@@ -982,6 +982,7 @@ channel-approval-btn-approve = Aprobar
 channel-approval-btn-deny = Denegar
 channel-approval-btn-always = Siempre
 channel-approval-tap-instruction = Toca un botón a continuación:
+channel-approval-position = Llamada de herramienta { $index } de { $total }
 channel-approval-reply-instruction-yesno = Responde: "{ $yes_command }", "{ $no_command }" o "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Responde con `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
 channel-approval-group-visibility-warning =

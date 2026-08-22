@@ -4490,8 +4490,14 @@ Ensure only one `zeroclaw` process is using this bot token."
 
         let tool = Self::escape_html(&request.tool_name);
         let args = Self::escape_html(&request.arguments_summary);
+        // Back-to-back cards from one message are otherwise indistinguishable
+        // before the operator taps, so say which call this is.
+        let position = Self::escape_html(&crate::util::approval_position_line(
+            request.position_counter(),
+        ));
         let text = format!(
             "\u{1f527} <b>{heading}</b>\n\n\
+             {position}\
              {tool_label}: <code>{tool}</code>\n\
              {args}\n\n\
              {tap_instruction}",
@@ -10058,6 +10064,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls -la".to_string(),
             raw_arguments: None,
+            position: None,
         };
 
         // No one resolves the pending oneshot — the short timeout above lets
