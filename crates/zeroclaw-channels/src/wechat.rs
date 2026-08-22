@@ -33,6 +33,14 @@ const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 const BACKOFF_DELAY: Duration = Duration::from_secs(30);
 /// Retry delay for a single failure.
 const RETRY_DELAY: Duration = Duration::from_secs(2);
+/// Initial delay before re-polling a batch held back by a retryable
+/// attachment failure. Doubles per consecutive held pass, capped at
+/// `ATTACHMENT_RETRY_MAX_DELAY`, and resets as soon as a batch commits.
+/// Without this, a held batch re-polls immediately in a tight loop for
+/// as long as the CDN keeps failing.
+const ATTACHMENT_RETRY_BASE_DELAY: Duration = Duration::from_secs(2);
+/// Ceiling for the attachment-retry backoff.
+const ATTACHMENT_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
 /// QR code long-poll timeout.
 const QR_POLL_TIMEOUT: Duration = Duration::from_secs(35);
 /// Maximum QR code refresh attempts.
@@ -146,6 +154,136 @@ struct InboundAttachmentSpec {
     encrypted_query_param: String,
     aes_key: Option<String>,
     file_name: String,
+}
+
+/// Outcome of attempting to build inbound attachment content for a
+/// message, distinguishing "nothing to do" from a failure, and a
+/// retryable failure from a permanent one.
+///
+/// The listener uses this to decide whether it may commit `next_cursor`
+/// for the batch: `Retryable` must hold the cursor so the message is
+/// re-fetched (and the attachment retried) after a restart; `Permanent`
+/// and `None` must not hold the cursor, since nothing further will
+/// change on retry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachmentDisposition {
+    /// The message carries no fetchable attachment (or no workspace
+    /// directory is configured for downloads). Not a failure.
+    None,
+    /// Attachment content was built successfully.
+    Ready(String),
+    /// Building the attachment failed for a condition that may clear up
+    /// on its own (see `AttachmentBuildFailure::Retryable`).
+    Retryable,
+    /// Building the attachment failed for a condition retrying will not
+    /// fix (see `AttachmentBuildFailure::Permanent`).
+    Permanent,
+}
+
+/// Classify a local workspace filesystem error into a retry disposition.
+///
+/// Retrying the CDN cannot clear an unwritable workspace. If every local
+/// I/O error is `Retryable`, the cursor is retained and the listener
+/// re-fetches the same batch forever, holding every later WeChat message
+/// behind a condition that will never resolve on its own. So errors that
+/// need operator action are `Permanent`: the attachment is skipped, the
+/// batch commits, and inbound delivery keeps flowing.
+///
+/// Genuinely transient conditions — a temporarily unavailable mount, a
+/// full disk, an interrupted call — stay `Retryable` and keep the
+/// existing bounded backoff.
+fn classify_workspace_io(err: &std::io::Error) -> AttachmentDisposition {
+    use std::io::ErrorKind;
+    match err.kind() {
+        // Operator-action conditions: permissions, a read-only mount, a
+        // workspace path that is not (or is not under) a directory, a
+        // malformed path, or a path already occupied by a conflicting
+        // entry. None of these change by retrying.
+        //
+        // `AlreadyExists` is the EEXIST that `create_dir_all` returns when
+        // the attachment directory path is occupied by a regular file: no
+        // amount of re-fetching from the CDN turns that file into a
+        // directory, so treating it as transient would wedge every later
+        // inbound message behind the held batch.
+        ErrorKind::PermissionDenied
+        | ErrorKind::ReadOnlyFilesystem
+        | ErrorKind::NotADirectory
+        | ErrorKind::IsADirectory
+        | ErrorKind::AlreadyExists
+        | ErrorKind::InvalidInput
+        | ErrorKind::InvalidFilename => AttachmentDisposition::Permanent,
+        // Transient: unavailable mount, ENOSPC, EINTR, and anything the
+        // std mapping does not name.
+        _ => AttachmentDisposition::Retryable,
+    }
+}
+
+/// ERROR-level, operator-visible record of a workspace write that cannot
+/// be retried away, naming the path and the decision taken.
+fn record_workspace_io_failure(
+    path: &Path,
+    err: &std::io::Error,
+    disposition: &AttachmentDisposition,
+    what: &str,
+) {
+    let permanent = matches!(disposition, AttachmentDisposition::Permanent);
+    let decision = if permanent {
+        "attachment skipped permanently; batch will commit so inbound delivery keeps flowing"
+    } else {
+        "attachment held for retry; batch cursor retained"
+    };
+    let attrs = ::serde_json::json!({
+        "error": format!("{err}"),
+        "error_kind": format!("{:?}", err.kind()),
+        "workspace_path": path.display().to_string(),
+        "permanent": permanent,
+        "decision": decision,
+    });
+    if permanent {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(attrs),
+            what
+        );
+    } else {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(attrs),
+            what
+        );
+    }
+}
+
+/// Why downloading/decrypting an inbound attachment failed, classified
+/// so the caller can pick a retryable-vs-permanent `AttachmentDisposition`.
+///
+/// Network and transport-layer failures are `Retryable`: connection
+/// errors, request timeouts, CDN HTTP 5xx, CDN HTTP 429, and CDN HTTP
+/// 408. Content and parse-layer failures are `Permanent`: CDN HTTP 4xx
+/// other than 408/429 (the object is gone), decrypt/decode failures, and
+/// unsupported/oversized content. When an error does not map cleanly to
+/// either bucket, the default is `Retryable` for network/transport-layer
+/// errors and `Permanent` for content/parse-layer errors.
+///
+/// Local workspace I/O is not classified here — it is classified by
+/// `classify_workspace_io`, which splits transient conditions from ones
+/// only an operator can clear.
+#[derive(Debug)]
+enum AttachmentBuildFailure {
+    Retryable(String),
+    Permanent(String),
+}
+
+impl std::fmt::Display for AttachmentBuildFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Retryable(msg) | Self::Permanent(msg) => write!(f, "{msg}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1007,6 +1145,38 @@ impl WeChatChannel {
         parts.next().map(str::trim).filter(|code| !code.is_empty())
     }
 
+    fn build_inbound_channel_message(
+        &self,
+        from_user_id: &str,
+        message_id: String,
+        text: &str,
+        timestamp: u64,
+        attachment_content: Option<String>,
+    ) -> Option<Box<ChannelMessage>> {
+        let content = match (attachment_content, text.is_empty()) {
+            (Some(marker), true) => marker,
+            (Some(marker), false) => format!("{marker}\n\n{text}"),
+            (None, false) => text.to_string(),
+            (None, true) => return None,
+        };
+
+        Some(Box::new(ChannelMessage {
+            id: message_id,
+            sender: from_user_id.to_string(),
+            reply_target: from_user_id.to_string(),
+            content,
+            channel: "wechat".to_string(),
+            channel_alias: Some(self.alias.clone()),
+            timestamp,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: Vec::new(),
+            subject: None,
+
+            ..Default::default()
+        }))
+    }
+
     fn api_url(&self, endpoint: &str) -> String {
         let base = self.api_base_url.trim_end_matches('/');
         format!("{base}/ilink/bot/{endpoint}")
@@ -1540,32 +1710,57 @@ impl WeChatChannel {
     async fn download_inbound_attachment(
         &self,
         spec: &InboundAttachmentSpec,
-    ) -> anyhow::Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, AttachmentBuildFailure> {
         let resp = self
             .client
             .get(self.cdn_download_url(&spec.encrypted_query_param))
             .timeout(API_TIMEOUT)
             .send()
-            .await?;
+            .await
+            .map_err(|e| {
+                // Connection error or request timeout: transport-layer,
+                // may succeed on retry.
+                AttachmentBuildFailure::Retryable(format!("attachment request failed: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
-            anyhow::bail!("attachment download failed ({status}): {body}");
+            let message = format!("attachment download failed ({status}): {body}");
+            // CDN 5xx, 429, and 408 are treated as transient; every other
+            // 4xx (e.g. 404/410) means the object is gone and won't come back.
+            return Err(
+                if status.is_server_error() || matches!(status.as_u16(), 408 | 429) {
+                    AttachmentBuildFailure::Retryable(message)
+                } else {
+                    AttachmentBuildFailure::Permanent(message)
+                },
+            );
         }
 
-        let bytes = resp.bytes().await?.to_vec();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| {
+                AttachmentBuildFailure::Retryable(format!("attachment body read failed: {e}"))
+            })?
+            .to_vec();
         if bytes.len() as u64 > WECHAT_MEDIA_MAX_BYTES {
-            anyhow::bail!(
+            // Oversized content: unsupported, won't shrink on retry.
+            return Err(AttachmentBuildFailure::Permanent(format!(
                 "inbound attachment exceeds {} MB limit",
                 WECHAT_MEDIA_MAX_BYTES / (1024 * 1024)
-            );
+            )));
         }
 
         match spec.aes_key.as_deref() {
             Some(aes_key) if !aes_key.is_empty() => {
-                let key = parse_aes_key(aes_key)?;
+                // Decrypt/decode failures are content-layer: corrupt or
+                // undecryptable content will not fix itself on retry.
+                let key = parse_aes_key(aes_key)
+                    .map_err(|e| AttachmentBuildFailure::Permanent(e.to_string()))?;
                 decrypt_aes_ecb(&bytes, &key)
+                    .map_err(|e| AttachmentBuildFailure::Permanent(e.to_string()))
             }
             _ => Ok(bytes),
         }
@@ -1575,50 +1770,63 @@ impl WeChatChannel {
         &self,
         items: &[serde_json::Value],
         message_id: &str,
-    ) -> Option<String> {
-        let workspace_dir = self.workspace_dir.as_ref()?;
-        let spec = Self::find_inbound_attachment(items, message_id)?;
+    ) -> AttachmentDisposition {
+        let Some(workspace_dir) = self.workspace_dir.as_ref() else {
+            return AttachmentDisposition::None;
+        };
+        let Some(spec) = Self::find_inbound_attachment(items, message_id) else {
+            return AttachmentDisposition::None;
+        };
         let bytes = match self.download_inbound_attachment(&spec).await {
             Ok(bytes) => bytes,
-            Err(err) => {
+            Err(failure) => {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                         .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                        .with_attrs(::serde_json::json!({
+                            "error": failure.to_string(),
+                            "retryable": matches!(failure, AttachmentBuildFailure::Retryable(_)),
+                        })),
                     "attachment download skipped"
                 );
-                return None;
+                return match failure {
+                    AttachmentBuildFailure::Retryable(_) => AttachmentDisposition::Retryable,
+                    AttachmentBuildFailure::Permanent(_) => AttachmentDisposition::Permanent,
+                };
             }
         };
 
         let save_dir = workspace_dir.join("wechat_files");
         if let Err(err) = tokio::fs::create_dir_all(&save_dir).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                "Failed to create WeChat attachment dir"
+            // Local filesystem, not the CDN: a permission problem, a
+            // read-only mount, or a non-directory workspace path is not
+            // cleared by retrying, and holding the cursor for it wedges
+            // every later message behind this batch.
+            let disposition = classify_workspace_io(&err);
+            record_workspace_io_failure(
+                &save_dir,
+                &err,
+                &disposition,
+                "failed to create WeChat attachment dir",
             );
-            return None;
+            return disposition;
         }
 
         let local_path = save_dir.join(&spec.file_name);
         if let Err(err) = tokio::fs::write(&local_path, bytes).await {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "Failed to save WeChat attachment to {}: {err}",
-                    local_path.display()
-                )
+            // Same policy as the directory create above.
+            let disposition = classify_workspace_io(&err);
+            record_workspace_io_failure(
+                &local_path,
+                &err,
+                &disposition,
+                "failed to save WeChat attachment",
             );
-            return None;
+            return disposition;
         }
 
-        Some(format_attachment_content(
+        AttachmentDisposition::Ready(format_attachment_content(
             spec.kind,
             &spec.file_name,
             &local_path,
@@ -2204,6 +2412,10 @@ impl Channel for WeChatChannel {
         let mut cursor = self.cursor.lock().clone();
         let mut long_poll_timeout_ms = LONG_POLL_TIMEOUT_MS;
         let mut consecutive_failures: u32 = 0;
+        // Consecutive polls whose batch was held back by a retryable
+        // attachment failure. Drives the backoff at the commit site and
+        // resets on any committed batch.
+        let mut consecutive_attachment_holds: u32 = 0;
 
         loop {
             let token = match self.get_token() {
@@ -2354,16 +2566,15 @@ impl Channel for WeChatChannel {
 
             consecutive_failures = 0;
 
-            // Update cursor
-            if let Some(new_cursor) = data
+            // Capture the response cursor but defer committing it (both the
+            // local `cursor` and `self.cursor`/disk) until every message in
+            // this batch has been successfully enqueued below. See the
+            // commit site after the `for msg in &msgs` loop for why.
+            let next_cursor = data
                 .get("get_updates_buf")
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
-            {
-                cursor = new_cursor.to_string();
-                *self.cursor.lock() = cursor.clone();
-                self.save_sync_data();
-            }
+                .map(|s| s.to_string());
 
             if let Some(next_timeout) = data
                 .get("longpolling_timeout_ms")
@@ -2379,6 +2590,67 @@ impl Channel for WeChatChannel {
                 .and_then(|v| v.as_array())
                 .cloned()
                 .unwrap_or_default();
+
+            // Set when any message in this batch hit a retryable
+            // attachment-build failure (see `AttachmentDisposition::Retryable`).
+            // Checked at the commit site below: a retryable failure must
+            // withhold `next_cursor` so the whole batch is re-fetched, and
+            // the attachment retried, after a restart. A permanent failure
+            // does not set this: holding the cursor forever for an
+            // attachment that will never succeed would wedge the listener.
+            let mut batch_has_retryable_attachment_failure = false;
+
+            // Everything the batch wants to do downstream is staged in batch
+            // order. Nothing is published to `tx` until every attachment the
+            // sender is currently authorized to fetch has prepared cleanly.
+            // Messages that may become authorized through an earlier staged
+            // `/bind` retain only their transport fields; their attachment I/O
+            // runs in the authorization-aware preparation phase below. This
+            // prevents unauthenticated CDN/workspace side effects while still
+            // keeping every inbound agent turn unpublished until the batch is
+            // complete.
+            enum StagedInbound {
+                /// An authorized message, fully prepared and ready to
+                /// publish downstream.
+                Deliver(Box<ChannelMessage>),
+                /// A message that follows a syntactically valid `/bind` from
+                /// the same sender in this batch. Its
+                /// attachment is deliberately NOT fetched or written while
+                /// the sender is unauthorized. Before publication, the
+                /// earlier bind runs, authorization is resolved again from
+                /// the canonical Config-backed peer resolver, and only then
+                /// may attachment preparation cross the CDN/workspace trust
+                /// boundary.
+                DeliverIfAuthorized {
+                    from_user_id: String,
+                    items: Vec<serde_json::Value>,
+                    message_id: String,
+                    text: String,
+                    timestamp: u64,
+                },
+                /// A message from an unauthorized sender. Handling it has
+                /// side effects (pairing attempts, outbound replies), so it
+                /// is deferred until the authorization-aware preparation
+                /// phase. A successful bind may therefore update canonical
+                /// authorization before a dependent attachment later reports
+                /// a retryable failure. The cursor remains pending, but the
+                /// replay sees that canonical authorization and treats the
+                /// already-applied `/bind` as a control no-op, preventing a
+                /// second attempt or reply.
+                Unauthorized { from_user_id: String, text: String },
+                /// A control message or empty message that has already been
+                /// handled during authorization-aware preparation and must
+                /// not be published downstream.
+                Skip,
+            }
+            let mut staged: Vec<StagedInbound> = Vec::new();
+            // Ephemeral materialized view of possible authorization
+            // transitions inside this one batch. It is not authorization
+            // state: the preparation phase always re-resolves the canonical
+            // Config-backed peer list before delivery or attachment I/O. Its
+            // sole purpose is to defer later messages until a preceding
+            // `/bind` has been evaluated in message order.
+            let mut staged_bind_senders = std::collections::HashSet::new();
 
             for msg in &msgs {
                 let from_user_id = msg
@@ -2410,20 +2682,32 @@ impl Channel for WeChatChannel {
 
                 let text = extract_text_from_items(&items);
 
-                // Check authorization
-                if !self.is_user_allowed(from_user_id) {
-                    self.handle_unauthorized_message(from_user_id, &text).await;
+                // Resolve current authorization from the canonical peer
+                // configuration. A prior `/bind` from this sender in the
+                // same batch is only a possible transition: prepare this
+                // message's transport metadata now, but do not fetch its
+                // attachment. Re-check the canonical source after that bind
+                // runs, before crossing the CDN/workspace trust boundary.
+                let currently_authorized = self.is_user_allowed(from_user_id);
+                let may_be_authorized_by_staged_bind = staged_bind_senders.contains(from_user_id);
+                if currently_authorized && Self::extract_bind_code(&text).is_some() {
+                    // A held batch can be replayed after its bind already
+                    // succeeded but before the attachment and cursor commit.
+                    // Treat that replayed control message as a no-op: it must
+                    // not reach the agent and must not repeat the pairing
+                    // attempt or success reply.
                     continue;
                 }
-
-                let attachment_content =
-                    self.try_build_attachment_content(&items, &message_id).await;
-                let content = match (attachment_content, text.is_empty()) {
-                    (Some(marker), true) => marker,
-                    (Some(marker), false) => format!("{marker}\n\n{text}"),
-                    (None, false) => text,
-                    (None, true) => continue,
-                };
+                if !currently_authorized && !may_be_authorized_by_staged_bind {
+                    if Self::extract_bind_code(&text).is_some() {
+                        staged_bind_senders.insert(from_user_id.to_string());
+                    }
+                    staged.push(StagedInbound::Unauthorized {
+                        from_user_id: from_user_id.to_string(),
+                        text,
+                    });
+                    continue;
+                }
 
                 let timestamp = msg
                     .get("create_time_ms")
@@ -2431,30 +2715,196 @@ impl Channel for WeChatChannel {
                     .unwrap_or(0)
                     / 1000; // Convert to seconds
 
-                let channel_msg = ChannelMessage {
-                    id: message_id,
-                    sender: from_user_id.to_string(),
-                    reply_target: from_user_id.to_string(),
-                    content,
-                    channel: "wechat".to_string(),
-                    channel_alias: Some(self.alias.clone()),
-                    timestamp,
-                    thread_ts: None,
-                    interruption_scope_id: None,
-                    attachments: Vec::new(),
-                    subject: None,
-
-                    ..Default::default()
-                };
-
-                if tx.send(channel_msg).await.is_err() {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        "channel receiver dropped, stopping"
-                    );
-                    return Ok(());
+                if !currently_authorized {
+                    // The sender is not authorized yet, so even a syntactically
+                    // valid preceding bind cannot authorize network or
+                    // filesystem side effects. Keep the raw transport fields
+                    // ephemeral until publication applies the bind and the
+                    // canonical peer resolver confirms the transition.
+                    staged.push(StagedInbound::DeliverIfAuthorized {
+                        from_user_id: from_user_id.to_string(),
+                        items,
+                        message_id,
+                        text,
+                        timestamp,
+                    });
+                    continue;
                 }
+
+                let attachment_content =
+                    match self.try_build_attachment_content(&items, &message_id).await {
+                        AttachmentDisposition::Ready(marker) => Some(marker),
+                        AttachmentDisposition::None | AttachmentDisposition::Permanent => None,
+                        AttachmentDisposition::Retryable => {
+                            // Defer the whole batch. The cursor is held
+                            // below, so this exact batch is re-fetched on
+                            // the next poll. The messages staged so far are
+                            // discarded — NOT published — because the held
+                            // cursor means they will be re-fetched and
+                            // re-staged on the next pass; publishing them
+                            // now would deliver them again on every pass
+                            // for as long as the failure persists, and each
+                            // duplicate can start another agent turn and
+                            // repeat downstream tool effects.
+                            batch_has_retryable_attachment_failure = true;
+                            break;
+                        }
+                    };
+                if let Some(channel_msg) = self.build_inbound_channel_message(
+                    from_user_id,
+                    message_id,
+                    &text,
+                    timestamp,
+                    attachment_content,
+                ) {
+                    staged.push(StagedInbound::Deliver(channel_msg));
+                }
+            }
+
+            // Apply authorization transitions and prepare their dependent
+            // messages before ANY message crosses `tx.send`. This second
+            // preparation phase is necessary because attachment I/O for an
+            // unauthorized sender must not run merely because a preceding
+            // message looks like `/bind CODE`: only the canonical peer source
+            // after `try_pair` may authorize that CDN request and workspace
+            // write.
+            if !batch_has_retryable_attachment_failure {
+                for item in &mut staged {
+                    let pending = std::mem::replace(item, StagedInbound::Skip);
+                    match pending {
+                        StagedInbound::Deliver(message) => {
+                            *item = StagedInbound::Deliver(message);
+                        }
+                        StagedInbound::Unauthorized { from_user_id, text } => {
+                            self.handle_unauthorized_message(&from_user_id, &text).await;
+                        }
+                        StagedInbound::DeliverIfAuthorized {
+                            from_user_id,
+                            items,
+                            message_id,
+                            text,
+                            timestamp,
+                        } => {
+                            if !self.is_user_allowed(&from_user_id) {
+                                // The preceding bind was invalid or could
+                                // not make this sender canonical. Fail
+                                // closed without fetching or persisting the
+                                // attachment.
+                                self.handle_unauthorized_message(&from_user_id, &text).await;
+                                continue;
+                            }
+
+                            let attachment_content = match self
+                                .try_build_attachment_content(&items, &message_id)
+                                .await
+                            {
+                                AttachmentDisposition::Ready(marker) => Some(marker),
+                                AttachmentDisposition::None | AttachmentDisposition::Permanent => {
+                                    None
+                                }
+                                AttachmentDisposition::Retryable => {
+                                    // The bind has already updated the
+                                    // canonical peer source, but no inbound
+                                    // message has crossed `tx.send`. Hold the
+                                    // cursor and replay. On that replay the
+                                    // now-authorized `/bind` is a control
+                                    // no-op, so its one-time code and reply
+                                    // are not repeated.
+                                    batch_has_retryable_attachment_failure = true;
+                                    break;
+                                }
+                            };
+
+                            if let Some(message) = self.build_inbound_channel_message(
+                                &from_user_id,
+                                message_id,
+                                &text,
+                                timestamp,
+                                attachment_content,
+                            ) {
+                                *item = StagedInbound::Deliver(message);
+                            }
+                        }
+                        StagedInbound::Skip => {}
+                    }
+                }
+            }
+
+            // Publish only after the WHOLE batch prepared cleanly. A
+            // retryable failure discards the staged messages instead —
+            // they are re-fetched with the held cursor on the next pass,
+            // so no inbound agent turn is delivered twice.
+            if !batch_has_retryable_attachment_failure {
+                for item in staged {
+                    let StagedInbound::Deliver(channel_msg) = item else {
+                        continue;
+                    };
+                    if tx.send(*channel_msg).await.is_err() {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            ),
+                            "channel receiver dropped, stopping"
+                        );
+                        // Do NOT commit `next_cursor` here: the batch is
+                        // only partially (or not at all) enqueued, so the
+                        // old cursor must stay on disk. On supervised
+                        // restart `listen()` reloads it and re-polls this
+                        // batch.
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Commit the cursor only now that the whole batch has been
+            // enqueued (or there was nothing to enqueue). Persisting any
+            // earlier — e.g. right after reading the getupdates response,
+            // before this loop — would let a crash/exit between cursor
+            // persistence and enqueue completion permanently lose the
+            // batch: on restart, `listen()` would reload the
+            // already-advanced cursor and never re-poll those messages.
+            // There is no inbound dedup, so redelivery after a restart is
+            // possible (at-least-once); that trade is intentional and
+            // preferable to silent message loss.
+            //
+            // A batch that hit a retryable attachment failure is held back
+            // the same way: committing `next_cursor` here would permanently
+            // skip the attachment on restart, since the batch would never
+            // be re-fetched. A permanent attachment failure does not hold
+            // the cursor: the attachment is genuinely unfetchable, and
+            // holding forever would wedge the listener on it.
+            if batch_has_retryable_attachment_failure {
+                // The batch is deferred, not dropped: preparation broke at
+                // the failing message, the staged messages were discarded
+                // unpublished, and the cursor stays put — so the next poll
+                // re-fetches the identical batch and NOTHING from this
+                // pass was delivered. Back off before re-polling so a
+                // sustained CDN outage cannot spin this loop; the delay
+                // doubles per consecutive held pass up to a ceiling.
+                let delay = ATTACHMENT_RETRY_BASE_DELAY
+                    .saturating_mul(1u32 << consecutive_attachment_holds.min(5))
+                    .min(ATTACHMENT_RETRY_MAX_DELAY);
+                consecutive_attachment_holds = consecutive_attachment_holds.saturating_add(1);
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "consecutive_attachment_holds": consecutive_attachment_holds,
+                            "delay_ms": delay.as_millis() as u64,
+                        })),
+                    "holding WeChat batch after retryable attachment failure; backing off before re-poll"
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            consecutive_attachment_holds = 0;
+            if let Some(new_cursor) = next_cursor {
+                cursor = new_cursor;
+                *self.cursor.lock() = cursor.clone();
+                self.save_sync_data();
             }
         }
     }
@@ -3422,6 +3872,1661 @@ mod tests {
         assert_eq!(
             ch2.get_context_token("acct:user1"),
             Some("new_token".to_string())
+        );
+    }
+
+    /// Build a `WeChatChannel` wired to a wiremock server. `WeChatChannel::new`
+    /// rejects non-https `api_base_url` values (see
+    /// `wechat_channel_rejects_http_api_base_url` above) and `MockServer::uri()`
+    /// is `http://127.0.0.1:<port>`, so we construct with the (unused) https
+    /// default and then overwrite the private `api_base_url` field directly —
+    /// legal here because this test module is nested inside the same file and
+    /// therefore shares its privacy scope with `WeChatChannel`.
+    fn wechat_channel_for_mock(state_dir: PathBuf, mock_base_url: String) -> WeChatChannel {
+        let mut ch = WeChatChannel::new(
+            "wechat_test_alias",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir),
+        )
+        .unwrap();
+        ch.api_base_url = mock_base_url;
+        *ch.bot_token.write().unwrap() = Some("test-token".to_string());
+        ch
+    }
+
+    fn getupdates_batch(cursor: &str, msgs: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "ret": 0,
+            "errcode": 0,
+            "get_updates_buf": cursor,
+            "msgs": msgs,
+        })
+    }
+
+    /// Like `wechat_channel_for_mock`, but also points the CDN base URL at
+    /// the mock server and configures a workspace directory so inbound
+    /// attachments can be downloaded and saved.
+    fn wechat_channel_for_mock_with_workspace(
+        state_dir: PathBuf,
+        workspace_dir: PathBuf,
+        mock_base_url: String,
+    ) -> WeChatChannel {
+        let mut ch = wechat_channel_for_mock(state_dir, mock_base_url.clone());
+        ch.cdn_base_url = mock_base_url;
+        ch.with_workspace_dir(workspace_dir)
+    }
+
+    /// Build the production pairing shape: the resolver and persistence
+    /// writer share one canonical Config handle, initially with no peers.
+    /// The returned code is the one-time `/bind` code generated by
+    /// `WeChatChannel::new` for that empty allowlist.
+    fn pairing_wechat_channel_for_mock(
+        root: &Path,
+        mock_base_url: String,
+    ) -> (WeChatChannel, Arc<parking_lot::RwLock<Config>>, String) {
+        let alias = "wechat_test_alias";
+        let mut config = Config {
+            config_path: root.join("config.toml"),
+            data_dir: root.join("data"),
+            ..Default::default()
+        };
+        config.channels.wechat.insert(
+            alias.to_string(),
+            zeroclaw_config::schema::WeChatConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(parking_lot::RwLock::new(config));
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let config = config.clone();
+            let alias = alias.to_string();
+            Arc::new(move || config.read().channel_external_peers("wechat", &alias))
+        };
+
+        let mut channel =
+            WeChatChannel::new(alias, peer_resolver, None, None, Some(root.join("state")))
+                .unwrap()
+                .with_persistence(config.clone())
+                .with_workspace_dir(root.join("workspace"));
+        let pairing_code = channel
+            .pairing
+            .as_ref()
+            .and_then(PairingGuard::pairing_code)
+            .expect("empty canonical peer list must generate a pairing code");
+        channel.api_base_url = mock_base_url.clone();
+        channel.cdn_base_url = mock_base_url;
+        *channel.bot_token.write().unwrap() = Some("test-token".to_string());
+        (channel, config, pairing_code)
+    }
+
+    /// A `/bind` changes authorization for the messages after it in the
+    /// same server batch. Staging must not freeze the pre-bind decision:
+    /// once the bind is persisted, the following message is delivered in
+    /// order before the cursor commits.
+    #[tokio::test]
+    async fn listen_applies_bind_before_following_same_sender_message() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+
+        let batch = getupdates_batch(
+            "cursor_after_batch",
+            serde_json::json!([
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 1,
+                    "create_time_ms": 1_700_000_000_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": format!("/bind {pairing_code}")}
+                    }]
+                },
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 2,
+                    "create_time_ms": 1_700_000_001_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": "hello after bind"}
+                    }]
+                }
+            ]),
+        );
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        let delivered = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("timed out waiting for the post-bind message")
+            .expect("listener closed before the post-bind message");
+        assert_eq!(delivered.sender, "new_user");
+        assert_eq!(delivered.content, "hello after bind");
+        assert_eq!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias"),
+            vec!["new_user".to_string()],
+            "bind must update the canonical peer source before delivery"
+        );
+
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(duplicate.is_err(), "post-bind message must deliver once");
+        assert_eq!(*channel.cursor.lock(), "cursor_after_batch");
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// A syntactically valid `/bind` is only a staging hint, not authority.
+    /// An invalid code followed by an attachment from the same sender must
+    /// not trigger a CDN request or workspace write before canonical pairing
+    /// succeeds.
+    #[tokio::test]
+    async fn listen_does_not_fetch_attachment_after_invalid_staged_bind() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, valid_pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+        let invalid_pairing_code = format!("{valid_pairing_code}x");
+
+        let batch = getupdates_batch(
+            "cursor_after_batch",
+            serde_json::json!([
+                {
+                    "from_user_id": "unpaired_user",
+                    "message_id": 1,
+                    "create_time_ms": 1_700_000_000_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": format!("/bind {invalid_pairing_code}")}
+                    }]
+                },
+                {
+                    "from_user_id": "unpaired_user",
+                    "message_id": 2,
+                    "create_time_ms": 1_700_000_001_000u64,
+                    "item_list": [
+                        {"type": 1, "text_item": {"text": "unauthorized attachment"}},
+                        {
+                            "type": 2,
+                            "image_item": {
+                                "media": {"encrypt_query_param": "must_not_be_fetched"}
+                            }
+                        }
+                    ]
+                }
+            ]),
+        );
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while *channel.cursor.lock() != "cursor_after_batch" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("invalid bind batch must advance without attachment I/O");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), rx.recv())
+                .await
+                .is_err(),
+            "an invalid bind must not deliver its following attachment"
+        );
+        assert!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias")
+                .is_empty(),
+            "invalid pairing must not update the canonical peer source"
+        );
+        assert!(
+            !temp.path().join("workspace/wechat_files").exists(),
+            "unauthorized attachment staging must not create its workspace directory"
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "GET")
+                .count(),
+            0,
+            "invalid pairing must not authorize any CDN request"
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                .count(),
+            1,
+            "the invalid-code reply should be sent once"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// Attachment I/O for a staged-bind sender starts only after the bind
+    /// updates canonical authorization. If that newly authorized fetch is
+    /// retryable, the cursor stays pending; replay treats the already-applied
+    /// `/bind` as a control no-op so the pairing attempt and reply happen once,
+    /// while the inbound message still waits for the attachment.
+    #[tokio::test]
+    async fn listen_replays_post_bind_attachment_failure_without_rebinding() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("workspace")).unwrap();
+        let mock_server = MockServer::start().await;
+        let (channel, config, pairing_code) =
+            pairing_wechat_channel_for_mock(temp.path(), mock_server.uri());
+
+        let batch = getupdates_batch(
+            "cursor_after_batch",
+            serde_json::json!([
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 1,
+                    "create_time_ms": 1_700_000_000_000u64,
+                    "item_list": [{
+                        "type": 1,
+                        "text_item": {"text": format!("/bind {pairing_code}")}
+                    }]
+                },
+                {
+                    "from_user_id": "new_user",
+                    "message_id": 2,
+                    "create_time_ms": 1_700_000_001_000u64,
+                    "item_list": [
+                        {"type": 1, "text_item": {"text": "caption after bind"}},
+                        {
+                            "type": 2,
+                            "image_item": {
+                                "media": {"encrypt_query_param": "enc_param_1"}
+                            }
+                        }
+                    ]
+                }
+            ]),
+        );
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/sendmessage"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({"ret": 0})))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        *channel.cursor.lock() = "original_cursor".to_string();
+        channel.save_sync_data();
+        let channel = Arc::new(channel);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let listen_channel = channel.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_channel.listen(tx).await });
+
+        let held = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+        assert!(held.is_err(), "held batch must publish no message");
+        assert_eq!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias"),
+            vec!["new_user".to_string()],
+            "the bind must establish canonical authorization before attachment I/O"
+        );
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                .count(),
+            1,
+            "the successful bind reply must be sent once before the held replay"
+        );
+
+        let delivered = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("timed out waiting for attachment recovery")
+            .expect("listener closed before attachment recovery");
+        assert_eq!(delivered.sender, "new_user");
+        assert!(delivered.content.contains("[IMAGE:"), "{delivered:?}");
+        assert!(delivered.content.contains("caption after bind"));
+        assert_eq!(
+            config
+                .read()
+                .channel_external_peers("wechat", "wechat_test_alias"),
+            vec!["new_user".to_string()]
+        );
+
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(duplicate.is_err(), "recovered message must deliver once");
+        assert_eq!(*channel.cursor.lock(), "cursor_after_batch");
+        let requests = mock_server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.url.path() == "/ilink/bot/sendmessage")
+                .count(),
+            1,
+            "replayed bind must reply exactly once"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// Regression test for lost inbound batches: if the very first
+    /// `tx.send` in a batch fails (receiver gone), `listen()` must return without ever
+    /// committing the cursor the response carried — otherwise a crash
+    /// between cursor persistence and enqueue completion would
+    /// permanently skip the un-enqueued messages on restart.
+    #[tokio::test]
+    async fn listen_does_not_commit_cursor_when_first_enqueue_fails() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "hello"}}]
+                    },
+                    {
+                        "from_user_id": "user_b",
+                        "message_id": 2,
+                        "create_time_ms": 1_700_000_001_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "world"}}]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock(state_dir.clone(), mock_server.uri());
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx); // first tx.send in the batch will fail immediately
+
+        let result = tokio::time::timeout(Duration::from_secs(5), ch.listen(tx))
+            .await
+            .expect("listen() should return promptly once the receiver is gone");
+        assert!(result.is_ok());
+
+        // Probe through the production reload path (`load_persisted_state`
+        // via the constructor) — exactly what a supervised restart runs.
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "original_cursor",
+            "cursor must not advance when the batch was never enqueued"
+        );
+    }
+
+    /// Happy path for the deferred cursor commit: once a batch is fully
+    /// enqueued, its cursor commits. A second batch whose enqueue fails (receiver
+    /// dropped mid-flight) must NOT move the cursor further.
+    #[tokio::test]
+    async fn listen_commits_cursor_only_after_batch_fully_enqueued() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+        let mock_server = MockServer::start().await;
+
+        // First batch: fully drained by the test below, so its cursor
+        // must be committed.
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_batch_1",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "hello"}}]
+                    },
+                    {
+                        "from_user_id": "user_b",
+                        "message_id": 2,
+                        "create_time_ms": 1_700_000_001_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "world"}}]
+                    }
+                ]),
+            )))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+
+        // Second batch: the receiver is dropped as soon as batch 1 has
+        // been fully drained, before this response's message is
+        // enqueued, so this cursor must never be committed.
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_batch_2",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_c",
+                        "message_id": 3,
+                        "create_time_ms": 1_700_000_002_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "third"}}]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock(state_dir.clone(), mock_server.uri());
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for first message")
+            .expect("channel closed before first message");
+        assert_eq!(first.sender, "user_a");
+
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for second message")
+            .expect("channel closed before second message");
+        assert_eq!(second.sender, "user_b");
+
+        // Batch 1 is fully drained now (both sends returned Ok). Drop the
+        // receiver synchronously, before yielding back to the executor, so
+        // batch 2's send is guaranteed to observe a closed channel.
+        drop(rx);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("listen() task timed out")
+            .expect("listen() task panicked");
+        assert!(result.is_ok());
+
+        // Probe through the production reload path (`load_persisted_state`
+        // via the constructor) — exactly what a supervised restart runs.
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "cursor_batch_1",
+            "cursor should advance to batch 1's cursor, not batch 2's"
+        );
+    }
+
+    /// Covers the subtlety the fix hinges on: `set_context_token` (called
+    /// mid-batch, for the first message) itself calls `save_sync_data()`.
+    /// Because cursor commitment is deferred until the whole batch is
+    /// enqueued, that mid-batch save must still see (and persist) the OLD
+    /// cursor — even though the getupdates response already carried a new
+    /// one — while still recording the new context token.
+    #[tokio::test]
+    async fn listen_mid_batch_context_token_save_keeps_old_cursor() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().to_path_buf();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "context_token": "ctx_abc123",
+                        "item_list": [{"type": 1, "text_item": {"text": "hello"}}]
+                    },
+                    {
+                        "from_user_id": "user_b",
+                        "message_id": 2,
+                        "create_time_ms": 1_700_000_001_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "world"}}]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock(state_dir.clone(), mock_server.uri());
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for first message")
+            .expect("channel closed before first message");
+        assert_eq!(first.sender, "user_a");
+
+        // Drop synchronously (no intervening await) so message 2's send
+        // observes a closed channel and the batch never completes.
+        drop(rx);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("listen() task timed out")
+            .expect("listen() task panicked");
+        assert!(result.is_ok());
+
+        // Probe through the production reload path (`load_persisted_state`
+        // via the constructor) — exactly what a supervised restart runs.
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            probe.get_context_token("user_a"),
+            Some("ctx_abc123".to_string()),
+            "mid-batch set_context_token must still persist the new token"
+        );
+        assert_eq!(
+            *probe.cursor.lock(),
+            "original_cursor",
+            "mid-batch save must not have leaked the uncommitted new cursor"
+        );
+    }
+
+    /// Invariant: a batch carrying a text-plus-attachment message whose
+    /// attachment download fails retryably (a transient CDN 503) must not
+    /// let `next_cursor` commit, and must publish nothing while held.
+    /// Delivering the bare text and moving the cursor on would permanently
+    /// drop the attachment, since a redelivered message never happens
+    /// without inbound dedup.
+    ///
+    /// Scope: SAME-PROCESS recovery. One long-lived listener stays up
+    /// across the failure and the CDN's recovery, so this covers the
+    /// held-then-recovered path plus the post-commit persistence a later
+    /// restart would read. It deliberately does NOT cover restart *while*
+    /// the cursor is still pending — that is
+    /// `listen_recovers_held_batch_after_restart_while_cursor_pending`.
+    #[tokio::test]
+    async fn listen_holds_cursor_on_retryable_attachment_failure_and_recovers_on_same_listener() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        let attachment_batch = || {
+            getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )
+        };
+
+        // getupdates: the batch is served while the listener still polls
+        // with the pre-batch cursor. Once the batch commits and the
+        // listener polls with `cursor_after_batch`, the server has nothing
+        // left — mirroring a real server, which only replays a batch the
+        // client has not acknowledged.
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(attachment_batch()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        // CDN: retryable failure (503) on the first download attempt,
+        // then succeeds on every attempt after.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // The first pass hits the 503 and holds the batch, so nothing is
+        // delivered yet — in particular the bare "hello" text must NOT be
+        // enqueued, or it would repeat on every re-poll.
+        let held = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            held.is_err(),
+            "a retryable attachment failure must defer the batch, not deliver degraded content"
+        );
+
+        // Keep the SAME listener running across the failure and into
+        // recovery — this is the production path a restart-only test skips.
+        // The CDN mock succeeds after the first attempt, so the backed-off
+        // re-poll re-fetches the same batch and delivers it complete, exactly
+        // once.
+        let first = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("timed out waiting for the recovered delivery")
+            .expect("channel closed before the recovered delivery");
+        assert_eq!(first.sender, "user_a");
+        assert!(
+            first.content.contains("[IMAGE:"),
+            "the recovered pass must carry the attachment, got: {}",
+            first.content
+        );
+        assert!(
+            first.content.contains("hello"),
+            "the recovered pass must still carry the text, got: {}",
+            first.content
+        );
+
+        // And the batch must not be delivered a second time once its
+        // cursor commits.
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            duplicate.is_err(),
+            "a recovered batch must deliver exactly once, not redeliver on the next poll"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+
+        // The batch committed in-process once the CDN recovered, so a
+        // supervised restart must not re-poll it.
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "cursor_after_batch",
+            "cursor must advance once the held batch finally delivers in full"
+        );
+    }
+
+    /// Unit-level companion to the listener regression below: the
+    /// classification split itself. Conditions only an operator can clear
+    /// are `Permanent`; genuinely transient ones stay `Retryable`.
+    #[test]
+    fn classify_workspace_io_splits_operator_action_from_transient() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::ReadOnlyFilesystem,
+            ErrorKind::NotADirectory,
+            ErrorKind::IsADirectory,
+            ErrorKind::AlreadyExists,
+            ErrorKind::InvalidInput,
+            ErrorKind::InvalidFilename,
+        ] {
+            assert_eq!(
+                classify_workspace_io(&Error::new(kind, "boom")),
+                AttachmentDisposition::Permanent,
+                "{kind:?} cannot be cleared by retrying the CDN"
+            );
+        }
+        for kind in [
+            ErrorKind::StorageFull,
+            ErrorKind::Interrupted,
+            ErrorKind::TimedOut,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(
+                classify_workspace_io(&Error::new(kind, "boom")),
+                AttachmentDisposition::Retryable,
+                "{kind:?} may clear on its own"
+            );
+        }
+    }
+
+    /// Invariant: an unwritable workspace must not wedge inbound
+    /// delivery. Every local filesystem error used to map to
+    /// `Retryable`, so a `PermissionDenied` workspace held the cursor and
+    /// re-fetched the same batch forever — every later WeChat message
+    /// stuck behind a condition retrying can never clear.
+    ///
+    /// Here the workspace is a read-only directory, so `create_dir_all`
+    /// of `wechat_files` fails with `PermissionDenied` on every pass. The
+    /// batch must be classified permanent: the attachment is dropped, the
+    /// text still delivers, and the cursor commits so the next batch can
+    /// flow.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn listen_does_not_hold_batch_forever_on_unwritable_workspace() {
+        use std::os::unix::fs::PermissionsExt;
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        // Read-only workspace: creating `wechat_files/` inside it is
+        // EACCES, and no amount of CDN retrying changes that.
+        let mut perms = std::fs::metadata(&workspace_dir).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&workspace_dir, perms).unwrap();
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        // The CDN is healthy throughout: the only failure is local.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // Delivery must not be wedged: the text arrives promptly, well
+        // inside the first backoff step, instead of being held.
+        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("an unwritable workspace must not hold inbound delivery")
+            .expect("channel closed before delivery");
+        assert_eq!(msg.sender, "user_a");
+        assert!(
+            msg.content.contains("hello"),
+            "the text must still be delivered, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("[IMAGE:"),
+            "the attachment is unsaveable, so no marker may be claimed, got: {}",
+            msg.content
+        );
+
+        // And the cursor must move on, or the next batch never arrives.
+        let mut committed = false;
+        for _ in 0..100 {
+            if *ch.cursor.lock() == "cursor_after_batch" {
+                committed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            committed,
+            "an unclearable local I/O failure must not retain the cursor: still at {:?}",
+            *ch.cursor.lock()
+        );
+
+        handle.abort();
+        let _ = handle.await;
+
+        // Restore write permission so the tempdir can be cleaned up.
+        let mut perms = std::fs::metadata(&workspace_dir).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&workspace_dir, perms).unwrap();
+    }
+
+    /// Same invariant as the read-only-workspace regression above, for
+    /// the collision that needs no permission trick and so reproduces on
+    /// every platform: `workspace/wechat_files` already exists as a
+    /// regular file.
+    ///
+    /// `create_dir_all` then returns EEXIST (`ErrorKind::AlreadyExists`).
+    /// Retrying the CDN cannot turn a file into a directory, so if this
+    /// were classified `Retryable` the listener would retain the cursor
+    /// and re-poll the same batch forever, wedging every later inbound
+    /// message. It must be `Permanent`: the attachment is dropped, the
+    /// text still delivers, and the cursor commits.
+    #[tokio::test]
+    async fn listen_does_not_hold_batch_when_attachment_dir_path_is_a_file() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        // The collision: the attachment directory path is occupied by a
+        // regular file, so `create_dir_all` fails with EEXIST forever.
+        std::fs::write(workspace_dir.join("wechat_files"), b"not a directory").unwrap();
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+        // The CDN is healthy throughout: the only failure is local.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let msg = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("an occupied attachment dir path must not hold inbound delivery")
+            .expect("channel closed before delivery");
+        assert_eq!(msg.sender, "user_a");
+        assert!(
+            msg.content.contains("hello"),
+            "the text must still be delivered, got: {}",
+            msg.content
+        );
+        assert!(
+            !msg.content.contains("[IMAGE:"),
+            "the attachment is unsaveable, so no marker may be claimed, got: {}",
+            msg.content
+        );
+
+        let mut committed = false;
+        for _ in 0..100 {
+            if *ch.cursor.lock() == "cursor_after_batch" {
+                committed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            committed,
+            "an EEXIST attachment-dir collision must not retain the cursor: still at {:?}",
+            *ch.cursor.lock()
+        );
+
+        // The colliding file is untouched: nothing tried to write through it.
+        assert_eq!(
+            std::fs::read(workspace_dir.join("wechat_files")).unwrap(),
+            b"not a directory",
+            "the colliding file must not be overwritten"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+    }
+
+    /// The restart-while-cursor-pending regression, and the gap the
+    /// same-process test above does NOT cover: the process must be able
+    /// to die *while the batch is still held* and have a freshly
+    /// constructed channel — built through `WeChatChannel::new` from the
+    /// persisted state dir, exactly like a supervised restart — re-poll
+    /// that batch and deliver it once.
+    ///
+    /// Pass 1 holds the batch (CDN 503) and the listener is aborted
+    /// before the cursor ever commits, so `sync.json` still carries the
+    /// pre-batch cursor. Pass 2 rebuilds from that file with a healthy
+    /// CDN and must re-fetch the identical batch, deliver it complete
+    /// exactly once, and only then commit. A regression in
+    /// `save_sync_data()` ordering, or in the reload constructor, breaks
+    /// this even though every same-process test stays green.
+    #[tokio::test]
+    async fn listen_recovers_held_batch_after_restart_while_cursor_pending() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        let attachment_batch = || {
+            getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )
+        };
+
+        // The server only replays a batch the client has not acknowledged:
+        // polling with the pre-batch cursor yields the batch, polling with
+        // the committed cursor yields nothing. That matcher is what makes
+        // "delivered exactly once" meaningful below.
+        async fn mount_getupdates(server: &MockServer, batch: serde_json::Value) {
+            Mock::given(method("POST"))
+                .and(path("/ilink/bot/getupdates"))
+                .and(body_partial_json(
+                    serde_json::json!({"get_updates_buf": "original_cursor"}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(batch))
+                .mount(server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/ilink/bot/getupdates"))
+                .and(body_partial_json(
+                    serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                    "cursor_after_batch",
+                    serde_json::json!([]),
+                )))
+                .mount(server)
+                .await;
+        }
+
+        // ---- pass 1: CDN down, batch held, killed before commit ----
+        mount_getupdates(&mock_server, attachment_batch()).await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let held = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+        assert!(
+            held.is_err(),
+            "nothing may be delivered while the batch is held on a failing CDN"
+        );
+
+        // Kill the listener mid-hold — the crash/restart this test exists
+        // for. The cursor has NOT committed at this point.
+        handle.abort();
+        let _ = handle.await;
+        drop(rx);
+        drop(ch);
+
+        let pending = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *pending.cursor.lock(),
+            "original_cursor",
+            "the held batch must leave the pre-batch cursor on disk, or a restart skips it"
+        );
+        drop(pending);
+
+        // ---- pass 2: restart from persisted state with a healthy CDN ----
+        mock_server.reset().await;
+        mount_getupdates(&mock_server, attachment_batch()).await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        // Built through the production constructor, which reloads the
+        // cursor from `sync.json`; the test never sets it by hand.
+        let restarted = Arc::new(wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        ));
+        assert_eq!(
+            *restarted.cursor.lock(),
+            "original_cursor",
+            "the restarted channel must resume from the persisted pending cursor"
+        );
+
+        let (tx2, mut rx2) = tokio::sync::mpsc::channel(8);
+        let restart_ch = restarted.clone();
+        let handle2 = zeroclaw_spawn::spawn!(async move { restart_ch.listen(tx2).await });
+
+        let msg = tokio::time::timeout(Duration::from_secs(20), rx2.recv())
+            .await
+            .expect("timed out waiting for the held batch to be redelivered after restart")
+            .expect("channel closed before the held batch was redelivered");
+        assert_eq!(msg.sender, "user_a");
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "the restarted pass must carry the attachment, got: {}",
+            msg.content
+        );
+        assert!(
+            msg.content.contains("hello"),
+            "the restarted pass must still carry the text, got: {}",
+            msg.content
+        );
+
+        let duplicate = tokio::time::timeout(Duration::from_secs(3), rx2.recv()).await;
+        assert!(
+            duplicate.is_err(),
+            "a batch recovered after restart must deliver exactly once"
+        );
+
+        handle2.abort();
+        let _ = handle2.await;
+        drop(rx2);
+        drop(restarted);
+
+        let committed = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *committed.cursor.lock(),
+            "cursor_after_batch",
+            "the cursor must commit once the restarted pass delivers the batch in full"
+        );
+    }
+
+    /// Invariant: while a batch is held for a retryable attachment
+    /// failure, NOTHING may be delivered — in particular an ordinary text
+    /// message A that precedes the failing message B must not cross
+    /// `tx.send`, or it would start a fresh agent turn on every held
+    /// re-poll. Once the CDN recovers, A and B arrive exactly once, in
+    /// order, with no duplicates afterward.
+    #[tokio::test]
+    async fn listen_stages_whole_batch_before_publishing_any_message() {
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        let two_message_batch = || {
+            getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [{"type": 1, "text_item": {"text": "plain text A"}}]
+                    },
+                    {
+                        "from_user_id": "user_b",
+                        "message_id": 2,
+                        "create_time_ms": 1_700_000_001_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "caption B"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )
+        };
+
+        // The server replays the batch for as long as the client polls
+        // with the pre-batch cursor, and has nothing once it acknowledges.
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "original_cursor"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(two_message_batch()))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .and(body_partial_json(
+                serde_json::json!({"get_updates_buf": "cursor_after_batch"}),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        // CDN: retryable failure (503) on the first attempt, success after.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fake-image-bytes".to_vec()))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // While the batch is held by B's 503, NOTHING is delivered — not
+        // even A, whose own preparation succeeded. Publishing A here would
+        // redeliver it on every held re-poll.
+        let held = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            held.is_err(),
+            "message A must not be published while a later message holds the batch"
+        );
+
+        // After the backed-off re-poll the CDN succeeds: A then B arrive,
+        // in order, on the same listener.
+        let first = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("timed out waiting for message A after recovery")
+            .expect("channel closed before message A");
+        assert_eq!(first.sender, "user_a");
+        assert_eq!(first.content, "plain text A");
+
+        let second = tokio::time::timeout(Duration::from_secs(20), rx.recv())
+            .await
+            .expect("timed out waiting for message B after recovery")
+            .expect("channel closed before message B");
+        assert_eq!(second.sender, "user_b");
+        assert!(
+            second.content.contains("[IMAGE:"),
+            "message B must carry its recovered attachment, got: {}",
+            second.content
+        );
+        assert!(
+            second.content.contains("caption B"),
+            "message B must still carry its text, got: {}",
+            second.content
+        );
+
+        // Exactly once: the committed cursor means the next poll returns
+        // an empty batch, so no duplicate of A or B may appear.
+        let duplicate = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            duplicate.is_err(),
+            "a recovered batch must deliver exactly once, got a duplicate"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "cursor_after_batch",
+            "cursor must advance once the held batch delivers in full"
+        );
+    }
+
+    /// Companion to the retryable-failure regression above: a permanent
+    /// attachment failure (CDN 404, object gone) must NOT hold the
+    /// cursor. Holding it forever for an attachment that will never
+    /// succeed would wedge the listener on that batch.
+    #[tokio::test]
+    async fn listen_advances_cursor_when_attachment_fails_permanently() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        // CDN: the object is gone (404) on every attempt.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        let first = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("timed out waiting for message")
+            .expect("channel closed before message");
+        assert_eq!(first.sender, "user_a");
+        assert_eq!(
+            first.content, "hello",
+            "a permanent attachment failure delivers the text without the attachment"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "cursor_after_batch",
+            "a permanent attachment failure must not wedge the listener by holding the cursor"
+        );
+    }
+
+    /// A CDN `408 Request Timeout` is a transient delivery failure, not a
+    /// missing object, so it must hold the cursor like a 5xx/429 rather
+    /// than advancing past the attachment and losing it forever.
+    #[tokio::test]
+    async fn listen_holds_cursor_when_attachment_download_times_out() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/ilink/bot/getupdates"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(getupdates_batch(
+                "cursor_after_batch",
+                serde_json::json!([
+                    {
+                        "from_user_id": "user_a",
+                        "message_id": 1,
+                        "create_time_ms": 1_700_000_000_000u64,
+                        "item_list": [
+                            {"type": 1, "text_item": {"text": "hello"}},
+                            {
+                                "type": 2,
+                                "image_item": {
+                                    "media": {"encrypt_query_param": "enc_param_1"}
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            )))
+            .mount(&mock_server)
+            .await;
+
+        // CDN: transient timeout on every attempt.
+        Mock::given(method("GET"))
+            .and(path("/download"))
+            .respond_with(ResponseTemplate::new(408))
+            .mount(&mock_server)
+            .await;
+
+        let ch = wechat_channel_for_mock_with_workspace(
+            state_dir.clone(),
+            workspace_dir.clone(),
+            mock_server.uri(),
+        );
+        *ch.cursor.lock() = "original_cursor".to_string();
+        ch.save_sync_data();
+        let ch = Arc::new(ch);
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listen_ch = ch.clone();
+        let handle = zeroclaw_spawn::spawn!(async move { listen_ch.listen(tx).await });
+
+        // A held batch must not deliver anything: the message carries an
+        // attachment that never arrives, so enqueueing its bare text would
+        // redeliver that text on every re-poll for as long as the 408
+        // persists. Nothing should come through.
+        let delivered = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(
+            delivered.is_err(),
+            "a retryable attachment failure must defer the batch, not deliver degraded content"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+
+        let probe = WeChatChannel::new(
+            "test",
+            Arc::new(|| vec!["*".to_string()]),
+            None,
+            None,
+            Some(state_dir.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            *probe.cursor.lock(),
+            "original_cursor",
+            "a 408 is transient: the cursor must stay pending so the attachment is re-fetched"
         );
     }
 }
