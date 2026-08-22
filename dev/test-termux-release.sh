@@ -206,48 +206,15 @@ fi
 
 # --- Test 11: install.sh Termux detection ---
 info "Validating install.sh Termux detection"
-INSTALL_SH="install.sh"
-if [[ ! -f "$INSTALL_SH" ]]; then
-  INSTALL_SH="$(dirname "$0")/../install.sh"
-fi
-
-if [[ -f "$INSTALL_SH" ]]; then
-  if grep -q 'TERMUX_VERSION' "$INSTALL_SH"; then
-    pass "install.sh checks TERMUX_VERSION"
+CANONICAL_DETECTOR_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/scripts/ci/install_target_triple_test.sh"
+if [[ -f "$CANONICAL_DETECTOR_TEST" ]]; then
+  if bash "$CANONICAL_DETECTOR_TEST"; then
+    pass "install.sh target detection passed canonical detector test"
   else
-    fail "install.sh does not check TERMUX_VERSION"
-  fi
-
-  if grep -q 'aarch64-linux-android' "$INSTALL_SH"; then
-    pass "install.sh maps to aarch64-linux-android target"
-  else
-    fail "install.sh does not map to aarch64-linux-android"
-  fi
-
-  # Simulate Termux detection (mock uname as Linux since we may run on macOS)
-  detect_result=$(
-    bash -c '
-      TERMUX_VERSION="0.118"
-      os="Linux"
-      arch="aarch64"
-      case "$os:$arch" in
-        Linux:aarch64|Linux:arm64)
-          if [[ -n "${TERMUX_VERSION:-}" || -d "/data/data/com.termux" ]]; then
-            echo "aarch64-linux-android"
-          else
-            echo "aarch64-unknown-linux-gnu"
-          fi
-          ;;
-      esac
-    '
-  )
-  if [[ "$detect_result" == "aarch64-linux-android" ]]; then
-    pass "Termux detection returns correct target (simulated)"
-  else
-    fail "Termux detection returned: $detect_result (expected aarch64-linux-android)"
+    fail "install.sh target detection failed canonical detector test"
   fi
 else
-  warn "install.sh not found — skipping detection tests"
+  fail "Canonical install target detector test not found: $CANONICAL_DETECTOR_TEST"
 fi
 
 # --- Summary ---
