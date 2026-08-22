@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// MicroPython UF2 binary — copied to RPI-RP2 to install the base runtime.
 const PICO_UF2: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../firmware/pico/zeroclaw-pico.uf2"
+    "/pico-firmware/zeroclaw-pico.uf2"
 ));
 
 /// UF2 magic word 1 (little-endian bytes at offset 0 of every UF2 block).

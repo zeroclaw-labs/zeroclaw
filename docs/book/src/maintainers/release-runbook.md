@@ -22,8 +22,8 @@ Last verified against the `v0.8.2` release cycle.
 6. [Verify the release exists and assets are downloadable](#step-6-verify-the-release)
 7. [Versioned documentation deployment](#step-7-versioned-documentation-deployment)
 
-That is the entire process. Everything else (Docker, website redeploy, Scoop,
-AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
+That is the entire process. Everything else (crates.io, Docker, website
+redeploy, Scoop, AUR, Discord, tweet) runs automatically as downstream jobs. Homebrew Core
 detects the stable GitHub release through its own autobump service. You do not
 need to do anything for those unless a job explicitly fails or Homebrew's
 external bump remains stale.
@@ -424,7 +424,7 @@ inside the stable release workflow. You do not need a separate Docker check if
 all release jobs are green. If a maintainer instead starts the release by
 pushing a `vX.Y.Z` tag, Docker Publish starts as a separate tag-triggered run;
 confirm that sibling run is green before treating container publication as
-complete. Scoop and AUR need separate attention only when their jobs show red.
+complete. crates.io, Scoop, and AUR need separate attention only when their jobs show red.
 Homebrew Core is external to this workflow; its
 [autobump service](https://docs.brew.sh/Autobump) checks eligible formulae on
 its own schedule.
@@ -530,6 +530,14 @@ failed distribution job does not invalidate the release itself. For Scoop
 credential failures, use Scoop Bucket Canary instead of treating a generic dry
 run as credential proof; the canary enables the fail-closed
 `credential_canary` path.
+
+**The crates.io publisher stopped after uploading some crates:** Do not bump the
+version or start a second release. crates.io versions cannot be replaced or
+deleted. Fix the failing crate at the same release commit, then re-run
+`Pub crates.io` for the same tag with `dry_run: false`; the publisher queries
+every `<crate>@<version>` first and skips versions that already landed. Read the
+Publish step for the last successful crate. If preflight failed, no upload was
+attempted and the problem is still reversible.
 
 **The `scoop` job failed with `remote: Permission ... denied to <account>` (403):**
 A permissions problem, not a manifest problem: the bucket token is dead or

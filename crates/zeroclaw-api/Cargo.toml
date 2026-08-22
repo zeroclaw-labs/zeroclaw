@@ -4,7 +4,8 @@ version.workspace = true
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Trait definitions and shared types for ZeroClaw — the API layer."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 anyhow = "1.0"

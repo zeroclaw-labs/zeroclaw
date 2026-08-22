@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "Hardware discovery, peripherals, and device management for ZeroClaw."
-publish = false
+repository.workspace = true
+publish = true
 
 [dependencies]
 zeroclaw-log.workspace = true
