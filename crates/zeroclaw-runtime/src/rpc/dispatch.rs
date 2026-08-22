@@ -1795,6 +1795,35 @@ impl RpcDispatcher {
             .await
             .map_err(|e| rpc_err(SESSION_BUSY, format!("Session busy: {e}")))?;
 
+        let chat_mode = self
+            .ctx
+            .sessions
+            .chat_mode(sid)
+            .await
+            .unwrap_or(crate::rpc::types::ChatMode::Chat);
+
+        // Mirror the gateway WS path so `session/state` and stuck-session
+        // detection see RPC-driven turns too. The durable row lives under the
+        // same `rpc_{sid}` key the Chat-mode message persistence below and
+        // `session/state` both use. The HTTP running-sessions listing stays
+        // blind to these rows: it derives its caller-facing id by stripping a
+        // `gw_` prefix, and the sibling lookup and abort paths resolve only
+        // gateway keys, so surfacing a row here would hand callers an id those
+        // endpoints cannot act on.
+        //
+        // Scoped to Chat sessions only. Session IDs are caller-supplied and
+        // the two persistence modes share that namespace, so an ACP prompt
+        // reusing the ID of a closed Chat session would otherwise mutate that
+        // session's retained `rpc_{sid}` row — making a stale Chat record
+        // report `running`/`idle`/`error` from an ACP turn, and surfacing it
+        // in stuck-session queries. ACP state belongs to `AcpSessionStore`.
+        let persist_session_state = !matches!(chat_mode, crate::rpc::types::ChatMode::Acp);
+        let session_key = format!("rpc_{sid}");
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+            let _ = backend.set_session_state(&session_key, "running", Some(&turn_id));
+        }
+
         let cancel = tokio_util::sync::CancellationToken::new();
         let cancel_generation = self.ctx.sessions.register_cancel_token(sid, cancel.clone());
         self.ctx.sessions.touch(sid).await;
@@ -1806,12 +1835,6 @@ impl RpcDispatcher {
             "turn dispatch: registered cancel token, starting turn"
         );
 
-        let chat_mode = self
-            .ctx
-            .sessions
-            .chat_mode(sid)
-            .await
-            .unwrap_or(crate::rpc::types::ChatMode::Chat);
         // Capture live attribution fields and max_context_tokens for the turn span.
         // Zerocode's context meter field is named `max_context_tokens` and must
         // reflect the runtime-profile budget (`[runtime_profiles.<name>]
@@ -2019,6 +2042,9 @@ impl RpcDispatcher {
 
         match outcome {
             Ok(TurnOutcome::Completed { text, .. }) => {
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "idle", None);
+                }
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Completed,
@@ -2032,6 +2058,9 @@ impl RpcDispatcher {
                 })
             }
             Ok(TurnOutcome::Cancelled { partial_text, .. }) => {
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "idle", None);
+                }
                 let cancel_message = match cancel_cause {
                     Some(cause) => {
                         format!(
@@ -2075,6 +2104,9 @@ impl RpcDispatcher {
                 })
             }
             Err(e) => {
+                if persist_session_state && let Some(ref backend) = self.ctx.session_backend {
+                    let _ = backend.set_session_state(&session_key, "error", Some(&turn_id));
+                }
                 let user_message = e.user_message().map(str::to_owned);
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -10675,6 +10707,467 @@ mod tests {
         assert!(
             !on_disk.contains("[agents.alpha]"),
             "old alias must not survive on disk:\n{on_disk}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // session/prompt must mirror the durable running/idle/error state the
+    // gateway WS path already writes, so session/state and stuck-session
+    // detection see RPC-driven turns.
+    // -----------------------------------------------------------------------
+
+    /// A provider whose `chat` call reports back on `started` the moment it
+    /// is invoked, then blocks until the test releases it on `release`. Lets
+    /// a test observe state that is only true while a turn is in flight,
+    /// without racing a sleep against the agent loop.
+    struct GatedProvider {
+        started: tokio::sync::mpsc::UnboundedSender<()>,
+        release: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for GatedProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            let _ = self.started.send(());
+            let rx = self
+                .release
+                .lock()
+                .await
+                .take()
+                .expect("chat must be invoked at most once in this harness");
+            let _ = rx.await;
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("turn finished".to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for GatedProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "gated-provider"
+        }
+    }
+
+    /// A provider whose `chat` call always fails, driving `execute_turn` down
+    /// the `Err` path so the session-state write on failure can be observed.
+    struct FailingProvider;
+
+    #[async_trait]
+    impl zeroclaw_api::model_provider::ModelProvider for FailingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            Err(anyhow::Error::msg("provider unavailable"))
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for FailingProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "failing-provider"
+        }
+    }
+
+    /// Build an `Agent` around the given provider and register it directly in
+    /// `sessions` as a Chat-mode RPC session, bypassing `session/new` so the
+    /// provider can be a test double. Also stamps the durable metadata row
+    /// under the same `rpc_{sid}` key `session/new` would, since
+    /// `set_session_state` only ever `UPDATE`s an existing row.
+    async fn install_state_test_session(
+        sessions: &Arc<crate::rpc::session::SessionStore>,
+        chat_backend: &Arc<zeroclaw_infra::session_sqlite::SqliteSessionBackend>,
+        sid: &str,
+        provider: impl zeroclaw_api::model_provider::ModelProvider + 'static,
+    ) -> String {
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(provider))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Chat,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+
+        let session_key = format!("rpc_{sid}");
+        chat_backend
+            .set_session_agent_alias(&session_key, "test-agent")
+            .unwrap();
+        session_key
+    }
+
+    #[tokio::test]
+    async fn session_prompt_reports_running_during_turn_and_idle_after() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let provider = GatedProvider {
+            started: started_tx,
+            release: tokio::sync::Mutex::new(Some(release_rx)),
+        };
+
+        let sid = "rpc-state-turn";
+        let session_key = install_state_test_session(&sessions, &chat_backend, sid, provider).await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-state:pid=1".into());
+
+        let before = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.state, "idle",
+            "session must start idle before any turn runs"
+        );
+
+        let handle = dispatcher.spawn_handle();
+        let sid_owned = sid.to_string();
+        let turn_task = zeroclaw_spawn::spawn!(async move {
+            handle
+                .handle_session_prompt(&json!({
+                    "session_id": sid_owned,
+                    "prompt": "hello",
+                }))
+                .await
+        });
+
+        started_rx
+            .recv()
+            .await
+            .expect("provider must be invoked once the turn starts");
+
+        let mid_turn = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("state row must exist once the turn has started");
+        assert_eq!(
+            mid_turn.state, "running",
+            "session state must be running while the RPC turn is in flight"
+        );
+        assert!(
+            mid_turn.turn_id.is_some(),
+            "a running state must carry a turn id"
+        );
+
+        release_tx
+            .send(())
+            .expect("test harness must still hold the release channel");
+
+        let result = turn_task.await.expect("turn task must not panic");
+        assert!(result.is_ok(), "turn should complete: {result:?}");
+
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state, "idle",
+            "session state must return to idle once the turn completes"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_reports_error_state_on_provider_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "rpc-state-error";
+        let session_key =
+            install_state_test_session(&sessions, &chat_backend, sid, FailingProvider).await;
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            None,
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-error:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "a failing provider must surface as an RPC error"
+        );
+
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.state, "error",
+            "session state must record error after a failed turn"
+        );
+        assert!(
+            after.turn_id.is_some(),
+            "the error state must still carry the turn id it failed under"
+        );
+    }
+
+    /// `session/new` with `chat_mode: "acp"` never creates a `session_backend`
+    /// row — ACP sessions live entirely in `acp_session_store` — and
+    /// `set_session_state` only `UPDATE`s an existing row. So the
+    /// running/idle/error write in `handle_session_prompt` is a silent no-op
+    /// for ACP-mode turns, and `session/state` (which probes `session_backend`
+    /// under the bare id, `rpc_{id}`, and `gw_{id}`) reports session-not-found
+    /// rather than idle or running, both before and after the turn.
+    #[tokio::test]
+    async fn acp_mode_session_prompt_leaves_session_backend_state_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "acp-state-gap";
+        acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(FailingProvider))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Acp,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+
+        let candidates = [sid.to_string(), format!("rpc_{sid}"), format!("gw_{sid}")];
+        for key in &candidates {
+            assert!(
+                chat_backend.get_session_state(key).unwrap().is_none(),
+                "an ACP session must have no session_backend row under {key} before a turn"
+            );
+        }
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(acp_store),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-acp-gap:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "the failing provider still surfaces as an RPC error under ACP mode"
+        );
+
+        for key in &candidates {
+            assert!(
+                chat_backend.get_session_state(key).unwrap().is_none(),
+                "an ACP session must still have no session_backend row under {key} after a \
+                 turn — the running/idle/error write is a no-op for chat_mode: acp"
+            );
+        }
+
+        let state_result = dispatcher
+            .handle_session_state(&json!({ "session_id": sid }))
+            .await;
+        assert!(
+            state_result.is_err(),
+            "session/state must report the ACP session as not found rather than idle or \
+             running, since chat_mode: acp never populates session_backend"
+        );
+    }
+
+    /// Session IDs are caller-supplied and the Chat and ACP persistence modes
+    /// share that namespace, so a closed or replaced Chat session can leave a
+    /// durable `rpc_{sid}` row behind that an ACP session later reuses the ID
+    /// of. The lifecycle writes must be scoped by `chat_mode`, or the ACP turn
+    /// mutates the retained Chat row — making a stale Chat record report
+    /// `running`/`idle`/`error` from an ACP turn and surfacing it in
+    /// stuck-session queries.
+    ///
+    /// Unlike `acp_mode_session_prompt_leaves_session_backend_state_absent`,
+    /// this starts *with* a Chat row present, which is the only way to observe
+    /// the cross-store mutation: `set_session_state` only `UPDATE`s an
+    /// existing row, so the no-row case cannot catch the collision.
+    #[tokio::test]
+    async fn acp_prompt_does_not_mutate_a_retained_chat_row_with_the_same_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let chat_backend = Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(tmp.path()).unwrap(),
+        );
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let queue = Arc::new(zeroclaw_infra::session_queue::SessionActorQueue::new(
+            4, 10, 60,
+        ));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+
+        let sid = "shared-id-collision";
+        let session_key = format!("rpc_{sid}");
+
+        // A Chat session existed under this id and left its durable row
+        // behind, carrying a terminal state from its own last turn.
+        chat_backend
+            .set_session_agent_alias(&session_key, "test-agent")
+            .unwrap();
+        chat_backend
+            .set_session_state(&session_key, "error", Some("chat-era-turn"))
+            .unwrap();
+        let retained = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the retained Chat row must exist before the ACP turn");
+        assert_eq!(retained.state, "error");
+        assert_eq!(retained.turn_id.as_deref(), Some("chat-era-turn"));
+
+        // An ACP session now reuses the same caller-supplied id.
+        acp_store.create_session(sid, "test-agent", "/tmp").unwrap();
+        let agent = crate::agent::agent::Agent::builder()
+            .model_provider(Box::new(FailingProvider))
+            .tools(vec![])
+            .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
+            .observer(Arc::new(crate::observability::noop::NoopObserver))
+            .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
+            .workspace_dir(std::env::temp_dir())
+            .agent_alias("test-agent".to_string())
+            .build()
+            .expect("test agent should build");
+        let rpc_session = crate::rpc::session::RpcSession::new(
+            agent,
+            "test-agent",
+            std::env::temp_dir().to_str().unwrap(),
+            crate::rpc::types::ChatMode::Acp,
+        );
+        sessions.insert(sid.to_string(), rpc_session).await.unwrap();
+
+        let ctx = RpcContext::for_persistence_tests(
+            zeroclaw_config::schema::Config::default(),
+            Arc::clone(&sessions),
+            Some(chat_backend.clone() as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(acp_store),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-collision:pid=1".into());
+
+        let result = dispatcher
+            .handle_session_prompt(&json!({
+                "session_id": sid,
+                "prompt": "hello",
+            }))
+            .await;
+        assert!(
+            result.is_err(),
+            "the failing provider still surfaces as an RPC error under ACP mode"
+        );
+
+        // The ACP turn ran start-to-error. Had the lifecycle writes not been
+        // mode-scoped, this row would now read "error" under a fresh uuid
+        // turn id — an ACP turn overwriting Chat-owned durable state.
+        let after = chat_backend
+            .get_session_state(&session_key)
+            .unwrap()
+            .expect("the retained Chat row must still exist");
+        assert_eq!(
+            after.state, "error",
+            "an ACP turn must not rewrite the retained Chat row's state"
+        );
+        assert_eq!(
+            after.turn_id.as_deref(),
+            Some("chat-era-turn"),
+            "an ACP turn must not stamp its own turn id onto the retained Chat row"
         );
     }
 }
