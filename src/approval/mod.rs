@@ -301,6 +301,7 @@ mod tests {
         let req = ApprovalRequest {
             tool_name: "shell".into(),
             arguments: serde_json::json!({"command": "echo hi"}),
+            host_summary: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();

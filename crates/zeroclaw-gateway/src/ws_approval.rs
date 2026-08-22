@@ -31,6 +31,13 @@ pub struct WsApprovalChannel {
     event_tx: mpsc::Sender<TurnEvent>,
     pending: PendingApprovals,
     timeout: Duration,
+    /// Whether the underlying WS connection proved an operator identity —
+    /// i.e. it carried a paired-token subject. `false` when pairing is
+    /// disabled (`require_pairing = false`), where `/ws/chat` accepts the
+    /// connection with no authenticated subject. This gates
+    /// [`Channel::is_operator_approval_surface`] so an unauthenticated client
+    /// cannot approve operator-only tools.
+    operator_authenticated: bool,
 }
 
 impl WsApprovalChannel {
@@ -38,11 +45,13 @@ impl WsApprovalChannel {
         event_tx: mpsc::Sender<TurnEvent>,
         pending: PendingApprovals,
         timeout: Duration,
+        operator_authenticated: bool,
     ) -> Self {
         Self {
             event_tx,
             pending,
             timeout,
+            operator_authenticated,
         }
     }
 }
@@ -62,6 +71,17 @@ impl ::zeroclaw_api::attribution::Attributable for WsApprovalChannel {
 impl Channel for WsApprovalChannel {
     fn name(&self) -> &str {
         "ws"
+    }
+
+    /// Only a connection that proved an operator identity (a paired-token
+    /// subject) may approve operator-only tools
+    /// (`Tool::approval_requires_operator`). When pairing is disabled,
+    /// `/ws/chat` accepts unauthenticated connections that can still answer
+    /// `approval_response` frames — so this must fail closed there rather
+    /// than assume the socket implies an operator. The terminal remains the
+    /// operator surface for those tools when pairing is off.
+    fn is_operator_approval_surface(&self) -> bool {
+        self.operator_authenticated
     }
 
     async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
@@ -164,11 +184,42 @@ mod tests {
     fn ws_approval_channel_declines_free_form_ask() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let pending = new_pending_approvals();
-        let channel = WsApprovalChannel::new(tx, pending, Duration::from_secs(30));
+        let channel = WsApprovalChannel::new(tx, pending, Duration::from_secs(30), true);
         assert!(
             !channel.supports_free_form_ask(),
             "WsApprovalChannel must refuse free-form ask_user; \
              its send() is a no-op and listen() drops immediately"
+        );
+    }
+
+    /// The operator-surface capability must track the connection's
+    /// authenticated state, never the transport. When pairing is disabled the
+    /// WS carries no authenticated subject (`operator_authenticated = false`),
+    /// and an unauthenticated client answering `approval_response` frames must
+    /// NOT be treated as an operator — otherwise it could approve its own
+    /// operator-only `config_patch`. A paired connection
+    /// (`operator_authenticated = true`) still qualifies.
+    #[test]
+    fn operator_surface_tracks_authentication_not_the_transport() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        let paired = WsApprovalChannel::new(
+            tx.clone(),
+            new_pending_approvals(),
+            Duration::from_secs(30),
+            true,
+        );
+        assert!(
+            paired.is_operator_approval_surface(),
+            "a paired-token-authenticated WS is an operator surface"
+        );
+
+        let unpaired =
+            WsApprovalChannel::new(tx, new_pending_approvals(), Duration::from_secs(30), false);
+        assert!(
+            !unpaired.is_operator_approval_surface(),
+            "an unauthenticated WS (pairing disabled) must fail closed — it \
+             cannot approve operator-only tools"
         );
     }
 
@@ -192,7 +243,7 @@ mod tests {
         // rather than the "forward task gone" early return.
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let pending = new_pending_approvals();
-        let channel = WsApprovalChannel::new(tx, pending, Duration::from_millis(50));
+        let channel = WsApprovalChannel::new(tx, pending, Duration::from_millis(50), true);
 
         let attributed = channel
             .request_approval_attributed("operator", &approval_request())
@@ -215,7 +266,8 @@ mod tests {
     async fn dropped_responder_denies_with_runtime_provenance() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let pending = new_pending_approvals();
-        let channel = WsApprovalChannel::new(tx, Arc::clone(&pending), Duration::from_secs(30));
+        let channel =
+            WsApprovalChannel::new(tx, Arc::clone(&pending), Duration::from_secs(30), true);
 
         let call = async {
             channel
@@ -255,7 +307,7 @@ mod tests {
     async fn legacy_request_approval_still_returns_a_bare_deny_on_timeout() {
         let (tx, _rx) = tokio::sync::mpsc::channel(8);
         let pending = new_pending_approvals();
-        let channel = WsApprovalChannel::new(tx, pending, Duration::from_millis(50));
+        let channel = WsApprovalChannel::new(tx, pending, Duration::from_millis(50), true);
 
         let response = channel
             .request_approval("operator", &approval_request())

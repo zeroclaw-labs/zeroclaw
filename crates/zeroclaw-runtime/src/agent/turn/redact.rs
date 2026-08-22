@@ -99,9 +99,97 @@ pub fn scrub_credentials_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+/// Log-safe string form of a tool call's `args`, for audit logs, observer
+/// events, and the approval WARN record. When the tool declares a
+/// source-level redaction ([`Tool::redact_args_for_log`]) — because its raw
+/// arguments carry secret values the generic scrubber cannot recognize — that
+/// redacted form is used; otherwise the existing generic string scrub applies.
+/// The generic scrubber still runs over the redacted form as defense in depth.
+pub fn loggable_args_string(
+    tool: Option<&dyn zeroclaw_api::tool::Tool>,
+    args: &serde_json::Value,
+) -> String {
+    match tool.and_then(|t| t.redact_args_for_log(args)) {
+        Some(redacted) => scrub_credentials(&redacted.to_string()),
+        None => scrub_credentials(&args.to_string()),
+    }
+}
+
+/// Log-safe JSON form of a tool call's `args`, for structured log attributes
+/// and client-facing `TurnEvent::ToolCall` frames. When the tool redacts its
+/// own arguments the redacted value is returned unchanged; otherwise the
+/// arguments pass through untouched, preserving prior behavior for every tool
+/// that does not opt in.
+pub fn loggable_args_value(
+    tool: Option<&dyn zeroclaw_api::tool::Tool>,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    tool.and_then(|t| t.redact_args_for_log(args))
+        .unwrap_or_else(|| args.clone())
+}
+
+/// Presentation-safe JSON form for draft start/completion events.
+///
+/// Resolved tools may provide their canonical secret-aware projection. Known
+/// tools without one retain their argument shape after generic credential
+/// scrubbing. Unresolved tools expose no arguments: the runtime cannot know
+/// which fields are safe to reflect before it resolves a trusted tool.
+pub fn streamable_args_value(
+    tool: Option<&dyn zeroclaw_api::tool::Tool>,
+    args: &serde_json::Value,
+) -> serde_json::Value {
+    match tool {
+        Some(tool) => tool
+            .redact_args_for_log(args)
+            .unwrap_or_else(|| scrub_credentials_value(args.clone())),
+        None => serde_json::json!({}),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_credential_key, scrub_credentials, scrub_credentials_value};
+    use super::{
+        is_credential_key, scrub_credentials, scrub_credentials_value, streamable_args_value,
+    };
+    use crate::tools::config_patch::ConfigPatchTool;
+    use std::sync::Arc;
+    use zeroclaw_config::policy::SecurityPolicy;
+
+    #[test]
+    fn unresolved_tool_stream_projection_hides_arbitrary_arguments() {
+        let sentinel = "sentinel-progress-secret-must-not-leak";
+        let projected = streamable_args_value(
+            None,
+            &serde_json::json!({"action": sentinel, "query": sentinel}),
+        );
+
+        assert_eq!(projected, serde_json::json!({}));
+        assert!(!projected.to_string().contains(sentinel));
+    }
+
+    #[test]
+    fn stream_projection_uses_the_tools_secret_aware_projection() {
+        let sentinel = "sentinel-stream-secret-must-not-leak";
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ConfigPatchTool::new(
+            dir.path().join("config.toml"),
+            Arc::new(SecurityPolicy::default()),
+        );
+        let projected = streamable_args_value(
+            Some(&tool),
+            &serde_json::json!({
+                "ops": [{
+                    "op": "add",
+                    "path": "/providers/models/openai/default/api_key",
+                    "value": sentinel
+                }]
+            }),
+        );
+        let rendered = projected.to_string();
+
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        assert!(!rendered.contains(sentinel), "{rendered}");
+    }
 
     #[test]
     fn credential_key_classification_combines_shared_secret_policies() {

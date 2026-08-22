@@ -444,6 +444,7 @@ mod payload_capture_tests {
             draft_reasoning,
             agent_alias: None,
             turn_id: "trace-req-test",
+            tools: &[],
         }
     }
 
@@ -831,6 +832,7 @@ mod streaming_fallback_tests {
             event_tx: None,
             hooks: None,
             dedup_exempt_tools: &[],
+            tools: &[],
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
@@ -887,6 +889,7 @@ mod streaming_fallback_tests {
             event_tx: None,
             hooks: None,
             dedup_exempt_tools: &[],
+            tools: &[],
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
@@ -959,6 +962,7 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            tools: &[],
         };
 
         let outcome = call_provider(
@@ -1022,6 +1026,7 @@ mod streaming_fallback_tests {
             turn_id: "test-turn",
             agent_alias: None,
             parent_agent_alias: None,
+            tools: &[],
         };
 
         let outcome = call_provider(

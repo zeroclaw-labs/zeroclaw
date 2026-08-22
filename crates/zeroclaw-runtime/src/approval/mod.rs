@@ -19,6 +19,11 @@ use zeroclaw_config::schema::RiskProfileConfig;
 pub struct ApprovalRequest {
     pub tool_name: String,
     pub arguments: serde_json::Value,
+    /// Host-computed prompt text from `Tool::approval_summary`. When set,
+    /// approval surfaces show this instead of the generic argument summary.
+    /// Computed by the tool from the arguments' effects — never model text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_summary: Option<String>,
 }
 
 /// The user's response to an approval request.
@@ -259,11 +264,24 @@ impl ApprovalManager {
 
 /// Display the approval prompt and read user input from the controlling
 /// terminal when available, falling back to stdin otherwise.
+/// The prompt text an operator reads before answering. Separated from the
+/// terminal I/O so the one security-relevant property — a host summary, when
+/// present, replaces the generic argument dump — is testable.
+fn render_cli_approval_prompt(request: &ApprovalRequest) -> String {
+    let summary = request
+        .host_summary
+        .clone()
+        .unwrap_or_else(|| summarize_args(&request.arguments));
+    // Keep multi-line host summaries aligned under the tool name.
+    format!(
+        "\n🔧 Agent wants to execute: {}\n   {}\n",
+        request.tool_name,
+        summary.replace('\n', "\n   ")
+    )
+}
+
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
-    let summary = summarize_args(&request.arguments);
-    eprintln!();
-    eprintln!("🔧 Agent wants to execute: {}", request.tool_name);
-    eprintln!("   {summary}");
+    eprint!("{}", render_cli_approval_prompt(request));
     eprint!("   [Y]es / [N]o / [A]lways for {}: ", request.tool_name);
     let _ = io::stderr().flush();
 
@@ -827,10 +845,48 @@ mod tests {
         let req = ApprovalRequest {
             tool_name: "shell".into(),
             arguments: serde_json::json!({"command": "echo hi"}),
+            host_summary: None,
         };
         let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            !json.contains("host_summary"),
+            "an absent host summary must not appear on the wire: {json}"
+        );
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
+    }
+
+    #[test]
+    fn cli_prompt_prefers_the_host_summary_over_the_argument_dump() {
+        let with_summary = ApprovalRequest {
+            tool_name: "config_patch".into(),
+            arguments: serde_json::json!({"ops": [{"op": "replace"}]}),
+            host_summary: Some("Autonomy: Supervised -> Full\nsecond line".into()),
+        };
+        let rendered = render_cli_approval_prompt(&with_summary);
+        assert!(
+            rendered.contains("Autonomy: Supervised -> Full"),
+            "the host-computed text is what the operator reads: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ops"),
+            "the raw argument dump is replaced, not appended: {rendered}"
+        );
+        assert!(
+            rendered.contains("\n   second line"),
+            "multi-line summaries stay aligned under the tool name: {rendered}"
+        );
+
+        let without_summary = ApprovalRequest {
+            tool_name: "shell".into(),
+            arguments: serde_json::json!({"command": "echo hi"}),
+            host_summary: None,
+        };
+        let rendered = render_cli_approval_prompt(&without_summary);
+        assert!(
+            rendered.contains("echo hi"),
+            "without a host summary the generic argument summary still shows: {rendered}"
+        );
     }
 
     // ──default approved tools in channels ──

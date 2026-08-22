@@ -84,7 +84,9 @@ fn locked_down_risk() -> RiskProfileConfig {
         delegation_policy: DelegationPolicy::default(),
         approval_route: None,
         allowed_tools: vec![],
-        excluded_tools: vec![],
+        // Tightest preset: config authoring is not offered at all, not even
+        // behind a prompt.
+        excluded_tools: vec!["config_patch".to_string()],
         sandbox_enabled: Some(true),
         sandbox_backend: None,
         firejail_args: vec![],
@@ -101,7 +103,10 @@ fn balanced_risk() -> RiskProfileConfig {
         block_high_risk_commands: true,
         shell_env_passthrough: vec![],
         auto_approve: vec![],
-        always_ask: vec![],
+        // Config authoring must survive a custom `auto_approve = ["*"]`:
+        // `always_ask` outranks `auto_approve` in `approval_requirement`, so
+        // this pin keeps the operator in the loop even then.
+        always_ask: vec!["config_patch".to_string()],
         allowed_roots: vec![],
         delegation_policy: DelegationPolicy {
             mode: DelegationMode::Allow,
@@ -800,5 +805,46 @@ mod tests {
         .expect("deserialize legacy channel without fields");
 
         assert!(channel.fields.is_empty());
+    }
+
+    /// Who may author config through the `config_patch` tool, per preset.
+    /// This is the access matrix the tool's registration comment cites; if a
+    /// preset edit changes any row, this fails and the justification gets
+    /// re-read instead of silently drifting.
+    #[test]
+    fn config_patch_tool_access_matrix_across_presets() {
+        let ws = std::path::Path::new("/tmp/zeroclaw-preset-probe");
+
+        let locked = locked_down_risk();
+        let policy = crate::policy::SecurityPolicy::from_risk_profile(&locked, ws);
+        assert!(
+            !policy.is_tool_allowed("config_patch"),
+            "locked_down must not offer config authoring at all"
+        );
+
+        let balanced = balanced_risk();
+        let policy = crate::policy::SecurityPolicy::from_risk_profile(&balanced, ws);
+        assert!(
+            policy.is_tool_allowed("config_patch"),
+            "balanced offers the tool"
+        );
+        assert!(
+            balanced.always_ask.iter().any(|t| t == "config_patch"),
+            "balanced pins config_patch to always_ask so a custom \
+             auto_approve wildcard cannot silence the prompt"
+        );
+
+        let yolo = yolo_risk();
+        let policy = crate::policy::SecurityPolicy::from_risk_profile(&yolo, ws);
+        assert!(
+            policy.is_tool_allowed("config_patch"),
+            "yolo offers the tool"
+        );
+        assert_eq!(
+            yolo.level,
+            AutonomyLevel::Full,
+            "yolo is Full autonomy, which auto-approves every tool — \
+             consistent with it already being able to edit config via shell"
+        );
     }
 }

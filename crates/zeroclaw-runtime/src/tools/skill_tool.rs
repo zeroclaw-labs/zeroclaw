@@ -393,6 +393,23 @@ impl Tool for SkillBuiltinTool {
         (*self.advertised_schema).clone()
     }
 
+    fn approval_requires_operator(&self) -> bool {
+        self.target_tool.approval_requires_operator()
+    }
+
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        let merged = merge_locked_args(&self.locked_args, args.clone());
+        self.target_tool.approval_summary(&merged)
+    }
+
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        let merged = merge_locked_args(&self.locked_args, args.clone());
+        self.target_tool.approval_summary_for_call(&merged)
+    }
+
     // Hand out the stored schema by `Arc::clone` instead of the trait
     // default's per-call deep clone — specs are rebuilt every agent-loop
     // iteration and elevated skill tools can front MCP-derived schemas.
@@ -788,6 +805,53 @@ mod tests {
         }
     }
 
+    struct OperatorApprovalTool;
+
+    impl ::zeroclaw_api::attribution::Attributable for OperatorApprovalTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+
+        fn alias(&self) -> &str {
+            "operator_approval"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for OperatorApprovalTool {
+        fn name(&self) -> &str {
+            "operator_approval"
+        }
+
+        fn description(&self) -> &str {
+            "Operator-only test tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn approval_requires_operator(&self) -> bool {
+            true
+        }
+
+        fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+            Some(format!(
+                "scope={}; input={}",
+                args.get("scope")?.as_str()?,
+                args.get("input")?.as_str()?
+            ))
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: ToolOutput::default(),
+                error: None,
+            })
+        }
+    }
+
     fn sample_builtin_skill_tool() -> SkillTool {
         SkillTool {
             name: "use_shell".to_string(),
@@ -918,6 +982,29 @@ mod tests {
         let spec = tool.spec();
         assert_eq!(spec.name, "my_skill__use_shell");
         assert_eq!(spec.description, "Elevated shell access via skill");
+    }
+
+    #[test]
+    fn skill_builtin_tool_forwards_operator_approval_contract_with_locked_args() {
+        let target: Arc<dyn Tool> = Arc::new(OperatorApprovalTool);
+        let mut locked = HashMap::new();
+        locked.insert("scope".to_string(), "fixed".to_string());
+        let st = elevation_skill_tool("builtin", "operator_approval", locked.clone());
+        let tool = SkillBuiltinTool::new("ops", &st, target, locked);
+
+        assert!(
+            tool.approval_requires_operator(),
+            "a skill wrapper must not erase its target's operator-only marker"
+        );
+        assert_eq!(
+            tool.approval_summary(&serde_json::json!({
+                "scope": "caller-controlled",
+                "input": "request"
+            }))
+            .as_deref(),
+            Some("scope=fixed; input=request"),
+            "the target must summarize the same locked-argument merge that executes"
+        );
     }
 
     #[test]
@@ -1249,6 +1336,65 @@ mod tests {
         assert!(
             registry.iter().any(|t| t.name() == "ops__use_shell"),
             "the scoped elevation wrapper must be the only callable path"
+        );
+    }
+
+    #[test]
+    fn operator_only_config_patch_cannot_be_hidden_by_a_skill_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let skill_dir = tmp.path().join("skills").join("ops");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.toml"),
+            r#"[skill]
+name = "ops"
+description = "operator-only alias regression"
+version = "1"
+
+[[tools]]
+name = "patch"
+description = "alias config patch"
+kind = "builtin"
+command = ""
+target = "config_patch"
+"#,
+        )
+        .unwrap();
+        let (skills, dropped) =
+            crate::skills::load_skills_from_directory(&tmp.path().join("skills"), true);
+        assert_eq!(
+            skills.len(),
+            1,
+            "the SKILL.toml fixture must load; dropped={dropped:?}"
+        );
+
+        let policy = Arc::new(SecurityPolicy {
+            excluded_tools: Some(vec!["config_patch".to_string()]),
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let config_patch: Arc<dyn Tool> =
+            Arc::new(crate::tools::config_patch::ConfigPatchTool::new(
+                tmp.path().join("config.toml"),
+                Arc::clone(&policy),
+            ));
+        let resolution = vec![Arc::clone(&config_patch)];
+        let mut registry: Vec<Box<dyn Tool>> = vec![Box::new(crate::tools::ArcToolRef(
+            Arc::clone(&config_patch),
+        ))];
+        crate::agent::loop_::apply_policy_tool_filter(&mut registry, Some(&policy), None);
+        crate::tools::register_skill_tools_with_context(
+            &mut registry,
+            &skills,
+            Arc::clone(&policy),
+            &resolution,
+        );
+
+        assert!(
+            registry
+                .iter()
+                .all(|tool| tool.name() != "config_patch" && tool.name() != "ops__patch"),
+            "excluding config_patch must not leave a model-callable operator-only alias"
         );
     }
 }

@@ -641,6 +641,17 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         true
     }
 
+    /// True when this channel IS an authenticated operator surface — a
+    /// client that proved operator identity to connect (e.g. the gateway's
+    /// paired websocket client), as opposed to a remote chat account.
+    /// Tools whose approval is operator-only (`Tool::approval_requires_operator`)
+    /// are offered for approval only on such channels; everywhere else the
+    /// channel is notified and the call is denied. Default: `false` — a new
+    /// channel type must opt in to granting authority, never inherit it.
+    fn is_operator_approval_surface(&self) -> bool {
+        false
+    }
+
     /// Send a discrete-choice prompt with options.
     ///
     /// Each `(callback_id, label)` pair represents one choice. Whether
@@ -948,6 +959,25 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
             .request_approval(recipient, request)
             .await?
             .map(AttributedApprovalResponse::operator))
+    }
+
+    /// Request approval for a tool whose authority may be granted only by an
+    /// authenticated operator surface.
+    ///
+    /// The default fails closed for ordinary chat channels and delegates to
+    /// the attributed approval path only after the channel has explicitly
+    /// opted into [`Channel::is_operator_approval_surface`]. Synthetic
+    /// fan-out channels must override this method when they contain a mix of
+    /// operator and non-operator back-channels so only the former are asked.
+    async fn request_operator_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        if !self.is_operator_approval_surface() {
+            return Ok(None);
+        }
+        self.request_approval_attributed(recipient, request).await
     }
 
     /// Present a long-lived, out-of-band gate prompt (e.g. a parked SOP
