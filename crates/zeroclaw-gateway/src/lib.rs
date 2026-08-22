@@ -580,6 +580,7 @@ pub struct AppState {
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)] // supervised-run wiring; params mirror the daemon registry
 pub async fn run_gateway(
     host: &str,
     port: u16,
@@ -596,6 +597,10 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // The daemon's canonical live pairing authority, shared with the RPC
+    // native auth provider. `None` (standalone gateway) constructs a
+    // local guard from config as before.
+    shared_pairing: Option<PairingGuard>,
     readiness: Option<zeroclaw_runtime::daemon::GatewayReadinessReporter>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
@@ -1281,10 +1286,15 @@ pub async fn run_gateway(
     };
 
     // ── Pairing guard ──────────────────────────────────────
-    let pairing = Arc::new(PairingGuard::new(
-        config.gateway.require_pairing,
-        &config.gateway.paired_tokens,
-    ));
+    // Supervised runs share the daemon's live authority so pairing and
+    // revocation reach RPC authentication too; standalone constructs its
+    // own from config exactly as before.
+    let pairing = Arc::new(shared_pairing.unwrap_or_else(|| {
+        PairingGuard::new(
+            config.gateway.require_pairing,
+            &config.gateway.paired_tokens,
+        )
+    }));
     let rate_limit_max_keys = normalize_max_keys(
         config.gateway.rate_limit_max_keys,
         RATE_LIMIT_MAX_KEYS_DEFAULT,
@@ -5033,6 +5043,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5101,6 +5112,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
         });
@@ -5147,6 +5159,7 @@ mod tests {
                 "127.0.0.1",
                 0,
                 config,
+                None,
                 None,
                 None,
                 None,
@@ -5218,6 +5231,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 Some(readiness),
             )
             .await
@@ -5281,6 +5295,7 @@ mod tests {
             "127.0.0.1",
             0,
             config,
+            None,
             None,
             None,
             None,

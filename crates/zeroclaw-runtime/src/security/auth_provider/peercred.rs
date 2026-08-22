@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
@@ -67,13 +68,15 @@ impl UidRoster {
 
 pub struct PeercredAuthProvider {
     daemon_uid: u32,
-    trust_daemon_uid: bool,
+    /// Live view of `security.trust_daemon_uid`: refreshed with the
+    /// authorization policy so narrowing it applies without restart.
+    trust_daemon_uid: Arc<AtomicBool>,
     roster: Arc<UidRoster>,
 }
 
 impl PeercredAuthProvider {
     #[must_use]
-    pub fn new(daemon_uid: u32, trust_daemon_uid: bool, roster: Arc<UidRoster>) -> Self {
+    pub fn new(daemon_uid: u32, trust_daemon_uid: Arc<AtomicBool>, roster: Arc<UidRoster>) -> Self {
         Self {
             daemon_uid,
             trust_daemon_uid,
@@ -115,7 +118,7 @@ impl AuthProvider for PeercredAuthProvider {
                 reason: DenyReason::BadCredential,
             };
         };
-        if *uid == self.daemon_uid && self.trust_daemon_uid {
+        if *uid == self.daemon_uid && self.trust_daemon_uid.load(Ordering::Acquire) {
             return AuthOutcome::Verified(AuthenticatedIdentity::shared_operator(
                 AuthMethod::Peercred,
             ));
@@ -160,7 +163,8 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_uid_is_trusted_while_the_flag_is_on() {
-        let provider = PeercredAuthProvider::new(1000, true, roster_with(&[]));
+        let provider =
+            PeercredAuthProvider::new(1000, Arc::new(AtomicBool::new(true)), roster_with(&[]));
         let out = provider.verify(&Credential::Peercred { uid: 1000 }).await;
         let identity = out.identity().expect("trusted");
         assert_eq!(identity.subject, IdentitySubject::SharedOperator);
@@ -172,7 +176,8 @@ mod tests {
 
     #[tokio::test]
     async fn trust_daemon_uid_off_requires_a_roster_mapping() {
-        let provider = PeercredAuthProvider::new(1000, false, roster_with(&[]));
+        let provider =
+            PeercredAuthProvider::new(1000, Arc::new(AtomicBool::new(false)), roster_with(&[]));
         assert!(
             !provider
                 .verify(&Credential::Peercred { uid: 1000 })
@@ -180,7 +185,11 @@ mod tests {
                 .is_allowed(),
             "with the flag off the daemon's own uid holds no implicit trust"
         );
-        let provider = PeercredAuthProvider::new(1000, false, roster_with(&[("op", 1000)]));
+        let provider = PeercredAuthProvider::new(
+            1000,
+            Arc::new(AtomicBool::new(false)),
+            roster_with(&[("op", 1000)]),
+        );
         let out = provider.verify(&Credential::Peercred { uid: 1000 }).await;
         assert_eq!(
             out.identity().expect("roster-mapped").subject,
@@ -192,7 +201,11 @@ mod tests {
 
     #[tokio::test]
     async fn roster_uid_authenticates_as_its_durable_principal() {
-        let provider = PeercredAuthProvider::new(1000, true, roster_with(&[("bob", 2222)]));
+        let provider = PeercredAuthProvider::new(
+            1000,
+            Arc::new(AtomicBool::new(true)),
+            roster_with(&[("bob", 2222)]),
+        );
         let out = provider.verify(&Credential::Peercred { uid: 2222 }).await;
         let identity = out.identity().expect("authenticated");
         assert_eq!(
@@ -219,7 +232,7 @@ mod tests {
             },
         );
         let roster = Arc::new(UidRoster::from_config(&config));
-        let provider = PeercredAuthProvider::new(1000, true, roster);
+        let provider = PeercredAuthProvider::new(1000, Arc::new(AtomicBool::new(true)), roster);
         let out = provider.verify(&Credential::Peercred { uid: 2222 }).await;
         assert_eq!(
             out.identity().expect("authenticated").subject,
@@ -231,7 +244,11 @@ mod tests {
 
     #[tokio::test]
     async fn unrostered_uid_and_root_are_denied() {
-        let provider = PeercredAuthProvider::new(1000, true, roster_with(&[("bob", 2222)]));
+        let provider = PeercredAuthProvider::new(
+            1000,
+            Arc::new(AtomicBool::new(true)),
+            roster_with(&[("bob", 2222)]),
+        );
         assert!(
             !provider
                 .verify(&Credential::Peercred { uid: 3333 })
@@ -250,7 +267,8 @@ mod tests {
     #[tokio::test]
     async fn roster_replacement_applies_live() {
         let roster = roster_with(&[("bob", 2222)]);
-        let provider = PeercredAuthProvider::new(1000, true, Arc::clone(&roster));
+        let provider =
+            PeercredAuthProvider::new(1000, Arc::new(AtomicBool::new(true)), Arc::clone(&roster));
         assert!(
             provider
                 .verify(&Credential::Peercred { uid: 2222 })
@@ -288,7 +306,8 @@ mod tests {
 
     #[tokio::test]
     async fn non_peercred_credentials_are_not_accepted() {
-        let provider = PeercredAuthProvider::new(1000, true, roster_with(&[]));
+        let provider =
+            PeercredAuthProvider::new(1000, Arc::new(AtomicBool::new(true)), roster_with(&[]));
         assert!(!provider.accepts(&Credential::Bearer("tok".into())));
         assert!(!provider.accepts(&Credential::None));
         assert!(

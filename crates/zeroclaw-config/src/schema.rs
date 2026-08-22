@@ -20802,6 +20802,24 @@ impl Config {
             }
         }
 
+        // A remote WSS listener with no possible credential path must fail
+        // validation rather than start: before enforcement that meant
+        // silently accepting unauthenticated clients, after it an
+        // enforced-but-unusable listener. gateway.require_pairing keeps a
+        // recoverable path (pair, then authenticate) even with no tokens
+        // yet.
+        if self.wss.enabled
+            && self.oidc.is_empty()
+            && self.gateway.paired_tokens.is_empty()
+            && !self.gateway.require_pairing
+        {
+            validation_bail!(
+                ValidationFailed,
+                "wss.enabled",
+                "wss.enabled requires a remote credential path: configure [oidc.<alias>], enable gateway.require_pairing (then pair a device), or keep an existing paired token",
+            );
+        }
+
         // Security OTP / estop
         if self.security.otp.challenge_max_attempts == 0 {
             validation_bail!(
@@ -24409,6 +24427,26 @@ zeroclaw-operators = "operator"
             "operator"
         );
         assert_eq!(config.users["alice"].uid, Some(1000));
+    }
+
+    #[::core::prelude::v1::test]
+    fn wss_without_any_credential_path_fails_validation() {
+        let mut config = Config::default();
+        config.wss.enabled = true;
+        config.gateway.require_pairing = false;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("remote credential path"), "got: {err}");
+
+        config.gateway.require_pairing = true;
+        config
+            .validate()
+            .expect("pairing-capable wss config is startable");
+
+        config.gateway.require_pairing = false;
+        config.gateway.paired_tokens = vec!["zc_tok".into()];
+        config
+            .validate()
+            .expect("an existing paired token is a path");
     }
 
     #[::core::prelude::v1::test]

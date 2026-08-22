@@ -279,7 +279,8 @@ pub async fn run_wss_listener(
                     let mut transport = WssTransport::new(ws_stream, remote_addr);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
+                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer)
+                        .with_transport(transport.kind(), transport.credential());
                     dispatcher.run(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {
