@@ -3,88 +3,13 @@
 use super::traits::{
     ExportFilter, Memory, MemoryCategory, MemoryEntry, MemoryStats, ProceduralMessage, StoreOptions,
 };
+use crate::sqlite_permissions::harden_sqlite_storage;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
 use std::path::Path;
 use std::sync::Arc;
-
-#[cfg(unix)]
-fn ensure_owner_only_dir(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::create_dir_all(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_owner_only_dir(path: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(path)?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn ensure_owner_only_file(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-    if !path.exists() {
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-        {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn ensure_owner_only_file(path: &Path) -> anyhow::Result<()> {
-    if !path.exists() {
-        match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(path)
-        {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sqlite_sidecar_path(db_path: &Path, suffix: &str) -> std::path::PathBuf {
-    let mut path = db_path.as_os_str().to_os_string();
-    path.push(suffix);
-    path.into()
-}
-
-#[cfg(unix)]
-fn harden_existing_sqlite_sidecars(db_path: &Path) -> anyhow::Result<()> {
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = sqlite_sidecar_path(db_path, suffix);
-        if sidecar.exists() {
-            ensure_owner_only_file(&sidecar)?;
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn harden_existing_sqlite_sidecars(_db_path: &Path) -> anyhow::Result<()> {
-    Ok(())
-}
 
 /// Audit log entry operations.
 #[derive(Debug, Clone, Copy)]
@@ -130,10 +55,7 @@ impl<M: Memory> ::zeroclaw_api::attribution::Attributable for AuditedMemory<M> {
 impl<M: Memory> AuditedMemory<M> {
     pub fn new(inner: M, workspace_dir: &Path) -> anyhow::Result<Self> {
         let db_path = workspace_dir.join("memory").join("audit.db");
-        if let Some(parent) = db_path.parent() {
-            ensure_owner_only_dir(parent)?;
-        }
-        ensure_owner_only_file(&db_path)?;
+        harden_sqlite_storage(&db_path)?;
 
         let conn = Connection::open(&db_path)?;
         conn.execute_batch(
@@ -151,8 +73,7 @@ impl<M: Memory> AuditedMemory<M> {
              CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON memory_audit(timestamp);
              CREATE INDEX IF NOT EXISTS idx_audit_operation ON memory_audit(operation);",
         )?;
-        ensure_owner_only_file(&db_path)?;
-        harden_existing_sqlite_sidecars(&db_path)?;
+        harden_sqlite_storage(&db_path)?;
 
         Ok(Self {
             inner,
@@ -664,7 +585,7 @@ mod tests {
         std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o666)).unwrap();
 
         for suffix in ["-wal", "-shm"] {
-            let sidecar = sqlite_sidecar_path(&db_path, suffix);
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(&db_path, suffix);
             if sidecar.exists() {
                 std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o666)).unwrap();
             }
@@ -675,7 +596,7 @@ mod tests {
         assert_eq!(mode(&memory_dir), 0o700);
         assert_eq!(mode(&db_path), 0o600);
         for suffix in ["-wal", "-shm"] {
-            let sidecar = sqlite_sidecar_path(&db_path, suffix);
+            let sidecar = crate::sqlite_permissions::sqlite_sidecar_path(&db_path, suffix);
             if sidecar.exists() {
                 assert_eq!(mode(&sidecar), 0o600);
             }
