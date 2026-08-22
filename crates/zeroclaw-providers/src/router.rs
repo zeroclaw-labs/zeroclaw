@@ -358,6 +358,13 @@ impl ModelProvider for RouterModelProvider {
             .unwrap_or_default()
     }
 
+    fn vision_limited_by(&self, model: &str) -> Option<String> {
+        let (provider_idx, resolved_model) = self.resolve(model);
+        self.model_providers
+            .get(provider_idx)
+            .and_then(|(_, provider)| provider.vision_limited_by(&resolved_model))
+    }
+
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
         let (provider_idx, resolved_model) = self.resolve(model);
         self.model_providers

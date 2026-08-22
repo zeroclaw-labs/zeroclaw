@@ -87,6 +87,10 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.capabilities_for_model(&self.pinned_model)
     }
 
+    fn vision_limited_by(&self, _model: &str) -> Option<String> {
+        self.inner.vision_limited_by(&self.pinned_model)
+    }
+
     fn has_mixed_native_tool_support_for_model(&self, _model: &str) -> bool {
         self.inner
             .has_mixed_native_tool_support_for_model(&self.pinned_model)

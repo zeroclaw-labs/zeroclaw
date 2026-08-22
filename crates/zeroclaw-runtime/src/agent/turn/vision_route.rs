@@ -85,14 +85,26 @@ pub(crate) fn resolve_vision_provider(
                 model: vision_model,
             })
         } else if latest_user_image_marker_count > 0 {
+            // `vision_limited_by` already excludes the primary entry (it
+            // returns `None` when the primary itself is the non-vision
+            // entry), so any `Some` here names a genuine fallback and is
+            // safe to surface without re-deriving primary-vs-fallback from
+            // `provider_name`, whose format is not guaranteed to line up
+            // with the dotted entry name.
+            let message = match model_provider.vision_limited_by(model) {
+                Some(fallback_name) => format!(
+                    "received {latest_user_image_marker_count} image marker(s), but fallback model_provider={fallback_name} does not support vision input"
+                ),
+                None => format!(
+                    "received {latest_user_image_marker_count} image marker(s), but this model_provider does not support vision input"
+                ),
+            };
             return Err(ProviderCapabilityError {
-                        model_provider: provider_name.to_string(),
-                        capability: "vision".to_string(),
-                        message: format!(
-                            "received {latest_user_image_marker_count} image marker(s), but this model_provider does not support vision input"
-                        ),
-                    }
-                    .into());
+                model_provider: provider_name.to_string(),
+                capability: "vision".to_string(),
+                message,
+            }
+            .into());
         } else {
             ::zeroclaw_log::record!(
                 WARN,
@@ -354,6 +366,123 @@ vision = false
         assert!(
             err.to_string().contains("does not support vision"),
             "expected the vision-route capability error, got: {err}"
+        );
+    }
+
+    /// Regression: when the primary is an aggregate (e.g. a reliable
+    /// model_provider) whose non-vision entry is a configured fallback, the
+    /// capability error must name that fallback rather than blaming the
+    /// primary, since the primary itself may well support vision.
+    #[test]
+    fn resolve_vision_provider_names_fallback_in_capability_error() {
+        struct NonVisionWithNamedFallback;
+        #[async_trait::async_trait]
+        impl ModelProvider for NonVisionWithNamedFallback {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            fn capabilities_for_model(
+                &self,
+                _model: &str,
+            ) -> zeroclaw_api::model_provider::ProviderCapabilities {
+                zeroclaw_api::model_provider::ProviderCapabilities {
+                    vision: false,
+                    ..Default::default()
+                }
+            }
+            fn vision_limited_by(&self, _model: &str) -> Option<String> {
+                Some("zai.default".to_string())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for NonVisionWithNamedFallback {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "NonVisionWithNamedFallback"
+            }
+        }
+
+        let multimodal = MultimodalConfig::default();
+        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+
+        let err = resolve_vision_provider(
+            None,
+            &NonVisionWithNamedFallback,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+        )
+        .err()
+        .expect("a non-vision aggregate with no vision route must surface a capability error");
+
+        assert!(
+            err.to_string()
+                .contains("fallback model_provider=zai.default does not support vision input"),
+            "expected the fallback-named capability error, got: {err}"
+        );
+    }
+
+    /// Companion to the fallback-naming test above: a lone non-vision
+    /// provider (no aggregate, so nothing names a fallback) must keep the
+    /// original wording rather than being mislabeled as a fallback problem.
+    #[test]
+    fn resolve_vision_provider_keeps_primary_wording_without_a_named_fallback() {
+        struct PlainNonVisionPrimary;
+        #[async_trait::async_trait]
+        impl ModelProvider for PlainNonVisionPrimary {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+        }
+        impl zeroclaw_api::attribution::Attributable for PlainNonVisionPrimary {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Provider(
+                    zeroclaw_api::attribution::ProviderKind::Model(
+                        zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "PlainNonVisionPrimary"
+            }
+        }
+
+        let multimodal = MultimodalConfig::default();
+        let history = vec![ChatMessage::user("look [IMAGE:/tmp/x.png]".to_string())];
+
+        let err = resolve_vision_provider(
+            None,
+            &PlainNonVisionPrimary,
+            &history,
+            &multimodal,
+            "primary",
+            "primary-model",
+        )
+        .err()
+        .expect("a non-vision primary with no vision route must surface a capability error");
+
+        assert!(
+            err.to_string()
+                .contains("but this model_provider does not support vision input"),
+            "expected the original unnamed-primary wording, got: {err}"
         );
     }
 
