@@ -7,11 +7,13 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::authority::is_authoritative;
-use super::task_registry::{TaskKind, TaskRecord, TaskRegistry, TaskStatus};
+use super::task_registry::{
+    TaskKind, TaskRecord, TaskRegistry, TaskSnapshot, TaskStatus, TerminalSettlementIntent,
+};
 
 mod goal;
 
-const CONTROL_PLANE_SCHEMA_VERSION: i64 = 7;
+const CONTROL_PLANE_SCHEMA_VERSION: i64 = 8;
 
 pub struct SqliteTaskStore {
     conn: Mutex<Connection>,
@@ -104,6 +106,25 @@ fn migrate_schema(conn: &Connection) -> Result<()> {
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .context("read control-plane schema version")?;
     goal::migrate_schema(conn, version)?;
+    if version < 8 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS terminal_settlement_intents (
+                 task_id          TEXT PRIMARY KEY
+                                  REFERENCES tasks(id) ON DELETE CASCADE,
+                 owner_pid        INTEGER NOT NULL,
+                 owner_boot_id    TEXT NOT NULL,
+                 desired_status   TEXT NOT NULL,
+                 artifact_path    TEXT NOT NULL,
+                 artifact_ref     TEXT,
+                 artifact_sha256  TEXT NOT NULL,
+                 terminal_error   TEXT
+             );
+             CREATE INDEX IF NOT EXISTS idx_terminal_settlement_intents_owner
+                ON terminal_settlement_intents(owner_pid, owner_boot_id);
+             PRAGMA user_version = 8;",
+        )
+        .context("apply control-plane schema v8")?;
+    }
     if version > CONTROL_PLANE_SCHEMA_VERSION {
         ::zeroclaw_log::record!(
             WARN,
@@ -197,6 +218,230 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
     })
 }
 
+fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSnapshot> {
+    Ok(TaskSnapshot {
+        task: row_to_record(row)?,
+        output: row.get("output")?,
+        error: row.get("error")?,
+    })
+}
+
+fn row_to_settlement_intent(row: &rusqlite::Row<'_>) -> rusqlite::Result<TerminalSettlementIntent> {
+    let status_s: String = row.get("desired_status")?;
+    let desired_status = status_from_db(&status_s).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, error.into())
+    })?;
+    Ok(TerminalSettlementIntent {
+        task_id: row.get("task_id")?,
+        owner_pid: row.get::<_, i64>("owner_pid")? as u32,
+        owner_boot_id: row.get("owner_boot_id")?,
+        desired_status,
+        artifact_path: row.get("artifact_path")?,
+        artifact_ref: row.get("artifact_ref")?,
+        artifact_sha256: row.get("artifact_sha256")?,
+        terminal_error: row.get("terminal_error")?,
+    })
+}
+
+fn validate_settlement_intent(intent: &TerminalSettlementIntent) -> Result<()> {
+    anyhow::ensure!(
+        intent.desired_status.is_terminal(),
+        "terminal settlement intent for {} must use a terminal status",
+        intent.task_id
+    );
+    anyhow::ensure!(
+        !intent.artifact_path.is_empty(),
+        "terminal settlement intent for {} has no artifact path",
+        intent.task_id
+    );
+    if intent.desired_status == TaskStatus::Completed {
+        anyhow::ensure!(
+            intent
+                .artifact_ref
+                .as_deref()
+                .is_some_and(|artifact_ref| !artifact_ref.is_empty()),
+            "completed settlement intent for {} has no artifact reference",
+            intent.task_id
+        );
+    }
+    anyhow::ensure!(
+        hex::decode(&intent.artifact_sha256)
+            .map(|digest| digest.len() == 32)
+            .unwrap_or(false),
+        "terminal settlement intent for {} has an invalid SHA-256 digest",
+        intent.task_id
+    );
+    Ok(())
+}
+
+fn delete_settlement_intent_record(
+    conn: &Connection,
+    intent: &TerminalSettlementIntent,
+) -> Result<usize> {
+    conn.execute(
+        "DELETE FROM terminal_settlement_intents
+          WHERE task_id = ?1
+            AND owner_pid = ?2
+            AND owner_boot_id = ?3
+            AND desired_status = ?4
+            AND artifact_path = ?5
+            AND artifact_ref IS ?6
+            AND artifact_sha256 = ?7
+            AND terminal_error IS ?8",
+        params![
+            &intent.task_id,
+            intent.owner_pid as i64,
+            &intent.owner_boot_id,
+            status_to_db(intent.desired_status),
+            &intent.artifact_path,
+            &intent.artifact_ref,
+            &intent.artifact_sha256,
+            &intent.terminal_error,
+        ],
+    )
+    .context("delete terminal settlement intent")
+}
+
+fn persist_settlement_intent_record(
+    conn: &mut Connection,
+    intent: &TerminalSettlementIntent,
+) -> Result<bool> {
+    validate_settlement_intent(intent)?;
+    let tx = conn
+        .transaction()
+        .context("begin settlement intent transaction")?;
+    let task_is_active: bool = tx
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM tasks
+                 WHERE id = ?1
+                   AND owner_pid = ?2
+                   AND owner_boot_id = ?3
+                   AND status NOT IN ('completed','failed','cancelled','lost','timed_out')
+            )",
+            params![
+                &intent.task_id,
+                intent.owner_pid as i64,
+                &intent.owner_boot_id
+            ],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("check terminal settlement owner")?
+        != 0;
+    if !task_is_active {
+        tx.commit()
+            .context("finish inactive settlement intent check")?;
+        return Ok(false);
+    }
+
+    let inserted = tx
+        .execute(
+            "INSERT INTO terminal_settlement_intents
+                (task_id, owner_pid, owner_boot_id, desired_status, artifact_path,
+                 artifact_ref, artifact_sha256, terminal_error)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(task_id) DO NOTHING",
+            params![
+                &intent.task_id,
+                intent.owner_pid as i64,
+                &intent.owner_boot_id,
+                status_to_db(intent.desired_status),
+                &intent.artifact_path,
+                &intent.artifact_ref,
+                &intent.artifact_sha256,
+                &intent.terminal_error,
+            ],
+        )
+        .context("persist terminal settlement intent")?;
+    if inserted == 1 {
+        tx.commit().context("commit terminal settlement intent")?;
+        return Ok(true);
+    }
+
+    let existing = tx
+        .query_row(
+            "SELECT * FROM terminal_settlement_intents WHERE task_id = ?1",
+            params![&intent.task_id],
+            row_to_settlement_intent,
+        )
+        .optional()
+        .context("read existing terminal settlement intent")?;
+    if let Some(existing) = existing {
+        anyhow::ensure!(
+            existing == intent.clone(),
+            "conflicting terminal settlement intent for task {}",
+            intent.task_id
+        );
+        tx.commit()
+            .context("commit existing terminal settlement intent")?;
+        return Ok(true);
+    }
+
+    tx.commit()
+        .context("finish missing settlement intent check")?;
+    Ok(false)
+}
+
+fn promote_settlement_record(
+    conn: &mut Connection,
+    intent: &TerminalSettlementIntent,
+    resolved_status: TaskStatus,
+    output: Option<String>,
+    error: Option<String>,
+) -> Result<bool> {
+    anyhow::ensure!(
+        resolved_status.is_terminal(),
+        "terminal settlement resolution requires a terminal status"
+    );
+    let tx = conn
+        .transaction()
+        .context("begin terminal settlement promotion")?;
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let changed = tx
+        .execute(
+            "UPDATE tasks
+                SET status = ?1,
+                    output = ?2,
+                    error = ?3,
+                    finished_at = ?4
+              WHERE id = ?5
+                AND owner_pid = ?6
+                AND owner_boot_id = ?7
+                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')
+                AND EXISTS (
+                    SELECT 1
+                      FROM terminal_settlement_intents
+                     WHERE task_id = ?5
+                       AND owner_pid = ?6
+                       AND owner_boot_id = ?7
+                       AND desired_status = ?8
+                       AND artifact_path = ?9
+                       AND artifact_ref IS ?10
+                       AND artifact_sha256 = ?11
+                       AND terminal_error IS ?12
+                )",
+            params![
+                status_to_db(resolved_status),
+                output,
+                error,
+                finished_at,
+                &intent.task_id,
+                intent.owner_pid as i64,
+                &intent.owner_boot_id,
+                status_to_db(intent.desired_status),
+                &intent.artifact_path,
+                &intent.artifact_ref,
+                &intent.artifact_sha256,
+                &intent.terminal_error,
+            ],
+        )
+        .context("promote terminal settlement")?;
+    let _ = delete_settlement_intent_record(&tx, intent)?;
+    tx.commit()
+        .context("commit terminal settlement promotion")?;
+    Ok(changed == 1)
+}
+
 /// Collect query rows, SKIPPING (and logging) any single row that fails to convert —
 /// one unrecognised/corrupt record (e.g. a forward-incompat `kind`/`status` written by a
 /// newer binary) must not fail the whole enumeration and starve the reaper (finding #3).
@@ -267,17 +512,62 @@ fn update_task_status_record(
     let finished_at = status
         .is_terminal()
         .then(|| chrono::Utc::now().to_rfc3339());
-    conn.execute(
-        "UPDATE tasks
-            SET status = ?1,
-                output = COALESCE(?2, output),
-                error  = COALESCE(?3, error),
-                finished_at = COALESCE(?4, finished_at)
-          WHERE id = ?5
-            AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
-        params![status_to_db(status), output, error, finished_at, id],
-    )
-    .context("update task status")
+    let changed = conn
+        .execute(
+            "UPDATE tasks
+                SET status = ?1,
+                    output = COALESCE(?2, output),
+                    error  = COALESCE(?3, error),
+                    finished_at = COALESCE(?4, finished_at)
+              WHERE id = ?5
+                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
+            params![status_to_db(status), output, error, finished_at, id],
+        )
+        .context("update task status")?;
+    if changed > 0 && status.is_terminal() {
+        conn.execute(
+            "DELETE FROM terminal_settlement_intents WHERE task_id = ?1",
+            params![id],
+        )
+        .context("delete stale terminal settlement intent")?;
+    }
+    Ok(changed)
+}
+
+fn transition_task_terminal_record(
+    conn: &mut Connection,
+    id: &str,
+    status: TaskStatus,
+    output: Option<String>,
+    error: Option<String>,
+) -> Result<usize> {
+    anyhow::ensure!(
+        status.is_terminal(),
+        "terminal transition requires a terminal status"
+    );
+    let tx = conn.transaction().context("begin terminal transition")?;
+    let finished_at = chrono::Utc::now().to_rfc3339();
+    let changed = tx
+        .execute(
+            "UPDATE tasks
+                SET status = ?1,
+                    output = ?2,
+                    error = ?3,
+                    finished_at = ?4
+              WHERE id = ?5
+                AND status NOT IN ('completed','failed','cancelled','lost','timed_out')",
+            params![status_to_db(status), output, error, finished_at, id],
+        )
+        .context("transition task terminal")?;
+    if changed == 1 {
+        tx.execute(
+            "DELETE FROM terminal_settlement_intents WHERE task_id = ?1",
+            params![id],
+        )
+        .context("delete stale terminal settlement intent")?;
+    }
+    tx.commit().context("commit terminal transition")?;
+    Ok(changed)
 }
 
 fn claim_task_owner_record(
@@ -332,9 +622,71 @@ impl TaskRegistry for SqliteTaskStore {
         Ok(())
     }
 
-    async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
+    async fn transition_terminal(
+        &self,
+        id: &str,
+        status: TaskStatus,
+        output: Option<String>,
+        error: Option<String>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        Ok(transition_task_terminal_record(&mut conn, id, status, output, error)? == 1)
+    }
+
+    async fn persist_terminal_settlement_intent(
+        &self,
+        intent: TerminalSettlementIntent,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        persist_settlement_intent_record(&mut conn, &intent)
+    }
+
+    async fn list_terminal_settlement_intents(&self) -> Result<Vec<TerminalSettlementIntent>> {
         let conn = self.conn.lock();
-        claim_task_owner_record(&conn, id, owner_pid, owner_boot_id)?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT * FROM terminal_settlement_intents
+                 ORDER BY task_id",
+            )
+            .context("prepare list terminal settlement intents")?;
+        let rows = stmt
+            .query_map([], row_to_settlement_intent)
+            .context("query terminal settlement intents")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .context("read terminal settlement intents")
+    }
+
+    async fn promote_terminal_settlement(
+        &self,
+        intent: &TerminalSettlementIntent,
+        resolved_status: TaskStatus,
+        output: Option<String>,
+        error: Option<String>,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock();
+        promote_settlement_record(&mut conn, intent, resolved_status, output, error)
+    }
+
+    async fn discard_terminal_settlement_intent(
+        &self,
+        intent: &TerminalSettlementIntent,
+    ) -> Result<bool> {
+        let conn = self.conn.lock();
+        Ok(delete_settlement_intent_record(&conn, intent)? == 1)
+    }
+
+    async fn claim_owner(&self, id: &str, owner_pid: u32, owner_boot_id: &str) -> Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().context("begin task owner claim")?;
+        tx.execute(
+            "DELETE FROM terminal_settlement_intents
+              WHERE task_id = ?1
+                AND (owner_pid != ?2 OR owner_boot_id != ?3)",
+            params![id, owner_pid as i64, owner_boot_id],
+        )
+        .context("delete prior-owner terminal settlement intent")?;
+        claim_task_owner_record(&tx, id, owner_pid, owner_boot_id)?;
+        tx.commit().context("commit task owner claim")?;
         Ok(())
     }
 
@@ -349,6 +701,17 @@ impl TaskRegistry for SqliteTaskStore {
             .optional()
             .context("get task")?;
         Ok(rec)
+    }
+
+    async fn get_snapshot(&self, id: &str) -> Result<Option<TaskSnapshot>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT * FROM tasks WHERE id = ?1",
+            params![id],
+            row_to_snapshot,
+        )
+        .optional()
+        .context("get task snapshot")
     }
 
     async fn list_running(&self) -> Result<Vec<TaskRecord>> {
@@ -373,29 +736,87 @@ impl TaskRegistry for SqliteTaskStore {
         Ok(collect_skipping_bad_rows(rows))
     }
 
-    async fn reconcile_lost(&self, id: &str, now_boot_id: &str) -> Result<bool> {
-        let conn = self.conn.lock();
-        let rec = conn
-            .query_row(
+    async fn reconcile_lost(&self, id: &str, _now_boot_id: &str) -> Result<bool> {
+        let rec = {
+            let conn = self.conn.lock();
+            conn.query_row(
                 "SELECT * FROM tasks WHERE id = ?1",
                 params![id],
                 row_to_record,
             )
             .optional()
-            .context("reconcile: load task")?;
+            .context("reconcile: load task")?
+        };
         let Some(rec) = rec else { return Ok(false) };
         // Never reclaim a terminal record, and never one a live owner still holds.
-        if rec.status.is_terminal() || !is_authoritative(&rec, now_boot_id) {
+        if rec.status.is_terminal() || !is_authoritative(&rec) {
             return Ok(false);
         }
         let now = chrono::Utc::now().to_rfc3339();
-        conn.execute(
-            "UPDATE tasks SET status = 'lost', finished_at = ?1
-              WHERE id = ?2 AND status = 'running'",
-            params![now, id],
-        )
-        .context("reconcile: mark lost")?;
-        Ok(true)
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("reconcile: begin lost transition")?;
+        let changed = tx
+            .execute(
+                "UPDATE tasks
+                    SET status = 'lost',
+                        error = COALESCE(error, 'task owner is no longer available'),
+                        finished_at = ?1
+                  WHERE id = ?2
+                    AND status = 'running'
+                    AND owner_pid = ?3
+                    AND owner_boot_id = ?4",
+                params![now, id, rec.owner_pid as i64, rec.owner_boot_id],
+            )
+            .context("reconcile: mark lost")?;
+        if changed == 1 {
+            tx.execute(
+                "DELETE FROM terminal_settlement_intents WHERE task_id = ?1",
+                params![id],
+            )
+            .context("reconcile: delete stale terminal settlement intent")?;
+        }
+        tx.commit().context("reconcile: commit lost transition")?;
+        Ok(changed == 1)
+    }
+
+    async fn reconcile_timed_out(
+        &self,
+        id: &str,
+        owner_pid: u32,
+        owner_boot_id: &str,
+        heartbeat_at: &str,
+    ) -> Result<bool> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn
+            .transaction()
+            .context("reconcile: begin timeout transition")?;
+        let changed = tx
+            .execute(
+                "UPDATE tasks
+                    SET status = 'timed_out',
+                        error = COALESCE(error, 'heartbeat timeout'),
+                        finished_at = ?1
+                  WHERE id = ?2
+                    AND status = 'running'
+                    AND owner_pid = ?3
+                    AND owner_boot_id = ?4
+                    AND heartbeat_at = ?5",
+                params![now, id, owner_pid as i64, owner_boot_id, heartbeat_at],
+            )
+            .context("reconcile: mark timed out")?;
+        if changed == 1 {
+            tx.execute(
+                "DELETE FROM terminal_settlement_intents WHERE task_id = ?1",
+                params![id],
+            )
+            .context("reconcile: delete stale terminal settlement intent")?;
+        }
+        tx.commit()
+            .context("reconcile: commit timeout transition")?;
+        Ok(changed == 1)
     }
 }
 
@@ -434,6 +855,40 @@ mod tests {
         assert!(s.get("missing").await.unwrap().is_none());
     }
 
+    #[test]
+    fn version_seven_store_migrates_terminal_settlement_outbox_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SqliteTaskStore::new(dir.path()).unwrap();
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "DROP TABLE terminal_settlement_intents;
+                 PRAGMA user_version = 7;",
+            )
+            .unwrap();
+        }
+        drop(store);
+
+        let reopened = SqliteTaskStore::new(dir.path()).unwrap();
+        let conn = reopened.conn.lock();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        let outbox_exists: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'terminal_settlement_intents'
+                )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(version, CONTROL_PLANE_SCHEMA_VERSION);
+        assert_eq!(outbox_exists, 1);
+    }
+
     #[tokio::test]
     async fn update_status_sets_terminal_and_finished_at() {
         let s = SqliteTaskStore::new_in_memory().unwrap();
@@ -444,6 +899,91 @@ mod tests {
         let got = s.get("a").await.unwrap().unwrap();
         assert_eq!(got.status, TaskStatus::Completed);
         assert!(got.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn terminal_transition_atomically_records_the_winning_outcome() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("atomic", "main", 1, "boot-1")).await.unwrap();
+
+        assert!(
+            s.transition_terminal(
+                "atomic",
+                TaskStatus::Completed,
+                Some("delegate_results/atomic.json".into()),
+                None,
+            )
+            .await
+            .unwrap()
+        );
+
+        let snapshot = s.get_snapshot("atomic").await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Completed);
+        assert_eq!(
+            snapshot.output.as_deref(),
+            Some("delegate_results/atomic.json")
+        );
+        assert!(snapshot.error.is_none());
+        assert!(snapshot.task.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn competing_terminal_transition_cannot_overwrite_the_winner() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("race", "main", 1, "boot-1")).await.unwrap();
+
+        assert!(
+            s.transition_terminal(
+                "race",
+                TaskStatus::Cancelled,
+                None,
+                Some("cancelled by user request".into()),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !s.transition_terminal(
+                "race",
+                TaskStatus::Completed,
+                Some("delegate_results/race.json".into()),
+                None,
+            )
+            .await
+            .unwrap()
+        );
+
+        let snapshot = s.get_snapshot("race").await.unwrap().unwrap();
+        assert_eq!(snapshot.task.status, TaskStatus::Cancelled);
+        assert!(snapshot.output.is_none());
+        assert_eq!(snapshot.error.as_deref(), Some("cancelled by user request"));
+    }
+
+    #[tokio::test]
+    async fn timeout_reconciliation_requires_the_observed_owner_and_heartbeat() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        let mut task = rec("timeout-race", "main", 7, "boot-1");
+        task.heartbeat_at = Some("2026-06-18T00:00:00Z".into());
+        s.create(task).await.unwrap();
+
+        assert!(
+            !s.reconcile_timed_out("timeout-race", 7, "boot-1", "2026-06-18T00:00:01Z",)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.get("timeout-race").await.unwrap().unwrap().status,
+            TaskStatus::Running
+        );
+        assert!(
+            s.reconcile_timed_out("timeout-race", 7, "boot-1", "2026-06-18T00:00:00Z",)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            s.get("timeout-race").await.unwrap().unwrap().status,
+            TaskStatus::TimedOut
+        );
     }
 
     #[tokio::test]
@@ -511,5 +1051,39 @@ mod tests {
         assert_eq!(got.owner_pid, 42);
         assert_eq!(got.owner_boot_id, "boot-new");
         assert!(got.heartbeat_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn claim_owner_removes_only_the_prior_owners_settlement_intent() {
+        let s = SqliteTaskStore::new_in_memory().unwrap();
+        s.create(rec("a", "main", 1, "boot-old")).await.unwrap();
+        let intent = TerminalSettlementIntent {
+            task_id: "a".into(),
+            owner_pid: 1,
+            owner_boot_id: "boot-old".into(),
+            desired_status: TaskStatus::Completed,
+            artifact_path: "/tmp/a.json".into(),
+            artifact_ref: Some("artifact:a.json".into()),
+            artifact_sha256: "00".repeat(32),
+            terminal_error: None,
+        };
+        assert!(s.persist_terminal_settlement_intent(intent).await.unwrap());
+
+        s.claim_owner("a", 1, "boot-old").await.unwrap();
+        assert_eq!(s.list_terminal_settlement_intents().await.unwrap().len(), 1);
+
+        s.claim_owner("a", 42, "boot-new").await.unwrap();
+
+        assert!(
+            s.list_terminal_settlement_intents()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let got = s.get("a").await.unwrap().unwrap();
+        assert_eq!(
+            (got.owner_pid, got.owner_boot_id.as_str()),
+            (42, "boot-new")
+        );
     }
 }

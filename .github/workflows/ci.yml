@@ -317,6 +317,13 @@ jobs:
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER: clang
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+      - name: Test Windows task-owner recovery
+        if: runner.os == 'Windows'
+        shell: bash
+        run: >-
+           cargo test --profile ci --locked -p zeroclaw-runtime --lib
+           --target x86_64-pc-windows-msvc
+           control_plane::authority::tests::windows_process_exit_is_detected -- --exact
 
   check:
     name: Check (${{ matrix.name }})
