@@ -1215,7 +1215,7 @@ pub struct QwenModelProviderConfig {
     pub base: ModelProviderConfig,
     #[serde(default)]
     pub endpoint: QwenEndpoint,
-    /// Auth flow. Defaults to `api_key`; set to `oauth` to use the vendor's
+    /// Auth flow. Defaults to `api_key`; set to `o_auth` to use the vendor's
     /// OAuth-cache integration instead of the `api_key` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,
@@ -2644,7 +2644,7 @@ pub struct GeminiModelProviderConfig {
     #[nested]
     #[serde(flatten)]
     pub base: ModelProviderConfig,
-    /// Auth flow. Defaults to `api_key`; `oauth` uses GeminiModelProvider's
+    /// Auth flow. Defaults to `api_key`; `o_auth` uses GeminiModelProvider's
     /// OAuth-cache integration instead of the `api_key` field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<AuthMode>,

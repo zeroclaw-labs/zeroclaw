@@ -537,7 +537,7 @@ Variants: `cn`, `intl`, `code`.
 
 ### Qwen / DashScope: slot `qwen`
 
-OAuth-backed Qwen accounts use the same slot with `auth_mode = "oauth"`.
+OAuth-backed Qwen accounts use the same slot with `auth_mode = "o_auth"`.
 
 ### GLM: slot `glm`
 
