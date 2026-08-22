@@ -25,6 +25,58 @@ pub enum AccessMode {
     ReadWrite,
 }
 
+/// A cross-agent memory read grant.
+///
+/// The legacy string form (`"researcher"`) remains an unrestricted grant
+/// for that agent. The structured form adds an optional exact-match category
+/// allowlist, e.g. `{ agent = "researcher", categories = ["facts"] }`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(untagged)]
+pub enum MemoryGrant {
+    /// Backward-compatible unrestricted grant.
+    Agent(AgentAlias),
+    /// Structured grant with an optional category restriction.
+    Scoped {
+        agent: AgentAlias,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        categories: Option<Vec<String>>,
+    },
+}
+
+impl MemoryGrant {
+    /// Return the source agent named by this grant.
+    #[must_use]
+    pub fn agent(&self) -> &AgentAlias {
+        match self {
+            Self::Agent(agent) | Self::Scoped { agent, .. } => agent,
+        }
+    }
+
+    /// Return the source agent mutably so alias cascades can preserve the
+    /// grant's category scope while renaming references.
+    pub fn agent_mut(&mut self) -> &mut AgentAlias {
+        match self {
+            Self::Agent(agent) | Self::Scoped { agent, .. } => agent,
+        }
+    }
+
+    /// Return the exact category allowlist, or `None` for unrestricted access.
+    #[must_use]
+    pub fn categories(&self) -> Option<&[String]> {
+        match self {
+            Self::Agent(_) => None,
+            Self::Scoped { categories, .. } => categories.as_deref(),
+        }
+    }
+
+    /// Convenience accessor matching the existing alias-reference API.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.agent().as_str()
+    }
+}
+
 /// Selects the memory backend used by an agent.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -66,8 +118,10 @@ pub struct AgentWorkspaceConfig {
     /// the host filesystem permits. Off by default; flipping this on is
     /// auditable.
     pub unrestricted_filesystem: bool,
-    /// Cross-agent memory allowlist. An empty list grants access only to local memory.
-    pub read_memory_from: Vec<AgentAlias>,
+    /// Cross-agent memory allowlist. An empty list grants access only to local
+    /// memory. Legacy string entries grant all categories; structured entries
+    /// can restrict reads to exact category names.
+    pub read_memory_from: Vec<MemoryGrant>,
 }
 
 /// Per-agent memory backend selection and its persistence contract.
@@ -270,7 +324,7 @@ gamma = "read_write"
         assert_eq!(parsed.path, None);
         assert!(!parsed.unrestricted_filesystem);
         assert_eq!(parsed.read_memory_from.len(), 1);
-        assert_eq!(parsed.read_memory_from[0], "beta");
+        assert_eq!(parsed.read_memory_from[0].as_str(), "beta");
         assert_eq!(parsed.access.len(), 2);
         let beta = AgentAlias::new("beta");
         let gamma = AgentAlias::new("gamma");
@@ -285,6 +339,34 @@ gamma = "read_write"
         assert!(cfg.access.is_empty());
         assert!(!cfg.unrestricted_filesystem);
         assert!(cfg.read_memory_from.is_empty());
+    }
+
+    #[test]
+    fn memory_grant_round_trips_legacy_and_scoped_forms() {
+        let parsed: AgentWorkspaceConfig = toml::from_str(
+            r#"
+read_memory_from = [
+  "beta",
+  { agent = "gamma" },
+  { agent = "delta", categories = ["family", "events"] },
+]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.read_memory_from[0].as_str(), "beta");
+        assert!(parsed.read_memory_from[0].categories().is_none());
+        assert_eq!(parsed.read_memory_from[1].as_str(), "gamma");
+        assert!(parsed.read_memory_from[1].categories().is_none());
+        assert_eq!(parsed.read_memory_from[2].as_str(), "delta");
+        assert_eq!(
+            parsed.read_memory_from[2].categories(),
+            Some(["family".to_string(), "events".to_string()].as_slice())
+        );
+
+        let written = toml::to_string(&parsed).unwrap();
+        assert!(written.contains("read_memory_from = [\"beta\", { agent = \"gamma\" },"));
+        assert!(written.contains("categories = [\"family\", \"events\"]"));
     }
 
     #[test]

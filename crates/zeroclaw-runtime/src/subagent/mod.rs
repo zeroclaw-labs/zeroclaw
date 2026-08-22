@@ -73,7 +73,7 @@ impl SubAgentSpawn {
             .workspace
             .read_memory_from
             .iter()
-            .map(|alias| alias.as_str().to_string())
+            .map(|grant| grant.as_str().to_string())
             .collect();
         parent_allowed_agent_aliases.insert(agent_alias.to_string());
 

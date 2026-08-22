@@ -22401,14 +22401,36 @@ impl Config {
                 }
             }
 
-            // workspace.read_memory_from: every alias must exist as a
-            // configured agent and must use the same MemoryBackendKind
-            // as the declaring agent. Mismatched backends fail at
-            // config load rather than producing a runtime error when
-            // the per-agent memory plumbing consumes the allowlist.
+            // workspace.read_memory_from: every grant must name a configured
+            // agent, use the same MemoryBackendKind as the declaring agent,
+            // and appear at most once. Legacy string grants are unrestricted;
+            // structured grants may carry an exact category allowlist. An
+            // explicitly empty category list is invalid rather than silently
+            // becoming unrestricted. Mismatched backends fail at config load
+            // rather than producing a runtime error when the per-agent memory
+            // plumbing consumes the allowlist.
             let agent_backend = agent.memory.backend;
+            let mut seen_memory_grants: std::collections::BTreeSet<&str> =
+                std::collections::BTreeSet::new();
             for (i, target) in agent.workspace.read_memory_from.iter().enumerate() {
                 let target_str = target.as_str();
+                if target
+                    .categories()
+                    .is_some_and(|categories| categories.is_empty())
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        "agents.{alias}.workspace.read_memory_from[{i}].categories must contain at least one category when present",
+                    );
+                }
+                if !seen_memory_grants.insert(target_str) {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].agent"),
+                        "agents.{alias}.workspace.read_memory_from[{i}].agent = {target_str:?} duplicates an earlier memory grant; combine categories into one grant",
+                    );
+                }
                 if target_str == alias.as_str() {
                     validation_bail!(
                         InvalidFormat,
@@ -22423,6 +22445,18 @@ impl Config {
                         "agents.{alias}.workspace.read_memory_from[{i}] = {target_str:?} but agents.{target_str} is not configured",
                     );
                 };
+                if target.categories().is_some()
+                    && matches!(
+                        agent_backend,
+                        crate::multi_agent::MemoryBackendKind::Markdown
+                    )
+                {
+                    validation_bail!(
+                        InvalidFormat,
+                        format!("agents.{alias}.workspace.read_memory_from[{i}].categories"),
+                        "agents.{alias}.workspace.read_memory_from[{i}] uses a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution",
+                    );
+                }
                 if target_agent.memory.backend != agent_backend {
                     let target_backend = target_agent.memory.backend;
                     validation_bail!(
@@ -38868,7 +38902,9 @@ allowed_users = []
         alpha
             .workspace
             .read_memory_from
-            .push(crate::multi_agent::AgentAlias::new("alpha"));
+            .push(crate::multi_agent::MemoryGrant::Agent(
+                crate::multi_agent::AgentAlias::new("alpha"),
+            ));
         let err = config
             .validate()
             .expect_err("self-reference must fail validation");
@@ -38899,7 +38935,9 @@ allowed_users = []
         alpha
             .workspace
             .read_memory_from
-            .push(crate::multi_agent::AgentAlias::new("beta"));
+            .push(crate::multi_agent::MemoryGrant::Agent(
+                crate::multi_agent::AgentAlias::new("beta"),
+            ));
 
         let err = config
             .validate()
@@ -38908,6 +38946,104 @@ allowed_users = []
         assert!(
             msg.contains("same-backend siblings only"),
             "expected cross-backend explanation, got: {msg}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_empty_memory_grant_categories() {
+        let mut config = multi_agent_test_config();
+        config
+            .agents
+            .get_mut("alpha")
+            .unwrap()
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("beta"),
+                categories: Some(Vec::new()),
+            });
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+
+        let err = config
+            .validate()
+            .expect_err("an explicitly empty category list must fail validation");
+        assert!(
+            err.to_string()
+                .contains("categories must contain at least one category"),
+            "expected empty-category explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_scoped_grants_for_markdown_memory() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            memory: crate::multi_agent::AgentMemoryConfig {
+                backend: crate::multi_agent::MemoryBackendKind::Markdown,
+            },
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        let alpha = config.agents.get_mut("alpha").unwrap();
+        alpha.memory.backend = crate::multi_agent::MemoryBackendKind::Markdown;
+        alpha
+            .workspace
+            .read_memory_from
+            .push(crate::multi_agent::MemoryGrant::Scoped {
+                agent: crate::multi_agent::AgentAlias::new("beta"),
+                categories: Some(vec!["core".to_string()]),
+            });
+
+        let err = config
+            .validate()
+            .expect_err("Markdown must fail closed for scoped grants");
+        assert!(
+            err.to_string()
+                .contains("Markdown memory does not preserve per-row categories"),
+            "expected Markdown fail-closed explanation, got: {err}"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_duplicate_memory_grants() {
+        let mut config = multi_agent_test_config();
+        let beta = AliasedAgentConfig {
+            channels: vec![crate::providers::ChannelRef::new("telegram.draft")],
+            model_provider: crate::providers::ModelProviderRef::new("anthropic.default"),
+            risk_profile: "default".into(),
+            ..AliasedAgentConfig::default()
+        };
+        config.agents.insert("beta".to_string(), beta);
+        config
+            .agents
+            .get_mut("alpha")
+            .unwrap()
+            .workspace
+            .read_memory_from
+            .extend([
+                crate::multi_agent::MemoryGrant::Agent(crate::multi_agent::AgentAlias::new("beta")),
+                crate::multi_agent::MemoryGrant::Scoped {
+                    agent: crate::multi_agent::AgentAlias::new("beta"),
+                    categories: Some(vec!["core".to_string()]),
+                },
+            ]);
+
+        let err = config
+            .validate()
+            .expect_err("duplicate grants for one source agent must fail validation");
+        assert!(
+            err.to_string()
+                .contains("duplicates an earlier memory grant"),
+            "expected duplicate-grant explanation, got: {err}"
         );
     }
 

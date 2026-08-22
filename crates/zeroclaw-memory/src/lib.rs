@@ -44,7 +44,7 @@ pub mod threat;
 pub mod traits;
 pub mod vector;
 
-pub use agent_scoped::AgentScopedMemory;
+pub use agent_scoped::{AgentMemoryGrant, AgentScopedMemory};
 pub use agent_scoped_markdown::{AgentScopedMarkdownMemory, MarkdownPeer};
 pub use audit::AuditedMemory;
 #[allow(unused_imports)]
@@ -1021,14 +1021,24 @@ pub async fn create_memory_for_agent(
     // apply the install-wide policy decorator to own and peer Markdown
     // stores before composition.
     if matches!(backend_kind, ConfigBackend::Markdown) {
+        if agent_cfg
+            .workspace
+            .read_memory_from
+            .iter()
+            .any(|grant| grant.categories().is_some())
+        {
+            anyhow::bail!(
+                "agents.{agent_alias}.workspace.read_memory_from contains a category-scoped grant, but Markdown memory does not preserve per-row categories; use an unrestricted grant or a backend with category attribution"
+            );
+        }
         let own_workspace = config.agent_workspace_dir(agent_alias);
         let own: Arc<dyn Memory> = Arc::new(ScannedMemory::new(
             MarkdownMemory::new("markdown", &own_workspace),
             &config.memory.policy,
         ));
         let mut peers: Vec<agent_scoped_markdown::MarkdownPeer> = Vec::new();
-        for peer in &agent_cfg.workspace.read_memory_from {
-            let peer_alias = peer.as_str();
+        for grant in &agent_cfg.workspace.read_memory_from {
+            let peer_alias = grant.as_str();
             let peer_workspace = config.agent_workspace_dir(peer_alias);
             peers.push(agent_scoped_markdown::MarkdownPeer {
                 alias: peer_alias.to_string(),
@@ -1036,6 +1046,9 @@ pub async fn create_memory_for_agent(
                     MarkdownMemory::new("markdown", &peer_workspace),
                     &config.memory.policy,
                 )),
+                allowed_categories: grant
+                    .categories()
+                    .map(|categories| categories.iter().cloned().collect()),
             });
         }
         let scoped = AgentScopedMarkdownMemory::new(agent_alias, own, peers);
@@ -1071,13 +1084,18 @@ pub async fn create_memory_for_agent(
     let inner_arc: Arc<dyn Memory> = Arc::from(inner);
 
     let bound_id = inner_arc.ensure_agent_uuid(agent_alias).await?;
-    let mut allowlist_ids = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
-    for peer in &agent_cfg.workspace.read_memory_from {
-        let uuid = inner_arc.ensure_agent_uuid(peer.as_str()).await?;
-        allowlist_ids.push(uuid);
+    let mut grants = Vec::with_capacity(agent_cfg.workspace.read_memory_from.len());
+    for grant in &agent_cfg.workspace.read_memory_from {
+        let uuid = inner_arc.ensure_agent_uuid(grant.as_str()).await?;
+        grants.push(AgentMemoryGrant {
+            agent_id: uuid,
+            categories: grant
+                .categories()
+                .map(|categories| categories.iter().cloned().collect()),
+        });
     }
 
-    let scoped = AgentScopedMemory::new(inner_arc, bound_id, allowlist_ids);
+    let scoped = AgentScopedMemory::new_with_grants(inner_arc, bound_id, grants);
     Ok(wrap_in_retrieval_pipeline(Arc::new(scoped), &config.memory))
 }
 
@@ -1140,7 +1158,9 @@ mod tests {
 
     #[tokio::test]
     async fn per_agent_markdown_factory_applies_memory_policy() {
-        use zeroclaw_config::multi_agent::{AgentAlias, AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, AgentMemoryConfig, MemoryBackendKind, MemoryGrant,
+        };
         use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 
         let tmp = TempDir::new().unwrap();
@@ -1155,7 +1175,7 @@ mod tests {
         alpha
             .workspace
             .read_memory_from
-            .push(AgentAlias::new("beta"));
+            .push(MemoryGrant::Agent(AgentAlias::new("beta")));
         alpha.memory = AgentMemoryConfig {
             backend: MemoryBackendKind::Markdown,
         };
@@ -1207,6 +1227,48 @@ mod tests {
                 .iter()
                 .any(|entry| entry.content.contains("$API_TOKEN")),
             "flagged peer Markdown rows must be filtered by the wrapped peer memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_agent_markdown_factory_rejects_scoped_grant() {
+        use zeroclaw_config::multi_agent::{
+            AgentAlias, AgentMemoryConfig, MemoryBackendKind, MemoryGrant,
+        };
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config};
+
+        let tmp = TempDir::new().unwrap();
+        let alpha_dir = tmp.path().join("alpha");
+        let beta_dir = tmp.path().join("beta");
+        std::fs::create_dir_all(&alpha_dir).unwrap();
+        std::fs::create_dir_all(&beta_dir).unwrap();
+
+        let mut config = Config::default();
+        let mut alpha = AliasedAgentConfig::default();
+        alpha.workspace.path = Some(alpha_dir);
+        alpha.workspace.read_memory_from.push(MemoryGrant::Scoped {
+            agent: AgentAlias::new("beta"),
+            categories: Some(vec!["core".to_string()]),
+        });
+        alpha.memory = AgentMemoryConfig {
+            backend: MemoryBackendKind::Markdown,
+        };
+        let mut beta = AliasedAgentConfig::default();
+        beta.workspace.path = Some(beta_dir);
+        beta.memory = AgentMemoryConfig {
+            backend: MemoryBackendKind::Markdown,
+        };
+        config.agents.insert("alpha".into(), alpha);
+        config.agents.insert("beta".into(), beta);
+
+        let err = match create_memory_for_agent(&config, "alpha", None).await {
+            Ok(_) => panic!("Markdown factory must fail closed for scoped grants"),
+            Err(error) => error,
+        };
+        assert!(
+            err.to_string()
+                .contains("Markdown memory does not preserve per-row categories"),
+            "expected Markdown factory backstop explanation, got: {err}"
         );
     }
 

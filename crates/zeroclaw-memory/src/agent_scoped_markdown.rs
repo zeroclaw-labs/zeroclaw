@@ -3,11 +3,14 @@
 use super::traits::{Memory, MemoryCategory, MemoryEntry};
 use anyhow::Result;
 use async_trait::async_trait;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 pub struct MarkdownPeer {
     pub alias: String,
     pub memory: Arc<dyn Memory>,
+    /// `None` exposes every category; `Some` exposes exact category names.
+    pub allowed_categories: Option<HashSet<String>>,
 }
 
 /// Composed Markdown memory for one agent: own backend plus the
@@ -60,6 +63,18 @@ impl AgentScopedMarkdownMemory {
             entry.agent_id = Some(alias.to_string());
         }
         entries
+    }
+
+    fn filter_peer_entries(
+        categories: Option<&HashSet<String>>,
+        entries: Vec<MemoryEntry>,
+    ) -> Vec<MemoryEntry> {
+        entries
+            .into_iter()
+            .filter(|entry| {
+                categories.is_none_or(|allowed| allowed.contains(&entry.category.to_string()))
+            })
+            .collect()
     }
 }
 
@@ -137,7 +152,10 @@ impl Memory for AgentScopedMarkdownMemory {
                 .recall(query, limit, session_id, since, until)
                 .await
             {
-                Ok(rows) => merged.extend(Self::attribute(&peer.alias, rows)),
+                Ok(rows) => merged.extend(Self::attribute(
+                    &peer.alias,
+                    Self::filter_peer_entries(peer.allowed_categories.as_ref(), rows),
+                )),
                 Err(error) => ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -190,7 +208,10 @@ impl Memory for AgentScopedMarkdownMemory {
                 .recall(query, limit, session_id, since, until)
                 .await
             {
-                Ok(rows) => merged.extend(Self::attribute(&peer.alias, rows)),
+                Ok(rows) => merged.extend(Self::attribute(
+                    &peer.alias,
+                    Self::filter_peer_entries(peer.allowed_categories.as_ref(), rows),
+                )),
                 Err(error) => ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -272,6 +293,7 @@ mod tests {
             vec![MarkdownPeer {
                 alias: "beta".into(),
                 memory: Arc::new(peer_mem),
+                allowed_categories: None,
             }],
         );
 
@@ -311,6 +333,7 @@ mod tests {
             vec![MarkdownPeer {
                 alias: "beta".into(),
                 memory: Arc::new(peer_mem),
+                allowed_categories: None,
             }],
         );
 
@@ -334,6 +357,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_filters_peer_rows_to_exact_grant_categories() {
+        let (_tmp_a, own) = make_md("alpha-ws");
+        let (_tmp_b, peer_mem) = make_md("beta-ws");
+        peer_mem
+            .store("allowed", "beta core", MemoryCategory::Core, None)
+            .await
+            .unwrap();
+        peer_mem
+            .store("blocked", "beta daily", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let scoped = AgentScopedMarkdownMemory::new(
+            "alpha",
+            Arc::new(own),
+            vec![MarkdownPeer {
+                alias: "beta".into(),
+                memory: Arc::new(peer_mem),
+                allowed_categories: Some(["core".to_string()].into_iter().collect()),
+            }],
+        );
+
+        let allowed = scoped.recall("core", 10, None, None, None).await.unwrap();
+        assert!(
+            allowed
+                .iter()
+                .any(|entry| entry.content.contains("beta core"))
+        );
+
+        let blocked = scoped.recall("daily", 10, None, None, None).await.unwrap();
+        assert!(
+            !blocked
+                .iter()
+                .any(|entry| entry.content.contains("beta daily"))
+        );
+    }
+
+    #[tokio::test]
     async fn recall_for_agents_filters_to_alias_intersection() {
         let (_tmp_a, own) = make_md("alpha-ws");
         let (_tmp_b, peer_mem) = make_md("beta-ws");
@@ -349,6 +410,7 @@ mod tests {
             vec![MarkdownPeer {
                 alias: "beta".into(),
                 memory: Arc::new(peer_mem),
+                allowed_categories: None,
             }],
         );
 
@@ -433,6 +495,7 @@ mod tests {
             vec![MarkdownPeer {
                 alias: "beta".into(),
                 memory: Arc::new(peer_mem),
+                allowed_categories: None,
             }],
         );
         scoped
