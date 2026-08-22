@@ -877,7 +877,7 @@ Examples:
         /// New IANA timezone
         #[arg(long)]
         tz: Option<String>,
-        /// New command to run
+        /// New shell command, or new agent prompt when the job is an agent job
         #[arg(long)]
         command: Option<String>,
         /// New job name
