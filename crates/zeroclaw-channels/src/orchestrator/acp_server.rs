@@ -2671,7 +2671,9 @@ mod tests {
     fn acp_test_agent(workspace_dir: std::path::PathBuf) -> Agent {
         Agent::builder()
             .model_provider(Box::new(EmptyTerminalProvider))
-            .tools(Vec::new())
+            .tools(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new()),
+            )
             .observer(Arc::from(zeroclaw_runtime::observability::NoopObserver {}))
             .tool_dispatcher(Box::new(
                 zeroclaw_runtime::agent::dispatcher::NativeToolDispatcher,
