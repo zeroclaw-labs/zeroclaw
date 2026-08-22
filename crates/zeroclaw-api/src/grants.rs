@@ -1,5 +1,5 @@
 //! Resolved authorization grants — the single runtime authorization
-//! vocabulary (RFC #7141).
+//! vocabulary (RFC 7141).
 //!
 //! The grant vocabulary is resource × verb over enum-typed resource classes,
 //! plus three fine-grain selectors (agent aliases, config write paths, tool

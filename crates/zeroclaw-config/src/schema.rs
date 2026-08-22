@@ -12880,7 +12880,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
-// ── Inbound authentication & principals (#7141) ──────────────────
+// ── Inbound authentication & principals (RFC 7141) ──────────────
 
 /// Validates the operator-chosen names used by the auth sections: OIDC
 /// aliases (which become the `oidc.<alias>` provider selection key) and
@@ -22046,7 +22046,7 @@ impl Config {
             }
         }
 
-        // Inbound authentication & principals (#7141): each auth section
+        // Inbound authentication & principals (RFC 7141): each auth section
         // must be internally valid, reference only configured entries, and
         // map credentials and principal ids unambiguously. Keys are sorted
         // so the first error reported is deterministic.
@@ -25880,7 +25880,7 @@ mod tests {
         assert_eq!(AmqpConfig::default().dispatch, SopDispatch::AgentLoop);
     }
 
-    // ── Inbound auth config sections (#7141 / #8289 Stage 2) ─────────
+    // ── Inbound auth config sections (RFC 7141 stage 2) ─────────────
 
     fn auth_operator_profile() -> PermissionProfileConfig {
         PermissionProfileConfig {
