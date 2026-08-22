@@ -20,121 +20,53 @@
 //! [`crate::writer::record_event`]'s guarantee that pairing credentials never
 //! reach disk.
 //!
-//! So the bridge is a scrubbing adapter, not a pass-through. A target
-//! allowlist alone cannot draw the line — in `whatsapp-rust` the useful
-//! failure diagnostics and the identifier-bearing lines share a target — so
-//! the boundary sits on the message text and is **deny by default**: a token
-//! is forwarded verbatim only when it cannot express an identifier or a
-//! credential, and anything else becomes [`REDACTED`]. Severity, target,
-//! module path and source location are structured metadata, never free text,
-//! and are forwarded untouched so `RUST_LOG` directives and the failure's
-//! provenance still work.
+//! So the bridge forwards a record's *metadata* and drops its *text*. The
+//! message body is the one free-text channel a `log` record carries, it is
+//! written by code this workspace does not review, and nothing here can tell
+//! a harmless sentence from a name, a brand, an identifier or a credential.
+//! So none of it crosses: every bridged record carries the fixed
+//! [`REDACTED_MESSAGE`] marker in place of whatever the dependency formatted.
+//! There is no heuristic and no allowlist, so there is no rule to get wrong
+//! and nothing an unusual message shape can talk its way past.
+//!
+//! What does cross is structured metadata: severity, the dependency's own
+//! target, its module path and its source `file:line`. Those are fixed at
+//! each call site in the dependency's own source rather than formatted from
+//! runtime values, so they carry no payload. They are also enough to keep the
+//! diagnostics actionable — the severity says how bad it was, and the target
+//! plus `file:line` name the exact line that fired, so the wording can be
+//! read from the dependency's source instead of from our trace — and enough
+//! for `RUST_LOG` directives to keep addressing a dependency by its own
+//! target.
 //!
 //! Note the deliberate contrast with [`zeroclaw_memory::redact`], which is
 //! allow-by-default: it rewrites *recognized* patterns in user content the
 //! operator opted into storing. Here the input is unreviewed third-party text
-//! entering a credential-adjacent sink, so an unclassifiable token must be
-//! dropped rather than passed.
+//! entering a credential-adjacent sink, so none of it is passed.
 //!
 //! [`zeroclaw_memory::redact`]: https://docs.rs/zeroclaw-memory
 
 use tracing_log::AsTrace;
 
-/// Placeholder substituted for any token the scrubber cannot vouch for.
-pub(crate) const REDACTED: &str = "[redacted]";
-
-/// Longest bare-decimal token forwarded verbatim. Sized below every
-/// identifier shape this boundary defends against: an E.164 phone number
-/// carries at least 7 digits and a `whatsapp-rust` pair code is 8 Crockford
-/// Base32 characters, so four digits cannot spell either. Keeps close codes
-/// (`1006`), HTTP statuses and small counts readable in a failure line.
-const MAX_BARE_DIGITS: usize = 4;
-
-/// Shortest all-uppercase-letter run treated as a possible pair code. The
-/// generator emits 8 Crockford Base32 characters, and roughly one code in
-/// twenty comes out with no digit at all, so an all-caps run cannot be waved
-/// through on "it has no digits". Mixed-case words (`WebSocket`) and short
-/// all-caps words (`WARN`, `HTTP`, `TLS`, `IQ`) stay readable.
-const MIN_UPPERCASE_RUN: usize = 6;
-
-/// Scrub a third-party log message, deny by default.
+/// Fixed text substituted for every third-party `log` message body.
 ///
-/// Whitespace and token order are preserved so the line still reads; each
-/// whitespace-delimited token is either forwarded verbatim or replaced whole
-/// by [`REDACTED`], with any surrounding ASCII punctuation kept so the
-/// sentence does not lose its shape.
-///
-/// A token survives only when, ignoring leading/trailing ASCII punctuation,
-/// it satisfies all of:
-///
-/// * it contains no `@` — that is a JID or an email address;
-/// * it contains no numeric character, *unless* it is at most
-///   [`MAX_BARE_DIGITS`] ASCII digits and nothing else;
-/// * it is not a run of [`MIN_UPPERCASE_RUN`] or more ASCII uppercase
-///   letters.
-///
-/// Everything else — phone numbers, pair codes, JIDs, LIDs, session and
-/// message ids, keys, hex and Base64 blobs — falls to the default and is
-/// redacted, because the boundary cannot tell them apart from the identifiers
-/// it exists to withhold.
-pub(crate) fn scrub(message: &str) -> String {
-    let mut out = String::with_capacity(message.len());
-    let mut rest = message;
-    while !rest.is_empty() {
-        let token_start = rest
-            .find(|c: char| !c.is_whitespace())
-            .unwrap_or(rest.len());
-        out.push_str(&rest[..token_start]);
-        rest = &rest[token_start..];
-        if rest.is_empty() {
-            break;
-        }
-        let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        push_scrubbed_token(&mut out, &rest[..token_end]);
-        rest = &rest[token_end..];
-    }
-    out
-}
-
-fn push_scrubbed_token(out: &mut String, token: &str) {
-    let core = token.trim_matches(|c: char| c.is_ascii_punctuation());
-    if core.is_empty() || core_is_safe(core) {
-        out.push_str(token);
-        return;
-    }
-    // Keep the punctuation that framed the token (`(`, `,`, `:`, `.`) so the
-    // surrounding sentence still parses; only the payload is replaced.
-    let lead = token.len()
-        - token
-            .trim_start_matches(|c: char| c.is_ascii_punctuation())
-            .len();
-    let trail = token.len() - core.len() - lead;
-    out.push_str(&token[..lead]);
-    out.push_str(REDACTED);
-    out.push_str(&token[token.len() - trail..]);
-}
-
-fn core_is_safe(core: &str) -> bool {
-    if core.contains('@') {
-        return false;
-    }
-    if core.chars().any(char::is_numeric) {
-        return core.len() <= MAX_BARE_DIGITS && core.bytes().all(|b| b.is_ascii_digit());
-    }
-    !(core.len() >= MIN_UPPERCASE_RUN && core.chars().all(|c| c.is_ascii_uppercase()))
-}
+/// Not a per-token placeholder: the message is never inspected, so this
+/// replaces the whole of it every time. Its presence in a record is the
+/// signal that a dependency logged at that call site and that the wording was
+/// withheld by design rather than lost.
+pub(crate) const REDACTED_MESSAGE: &str = "[third-party message redacted]";
 
 /// The `log` logger installed in the process-global slot. Forwards each
 /// record into `tracing` through [`tracing_log::format_trace`], which is the
 /// same dispatch [`tracing_log::LogTracer`] performs — identical callsite,
 /// identical `log.target` / `log.module_path` / `log.file` / `log.line`
-/// normalization — except that the message it carries has been through
-/// [`scrub`].
-struct ScrubbingLogBridge;
+/// normalization — except that the message it carries is always
+/// [`REDACTED_MESSAGE`] instead of the dependency's own text.
+struct RedactingLogBridge;
 
-static BRIDGE: ScrubbingLogBridge = ScrubbingLogBridge;
+static BRIDGE: RedactingLogBridge = RedactingLogBridge;
 
-impl log::Log for ScrubbingLogBridge {
+impl log::Log for RedactingLogBridge {
     /// Always true: `log`-side filtering would silently pre-empt the
     /// `RUST_LOG` directives, so the tracing filters stay the single place
     /// that decides what is recorded.
@@ -143,21 +75,22 @@ impl log::Log for ScrubbingLogBridge {
     }
 
     fn log(&self, record: &log::Record<'_>) {
-        // Ask the subscriber first so a record no layer wants costs no
-        // rendering or scrubbing. `format_trace` repeats this check; doing it
-        // here keeps the chatty `DEBUG`/`TRACE` tiers of a dependency off the
-        // allocator when the filter floor is `INFO`.
+        // Ask the subscriber first so a record no layer wants costs nothing
+        // to dispatch. `format_trace` repeats this check; doing it here keeps
+        // a dependency's chatty `DEBUG`/`TRACE` tiers off the callsite
+        // machinery when the filter floor is `INFO`.
         if !tracing::dispatcher::get_default(|dispatch| dispatch.enabled(&record.as_trace())) {
             return;
         }
-        let scrubbed = scrub(&record.args().to_string());
         // Rebuilt field by field rather than copied from the incoming record:
-        // this is the whole list of things allowed across the boundary, so a
-        // future `log` release that grows another payload channel (structured
-        // key-values, say) cannot ride along unreviewed.
+        // this list is the whole of what may cross the boundary, so a future
+        // `log` release that grows another payload channel (structured
+        // key-values, say) cannot ride along unreviewed. `args` is the free
+        // text channel and it is overwritten rather than forwarded — the
+        // dependency's own message is never read.
         let _ = tracing_log::format_trace(
             &log::Record::builder()
-                .args(format_args!("{scrubbed}"))
+                .args(format_args!("{REDACTED_MESSAGE}"))
                 .level(record.level())
                 .target(record.target())
                 .module_path(record.module_path())
@@ -170,7 +103,7 @@ impl log::Log for ScrubbingLogBridge {
     fn flush(&self) {}
 }
 
-/// Install the scrubbing bridge into the process-global `log` slot.
+/// Install the redacting bridge into the process-global `log` slot.
 ///
 /// Fails when another logger already owns that slot; `log` permits exactly
 /// one per process.
@@ -208,90 +141,4 @@ pub(crate) fn install_or_panic() {
 /// [`install_or_panic`].
 pub(crate) fn install_best_effort_for_tests() {
     let _ = install();
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn scrub_redacts_pairing_credentials_and_identifiers() {
-        // Message shapes from whatsapp-rust `src/pair_code.rs` at the locked
-        // revision, plus a JID-bearing line from `src/message.rs`.
-        assert_eq!(
-            scrub("Starting pair code authentication for phone: 972501234567"),
-            format!("Starting pair code authentication for phone: {REDACTED}")
-        );
-        assert_eq!(
-            scrub("Stage 1 complete, waiting for phone confirmation. Code: 3K7XW2QZ"),
-            format!("Stage 1 complete, waiting for phone confirmation. Code: {REDACTED}")
-        );
-        // A pair code that happens to draw no digits from the Crockford
-        // alphabet must not slip through the digit rule.
-        assert_eq!(scrub("Code: ZXKWQTRV"), format!("Code: {REDACTED}"));
-        assert_eq!(
-            scrub("Failed to decrypt from 972501234567@s.whatsapp.net"),
-            format!("Failed to decrypt from {REDACTED}")
-        );
-        assert_eq!(
-            scrub("group 120363012345678901@g.us went silent"),
-            format!("group {REDACTED} went silent")
-        );
-        assert_eq!(
-            scrub("phone: +972-50-123-4567"),
-            format!("phone: +{REDACTED}")
-        );
-    }
-
-    #[test]
-    fn scrub_keeps_dependency_failure_diagnostics_readable() {
-        for line in [
-            "websocket read failed: connection reset by peer",
-            "Failed to send companion_finish: broken pipe",
-            "Missing or invalid primary identity pub in notification",
-        ] {
-            assert_eq!(scrub(line), line, "failure diagnostic must survive intact");
-        }
-        // Short bare numbers stay: close codes, statuses, counts.
-        assert_eq!(
-            scrub("socket closed with code 1006 after 3 retries"),
-            "socket closed with code 1006 after 3 retries"
-        );
-        // Mixed case and short all-caps words are prose, not codes.
-        assert_eq!(
-            scrub("WebSocket handshake failed over TLS"),
-            "WebSocket handshake failed over TLS"
-        );
-    }
-
-    #[test]
-    fn scrub_is_deny_by_default_for_unclassifiable_tokens() {
-        // Neither a phone nor a JID nor a pair code, but equally
-        // unvouchable: ids, keys, blobs, and long digit runs.
-        for token in [
-            "3EB0C767D26A1D8B1F49",
-            "session-9f2c41ab",
-            "1234567",
-            "sk_live_abc123def456",
-            "١٢٣٤٥٦٧٨",
-        ] {
-            let out = scrub(&format!("saw {token} here"));
-            assert_eq!(
-                out,
-                format!("saw {REDACTED} here"),
-                "unclassifiable token must fail closed: {token}"
-            );
-        }
-    }
-
-    #[test]
-    fn scrub_preserves_whitespace_and_framing_punctuation() {
-        assert_eq!(
-            scrub("info (from=972501234567@s.whatsapp.net):\n\tdecrypt failed"),
-            format!("info ({REDACTED}):\n\tdecrypt failed")
-        );
-        assert_eq!(scrub(""), "");
-        assert_eq!(scrub("   "), "   ");
-        assert_eq!(scrub("-->"), "-->");
-    }
 }
