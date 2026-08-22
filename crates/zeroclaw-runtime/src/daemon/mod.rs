@@ -1820,6 +1820,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
         let mut tasks = engine.collect_runnable_tasks().await?;
         let has_high_priority = tasks.iter().any(|t| t.priority == TaskPriority::High);
 
+        // Standing instructions written around those tasks in HEARTBEAT.md.
+        // Re-read every tick, like the tasks themselves, so editing the file
+        // takes effect without a restart. A failure to read is not fatal: the
+        // tick still runs, just without the briefing.
+        let briefing = engine.collect_briefing().await.unwrap_or_default();
+
         if tasks.is_empty() {
             if let Some(fallback) = config
                 .heartbeat
@@ -1961,6 +1967,14 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             // Daemon origin (agent::memory_inject): Conversation entries are
             // excluded for scheduled origins. `heartbeat_memory` stays for
             // the post-run auto-save consolidation below.
+            //
+            // Order: briefing (how to act) before session context (what was
+            // said) before the task (what to do now), so the standing rules
+            // frame the conversation rather than trailing it.
+            let task_prompt = match &briefing {
+                Some(b) => format!("{b}\n\n{task_prompt}"),
+                None => task_prompt,
+            };
             let prompt = match &session_context {
                 Some(sc) => format!("{sc}\n\n{task_prompt}"),
                 None => task_prompt,
