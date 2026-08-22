@@ -10,6 +10,10 @@ publish = false
 name = "zeroclaw_bootstrap"
 path = "src/lib.rs"
 
+[[bin]]
+name = "zeroclaw-bootstrap"
+path = "src/main.rs"
+
 [dependencies]
 # The target/artifact mapping is generated from the canonical release registry.
 # Hand-maintaining a second target list here would give the published-target
