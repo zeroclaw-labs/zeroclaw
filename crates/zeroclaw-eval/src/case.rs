@@ -9,18 +9,41 @@ use std::path::{Path, PathBuf};
 pub struct LlmTrace {
     /// Identifier for the trace (surfaced in reports).
     pub model_name: String,
+    /// Optional stable report identity. When set, reports and receipts use this
+    /// instead of `model_name`; readers should go through [`LlmTrace::display_id`].
+    #[serde(default)]
+    pub id: Option<String>,
     /// Conversation turns, replayed in order.
     pub turns: Vec<TraceTurn>,
     /// Declarative expectations graded against the run.
     #[serde(default)]
     pub expects: TraceExpects,
+    /// Pre-run environment preparation for the case (live mode).
+    #[serde(default)]
+    pub setup: Option<CaseSetup>,
+    /// Tool names this case requests. Live mode only; ignored in replay.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+}
+
+/// Pre-run environment preparation for a case.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CaseSetup {
+    /// Files written into the case's temp workspace before the run.
+    /// Keys are workspace-relative paths; absolute paths and `..` are rejected.
+    #[serde(default)]
+    pub workspace_files: std::collections::BTreeMap<String, String>,
 }
 
 /// A single conversation turn (user input + scripted LLM response steps).
+///
+/// `steps` is optional: replay cases script every LLM round-trip, while live
+/// cases must omit them (the real provider produces the responses).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceTurn {
     pub user_input: String,
-    pub steps: Vec<TraceStep>,
+    #[serde(default)]
+    pub steps: Option<Vec<TraceStep>>,
 }
 
 /// A single LLM response step within a turn.
@@ -86,6 +109,12 @@ pub struct TraceExpects {
 }
 
 impl LlmTrace {
+    /// The identity used in reports and receipts: the explicit `id` when set,
+    /// otherwise `model_name`.
+    pub fn display_id(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.model_name)
+    }
+
     /// Load a trace from a JSON file.
     pub fn from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)
@@ -96,17 +125,62 @@ impl LlmTrace {
     }
 }
 
+/// Validate that `path` is a safe workspace-relative path: non-empty, not absolute,
+/// and free of any `..` component. Used before writing setup files or grading
+/// workspace paths, so a case cannot read or write outside its sandbox.
+pub fn validate_workspace_rel_path(path: &str) -> anyhow::Result<()> {
+    if path.is_empty() {
+        anyhow::bail!("workspace path must not be empty");
+    }
+    for component in Path::new(path).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                anyhow::bail!("workspace path {path:?} must not contain a `..` component");
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                anyhow::bail!("workspace path {path:?} must be relative, not absolute");
+            }
+            std::path::Component::CurDir | std::path::Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Collect the `*.json` fixture paths from a suite-directory listing, sorted
+/// for stable ordering.
+///
+/// Entry-level I/O errors are propagated with the suite directory attached,
+/// never discarded. A suite that cannot be fully enumerated must fail, not
+/// shrink: an eval report is used as CI evidence, and a silently smaller
+/// certified set yields a green report and a zero exit while an unknown
+/// number of cases never ran.
+///
+/// Takes the listing as an iterator rather than a `ReadDir` so the
+/// error path is reachable from a test without depending on the host
+/// filesystem being coaxed into failing mid-enumeration.
+fn collect_fixture_paths(
+    entries: impl Iterator<Item = std::io::Result<PathBuf>>,
+    dir: &Path,
+) -> anyhow::Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| {
+            format!("reading an entry in eval suite directory {}", dir.display())
+        })?;
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
 /// Load every `*.json` trace fixture in `dir`, sorted by path for stable ordering.
 pub fn load_suite(dir: &Path) -> anyhow::Result<Vec<(PathBuf, LlmTrace)>> {
     let read = std::fs::read_dir(dir)
         .with_context(|| format!("reading eval suite directory {}", dir.display()))?;
 
-    let mut paths: Vec<PathBuf> = read
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
-        .collect();
-    paths.sort();
+    let paths = collect_fixture_paths(read.map(|entry| entry.map(|e| e.path())), dir)?;
 
     let mut out = Vec::with_capacity(paths.len());
     for path in paths {
@@ -176,6 +250,44 @@ mod tests {
     }
 
     #[test]
+    fn display_id_prefers_id_then_falls_back_to_model_name() {
+        let with_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","id":"case-7","turns":[]}"#).unwrap();
+        assert_eq!(with_id.display_id(), "case-7");
+        let without_id: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[]}"#).unwrap();
+        assert_eq!(without_id.display_id(), "m");
+    }
+
+    #[test]
+    fn turn_steps_default_to_none_when_omitted() {
+        let t: LlmTrace =
+            serde_json::from_str(r#"{"model_name":"m","turns":[{"user_input":"hi"}]}"#).unwrap();
+        assert!(t.turns[0].steps.is_none());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_absolute() {
+        assert!(validate_workspace_rel_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_empty() {
+        assert!(validate_workspace_rel_path("").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_rejects_parent_component() {
+        assert!(validate_workspace_rel_path("../secret").is_err());
+        assert!(validate_workspace_rel_path("sub/../../secret").is_err());
+    }
+
+    #[test]
+    fn validate_workspace_rel_path_accepts_nested_relative() {
+        assert!(validate_workspace_rel_path("sub/dir/file.txt").is_ok());
+    }
+
+    #[test]
     fn load_suite_filters_json_and_sorts_by_path() {
         let dir = std::env::temp_dir().join("zeroclaw_eval_case_suite_test");
         let _ = std::fs::remove_dir_all(&dir);
@@ -188,5 +300,52 @@ mod tests {
         assert_eq!(suite[0].1.model_name, "a"); // sorted by path
         assert_eq!(suite[1].1.model_name, "b");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_suite_propagates_entry_error_instead_of_shrinking() {
+        // The defect this guards: `filter_map(Result::ok)` over `read_dir`
+        // discarded entry-level I/O errors, so a fixture that disappeared or
+        // became unreadable mid-enumeration was silently omitted and the
+        // suite still reported all-green with a zero exit. Enumeration must
+        // fail, not shrink.
+        let dir = Path::new("/eval/suite");
+        let entries = vec![
+            Ok(dir.join("a.json")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "entry unreadable",
+            )),
+            Ok(dir.join("b.json")),
+        ];
+
+        let err = collect_fixture_paths(entries.into_iter(), dir)
+            .expect_err("an unreadable entry must abort the suite, not shrink it");
+
+        // The suite directory must be in the chain so CI output names which
+        // suite failed to enumerate.
+        let rendered = format!("{err:#}");
+        assert!(
+            rendered.contains("reading an entry in eval suite directory /eval/suite"),
+            "error must name the suite directory, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("entry unreadable"),
+            "error must preserve the underlying io cause, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn collect_fixture_paths_keeps_only_sorted_json_on_the_happy_path() {
+        let dir = Path::new("/eval/suite");
+        let entries = vec![
+            Ok(dir.join("b.json")),
+            Ok(dir.join("note.txt")),
+            Ok(dir.join("a.json")),
+        ];
+
+        let paths = collect_fixture_paths(entries.into_iter(), dir).unwrap();
+
+        assert_eq!(paths, vec![dir.join("a.json"), dir.join("b.json")]);
     }
 }

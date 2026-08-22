@@ -518,11 +518,12 @@ impl LogLevel {
 enum EvalCommands {
     /// Run a suite of evaluation cases.
     Run {
-        /// Directory of `*.json` trace fixtures (defaults to `evals`).
+        /// Directory of `*.json` trace fixtures (defaults to `evals/regression`).
         #[arg(long)]
         suite: Option<String>,
 
-        /// Execution mode: `replay` (deterministic) or `live` (later phase).
+        /// Execution mode: `replay` (deterministic, no network) or `live`
+        /// (real configured provider, spends real tokens).
         /// Defaults to config `[eval] mode`.
         #[arg(long)]
         mode: Option<String>,
@@ -1052,14 +1053,25 @@ Examples:
     #[command(long_about = "\
 Run the agent evaluation harness.
 
-Phase 0 supports deterministic replay: every `*.json` trace fixture in the suite \
-directory is replayed through the real agent loop and graded against its declarative \
-expectations. No network calls, fully deterministic. Exits non-zero if any case fails, \
-so it can gate CI.
+`--mode replay` (the default) is deterministic: every `*.json` trace fixture in the \
+suite directory is replayed through the real agent loop against scripted LLM responses \
+and graded against its declarative expectations. No network calls. Exits non-zero if any \
+case fails, so it can gate CI.
+
+`--mode live` runs the same cases against the real provider configured in \
+`[eval].live_provider` (a dotted `providers.models` reference such as \
+`anthropic.sonnet`), so it makes real network calls and spends real tokens. Each case \
+gets a fresh temporary workspace under a `workspace_only` policy, `Supervised` autonomy \
+(never `Full`), and a tool surface limited to the case's own `tools` intersected with \
+`[eval].live_allowed_tools`; `shell` is excluded unconditionally, and anything not \
+allowlisted is auto-denied because approvals are non-interactive. Each turn is bounded \
+by `[eval].case_timeout_secs`. Live output is non-deterministic, so live runs are not a \
+CI gate.
 
 Examples:
-  zeroclaw eval run                                  # replay ./evals
-  zeroclaw eval run --suite evals --format json")]
+  zeroclaw eval run                                  # replay ./evals/regression
+  zeroclaw eval run --suite evals/regression --format json
+  zeroclaw eval run --mode live                      # real provider, real tokens")]
     Eval {
         #[command(subcommand)]
         eval_command: EvalCommands,
@@ -5387,12 +5399,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let suite_dir = suite.unwrap_or_else(|| config.eval.suite_dir.clone());
                 let mode: zeroclaw_eval::Mode =
                     mode.unwrap_or_else(|| config.eval.mode.clone()).parse()?;
-                let report = commands::eval::run(std::path::PathBuf::from(suite_dir), mode).await?;
+                let report =
+                    commands::eval::run(&config, std::path::PathBuf::from(suite_dir), mode).await?;
                 commands::eval::print_report(&report, format);
-                if !report.all_passed() {
-                    std::process::exit(1);
-                }
-                Ok(())
+                std::process::exit(report.exit_code());
             }
         },
 
@@ -8618,6 +8628,57 @@ mod tests {
         assert!(
             has_model_flag,
             "onboard help should include --model for quick setup overrides"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn eval_help_describes_live_mode_rather_than_calling_it_a_later_phase() {
+        // The help text is the only place an operator learns that `--mode live`
+        // is real: it reaches a configured provider, spends tokens, and runs
+        // under a restricted tool surface. Calling it a "later phase" told
+        // operators the opposite of what the binary actually does.
+        let cmd = Cli::command();
+        let eval = cmd
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "eval")
+            .expect("eval subcommand must exist");
+
+        let long_about = eval
+            .get_long_about()
+            .expect("eval must have long help")
+            .to_string();
+
+        assert!(
+            !long_about.contains("later phase"),
+            "live mode is implemented, so the help must not defer it: {long_about}"
+        );
+        for expected in [
+            "--mode live",
+            "real tokens",
+            "live_allowed_tools",
+            "case_timeout_secs",
+        ] {
+            assert!(
+                long_about.contains(expected),
+                "eval long help must mention {expected:?}, got: {long_about}"
+            );
+        }
+
+        let mode_arg = eval
+            .get_subcommands()
+            .find(|subcommand| subcommand.get_name() == "run")
+            .expect("eval run subcommand must exist")
+            .get_arguments()
+            .find(|arg| arg.get_id().as_str() == "mode")
+            .expect("eval run must have a --mode flag");
+        let mode_help = mode_arg
+            .get_help()
+            .map(|help| help.to_string())
+            .unwrap_or_default();
+        assert!(
+            !mode_help.contains("later phase"),
+            "--mode help must not defer live mode: {mode_help}"
         );
     }
 
