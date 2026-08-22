@@ -2607,7 +2607,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         // legacy WARN-and-fallback `warm_capabilities_metadata` path is
         // retained for callers that only best-effort warm.
         if self.models_dev_key.is_some() {
-            crate::models_dev::ensure_catalog_loaded().await?;
+            crate::models_dev::ensure_catalog_loaded_for_resolve().await?;
         }
         Ok(self.capabilities_for_model(model))
     }
@@ -5707,14 +5707,12 @@ mod tests {
     /// in production, not just on the concrete type.
     #[tokio::test]
     async fn resolve_capabilities_dyn_dispatch_honors_compatible_override() {
-        use crate::models_dev::CatalogFetchOverrideGuard;
-
-        // Forced catalog outage through the process-global override; this test
-        // runs alone in its process so the cached-catalog OnceCell is empty.
-        let _guard = CatalogFetchOverrideGuard::install(|| {
-            Box::pin(async { Err(anyhow::Error::msg("models.dev catalog unavailable")) })
-        })
-        .await;
+        // Force an isolated catalog outage via the resolve seam — a fresh
+        // local cache + failing lifecycle — so this test is deterministic even
+        // when a sibling test already populated the process-global
+        // `CACHED_CATALOG` (a OnceCell can never be reset).
+        use crate::models_dev::ResolveCatalogIsolationGuard;
+        let _guard = ResolveCatalogIsolationGuard::install_with_failing_fetch().await;
 
         let provider = OpenAiCompatibleModelProvider::builder("test")
             .display_name("dyn-dispatch")

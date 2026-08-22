@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
@@ -38,67 +40,14 @@ pub(crate) async fn __private_test_catalog_lock() -> tokio::sync::MutexGuard<'st
     CATALOG_LIFECYCLE_TEST_LOCK.lock().await
 }
 
-/// Injectable fetcher for tests. Production code never sets this; tests
-/// install an RAII guard so [`ensure_catalog_loaded`] can be exercised without
-/// network access. The `Fn` returns a boxed future so the override can own
-/// captured counters.
+/// Injectable fetcher for tests. Production never sets this; tests construct an
+/// isolated [`CatalogLifecycle`] with their own `CatalogFetchFuture` instead of
+/// mutating process-global state. The `Fn` returns a boxed future so the
+/// override can own captured counters.
 type CatalogFetchFuture = std::pin::Pin<Box<dyn Future<Output = Result<Arc<Catalog>>> + Send>>;
-static CATALOG_FETCH_OVERRIDE: std::sync::Mutex<
-    Option<Arc<dyn Fn() -> CatalogFetchFuture + Send + Sync>>,
-> = std::sync::Mutex::new(None);
 
-/// RAII guard that installs a catalog-fetch override for the process-global
-/// lifecycle, so a test can make `ensure_catalog_loaded` fail (or answer)
-/// without network access. Held for the test's duration; restores the previous
-/// override (usually `None`) on drop. Serializes with the catalog-global lock
-/// so it never races another test mutating the shared catalog state.
-#[cfg(test)]
-pub(crate) struct CatalogFetchOverrideGuard {
-    _previous: Option<Arc<dyn Fn() -> CatalogFetchFuture + Send + Sync>>,
-    _lock: tokio::sync::MutexGuard<'static, ()>,
-}
-
-#[cfg(test)]
-impl CatalogFetchOverrideGuard {
-    /// Install `fetcher` as the process-global catalog fetch. The returned
-    /// guard must outlive the assertions that depend on the override.
-    pub(crate) async fn install(
-        fetcher: impl Fn() -> CatalogFetchFuture + Send + Sync + 'static,
-    ) -> Self {
-        let lock = __private_test_catalog_lock().await;
-        let fetcher = Arc::new(fetcher);
-        let mut slot = CATALOG_FETCH_OVERRIDE
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let previous = slot.replace(fetcher);
-        Self {
-            _previous: previous,
-            _lock: lock,
-        }
-    }
-}
-
-#[cfg(test)]
-impl Drop for CatalogFetchOverrideGuard {
-    fn drop(&mut self) {
-        if let Ok(mut slot) = CATALOG_FETCH_OVERRIDE.lock() {
-            *slot = self._previous.take();
-        }
-    }
-}
-
-/// Run the catalog fetch, honoring the test override when installed. The
-/// override lock is released before awaiting the fetch (the boxed future does
-/// not borrow it), so a fetch that internally awaits is never blocked on the
-/// override mutex.
+/// Run the catalog fetch live against models.dev.
 async fn run_catalog_fetch() -> Result<Arc<Catalog>> {
-    let override_fetch = match CATALOG_FETCH_OVERRIDE.lock() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
-    if let Some(fetch) = override_fetch {
-        return (fetch)().await;
-    }
     fetch_catalog().await
 }
 
@@ -198,9 +147,9 @@ impl CatalogLifecycle {
 }
 
 /// Process-wide lifecycle used by production (`ensure_catalog_loaded` and the
-/// listing functions). Its fetcher honors `CATALOG_FETCH_OVERRIDE`, so tests
-/// that exercise the global path can still avoid network access; tests that
-/// need full isolation construct their own `CatalogLifecycle`.
+/// listing functions). Its fetcher fetches live against models.dev; tests that
+/// need to exercise a fetch failure construct their own isolated
+/// `CatalogLifecycle` rather than mutating this global.
 static GLOBAL_CATALOG_LIFECYCLE: OnceLock<CatalogLifecycle> = OnceLock::new();
 
 fn global_catalog_lifecycle() -> &'static CatalogLifecycle {
@@ -333,6 +282,94 @@ pub(crate) async fn ensure_catalog_loaded() -> Result<()> {
     global_catalog_lifecycle()
         .ensure_loaded(&CACHED_CATALOG)
         .await
+}
+
+/// Entry point the compatible resolve override uses before querying per-model
+/// vision. In production it is exactly [`ensure_catalog_loaded`]. Under
+/// `#[cfg(test)]` it can be redirected at an isolated failing-catalog scenario
+/// (its own local cache + lifecycle) so a test can deterministically force the
+/// credentialed resolve branch to surface `Err` regardless of whether the
+/// process-global `CACHED_CATALOG` has already been populated by a sibling test
+/// (a `OnceCell` can never be reset). Non-`#[cfg(test)]` behavior is unchanged.
+pub(crate) async fn ensure_catalog_loaded_for_resolve() -> Result<()> {
+    #[cfg(test)]
+    {
+        let scenario = TEST_RESOLVE_CATALOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(scenario) = scenario {
+            return scenario.lifecycle.ensure_loaded(&scenario.cache).await;
+        }
+    }
+    ensure_catalog_loaded().await
+}
+
+/// Test-only isolated catalog scenario installed for the compatible resolve
+/// override: its own `CatalogLifecycle` (with the test's fetcher) and its own
+/// local, always-empty `OnceCell` cache. Because the cache belongs to the
+/// scenario and never to the process-global `CACHED_CATALOG`, the lifecycle's
+/// failing fetcher always runs and deterministically surfaces `Err` — no
+/// dependence on (or mutation of) the global snapshot.
+#[cfg(test)]
+struct IsolatedResolveCatalog {
+    lifecycle: CatalogLifecycle,
+    cache: OnceCell<Arc<Catalog>>,
+}
+
+#[cfg(test)]
+static TEST_RESOLVE_CATALOG: Mutex<Option<Arc<IsolatedResolveCatalog>>> = Mutex::new(None);
+
+/// RAII guard that installs an isolated failing-catalog scenario for
+/// [`ensure_catalog_loaded_for_resolve`]. Held for the test's duration; the
+/// tests in `compatible.rs` and `vision_override.rs` build their provider
+/// chains while a guard is live and assert the credentialed resolve branch
+/// fails. Restores the previous override on drop. Serializes on the same
+/// process-global catalog-state lock as the other catalog-mutating tests so it
+/// never races a sibling test seeding `CACHED_CATALOG`.
+#[cfg(test)]
+pub(crate) struct ResolveCatalogIsolationGuard {
+    _previous: Option<Arc<IsolatedResolveCatalog>>,
+    _lock: tokio::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl ResolveCatalogIsolationGuard {
+    /// Install a fresh scenario whose lattice-aware fetcher always fails, on a
+    /// local empty cache, so an `Err` is deterministic and independent of the
+    /// global `CACHED_CATALOG` state.
+    pub(crate) async fn install_with_failing_fetch() -> Self {
+        let lock = __private_test_catalog_lock().await;
+        let scene = Arc::new(IsolatedResolveCatalog {
+            lifecycle: CatalogLifecycle {
+                in_flight: tokio::sync::Mutex::const_new(()),
+                last_failure: AtomicI64::new(0),
+                clock: Box::new(now_monotonic_secs),
+                fetcher: Box::new(|| {
+                    Box::pin(async { Err(anyhow::Error::msg("models.dev catalog unavailable")) })
+                        as CatalogFetchFuture
+                }),
+            },
+            cache: OnceCell::const_new(),
+        });
+        let mut slot = TEST_RESOLVE_CATALOG
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = slot.replace(scene);
+        Self {
+            _previous: previous,
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ResolveCatalogIsolationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = TEST_RESOLVE_CATALOG.lock() {
+            *slot = self._previous.take();
+        }
+    }
 }
 
 /// Look up model IDs for a model_provider, keyed by `models.dev`'s model_provider name.
