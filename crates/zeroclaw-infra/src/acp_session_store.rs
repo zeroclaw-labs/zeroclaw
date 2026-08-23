@@ -1421,6 +1421,36 @@ mod tests {
     }
 
     #[test]
+    fn owned_delete_is_an_atomic_ownership_predicate() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("owned", "agent", "/ws", Some("user:alice"))
+            .unwrap();
+
+        assert!(
+            !store.delete_session_owned("owned", "user:bob").unwrap(),
+            "the wrong owner deletes nothing"
+        );
+        assert!(store.load_session("owned").unwrap().is_some());
+
+        assert!(store.delete_session_owned("owned", "user:alice").unwrap());
+        assert!(store.load_session("owned").unwrap().is_none());
+    }
+
+    #[test]
+    fn owned_delete_refuses_null_owner_rows() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("legacy", "agent", "/ws", None)
+            .unwrap();
+        assert!(
+            !store.delete_session_owned("legacy", "user:alice").unwrap(),
+            "NULL never equals a principal id"
+        );
+        assert!(store.load_session("legacy").unwrap().is_some());
+    }
+
+    #[test]
     fn mark_session_killed_persists_without_deleting_history() {
         let (tmp, store) = open_store();
         store

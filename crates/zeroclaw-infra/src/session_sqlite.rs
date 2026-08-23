@@ -1732,6 +1732,45 @@ mod tests {
     }
 
     #[test]
+    fn owned_delete_is_an_atomic_ownership_predicate() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_principal("s1", "user:alice").unwrap();
+
+        // The wrong owner deletes nothing and leaves the session intact.
+        assert!(!backend.delete_session_owned("s1", "user:bob").unwrap());
+        assert!(!backend.load("s1").is_empty());
+        assert_eq!(
+            backend
+                .get_session_metadata("s1")
+                .and_then(|m| m.principal_id),
+            Some("user:alice".to_string())
+        );
+
+        // The owner's predicated delete removes the session and its rows.
+        assert!(backend.delete_session_owned("s1", "user:alice").unwrap());
+        assert!(backend.load("s1").is_empty());
+        assert!(backend.get_session_metadata("s1").is_none());
+    }
+
+    #[test]
+    fn owned_delete_refuses_null_owner_rows() {
+        // A legacy row with no owner is not deletable through the owned
+        // path: NULL never equals a principal id, so scoped principals
+        // cannot destroy pre-principal sessions.
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        backend.append("legacy", &ChatMessage::user("old")).unwrap();
+        assert!(
+            !backend
+                .delete_session_owned("legacy", "user:alice")
+                .unwrap()
+        );
+        assert!(!backend.load("legacy").is_empty());
+    }
+
+    #[test]
     fn session_exists_tracks_metadata_row() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
