@@ -124,10 +124,27 @@ An OIDC access token works the same way with `auth_provider = "oidc.<alias>"`.
   preserves the TUI's registry identity and grants **no** authority. Every
   `initialize` re-presents a credential.
 
+## Session isolation
+
+Every session a scoped principal creates is stamped with that principal's
+id in the live store and on disk (chat backend and ACP store). Scoped
+principals see and touch only their own sessions: listings are filtered,
+reads and mutations get one uniform not-found-or-not-owned denial (no
+existence probing), destructive deletes run as owner-predicated storage
+statements, and in-flight approvals resolve only for the owner of the
+session they were raised for. Sessions created before this change (or by
+unscoped connections) carry no owner: they stay fully visible to unscoped
+connections and invisible to scoped principals.
+
+Memory operations are fail-closed for scoped principals in the interim:
+queries must be scoped to an owned session, and bare-key or cross-session
+memory access stays unscoped-only until principal-owned memory storage
+lands.
+
 ## What this layer does not do (yet)
 
-Session and memory records are not yet principal-owned (that storage
-boundary is its own tracked change), gateway HTTP routes keep their
+Memory records are not yet principal-owned at the storage layer (scoped
+access is fail-closed instead, as above), gateway HTTP routes keep their
 existing pairing checks, and channel identities do not resolve into this
 principal model. The daemon's own uid and the shared operator retain full
 access throughout, so single-operator installs behave exactly as before.
