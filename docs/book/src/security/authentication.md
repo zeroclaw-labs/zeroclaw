@@ -136,15 +136,20 @@ session they were raised for. Sessions created before this change (or by
 unscoped connections) carry no owner: they stay fully visible to unscoped
 connections and invisible to scoped principals.
 
-Memory operations are fail-closed for scoped principals in the interim:
-queries must be scoped to an owned session, and bare-key or cross-session
-memory access stays unscoped-only until principal-owned memory storage
-lands.
+Scoped principals get PRIVATE memory: their memory operations read and
+write a per-principal plane whose owner travels in every storage
+statement, invisible to and untouchable from the shared plane (and vice
+versa). Private writes pass the same content scanning and policy gates as
+shared writes, and private operations are audited with principal
+attribution. On memory backends without principal support (markdown,
+lucid, postgres, qdrant today) private memory fails closed with a clear
+denial rather than silently un-scoping.
 
 ## What this layer does not do (yet)
 
-Memory records are not yet principal-owned at the storage layer (scoped
-access is fail-closed instead, as above), gateway HTTP routes keep their
-existing pairing checks, and channel identities do not resolve into this
-principal model. The daemon's own uid and the shared operator retain full
+Agent-loop memory (auto-save and per-turn recall inside sessions) stays
+on the shared plane, administrative access into another principal's
+private memory has no surfaced pathway yet (deny-by-default), gateway
+HTTP routes keep their existing pairing checks, and channel identities do
+not resolve into this principal model. The daemon's own uid and the shared operator retain full
 access throughout, so single-operator installs behave exactly as before.
