@@ -1273,7 +1273,7 @@ mod tests {
         let (pending_tx, mut pending_rx) =
             tokio::sync::oneshot::channel::<zeroclaw_api::channel::ChannelApprovalResponse>();
         ctx.approval_pending
-            .insert("test-req-1".to_string(), pending_tx);
+            .insert("test-req-1".to_string(), "unused".to_string(), pending_tx);
 
         let approve_params = serde_json::json!({
             "session_id": "unused",
