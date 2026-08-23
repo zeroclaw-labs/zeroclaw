@@ -1,7 +1,7 @@
 ---
 type: architecture
 status: accepted
-last-reviewed: 2026-07-25
+last-reviewed: 2026-08-20
 relates-to:
   - docs/book/src/foundations/fnd-002-documentation-standards.md
 ---
@@ -29,6 +29,7 @@ Accepted ADRs are immutable. If the architecture changes, write a new ADR and ma
 | [ADR-011](./ADR-011-multi-agent-runtime-boundaries.md) | accepted | Configured agents have explicit runtime boundaries under one daemon. |
 | [ADR-012](./ADR-012-generation-scoped-live-config-apply.md) | proposed | Live config application uses canonical generations and target-specific results. |
 | [ADR-013](./ADR-013-key-source-authority.md) | proposed | Master key acquisition uses one configured key-source authority. |
+| [ADR-014](./ADR-014-plugin-egress-authority.md) | proposed | Plugin network access is mediated by one host-owned egress authority. |
 
 ADR-006 and ADR-007 are implementation-gated roadmap decisions from [FND-002](../../foundations/fnd-002-documentation-standards.md). Their target directions are recorded, but they remain proposed until the acceptance boundaries in each record ship.
 
@@ -37,3 +38,5 @@ ADR-010 remains proposed until the acceptance gates in the record are met.
 ADR-012 remains proposed until canonical config publication, generation-scoped results, and the bounded security and channel live-apply consumers meet the acceptance gates in the record.
 
 ADR-013 remains proposed until the canonical key-source boundary, safe file compatibility, configured fail-closed selection, and a supported non-file source meet the acceptance gates in the record.
+
+ADR-014 remains proposed until the enforced plugin transport boundary, the signature-covered manifest declaration, the operator grant ceremony, and the fleet rollout meet the acceptance gates in the record.
