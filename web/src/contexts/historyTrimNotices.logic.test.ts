@@ -101,6 +101,7 @@ test('untrimmable newest-turn floor renders a distinct notice that does not clai
       token_budget: 100000,
       tokens_before: 612000,
       tokens_after: 117000,
+      unsatisfiable_floor: true,
     } satisfies HistoryTrimmedNoticeMessage,
     t,
   );
@@ -109,6 +110,23 @@ test('untrimmable newest-turn floor renders a distinct notice that does not clai
   assert.match(text, /configured budget: 100000/);
   assert.ok(!text.includes('was trimmed:'), 'the floor must not claim history changed');
   assert.ok(!text.includes('messages dropped'), 'the floor must not claim a trim happened');
+});
+
+test('floor reached after real drops reports the unsatisfiable outcome, not a successful trim', () => {
+  const text = buildHistoryTrimmedNotice(
+    {
+      reason: 'context token budget exceeded',
+      dropped_messages: 2,
+      kept_turns: 1,
+      token_budget: 100000,
+      tokens_before: 612000,
+      tokens_after: 117000,
+      unsatisfiable_floor: true,
+    } satisfies HistoryTrimmedNoticeMessage,
+    t,
+  );
+  assert.match(text, /could not be trimmed below the configured token budget/);
+  assert.ok(!text.includes('Earlier conversation history was trimmed'));
 });
 
 test('ordinary trim with dropped messages keeps the trimmed wording even when slightly over budget', () => {

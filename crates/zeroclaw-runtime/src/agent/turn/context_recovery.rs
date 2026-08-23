@@ -156,6 +156,7 @@ pub(crate) async fn try_recover_context_overflow(
                             zeroclaw_api::agent::TokenCountSource::Estimated,
                         ),
                         tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                        unsatisfiable_floor: None,
                     })
                     .await;
             }
@@ -171,6 +172,7 @@ pub(crate) async fn try_recover_context_overflow(
                 tokens_after: Some(tokens_after as u64),
                 tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                unsatisfiable_floor: None,
             });
             return true;
         }
@@ -355,6 +357,7 @@ mod tests {
                 tokens_after,
                 tokens_before_source,
                 tokens_after_source,
+                unsatisfiable_floor: _,
             } => {
                 assert!(dropped_messages > 0, "must report dropped messages");
                 assert!(kept_turns >= 1, "must keep at least the current turn");

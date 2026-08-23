@@ -7237,17 +7237,17 @@ impl ChatState {
                 tokens_after,
                 tokens_before_source,
                 tokens_after_source,
+                unsatisfiable_floor,
                 ..
             } => {
                 let dropped = dropped_messages.to_string();
                 let kept = kept_turns.to_string();
-                // The untrimmable newest-turn/schema floor is emitted with
-                // `dropped_messages` 0 while the projected `tokens_after` still
-                // exceeds the configured budget. It must not claim history was
-                // trimmed: render a distinct, truthful notice.
-                let at_floor = dropped_messages == 0
-                    && token_budget
-                        .is_some_and(|budget| tokens_after.is_some_and(|after| after > budget));
+                // The unsatisfiable newest-turn/schema floor is flagged
+                // explicitly by the runtime: the retained request cannot fit
+                // the configured budget even though history MAY have been
+                // trimmed on the way to that floor, so the notice must not
+                // claim a successful trim.
+                let at_floor = unsatisfiable_floor == Some(true);
                 let notice = if at_floor {
                     crate::i18n::t_args(
                         "zc-chat-history-trimmed-floor",
@@ -12409,6 +12409,7 @@ mod tests {
             tokens_after: None,
             tokens_before_source: None,
             tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(
@@ -12433,6 +12434,7 @@ mod tests {
             tokens_after: Some(117_000),
             tokens_before_source: Some("provider".to_string()),
             tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(
@@ -12465,6 +12467,7 @@ mod tests {
             tokens_after: Some(117_000),
             tokens_before_source: Some("provider".to_string()),
             tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(
@@ -12491,6 +12494,7 @@ mod tests {
             tokens_after: Some(117_000),
             tokens_before_source: Some("provider".to_string()),
             tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(
@@ -12505,9 +12509,10 @@ mod tests {
 
     #[test]
     fn history_trimmed_untrimmable_floor_does_not_claim_history_changed() {
-        // The newest-turn/schema floor is emitted with `dropped_messages` 0
-        // while the projected `tokens_after` still exceeds the configured
-        // budget. The notice must not claim history was trimmed.
+        // The unsatisfiable newest-turn/schema floor carries the explicit
+        // `unsatisfiable_floor` flag while the projected `tokens_after`
+        // still exceeds the configured budget. The notice must not claim
+        // history was trimmed.
         let mut s = state();
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
@@ -12519,6 +12524,7 @@ mod tests {
             tokens_after: Some(117_000),
             tokens_before_source: Some("calibrated".to_string()),
             tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
         });
 
         assert!(matches!(
@@ -12533,9 +12539,38 @@ mod tests {
     }
 
     #[test]
-    fn history_trimmed_floor_discriminator_requires_dropped_zero_and_over_budget() {
-        // A real trim that dropped at least one message must keep the trimmed
-        // wording even when the retained count still exceeds the budget.
+    fn history_trimmed_floor_with_real_drops_reports_both_facts() {
+        // A breadcrumb-induced floor after real turns were removed carries
+        // BOTH the honest drop count and the unsatisfiable flag; the notice
+        // must use the floor wording, not claim an ordinary successful trim.
+        let mut s = state();
+        s.apply_update(SessionUpdate::HistoryTrimmed {
+            session_id: "sess-1".to_string(),
+            dropped_messages: 2,
+            kept_turns: 1,
+            reason: "context token budget exceeded".to_string(),
+            token_budget: Some(100_000),
+            tokens_before: Some(200_000),
+            tokens_after: Some(117_000),
+            tokens_before_source: Some("provider".to_string()),
+            tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: Some(true),
+        });
+
+        assert!(matches!(
+            s.entries().last(),
+            Some(ChatEntry::SystemMessage(text))
+                if text.contains("could not be trimmed below the configured token budget")
+                    && text.contains("configured budget: 100000")
+                    && !text.contains("Earlier conversation history was trimmed")
+        ));
+    }
+
+    #[test]
+    fn history_trimmed_without_flag_keeps_trimmed_wording_when_over_budget() {
+        // Older daemons never emit the flag; their events must keep rendering
+        // through the ordinary wording paths even when counts exceed the
+        // budget, so the flag alone drives the floor discriminator.
         let mut s = state();
         s.apply_update(SessionUpdate::HistoryTrimmed {
             session_id: "sess-1".to_string(),
@@ -12547,6 +12582,7 @@ mod tests {
             tokens_after: Some(117_000),
             tokens_before_source: Some("provider".to_string()),
             tokens_after_source: Some("calibrated".to_string()),
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(
@@ -12570,6 +12606,7 @@ mod tests {
             tokens_after: Some(6_000),
             tokens_before_source: Some("estimate".to_string()),
             tokens_after_source: Some("estimate".to_string()),
+            unsatisfiable_floor: None,
         });
 
         assert!(matches!(

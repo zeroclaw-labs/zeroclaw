@@ -452,14 +452,24 @@ async fn enforce_reported_budget(
         // If the breadcrumb pushes the retained newest turn over the decision
         // budget and no more whole turn can be dropped, carry the floor flag so
         // the explicit floor is surfaced instead of a successful ordinary
-        // trim that still exceeds the budget.
+        // trim that still exceeds the budget. The floor event reports the REAL
+        // structural removals that happened on the way to the floor (this loop
+        // may already have dropped turns before the breadcrumb-induced floor)
+        // and marks the outcome unsatisfiable so clients never read it as an
+        // ordinary successful trim.
         if hit_floor && tokens_after > decision_budget {
-            let floor_turns = crate::agent::history_trim::count_turns(&trimmed);
+            let structural_drops = taken_len.saturating_sub(
+                trimmed
+                    .len()
+                    .saturating_add(usize::from(taken_had_crumb))
+                    .saturating_sub(1),
+            );
+            let floor_turns = crate::agent::history_trim::count_turns(&trimmed).saturating_sub(1);
             *history = trimmed;
             if let Some(tx) = event_tx {
                 let _ = tx
                     .send(TurnEvent::HistoryTrimmed {
-                        dropped_messages: 0,
+                        dropped_messages: structural_drops,
                         kept_turns: floor_turns,
                         reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                         token_budget: Some(context_token_budget as u64),
@@ -471,12 +481,13 @@ async fn enforce_reported_budget(
                         tokens_after_source: Some(
                             zeroclaw_api::agent::TokenCountSource::Calibrated,
                         ),
+                        unsatisfiable_floor: Some(true),
                     })
                     .await;
             }
             observer.record_event(
                 &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-                    dropped_messages: 0,
+                    dropped_messages: structural_drops,
                     kept_turns: floor_turns,
                     reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
                     channel: None,
@@ -487,6 +498,7 @@ async fn enforce_reported_budget(
                     tokens_after: Some(tokens_after as u64),
                     tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                    unsatisfiable_floor: Some(true),
                 },
             );
             return;
@@ -543,6 +555,7 @@ async fn enforce_reported_budget(
                     // durable retained population.
                     tokens_before_source: Some(tokens_before_source),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                    unsatisfiable_floor: None,
                 })
                 .await;
         }
@@ -559,6 +572,7 @@ async fn enforce_reported_budget(
                 tokens_after: Some(result.tokens_after as u64),
                 tokens_before_source: Some(tokens_before_source),
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                unsatisfiable_floor: None,
             },
         );
     } else if hit_floor {
@@ -567,8 +581,11 @@ async fn enforce_reported_budget(
         // so no whole turn could be removed. Nothing was dropped, so no breadcrumb
         // is injected and no trim claim is made; instead the floor is surfaced
         // explicitly with the honest accounting so clients and operators see that
-        // the request cannot be brought under the configured budget.
-        let floor_turns = crate::agent::history_trim::count_turns(&trimmed);
+        // the request cannot be brought under the configured budget. `kept_turns`
+        // excludes a leading crumb left by an earlier trim so the count stays
+        // breadcrumb-aware.
+        let floor_turns = crate::agent::history_trim::count_turns(&trimmed)
+            .saturating_sub(usize::from(taken_had_crumb));
         *history = trimmed;
         if let Some(tx) = event_tx {
             let _ = tx
@@ -581,6 +598,7 @@ async fn enforce_reported_budget(
                     tokens_after: Some(tokens_after as u64),
                     tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                    unsatisfiable_floor: Some(true),
                 })
                 .await;
         }
@@ -597,6 +615,7 @@ async fn enforce_reported_budget(
                 tokens_after: Some(tokens_after as u64),
                 tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
                 tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+                unsatisfiable_floor: Some(true),
             },
         );
     } else {
@@ -1020,6 +1039,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                             tokens_after_source: Some(
                                 zeroclaw_api::agent::TokenCountSource::Estimated,
                             ),
+                            unsatisfiable_floor: None,
                         })
                         .await;
                 }
@@ -1038,6 +1058,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                             zeroclaw_api::agent::TokenCountSource::Estimated,
                         ),
                         tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                        unsatisfiable_floor: None,
                     },
                 );
             }
@@ -3627,6 +3648,117 @@ mod reported_budget_tests {
         assert_eq!(
             after, taken,
             "the untrimmable floor must not mutate the retained history"
+        );
+    }
+
+    #[tokio::test]
+    async fn enforce_breadcrumb_induced_floor_after_real_drop_reports_both_facts() {
+        // Two real turns: the projection drops the oldest turn to fit, but the
+        // inserted model-visible breadcrumb pushes the retained newest turn
+        // back over the budget and no further whole turn can be dropped. The
+        // floor outcome must report BOTH facts honestly: the messages that
+        // were actually removed on the way to the floor, and the
+        // unsatisfiable flag clients use as the authoritative discriminator —
+        // not a zero-drop "nothing was trimmed" claim about a history that
+        // lost a real turn.
+        let big = "x".repeat(2000);
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("turn1 {big}")),
+            ChatMessage::assistant("a1".to_string()),
+            ChatMessage::user("turn2 question".to_string()),
+            ChatMessage::assistant("turn2 answer".to_string()),
+        ];
+        let estimated = crate::agent::history::estimate_history_tokens(&history);
+        let reported = estimated;
+        let trimmed_without_crumb = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("turn2 question".to_string()),
+            ChatMessage::assistant("turn2 answer".to_string()),
+        ];
+        let est_trimmed = crate::agent::history::estimate_history_tokens(&trimmed_without_crumb);
+        let crumb = crate::agent::history_trim::breadcrumb();
+        let with_crumb = vec![
+            ChatMessage::system("system"),
+            crumb,
+            ChatMessage::user("turn2 question".to_string()),
+            ChatMessage::assistant("turn2 answer".to_string()),
+        ];
+        let est_with_crumb = crate::agent::history::estimate_history_tokens(&with_crumb);
+        assert!(
+            est_with_crumb > est_trimmed,
+            "the breadcrumb must add measurable population"
+        );
+        // Budget sits strictly between the trimmed population without the
+        // crumb (fits) and with the crumb (does not): dropping one turn fits,
+        // but the breadcrumb tips it over the floor.
+        let budget = est_trimmed + (est_with_crumb - est_trimmed) / 2;
+        let next_schema_tokens = 0;
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        enforce_reported_budget(
+            &mut history,
+            reported,
+            estimated,
+            next_schema_tokens,
+            budget,
+            Some(&tx),
+            &NoopObserver,
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            false,
+            None,
+            false,
+            0,
+        )
+        .await;
+
+        let event = rx
+            .recv()
+            .await
+            .expect("the breadcrumb-induced floor must emit a HistoryTrimmed event");
+        let (dropped_messages, kept_turns, unsatisfiable_floor, tokens_after) = match event {
+            TurnEvent::HistoryTrimmed {
+                dropped_messages,
+                kept_turns,
+                unsatisfiable_floor,
+                tokens_after,
+                ..
+            } => (
+                dropped_messages,
+                kept_turns,
+                unsatisfiable_floor,
+                tokens_after,
+            ),
+            other => panic!("expected HistoryTrimmed, got {other:?}"),
+        };
+        assert_eq!(
+            dropped_messages, 2,
+            "the event must report the real structural removals (user + assistant of turn1), \
+             not a zero-drop floor claim"
+        );
+        assert!(
+            !history.iter().any(|m| m.content.contains("turn1")),
+            "turn1 must actually be gone from the retained history"
+        );
+        assert!(
+            crate::agent::history_trim::has_leading_breadcrumb(&history),
+            "the retained history must carry the model-visible breadcrumb"
+        );
+        assert_eq!(
+            kept_turns, 1,
+            "kept_turns must be breadcrumb-aware: only the newest real turn remains"
+        );
+        assert_eq!(
+            unsatisfiable_floor,
+            Some(true),
+            "the client-visible unsatisfiable flag must mark the floor even after real drops"
+        );
+        let tokens_after =
+            tokens_after.expect("the floor event must carry the projected post-trim count");
+        assert!(
+            tokens_after > budget as u64,
+            "the retained request must still exceed the budget at the floor \
+             (tokens_after {tokens_after}, budget {budget})"
         );
     }
 

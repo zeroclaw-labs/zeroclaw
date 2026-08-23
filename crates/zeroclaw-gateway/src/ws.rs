@@ -592,6 +592,7 @@ async fn handle_socket(
         tokens_after,
         tokens_before_source,
         tokens_after_source,
+        unsatisfiable_floor,
     }) = restore_trim_event
     {
         let frame = history_trimmed_ws_frame(
@@ -603,6 +604,7 @@ async fn handle_socket(
             tokens_after,
             tokens_before_source.map(|s| s.as_str()),
             tokens_after_source.map(|s| s.as_str()),
+            unsatisfiable_floor,
         );
         let _ = sender.send(Message::Text(frame.to_string().into())).await;
     }
@@ -953,6 +955,7 @@ fn history_trimmed_ws_frame(
     tokens_after: Option<u64>,
     tokens_before_source: Option<&str>,
     tokens_after_source: Option<&str>,
+    unsatisfiable_floor: Option<bool>,
 ) -> serde_json::Value {
     let mut frame = serde_json::json!({
         "type": "history_trimmed",
@@ -974,6 +977,9 @@ fn history_trimmed_ws_frame(
     }
     if let Some(tokens_after_source) = tokens_after_source {
         frame["tokens_after_source"] = tokens_after_source.into();
+    }
+    if let Some(unsatisfiable_floor) = unsatisfiable_floor {
+        frame["unsatisfiable_floor"] = unsatisfiable_floor.into();
     }
     frame
 }
@@ -1329,6 +1335,7 @@ async fn process_chat_message(
                             tokens_after,
                             tokens_before_source,
                             tokens_after_source,
+                            unsatisfiable_floor,
                         } => history_trimmed_ws_frame(
                             dropped_messages,
                             kept_turns,
@@ -1338,6 +1345,7 @@ async fn process_chat_message(
                             tokens_after,
                             tokens_before_source.map(|s| s.as_str()),
                             tokens_after_source.map(|s| s.as_str()),
+                            unsatisfiable_floor,
                         ),
                         TurnEvent::Plan { entries } => serde_json::json!({
                             "type": "plan",
@@ -2041,7 +2049,8 @@ data: {\"type\":\"message_stop\"}\n\n",
 
     #[test]
     fn restore_trim_uses_live_history_trimmed_frame_shape() {
-        let frame = history_trimmed_ws_frame(12, 3, "message limit", None, None, None, None, None);
+        let frame =
+            history_trimmed_ws_frame(12, 3, "message limit", None, None, None, None, None, None);
 
         assert_eq!(
             frame,
@@ -2065,6 +2074,7 @@ data: {\"type\":\"message_stop\"}\n\n",
             Some(117_000),
             Some("provider"),
             Some("calibrated"),
+            None,
         );
 
         assert_eq!(frame["type"], "history_trimmed");

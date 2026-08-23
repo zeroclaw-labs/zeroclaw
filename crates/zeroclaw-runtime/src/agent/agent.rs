@@ -314,6 +314,7 @@ impl HistoryTrimNotice {
             tokens_after: None,
             tokens_before_source: None,
             tokens_after_source: None,
+            unsatisfiable_floor: None,
         }
     }
 }
@@ -1972,6 +1973,7 @@ impl Agent {
             tokens_after: None,
             tokens_before_source: None,
             tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         Some(HistoryTrimNotice {

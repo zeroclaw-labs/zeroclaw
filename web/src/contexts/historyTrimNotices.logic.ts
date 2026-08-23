@@ -17,6 +17,7 @@ export interface HistoryTrimmedNoticeMessage {
   tokens_after?: number;
   tokens_before_source?: string;
   tokens_after_source?: string;
+  unsatisfiable_floor?: boolean;
 }
 
 export function buildHistoryTrimmedNotice(
@@ -27,14 +28,13 @@ export function buildHistoryTrimmedNotice(
   const dropped = String(msg.dropped_messages ?? 0);
   const kept = String(msg.kept_turns ?? 0);
   const hasTokens = msg.tokens_before != null && msg.tokens_after != null;
-  // The untrimmable newest-turn/schema floor is emitted with `dropped_messages`
-  // 0 while the projected `tokens_after` still exceeds the configured budget.
-  // It must not claim history was trimmed: render a distinct, truthful notice.
+  // The unsatisfiable newest-turn/schema floor is flagged explicitly by the
+  // runtime: the retained request cannot fit the configured budget even though
+  // history MAY have been trimmed on the way to that floor. The flag — not
+  // `dropped_messages === 0` — is the authoritative signal, so a floor reached
+  // after real drops still renders truthfully.
   const atFloor =
-    (msg.dropped_messages ?? 0) === 0 &&
-    hasTokens &&
-    msg.token_budget != null &&
-    msg.tokens_after > msg.token_budget;
+    msg.unsatisfiable_floor === true && hasTokens && msg.token_budget != null;
   if (atFloor) {
     return t('agent.history_trimmed_floor')
       .replace('{reason}', reason)

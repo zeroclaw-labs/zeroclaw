@@ -141,6 +141,13 @@ pub enum TurnEvent {
         tokens_before_source: Option<TokenCountSource>,
         /// Provenance of `tokens_after`.
         tokens_after_source: Option<TokenCountSource>,
+        /// The retained provider-facing request cannot be brought under the
+        /// configured budget because only the protected newest turn (plus
+        /// tool schemas) remains. History MAY have been trimmed on the way to
+        /// that floor, so this flag — not `dropped_messages == 0` — is the
+        /// authoritative "unsatisfiable" signal. `None`/absent for ordinary
+        /// trims.
+        unsatisfiable_floor: Option<bool>,
     },
     /// Per-LLM-call token usage and cost; a turn may emit several, one per
     /// model call. `None` means "unavailable for this call", not zero.

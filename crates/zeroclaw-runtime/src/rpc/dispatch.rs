@@ -5453,6 +5453,7 @@ fn notification_for_turn_event(
             tokens_after,
             tokens_before_source,
             tokens_after_source,
+            unsatisfiable_floor,
         } => SessionUpdateEvent::HistoryTrimmed {
             session_id: session_id.to_string(),
             dropped_messages: *dropped_messages,
@@ -5463,6 +5464,7 @@ fn notification_for_turn_event(
             tokens_after: *tokens_after,
             tokens_before_source: *tokens_before_source,
             tokens_after_source: *tokens_after_source,
+            unsatisfiable_floor: *unsatisfiable_floor,
         },
         TurnEvent::Usage { input_tokens, .. } => SessionUpdateEvent::ContextUsage {
             session_id: session_id.to_string(),
@@ -8051,6 +8053,7 @@ mod tests {
             tokens_after: Some(117_000),
             tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
             tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            unsatisfiable_floor: None,
         };
         let json = notification_for_turn_event("s1", &event, None).unwrap();
         let v = parse(&json);
@@ -8081,6 +8084,7 @@ mod tests {
             tokens_after: Some(6_000),
             tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
             tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            unsatisfiable_floor: None,
         };
         let json = notification_for_turn_event("s1", &event, None).unwrap();
         let v = parse(&json);
@@ -9391,6 +9395,7 @@ mod tests {
             tokens_after: None,
             tokens_before_source: None,
             tokens_after_source: None,
+            unsatisfiable_floor: None,
         };
 
         dispatcher

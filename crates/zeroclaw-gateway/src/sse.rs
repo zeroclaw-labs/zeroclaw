@@ -344,6 +344,7 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 tokens_after,
                 tokens_before_source,
                 tokens_after_source,
+                unsatisfiable_floor,
             } => {
                 let mut json = serde_json::json!({
                     "type": "history_trimmed",
@@ -367,6 +368,9 @@ impl zeroclaw_runtime::observability::Observer for BroadcastObserver {
                 }
                 if let Some(tokens_after_source) = tokens_after_source {
                     json["tokens_after_source"] = tokens_after_source.as_str().into();
+                }
+                if let Some(unsatisfiable_floor) = unsatisfiable_floor {
+                    json["unsatisfiable_floor"] = (*unsatisfiable_floor).into();
                 }
                 add_optional_string(&mut json, "channel", channel);
                 add_optional_string(&mut json, "agent_alias", agent_alias);
@@ -494,6 +498,7 @@ mod tests {
             tokens_after: Some(117_000),
             tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Provider),
             tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Calibrated),
+            unsatisfiable_floor: None,
         });
 
         let value = rx.try_recv().expect("history_trimmed must broadcast");
@@ -531,6 +536,7 @@ mod tests {
             tokens_after: None,
             tokens_before_source: None,
             tokens_after_source: None,
+            unsatisfiable_floor: None,
         });
 
         let value = rx.try_recv().expect("history_trimmed must broadcast");
