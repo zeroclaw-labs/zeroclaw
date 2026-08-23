@@ -71,6 +71,27 @@ mapping, and the lifetime bounds are documented on the section reference:
 
 {{#config-fields oidc}}
 
+#### Enrolling (getting a token to present)
+
+The daemon only verifies tokens; clients obtain them from the IdP. Two
+browserless flows ship with the CLI:
+
+```sh
+# Interactive sign-in via the Device Authorization Grant (RFC 8628):
+# prints a verification code to enter in any browser, waits for
+# approval, then writes the access token to stdout.
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp)"
+
+# Headless service principals via client_credentials (requires the
+# entry's client_secret):
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc token corp)"
+```
+
+Progress messages go to stderr; stdout carries only the token, so both
+commands compose with command substitution. Nothing is stored: present
+the token as `auth_token` in the RPC handshake (or via the environment
+variable) before it expires, then re-enroll.
+
 ## Permission profiles
 
 {{#config-fields permission_profiles}}
