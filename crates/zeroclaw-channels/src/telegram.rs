@@ -943,57 +943,79 @@ impl TelegramChannel {
     /// (`is_from_allowed_group`, `is_any_user_allowed`) see the latest
     /// authorization policy before a message is admitted.
     ///
+    /// Returns `Ok(true)` if config was refreshed, `Ok(false)` if stamp
+    /// unchanged, `Err` if reload failed. On failure, the previous shared
+    /// config is retained and the stamp is NOT updated, so the next poll
+    /// will retry.
+    ///
     /// Provider warmup and model-provider cache updates are deliberately
     /// NOT done here — that heavier work stays in the orchestrator's
     /// `maybe_apply_runtime_config_update` so it doesn't block the listener.
-    async fn refresh_runtime_config(&self) {
+    async fn refresh_runtime_config(&self) -> anyhow::Result<bool> {
         let Some(config_path) = &self.config_path else {
-            return;
+            return Ok(false);
         };
 
         let Some(persist) = &self.persist else {
-            return;
+            return Ok(false);
         };
 
-        let metadata = match tokio::fs::metadata(config_path).await {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        let modified = match metadata.modified() {
-            Ok(t) => t,
-            Err(_) => return,
-        };
+        let metadata = tokio::fs::metadata(config_path).await?;
+        let modified = metadata.modified()?;
         let len = metadata.len();
         let stamp = (modified, len);
 
         {
             let last = self.last_config_stamp.lock();
             if *last == Some(stamp) {
-                return;
+                return Ok(false);
             }
         }
 
         // Stamp changed — reload config and write into shared handle.
-        let contents = match tokio::fs::read_to_string(config_path).await {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let mut parsed: Config = match zeroclaw_config::migration::migrate_to_current(&contents) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
+        let contents = tokio::fs::read_to_string(config_path).await?;
+        let mut parsed: Config = zeroclaw_config::migration::migrate_to_current(&contents)?;
         parsed.config_path = config_path.clone();
 
-        if let Some(zeroclaw_dir) = config_path.parent()
-            && let Ok(store) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(zeroclaw_dir) = config_path.parent() {
+            if let Ok(store) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 zeroclaw_runtime::security::SecretStore::new(zeroclaw_dir, parsed.secrets.encrypt)
-            }))
-        {
-            let _ = parsed.decrypt_secrets(&store);
+            })) {
+                if let Err(e) = parsed.decrypt_secrets(&store) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "path": config_path.display().to_string(),
+                                "alias": self.alias.as_str(),
+                                "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                            })),
+                        "Secret decryption failed during config refresh; retaining previous secrets"
+                    );
+                }
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "path": config_path.display().to_string(),
+                            "alias": self.alias.as_str(),
+                        })),
+                    "SecretStore construction panicked during config refresh; retaining previous secrets"
+                );
+            }
         }
-        if let Ok(applied) = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed) {
-            parsed.env_overridden_paths = applied.paths;
-            parsed.pre_override_snapshots = applied.snapshots;
+        if let Err(e) = zeroclaw_config::env_overrides::apply_env_overrides(&mut parsed) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "path": config_path.display().to_string(),
+                        "alias": self.alias.as_str(),
+                        "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                    })),
+                "Environment overrides failed during config refresh; retaining previous overrides"
+            );
         }
 
         *persist.write() = parsed;
@@ -1013,6 +1035,7 @@ impl TelegramChannel {
             ),
             "Refreshed runtime config for authorization policy"
         );
+        Ok(true)
     }
 
     async fn persist_allowed_identity(&self, identity: &str) -> anyhow::Result<()> {
@@ -4031,7 +4054,17 @@ impl Channel for TelegramChannel {
 
             // Recheck authorization policy after long-poll returns, so edits
             // made during the poll are visible for the first admitted update.
-            self.refresh_runtime_config().await;
+            if let Err(e) = self.refresh_runtime_config().await {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({
+                            "alias": self.alias.as_str(),
+                            "error": zeroclaw_runtime::security::scrub(&format!("{}", e)),
+                        })),
+                    "Failed to refresh runtime authorization policy; retaining previous policy"
+                );
+            }
 
             let ok = data
                 .get("ok")
