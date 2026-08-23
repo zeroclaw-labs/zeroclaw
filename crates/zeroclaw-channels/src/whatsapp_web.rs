@@ -2042,6 +2042,27 @@ fn fromme_outside_self_chat_is_operator_trigger(
     super::whatsapp::WhatsAppChannel::text_matches_patterns(applicable, text)
 }
 
+/// WhatsApp JID domains that identify a one-to-one chat.
+///
+/// This is an allow-list rather than "anything that is not `@g.us`". Broadcast
+/// lists, newsletters and call JIDs are not group chats either, yet they are
+/// not direct messages, and treating an unrecognised future domain as a DM
+/// would silently widen every `is_direct_message()` bypass downstream.
+#[cfg(feature = "whatsapp-web")]
+const DIRECT_MESSAGE_JID_DOMAINS: [&str; 2] = ["s.whatsapp.net", "lid"];
+
+/// Whether an originating chat JID denotes a one-to-one conversation.
+///
+/// `reply_target` carries the originating chat JID unchanged, so the domain is
+/// the authoritative signal: `@g.us` is a group, `@s.whatsapp.net` and `@lid`
+/// are individual chats (the latter is WhatsApp's hidden-identity addressing).
+#[cfg(feature = "whatsapp-web")]
+fn is_direct_message_jid(chat_jid: &str) -> bool {
+    chat_jid.rsplit_once('@').is_some_and(|(user, domain)| {
+        !user.is_empty() && DIRECT_MESSAGE_JID_DOMAINS.contains(&domain)
+    })
+}
+
 #[cfg(feature = "whatsapp-web")]
 fn is_group_chat_allowed(chat_jid: &str, allowed_groups: &[String]) -> bool {
     if allowed_groups.is_empty() {
@@ -2409,6 +2430,14 @@ impl ::zeroclaw_api::attribution::Attributable for WhatsAppWebChannel {
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
         "whatsapp"
+    }
+
+    /// Without this the trait default (`false`) applies, so every WhatsApp DM
+    /// is treated as a non-direct message. Callers that exist to spare direct
+    /// messages extra handling — notably the reply-intent precheck bypass in
+    /// the channel orchestrator — then never fire for WhatsApp at all.
+    fn is_direct_message(&self, msg: &ChannelMessage) -> bool {
+        is_direct_message_jid(&msg.reply_target)
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
@@ -3431,6 +3460,41 @@ mod tests {
     fn allowed_groups_empty_permits_all() {
         // Empty list is the default: every group passes (no behavior change).
         assert!(super::is_group_chat_allowed("123456789012345@g.us", &[]));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_accepts_individual_chats() {
+        // Both individual addressing forms: the plain phone JID and the hidden
+        // identity (LID) form WhatsApp uses for privacy-preserving chats.
+        assert!(super::is_direct_message_jid("15550001111@s.whatsapp.net"));
+        assert!(super::is_direct_message_jid("100000000000001@lid"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_groups() {
+        assert!(!super::is_direct_message_jid("120363000000000001@g.us"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_non_conversational_domains() {
+        // Not groups, but not direct messages either. An allow-list keeps these
+        // out; a "not @g.us" check would wrongly admit all three.
+        assert!(!super::is_direct_message_jid("status@broadcast"));
+        assert!(!super::is_direct_message_jid(
+            "120363000000000000@newsletter"
+        ));
+        assert!(!super::is_direct_message_jid("15550001111@call"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn direct_message_jid_rejects_malformed_input() {
+        assert!(!super::is_direct_message_jid(""));
+        assert!(!super::is_direct_message_jid("15550001111"));
+        assert!(!super::is_direct_message_jid("@s.whatsapp.net"));
     }
 
     #[test]
