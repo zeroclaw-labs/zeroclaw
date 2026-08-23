@@ -107,6 +107,9 @@ pub async fn maybe_run_skill_review(
 
     let receipts: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let turn_id = uuid::Uuid::new_v4().to_string();
+    // The review fork owns a fresh transcript: no prior trim ran, so no
+    // crumb exists and none can outlive this scoped loop.
+    let mut fork_crumb_present = false;
 
     // The tool loop can compact/trim `review_history` in place (hard-cap and
     // reported-budget trimming both shrink the history vec during the loop).
@@ -154,6 +157,9 @@ pub async fn maybe_run_skill_review(
                     },
                 ),
                 history: &mut review_history,
+                // The review fork owns a fresh transcript: no prior trim ran,
+                // so no crumb exists and none can outlive this scoped loop.
+                history_has_trim_breadcrumb: &mut fork_crumb_present,
                 // no human in the loop here
                 channel_name: "skill_review",
                 channel_reply_target: None,

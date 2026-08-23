@@ -64,6 +64,10 @@ pub(crate) async fn try_recover_context_overflow(
     on_delta: Option<&tokio::sync::mpsc::Sender<super::events::DraftEvent>>,
     observer: &dyn Observer,
     context_token_budget: usize,
+    // Owner-tracked breadcrumb provenance for `history` (see
+    // `history_trim::insert_breadcrumb_deduped`); set when this recovery
+    // inserts a fresh crumb so classification never depends on text.
+    crumb_present: &mut bool,
 ) -> bool {
     if zeroclaw_providers::reliable::is_context_window_exceeded(e) {
         ::zeroclaw_log::record!(
@@ -113,6 +117,7 @@ pub(crate) async fn try_recover_context_overflow(
                 .take_while(|m| m.role == "system")
                 .count();
             recovered_history.insert(system_count, crate::agent::history_trim::breadcrumb());
+            *crumb_present = true;
             // Recompute from the final recovered history (breadcrumb included)
             // so the reported count matches what the retried call sends.
             tokens_after = crate::agent::history::estimate_history_tokens(&recovered_history);
@@ -242,6 +247,7 @@ mod tests {
             Some(&delta_tx),
             &observer,
             32_000,
+            &mut false,
         )
         .await;
 
@@ -274,6 +280,7 @@ mod tests {
             Some(&delta_tx),
             &observer,
             32_000,
+            &mut false,
         )
         .await;
 
@@ -309,6 +316,7 @@ mod tests {
             Some(&delta_tx),
             &observer,
             32_000,
+            &mut false,
         )
         .await;
 
@@ -334,9 +342,17 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            32_000,
+            &mut false,
+        )
+        .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         // The retried history must carry the model-visible breadcrumb after the
@@ -417,6 +433,7 @@ mod tests {
             None,
             &observer,
             configured_budget,
+            &mut false,
         )
         .await;
 
@@ -455,9 +472,17 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 0)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            0,
+            &mut false,
+        )
+        .await;
 
         assert!(recovered, "an overflowing history must trim and recover");
         let event = rx.try_recv().expect("recovery must emit a TurnEvent");
@@ -488,9 +513,17 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 100)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            100,
+            &mut false,
+        )
+        .await;
 
         assert!(
             !recovered,
@@ -516,9 +549,17 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
         let observer = NoopObserver;
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, Some(&tx), None, &observer, 32_000)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            Some(&tx),
+            None,
+            &observer,
+            32_000,
+            &mut false,
+        )
+        .await;
 
         assert!(!recovered, "a non-overflow error must not trigger recovery");
         assert!(rx.try_recv().is_err(), "no event on the non-overflow path");
@@ -549,9 +590,17 @@ mod tests {
         // Drain any pre-existing broadcast traffic from parallel tests.
         while rx.try_recv().is_ok() {}
 
-        let recovered =
-            try_recover_context_overflow(&mut history, &err, 1, None, None, &observer, budget)
-                .await;
+        let recovered = try_recover_context_overflow(
+            &mut history,
+            &err,
+            1,
+            None,
+            None,
+            &observer,
+            budget,
+            &mut false,
+        )
+        .await;
         assert!(!recovered, "floor-dominates overflow must not recover");
 
         // Read the emitted `context_floor_exceeds_budget` record within a 2s

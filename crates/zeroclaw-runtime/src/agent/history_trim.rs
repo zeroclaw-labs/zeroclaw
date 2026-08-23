@@ -264,15 +264,15 @@ pub(crate) fn count_turns(history: &[ChatMessage]) -> usize {
 
 /// Drop the oldest whole turn (after leading system messages and an optional
 /// breadcrumb), preserving the most recent whole turn and the system prefix.
-/// Returns how many messages were dropped — zero when only the newest turn
-/// remains, which the caller treats as the unsatisfiable floor rather than
-/// silently claiming the history fits.
-pub(crate) fn drop_oldest_whole_turn(history: &mut Vec<ChatMessage>) -> usize {
+/// `crumb_present` is the OWNER's authoritative record that the population
+/// carries the synthetic trim breadcrumb — never inferred from message text,
+/// so a genuine user turn that happens to equal the localized breadcrumb
+/// string keeps its turn-boundary role regardless of locale. Returns how many
+/// messages were dropped — zero when only the newest turn remains, which the
+/// caller treats as the unsatisfiable floor rather than silently claiming the
+/// history fits.
+pub(crate) fn drop_oldest_whole_turn(history: &mut Vec<ChatMessage>, crumb_present: bool) -> usize {
     let leading_system = history.iter().take_while(|m| is_system(m)).count();
-    let crumb = breadcrumb();
-    let crumb_present = history
-        .get(leading_system)
-        .is_some_and(|m| m.role == crumb.role && m.content == crumb.content);
     let body_start = leading_system + usize::from(crumb_present);
     let body = &history[body_start..];
     let boundaries: Vec<usize> = body
@@ -296,26 +296,18 @@ pub fn breadcrumb() -> ChatMessage {
     ChatMessage::user(crate::i18n::get_required_cli_string("history-trim-breadcrumb").as_str())
 }
 
-/// Insert the trim breadcrumb after the leading system messages, unless one is
-/// already sitting there.
-pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>) {
-    if has_leading_breadcrumb(history) {
-        return;
+/// Insert the trim breadcrumb after the leading system messages unless the
+/// owner's `crumb_present` record says one is already sitting there. Returns
+/// whether a breadcrumb is present after the call, so the caller can store it
+/// as the population's authoritative provenance instead of re-inferring it
+/// from text later.
+pub fn insert_breadcrumb_deduped(history: &mut Vec<ChatMessage>, crumb_present: bool) -> bool {
+    if crumb_present {
+        return true;
     }
     let system_count = history.iter().take_while(|m| is_system(m)).count();
     history.insert(system_count, breadcrumb());
-}
-
-/// Whether `history` already carries the synthetic trim breadcrumb after its
-/// leading system messages. A population that was itself the product of an
-/// earlier trim keeps its crumb, so accounting must not treat it as a fresh
-/// synthetic message.
-pub fn has_leading_breadcrumb(history: &[ChatMessage]) -> bool {
-    let system_count = history.iter().take_while(|m| is_system(m)).count();
-    let crumb = breadcrumb();
-    history
-        .get(system_count)
-        .is_some_and(|m| m.role == crumb.role && m.content == crumb.content)
+    true
 }
 
 /// Insert the trim breadcrumb into structured history after leading system
@@ -1113,9 +1105,9 @@ mod tests {
     #[test]
     fn insert_breadcrumb_deduped_does_not_stack() {
         let mut h = vec![sys("system"), user("turn1"), asst("a1")];
-        insert_breadcrumb_deduped(&mut h);
+        let mut crumb_present = insert_breadcrumb_deduped(&mut h, false);
         let after_first = h.len();
-        insert_breadcrumb_deduped(&mut h);
+        crumb_present = insert_breadcrumb_deduped(&mut h, crumb_present);
         assert_eq!(
             h.len(),
             after_first,
@@ -1126,15 +1118,79 @@ mod tests {
             .filter(|m| m.role == breadcrumb().role && m.content == breadcrumb().content)
             .count();
         assert_eq!(crumbs, 1);
+        assert!(crumb_present);
+        // A genuine first user turn equal to the breadcrumb string must not
+        // be mistaken for an existing crumb: the OWNER record decides.
+        let mut colliding = vec![sys("system"), user(&breadcrumb().content), asst("a1")];
+        let inserted = insert_breadcrumb_deduped(&mut colliding, false);
+        assert!(
+            inserted,
+            "the owner record says no crumb exists, so a fresh one is inserted"
+        );
+        let crumbs = colliding
+            .iter()
+            .filter(|m| m.role == breadcrumb().role && m.content == breadcrumb().content)
+            .count();
+        assert_eq!(
+            crumbs, 2,
+            "the real user turn stays untouched and the synthetic crumb is added"
+        );
     }
 
     #[test]
     fn insert_breadcrumb_deduped_sits_after_leading_system() {
         let mut h = vec![sys("s1"), sys("s2"), user("turn1"), asst("a1")];
-        insert_breadcrumb_deduped(&mut h);
+        insert_breadcrumb_deduped(&mut h, false);
         assert_eq!(h[0].role, "system");
         assert_eq!(h[1].role, "system");
         assert_eq!(h[2].role, breadcrumb().role);
         assert_eq!(h[2].content, breadcrumb().content);
+    }
+
+    #[test]
+    fn drop_oldest_whole_turn_uses_owner_crumb_record_not_text_inference() {
+        // The history's first non-system turn IS the exact localized
+        // breadcrumb text — but the owner record says it is a REAL user turn.
+        // Whole-turn selection must treat it as a turn boundary, never skip
+        // it as synthetic, regardless of the active locale's wording.
+        let mut h = vec![
+            sys("system"),
+            user(&breadcrumb().content),
+            asst("answer to what looks like a crumb"),
+            user("newest request"),
+            asst("newest answer"),
+        ];
+        let dropped = drop_oldest_whole_turn(&mut h, false);
+        assert_eq!(dropped, 2, "the colliding first turn drops as a whole turn");
+        assert!(
+            matches!(
+                h.get(1),
+                Some(m) if m.role == "user" && m.content == "newest request"
+            ),
+            "the colliding turn is dropped whole and the newest turn survives"
+        );
+        // With the owner record saying a crumb IS present, selection starts
+        // after it even when the crumb slot holds ordinary text.
+        let mut with_marker = vec![
+            sys("system"),
+            user("[synthetic] earlier history was trimmed"),
+            user("old request"),
+            asst("old answer"),
+            user("newest request"),
+            asst("newest answer"),
+        ];
+        let dropped = drop_oldest_whole_turn(&mut with_marker, true);
+        assert_eq!(
+            dropped, 2,
+            "drop starts after the owner-recorded synthetic crumb"
+        );
+        assert!(matches!(
+            with_marker.get(1),
+            Some(m) if m.role == "user" && m.content.contains("synthetic")
+        ));
+        assert!(matches!(
+            with_marker.get(2),
+            Some(m) if m.role == "user" && m.content == "newest request"
+        ));
     }
 }

@@ -6610,6 +6610,11 @@ async fn process_channel_message_body(
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+    // Breadcrumb provenance for `history`, tracked beside the buffer instead
+    // of inferred from localized message text. Persisted prior turns cannot
+    // vouch for a crumb written by an earlier process, so the record starts
+    // fresh here and any trim during this turn updates it.
+    let mut history_has_trim_breadcrumb = false;
 
     let preamble = build_channel_turn_context_preamble(&msg, target_channel.as_ref());
     if let Some(last_turn) = history.last_mut()
@@ -7169,6 +7174,7 @@ async fn process_channel_message_body(
                     },
                 ),
                 history: &mut history,
+                history_has_trim_breadcrumb: &mut history_has_trim_breadcrumb,
                 channel_name: msg.channel.as_str(),
                 channel_reply_target: Some(msg.reply_target.as_str()),
                 cancellation_token: Some(cancellation_token.clone()),

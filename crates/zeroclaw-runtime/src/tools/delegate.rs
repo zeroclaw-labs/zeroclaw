@@ -2810,6 +2810,9 @@ impl DelegateTool {
         };
 
         let mut history = Vec::new();
+        // Delegate subagents start a fresh transcript: no prior trim, so no
+        // crumb exists and none outlives this scoped loop.
+        let mut subagent_crumb_present = false;
         if let Some(system_prompt) = enriched_system_prompt.as_ref() {
             history.push(ChatMessage::system(system_prompt.clone()));
         }
@@ -2875,6 +2878,9 @@ impl DelegateTool {
                     },
                 ),
                 history: &mut history,
+                // Delegate subagents start a fresh transcript: no prior trim,
+                // so no crumb exists and none outlives this scoped loop.
+                history_has_trim_breadcrumb: &mut subagent_crumb_present,
                 channel_name: "delegate",
                 channel_reply_target: None,
                 cancellation_token: Some(self.cancellation_token.child_token()),

@@ -198,6 +198,14 @@ pub struct ToolLoop<'a> {
     /// [`ResolvedAgentExecution`]. Everything below is per-message turn state.
     pub exec: ResolvedAgentExecution<'a>,
     pub history: &'a mut Vec<ChatMessage>,
+    /// The history owner's authoritative record that `history` carries the
+    /// synthetic trim breadcrumb after its leading system messages. Provenance
+    /// is tracked beside the buffer — never inferred from localized message
+    /// text — so a genuine user turn equal to the breadcrumb string keeps its
+    /// turn-boundary role and a persisted crumb stays classified across
+    /// locale changes for the runtime's lifetime. Trim paths write back any
+    /// crumb they insert through this reference.
+    pub history_has_trim_breadcrumb: &'a mut bool,
     pub channel_name: &'a str,
     pub channel_reply_target: Option<&'a str>,
     pub cancellation_token: Option<CancellationToken>,
@@ -272,6 +280,72 @@ async fn projected_provider_facing_tokens(
         .round() as usize
 }
 
+/// Authoritative pre-dispatch budget gate. `measured_population` is the
+/// estimate of the EXACT provider-facing population about to be dispatched —
+/// post-hook request messages plus this iteration's native tool schemas — so
+/// no projection or hook re-execution is involved. When that population
+/// exceeds the configured budget, the oversized dispatch is surfaced with an
+/// explicit unsatisfiable-floor event instead of passing silently: the
+/// durable-history trim ran earlier in the iteration, so any residual overage
+/// comes from transient growth (a modifying hook's additions or schema
+/// population) that dropping whole turns cannot remove. The dispatch itself
+/// still proceeds; the provider's own overflow signal and recovery path stay
+/// authoritative for whether the provider accepts it.
+async fn surface_oversized_dispatch_if_needed(
+    measured_population: u64,
+    tool_schema_tokens: usize,
+    context_token_budget: usize,
+    kept_turns: usize,
+    event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
+    observer: &dyn crate::observability::Observer,
+) {
+    if context_token_budget == 0 || measured_population <= context_token_budget as u64 {
+        return;
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_category(::zeroclaw_log::EventCategory::Agent)
+            .with_attrs(::serde_json::json!({
+                "measured_population": measured_population,
+                "tool_schema_tokens": tool_schema_tokens,
+                "context_token_budget": context_token_budget,
+            })),
+        "next provider request exceeds the configured token budget after durable-history enforcement"
+    );
+    if let Some(tx) = event_tx {
+        let _ = tx
+            .send(TurnEvent::HistoryTrimmed {
+                dropped_messages: 0,
+                kept_turns,
+                reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                token_budget: Some(context_token_budget as u64),
+                tokens_before: Some(measured_population),
+                tokens_after: Some(measured_population),
+                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                unsatisfiable_floor: Some(true),
+            })
+            .await;
+    }
+    observer.record_event(
+        &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+            dropped_messages: 0,
+            kept_turns,
+            reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+            token_budget: Some(context_token_budget as u64),
+            tokens_before: Some(measured_population),
+            tokens_after: Some(measured_population),
+            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+            unsatisfiable_floor: Some(true),
+        },
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enforce_reported_budget(
     history: &mut Vec<ChatMessage>,
@@ -315,12 +389,20 @@ async fn enforce_reported_budget(
     // varies between iterations are re-measured at the next dispatch seam, which
     // re-enforces against its own measured population.
     hook_reserve_tokens: usize,
+    // The history owner's authoritative record that the population carries the
+    // synthetic trim breadcrumb after its leading system messages. Provenance is
+    // never inferred from message text: a genuine first user turn that happens
+    // to equal the localized breadcrumb string must keep its turn-boundary role,
+    // and a persisted crumb written under another locale must stay classified
+    // as synthetic for the whole runtime lifetime. Set to true when this pass
+    // inserts a fresh crumb so the owner stays authoritative.
+    crumb_present: &mut bool,
 ) {
     if context_token_budget == 0 {
         return;
     }
     let pre_trim_estimated = reported_population_estimated;
-    let taken_had_crumb = crate::agent::history_trim::has_leading_breadcrumb(history);
+    let taken_had_crumb = *crumb_present;
     let taken = std::mem::take(history);
     let taken_len = taken.len();
     let ratio = reported_input_tokens as f64 / pre_trim_estimated.max(1) as f64;
@@ -416,7 +498,8 @@ async fn enforce_reported_budget(
         if tokens_after <= decision_budget {
             break;
         }
-        let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed);
+        let dropped =
+            crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed, taken_had_crumb);
         if dropped == 0 {
             hit_floor = true;
             break;
@@ -429,7 +512,8 @@ async fn enforce_reported_budget(
         // population with it included and, if the crumb pushes the calibrated
         // count over the decision budget, drop the oldest whole turn again
         // (stopping at the newest-turn/schema floor).
-        crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed);
+        crate::agent::history_trim::insert_breadcrumb_deduped(&mut trimmed, taken_had_crumb);
+        *crumb_present = true;
         loop {
             tokens_after = projected_provider_facing_tokens(
                 &trimmed,
@@ -443,7 +527,7 @@ async fn enforce_reported_budget(
             if tokens_after <= decision_budget {
                 break;
             }
-            let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed);
+            let dropped = crate::agent::history_trim::drop_oldest_whole_turn(&mut trimmed, true);
             if dropped == 0 {
                 hit_floor = true;
                 break;
@@ -635,14 +719,25 @@ struct TurnState<'a> {
     history: &'a mut Vec<ChatMessage>,
     canonical: Option<&'a mut Vec<ChatMessage>>,
     synced: usize,
+    /// Owner-tracked provenance that `history` carries the synthetic trim
+    /// breadcrumb after its leading system messages. Kept beside the buffer
+    /// instead of being inferred from message text so classification never
+    /// depends on the active locale or on a user turn colliding with the
+    /// breadcrumb string.
+    crumb_present: bool,
 }
 
 impl<'a> TurnState<'a> {
-    fn new(history: &'a mut Vec<ChatMessage>, canonical: Option<&'a mut Vec<ChatMessage>>) -> Self {
+    fn new(
+        history: &'a mut Vec<ChatMessage>,
+        canonical: Option<&'a mut Vec<ChatMessage>>,
+        crumb_present: bool,
+    ) -> Self {
         Self {
             history,
             canonical,
             synced: 0,
+            crumb_present,
         }
     }
 
@@ -716,7 +811,10 @@ impl<'a> TurnState<'a> {
             crate::agent::history_trim::trim_to_recent_turns(taken, context_token_budget);
         let mut history = std::mem::take(&mut result.history);
         if result.trimmed {
-            crate::agent::history_trim::insert_breadcrumb_deduped(&mut history);
+            self.crumb_present = crate::agent::history_trim::insert_breadcrumb_deduped(
+                &mut history,
+                self.crumb_present,
+            );
             result.tokens_after = crate::agent::history::estimate_history_tokens(&history);
         }
         *self.history = history;
@@ -734,6 +832,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     let ToolLoop {
         exec,
         history: raw_history,
+        history_has_trim_breadcrumb,
         channel_name,
         channel_reply_target,
         cancellation_token,
@@ -781,7 +880,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         knobs,
     } = exec;
 
-    let mut turn_state = TurnState::new(raw_history, raw_canonical);
+    let mut turn_state = TurnState::new(raw_history, raw_canonical, *history_has_trim_breadcrumb);
 
     turn_state.sync_pending();
 
@@ -988,6 +1087,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 );
             }
             let result = turn_state.trim_to_budget(context_token_budget);
+            *history_has_trim_breadcrumb = turn_state.crumb_present;
             if result.trimmed {
                 {
                     let __zc_trim_span = ::zeroclaw_log::info_span!(
@@ -1198,6 +1298,22 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             crate::agent::history::estimate_history_tokens(&provider_request_messages)
                 + tool_schema_tokens;
 
+        // Authoritative pre-dispatch check on the ACTUAL request population
+        // (post-hook messages plus schemas). The durable-history enforcement
+        // ran earlier against its measured reserve; a stateful hook whose
+        // growth varies per iteration can still push this exact dispatch past
+        // the configured budget. Surface that explicitly instead of letting an
+        // oversized request pass silently.
+        surface_oversized_dispatch_if_needed(
+            reported_population_estimated as u64,
+            tool_schema_tokens,
+            context_token_budget,
+            crate::agent::history_trim::count_turns(turn_state.history),
+            event_tx.as_ref(),
+            observer,
+        )
+        .await;
+
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
         // state, and a rejected turn never reaches the provider — announcing
@@ -1357,6 +1473,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     on_delta.as_ref(),
                     observer,
                     context_token_budget,
+                    &mut turn_state.crumb_present,
                 )
                 .await;
                 if recovered {
@@ -1551,9 +1668,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     image_cache.as_deref_mut(),
                     use_native_tools,
                     0,
+                    &mut turn_state.crumb_present,
                 )
                 .await;
             }
+            *history_has_trim_breadcrumb = turn_state.crumb_present;
             return Ok(accumulated_display_text);
         }
 
@@ -1779,6 +1898,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             Box::pin(drive_live_sop_actions(
                 queued_sop_actions,
                 turn_state.history,
+                &mut turn_state.crumb_present,
                 model_provider,
                 provider_name,
                 model,
@@ -1866,14 +1986,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 activated_tools,
             ) {
                 Ok(mut next_specs) => {
-                    // Use the hook-selected model for the next iteration's
-                    // native-tool capability projection, not the current
-                    // iteration's starting model. The next iteration will
-                    // derive `provider_request_model` from the hook result
-                    // and refresh native-tool mode from that model; the
-                    // projection must reserve the same schema population that
-                    // will actually be sent.
-                    let next_protocol_model = provider_request_model;
+                    // Use the NEXT route's model for the native-tool capability
+                    // projection. `provider_request_model` belongs to the
+                    // request that just completed and may be stale the moment a
+                    // hook flips models; the re-resolved vision route names the
+                    // provider whose capability actually decides whether
+                    // schemas are serialized into the next request.
+                    let next_protocol_model = next_vision
+                        .as_ref()
+                        .map(|resolved| resolved.model.as_str())
+                        .unwrap_or(model);
                     next_specs.refresh_native_tool_mode(next_active_provider, next_protocol_model);
                     (
                         if next_specs.use_native_tools {
@@ -1901,10 +2023,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 image_cache.as_deref_mut(),
                 next_use_native_tools,
                 measured_hook_growth_tokens,
+                &mut turn_state.crumb_present,
             )
             .await;
         }
     }
+
+    *history_has_trim_breadcrumb = turn_state.crumb_present;
 
     finish_after_max_iterations(
         model_provider,
@@ -2304,6 +2429,9 @@ fn build_owned_step_system_prompt(
 async fn drive_live_sop_actions(
     queued_actions: Vec<crate::sop::executor::QueuedSopAction>,
     history: &mut Vec<ChatMessage>,
+    // Owner-tracked breadcrumb provenance for `history`; same-agent step
+    // loops write back any crumb their trim paths insert.
+    crumb_present: &mut bool,
     model_provider: &dyn ModelProvider,
     provider_name: &str,
     model: &str,
@@ -2598,6 +2726,15 @@ async fn drive_live_sop_actions(
                         if let Some(err) = child_setup_error {
                             Err(err)
                         } else {
+                            // Breadcrumb provenance travels with the transcript
+                            // it describes: a fresh child transcript starts
+                            // clean; the parent's continues its owner-tracked
+                            // state and writes any new crumb back below.
+                            let mut nested_crumb_present = if owned.is_some() {
+                                false
+                            } else {
+                                *crumb_present
+                            };
                             let nested_history: &mut Vec<ChatMessage> = match owned {
                                 Some(_) => &mut child_history,
                                 None => &mut *history,
@@ -2655,6 +2792,7 @@ async fn drive_live_sop_actions(
                                         },
                                     ),
                                     history: nested_history,
+                                    history_has_trim_breadcrumb: &mut nested_crumb_present,
                                     channel_name,
                                     channel_reply_target,
                                     cancellation_token: cancellation_token.clone(),
@@ -2707,6 +2845,12 @@ async fn drive_live_sop_actions(
                                 && let Some(outer) = new_messages_out.as_deref_mut()
                             {
                                 outer.extend_from_slice(&inner_new_msgs);
+                            }
+                            // A same-agent step ran over the parent
+                            // transcript: adopt whatever breadcrumb state the
+                            // sub-loop's trim paths left behind.
+                            if owned.is_none() {
+                                *crumb_present = nested_crumb_present;
                             }
                             step_result
                         }
@@ -3023,6 +3167,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
         assert!(
@@ -3058,6 +3203,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -3086,6 +3232,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
 
@@ -3113,6 +3260,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
         let after: Vec<String> = history.iter().map(|m| m.content.clone()).collect();
@@ -3139,6 +3287,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
 
@@ -3201,6 +3350,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
 
@@ -3288,6 +3438,7 @@ mod reported_budget_tests {
             Some(&mut image_cache),
             false,
             0,
+            &mut false,
         )
         .await;
 
@@ -3375,6 +3526,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
 
@@ -3448,6 +3600,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
 
@@ -3488,7 +3641,9 @@ mod reported_budget_tests {
         // the crumb is present in both the taken and the retained set, so every
         // message missing from the retained set is a genuinely dropped one.
         let mut history = big_history();
-        crate::agent::history_trim::insert_breadcrumb_deduped(&mut history);
+        let mut crumb_present = false;
+        crumb_present =
+            crate::agent::history_trim::insert_breadcrumb_deduped(&mut history, crumb_present);
         assert!(
             history
                 .iter()
@@ -3513,6 +3668,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut crumb_present,
         )
         .await;
         assert!(
@@ -3594,6 +3750,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
 
@@ -3696,6 +3853,7 @@ mod reported_budget_tests {
         let next_schema_tokens = 0;
 
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut crumb_present = false;
         enforce_reported_budget(
             &mut history,
             reported,
@@ -3709,6 +3867,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut crumb_present,
         )
         .await;
 
@@ -3741,8 +3900,8 @@ mod reported_budget_tests {
             "turn1 must actually be gone from the retained history"
         );
         assert!(
-            crate::agent::history_trim::has_leading_breadcrumb(&history),
-            "the retained history must carry the model-visible breadcrumb"
+            crumb_present,
+            "the owner record must show the inserted model-visible breadcrumb"
         );
         assert_eq!(
             kept_turns, 1,
@@ -3855,6 +4014,7 @@ mod reported_budget_tests {
             None,
             false,
             hook_reserve_tokens,
+            &mut false,
         )
         .await;
 
@@ -3943,6 +4103,7 @@ mod reported_budget_tests {
             None,
             false,
             0,
+            &mut false,
         )
         .await;
 
@@ -4023,6 +4184,7 @@ mod trim_budget_tests {
             history: &mut history,
             canonical: None,
             synced: 0,
+            crumb_present: false,
         };
         let result = state.trim_to_budget(budget);
         assert!(result.trimmed, "budget must force a trim");
@@ -4713,6 +4875,7 @@ mod sop_step_reassembly_tests {
         drive_live_sop_actions(
             vec![queued],
             history,
+            &mut false,
             parent_provider,
             "mock",
             "mock-model",

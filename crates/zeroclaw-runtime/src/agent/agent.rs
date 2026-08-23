@@ -2533,6 +2533,9 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        // Seed raw-transcript crumb provenance from the structured history's
+        // owner-tracked state (the conversion preserves the crumb position).
+        let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
         let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
@@ -2600,6 +2603,11 @@ impl Agent {
                         },
                     ),
                     history: &mut loop_history,
+                    // The raw loop transcript is converted from the structured
+                    // history, whose crumb state the Agent already tracks; a
+                    // trim-inserted raw crumb lives only in this per-turn
+                    // buffer, so no write-back to the owner happens here.
+                    history_has_trim_breadcrumb: &mut loop_history_crumb_present,
                     channel_name: &self.channel_name,
                     channel_reply_target: None,
                     cancellation_token: None,
@@ -2900,6 +2908,9 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        // Seed raw-transcript crumb provenance from the structured history's
+        // owner-tracked state (the conversion preserves the crumb position).
+        let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
@@ -3043,6 +3054,7 @@ impl Agent {
                             },
                         ),
                         history: &mut loop_history,
+                        history_has_trim_breadcrumb: &mut loop_history_crumb_present,
                         channel_name: &self.channel_name,
                         channel_reply_target: None,
                         cancellation_token: cancel_token.clone(),
