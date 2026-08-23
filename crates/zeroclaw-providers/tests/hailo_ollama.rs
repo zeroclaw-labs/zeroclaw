@@ -212,31 +212,66 @@ async fn reflected_sensitive_malformed_success() -> (StatusCode, &'static str) {
 async fn receive_log_event_with_error_key(
     rx: &mut tokio::sync::broadcast::Receiver<Value>,
     error_key: &str,
+    model_provider: &str,
 ) -> Value {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         assert!(
             !remaining.is_zero(),
-            "did not capture log event {error_key}"
+            "did not capture log event {error_key} for provider {model_provider}"
         );
         match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(value))
-                if value
-                    .get("attributes")
+            Ok(Ok(value)) => {
+                let attributes = value.get("attributes");
+                let matches_error_key = attributes
                     .and_then(|attrs| attrs.get("error_key"))
                     .and_then(Value::as_str)
-                    == Some(error_key) =>
-            {
-                return value;
+                    == Some(error_key);
+                let matches_provider = attributes
+                    .and_then(|attrs| attrs.get("model_provider"))
+                    .and_then(Value::as_str)
+                    == Some(model_provider);
+                if matches_error_key && matches_provider {
+                    return value;
+                }
             }
-            Ok(Ok(_)) | Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
             Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
-                panic!("log capture closed before {error_key}")
+                panic!("log capture closed before {error_key} for provider {model_provider}")
             }
-            Err(_) => panic!("timed out waiting for log event {error_key}"),
+            Err(_) => {
+                panic!("timed out waiting for log event {error_key} for provider {model_provider}")
+            }
         }
     }
+}
+
+#[tokio::test]
+async fn log_event_receiver_correlates_provider_alias() {
+    let (tx, mut rx) = tokio::sync::broadcast::channel(4);
+    tx.send(json!({
+        "attributes": {
+            "error_key": "hailo_api_error",
+            "model_provider": "other_alias",
+        }
+    }))
+    .expect("send unrelated event");
+    tx.send(json!({
+        "attributes": {
+            "error_key": "hailo_api_error",
+            "model_provider": "expected_alias",
+        }
+    }))
+    .expect("send correlated event");
+
+    let event =
+        receive_log_event_with_error_key(&mut rx, "hailo_api_error", "expected_alias").await;
+
+    assert_eq!(
+        event["attributes"]["model_provider"].as_str(),
+        Some("expected_alias")
+    );
 }
 
 async fn reasoning_only_chat() -> Json<Value> {
@@ -751,7 +786,7 @@ async fn native_hailo_error_logs_use_stable_messages_and_structured_payload_attr
         .simple_chat("hello", "qwen3:1.7b", Some(0.2))
         .await
         .expect_err("non-2xx response must fail");
-    let event = receive_log_event_with_error_key(&mut rx, "hailo_api_error").await;
+    let event = receive_log_event_with_error_key(&mut rx, "hailo_api_error", "edge").await;
     assert_eq!(
         event.get("message").and_then(Value::as_str),
         Some("Hailo-Ollama API error response")
@@ -780,7 +815,8 @@ async fn native_hailo_error_logs_use_stable_messages_and_structured_payload_attr
         .simple_chat("hello", "qwen3:1.7b", Some(0.2))
         .await
         .expect_err("malformed response must fail");
-    let event = receive_log_event_with_error_key(&mut rx, "hailo_response_deserialize").await;
+    let event =
+        receive_log_event_with_error_key(&mut rx, "hailo_response_deserialize", "edge").await;
     assert_eq!(
         event.get("message").and_then(Value::as_str),
         Some("Hailo-Ollama response deserialization failed")
@@ -839,7 +875,8 @@ async fn native_hailo_error_diagnostics_redact_configured_auth_header_values() {
         .to_string();
     assert!(!error.contains("gateway-token"));
     assert!(!error.contains("canary"));
-    let event = receive_log_event_with_error_key(&mut rx, "hailo_api_error").await;
+    let event =
+        receive_log_event_with_error_key(&mut rx, "hailo_api_error", "reflected_error").await;
     let body_excerpt = event["attributes"]["body_excerpt"]
         .as_str()
         .expect("non-2xx body excerpt");
@@ -874,7 +911,12 @@ async fn native_hailo_error_diagnostics_redact_configured_auth_header_values() {
         .simple_chat("hello", "qwen3:1.7b", Some(0.2))
         .await
         .expect_err("reflected malformed response must fail");
-    let event = receive_log_event_with_error_key(&mut rx, "hailo_response_deserialize").await;
+    let event = receive_log_event_with_error_key(
+        &mut rx,
+        "hailo_response_deserialize",
+        "reflected_malformed",
+    )
+    .await;
     let body_excerpt = event["attributes"]["body_excerpt"]
         .as_str()
         .expect("malformed body excerpt");
