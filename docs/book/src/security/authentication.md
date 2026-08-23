@@ -195,6 +195,42 @@ attribution. On memory backends without principal support (markdown,
 lucid, postgres, qdrant today) private memory fails closed with a clear
 denial rather than silently un-scoping.
 
+## Lockout recovery (local only)
+
+An IdP outage, an expired client secret, or a bad `profile_map` edit can
+lock every remote principal out at once. Recovery never depends on the
+IdP: it runs over the local socket on the daemon's host, which stays
+usable in two ways.
+
+1. **The daemon's own uid** keeps the trusted shared-operator path on the
+   local socket while `security.trust_daemon_uid` is `true` (the
+   default). SSH to the host as the account that runs the daemon and the
+   CLI works with full access, no credential involved.
+2. **A mapped local uid** from the `[users]` roster authenticates through
+   OS peer credentials, IdP or not. Keep at least one admin-profiled
+   roster entry on any hardened deployment that sets
+   `trust_daemon_uid = false`.
+
+From that local session, fix or remove the broken `[oidc.<alias>]`
+entry, then reload the daemon. If both local paths were disabled and no
+roster uid maps to you, recovery is by editing `config.toml` directly on
+the host as the file's owner and restarting the daemon: authorization
+policy lives in the config, so host file access is by design the root of
+trust. There is deliberately no remote break-glass credential.
+
+## Migrating from [security.nevis]
+
+The Nevis IAM integration was removed; its config table is accepted,
+ignored with a load-time warning, and dropped on the next config save.
+Its scope maps onto the current stack:
+
+| Nevis concept | Replacement |
+|---|---|
+| `instance_url` / `realm` token validation | `[oidc.<alias>]` `issuer` + `validation` (`jwks` or `introspection`) |
+| `role_mapping` role → permissions | `claim_path` + `profile_map` → `[permission_profiles.<alias>]` grants |
+| `require_mfa` | `[oidc.<alias>] require_mfa` / `required_acr` |
+| `session_timeout_secs` | `max_auth_lifetime_secs` (offline) / `revalidation_secs` (introspection) |
+
 ## What this layer does not do (yet)
 
 Agent-loop memory (auto-save and per-turn recall inside sessions) stays
