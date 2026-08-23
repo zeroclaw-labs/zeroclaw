@@ -29,15 +29,27 @@ type HeaderCapture = Arc<Mutex<Option<HeaderMap>>>;
 static LIVE_HAILO_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn hailo_provider(base_url: &str) -> HailoOllamaModelProvider {
-    hailo_provider_with_queue_timeout(base_url, 5)
+    hailo_provider_with_alias_and_queue_timeout(base_url, "edge", 5)
+}
+
+fn hailo_provider_with_alias(base_url: &str, alias: &str) -> HailoOllamaModelProvider {
+    hailo_provider_with_alias_and_queue_timeout(base_url, alias, 5)
 }
 
 fn hailo_provider_with_queue_timeout(
     base_url: &str,
     queue_timeout_secs: u64,
 ) -> HailoOllamaModelProvider {
+    hailo_provider_with_alias_and_queue_timeout(base_url, "edge", queue_timeout_secs)
+}
+
+fn hailo_provider_with_alias_and_queue_timeout(
+    base_url: &str,
+    alias: &str,
+    queue_timeout_secs: u64,
+) -> HailoOllamaModelProvider {
     HailoOllamaModelProvider::new(
-        "edge",
+        alias,
         Some(base_url),
         5,
         queue_timeout_secs,
@@ -782,11 +794,12 @@ async fn native_hailo_error_logs_use_stable_messages_and_structured_payload_attr
         .await
         .expect("serve non-2xx Hailo server");
     });
-    let _ = hailo_provider(&format!("http://{addr}"))
+    let _ = hailo_provider_with_alias(&format!("http://{addr}"), "stable_error_logs")
         .simple_chat("hello", "qwen3:1.7b", Some(0.2))
         .await
         .expect_err("non-2xx response must fail");
-    let event = receive_log_event_with_error_key(&mut rx, "hailo_api_error", "edge").await;
+    let event =
+        receive_log_event_with_error_key(&mut rx, "hailo_api_error", "stable_error_logs").await;
     assert_eq!(
         event.get("message").and_then(Value::as_str),
         Some("Hailo-Ollama API error response")
@@ -811,12 +824,16 @@ async fn native_hailo_error_logs_use_stable_messages_and_structured_payload_attr
         .await
         .expect("serve malformed Hailo server");
     });
-    let _ = hailo_provider(&format!("http://{addr}"))
+    let _ = hailo_provider_with_alias(&format!("http://{addr}"), "stable_error_logs")
         .simple_chat("hello", "qwen3:1.7b", Some(0.2))
         .await
         .expect_err("malformed response must fail");
-    let event =
-        receive_log_event_with_error_key(&mut rx, "hailo_response_deserialize", "edge").await;
+    let event = receive_log_event_with_error_key(
+        &mut rx,
+        "hailo_response_deserialize",
+        "stable_error_logs",
+    )
+    .await;
     assert_eq!(
         event.get("message").and_then(Value::as_str),
         Some("Hailo-Ollama response deserialization failed")
