@@ -348,6 +348,72 @@ impl<M: Memory> Memory for ScannedMemory<M> {
         self.filter_recalled_limited(entries, limit)
     }
 
+    async fn store_for_principal(
+        &self,
+        principal_id: &str,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        // Private writes go through the same content scan and policy gate
+        // as shared writes.
+        let content = self.process_content(key, content, None)?;
+        self.enforce_policy(key, None, &category).await?;
+        self.inner
+            .store_for_principal(principal_id, key, &content, category, session_id)
+            .await
+    }
+
+    async fn recall_for_principal(
+        &self,
+        principal_id: &str,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self
+            .inner
+            .recall_for_principal(
+                principal_id,
+                query,
+                Self::read_fetch_limit(limit),
+                session_id,
+                since,
+                until,
+            )
+            .await?;
+        self.filter_recalled_limited(entries, limit)
+    }
+
+    async fn list_for_principal(
+        &self,
+        principal_id: &str,
+        category: Option<&MemoryCategory>,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let entries = self
+            .inner
+            .list_for_principal(principal_id, category, session_id)
+            .await?;
+        self.filter_recalled(entries)
+    }
+
+    async fn get_for_principal(
+        &self,
+        principal_id: &str,
+        key: &str,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let entry = self.inner.get_for_principal(principal_id, key).await?;
+        self.filter_single(entry)
+    }
+
+    async fn forget_for_principal(&self, principal_id: &str, key: &str) -> anyhow::Result<bool> {
+        self.inner.forget_for_principal(principal_id, key).await
+    }
+
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
         let entry = self.inner.get(key).await?;
         self.filter_single(entry)
