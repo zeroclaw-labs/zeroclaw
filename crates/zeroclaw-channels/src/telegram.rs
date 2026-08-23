@@ -8492,7 +8492,7 @@ mod tests {
         assert!(
             reqs.iter().any(|r| {
                 r.url.path().ends_with("/getUpdates")
-                    && r.body_json::<serde_json::Value>().map_or(false, |v| {
+                    && r.body_json::<serde_json::Value>().is_ok_and(|v| {
                         v.get("offset").and_then(|x| x.as_i64()) == Some(0)
                             && v.get("timeout").and_then(|x| x.as_i64()) == Some(30)
                     })
@@ -8628,7 +8628,7 @@ mod tests {
         assert!(
             reqs.iter().any(|r| {
                 r.url.path().ends_with("/getUpdates")
-                    && r.body_json::<serde_json::Value>().map_or(false, |v| {
+                    && r.body_json::<serde_json::Value>().is_ok_and(|v| {
                         v.get("offset").and_then(|x| x.as_i64()) == Some(0)
                             && v.get("timeout").and_then(|x| x.as_i64()) == Some(30)
                     })
