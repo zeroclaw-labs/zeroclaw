@@ -133,6 +133,35 @@ Migration for existing remote zerocode users:
 
 An OIDC access token works the same way with `auth_provider = "oidc.<alias>"`.
 
+## The gateway HTTP API
+
+The gateway's configuration and onboarding routes (`/api/config*`,
+`/api/quickstart/*`, `/api/channels/bind`) enforce authentication
+structurally: one route-layer middleware guards the whole group, so no
+individual handler carries (or can forget) a check. The middleware
+speaks the same principal model as the RPC path, through the same
+provider registry and resolver:
+
+- A **paired bearer** (`Authorization: Bearer zc_...`) resolves to the
+  shared operator with full access, exactly as before. Denials keep the
+  historical 401 shape.
+- An **OIDC bearer** presented with the `X-ZeroClaw-Auth-Provider:
+  oidc.<alias>` header is verified by that provider and resolved to a
+  scoped principal. Its `Config` grants then gate the request by HTTP
+  method: read for GET, delete for DELETE, update for everything else.
+  Selection is explicit, mirroring the RPC handshake's `auth_provider`
+  field: the named provider's denial is authoritative, and there is
+  never a fallback between providers.
+- CORS preflight (`OPTIONS`) passes through unauthenticated, as it
+  always has.
+
+Scoped requests re-derive resolver policy from the live configuration,
+so a roster or profile change applied through the gateway takes effect
+on the next request. Changing a provider's verification settings
+(issuer, keys, validation mode) still requires the daemon reload the
+config write already flags. Other gateway surfaces keep the pairing
+check per handler and adopt the layer in follow-ups.
+
 ## Credential lifecycle
 
 - **Expiry** ends the connection's authorization at the deadline; the
