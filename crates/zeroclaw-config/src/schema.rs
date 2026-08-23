@@ -22832,6 +22832,49 @@ impl Config {
             return result;
         }
 
+        let existing = fs::read_to_string(&config_path).await.with_context(|| {
+            format!(
+                "Failed to read existing config for incremental save: {}",
+                config_path.display()
+            )
+        })?;
+
+        self.save_dirty_from_source(&config_path, &existing, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Incremental save against an exact caller-provided source revision.
+    ///
+    /// Dirty paths are applied to `expected_source`, never to a later re-read
+    /// selected inside the save path. Immediately before atomic replacement,
+    /// the live file must still be byte-identical to that source. Returns
+    /// `Ok(false)` on revision drift and leaves the file and dirty set
+    /// untouched so the caller can re-read, re-validate, and retry.
+    ///
+    /// This is the persistence boundary for an operation whose effect was
+    /// approved against a specific config revision. Ordinary editors should
+    /// continue to use [`Self::save_dirty`].
+    pub async fn save_dirty_if_source_unchanged(&mut self, expected_source: &str) -> Result<bool> {
+        if self.dirty_paths.is_empty() {
+            return Ok(true);
+        }
+
+        let config_path = self.resolve_config_path_for_save().await?;
+        self.save_dirty_from_source(&config_path, expected_source, Some(expected_source))
+            .await
+    }
+
+    /// Materialize dirty paths onto one explicit TOML source. When
+    /// `expected_current` is present, compare it to the live file as the final
+    /// step before replacement so serialization and encryption cannot widen
+    /// the revision-check window.
+    async fn save_dirty_from_source(
+        &mut self,
+        config_path: &Path,
+        source: &str,
+        expected_current: Option<&str>,
+    ) -> Result<bool> {
         let mut config_to_save = self.clone();
         let zeroclaw_dir = config_path
             .parent()
@@ -22860,13 +22903,7 @@ impl Config {
             .and_then(|v| v.try_into().ok())
             .unwrap_or_default();
 
-        let existing = fs::read_to_string(&config_path).await.with_context(|| {
-            format!(
-                "Failed to read existing config for incremental save: {}",
-                config_path.display()
-            )
-        })?;
-        let mut doc: toml_edit::DocumentMut = existing
+        let mut doc: toml_edit::DocumentMut = source
             .parse()
             .context("Failed to parse existing config for incremental save")?;
 
@@ -22889,9 +22926,27 @@ impl Config {
 
         let toml_str = ensure_blank_line_before_sections(&doc.to_string());
 
-        write_config_atomically(&config_path, &toml_str).await?;
+        if let Some(expected) = expected_current {
+            let current = match fs::read_to_string(config_path).await {
+                Ok(current) => current,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Failed to verify config revision before incremental save: {}",
+                            config_path.display()
+                        )
+                    });
+                }
+            };
+            if current != expected {
+                return Ok(false);
+            }
+        }
+
+        write_config_atomically(config_path, &toml_str).await?;
         self.clear_dirty();
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -32762,6 +32817,58 @@ group_policy = "disabled"
             written.trim_start().starts_with("schema_version ="),
             "schema_version should remain the first key; got:\n{written}"
         );
+    }
+
+    #[test]
+    async fn save_dirty_if_source_unchanged_refuses_drift_and_preserves_dirty_paths() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let mut edited = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        edited.save().await.unwrap();
+        let approved_source = std::fs::read_to_string(&config_path).unwrap();
+
+        edited.observability.backend = ObservabilityBackend::Otel;
+        edited.mark_dirty("observability.backend");
+
+        // A separate writer changes an unrelated value after the caller has
+        // captured the source revision it intends to edit.
+        let mut external = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        external.gateway.port = 4242;
+        external.save().await.unwrap();
+        let external_source = std::fs::read_to_string(&config_path).unwrap();
+
+        assert!(
+            !edited
+                .save_dirty_if_source_unchanged(&approved_source)
+                .await
+                .unwrap(),
+            "revision drift must be an explicit non-save"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            external_source,
+            "a drift refusal must leave the external writer's bytes untouched"
+        );
+
+        // Refusal keeps the dirty set, so a caller that re-validates against
+        // the new revision can retry without reconstructing its edit.
+        assert!(
+            edited
+                .save_dirty_if_source_unchanged(&external_source)
+                .await
+                .unwrap()
+        );
+        let written: Config =
+            toml::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(written.gateway.port, 4242);
+        assert_eq!(written.observability.backend, ObservabilityBackend::Otel);
     }
 
     /// Regression for the per-field `[[mcp.servers]]` editor: after

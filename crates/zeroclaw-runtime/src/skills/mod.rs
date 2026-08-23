@@ -1775,6 +1775,18 @@ fn resolve_elevated_tool(
         return None;
     };
     match resolution_registry.iter().find(|t| t.name() == target_name) {
+        Some(target) if target.approval_requires_operator() => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                &format!(
+                    "Skill tool {}.{} targets operator-only {} '{}', skipping: skill aliases are model-callable and cannot provide an operator approval surface",
+                    skill_name, tool.name, kind_label, target_name
+                )
+            );
+            None
+        }
         Some(target) => Some(Box::new(crate::skills::skill_tool::SkillBuiltinTool::new(
             skill_name,
             tool,

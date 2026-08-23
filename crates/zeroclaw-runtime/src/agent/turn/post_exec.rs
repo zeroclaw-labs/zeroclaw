@@ -4,7 +4,7 @@
 use super::call_prep::StreamToolCall;
 use super::context::TurnCtx;
 use super::events::{ProgressEvent, StreamDelta, send_progress};
-use super::redact::scrub_credentials;
+use super::redact::{loggable_args_value, scrub_credentials};
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
@@ -90,9 +90,10 @@ pub(crate) async fn record_executed_outcomes(
 
         // Capture into the innermost live SOP step scope (no-op otherwise).
         if crate::sop::executor::step_capture_active() {
+            let capture_args = loggable_args_value(ctx.tool_by_name(&call.name), &call.arguments);
             crate::sop::executor::record_step_tool_call(
                 &call.name,
-                &call.arguments,
+                &capture_args,
                 outcome.success,
                 outcome.output.clone(),
                 outcome.output_data.clone(),
@@ -102,5 +103,93 @@ pub(crate) async fn record_executed_outcomes(
         }
 
         ordered_results[*idx] = Some((call.name.clone(), call.tool_call_id.clone(), outcome));
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::record_executed_outcomes;
+    use crate::agent::tool_execution::ToolExecutionOutcome;
+    use crate::observability::NoopObserver;
+    use crate::tools::config_patch::ConfigPatchTool;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use zeroclaw_api::tool::Tool;
+    use zeroclaw_config::policy::SecurityPolicy;
+    use zeroclaw_config::schema::{PacingConfig, StreamReasoningMode};
+    use zeroclaw_tool_call_parser::ParsedToolCall;
+
+    #[tokio::test]
+    async fn sop_capture_uses_the_tools_secret_aware_argument_projection() {
+        let sentinel = "sentinel-sop-secret-must-not-leak";
+        let dir = tempfile::tempdir().unwrap();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ConfigPatchTool::new(
+            dir.path().join("config.toml"),
+            Arc::new(SecurityPolicy::default()),
+        ))];
+        let pacing = PacingConfig::default();
+        let observer = NoopObserver;
+        let ctx = super::TurnCtx {
+            observer: &observer,
+            provider_name: "test-provider",
+            model: "test-model",
+            temperature: None,
+            approval: None,
+            channel_name: "test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools: &[],
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            draft_reasoning: StreamReasoningMode::Status,
+            turn_id: "sop-redaction-test",
+            agent_alias: None,
+            parent_agent_alias: None,
+            tools: &tools,
+        };
+        let call = ParsedToolCall {
+            name: "config_patch".to_string(),
+            arguments: serde_json::json!({
+                "ops": [{
+                    "op": "add",
+                    "path": "/providers/models/openai/default/api_key",
+                    "value": sentinel
+                }]
+            }),
+            tool_call_id: Some("call-1".to_string()),
+        };
+        let outcome = ToolExecutionOutcome {
+            output: "ok".to_string(),
+            output_data: None,
+            success: true,
+            error_reason: None,
+            duration: Duration::ZERO,
+            receipt: None,
+        };
+        let mut ordered_results = vec![None];
+        let sink = crate::sop::executor::new_step_call_sink();
+
+        crate::sop::executor::scope_step_call_sink(sink.clone(), async {
+            record_executed_outcomes(
+                &ctx,
+                &[0],
+                &[call],
+                &[None],
+                vec![outcome],
+                &mut ordered_results,
+                0,
+            )
+            .await;
+        })
+        .await;
+
+        let captured = crate::sop::executor::drain_step_calls(&sink);
+        assert_eq!(captured.len(), 1);
+        let rendered = captured[0].args.to_string();
+        assert!(rendered.contains("[redacted]"), "{rendered}");
+        assert!(!rendered.contains(sentinel), "{rendered}");
     }
 }

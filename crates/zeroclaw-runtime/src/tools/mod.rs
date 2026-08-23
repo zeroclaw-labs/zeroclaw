@@ -2,6 +2,7 @@
 
 pub mod attribution;
 pub(crate) mod coding_cli_executor;
+pub mod config_patch;
 pub mod cron_add;
 pub(crate) mod cron_common;
 pub mod cron_list;
@@ -210,6 +211,28 @@ impl Tool for ArcToolRef {
         self.0.spec()
     }
 
+    fn approval_requires_operator(&self) -> bool {
+        self.0.approval_requires_operator()
+    }
+
+    fn requires_host_approval_summary(&self) -> bool {
+        self.0.requires_host_approval_summary()
+    }
+
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        self.0.redact_args_for_log(args)
+    }
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        self.0.approval_summary(args)
+    }
+
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        self.0.approval_summary_for_call(args)
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -272,6 +295,28 @@ impl Tool for ArcDelegatingTool {
     // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
     fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
         self.inner.spec()
+    }
+
+    fn approval_requires_operator(&self) -> bool {
+        self.inner.approval_requires_operator()
+    }
+
+    fn requires_host_approval_summary(&self) -> bool {
+        self.inner.requires_host_approval_summary()
+    }
+
+    fn redact_args_for_log(&self, args: &serde_json::Value) -> Option<serde_json::Value> {
+        self.inner.redact_args_for_log(args)
+    }
+    fn approval_summary(&self, args: &serde_json::Value) -> Option<String> {
+        self.inner.approval_summary(args)
+    }
+
+    fn approval_summary_for_call(
+        &self,
+        args: &serde_json::Value,
+    ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+        self.inner.approval_summary_for_call(args)
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -763,6 +808,14 @@ pub fn all_tools_with_runtime(
         Arc::new(SendMessageToPeerTool::new(
             Arc::new(root_config.clone()),
             agent_alias,
+        )),
+        // Registered unconditionally; who actually reaches it is a policy
+        // decision. The `locked_down` preset excludes it, `balanced` puts it
+        // in `always_ask`, and `yolo` (Full autonomy) auto-approves —
+        // consistent with yolo already being able to edit config via shell.
+        Arc::new(config_patch::ConfigPatchTool::new(
+            root_config.config_path.clone(),
+            security.clone(),
         )),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
@@ -1925,6 +1978,85 @@ const = true
         assert_eq!(tools.len(), 7);
     }
 
+    /// The registry the turn loop holds is `Box<dyn Tool>` built through
+    /// `ArcDelegatingTool` (and `ArcToolRef` for elevation arcs). Either
+    /// delegator dropping `approval_summary` would silently downgrade the
+    /// operator's approval prompt to the generic argument dump.
+    #[test]
+    fn arc_delegators_forward_the_host_approval_summary() {
+        struct Summarizing;
+        impl ::zeroclaw_api::attribution::Attributable for Summarizing {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Plugin,
+                )
+            }
+            fn alias(&self) -> &str {
+                "summarizing"
+            }
+        }
+        #[async_trait]
+        impl Tool for Summarizing {
+            fn name(&self) -> &str {
+                "summarizing"
+            }
+            fn description(&self) -> &str {
+                "test stub"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn approval_summary(&self, _args: &serde_json::Value) -> Option<String> {
+                Some("computed by the host".into())
+            }
+            fn approval_summary_for_call(
+                &self,
+                _args: &serde_json::Value,
+            ) -> Option<zeroclaw_api::tool::ToolApprovalSummary> {
+                Some(
+                    zeroclaw_api::tool::ToolApprovalSummary::with_execution_binding(
+                        "computed by the host".into(),
+                        serde_json::json!("host-binding"),
+                    ),
+                )
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult::ok("ok"))
+            }
+        }
+
+        let arc: Arc<dyn Tool> = Arc::new(Summarizing);
+        let boxed = boxed_registry_from_arcs(vec![arc.clone()]);
+        assert_eq!(
+            boxed[0].approval_summary(&serde_json::json!({})).as_deref(),
+            Some("computed by the host"),
+            "ArcDelegatingTool must forward approval_summary"
+        );
+        assert_eq!(
+            ArcToolRef(arc.clone())
+                .approval_summary(&serde_json::json!({}))
+                .as_deref(),
+            Some("computed by the host"),
+            "ArcToolRef must forward approval_summary"
+        );
+        let delegated_binding = boxed[0]
+            .approval_summary_for_call(&serde_json::json!({}))
+            .and_then(|summary| summary.execution_binding);
+        assert_eq!(
+            delegated_binding,
+            Some(serde_json::json!("host-binding")),
+            "ArcDelegatingTool must forward the per-call execution binding"
+        );
+        let ref_binding = ArcToolRef(arc)
+            .approval_summary_for_call(&serde_json::json!({}))
+            .and_then(|summary| summary.execution_binding);
+        assert_eq!(
+            ref_binding,
+            Some(serde_json::json!("host-binding")),
+            "ArcToolRef must forward the per-call execution binding"
+        );
+    }
+
     #[cfg(feature = "plugins-wasm")]
     #[test]
     fn plugin_tool_names_cannot_shadow_native_reserved_or_prior_plugin_tools() {
@@ -2003,6 +2135,61 @@ const = true
         assert!(
             tools.iter().all(|tool| tool.name() != "metadata-probe"),
             "a component whose required metadata probe fails must not receive manifest fallback metadata"
+        );
+    }
+
+    /// `config_patch` must be present in the *assembled* registry, and the
+    /// entry the turn loop actually holds — behind whatever delegation the
+    /// assembly wraps it in — must still answer `approval_requires_operator`.
+    /// The preset matrix in `zeroclaw-config` pins who may reach the tool;
+    /// this pins that the tool exists to be reached and that the operator-only
+    /// marker survives registration.
+    #[test]
+    fn config_patch_is_registered_and_keeps_its_operator_only_marker() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools(
+            Arc::new(cfg.clone()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem,
+            None,
+            None,
+            &browser,
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        let tool = tools
+            .iter()
+            .find(|t| t.name() == "config_patch")
+            .expect("config_patch must be in the assembled registry");
+        assert!(
+            tool.approval_requires_operator(),
+            "the registered entry must keep the operator-only marker through \
+             the assembly's delegation, or the channel gate silently stops \
+             applying to the real instance"
         );
     }
 

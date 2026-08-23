@@ -321,6 +321,37 @@ impl OptionEntry {
     }
 }
 
+/// Reserved argument key used by the runtime to carry a tool-owned opaque
+/// approval binding from the host-computed preview into the matching execute
+/// call. Model-provided values under this key are removed before approval.
+pub const APPROVAL_EXECUTION_BINDING_ARG: &str = "__zeroclaw_approval_binding";
+
+/// Approval text and an optional opaque value that must accompany the same
+/// call at execution time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolApprovalSummary {
+    /// Host-rendered text shown to the operator.
+    pub text: String,
+    /// Tool-authenticated opaque value carried only into matching execution.
+    pub execution_binding: Option<serde_json::Value>,
+}
+
+impl ToolApprovalSummary {
+    pub fn new(text: String) -> Self {
+        Self {
+            text,
+            execution_binding: None,
+        }
+    }
+
+    pub fn with_execution_binding(text: String, execution_binding: serde_json::Value) -> Self {
+        Self {
+            text,
+            execution_binding: Some(execution_binding),
+        }
+    }
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Tool name (used in LLM function calling)
@@ -346,6 +377,72 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// selectable choices. Default: no domain-typed parameters.
     fn param_domains(&self) -> Vec<(&'static str, OptionDomain)> {
         Vec::new()
+    }
+
+    /// True when approving this tool is an operator-only act. Chat channels
+    /// that can normally answer approval prompts inline (e.g. a Telegram
+    /// keyboard) are then notified instead of asked: whoever holds the chat
+    /// account is not necessarily the operator, and for a tool that rewrites
+    /// config, "can message the agent" must not imply "can grant authority".
+    /// Authenticated operator surfaces (the terminal, a paired client) still
+    /// approve normally.
+    fn approval_requires_operator(&self) -> bool {
+        false
+    }
+
+    /// Host-computed text for the operator's approval prompt. `None` (the
+    /// default) falls back to the generic argument summary.
+    ///
+    /// Implement this when the raw arguments don't tell the operator what
+    /// they are actually authorizing — e.g. a config patch whose real
+    /// meaning is the permission change it causes, not the JSON ops. The
+    /// returned text must be **computed by the tool from the arguments'
+    /// effects**, never echoed from a model-written field: this is the one
+    /// line of text the model must not be able to author.
+    fn approval_summary(&self, _args: &serde_json::Value) -> Option<String> {
+        None
+    }
+
+    /// Host-computed approval text plus optional opaque execution binding for
+    /// one concrete call. The default preserves the ordinary summary-only
+    /// contract. Tools that must bind an operator preview to later execution
+    /// can return a signed, tool-owned value in `execution_binding`; the
+    /// runtime inserts it only after model hooks have finished and carries the
+    /// same arguments into execution.
+    ///
+    /// The binding is never operator-facing or model-authored. Implementations
+    /// must authenticate it before trusting it and redact it from every log,
+    /// audit, event, or transcript projection.
+    fn approval_summary_for_call(&self, args: &serde_json::Value) -> Option<ToolApprovalSummary> {
+        self.approval_summary(args).map(ToolApprovalSummary::new)
+    }
+
+    /// When `true`, the operator prompt for this tool MUST come from
+    /// [`Tool::approval_summary_for_call`] (whose default delegates to
+    /// [`Tool::approval_summary`]); if that returns `None`, the approval gate
+    /// refuses rather than falling back to the generic argument summary.
+    ///
+    /// A tool that carries secret values in its arguments (see
+    /// [`Tool::redact_args_for_log`]) and promises a secret-aware,
+    /// effects-based prompt cannot let the fallback path display those raw
+    /// arguments, nor let the operator approve blind when the specialized
+    /// summary could not be produced. Default: `false`.
+    fn requires_host_approval_summary(&self) -> bool {
+        false
+    }
+
+    /// A log-safe rendering of `args` for audit logs, observer events, and
+    /// client-facing tool-call frames, or `None` (the default) to let callers
+    /// apply the generic credential scrubber.
+    ///
+    /// Override this when the arguments carry secret values the generic
+    /// scrubber cannot recognize — e.g. a bare value written to a config
+    /// secret path, which sits under an innocuously-named `value` key. The
+    /// override redacts them at the source so no logging or telemetry sink
+    /// ever receives the raw value. It MUST be a pure function of `args` that
+    /// cannot fail: a sink has no safe fallback other than the raw arguments.
+    fn redact_args_for_log(&self, _args: &serde_json::Value) -> Option<serde_json::Value> {
+        None
     }
 
     /// Execute the tool with given arguments

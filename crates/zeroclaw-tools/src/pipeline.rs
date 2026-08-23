@@ -86,6 +86,15 @@ impl PipelineTool {
         access_policy: Option<ToolAccessPolicy>,
     ) -> Self {
         let allowed_set: HashSet<String> = config.allowed_tools.iter().cloned().collect();
+        // Pipeline steps bypass the outer agent loop's per-call approval
+        // gate. Never mint a nested route to a capability whose approval may
+        // only come from an operator surface, even when the global pipeline
+        // allowlist names it explicitly. Wrappers must forward the marker, so
+        // this also closes skill aliases and other delegated tool references.
+        let tools = tools
+            .into_iter()
+            .filter(|tool| !tool.approval_requires_operator())
+            .collect();
         Self {
             config,
             tools,
@@ -740,6 +749,30 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_operator_only_child_even_when_globally_allowed() {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 20,
+            allowed_tools: vec!["operator_only".to_string()],
+        };
+        let tool = PipelineTool::new(config, vec![Arc::new(OperatorOnlyTool)]);
+        let request = PipelineRequest {
+            steps: vec![PipelineStep {
+                tool: "operator_only".into(),
+                args: serde_json::json!({}),
+            }],
+            parallel: false,
+            result: PipelineResultMode::default(),
+        };
+
+        let err = tool.validate(&request).unwrap_err();
+        assert!(
+            matches!(err, PipelineError::UnknownTool(ref name) if name == "operator_only"),
+            "operator-only capabilities must not be reachable through nested pipeline dispatch"
+        );
+    }
+
+    #[test]
     fn validate_uses_exact_names_for_every_policy_ceiling() {
         let config = PipelineConfig {
             enabled: true,
@@ -840,7 +873,9 @@ mod tests {
         output: String,
     }
 
-    zeroclaw_api::mock_tool_attribution!(EchoTool);
+    struct OperatorOnlyTool;
+
+    zeroclaw_api::mock_tool_attribution!(EchoTool, OperatorOnlyTool);
 
     #[async_trait::async_trait]
     impl Tool for EchoTool {
@@ -859,6 +894,25 @@ mod tests {
                 output: self.output.clone().into(),
                 error: None,
             })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for OperatorOnlyTool {
+        fn name(&self) -> &str {
+            "operator_only"
+        }
+        fn description(&self) -> &str {
+            "operator-only test tool"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn approval_requires_operator(&self) -> bool {
+            true
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            Ok(ToolResult::ok("must not execute"))
         }
     }
 

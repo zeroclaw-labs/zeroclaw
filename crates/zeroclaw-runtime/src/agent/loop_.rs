@@ -1413,7 +1413,20 @@ pub async fn run(
             mcp_tool_names,
             ..
         } = assembled;
-        let tools_registry = registry.into_inner();
+        let mut tools_registry = registry.into_inner();
+        if !interactive {
+            // One-shot runs deliberately keep their legacy approval-free loop
+            // for ordinary tools, but they cannot satisfy an operator-only
+            // prompt. Remove only tools whose resolved profile still requires
+            // that prompt. Explicit per-tool auto-approval and Full autonomy
+            // remain standing operator grants; ReadOnly is enforced by each
+            // mutating tool's operation boundary.
+            let unattended_approval = ApprovalManager::for_non_interactive(&risk_profile);
+            tools_registry.retain(|tool| {
+                !tool.approval_requires_operator()
+                    || !unattended_approval.needs_approval(tool.name())
+            });
+        }
 
         // Populate all channel-driven tool handles from the registered factory.
         let count = seed_channel_handles(
@@ -16893,6 +16906,134 @@ Let me check the result."#;
             matches!(lifecycle.last(), Some(ObserverEvent::AgentEnd { .. })),
             "the target agent's last lifecycle event must be AgentEnd, \
              got {lifecycle:?} (full captured stream: {events:?})"
+        );
+    }
+
+    /// A one-shot `run()` has no operator prompt surface, but it still has to
+    /// evaluate the agent's approval policy. Before this regression, passing
+    /// `interactive = false` removed the approval manager entirely, turning an
+    /// `always_ask` operator-only tool into `NotRequired` inside the tool loop.
+    /// This drives the production registry and OpenAI-compatible wire path and
+    /// proves the real config file is not rewritten.
+    #[tokio::test]
+    async fn non_interactive_run_denies_operator_only_config_patch() {
+        use axum::{Json, Router, extract::State, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::autonomy::AutonomyLevel;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, ModelProviderConfig, OllamaModelProviderConfig, RiskProfileConfig,
+        };
+
+        type CallCount = Arc<std::sync::atomic::AtomicUsize>;
+
+        async fn respond_patch_then_done(
+            State(calls): State<CallCount>,
+        ) -> Json<serde_json::Value> {
+            let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if call == 0 {
+                Json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "call-config-patch-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "config_patch",
+                                    "arguments": "{\"ops\":[{\"op\":\"replace\",\"path\":\"/gateway/host\",\"value\":\"127.0.0.2\"}]}"
+                                }
+                            }]
+                        }
+                    }]
+                }))
+            } else {
+                Json(serde_json::json!({
+                    "choices": [{"message": {"content": "done"}}]
+                }))
+            }
+        }
+
+        let calls: CallCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let addr = listener.local_addr().expect("listener should have address");
+        let app = Router::new()
+            .route("/v1/chat/completions", post(respond_patch_then_done))
+            .with_state(Arc::clone(&calls));
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server should run");
+        });
+
+        let (_tmp, mut config) = isolated_run_test_config();
+        config.gateway.host = "127.0.0.1".to_string();
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("non-interactive-config-patch-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{addr}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "non-interactive-config-patch-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "ollama.default".into(),
+                risk_profile: "balanced-test".into(),
+                ..Default::default()
+            },
+        );
+        config.risk_profiles.insert(
+            "balanced-test".to_string(),
+            RiskProfileConfig {
+                level: AutonomyLevel::Supervised,
+                always_ask: vec!["config_patch".to_string()],
+                ..RiskProfileConfig::default()
+            },
+        );
+        config
+            .save()
+            .await
+            .expect("initial config should save before the agent turn");
+        let before = std::fs::read(&config.config_path).expect("read config before agent turn");
+
+        let result = super::run(
+            config.clone(),
+            "non-interactive-config-patch-agent",
+            Some("rewrite the gateway host".to_string()),
+            None,
+            None,
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            TurnOrigin::SubTurn,
+            super::AgentRunOverrides::default(),
+        )
+        .await;
+
+        server.abort();
+
+        assert_eq!(
+            result.expect("run() should continue after the denied tool call"),
+            "done"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the denied tool result must be returned to the model before completion"
+        );
+        assert_eq!(
+            std::fs::read(&config.config_path).expect("read config after agent turn"),
+            before,
+            "an operator-only tool must not rewrite config without an approval surface"
         );
     }
 

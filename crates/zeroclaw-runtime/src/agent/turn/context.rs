@@ -34,6 +34,20 @@ pub(crate) struct TurnCtx<'a> {
     /// the EFFECTIVE agent whose policy/tools execute; this keeps the parent
     /// correlation on every emitted record. `None` for ordinary turns.
     pub(crate) parent_agent_alias: Option<&'a str>,
+    /// The turn's tool registry, so the approval gate can ask a tool for a
+    /// host-computed prompt (`Tool::approval_summary`) before asking the
+    /// operator. Read-only here; execution stays with the dispatcher.
+    pub(crate) tools: &'a [Box<dyn zeroclaw_api::tool::Tool>],
+}
+
+impl TurnCtx<'_> {
+    /// Look up a registry tool by name, for approval-time introspection.
+    pub(crate) fn tool_by_name(&self, name: &str) -> Option<&dyn zeroclaw_api::tool::Tool> {
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(AsRef::as_ref)
+    }
 }
 
 /// Lightweight metadata for turn-level event emission.

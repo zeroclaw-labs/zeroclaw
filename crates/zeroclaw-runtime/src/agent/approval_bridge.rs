@@ -22,6 +22,20 @@ impl AskUserApprovalBridge {
     ) -> Self {
         Self { handles, route }
     }
+
+    /// Snapshot only authenticated operator surfaces. Operator-only tool
+    /// requests must never share the ordinary fan-out with chat channels that
+    /// can answer lower-authority approval prompts.
+    fn operator_handles(&self) -> PerToolChannelHandle {
+        let handles = self
+            .handles
+            .read()
+            .iter()
+            .filter(|(_, channel)| channel.is_operator_approval_surface())
+            .map(|(name, channel)| (name.clone(), Arc::clone(channel)))
+            .collect();
+        Arc::new(parking_lot::RwLock::new(handles))
+    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for AskUserApprovalBridge {
@@ -45,6 +59,13 @@ impl Channel for AskUserApprovalBridge {
 
     async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    fn is_operator_approval_surface(&self) -> bool {
+        self.handles
+            .read()
+            .values()
+            .any(|channel| channel.is_operator_approval_surface())
     }
 
     /// Non-attributed entry point, kept for trait completeness: delegates to
@@ -126,6 +147,20 @@ impl Channel for AskUserApprovalBridge {
         }
         Ok(None)
     }
+
+    async fn request_operator_approval_attributed(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<AttributedApprovalResponse>> {
+        // Reuse the route/fan-out implementation over a filtered snapshot.
+        // Keeping the original route is safe: a route naming a non-operator
+        // channel is absent from this snapshot and follows its configured
+        // fail-closed or inherit-originator policy among operator surfaces.
+        AskUserApprovalBridge::new(self.operator_handles(), self.route.clone())
+            .request_approval_attributed(recipient, request)
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +176,7 @@ mod tests {
     struct RecipientScopedApprover {
         name: String,
         approves_recipient: String,
+        operator_surface: bool,
     }
 
     impl ::zeroclaw_api::attribution::Attributable for RecipientScopedApprover {
@@ -158,6 +194,9 @@ mod tests {
     impl Channel for RecipientScopedApprover {
         fn name(&self) -> &str {
             &self.name
+        }
+        fn is_operator_approval_surface(&self) -> bool {
+            self.operator_surface
         }
         async fn send(&self, _m: &SendMessage) -> anyhow::Result<()> {
             Ok(())
@@ -185,6 +224,15 @@ mod tests {
         Arc::new(RecipientScopedApprover {
             name: name.to_string(),
             approves_recipient: approves_recipient.to_string(),
+            operator_surface: false,
+        })
+    }
+
+    fn operator_approver(name: &str, approves_recipient: &str) -> Arc<dyn Channel> {
+        Arc::new(RecipientScopedApprover {
+            name: name.to_string(),
+            approves_recipient: approves_recipient.to_string(),
+            operator_surface: true,
         })
     }
 
@@ -290,6 +338,53 @@ mod tests {
             zeroclaw_api::channel::ApprovalSource::Operator
         );
         assert!(!decided.source.is_runtime_fail_closed());
+    }
+
+    #[tokio::test]
+    async fn operator_only_fanout_filters_non_operator_backchannels() {
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![
+                // This ordinary chat surface would approve if it were asked.
+                approver("chat", "user-A"),
+                // The authenticated surface deliberately abstains.
+                operator_approver("paired-ws", "nobody"),
+            ]),
+            None,
+        );
+
+        assert!(bridge.is_operator_approval_surface());
+        assert!(
+            bridge
+                .request_operator_approval_attributed("user-A", &req())
+                .await
+                .unwrap()
+                .is_none(),
+            "a non-operator chat approval must not win the operator-only fan-out"
+        );
+    }
+
+    #[tokio::test]
+    async fn operator_only_fanout_reaches_the_authenticated_surface() {
+        let bridge = AskUserApprovalBridge::new(
+            handles_with(vec![
+                approver("chat", "nobody"),
+                operator_approver("paired-ws", "user-A"),
+            ]),
+            None,
+        );
+
+        let decided = bridge
+            .request_operator_approval_attributed("user-A", &req())
+            .await
+            .unwrap()
+            .expect("the paired operator approved");
+
+        assert_eq!(decided.response, ChannelApprovalResponse::Approve);
+        assert_eq!(decided.decided_by.as_deref(), Some("paired-ws"));
+        assert_eq!(
+            decided.source,
+            zeroclaw_api::channel::ApprovalSource::Operator
+        );
     }
 
     fn handles_with(channels: Vec<Arc<dyn Channel>>) -> PerToolChannelHandle {
