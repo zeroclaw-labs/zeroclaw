@@ -4,6 +4,7 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 
 ## Highlights
 
+- **Web research delegate**: search moves behind a bounded sub-agent — the main agent asks a question, the delegate searches and fetches with the configured `[web_search]` backend, and returns a distilled, source-cited summary instead of raw search-result text (#9824).
 - **Memory controls** add opt-in retrieval caching, reranking, typed-fact extraction, migration-aware configuration checks, content scanning, and auditable recall paths.
 - **SOP execution** gains per-SOP admission policies, quorum-based approval brokering, checkpoint editing, centralized fan-in adapters, and stronger deterministic gate handling.
 - **Operator surfaces** add dashboard-driven upgrades, channel relinking, agent renaming, runtime-context display, searchable keybinding help, and a more reliable terminal experience.
@@ -12,6 +13,10 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 - **Release integrity** adds a self-contained notarized macOS desktop path, repaired Scoop and AUR publication workflows, consolidated attestations, required SBOMs, checksums, and an offline verification archive.
 
 ## What's New
+
+### Web and Search
+
+- **`web_research` replaces raw `web_search_tool` in the default registry** (#9824): the raw tool now lives inside the delegate's scope (search + `web_fetch` only, bounded turns and wall clock, mandatory Sources section) and is auto-approved in its place. The delegate's nested tools are scoped by the active profile's denylist and bounded by the same wall clock, its model calls bill against the shared spend budget, and its `Sources:` list is rebuilt from pages actually retrieved. **Migration:** agents that need the raw tool back add `web_search_tool` to `allowed_tools`; `[web_search]` provider/key config is unchanged.
 
 ### Memory and Retrieval
 
