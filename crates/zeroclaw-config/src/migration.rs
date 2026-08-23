@@ -2224,6 +2224,51 @@ vision_model_provider = "openai"
     }
 
     #[test]
+    fn v2_canonical_openai_with_codex_subscription_auth_rewrites_bare_openai() {
+        // Codex subscription auth is documented operator configuration on the
+        // canonical `openai` slot itself (`requires_openai_auth = true`),
+        // not a differently named variant: only the `openai-codex` spelling
+        // materializes the separate `openai.codex` alias. A bare `openai`
+        // vision reference must therefore rewrite to `openai.default`, or
+        // the credential-bearing alias stays unreachable on the configless
+        // path; see `v2_bare_family_with_oauth_variant_stays_fail_closed`
+        // for the genuine-variant case that stays fail-closed.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai]
+model = "vision-model"
+requires_openai_auth = true
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "bare openai must rewrite to openai.default even when the canonical slot carries codex subscription auth"
+        );
+        let typed = cfg
+            .providers
+            .models
+            .openai
+            .get("default")
+            .expect("openai.default must exist");
+        assert!(
+            typed.base.requires_openai_auth,
+            "codex subscription auth must survive migration on the typed alias"
+        );
+        assert_eq!(
+            cfg.providers
+                .models
+                .find("openai", "default")
+                .and_then(|b| b.model.as_deref()),
+            Some("vision-model")
+        );
+    }
+
+    #[test]
     fn v2_canonical_qwen_with_oauth_rewrites_bare_qwen() {
         // A canonical `qwen` alias with an operator-selected `auth_mode =
         // "o_auth"` is still the uniquely sourced canonical credential — a

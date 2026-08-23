@@ -865,8 +865,9 @@ fn effective_source_identity_matches(
 
 /// Relaxed variant used only when provenance proves the sole raw producer IS
 /// the reference's own canonical spelling: operator-selected settings on the
-/// materialized alias (`auth_mode = "o_auth"` plus OAuth credential fields,
-/// or a `wire_api` override) are configuration on the same source, not
+/// materialized alias (`auth_mode = "o_auth"` plus OAuth credential fields, a
+/// `wire_api` override, or Codex subscription auth via
+/// `requires_openai_auth`) are configuration on the same source, not
 /// different named variants, so their presence must not block the rewrite.
 fn source_identity_matches_ignoring_alias_operator_fields(
     aliased_models: &toml::Table,
@@ -982,14 +983,16 @@ fn source_identity_matches_inner(
                     // For other families/URIs, allow bare match.
                     continue;
                 }
-            } else if allow_alias_operator_fields && (field == "auth_mode" || field == "wire_api") {
-                // Operator-selected auth flow or wire protocol on the
-                // canonical source itself: not variant markers, so do not
-                // fail closed on them. The only spelling that implies these
-                // extras (`openai-codex`) materializes a different alias, so
-                // within this relaxation an unmatched field can only come
-                // from the operator's own `[providers.models.<family>]`
-                // entry.
+            } else if allow_alias_operator_fields
+                && matches!(field, "auth_mode" | "wire_api" | "requires_openai_auth")
+            {
+                // Operator-selected auth flow, wire protocol, or Codex
+                // subscription auth on the canonical source itself: not
+                // variant markers, so do not fail closed on them. The only
+                // spelling that implies these extras (`openai-codex`)
+                // materializes a different alias (`openai.codex`), so within
+                // this relaxation an unmatched field can only come from the
+                // operator's own `[providers.models.<family>]` entry.
                 continue;
             } else {
                 return false;
