@@ -2267,6 +2267,59 @@ vision_model_provider = "qwen"
     }
 
     #[test]
+    fn v2_canonical_openai_with_wire_api_override_rewrites_bare_openai() {
+        // A canonical `openai` alias carrying an operator-selected
+        // `wire_api = "responses"` is still the uniquely sourced canonical
+        // credential — a bare `openai` reference must rewrite to the dotted
+        // alias so the migrated key and wire protocol reach the alias-aware
+        // vision factory. The only spelling whose extras include `wire_api`
+        // (`openai-codex`) materializes `openai.codex`, a different alias,
+        // so within this shape an unmatched `wire_api` can only be operator
+        // configuration; see `v2_bare_family_with_oauth_variant_stays_fail_closed`
+        // for the genuine-variant case that stays fail-closed.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.openai]
+api_key = "test-key"
+model = "vision-model"
+wire_api = "responses"
+
+[multimodal]
+vision_model_provider = "openai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("openai.default"),
+            "bare openai must rewrite to openai.default even when the canonical alias carries a wire_api override"
+        );
+        let typed = cfg
+            .providers
+            .models
+            .openai
+            .get("default")
+            .expect("openai.default must exist");
+        assert_eq!(
+            typed.base.wire_api,
+            Some(crate::schema::WireApi::Responses),
+            "the operator wire protocol must survive migration on the typed alias"
+        );
+        assert_eq!(
+            typed.base.api_key.as_deref(),
+            Some("test-key"),
+            "the credential must survive migration"
+        );
+        assert_eq!(
+            cfg.providers
+                .models
+                .find("openai", "default")
+                .and_then(|b| b.model.as_deref()),
+            Some("vision-model")
+        );
+    }
+
+    #[test]
     fn v2_legacy_qwen_oauth_variants_migrate_with_typed_auth_mode() {
         // Legacy Qwen OAuth variant spellings (`qwen-code`, `qwen-oauth`,
         // `qwen_oauth`) materialize an `auth_mode` extra. The V3 `AuthMode`

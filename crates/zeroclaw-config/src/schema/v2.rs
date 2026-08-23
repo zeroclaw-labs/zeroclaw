@@ -864,11 +864,11 @@ fn effective_source_identity_matches(
 }
 
 /// Relaxed variant used only when provenance proves the sole raw producer IS
-/// the reference's own canonical spelling: an operator-selected auth setting
-/// on the materialized alias (`auth_mode = "o_auth"` plus OAuth credential
-/// fields) is configuration on the same source, not a different named
-/// variant, so its presence must not block the rewrite.
-fn source_identity_matches_ignoring_alias_auth(
+/// the reference's own canonical spelling: operator-selected settings on the
+/// materialized alias (`auth_mode = "o_auth"` plus OAuth credential fields,
+/// or a `wire_api` override) are configuration on the same source, not
+/// different named variants, so their presence must not block the rewrite.
+fn source_identity_matches_ignoring_alias_operator_fields(
     aliased_models: &toml::Table,
     family: &str,
     alias: &str,
@@ -891,7 +891,7 @@ fn source_identity_matches_inner(
     alias: &str,
     expected_extras: &[(&'static str, toml::Value)],
     expected_url: Option<&str>,
-    allow_alias_auth_mode: bool,
+    allow_alias_operator_fields: bool,
 ) -> bool {
     let Some(toml::Value::Table(family_table)) = aliased_models.get(family) else {
         return false;
@@ -982,9 +982,14 @@ fn source_identity_matches_inner(
                     // For other families/URIs, allow bare match.
                     continue;
                 }
-            } else if field == "auth_mode" && allow_alias_auth_mode {
-                // Operator-selected auth flow on the canonical source itself:
-                // not a variant marker, so do not fail closed on it.
+            } else if allow_alias_operator_fields && (field == "auth_mode" || field == "wire_api") {
+                // Operator-selected auth flow or wire protocol on the
+                // canonical source itself: not variant markers, so do not
+                // fail closed on them. The only spelling that implies these
+                // extras (`openai-codex`) materializes a different alias, so
+                // within this relaxation an unmatched field can only come
+                // from the operator's own `[providers.models.<family>]`
+                // entry.
                 continue;
             } else {
                 return false;
@@ -1071,8 +1076,8 @@ fn rewrite_bare_vision_provider_reference(
         // identity field be operator configuration rather than a different
         // named source. A genuine variant (`qwen-code`, `minimax-oauth`,
         // `stepfun-intl`, …) normalizes to different extras or a different
-        // raw name and stays fail-closed. Endpoint, URI, and wire-api
-        // identity remain strict even in this relaxed path.
+        // raw name and stays fail-closed. Endpoint and URI identity remain
+        // strict even in this relaxed path.
         let sole_raw = producers.iter().next().expect("len 1");
         let (prod_family, prod_alias, prod_extras) = normalize_provider_type(sole_raw, "default");
         let producer_is_reference = sole_raw == reference
@@ -1080,7 +1085,7 @@ fn rewrite_bare_vision_provider_reference(
             && prod_alias == canonical_alias
             && prod_extras == reference_extras;
         if !(producer_is_reference
-            && source_identity_matches_ignoring_alias_auth(
+            && source_identity_matches_ignoring_alias_operator_fields(
                 aliased_models,
                 &canonical_family,
                 &canonical_alias,
