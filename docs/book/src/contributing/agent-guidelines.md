@@ -73,8 +73,6 @@ The stability-tier definitions and versioning policy live in [FND-001](../founda
 | `zeroclaw-macros` | Beta | Tightly coupled to the config schema |
 | `zeroclaw-eval` | Experimental | Agent evaluation harness with deterministic replay of LLM trace fixtures |
 | `zeroclaw-spawn` | Beta | Attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log` |
-| `robot-kit` | Experimental | Robot control toolkit: drive, vision, speech, sensors, and safety |
-| `aardvark-sys` | Experimental | Low-level FFI bindings for the Total Phase Aardvark adapter; the only crate where `unsafe` is permitted |
 
 Stable components follow the breaking-change policy. Beta components may make breaking changes in a MINOR release with changelog notes. Experimental components carry no stability guarantee. Tiers are promoted, never demoted, through deliberate team decision.
 

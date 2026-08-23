@@ -664,13 +664,13 @@ impl EdgeTtsProvider {
 
     /// Test-only constructor that accepts a script path and timeout so tests
     /// can drive the `edge-tts` subprocess. The production [`new`](Self::new)
-    /// allowlist stays a security boundary; this exists only under `cfg(test)`.
-    #[cfg(test)]
+    /// allowlist stays a security boundary; this exists only in Unix test builds.
+    #[cfg(all(test, unix))]
     fn new_with_binary(alias: &str, binary_path: &str, timeout: std::time::Duration) -> Self {
         Self::new_with_command(alias, binary_path, &[], timeout)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn new_with_command(
         alias: &str,
         binary_path: &str,

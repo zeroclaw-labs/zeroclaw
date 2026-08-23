@@ -2625,7 +2625,6 @@ mod tests {
                 ),
             ),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -3908,7 +3907,7 @@ mod tests {
 
     #[test]
     fn every_gateway_secret_is_classified() {
-        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &[];
+        const OPERATOR_EDITED_GATEWAY_SECRETS: &[&str] = &["gateway.webhook_secret"];
 
         let cfg = zeroclaw_config::schema::Config::default();
         let unclassified: Vec<String> = cfg

@@ -333,9 +333,9 @@ pub struct WhatsAppWebChannel {
     bot_lid: Arc<Mutex<Option<String>>>,
     /// Usage mode (business vs personal policy filtering)
     mode: zeroclaw_config::schema::WhatsAppWebMode,
-    /// DM policy when mode = personal
+    /// DM policy. Consulted under BOTH modes.
     dm_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
-    /// Group policy when mode = personal
+    /// Group policy. Consulted under BOTH modes, same as `dm_policy`.
     group_policy: zeroclaw_config::schema::WhatsAppChatPolicy,
     /// Whether to always respond in self-chat when mode = personal
     self_chat_mode: bool,
@@ -666,13 +666,21 @@ impl WhatsAppWebChannel {
             return String::new();
         }
         if mapped_phone.is_none() {
-            format!(
-                " (LID→phone resolution returned None for sender {sender}; \
-                 allowlist phone-number entries cannot match. Workaround: \
-                 add the LID-form (+{}) to allowed_numbers, or wait for the \
-                 in-memory LID cache to populate for this contact.)",
-                sender.user
-            )
+            // Deliberately identifier-free. This string reaches `record!(WARN, ..)`, which the
+            // repository fans out to the dashboard and the optional persisted JSONL, and
+            // `identity_persist.rs` already sets the contract for exactly this class: a raw
+            // linked-account identity is durable personal data and must not reach the log sink.
+            // The failure REASON and the candidate count at the call site are what the operator
+            // needs to act; the sender JID and the raw LID user value are not.
+            //
+            // The remedy also had to change. `allowed_numbers` is a V2 field that migrates into
+            // `peer_groups` on load, so steering an operator to it pointed at a knob the current
+            // config model no longer has.
+            " (sender is a LID and LID→phone resolution returned None, so phone-number entries \
+             cannot match it. Add this contact to the applicable \
+             [peer_groups.<name>].external_peers, or wait for the in-memory LID cache to \
+             populate for it.)"
+                .to_string()
         } else {
             " (sender is LID; resolved phone did not match any allowlist entry)".to_string()
         }
@@ -838,6 +846,13 @@ impl WhatsAppWebChannel {
             return;
         }
 
+        // ── Personal-mode sender semantics ──
+        //
+        // Self-chat and fromMe handling stay personal-only: they describe an
+        // operator's own linked device talking to itself, and the self-chat
+        // exception is a personal-mode affordance. The chat-type policies
+        // further down are NOT personal-only and run under both modes.
+        let mut operator_self_chat = false;
         if context.mode == zeroclaw_config::schema::WhatsAppWebMode::Personal {
             let sender_user = sender_jid.user();
             let chat_user = chat.split_once('@').map(|(u, _)| u).unwrap_or(&chat);
@@ -852,6 +867,9 @@ impl WhatsAppWebChannel {
                     );
                     return;
                 }
+                // self_chat_mode=true: the operator is talking to their own
+                // agent, so the chat-type policies below do not apply here.
+                operator_self_chat = true;
             } else if info.source.is_from_me
                 && !fromme_outside_self_chat_is_operator_trigger(
                     is_group,
@@ -867,80 +885,52 @@ impl WhatsAppWebChannel {
                     "ignoring fromMe message outside self-chat thread (chat=, sender=)"
                 );
                 return;
-            } else if is_group {
-                match &context.group_policy {
-                    zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            "ignoring group message (group_policy=ignore)"
-                        );
-                        return;
-                    }
-                    zeroclaw_config::schema::WhatsAppChatPolicy::All => {}
-                    zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
-                        if normalized.is_none() {
-                            let lid_diag = Self::lid_rejection_diagnostic(
-                                &sender_jid,
-                                mapped_phone.as_deref(),
-                            );
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!(
-                                    "message from unrecognized sender not in allowed list (candidates_count={}){}",
-                                    sender_candidates.len(),
-                                    lid_diag
-                                )
-                            );
-                            return;
-                        }
-                    }
-                }
-            } else {
-                match &context.dm_policy {
-                    zeroclaw_config::schema::WhatsAppChatPolicy::Ignore => {
-                        ::zeroclaw_log::record!(
-                            DEBUG,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            ),
-                            "ignoring DM (dm_policy=ignore)"
-                        );
-                        return;
-                    }
-                    zeroclaw_config::schema::WhatsAppChatPolicy::All => {}
-                    zeroclaw_config::schema::WhatsAppChatPolicy::Allowlist => {
-                        if normalized.is_none() {
-                            let lid_diag = Self::lid_rejection_diagnostic(
-                                &sender_jid,
-                                mapped_phone.as_deref(),
-                            );
-                            ::zeroclaw_log::record!(
-                                WARN,
-                                ::zeroclaw_log::Event::new(
-                                    module_path!(),
-                                    ::zeroclaw_log::Action::Note
-                                )
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!(
-                                    "message from unrecognized sender not in allowed list (candidates_count={}){}",
-                                    sender_candidates.len(),
-                                    lid_diag
-                                )
-                            );
-                            return;
-                        }
-                    }
-                }
+            }
+        }
+
+        // ── Chat-type policy, enforced under BOTH modes ──
+        //
+        // This block used to sit inside the personal-mode branch above, so a
+        // business-mode deployment validated dm_policy and group_policy and
+        // then never consulted either one.
+        match composed_chat_policy_decision(
+            &context.mode,
+            operator_self_chat,
+            is_group,
+            &context.group_policy,
+            &context.dm_policy,
+            normalized.is_some(),
+        ) {
+            ChatPolicyDecision::Admit => {}
+            ChatPolicyDecision::DropGroupIgnored => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "ignoring group message (group_policy=ignore)"
+                );
+                return;
+            }
+            ChatPolicyDecision::DropDmIgnored => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "ignoring DM (dm_policy=ignore)"
+                );
+                return;
+            }
+            ChatPolicyDecision::DropUnrecognizedSender => {
+                let lid_diag = Self::lid_rejection_diagnostic(&sender_jid, mapped_phone.as_deref());
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "message from unrecognized sender not in allowed list (candidates_count={}){}",
+                        sender_candidates.len(),
+                        lid_diag
+                    )
+                );
+                return;
             }
         }
 
@@ -2065,6 +2055,75 @@ fn is_group_chat_allowed(chat_jid: &str, allowed_groups: &[String]) -> bool {
         let entry = entry.trim();
         !entry.is_empty() && (entry == chat_jid || entry == chat_user)
     })
+}
+
+/// What the chat-type policies decide about one inbound message.
+///
+/// Each variant maps to one of the log lines the message loop emits, so
+/// extracting the decision does not flatten four distinct reasons into one.
+#[cfg(feature = "whatsapp-web")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatPolicyDecision {
+    Admit,
+    DropGroupIgnored,
+    DropDmIgnored,
+    DropUnrecognizedSender,
+}
+
+/// Apply `group_policy` or `dm_policy` to one message.
+///
+/// Deliberately takes no `WhatsAppWebMode`. These two policies apply under both
+/// modes, and a function that cannot see the mode cannot quietly start
+/// depending on it again, which is the defect this replaces: the decision used
+/// to sit inside a personal-mode branch, so business mode validated both keys
+/// and consulted neither.
+#[cfg(feature = "whatsapp-web")]
+fn chat_type_policy_decision(
+    is_group: bool,
+    group_policy: &zeroclaw_config::schema::WhatsAppChatPolicy,
+    dm_policy: &zeroclaw_config::schema::WhatsAppChatPolicy,
+    sender_recognized: bool,
+) -> ChatPolicyDecision {
+    use zeroclaw_config::schema::WhatsAppChatPolicy as Policy;
+
+    let policy = if is_group { group_policy } else { dm_policy };
+    match policy {
+        Policy::Ignore => {
+            if is_group {
+                ChatPolicyDecision::DropGroupIgnored
+            } else {
+                ChatPolicyDecision::DropDmIgnored
+            }
+        }
+        Policy::All => ChatPolicyDecision::Admit,
+        Policy::Allowlist => {
+            if sender_recognized {
+                ChatPolicyDecision::Admit
+            } else {
+                ChatPolicyDecision::DropUnrecognizedSender
+            }
+        }
+    }
+}
+
+/// Compose the mode-specific self-chat exception with the cross-mode policy.
+///
+/// The policy decision is always evaluated for business mode. Personal mode
+/// may bypass it only for an operator self-chat that was recognized upstream.
+#[cfg(feature = "whatsapp-web")]
+fn composed_chat_policy_decision(
+    mode: &zeroclaw_config::schema::WhatsAppWebMode,
+    operator_self_chat: bool,
+    is_group: bool,
+    group_policy: &zeroclaw_config::schema::WhatsAppChatPolicy,
+    dm_policy: &zeroclaw_config::schema::WhatsAppChatPolicy,
+    sender_recognized: bool,
+) -> ChatPolicyDecision {
+    if *mode == zeroclaw_config::schema::WhatsAppWebMode::Personal && operator_self_chat {
+        ChatPolicyDecision::Admit
+    } else {
+        chat_type_policy_decision(is_group, group_policy, dm_policy, sender_recognized)
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -3387,6 +3446,138 @@ mod tests {
         assert_eq!(resolved, file.canonicalize().expect("canonical fixture"));
     }
 
+    /// Both modes enforce chat policies; only a personal self-chat bypasses.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn composed_policy_decision_enforces_both_modes() {
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        for mode in [Mode::Business, Mode::Personal] {
+            for is_group in [false, true] {
+                assert_eq!(
+                    super::composed_chat_policy_decision(
+                        &mode,
+                        false,
+                        is_group,
+                        &Policy::Allowlist,
+                        &Policy::Allowlist,
+                        false,
+                    ),
+                    super::ChatPolicyDecision::DropUnrecognizedSender,
+                    "{mode:?} must enforce the default policy (is_group={is_group})"
+                );
+            }
+        }
+
+        assert_eq!(
+            super::composed_chat_policy_decision(
+                &Mode::Personal,
+                true,
+                false,
+                &Policy::Allowlist,
+                &Policy::Allowlist,
+                false,
+            ),
+            super::ChatPolicyDecision::Admit,
+            "a recognized personal self-chat bypasses chat-type policy"
+        );
+        assert_eq!(
+            super::composed_chat_policy_decision(
+                &Mode::Business,
+                true,
+                false,
+                &Policy::Allowlist,
+                &Policy::Allowlist,
+                false,
+            ),
+            super::ChatPolicyDecision::DropUnrecognizedSender,
+            "business mode cannot acquire the personal self-chat exception"
+        );
+    }
+
+    /// The mode-independence invariant, pinned at the decision itself.
+    ///
+    /// Business mode used to skip this decision entirely, so an unlisted sender
+    /// was admitted no matter what `dm_policy` said. The policy default is
+    /// `Allowlist`, so a default business config must now drop that sender, and
+    /// the same holds for a group.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn default_policy_drops_unrecognized_sender_in_dm_and_group() {
+        use zeroclaw_config::schema::WhatsAppChatPolicy as Policy;
+        let default = Policy::default();
+        assert_eq!(default, Policy::Allowlist, "the default must be allowlist");
+
+        for is_group in [false, true] {
+            assert_eq!(
+                super::chat_type_policy_decision(is_group, &default, &default, false),
+                super::ChatPolicyDecision::DropUnrecognizedSender,
+                "an unrecognized sender must be dropped under the default policy \
+                 (is_group={is_group})"
+            );
+            assert_eq!(
+                super::chat_type_policy_decision(is_group, &default, &default, true),
+                super::ChatPolicyDecision::Admit,
+                "a recognized sender is still admitted (is_group={is_group})"
+            );
+        }
+    }
+
+    /// `ignore` must keep its own reason rather than collapsing into the
+    /// unrecognized-sender path, because the two emit different log lines and a
+    /// reader diagnosing a silent bot needs to know which one fired.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn ignore_reports_the_chat_type_it_dropped() {
+        use zeroclaw_config::schema::WhatsAppChatPolicy as Policy;
+
+        assert_eq!(
+            super::chat_type_policy_decision(true, &Policy::Ignore, &Policy::All, true),
+            super::ChatPolicyDecision::DropGroupIgnored
+        );
+        assert_eq!(
+            super::chat_type_policy_decision(false, &Policy::All, &Policy::Ignore, true),
+            super::ChatPolicyDecision::DropDmIgnored
+        );
+    }
+
+    /// Walks the whole decision surface: both chat types, all three policies,
+    /// recognized and unrecognized. Twelve rows, and the point of walking rather
+    /// than sampling is that the group and DM halves must agree row for row.
+    ///
+    /// Mode does not appear here, which is the fix: the decision takes no
+    /// `WhatsAppWebMode`, so it cannot depend on one. This decision was
+    /// previously reachable only under personal mode.
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn decision_surface_is_total_and_mode_free() {
+        use super::ChatPolicyDecision as D;
+        use zeroclaw_config::schema::WhatsAppChatPolicy as Policy;
+
+        let mut rows = 0;
+        for policy in [Policy::Allowlist, Policy::Ignore, Policy::All] {
+            for recognized in [false, true] {
+                let group =
+                    super::chat_type_policy_decision(true, &policy, &Policy::All, recognized);
+                let dm = super::chat_type_policy_decision(false, &Policy::All, &policy, recognized);
+
+                let (want_group, want_dm) = match (&policy, recognized) {
+                    (Policy::Ignore, _) => (D::DropGroupIgnored, D::DropDmIgnored),
+                    (Policy::All, _) => (D::Admit, D::Admit),
+                    (Policy::Allowlist, false) => {
+                        (D::DropUnrecognizedSender, D::DropUnrecognizedSender)
+                    }
+                    (Policy::Allowlist, true) => (D::Admit, D::Admit),
+                };
+
+                assert_eq!(group, want_group, "group row {policy:?}/{recognized}");
+                assert_eq!(dm, want_dm, "dm row {policy:?}/{recognized}");
+                rows += 1;
+            }
+        }
+        assert_eq!(rows, 6, "the loop must not silently walk zero rows");
+    }
+
     #[test]
     #[cfg(feature = "whatsapp-web")]
     fn allowed_groups_full_jid_match() {
@@ -3792,14 +3983,56 @@ mod tests {
             diag.contains("LID→phone resolution returned None"),
             "diagnostic must name the resolution failure mode #6350 describes; got {diag:?}"
         );
+        // These two previously asserted the OPPOSITE, which is what pinned the defect in place:
+        // the diagnostic reaches a WARN that fans out to the dashboard and the persisted log, so
+        // the raw identity must never appear, and the remedy must name a field that still exists.
         assert!(
-            diag.contains("76188559093817"),
-            "diagnostic must surface the LID identifier so the operator can add the LID-form workaround; got {diag:?}"
+            !diag.contains("76188559093817"),
+            "the raw LID is durable personal data and must not reach the log sink; got {diag:?}"
         );
         assert!(
-            diag.contains("allowed_numbers"),
-            "diagnostic must point at the config knob to fix this; got {diag:?}"
+            !diag.contains("allowed_numbers"),
+            "allowed_numbers is a V2 field that migrates into peer_groups, so it is not a remedy an \
+             operator can apply today; got {diag:?}"
         );
+        assert!(
+            diag.contains("external_peers"),
+            "diagnostic must point at the admission source the current config model actually uses; \
+             got {diag:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn lid_rejection_diagnostic_never_leaks_sender_identity_on_either_branch() {
+        // The control for the two negative assertions above. Those alone would pass against a
+        // diagnostic that returned the empty string on every input, so this drives BOTH LID
+        // branches and requires each to stay informative while carrying no identifier.
+        let sender = Jid::lid("76188559093817");
+        for (label, mapped) in [
+            ("unresolved", None),
+            ("resolved-mismatch", Some("15551234567")),
+        ] {
+            let diag = WhatsAppWebChannel::lid_rejection_diagnostic(&sender, mapped);
+            assert!(
+                !diag.is_empty(),
+                "{label}: a LID sender must still produce a reason; got {diag:?}"
+            );
+            assert!(
+                !diag.contains("76188559093817"),
+                "{label}: the LID user value must not appear; got {diag:?}"
+            );
+            assert!(
+                !diag.contains(&sender.to_string()),
+                "{label}: the full sender JID must not appear; got {diag:?}"
+            );
+            if let Some(phone) = mapped {
+                assert!(
+                    !diag.contains(phone),
+                    "{label}: the resolved phone number must not appear either; got {diag:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4059,6 +4292,254 @@ mod tests {
                 .await
                 .is_err(),
             "missing persistent mapping must fail closed before dispatch"
+        );
+    }
+
+    /// The mode-independence invariant, driven through the production path.
+    ///
+    /// The helper tests above call the decision directly. This one calls
+    /// `handle_inbound_message_event`, which is what the event loop dispatches
+    /// to, so the group gate, the personal-mode sender semantics, the chat-type
+    /// policy and the dispatch tail all run composed. Business mode used to skip
+    /// the policy entirely, so every dropped row below reached dispatch under
+    /// `mode = "business"` no matter what `dm_policy` or `group_policy` said.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn inbound_path_enforces_chat_policy_under_both_modes() {
+        use wacore::types::events::Event;
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        const ALLOWED: &str = "15551234567";
+        const UNKNOWN: &str = "15559999999";
+        const GROUP_JID: &str = "120363012345678901@g.us";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        // Plain phone JIDs, so admission is decided from the JID itself and no
+        // LID mapping is in play. `allowed_groups` stays empty, which
+        // `is_group_chat_allowed` admits, so each group row reaches the
+        // chat-type policy instead of stopping at the group gate above it.
+        let event = |sender: &str, is_group: bool| {
+            let sender_jid: Jid = format!("{sender}@s.whatsapp.net")
+                .parse()
+                .expect("sender jid parses");
+            let chat: Jid = if is_group {
+                GROUP_JID.parse().expect("group jid parses")
+            } else {
+                sender_jid.clone()
+            };
+            Event::Message(
+                Arc::new(waproto::whatsapp::Message {
+                    conversation: Some("policy probe".to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat,
+                        sender: sender_jid,
+                        is_from_me: false,
+                        is_group,
+                        ..Default::default()
+                    },
+                    id: format!("policy-{sender}-{is_group}"),
+                    r#type: "text".to_string(),
+                    push_name: "Policy Probe".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        let context_for =
+            |mode: &Mode, policy: &Policy, tx: tokio::sync::mpsc::Sender<ChannelMessage>| {
+                WhatsAppInboundContext {
+                    tx,
+                    alias: Arc::new("both-modes-policy".to_string()),
+                    peer_resolver: Arc::new(|| vec![format!("+{ALLOWED}")]),
+                    allowed_groups_resolver: Arc::new(Vec::new),
+                    mode: mode.clone(),
+                    dm_policy: policy.clone(),
+                    group_policy: policy.clone(),
+                    self_chat_mode: false,
+                    mention_only: false,
+                    passive_group_context: false,
+                    bot_phone: Arc::new(Mutex::new(None)),
+                    bot_lid: Arc::new(Mutex::new(None)),
+                    dm_mention_patterns: Arc::new(Vec::new()),
+                    group_mention_patterns: Arc::new(Vec::new()),
+                    transcription_config: None,
+                    transcription_manager: None,
+                    voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+                }
+            };
+
+        for mode in [Mode::Business, Mode::Personal] {
+            for is_group in [false, true] {
+                // `allowlist` (the default) must reject an unlisted sender under
+                // either mode.
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let context = context_for(&mode, &Policy::Allowlist, tx);
+
+                let unlisted = event(UNKNOWN, is_group);
+                WhatsAppWebChannel::handle_inbound_message_event(&unlisted, &client, &context)
+                    .await;
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                        .await
+                        .is_err(),
+                    "{mode:?} must drop an unlisted sender under allowlist (is_group={is_group})"
+                );
+
+                // Control for the assertion above: the same harness, the same
+                // mode and the same chat type DO deliver a listed sender, so an
+                // empty channel is a policy decision rather than a probe that
+                // could never have dispatched anything.
+                let listed = event(ALLOWED, is_group);
+                WhatsAppWebChannel::handle_inbound_message_event(&listed, &client, &context).await;
+                let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("{mode:?} must dispatch a listed sender (is_group={is_group})")
+                    })
+                    .expect("dispatch sender must remain open");
+                assert_eq!(dispatched.content, "policy probe");
+
+                // `ignore` drops the chat type outright, so even the listed
+                // sender that just dispatched must now be refused. This is the
+                // row that proves the policy is consulted at all rather than the
+                // allowlist doing all the work.
+                let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+                let context = context_for(&mode, &Policy::Ignore, tx);
+                let listed = event(ALLOWED, is_group);
+                WhatsAppWebChannel::handle_inbound_message_event(&listed, &client, &context).await;
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                        .await
+                        .is_err(),
+                    "{mode:?} must honour policy=ignore for a listed sender (is_group={is_group})"
+                );
+            }
+        }
+    }
+
+    /// The self-chat exception composes with the policy, and stays personal-only.
+    ///
+    /// Driven through `handle_inbound_message_event` so the `operator_self_chat`
+    /// flag is produced by the personal-mode branch rather than passed in.
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn inbound_path_keeps_self_chat_bypass_personal_only() {
+        use wacore::types::events::Event;
+        use wacore::types::message::{MessageInfo, MessageSource};
+        use whatsapp_rust::TokioRuntime;
+        use whatsapp_rust::bot::Bot;
+        use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
+        use whatsapp_rust_ureq_http_client::UreqHttpClient;
+        use zeroclaw_config::schema::{WhatsAppChatPolicy as Policy, WhatsAppWebMode as Mode};
+
+        // Deliberately absent from `peer_resolver` below: the personal-mode
+        // bypass has to be what admits this message, not the allowlist.
+        const OPERATOR: &str = "15557654321";
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = Arc::new(crate::whatsapp_storage::RusqliteStore::new(tmp.path()).unwrap());
+        let bot = Bot::builder()
+            .with_backend(store)
+            .with_transport_factory(TokioWebSocketTransportFactory::new())
+            .with_http_client(UreqHttpClient::new())
+            .with_runtime(TokioRuntime)
+            .build()
+            .await
+            .unwrap();
+        let client = bot.client();
+
+        // A self-chat: chat and sender are the same JID and the message is
+        // fromMe, which is the shape the personal branch recognizes.
+        let self_chat_event = || {
+            let jid: Jid = format!("{OPERATOR}@s.whatsapp.net")
+                .parse()
+                .expect("operator jid parses");
+            Event::Message(
+                Arc::new(waproto::whatsapp::Message {
+                    conversation: Some("note to self".to_string()),
+                    ..Default::default()
+                }),
+                Arc::new(MessageInfo {
+                    source: MessageSource {
+                        chat: jid.clone(),
+                        sender: jid,
+                        is_from_me: true,
+                        is_group: false,
+                        ..Default::default()
+                    },
+                    id: "self-chat-probe".to_string(),
+                    r#type: "text".to_string(),
+                    push_name: "Operator".to_string(),
+                    timestamp: chrono::Utc::now(),
+                    ..Default::default()
+                }),
+            )
+        };
+
+        let context_for =
+            |mode: Mode, tx: tokio::sync::mpsc::Sender<ChannelMessage>| WhatsAppInboundContext {
+                tx,
+                alias: Arc::new("self-chat-policy".to_string()),
+                peer_resolver: Arc::new(Vec::new),
+                allowed_groups_resolver: Arc::new(Vec::new),
+                mode,
+                dm_policy: Policy::Allowlist,
+                group_policy: Policy::Allowlist,
+                self_chat_mode: true,
+                mention_only: false,
+                passive_group_context: false,
+                bot_phone: Arc::new(Mutex::new(None)),
+                bot_lid: Arc::new(Mutex::new(None)),
+                dm_mention_patterns: Arc::new(Vec::new()),
+                group_mention_patterns: Arc::new(Vec::new()),
+                transcription_config: None,
+                transcription_manager: None,
+                voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            };
+
+        // Personal mode: the operator's own self-chat is admitted even though
+        // the allowlist is empty.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let context = context_for(Mode::Personal, tx);
+        let event = self_chat_event();
+        WhatsAppWebChannel::handle_inbound_message_event(&event, &client, &context).await;
+        let dispatched = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("personal self-chat must reach dispatch")
+            .expect("dispatch sender must remain open");
+        assert_eq!(dispatched.content, "note to self");
+
+        // Business mode: the same message takes the policy path, and the
+        // allowlist is empty, so it is refused.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let context = context_for(Mode::Business, tx);
+        let event = self_chat_event();
+        WhatsAppWebChannel::handle_inbound_message_event(&event, &client, &context).await;
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), rx.recv())
+                .await
+                .is_err(),
+            "business mode must not acquire the personal self-chat bypass"
         );
     }
 

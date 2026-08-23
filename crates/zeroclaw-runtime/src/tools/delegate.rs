@@ -152,6 +152,15 @@ pub struct DelegateTool {
     /// time. When unset (legacy unit-test constructors), DelegateTool falls
     /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// The daemon's shared live-config handle, when the registry that built
+    /// this tool had one. `root_config` above is a *snapshot* taken at
+    /// construction; every nested registry this tool builds must additionally
+    /// receive this handle so the target's per-execution resolvers (plugin
+    /// `[plugins.entries.config]`, `send_via` peer-group authority) follow
+    /// config reloads and credential rotation instead of the startup snapshot.
+    /// `None` for one-shot / non-daemon callers, which keep the documented
+    /// snapshot fallback.
+    live_config: Option<Arc<RwLock<Config>>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
@@ -209,8 +218,8 @@ impl DelegateAction {
     }
 }
 
-struct IndependentTargetTools {
-    tools: Vec<Box<dyn Tool>>,
+pub(crate) struct IndependentTargetTools {
+    pub(crate) tools: Vec<Box<dyn Tool>>,
     /// The deferred-MCP + pinned-resources system-prompt section (empty unless
     /// the target has granted MCP bundles under deferred loading).
     deferred_section: String,
@@ -267,6 +276,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -314,6 +324,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -417,6 +428,21 @@ impl DelegateTool {
         self
     }
 
+    /// Attach the daemon's shared live-config handle alongside
+    /// [`Self::with_root_config`].
+    ///
+    /// `with_root_config` supplies the snapshot this tool reads synchronously
+    /// (reachability, target mode, per-target policy). This supplies the handle
+    /// that every *nested* registry built for a delegated target needs so its
+    /// per-execution resolvers follow reloads. Passing `None` is the documented
+    /// one-shot behavior and keeps the snapshot fallback; dropping the handle
+    /// when the caller has one silently pins delegated plugin tools to startup
+    /// config for the parent's whole lifetime.
+    pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
+        self.live_config = live_config;
+        self
+    }
+
     /// Set the owning agent's alias so it can be excluded from the
     /// advertised delegation roster (an agent must never delegate to
     /// itself).
@@ -425,7 +451,10 @@ impl DelegateTool {
         self
     }
 
-    fn policy_for_target(&self, target_alias: &str) -> anyhow::Result<Arc<SecurityPolicy>> {
+    pub(crate) fn policy_for_target(
+        &self,
+        target_alias: &str,
+    ) -> anyhow::Result<Arc<SecurityPolicy>> {
         let Some(config) = self.root_config.as_ref() else {
             return Ok(Arc::clone(&self.security));
         };
@@ -688,7 +717,7 @@ impl DelegateTool {
         ]
     }
 
-    async fn independent_agentic_tools_for_target(
+    pub(crate) async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
         target_policy: Arc<SecurityPolicy>,
@@ -752,7 +781,15 @@ impl DelegateTool {
             None,
             None,
             None,
-            None,
+            // The delegated target's registry is built once, here, but its
+            // plugin tools and `send_via` authority resolve per execution. They
+            // must resolve against the daemon's shared handle, not the
+            // `root_config` snapshot this DelegateTool captured at
+            // construction - otherwise a reload or credential rotation is
+            // invisible to every delegated plugin tool for the parent's whole
+            // lifetime. `None` only when the parent registry itself had no live
+            // handle (one-shot callers), which keeps the snapshot fallback.
+            self.live_config.clone(),
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -1610,6 +1647,9 @@ impl DelegateTool {
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
+        // Carried, not dropped: the background task rebuilds a DelegateTool that
+        // will construct its own nested registries.
+        let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
@@ -1635,6 +1675,7 @@ impl DelegateTool {
                     runtime_profiles,
                     skill_bundles,
                     root_config,
+                    live_config,
                     caller_alias,
                 };
 
@@ -1858,6 +1899,9 @@ impl DelegateTool {
             let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
             let root_config = self.root_config.clone();
+            // Carried, not dropped: each fan-out task rebuilds a DelegateTool
+            // that will construct its own nested registries.
+            let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let memory = self.memory.clone();
@@ -1883,6 +1927,7 @@ impl DelegateTool {
                         runtime_profiles,
                         skill_bundles,
                         root_config,
+                        live_config,
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
@@ -2426,8 +2471,6 @@ impl DelegateTool {
             }
         };
 
-        // Determine shell policy instructions when the `shell` tool is in the
-        // effective tool list.
         let empty_tools: &[Box<dyn Tool>] = &[];
         let expose_text_tools =
             sends_native_tool_specs || !agent_config.resolved.strict_tool_parsing;
@@ -2436,17 +2479,8 @@ impl DelegateTool {
         } else {
             empty_tools
         };
-        let has_shell = prompt_tools.iter().any(|t| t.name() == "shell");
-        let shell_policy = if has_shell {
-            "## Shell Policy\n\n\
-             - Prefer non-destructive commands. Use `trash` over `rm` where possible.\n\
-             - Do not run commands that exfiltrate data or modify system-critical paths.\n\
-             - Avoid interactive commands that block on stdin.\n\
-             - Quote paths that may contain spaces."
-                .to_string()
-        } else {
-            String::new()
-        };
+
+        let shell_profile = self.runtime.as_ref().and_then(|r| r.shell_profile());
 
         // Build structured operational context using SystemPromptBuilder sections.
         let dispatcher_instructions = if sends_native_tool_specs || prompt_tools.is_empty() {
@@ -2464,24 +2498,21 @@ impl DelegateTool {
             identity_config: None,
             dispatcher_instructions: &dispatcher_instructions,
             sends_native_tool_specs: sends_native_tool_specs && !prompt_tools.is_empty(),
-
             security_summary: None,
             autonomy_level: crate::security::AutonomyLevel::default(),
+            shell_profile,
         };
 
         let builder = SystemPromptBuilder::default()
             .add_section(Box::new(crate::agent::prompt::ToolsSection))
             .add_section(Box::new(crate::agent::prompt::SafetySection))
+            .add_section(Box::new(crate::agent::prompt::ShellSection))
             .add_section(Box::new(crate::agent::prompt::SkillsSection))
             .add_section(Box::new(crate::agent::prompt::WorkspaceSection))
+            .add_section(Box::new(crate::agent::prompt::RuntimeSection))
             .add_section(Box::new(crate::agent::prompt::DateTimeSection));
 
         let mut enriched = builder.build(&ctx).unwrap_or_default();
-
-        if !shell_policy.is_empty() {
-            enriched.push_str(&shell_policy);
-            enriched.push_str("\n\n");
-        }
 
         if let Some(target_workspace) = self.agent_workspace(agent_alias) {
             let identity_files = [
@@ -2857,6 +2888,9 @@ impl ::zeroclaw_api::attribution::Attributable for ToolArcRef {
     }
     fn alias(&self) -> &str {
         self.inner.alias()
+    }
+    fn tool_provenance(&self) -> ::zeroclaw_api::attribution::ToolProvenance {
+        self.inner.tool_provenance()
     }
 }
 
@@ -6405,11 +6439,40 @@ mod tests {
             }
         }
 
+        struct PosixRuntime;
+        impl crate::platform::RuntimeAdapter for PosixRuntime {
+            fn name(&self) -> &str {
+                "posix-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::Posix
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("/bin/sh");
+                cmd.args(["-c", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
         let workspace = std::env::temp_dir();
 
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
-            .with_workspace_dir(workspace.to_path_buf());
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PosixRuntime));
 
         let prompt = tool
             .build_enriched_system_prompt(
@@ -6424,8 +6487,12 @@ mod tests {
             .unwrap();
 
         assert!(
-            prompt.contains("## Shell Policy"),
-            "should contain shell policy when shell tool is present"
+            prompt.contains("## Shell"),
+            "should contain shell section when shell tool is present"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 
@@ -6484,6 +6551,112 @@ mod tests {
         assert!(
             !prompt.contains("## Shell Policy"),
             "should not contain shell policy when shell tool is absent"
+        );
+    }
+
+    #[test]
+    fn enriched_prompt_reports_powershell_dialect_for_delegate_with_shell_tool() {
+        let config = AliasedAgentConfig::default();
+
+        struct MockShellTool;
+        impl ::zeroclaw_api::attribution::Attributable for MockShellTool {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Tool(
+                    ::zeroclaw_api::attribution::ToolKind::Shell,
+                )
+            }
+            fn alias(&self) -> &str {
+                <Self as Tool>::name(self)
+            }
+        }
+        #[async_trait]
+        impl Tool for MockShellTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "Execute shell commands"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
+                    success: true,
+                    output: ToolOutput::default(),
+                    error: None,
+                })
+            }
+        }
+
+        struct PsRuntime;
+        impl crate::platform::RuntimeAdapter for PsRuntime {
+            fn name(&self) -> &str {
+                "ps-test"
+            }
+            fn has_filesystem_access(&self) -> bool {
+                true
+            }
+            fn storage_path(&self) -> std::path::PathBuf {
+                std::env::temp_dir()
+            }
+            fn supports_long_running(&self) -> bool {
+                false
+            }
+            fn shell_dialect(&self) -> crate::platform::ShellDialect {
+                crate::platform::ShellDialect::PowerShell
+            }
+            fn shell_profile(&self) -> Option<zeroclaw_api::runtime_traits::ShellProfile> {
+                Some(zeroclaw_api::runtime_traits::ShellProfile {
+                    name: "powershell".to_string(),
+                    dialect: crate::platform::ShellDialect::PowerShell,
+                })
+            }
+            fn build_shell_command(
+                &self,
+                command: &str,
+                workspace_dir: &std::path::Path,
+            ) -> anyhow::Result<tokio::process::Command> {
+                let mut cmd = tokio::process::Command::new("powershell");
+                cmd.args(["-Command", command]).current_dir(workspace_dir);
+                Ok(cmd)
+            }
+        }
+
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockShellTool)];
+        let workspace = std::env::temp_dir();
+
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_workspace_dir(workspace.to_path_buf())
+            .with_runtime(Arc::new(PsRuntime));
+
+        let prompt = tool
+            .build_enriched_system_prompt(
+                "alpha",
+                &config,
+                "test-model",
+                &tools,
+                &workspace,
+                false,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            prompt.contains("Shell: powershell") || prompt.contains("powershell"),
+            "prompt must identify powershell dialect; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("trash"),
+            "POSIX deletion advice must not appear in a PowerShell delegate prompt"
+        );
+        assert!(
+            prompt.contains("Get-ChildItem") || prompt.contains("Remove-Item"),
+            "PowerShell deletion guidance must appear; got:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("## Shell Policy"),
+            "static shell policy block must not appear"
         );
     }
 

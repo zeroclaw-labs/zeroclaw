@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn source_tool_name_extraction_skips_rust_doc_comments() {
         let root = tempfile::tempdir().unwrap();
-        let crates_dir = root.path().join("crates/robot-kit/src");
+        let crates_dir = root.path().join("crates/zeroclaw-example/src");
         std::fs::create_dir_all(&crates_dir).unwrap();
         std::fs::create_dir_all(root.path().join("src")).unwrap();
         std::fs::write(
