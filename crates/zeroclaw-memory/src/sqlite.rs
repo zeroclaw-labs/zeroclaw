@@ -986,6 +986,7 @@ impl SqliteMemory {
                 param_values.iter().map(AsRef::as_ref).collect();
             let rows = stmt.query_map(params_ref.as_slice(), |row| {
                 Ok(MemoryEntry {
+                    principal_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,
@@ -1250,6 +1251,7 @@ impl SqliteMemory {
                                 continue;
                             }
                         let entry = MemoryEntry {
+                            principal_id: None,
                             id: scored.id.clone(),
                             key,
                             content,
@@ -1368,6 +1370,7 @@ impl SqliteMemory {
                         param_values.iter().map(AsRef::as_ref).collect();
                     let rows = stmt.query_map(params_ref.as_slice(), |row| {
                         Ok(MemoryEntry {
+                            principal_id: None,
                             id: row.get(0)?,
                             key: row.get(1)?,
                             content: row.get(2)?,
@@ -1511,6 +1514,7 @@ impl Memory for SqliteMemory {
 
             let mut rows = stmt.query_map(params![key], |row| {
                 Ok(MemoryEntry {
+                    principal_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,
@@ -1556,6 +1560,7 @@ impl Memory for SqliteMemory {
 
             let mut rows = stmt.query_map(params![key, agent_id], |row| {
                 Ok(MemoryEntry {
+                    principal_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,
@@ -1600,6 +1605,7 @@ impl Memory for SqliteMemory {
 
             let row_mapper = |row: &rusqlite::Row| -> rusqlite::Result<MemoryEntry> {
                 Ok(MemoryEntry {
+                    principal_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,
@@ -1933,6 +1939,7 @@ impl Memory for SqliteMemory {
                 param_values.iter().map(AsRef::as_ref).collect();
             let rows = stmt.query_map(params_ref.as_slice(), |row| {
                 Ok(MemoryEntry {
+                    principal_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,
@@ -1974,6 +1981,7 @@ impl Memory for SqliteMemory {
             )?;
             let rows = stmt.query_map(params![agent_alias], |row| {
                 Ok(MemoryEntry {
+                    principal_id: None,
                     id: row.get(0)?,
                     key: row.get(1)?,
                     content: row.get(2)?,

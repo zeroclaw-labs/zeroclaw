@@ -945,6 +945,7 @@ mod tests {
 
     fn test_entry(key: &str, content: &str) -> MemoryEntry {
         MemoryEntry {
+            principal_id: None,
             id: key.into(),
             key: key.into(),
             content: content.into(),
