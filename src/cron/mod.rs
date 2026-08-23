@@ -93,6 +93,25 @@ fn merge_delivery(
     })
 }
 
+/// Confirm the payload the scheduler will actually run after `cron update`.
+///
+/// Agent jobs store that payload in `prompt` (including `--command` remaps),
+/// while shell jobs keep it in `command`. Printing the unused column after a
+/// successful remap makes the confirmation contradict the stored change.
+fn cron_update_payload_confirmation(
+    job_type: &JobType,
+    command: &str,
+    prompt: Option<&str>,
+) -> String {
+    match job_type {
+        JobType::Agent => get_required_cli_string_with_args(
+            "cli-cron-prompt",
+            &[("v", prompt.unwrap_or_default())],
+        ),
+        JobType::Shell => get_required_cli_string_with_args("cli-cron-cmd", &[("v", command)]),
+    }
+}
+
 /// Print where a created/updated job's output will go, so an `ok` job status is
 /// never mistaken for a successful delivery.
 fn print_delivery_line(job: &CronJob) {
@@ -632,7 +651,11 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             );
             println!(
                 "{}",
-                get_required_cli_string_with_args("cli-cron-cmd", &[("v", &job.command)])
+                cron_update_payload_confirmation(
+                    &job.job_type,
+                    &job.command,
+                    job.prompt.as_deref()
+                )
             );
             print_delivery_line(&job);
             Ok(())
@@ -1290,6 +1313,23 @@ mod tests {
             updated.command, "",
             "agent jobs must not persist --command on the unused command column"
         );
+        assert_eq!(
+            cron_update_payload_confirmation(
+                &updated.job_type,
+                &updated.command,
+                updated.prompt.as_deref(),
+            ),
+            get_required_cli_string_with_args("cli-cron-prompt", &[("v", "new overnight digest")]),
+            "update confirmation must show the remapped prompt, not the empty command column"
+        );
+        assert_ne!(
+            cron_update_payload_confirmation(
+                &updated.job_type,
+                &updated.command,
+                updated.prompt.as_deref(),
+            ),
+            get_required_cli_string_with_args("cli-cron-cmd", &[("v", "")])
+        );
     }
 
     #[test]
@@ -1332,5 +1372,38 @@ mod tests {
         assert_eq!(updated.job_type, JobType::Shell);
         assert_eq!(updated.command, "echo new");
         assert_eq!(updated.prompt, None);
+        assert_eq!(
+            cron_update_payload_confirmation(
+                &updated.job_type,
+                &updated.command,
+                updated.prompt.as_deref(),
+            ),
+            get_required_cli_string_with_args("cli-cron-cmd", &[("v", "echo new")]),
+            "shell update confirmation must keep printing the command column"
+        );
+    }
+
+    #[test]
+    fn cli_update_confirmation_renders_prompt_for_agent_jobs() {
+        let line =
+            cron_update_payload_confirmation(&JobType::Agent, "", Some("new overnight digest"));
+        assert_eq!(
+            line,
+            get_required_cli_string_with_args("cli-cron-prompt", &[("v", "new overnight digest")])
+        );
+        assert_ne!(
+            line,
+            get_required_cli_string_with_args("cli-cron-cmd", &[("v", "")]),
+            "agent confirmation must not fall through to an empty cli-cron-cmd line"
+        );
+    }
+
+    #[test]
+    fn cli_update_confirmation_renders_command_for_shell_jobs() {
+        let line = cron_update_payload_confirmation(&JobType::Shell, "echo new", None);
+        assert_eq!(
+            line,
+            get_required_cli_string_with_args("cli-cron-cmd", &[("v", "echo new")])
+        );
     }
 }

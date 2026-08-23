@@ -109,7 +109,7 @@ impl Tool for CronUpdateTool {
                         },
                         "command": {
                             "type": "string",
-                            "description": "New shell command (for shell jobs)"
+                            "description": "New shell command for shell jobs, or agent prompt for agent jobs"
                         },
                         "prompt": {
                             "type": "string",
@@ -627,6 +627,11 @@ mod tests {
                 "patch schema missing field: {field}"
             );
         }
+        assert_eq!(
+            patch_props["command"]["description"].as_str(),
+            Some("New shell command for shell jobs, or agent prompt for agent jobs"),
+            "command description must document the agent-job compatibility mapping"
+        );
 
         // patch.schedule is a oneOf with exactly 3 variants: cron, at, every
         let one_of = schema["properties"]["patch"]["properties"]["schedule"]["oneOf"]
