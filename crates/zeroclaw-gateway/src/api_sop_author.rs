@@ -25,8 +25,9 @@ fn sops_dir_and_mode(
     state: &AppState,
 ) -> (std::path::PathBuf, zeroclaw_runtime::sop::SopExecutionMode) {
     let config = state.config.read();
-    let workspace = config.shared_workspace_dir();
-    let dir = zeroclaw_runtime::sop::resolve_sops_dir(&workspace, config.sop.sops_dir.as_deref());
+    let install_root = config.install_root_dir();
+    let dir =
+        zeroclaw_runtime::sop::resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
     let mode = zeroclaw_runtime::sop::parse_execution_mode(&config.sop.default_execution_mode);
     (dir, mode)
 }

@@ -75,35 +75,13 @@ impl ToolRegistry {
             }
         }
 
-        // Aardvark I2C / SPI / GPIO tools + datasheet tool (hardware feature only,
-        // and only when at least one Aardvark adapter is present at startup).
-        #[cfg(feature = "hardware")]
-        {
-            let has_aardvark = {
-                let reg = devices.read().await;
-                reg.has_aardvark()
-            };
-            if has_aardvark {
-                for tool in super::aardvark_tools::aardvark_tools(devices.clone()) {
-                    let name = tool.name().to_string();
-                    if tools.contains_key(&name) {
-                        anyhow::bail!("duplicate built-in tool name: '{}'", name);
-                    }
-                    println!("[registry] loaded built-in: {}", name);
-                    tools.insert(name, tool);
-                }
-                // Datasheet tool: always useful once an Aardvark is connected.
-                {
-                    let tool: Box<dyn Tool> = Box::new(super::datasheet::DatasheetTool::new());
-                    let name = tool.name().to_string();
-                    if tools.contains_key(&name) {
-                        anyhow::bail!("duplicate built-in tool name: '{}'", name);
-                    }
-                    println!("[registry] loaded built-in: {}", name);
-                    tools.insert(name, tool);
-                }
-            }
-        }
+        // `datasheet` used to register here, gated on an Aardvark adapter being
+        // present at startup. That adapter support is gone, so the gate could
+        // never be satisfied and the registration is removed with it. The
+        // `datasheet` module itself is retained: no production entrypoint reaches
+        // this registry, because the CLI and daemon build hardware tools through
+        // `peripherals::create_peripheral_tools`, so registering the tool belongs
+        // with that factory rather than here.
 
         // ── 2. User plugins ───────────────────────────────────────────────
         let plugins = scan_plugin_dir();

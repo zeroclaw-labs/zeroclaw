@@ -66,6 +66,10 @@ impl ModelProvider for VisionOverrideProvider {
         capabilities
     }
 
+    fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+        self.inner.has_mixed_native_tool_support_for_model(model)
+    }
+
     fn default_temperature(&self) -> f64 {
         self.inner.default_temperature()
     }
@@ -290,6 +294,62 @@ mod tests {
         assert!(
             models[0].pricing.is_some(),
             "vision override must delegate list_models_with_pricing and keep pricing"
+        );
+    }
+
+    struct ModelAwareCapabilityFake;
+
+    impl Attributable for ModelAwareCapabilityFake {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            "model_aware_capability_fake"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ModelAwareCapabilityFake {
+        fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: model == "routed-model",
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
+            model == "routed-model"
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn vision_override_preserves_model_aware_tool_capabilities() {
+        let wrapped = VisionOverrideProvider::new(Box::new(ModelAwareCapabilityFake), false);
+
+        let capabilities = wrapped.capabilities_for_model("routed-model");
+        assert!(
+            capabilities.native_tool_calling,
+            "the vision decorator must preserve model-aware native-tool support"
+        );
+        assert!(
+            !capabilities.vision,
+            "the configured vision override remains authoritative"
+        );
+        assert!(
+            wrapped.has_mixed_native_tool_support_for_model("routed-model"),
+            "the vision decorator must transparently forward mixed-chain detection"
         );
     }
 

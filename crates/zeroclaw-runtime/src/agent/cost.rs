@@ -537,6 +537,79 @@ mod tests {
     }
 
     #[test]
+    fn provider_pricing_resolves_exact_alias_when_type_is_ambiguous() {
+        let pricing = HashMap::from([
+            (
+                "openai.fast".to_string(),
+                HashMap::from([
+                    ("gpt-4o-mini.input".to_string(), 0.15),
+                    ("gpt-4o-mini.output".to_string(), 0.60),
+                ]),
+            ),
+            (
+                "openai.smart".to_string(),
+                HashMap::from([
+                    ("gpt-4o.input".to_string(), 2.50),
+                    ("gpt-4o.output".to_string(), 10.00),
+                ]),
+            ),
+        ]);
+
+        let fast = provider_pricing(&pricing, "openai.fast").unwrap();
+        assert_eq!(fast.get("gpt-4o-mini.input"), Some(&0.15));
+        assert!(!fast.contains_key("gpt-4o.input"));
+        assert!(provider_pricing(&pricing, "openai").is_none());
+    }
+
+    #[test]
+    fn build_pricing_keeps_same_type_aliases_distinct() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o-mini.input".to_string(), 0.15),
+                        ("gpt-4o-mini.output".to_string(), 0.60),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "smart".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o.input".to_string(), 2.50),
+                        ("gpt-4o.output".to_string(), 10.00),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let pricing = build_model_provider_pricing(&config);
+        assert_eq!(
+            provider_pricing(&pricing, "openai.fast")
+                .unwrap()
+                .get("gpt-4o-mini.input"),
+            Some(&0.15)
+        );
+        assert_eq!(
+            provider_pricing(&pricing, "openai.smart")
+                .unwrap()
+                .get("gpt-4o.output"),
+            Some(&10.00)
+        );
+        assert!(provider_pricing(&pricing, "openai").is_none());
+    }
+
+    #[test]
     fn different_providers_for_same_model_are_independent() {
         // Same model name served by two different model_providers — operator may
         // configure them at different rates, so the warn must fire for each.

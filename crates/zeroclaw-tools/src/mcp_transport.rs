@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
@@ -47,6 +48,8 @@ const MCP_STREAMABLE_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_JSON_CONTENT_TYPE: &str = "application/json";
 /// Streamable HTTP session header used to preserve MCP server state.
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+/// Maximum size of one operator-selected PEM CA file.
+const MAX_TLS_CA_BYTES: usize = 1024 * 1024;
 
 fn http_request_timeout_secs(
     request: &JsonRpcRequest,
@@ -79,6 +82,144 @@ fn apply_request_timeout(
     } else {
         req
     }
+}
+
+fn require_https_url(server_name: &str, url: &str, target: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .with_context(|| format!("MCP server `{server_name}`: invalid {target} URL"))?;
+    if parsed.scheme() != "https" {
+        bail!(
+            "MCP server `{server_name}`: tls_ca_cert_path requires an HTTPS {target}; \
+             refusing plaintext transport"
+        );
+    }
+    Ok(())
+}
+
+/// Open a candidate CA file without letting a special file block the caller.
+///
+/// The open itself carries `O_NONBLOCK` on unix so that a FIFO (or a symlink to
+/// one) substituted at `path` returns a handle immediately instead of parking
+/// the thread until a writer appears. Classification happens on the returned
+/// handle, never on a second pathname lookup, so the file object we validate is
+/// the same one we read.
+///
+/// Symlinks are followed deliberately: certificate rotation and mounted-secret
+/// deployments publish CA bundles through symlink indirection. Following them is
+/// safe here precisely because the resulting handle is classified after the
+/// open — a symlink that retargets to a special file still yields a handle we
+/// reject rather than a blocking open.
+fn open_tls_ca_file(path: &str) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
+    let file = open_tls_ca_file(path).with_context(|| {
+        format!(
+            "MCP server `{}`: cannot read TLS CA certificate at `{path}`",
+            config.name
+        )
+    })?;
+    let opened_metadata = file.metadata().with_context(|| {
+        format!(
+            "MCP server `{}`: cannot inspect opened TLS CA certificate at `{path}`",
+            config.name
+        )
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        bail!(
+            "MCP server `{}`: TLS CA certificate path must name a regular file: `{path}`",
+            config.name
+        );
+    }
+    if opened_metadata.len() > MAX_TLS_CA_BYTES as u64 {
+        bail!(
+            "MCP server `{}`: TLS CA certificate at `{path}` exceeds the {MAX_TLS_CA_BYTES}-byte limit",
+            config.name
+        );
+    }
+
+    let mut pem = Vec::with_capacity(opened_metadata.len() as usize + 1);
+    file.take(MAX_TLS_CA_BYTES as u64 + 1)
+        .read_to_end(&mut pem)
+        .with_context(|| {
+            format!(
+                "MCP server `{}`: cannot read TLS CA certificate at `{path}`",
+                config.name
+            )
+        })?;
+    if pem.len() > MAX_TLS_CA_BYTES {
+        bail!(
+            "MCP server `{}`: TLS CA certificate at `{path}` exceeds the {MAX_TLS_CA_BYTES}-byte limit",
+            config.name
+        );
+    }
+    Ok(pem)
+}
+
+/// Build the shared HTTP client for remote MCP transports.
+///
+/// The optional server-specific CA is additive: system/default roots remain
+/// enabled, and normal chain and hostname verification stay in force.
+fn build_remote_http_client(config: &McpServerConfig) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+
+    if let Some(path) = config.tls_ca_cert_path.as_deref() {
+        let server_name = config.name.clone();
+        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error(std::io::Error::other(format!(
+                    "MCP server `{server_name}`: too many redirects"
+                )))
+            } else if attempt.url().scheme() == "https" {
+                attempt.follow()
+            } else {
+                attempt.error(std::io::Error::other(format!(
+                    "MCP server `{server_name}`: tls_ca_cert_path forbids redirecting to plaintext"
+                )))
+            }
+        }));
+
+        if !std::path::Path::new(path).is_absolute() {
+            bail!(
+                "MCP server `{}`: TLS CA certificate path must be absolute: `{}`",
+                config.name,
+                path
+            );
+        }
+
+        let pem = load_tls_ca_pem(config, path)?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem).with_context(|| {
+            format!(
+                "MCP server `{}`: invalid PEM CA certificate at `{}`",
+                config.name, path
+            )
+        })?;
+        if certificates.is_empty() {
+            bail!(
+                "MCP server `{}`: CA certificate file `{}` contained no certificates",
+                config.name,
+                path
+            );
+        }
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+
+    builder.build().with_context(|| {
+        format!(
+            "failed to build HTTP client for MCP server `{}`",
+            config.name
+        )
+    })
 }
 
 // ── Transport Errors ───────────────────────────────────────────────────────
@@ -935,9 +1076,10 @@ impl HttpTransport {
             })?
             .clone();
 
-        let client = reqwest::Client::builder()
-            .build()
-            .context("failed to build HTTP client")?;
+        if config.tls_ca_cert_path.is_some() {
+            require_https_url(&config.name, &url, "configured remote URL")?;
+        }
+        let client = build_remote_http_client(config)?;
 
         Ok(Self {
             url,
@@ -1115,6 +1257,7 @@ pub struct SseTransport {
     tool_timeout_secs: Option<u64>,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
+    require_https: bool,
     conn: Mutex<SseConnState>,
     shared: std::sync::Arc<Mutex<SseSharedState>>,
     pending: SsePendingMap,
@@ -1147,9 +1290,11 @@ impl SseTransport {
             })?
             .clone();
 
-        let client = reqwest::Client::builder()
-            .build()
-            .context("failed to build HTTP client")?;
+        let require_https = config.tls_ca_cert_path.is_some();
+        if require_https {
+            require_https_url(&config.name, &sse_url, "configured remote URL")?;
+        }
+        let client = build_remote_http_client(config)?;
 
         Ok(Self {
             sse_url,
@@ -1157,6 +1302,7 @@ impl SseTransport {
             tool_timeout_secs: config.tool_timeout_secs,
             client,
             headers: config.headers.clone(),
+            require_https,
             conn: Mutex::new(SseConnState {
                 stream_state: SseStreamState::Unknown,
                 shutdown_tx: None,
@@ -1622,6 +1768,13 @@ impl SharedMcpTransportConn for SseTransport {
             self.sse_url.clone()
         };
 
+        // The message endpoint can be supplied by the server via the SSE
+        // `endpoint` event, so re-check it here: a custom CA must never be
+        // downgraded to plaintext by a server-controlled redirect target.
+        if self.require_https {
+            require_https_url(&self.server_name, &message_url, "SSE message endpoint")?;
+        }
+
         // Acquire the epoch permit before registering a response waiter.
         // Cancellation while waiting for the permit is provably pre-write and
         // therefore cannot leak a pending sender.
@@ -1806,6 +1959,164 @@ pub(crate) fn create_shared_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestTlsServer {
+        url: String,
+        ca_pem: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    #[derive(Clone)]
+    enum TestTlsBehavior {
+        JsonRpc,
+        Sse,
+        Redirect(String),
+    }
+
+    fn test_ca_file() -> tempfile::NamedTempFile {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["ZeroClaw MCP test CA".into()]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), cert.pem()).unwrap();
+        file
+    }
+
+    /// Install the `ring` `CryptoProvider` for this process (idempotent).
+    ///
+    /// The workspace test build links both `ring` (this crate) and `aws-lc-rs`
+    /// (pulled in transitively by the `matrix-sdk` dev-dependency), so rustls
+    /// cannot infer a process-level provider from crate features and panics
+    /// inside `ServerConfig::builder()`. Production is unaffected: the remote
+    /// transports build their clients through reqwest's `__rustls-ring`
+    /// feature, which selects the provider explicitly.
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    async fn spawn_test_tls_server() -> TestTlsServer {
+        spawn_test_tls_server_with_san("127.0.0.1").await
+    }
+
+    async fn spawn_test_tls_server_with_san(server_san: &str) -> TestTlsServer {
+        spawn_test_tls_server_with_behavior(server_san, TestTlsBehavior::JsonRpc).await
+    }
+
+    async fn serve_test_tls_connection(
+        stream: tokio::net::TcpStream,
+        acceptor: tokio_rustls::TlsAcceptor,
+        addr: std::net::SocketAddr,
+        behavior: TestTlsBehavior,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let Ok(mut stream) = acceptor.accept(stream).await else {
+            return;
+        };
+        let mut request = vec![0_u8; 4096];
+        let bytes_read = stream.read(&mut request).await.unwrap();
+        let is_get = request[..bytes_read].starts_with(b"GET ");
+
+        let response = match behavior {
+            TestTlsBehavior::JsonRpc => {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            }
+            TestTlsBehavior::Sse if is_get => {
+                let body = format!("event: endpoint\ndata: https://{addr}/messages\n\n");
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            }
+            TestTlsBehavior::Sse => {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            }
+            TestTlsBehavior::Redirect(location) => {
+                format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+            }
+        };
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    async fn spawn_test_tls_server_with_behavior(
+        server_san: &str,
+        behavior: TestTlsBehavior,
+    ) -> TestTlsServer {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use std::sync::Arc;
+        use tokio_rustls::TlsAcceptor;
+
+        ensure_crypto_provider();
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["ZeroClaw MCP test CA".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(vec![server_san.into()]).unwrap();
+        server_params.is_ca = IsCa::NoCa;
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+            )
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connection_count = if matches!(&behavior, TestTlsBehavior::Sse) {
+            2
+        } else {
+            1
+        };
+        let task = ::zeroclaw_spawn::spawn!(async move {
+            let acceptor = TlsAcceptor::from(Arc::new(server_config));
+            let mut handlers = Vec::with_capacity(connection_count);
+            for _ in 0..connection_count {
+                let (stream, _) = listener.accept().await.unwrap();
+                let connection_acceptor = acceptor.clone();
+                let connection_behavior = behavior.clone();
+                handlers.push(::zeroclaw_spawn::spawn!(serve_test_tls_connection(
+                    stream,
+                    connection_acceptor,
+                    addr,
+                    connection_behavior,
+                )));
+            }
+            for handler in handlers {
+                handler.await.unwrap();
+            }
+        });
+
+        TestTlsServer {
+            url: format!("https://{addr}/mcp"),
+            ca_pem: ca_cert.pem(),
+            task,
+        }
+    }
 
     #[tokio::test]
     async fn stdio_routes_only_exact_numeric_id_and_preserves_other_waiters() {
@@ -2125,6 +2436,469 @@ mod tests {
             ..Default::default()
         };
         assert!(SseTransport::new(&config).is_err());
+    }
+
+    #[test]
+    fn remote_transports_without_custom_ca_build_unchanged() {
+        let http = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            ..Default::default()
+        };
+        let sse = McpServerConfig {
+            name: "test-sse".into(),
+            transport: McpTransport::Sse,
+            url: Some("https://localhost/sse".into()),
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(&http).is_ok());
+        assert!(SseTransport::new(&sse).is_ok());
+    }
+
+    #[test]
+    fn remote_transports_with_custom_ca_reject_plaintext_configured_url() {
+        let ca_file = test_ca_file();
+        for transport in [McpTransport::Http, McpTransport::Sse] {
+            let config = McpServerConfig {
+                name: "internal".into(),
+                transport,
+                url: Some("http://internal.example/mcp".into()),
+                tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            let error = create_transport(&config)
+                .err()
+                .expect("custom CA must reject a plaintext configured URL");
+            let message = error.to_string();
+            assert!(message.contains("internal"));
+            assert!(message.contains("requires an HTTPS configured remote URL"));
+            assert!(message.contains("refusing plaintext transport"));
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_ca_rejects_plaintext_endpoint_advertised_by_https_sse_stream() {
+        let ca_file = test_ca_file();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Sse,
+            url: Some("https://internal.example/sse".into()),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).expect("HTTPS SSE transport should build");
+
+        handle_sse_event(
+            &transport.server_name,
+            &transport.sse_url,
+            &transport.shared,
+            &transport.pending,
+            &transport.notify,
+            Some("endpoint"),
+            None,
+            "http://internal.example/messages".to_string(),
+        )
+        .await;
+        // Mark the stream unsupported so the send path uses the cached
+        // endpoint directly instead of trying to open a real GET stream.
+        transport.conn.lock().await.stream_state = SseStreamState::Unsupported;
+
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("custom CA must reject a plaintext advertised endpoint");
+        let message = error.to_string();
+        assert!(message.contains("internal"));
+        assert!(message.contains("requires an HTTPS SSE message endpoint"));
+        assert!(message.contains("refusing plaintext transport"));
+    }
+
+    #[test]
+    fn remote_transport_rejects_relative_custom_ca_path() {
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some("internal-ca.pem".into()),
+            ..Default::default()
+        };
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("relative path must fail");
+        let message = error.to_string();
+        assert!(message.contains("internal"));
+        assert!(message.contains("must be absolute"));
+    }
+
+    #[test]
+    fn both_remote_transports_fail_closed_for_missing_custom_ca() {
+        for transport in [McpTransport::Http, McpTransport::Sse] {
+            let config = McpServerConfig {
+                name: "internal".into(),
+                transport,
+                url: Some("https://localhost/mcp".into()),
+                tls_ca_cert_path: Some("/nonexistent/zeroclaw-internal-ca.pem".into()),
+                ..Default::default()
+            };
+            let error = create_transport(&config)
+                .err()
+                .expect("missing CA must fail");
+            let message = error.to_string();
+            assert!(message.contains("internal"));
+            assert!(message.contains("/nonexistent/zeroclaw-internal-ca.pem"));
+            assert!(!message.contains("BEGIN CERTIFICATE"));
+        }
+    }
+
+    #[test]
+    fn remote_transport_fails_closed_for_invalid_custom_ca() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"not a certificate").unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("invalid CA must fail");
+        let message = error.to_string();
+        assert!(message.contains("internal"));
+        assert!(message.contains(&file.path().to_string_lossy().to_string()));
+        assert!(!message.contains("not a certificate"));
+    }
+
+    #[test]
+    fn remote_transport_rejects_oversized_custom_ca_before_reading() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(MAX_TLS_CA_BYTES as u64 + 1).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("oversized CA must fail before PEM parsing");
+        let message = error.to_string();
+        assert!(message.contains("internal"));
+        assert!(message.contains("exceeds"));
+        assert!(message.contains(&MAX_TLS_CA_BYTES.to_string()));
+    }
+
+    #[test]
+    fn remote_transport_rejects_non_regular_custom_ca_path() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(directory.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("a directory must not be read as a CA bundle");
+        assert!(error.to_string().contains("must name a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_transport_rejects_special_custom_ca_file() {
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some("/dev/zero".into()),
+            ..Default::default()
+        };
+
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("a non-terminating device must be rejected");
+        assert!(error.to_string().contains("must name a regular file"));
+    }
+
+    /// Create a FIFO at `path` using the POSIX utility, so the test does not
+    /// need `unsafe` to reach `mkfifo(3)`.
+    #[cfg(unix)]
+    fn make_test_fifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo must be available on unix");
+        assert!(status.success(), "mkfifo failed for {}", path.display());
+    }
+
+    /// A CA path that alternates between a regular file and a FIFO must never
+    /// park the loader. The pathname is classified only through the opened
+    /// handle, so the losing side of the race is rejected rather than blocking
+    /// MCP registry startup on a writer that never arrives.
+    #[cfg(unix)]
+    #[test]
+    fn custom_ca_path_swapped_for_a_fifo_returns_instead_of_hanging() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let ca_path = directory.path().join("rotating-ca.pem");
+        let pem = test_ca_file();
+        let pem_bytes = std::fs::read(pem.path()).unwrap();
+
+        let config_for = |path: &std::path::Path| McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        // Alternate the same path between a readable bundle and a FIFO. Each
+        // iteration must terminate: the regular file loads, the FIFO is
+        // rejected as a non-regular file. A blocking open would hang here
+        // forever because nothing ever opens the FIFO for writing.
+        for _ in 0..10 {
+            std::fs::write(&ca_path, &pem_bytes).unwrap();
+            load_tls_ca_pem(&config_for(&ca_path), &ca_path.to_string_lossy())
+                .expect("a regular CA bundle must still load");
+
+            std::fs::remove_file(&ca_path).unwrap();
+            make_test_fifo(&ca_path);
+            let error = load_tls_ca_pem(&config_for(&ca_path), &ca_path.to_string_lossy())
+                .expect_err("a FIFO must be rejected, not opened for reading");
+            assert!(error.to_string().contains("must name a regular file"));
+
+            std::fs::remove_file(&ca_path).unwrap();
+        }
+    }
+
+    /// Certificate rotation and mounted-secret deployments publish CA bundles
+    /// through symlink indirection, so a symlink to a bounded regular file is
+    /// supported. A symlink pointing at a special file is still rejected,
+    /// because classification happens on the opened handle.
+    #[cfg(unix)]
+    #[test]
+    fn custom_ca_follows_symlinks_to_regular_files_but_not_to_special_files() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let pem = test_ca_file();
+        let pem_bytes = std::fs::read(pem.path()).unwrap();
+
+        let target = directory.path().join("real-ca.pem");
+        std::fs::write(&target, &pem_bytes).unwrap();
+        let link = directory.path().join("linked-ca.pem");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let config_for = |path: &std::path::Path| McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let loaded = load_tls_ca_pem(&config_for(&link), &link.to_string_lossy())
+            .expect("a symlink to a bounded regular CA file must load");
+        assert_eq!(loaded, pem_bytes);
+
+        let fifo_target = directory.path().join("special");
+        make_test_fifo(&fifo_target);
+        let fifo_link = directory.path().join("linked-special");
+        std::os::unix::fs::symlink(&fifo_target, &fifo_link).unwrap();
+
+        let error = load_tls_ca_pem(&config_for(&fifo_link), &fifo_link.to_string_lossy())
+            .expect_err("a symlink to a FIFO must be rejected");
+        assert!(error.to_string().contains("must name a regular file"));
+    }
+
+    #[tokio::test]
+    async fn private_ca_http_fails_unset_and_succeeds_with_matching_ca() {
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+
+        let server = spawn_test_tls_server().await;
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("a private CA must remain untrusted when the field is unset");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP request to MCP server failed")
+        );
+        server.task.await.unwrap();
+
+        let server = spawn_test_tls_server().await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &server.ca_pem).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let response = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .unwrap();
+        assert_eq!(response.id, Some(serde_json::Value::from(1)));
+        assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
+        server.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_ca_sse_fails_unset_and_succeeds_with_matching_ca() {
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+
+        let server = spawn_test_tls_server().await;
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Sse,
+            url: Some(server.url.replace("/mcp", "/sse")),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("a private CA must remain untrusted when the field is unset");
+        assert!(error.to_string().contains("SSE GET to MCP server failed"));
+        server.task.await.unwrap();
+
+        let server = spawn_test_tls_server_with_behavior("127.0.0.1", TestTlsBehavior::Sse).await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &server.ca_pem).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Sse,
+            url: Some(server.url.replace("/mcp", "/sse")),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let response = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .unwrap();
+        assert_eq!(response.id, Some(serde_json::Value::from(1)));
+        assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
+        transport.close().await.unwrap();
+        server.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_ca_redirect_to_plaintext_sends_nothing_to_destination() {
+        let destination = wiremock::MockServer::start().await;
+        let redirect_target = format!("{}/capture", destination.uri());
+        let server = spawn_test_tls_server_with_behavior(
+            "127.0.0.1",
+            TestTlsBehavior::Redirect(redirect_target),
+        )
+        .await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &server.ca_pem).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            headers: std::collections::HashMap::from([(
+                "Authorization".into(),
+                "Bearer synthetic-test-token".into(),
+            )]),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let request = JsonRpcRequest::new(
+            1,
+            "initialize",
+            serde_json::json!({"synthetic": "request-body"}),
+        );
+
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("HTTPS-to-HTTP redirect must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP request to MCP server failed")
+        );
+        server.task.await.unwrap();
+        assert!(
+            destination
+                .received_requests()
+                .await
+                .expect("destination request log")
+                .is_empty(),
+            "redirect policy must block headers and content before the plaintext destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_ca_does_not_trust_unrelated_ca_or_wrong_hostname() {
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+
+        let server = spawn_test_tls_server().await;
+        let wrong_ca_file = tempfile::NamedTempFile::new().unwrap();
+        let wrong_ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut wrong_ca_params =
+            rcgen::CertificateParams::new(vec!["unrelated test CA".into()]).unwrap();
+        wrong_ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let wrong_ca = wrong_ca_params.self_signed(&wrong_ca_key).unwrap();
+        std::fs::write(wrong_ca_file.path(), wrong_ca.pem()).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            tls_ca_cert_path: Some(wrong_ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("an unrelated CA must not authenticate the server");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP request to MCP server failed")
+        );
+        server.task.await.unwrap();
+
+        let server = spawn_test_tls_server_with_san("wrong.example").await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &server.ca_pem).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("a trusted CA must not bypass hostname verification");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP request to MCP server failed")
+        );
+        server.task.await.unwrap();
     }
 
     #[test]

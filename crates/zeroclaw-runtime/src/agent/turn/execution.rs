@@ -49,57 +49,69 @@ impl ResolvedModelAccess<'_> {
             tools,
             thinking,
         };
-        let result = ProviderDispatch::from_ref(self.model_provider)
-            .chat_accounted(request, self.model, self.temperature)
+        let dispatcher = ProviderDispatch::from_ref(self.model_provider);
+        let scope = zeroclaw_providers::dispatch::AccountedChatScope::new();
+        let result = scope
+            .scope(dispatcher.chat(request, self.model, self.temperature))
             .await;
+        let accounting = scope.take();
 
+        // Extract before branching on the provider result: a terminal error
+        // may still contain billed rejected Reliable attempts.
+        let has_accounted_rejections = !accounting.rejected_attempts().is_empty();
+        for rejected in accounting.rejected_attempts() {
+            crate::agent::cost::record_rejected_tool_loop_cost_usage(
+                rejected.provider_ref(),
+                rejected.model(),
+                rejected.usage(),
+            );
+        }
+
+        let accepted_route = accounting.accepted_route().cloned();
+        let (served_provider, served_model) = accepted_route
+            .as_ref()
+            .map(|route| (route.provider_ref().to_string(), route.model().to_string()))
+            .unwrap_or_else(|| (self.provider_name.to_string(), self.model.to_string()));
         match result {
-            Ok(accounted) => {
-                // Rejected attempts were billed, but did not supply the accepted
-                // response. Record them first without updating context-window
-                // fill; the accepted response below remains its sole source.
-                if let Some(usage) = accounted.rejected_attempt_usage.as_ref() {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        self.provider_name,
-                        self.model,
-                        usage,
-                    );
-                }
+            Ok(response) => {
                 // A terminal response without final text or tools was billed
                 // but cannot be accepted. Keep it out of context-window fill
                 // and successful response telemetry before returning its typed
                 // cause to every one-shot caller.
-                if accounted.response.is_semantically_empty_terminal() {
-                    if let Some(usage) = accounted.response.usage.as_ref() {
+                if response.is_semantically_empty_terminal() {
+                    if let Some(usage) = response.usage.as_ref() {
                         crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                            self.provider_name,
-                            self.model,
+                            &served_provider,
+                            &served_model,
                             usage,
                         );
                     }
                     return Err(anyhow::Error::new(SemanticEmptyTerminalCompletion));
                 }
+                zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
                 // Only a semantically valid result controls accepted context
                 // usage and successful response telemetry.
-                if let Some(usage) = accounted.response.usage.as_ref() {
+                if let Some(usage) = response.usage.as_ref() {
                     crate::agent::cost::record_tool_loop_cost_usage(
-                        self.provider_name,
-                        self.model,
+                        &served_provider,
+                        &served_model,
                         usage,
                     );
                 }
-                Ok(accounted.response)
+                Ok(response)
             }
             Err(error) => {
                 // Accounted dispatch carries rejected usage on failures in the
                 // typed Reliable error chain. Keep the original error intact so
                 // terminal-cause classification remains the provider's source
                 // of truth.
-                if let Some(usage) = error.chain().find_map(|cause| {
-                    cause
-                        .downcast_ref::<ReliableRejectedCompletionUsage>()
-                        .map(|rejected| &rejected.usage)
-                }) {
+                if !has_accounted_rejections
+                    && let Some(usage) = error.chain().find_map(|cause| {
+                        cause
+                            .downcast_ref::<ReliableRejectedCompletionUsage>()
+                            .map(|rejected| &rejected.usage)
+                    })
+                {
                     crate::agent::cost::record_rejected_tool_loop_cost_usage(
                         self.provider_name,
                         self.model,

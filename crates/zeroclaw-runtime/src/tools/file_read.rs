@@ -115,7 +115,6 @@ impl FileReadTool {
         let full_path = match self.resolve_candidate(path) {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -128,7 +127,6 @@ impl FileReadTool {
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -370,6 +368,7 @@ fn looks_binary(bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
     fn test_tool(workspace: std::path::PathBuf) -> FileReadTool {
         let security = Arc::new(SecurityPolicy {
@@ -1436,15 +1435,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_read_nonexistent_consumes_rate_limit_budget() {
+    async fn wrapped_file_read_failure_preserves_rate_limit_budget() {
         let dir = std::env::temp_dir().join("zeroclaw_test_file_read_probe");
         let _ = tokio::fs::remove_dir_all(&dir).await;
         tokio::fs::create_dir_all(&dir).await.unwrap();
 
-        // Allow only 2 actions total.
-        let tool = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
+        let inner = test_tool_with(dir.clone(), AutonomyLevel::Supervised, 2);
+        let security = inner.security.clone();
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(inner, security.clone()),
+            security.clone(),
+        );
 
-        // Two failing reads each consume one slot via the inner-tool charge.
+        // Failed production-wrapped reads release their reservations.
         let r1 = tool.execute(json!({"path": "nope1.txt"})).await.unwrap();
         assert!(!r1.success);
         assert!(
@@ -1466,7 +1469,12 @@ mod tests {
         let r3 = tool.execute(json!({"path": "nope3.txt"})).await.unwrap();
         assert!(!r3.success);
 
-        assert!(!tool.security.record_action(), "budget must be exhausted");
+        assert!(security.record_action(), "first slot remains available");
+        assert!(security.record_action(), "second slot remains available");
+        assert!(
+            !security.record_action(),
+            "successful debits exhaust the budget"
+        );
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }

@@ -211,29 +211,81 @@ mod tests {
         if !sysinfo::IS_SUPPORTED_SYSTEM {
             return;
         }
-        // Prime a real reading so `last_cpu_percent` is populated.
-        let _ = sample();
-        std::thread::sleep(
-            sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + std::time::Duration::from_millis(10),
-        );
-        let primed = sample();
-        assert!(primed.cpu_percent.is_some(), "primed sample has cpu%");
 
-        // Two back-to-back calls well under MINIMUM_CPU_UPDATE_INTERVAL —
-        // without rate limiting sysinfo would return 0 (or 100*ncpu on
-        // Linux). We should instead see the cached value from `primed`.
-        let a = sample();
-        let b = sample();
-        assert_eq!(
-            a.cpu_percent, primed.cpu_percent,
-            "rapid resample must reuse the last real reading, not a sysinfo artifact"
+        // The property under test is conditional: resamples that land inside
+        // MINIMUM_CPU_UPDATE_INTERVAL of the last real reading must reuse it.
+        // The condition is a timing premise this test cannot force on a
+        // loaded runner: under a parallel test run the thread can be
+        // descheduled between the samples for longer than the interval
+        // (making a fresh reading legitimate), and `STATE` is process-global,
+        // so a concurrent `sample()` from another test that crosses the
+        // interval boundary rotates the cache mid-sequence. Both showed up as
+        // one-in-many CI failures of the parallel runtime gate.
+        //
+        // So each attempt establishes the premise, samples, and only counts
+        // when the whole sequence provably fit inside the interval window
+        // anchored before the priming call: any refresh — ours or a
+        // concurrent caller's — can then only have happened at or after that
+        // anchor, so every later call in the window is sub-interval and must
+        // serve the cache. Attempts where the premise did not hold are
+        // retried rather than asserted. Exhausting all attempts still fails
+        // loudly: with rate limiting broken, `a`/`b` are independent sysinfo
+        // reads and will not equal `primed` five attempts running, so the
+        // regression this test exists for is still caught.
+        // Establish the process-global CPU baseline first: the very first
+        // `sample()` in the process returns `None` by contract, and this
+        // test must not depend on a sibling test having sampled already.
+        let _ = sample();
+
+        const ATTEMPTS: usize = 5;
+        let mut last_failure = String::new();
+        for attempt in 1..=ATTEMPTS {
+            // Ensure the next sample takes (or observes) a reading no older
+            // than `anchor`, then prime.
+            std::thread::sleep(
+                sysinfo::MINIMUM_CPU_UPDATE_INTERVAL + std::time::Duration::from_millis(10),
+            );
+            let anchor = Instant::now();
+            let primed = sample();
+            assert!(primed.cpu_percent.is_some(), "primed sample has cpu%");
+
+            // Back-to-back calls intended to land well under
+            // MINIMUM_CPU_UPDATE_INTERVAL — without rate limiting sysinfo
+            // would return 0 (or 100*ncpu on Linux) instead of the cache.
+            let a = sample();
+            let b = sample();
+            let elapsed = anchor.elapsed();
+
+            if elapsed >= sysinfo::MINIMUM_CPU_UPDATE_INTERVAL {
+                // Premise blown: the runner stalled us across the interval,
+                // so a fresh reading was legitimate. Not a verdict either way.
+                last_failure = format!(
+                    "attempt {attempt}: sequence took {elapsed:?}, \
+                     exceeding MINIMUM_CPU_UPDATE_INTERVAL"
+                );
+                continue;
+            }
+            if a.cpu_percent == primed.cpu_percent && b.cpu_percent == primed.cpu_percent {
+                // RSS is fine to update at any cadence — just check it stays
+                // plausible.
+                assert!(a.rss_bytes > 0);
+                assert!(b.rss_bytes > 0);
+                return;
+            }
+            // In-window mismatch. A concurrent sampler that crossed the
+            // interval boundary just before our anchor can still cause this
+            // once; its fresh reading resets the cache clock, so a retry
+            // gets a clean window. A real rate-limiting regression fails
+            // every attempt.
+            last_failure = format!(
+                "attempt {attempt}: rapid resample did not reuse the last real reading \
+                 (primed={:?} a={:?} b={:?}, elapsed {elapsed:?})",
+                primed.cpu_percent, a.cpu_percent, b.cpu_percent
+            );
+        }
+        panic!(
+            "rapid resample never reused the cached cpu% in {ATTEMPTS} attempts; \
+             last: {last_failure}"
         );
-        assert_eq!(
-            b.cpu_percent, primed.cpu_percent,
-            "second rapid resample also reuses cached value"
-        );
-        // RSS is fine to update at any cadence — just check it stays plausible.
-        assert!(a.rss_bytes > 0);
-        assert!(b.rss_bytes > 0);
     }
 }
