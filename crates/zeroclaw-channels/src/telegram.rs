@@ -8486,6 +8486,20 @@ mod tests {
             .await
             .ok();
 
+        // Prove the main-poll request with offset=0, timeout=30 was made
+        // and the target update was consumed before the skip branch.
+        let reqs = mock_server.received_requests().await.unwrap_or_default();
+        assert!(
+            reqs.iter().any(|r| {
+                r.url.path().ends_with("/getUpdates")
+                    && r.body_json::<serde_json::Value>().map_or(false, |v| {
+                        v.get("offset").and_then(|x| x.as_i64()) == Some(0)
+                            && v.get("timeout").and_then(|x| x.as_i64()) == Some(30)
+                    })
+            }),
+            "main-poll getUpdates with offset=0/timeout=30 was not requested"
+        );
+
         // No ChannelMessage should have been delivered.
         assert!(rx.try_recv().is_err());
     }
@@ -8607,6 +8621,20 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(500), listen_fut)
             .await
             .ok();
+
+        // Prove the main-poll request with offset=0, timeout=30 was made
+        // and the target update was consumed before the skip branch.
+        let reqs = mock_server.received_requests().await.unwrap_or_default();
+        assert!(
+            reqs.iter().any(|r| {
+                r.url.path().ends_with("/getUpdates")
+                    && r.body_json::<serde_json::Value>().map_or(false, |v| {
+                        v.get("offset").and_then(|x| x.as_i64()) == Some(0)
+                            && v.get("timeout").and_then(|x| x.as_i64()) == Some(30)
+                    })
+            }),
+            "main-poll getUpdates with offset=0/timeout=30 was not requested"
+        );
 
         assert!(rx.try_recv().is_err());
     }
