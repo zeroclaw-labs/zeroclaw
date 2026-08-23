@@ -37,6 +37,7 @@ pub mod hardware_context;
 pub mod node_tool;
 pub mod nodes;
 pub mod openapi;
+pub mod principal_gate;
 pub mod security_headers;
 pub mod session_queue;
 pub mod sse;
@@ -566,6 +567,102 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+}
+
+/// The config/onboarding route group. Authentication is enforced
+/// structurally by the `route_layer` at the tail (see [`principal_gate`]),
+/// never per handler: every route whose handler lives in `api_config`,
+/// `api_quickstart`, or `api_sections` MUST be registered on THIS router,
+/// whatever its URL prefix.
+fn config_admin_router(inbound_auth: &Arc<principal_gate::GatewayInboundAuth>) -> Router<AppState> {
+    Router::new()
+        .route(
+            "/api/config",
+            get(api_config::handle_config_get)
+                .patch(api_config::handle_patch)
+                .options(api_config::handle_options_config),
+        )
+        .route(
+            "/api/config/prop",
+            get(api_config::handle_prop_get)
+                .put(api_config::handle_prop_put)
+                .delete(api_config::handle_prop_delete)
+                .options(api_config::handle_options_prop),
+        )
+        .route("/api/config/list", get(api_config::handle_list))
+        .route("/api/config/drift", get(api_config::handle_drift))
+        .route(
+            "/api/config/reload-status",
+            get(api_config::handle_reload_status),
+        )
+        .route("/api/config/templates", get(api_config::handle_templates))
+        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
+        .route(
+            "/api/config/resolve-alias-source",
+            get(api_config::handle_resolve_alias_source),
+        )
+        .route(
+            "/api/config/map-key",
+            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
+        )
+        .route(
+            "/api/config/rename-map-key",
+            post(api_config::handle_rename_map_key),
+        )
+        .route(
+            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
+            post(api_config::handle_refresh_context_window),
+        )
+        .route(
+            "/api/config/delete-plan",
+            get(api_config::handle_delete_plan),
+        )
+        .route("/api/config/catalog", get(api_sections::handle_catalog))
+        .route(
+            "/api/config/catalog/models",
+            get(api_sections::handle_catalog_models),
+        )
+        .route(
+            "/api/config/status",
+            get(api_sections::handle_section_status),
+        )
+        .route(
+            "/api/config/agent-options",
+            get(api_sections::handle_agent_options),
+        )
+        .route("/api/config/sections", get(api_sections::handle_sections))
+        .route(
+            "/api/config/sections/{section}",
+            get(api_sections::handle_section_picker),
+        )
+        .route(
+            "/api/config/sections/{section}/items/{key}",
+            post(api_sections::handle_section_select),
+        )
+        .route("/api/quickstart/state", get(api_quickstart::handle_state))
+        .route(
+            "/api/quickstart/fields",
+            post(api_quickstart::handle_fields),
+        )
+        .route(
+            "/api/quickstart/validate",
+            post(api_quickstart::handle_validate),
+        )
+        .route("/api/quickstart/apply", post(api_quickstart::handle_apply))
+        .route(
+            "/api/quickstart/dismiss",
+            post(api_quickstart::handle_dismiss),
+        )
+        .route("/api/config/init", post(api_config::handle_init))
+        .route("/api/config/migrate", post(api_config::handle_migrate))
+        .route(
+            "/api/channels/bind",
+            post(api_config::handle_api_channel_bind),
+        )
+        .route_layer(axum::middleware::from_fn_with_state(
+            Arc::clone(inbound_auth),
+            principal_gate::config_route_auth,
+        ))
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -1534,6 +1631,15 @@ pub async fn run_gateway(
         None
     };
 
+    // The gateway's inbound-auth authority: same registry/resolver stack
+    // as the RPC layer, same canonical pairing guard, plus the live
+    // config handle for scoped-principal policy freshness.
+    let inbound_auth = Arc::new(principal_gate::GatewayInboundAuth::from_config(
+        &config,
+        Arc::clone(&pairing),
+        Arc::clone(&config_state),
+    )?);
+
     let state = AppState {
         config: config_state,
         config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -1612,6 +1718,7 @@ pub async fn run_gateway(
 
     // Build router with middleware
     let inner = Router::new()
+        .merge(config_admin_router(&inbound_auth))
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
@@ -1639,20 +1746,6 @@ pub async fn run_gateway(
             get(version::handle_version_upgrade_status),
         )
         .route("/api/logs", get(api_logs::handle_api_logs))
-        .route(
-            "/api/config",
-            get(api_config::handle_config_get)
-                .patch(api_config::handle_patch)
-                .options(api_config::handle_options_config),
-        )
-        .route(
-            "/api/config/prop",
-            get(api_config::handle_prop_get)
-                .put(api_config::handle_prop_put)
-                .delete(api_config::handle_prop_delete)
-                .options(api_config::handle_options_prop),
-        )
-        .route("/api/config/list", get(api_config::handle_list))
         .route(
             "/api/sops",
             get(api_sop_author::handle_sops_list).post(api_sop_author::handle_sop_create),
@@ -1706,67 +1799,7 @@ pub async fn run_gateway(
             "/api/sops/{name}/runs/{run_id}/cancel",
             post(api_sop_author::handle_sop_cancel),
         )
-        .route("/api/config/drift", get(api_config::handle_drift))
-        .route(
-            "/api/config/reload-status",
-            get(api_config::handle_reload_status),
-        )
-        .route("/api/config/templates", get(api_config::handle_templates))
-        .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
-        .route(
-            "/api/config/resolve-alias-source",
-            get(api_config::handle_resolve_alias_source),
-        )
-        .route(
-            "/api/config/map-key",
-            post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
-        )
-        .route("/api/config/rename-map-key", post(api_config::handle_rename_map_key))
-        .route(
-            "/api/config/model-providers/{type}/{alias}/refresh-context-window",
-            post(api_config::handle_refresh_context_window),
-        )
-        .route("/api/config/delete-plan", get(api_config::handle_delete_plan))
-        .route("/api/config/catalog", get(api_sections::handle_catalog))
-        .route(
-            "/api/config/catalog/models",
-            get(api_sections::handle_catalog_models),
-        )
-        .route("/api/config/status", get(api_sections::handle_section_status))
-        .route(
-            "/api/config/agent-options",
-            get(api_sections::handle_agent_options),
-        )
-        .route("/api/config/sections", get(api_sections::handle_sections))
-        .route(
-            "/api/config/sections/{section}",
-            get(api_sections::handle_section_picker),
-        )
-        .route(
-            "/api/config/sections/{section}/items/{key}",
-            post(api_sections::handle_section_select),
-        )
         .route("/api/personality", get(api_personality::handle_index))
-        .route(
-            "/api/quickstart/state",
-            get(api_quickstart::handle_state),
-        )
-        .route(
-            "/api/quickstart/fields",
-            post(api_quickstart::handle_fields),
-        )
-        .route(
-            "/api/quickstart/validate",
-            post(api_quickstart::handle_validate),
-        )
-        .route(
-            "/api/quickstart/apply",
-            post(api_quickstart::handle_apply),
-        )
-        .route(
-            "/api/quickstart/dismiss",
-            post(api_quickstart::handle_dismiss),
-        )
         .route(
             "/api/personality/templates",
             get(api_personality::handle_templates),
@@ -1817,8 +1850,6 @@ pub async fn run_gateway(
                 .put(api_skills::handle_write_skill)
                 .delete(api_skills::handle_delete_skill),
         )
-        .route("/api/config/init", post(api_config::handle_init))
-        .route("/api/config/migrate", post(api_config::handle_migrate))
         .route("/api/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/docs", get(openapi::handle_docs))
         .route("/api/tools", get(api::handle_api_tools))
@@ -1851,10 +1882,6 @@ pub async fn run_gateway(
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
-        .route(
-            "/api/channels/bind",
-            post(api_config::handle_api_channel_bind),
-        )
         .route(
             "/api/channels/{channel}/relink",
             post(api::handle_api_channel_relink),
