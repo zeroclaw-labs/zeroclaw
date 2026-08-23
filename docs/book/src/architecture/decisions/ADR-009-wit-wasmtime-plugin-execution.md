@@ -68,8 +68,13 @@ Host surfaces are permission-gated:
 
 - `HttpClient` is the permission that attaches outbound HTTP state and
   links WASI HTTP.
-- `ConfigRead` is required before the host injects a plugin's resolved
-  config section under `__config`.
+- `ConfigRead` is required before the host injects resolved values under tool
+  `__config` or channel `configure`. A manifest that includes `tool` and
+  excludes `channel` may mark top-level string properties `x-secret = true`;
+  those values are read through the instance-scoped `secrets` import during
+  `execute` and never enter `__config`. Channel-capable manifests with
+  `x-secret` are rejected until the host has a coherent warm-store secret
+  lifecycle.
 - The host does not expose a raw environment-variable read function.
 - Store limits, fuel, table limits, instance limits, and memory ceilings
   are resolved before the store is built.

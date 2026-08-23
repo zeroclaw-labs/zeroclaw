@@ -328,7 +328,7 @@ where
     })?
 }
 
-fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
+pub(super) fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     if value.is_empty() {
         anyhow::bail!("{field_name} must not be empty");
     }
@@ -351,7 +351,7 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn quote_identifier(value: &str) -> String {
+pub(super) fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
 }
 

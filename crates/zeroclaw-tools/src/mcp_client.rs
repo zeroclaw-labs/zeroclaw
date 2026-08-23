@@ -1592,6 +1592,7 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            tls_ca_cert_path: None,
         };
         let result = McpServer::connect(config).await;
         assert!(result.is_err());
@@ -1612,6 +1613,7 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            tls_ca_cert_path: None,
         }];
         let registry = McpRegistry::connect_all(&configs)
             .await
@@ -2468,6 +2470,7 @@ done
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            tls_ca_cert_path: None,
         };
 
         let registry = McpRegistry::connect_all(&[config])

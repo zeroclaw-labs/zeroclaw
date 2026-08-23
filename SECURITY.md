@@ -87,7 +87,4 @@ docker run --read-only -v /path/to/workspace:/workspace zeroclaw gateway
 
 ### CI Enforcement
 
-The `docker` job in `.github/workflows/checks-on-pr.yml` automatically verifies:
-1. Container does not run as root (UID 0)
-2. Runtime stage uses `:nonroot` variant
-3. Explicit `USER` directive with numeric UID exists
+The `source-images` job in `.github/workflows/docker-image-pr.yml` builds the default production image and verifies that the resulting image is configured to run as `65534:65534`.
