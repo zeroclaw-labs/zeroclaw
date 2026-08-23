@@ -1942,6 +1942,105 @@ vision_model_provider = "gemini"
     }
 
     #[test]
+    fn v2_canonical_reference_with_only_legacy_synonym_source_left_bare() {
+        // A bare canonical `xai` reference with only a legacy `[providers.models.grok]`
+        // source: both spellings normalize to xai.default, so the retained table's
+        // identity matches, but the V2 file never configured an `xai` source. The
+        // canonical reference must NOT adopt the synonym's credentials — it stays
+        // bare and keeps the configless path instead of silently changing which
+        // source owns the vision request.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.grok]
+api_key = "sk-grok-test"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "xai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai"),
+            "canonical reference must not claim a legacy-synonym producer's alias"
+        );
+        assert!(
+            cfg.providers.models.find("xai", "default").is_some(),
+            "the grok entry still migrates to xai.default for legacy references"
+        );
+    }
+
+    #[test]
+    fn v2_canonical_gemini_reference_with_only_google_source_left_bare() {
+        // Same ownership rule across the google->gemini synonym pair: a bare
+        // `gemini` reference with only a `google` source stays on the
+        // configless path rather than inheriting google's credential.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.google]
+api_key = "sk-google-test"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "gemini"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("gemini"),
+            "canonical gemini reference must not claim the google synonym's alias"
+        );
+    }
+
+    #[test]
+    fn v2_legacy_synonym_reference_still_rewrites_to_its_own_alias() {
+        // Ownership is about the REFERENCE spelling: the legacy `grok` spelling
+        // names its own migrated source, so it still rewrites to xai.default.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.grok]
+api_key = "sk-grok-test"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "grok"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "legacy synonym reference still rewrites to its own migrated alias"
+        );
+    }
+
+    #[test]
+    fn v2_canonical_reference_over_explicit_default_provider_fold_rewrites() {
+        // An explicit `default_provider` selector that CREATES the alias states
+        // ownership of the slot even though its raw spelling differs from the
+        // reference: a bare canonical `xai` reference may adopt it.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+api_key = "sk-global-test"
+default_provider = "grok"
+default_model = "vision-model"
+
+[multimodal]
+vision_model_provider = "xai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "fold-created slot owned by an explicit default_provider may capture the canonical reference"
+        );
+    }
+
+    #[test]
     fn v2_colon_url_source_rewrites_bare_custom() {
         // A colon-URL source materializes custom.default with the uri. The
         // provenance records the unsplit key; the equivalence check must split

@@ -254,14 +254,25 @@ impl V2Config {
         // more than one canonical family marks the target ambiguous instead, so
         // the slot's credential cannot be gifted to whichever family iteration
         // selected (see the struct doc above the fold).
+        // A bare `[multimodal] vision_model_provider = "<family>"` cannot select
+        // the migrated V3 alias: runtime resolves only dotted `<family>.<alias>`
+        // refs to typed alias config, so a bare ref reaches the legacy
+        // configless construction path and loses the alias's api_key. Rewrite
+        // it to the migrated alias only when the alias slot's effective source
+        // identity matches the reference's canonical variant. `fold_owned`
+        // records slots whose producer is an explicit fold ownership record
+        // (`default_provider` selector or synthesized fallback), which states
+        // ownership even when its spelling differs from the reference.
+        let mut fold_owned = std::collections::HashSet::new();
         match folded {
             GlobalFold::Producer(source) => {
                 let (raw_type, _) = split_colon_url_provider(&source);
                 let (family, alias, _) = normalize_provider_type(&raw_type, "default");
                 provenance
-                    .entry((family, alias))
+                    .entry((family.clone(), alias.clone()))
                     .or_default()
                     .insert(source);
+                fold_owned.insert((family, alias));
             }
             GlobalFold::Ambiguous { family, alias } => {
                 // Bolt two distinct, never-producible sentinel sources onto the
@@ -284,7 +295,12 @@ impl V2Config {
         // configless construction path and loses the alias's api_key. Rewrite
         // it to the migrated alias only when the alias slot's effective source
         // identity matches the reference's canonical variant.
-        rewrite_bare_vision_provider_reference(&mut passthrough, &aliased_models, &provenance);
+        rewrite_bare_vision_provider_reference(
+            &mut passthrough,
+            &aliased_models,
+            &provenance,
+            &fold_owned,
+        );
 
         // V3 dropped cost.prices: the V2 keys ("<provider>/<model>")
         // don't carry the V3 alias path, so remapping is fragile.
@@ -1018,7 +1034,13 @@ fn source_identity_matches_inner(
 /// provenance: a bare or variant reference is never redirected to an alias
 /// supplied by a differently-named source, and a collided slot (e.g. `qwen`
 /// plus `qwen-intl` both writing `qwen.default`) is left unchanged. A
-/// colon-URL reference is rewritten only when its full URL identity matches
+/// reference spelled as its own canonical family additionally requires the
+/// sole raw producer to be that exact canonical spelling (or a `fold_owned`
+/// slot, whose explicit `default_provider`/fallback selector states ownership
+/// even under a different spelling): canonicalization makes a legacy synonym's
+/// retained table look equivalent, but a bare `xai` reference must not adopt
+/// credentials from a `[providers.models.grok]` source the file never named.
+/// A colon-URL reference is rewritten only when its full URL identity matches
 /// the sole producer of the migrated alias; unmatched or collided colon
 /// references, already-valid dotted refs, and unknown families are left
 /// untouched so the runtime keeps failing closed.
@@ -1026,6 +1048,7 @@ fn rewrite_bare_vision_provider_reference(
     passthrough: &mut toml::Table,
     aliased_models: &toml::Table,
     provenance: &std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
+    fold_owned: &std::collections::HashSet<(String, String)>,
 ) {
     let Some(toml::Value::Table(multimodal)) = passthrough.get_mut("multimodal") else {
         return;
@@ -1051,6 +1074,28 @@ fn rewrite_bare_vision_provider_reference(
     // forms) are ambiguous regardless of whether they normalize equivalently,
     // because the materialized table retains only one of their configs.
     if producers.len() != 1 {
+        return;
+    }
+    // Canonical-source ownership: a reference typed as the canonical family
+    // itself (`xai`, not the legacy synonym `grok`) must not inherit a legacy
+    // synonym's credentials merely because both spellings normalize to the
+    // same slot and the retained table's identity matches. Require the sole
+    // producer to name this family under its canonical spelling (a colon-URL
+    // form keeps the family as its base type, so its URL identity stays
+    // verifiable below), or the slot to carry an explicit fold ownership
+    // record (an explicit `default_provider` selector or the synthesized
+    // fallback — registered only when the fold created the slot, so it states
+    // ownership of this exact credential). A variant-spelled reference
+    // (`grok`, `qwen-intl`) keeps the effective-identity behavior below:
+    // naming a non-canonical spelling IS naming a differently spelled source.
+    let sole_raw = producers.iter().next().expect("len 1");
+    let (sole_base_type, _) = split_colon_url_provider(sole_raw);
+    let reference_names_canonical_spelling =
+        reference_type == canonical_family && reference_url.is_none();
+    if reference_names_canonical_spelling
+        && sole_base_type != canonical_family.as_str()
+        && !fold_owned.contains(&(canonical_family.clone(), canonical_alias.clone()))
+    {
         return;
     }
     let effective_matches = effective_source_identity_matches(
