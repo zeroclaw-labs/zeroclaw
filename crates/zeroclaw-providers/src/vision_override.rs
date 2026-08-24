@@ -70,25 +70,21 @@ impl ModelProvider for VisionOverrideProvider {
         &self,
         model: &str,
     ) -> anyhow::Result<super::traits::ProviderCapabilities> {
-        // Forward the async, fallible capability resolution to the inner
-        // provider so a catalog/outage failure surfaces as `Err` (capability
-        // unknown) rather than being swallowed by the warm-then-sync default.
-        // This is what lets a caller at an image gate treat the result as
-        // unknown instead of silently stripping the attachment and dispatching
-        // a text-only request. An explicit `Some(true/false)` override remains
-        // authoritative: it decides the vision outcome itself, so a downstream
-        // catalog/outage failure must not block a decision that is already
-        // known — a `None` override fully delegates to the inner provider and
-        // propagates its error.
-        let mut capabilities = match self.inner.resolve_capabilities_for_model(model).await {
-            Ok(caps) => caps,
-            Err(_) if self.supports_vision.is_some() => self.capabilities(),
-            Err(err) => return Err(err),
-        };
+        // An explicit `Some(true/false)` vision override is authoritative and
+        // needs no catalog fetch, so short-circuit before the async inner
+        // resolve: an image-bearing turn for such an alias must not start or
+        // wait on the models.dev fetch (or a downstream outage) just to confirm
+        // a decision that is already known. Non-vision capability fields still
+        // come from the inner provider's model-aware (sync) lookup.
         if let Some(supports_vision) = self.supports_vision {
+            let mut capabilities = self.inner.capabilities_for_model(model);
             capabilities.vision = supports_vision;
+            return Ok(capabilities);
         }
-        Ok(capabilities)
+        // A `None` override fully delegates to the inner provider and propagates
+        // its error, so a catalog/outage failure surfaces as `Err` (capability
+        // unknown) rather than being swallowed into `Ok(vision=false)`.
+        self.inner.resolve_capabilities_for_model(model).await
     }
 
     async fn warm_capabilities_metadata(&self) {
@@ -410,6 +406,68 @@ mod tests {
         ) -> anyhow::Result<String> {
             Ok(String::new())
         }
+    }
+
+    /// Records whether the async `resolve_capabilities_for_model` is ever
+    /// delegated to. Used to prove that an explicit vision override short-
+    /// circuits before the (network-bound) inner resolve.
+    struct ResolveRecordingMock {
+        resolve_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ResolveRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn resolve_capabilities_for_model(
+            &self,
+            _model: &str,
+        ) -> anyhow::Result<ProviderCapabilities> {
+            self.resolve_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ProviderCapabilities::default())
+        }
+    }
+    impl Attributable for ResolveRecordingMock {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "resolve_recording_mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_override_short_circuits_before_inner_resolve() {
+        let resolve_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapped = VisionOverrideProvider::new(
+            Box::new(ResolveRecordingMock {
+                resolve_calls: std::sync::Arc::clone(&resolve_calls),
+            }),
+            true,
+        );
+
+        let capabilities = wrapped
+            .resolve_capabilities_for_model("some-model")
+            .await
+            .expect("an explicit override resolves synchronously without an outage");
+        assert!(
+            capabilities.vision,
+            "the explicit Some(true) override applies"
+        );
+        assert_eq!(
+            resolve_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an explicit vision override must not invoke the inner async resolve"
+        );
     }
 
     #[test]
