@@ -82,15 +82,33 @@ browserless flows ship with the CLI:
 # approval, then writes the access token to stdout.
 export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp)"
 
+# Same, via the system browser: Authorization Code + PKCE (S256 only)
+# with an RFC 8252 one-shot loopback listener. The mechanisms never
+# fall back into each other.
+export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc login corp --browser)"
+
 # Headless service principals via client_credentials (requires the
 # entry's client_secret):
 export ZEROCLAW_AUTH_TOKEN="$(zeroclaw oidc token corp)"
 ```
 
-Progress messages go to stderr; stdout carries only the token, so both
+Progress messages go to stderr; stdout carries only the token, so all
 commands compose with command substitution. Nothing is stored: present
 the token as `auth_token` in the RPC handshake (or via the environment
 variable) before it expires, then re-enroll.
+
+Clients that hold no IdP credentials (the web dashboard, zerocode)
+enroll through the gateway instead, which proxies the same flows with
+the configured entry's client credentials: `GET /api/oidc/providers`
+lists aliases, `POST /api/oidc/{alias}/device/start` and
+`/device/poll` drive the device grant, and `GET /oidc/login/{alias}`
+runs the browser flow, whose one-time callback page hands the token to
+the opening window via `postMessage` (same-origin only) with a manual
+copy fallback. These routes are unauthenticated by necessity
+(enrollment precedes authentication), rate limited, and grant nothing:
+they only relay what the IdP grants after the user approves. Design
+rationale and failure-mode table:
+`docs/security/oidc-browser-pkce-design-8289.md` in the repository.
 
 ## Permission profiles
 
