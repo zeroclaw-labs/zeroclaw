@@ -127,6 +127,9 @@ cli-oidc-device-waiting = 正在等待身份提供方批准(代码将在 { $seco
 cli-oidc-device-expired = 设备代码在获得批准前已过期;请重新运行该命令。
 cli-oidc-enrolled = 已向 [oidc.{ $alias }] 注册。访问令牌已输出到 stdout;请在 RPC 握手中作为 auth_token 提供,或导出为 ZEROCLAW_AUTH_TOKEN。
 cli-oidc-token-expiry = 令牌将在 { $seconds } 秒后过期。
+cli-oidc-browser-open = 正在打开浏览器进行登录。如果没有打开,请访问:
+    { $uri }
+cli-oidc-browser-waiting = 正在等待浏览器登录完成...
 cli-auth-list-about = 列出认证配置文件
 cli-auth-status-about = 显示认证状态，包括活动配置文件和令牌过期信息
 cli-memory-list-about = 列出内存条目，可使用可选过滤器

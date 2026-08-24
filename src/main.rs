@@ -3717,11 +3717,15 @@ enum AuthCommands {
 #[cfg(feature = "agent-runtime")]
 #[derive(Subcommand, Debug)]
 enum OidcCommands {
-    /// Sign in via the Device Authorization Grant (RFC 8628): shows a
-    /// verification code, waits for approval, prints the access token on stdout
+    /// Sign in interactively: shows a verification code (device grant) or
+    /// opens your browser (--browser), then prints the access token on stdout
     Login {
         /// Alias of the [oidc.<alias>] config entry to enroll against
         alias: String,
+        /// Sign in with the system browser via Authorization Code + PKCE
+        /// (RFC 8252 loopback) instead of the device grant
+        #[arg(long)]
+        browser: bool,
     },
     /// Obtain a service token via the client_credentials grant (requires the
     /// entry's client_secret); prints the access token on stdout
@@ -9104,9 +9108,21 @@ async fn run_anthropic_setup_token_inline(alias: &str, config: &mut Config) -> R
 async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Result<()> {
     use zeroclaw_runtime::security::auth_provider::{DevicePollOutcome, Enrollment};
 
-    let (alias, want_client_credentials) = match &oidc_command {
-        OidcCommands::Login { alias } => (alias.clone(), false),
-        OidcCommands::Token { alias } => (alias.clone(), true),
+    enum OidcFlow {
+        Device,
+        Browser,
+        ClientCredentials,
+    }
+    let (alias, flow) = match &oidc_command {
+        OidcCommands::Login {
+            alias,
+            browser: false,
+        } => (alias.clone(), OidcFlow::Device),
+        OidcCommands::Login {
+            alias,
+            browser: true,
+        } => (alias.clone(), OidcFlow::Browser),
+        OidcCommands::Token { alias } => (alias.clone(), OidcFlow::ClientCredentials),
     };
     let Some(entry) = config.oidc.get(&alias) else {
         let mut known: Vec<&str> = config.oidc.keys().map(String::as_str).collect();
@@ -9124,47 +9140,88 @@ async fn handle_oidc_command(oidc_command: OidcCommands, config: &Config) -> Res
     };
     let enrollment = Enrollment::new(entry.clone())?;
 
-    let token = if want_client_credentials {
-        enrollment.client_credentials().await?
-    } else {
-        let start = enrollment.device_grant_start().await?;
-        let uri = start
-            .verification_uri_complete
-            .clone()
-            .unwrap_or_else(|| start.verification_uri.clone());
-        let expires = start.expires_in.to_string();
-        eprintln!(
-            "{}",
-            ta(
-                "cli-oidc-device-visit",
-                &[("uri", &uri), ("code", &start.user_code)],
-                &format!("To sign in, visit {uri} and enter code {}", start.user_code),
-            )
-        );
-        eprintln!(
-            "{}",
-            ta(
-                "cli-oidc-device-waiting",
-                &[("seconds", &expires)],
-                &format!(
-                    "Waiting for identity-provider approval (the code expires in {expires} seconds)..."
-                ),
-            )
-        );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(start.expires_in);
-        let mut interval = start.interval.max(1);
-        loop {
-            if std::time::Instant::now() >= deadline {
-                bail!(t(
-                    "cli-oidc-device-expired",
-                    "The device code expired before approval; run the command again.",
-                ));
+    let token = match flow {
+        OidcFlow::ClientCredentials => enrollment.client_credentials().await?,
+        OidcFlow::Browser => {
+            use zeroclaw_runtime::security::auth_provider::LoopbackListener;
+            let listener = LoopbackListener::bind().await?;
+            let pkce = enrollment.pkce_start(&listener.redirect_uri()).await?;
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-browser-open",
+                    &[("uri", &pkce.authorize_url)],
+                    &format!(
+                        "Opening your browser to sign in. If nothing opens, visit:\n{}",
+                        pkce.authorize_url
+                    ),
+                )
+            );
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("open")
+                    .arg(&pkce.authorize_url)
+                    .spawn();
             }
-            tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-            match enrollment.device_grant_poll(&start.device_code).await? {
-                DevicePollOutcome::Pending => {}
-                DevicePollOutcome::SlowDown => interval += 5,
-                DevicePollOutcome::Token(token) => break *token,
+            #[cfg(target_os = "linux")]
+            {
+                let _ = std::process::Command::new("xdg-open")
+                    .arg(&pkce.authorize_url)
+                    .spawn();
+            }
+            eprintln!(
+                "{}",
+                t(
+                    "cli-oidc-browser-waiting",
+                    "Waiting for the browser sign-in to complete...",
+                )
+            );
+            let code = listener
+                .wait_for_code(&pkce.state, std::time::Duration::from_mins(5))
+                .await?;
+            enrollment.pkce_exchange(&pkce, &code).await?
+        }
+        OidcFlow::Device => {
+            let start = enrollment.device_grant_start().await?;
+            let uri = start
+                .verification_uri_complete
+                .clone()
+                .unwrap_or_else(|| start.verification_uri.clone());
+            let expires = start.expires_in.to_string();
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-device-visit",
+                    &[("uri", &uri), ("code", &start.user_code)],
+                    &format!("To sign in, visit {uri} and enter code {}", start.user_code),
+                )
+            );
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-oidc-device-waiting",
+                    &[("seconds", &expires)],
+                    &format!(
+                        "Waiting for identity-provider approval (the code expires in {expires} seconds)..."
+                    ),
+                )
+            );
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_secs(start.expires_in);
+            let mut interval = start.interval.max(1);
+            loop {
+                if std::time::Instant::now() >= deadline {
+                    bail!(t(
+                        "cli-oidc-device-expired",
+                        "The device code expired before approval; run the command again.",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                match enrollment.device_grant_poll(&start.device_code).await? {
+                    DevicePollOutcome::Pending => {}
+                    DevicePollOutcome::SlowDown => interval += 5,
+                    DevicePollOutcome::Token(token) => break *token,
+                }
             }
         }
     };

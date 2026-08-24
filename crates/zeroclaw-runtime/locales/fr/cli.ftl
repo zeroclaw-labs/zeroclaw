@@ -128,6 +128,9 @@ cli-oidc-device-waiting = En attente de l'approbation du fournisseur d'identité
 cli-oidc-device-expired = Le code d'appareil a expiré avant l'approbation ; relancez la commande.
 cli-oidc-enrolled = Enrôlé auprès de [oidc.{ $alias }]. Le jeton d'accès est sur stdout ; présentez-le comme auth_token dans la négociation RPC ou exportez-le comme ZEROCLAW_AUTH_TOKEN.
 cli-oidc-token-expiry = Le jeton expire dans { $seconds } secondes.
+cli-oidc-browser-open = Ouverture de votre navigateur pour vous connecter. Si rien ne s'ouvre, visitez :
+    { $uri }
+cli-oidc-browser-waiting = En attente de la fin de la connexion dans le navigateur...
 cli-auth-list-about = Lister les profils d'authentification
 cli-auth-status-about = Afficher le statut d'authentification avec le profil actif et les informations d'expiration du jeton
 cli-memory-list-about = Lister les entrées de mémoire avec des filtres optionnels

@@ -128,6 +128,9 @@ cli-oidc-device-waiting = ID プロバイダーの承認を待っています(�
 cli-oidc-device-expired = 承認前にデバイスコードが失効しました。コマンドを再実行してください。
 cli-oidc-enrolled = [oidc.{ $alias }] に登録しました。アクセストークンは標準出力にあります。RPC ハンドシェイクの auth_token として渡すか、ZEROCLAW_AUTH_TOKEN としてエクスポートしてください。
 cli-oidc-token-expiry = トークンは { $seconds } 秒で失効します。
+cli-oidc-browser-open = サインインのためにブラウザを開いています。開かない場合は次の URL にアクセスしてください:
+    { $uri }
+cli-oidc-browser-waiting = ブラウザでのサインイン完了を待っています...
 cli-auth-list-about = 認証プロファイルを一覧表示
 cli-auth-status-about = アクティブなプロファイルとトークン有効期限情報を表示
 cli-memory-list-about = オプションのフィルター付きでメモリエントリを一覧表示

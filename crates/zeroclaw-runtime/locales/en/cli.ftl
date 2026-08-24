@@ -151,6 +151,9 @@ cli-oidc-device-waiting = Waiting for identity-provider approval (the code expir
 cli-oidc-device-expired = The device code expired before approval; run the command again.
 cli-oidc-enrolled = Enrolled with [oidc.{ $alias }]. The access token is on stdout; present it as auth_token in the RPC handshake or export it as ZEROCLAW_AUTH_TOKEN.
 cli-oidc-token-expiry = The token expires in { $seconds } seconds.
+cli-oidc-browser-open = Opening your browser to sign in. If nothing opens, visit:
+    { $uri }
+cli-oidc-browser-waiting = Waiting for the browser sign-in to complete...
 cli-auth-list-about = List auth profiles
 cli-auth-status-about = Show auth status with active profile and token expiry info
 

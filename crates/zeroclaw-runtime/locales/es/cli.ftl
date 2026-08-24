@@ -128,6 +128,9 @@ cli-oidc-device-waiting = Esperando la aprobación del proveedor de identidad (e
 cli-oidc-device-expired = El código de dispositivo caducó antes de la aprobación; ejecuta el comando de nuevo.
 cli-oidc-enrolled = Inscrito con [oidc.{ $alias }]. El token de acceso está en stdout; preséntalo como auth_token en el handshake RPC o expórtalo como ZEROCLAW_AUTH_TOKEN.
 cli-oidc-token-expiry = El token caduca en { $seconds } segundos.
+cli-oidc-browser-open = Abriendo tu navegador para iniciar sesión. Si no se abre nada, visita:
+    { $uri }
+cli-oidc-browser-waiting = Esperando a que termine el inicio de sesión en el navegador...
 cli-auth-list-about = Listar perfiles de autenticación
 cli-auth-status-about = Mostrar el estado de autenticación con el perfil activo e información de caducidad del token
 cli-memory-list-about = Lista entradas de memoria con filtros opcionales
