@@ -1224,12 +1224,13 @@ impl Dashboard {
         };
 
         let mut lines = Vec::new();
+        let health_label_width = health_status_label_width();
         if let Some(obj) = h.as_object() {
-            // Overall status
+            // Overall status — share one value column across translated labels (#10103).
             if let Some(uptime) = obj.get("uptime_seconds").and_then(|v| v.as_u64()) {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-uptime")),
+                        status_label("zc-dashboard-label-uptime", health_label_width),
                         theme::dim_style(),
                     ),
                     Span::styled(format_uptime(uptime), theme::body_style()),
@@ -1238,7 +1239,7 @@ impl Dashboard {
             if let Some(pid) = obj.get("pid").and_then(|v| v.as_u64()) {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-pid")),
+                        status_label("zc-dashboard-label-pid", health_label_width),
                         theme::dim_style(),
                     ),
                     Span::styled(pid.to_string(), theme::body_style()),
@@ -2924,6 +2925,20 @@ const OVERVIEW_STATUS_LABEL_KEYS: &[&str] = &[
     "zc-dashboard-label-daemon-cpu",
 ];
 
+fn health_status_label_keys() -> [&'static str; 2] {
+    ["zc-dashboard-label-uptime", "zc-dashboard-label-pid"]
+}
+
+fn health_status_label_width() -> usize {
+    health_status_label_keys()
+        .iter()
+        .map(|key| crate::display_width::display_width(&crate::i18n::t(key)))
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(11)
+}
+
 fn overview_status_label_width() -> usize {
     OVERVIEW_STATUS_LABEL_KEYS
         .iter()
@@ -3458,6 +3473,23 @@ mod tests {
         assert!(
             value_columns[0] > daemon_memory_width,
             "widest label must retain a separating cell"
+        );
+    }
+
+    #[test]
+    fn health_status_labels_share_value_column() {
+        let width = health_status_label_width();
+        let uptime = status_label("zc-dashboard-label-uptime", width);
+        let pid = status_label("zc-dashboard-label-pid", width);
+        assert_eq!(
+            crate::display_width::display_width(&uptime),
+            crate::display_width::display_width(&pid)
+        );
+        assert!(
+            width
+                > crate::display_width::display_width(&crate::i18n::t(
+                    "zc-dashboard-label-uptime"
+                ))
         );
     }
 
