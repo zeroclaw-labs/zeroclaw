@@ -2681,6 +2681,7 @@ fn ensure_browser_env(cmd: &mut Command) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::proxy_test_lock_guard;
 
     #[test]
     fn validate_url_blocks_ipv6_ssrf() {
@@ -3776,6 +3777,7 @@ mod tests {
 
     #[tokio::test]
     async fn computer_use_dispatch_rejects_traversal_path_before_sidecar() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3819,6 +3821,7 @@ mod tests {
 
     #[tokio::test]
     async fn computer_use_dispatch_rejects_runtime_config_target_before_sidecar() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3883,6 +3886,7 @@ mod tests {
     #[tokio::test]
     #[cfg(unix)]
     async fn computer_use_dispatch_rejects_symlink_target_before_sidecar() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use std::os::unix::fs::symlink;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3950,6 +3954,7 @@ mod tests {
 
     #[tokio::test]
     async fn computer_use_dispatch_writes_validated_png_locally_without_forwarding_path() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4045,6 +4050,7 @@ mod tests {
 
     #[tokio::test]
     async fn computer_use_dispatch_does_not_forward_path_and_writes_local_target() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{body_partial_json, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4137,6 +4143,7 @@ mod tests {
     /// and leave the destination unwritten.
     #[tokio::test]
     async fn computer_use_dispatch_fails_closed_on_malformed_screenshot_response() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4256,6 +4263,7 @@ mod tests {
 
     #[tokio::test]
     async fn computer_use_dispatch_rejects_non_string_path_before_sidecar() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -4332,6 +4340,7 @@ mod tests {
 
     #[tokio::test]
     async fn computer_use_dispatch_passes_through_empty_string_path() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 

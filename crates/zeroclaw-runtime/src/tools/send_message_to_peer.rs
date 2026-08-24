@@ -201,7 +201,7 @@ impl Tool for SendMessageToPeerTool {
                 .as_ref()
                 .map(|_| Arc::new(Mutex::new(TurnUsage::default())));
             zeroclaw_spawn::spawn!(async move {
-                let turn = crate::agent::loop_::process_message(
+                let turn = crate::agent::loop_::process_message_with_live_config(
                     cfg,
                     None,
                     &recipient_alias,

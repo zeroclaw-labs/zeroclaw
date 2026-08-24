@@ -2874,9 +2874,9 @@ fn observe_registry_live_config(
     live
 }
 
-/// Process a single message through the full agent (with tools, peripherals, memory).
-/// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
-pub async fn process_message(
+/// Process a single message through the full agent (with tools, peripherals, memory),
+/// resolving SSRF policy from a live `config` handle on each dispatch.
+pub async fn process_message_with_live_config(
     config: Config,
     live_config: Option<Arc<parking_lot::RwLock<Config>>>,
     agent_alias: &str,
@@ -3443,6 +3443,22 @@ pub async fn process_message(
         .instrument(__zc_scope_span)
         .instrument(__zc_attribution_span)
         .await
+}
+
+/// Process a single message through the full agent (with tools, peripherals, memory),
+/// resolving SSRF policy from the construction-time `config` snapshot (no live handle).
+///
+/// Backward-compatible entry point: preserves the pre-live-config signature. Callers
+/// that want `config/set` revocations to reach an already-constructed tool on the next
+/// dispatch should use [`process_message_with_live_config`] with a live handle instead.
+pub async fn process_message(
+    config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    origin: TurnOrigin,
+) -> Result<String> {
+    process_message_with_live_config(config, None, agent_alias, message, session_id, origin).await
 }
 
 #[cfg(test)]
@@ -16114,7 +16130,6 @@ Let me check the result."#;
         .await;
         let _ = super::process_message(
             config,
-            None,
             "entrypoint-profile-agent",
             "hello",
             Some("session"),
@@ -16191,7 +16206,6 @@ Let me check the result."#;
 
         let result = super::process_message(
             config,
-            None,
             "process-message-reassembly-agent",
             "hello",
             Some("session"),
@@ -16289,7 +16303,7 @@ Let me check the result."#;
         // resolve the agent/provider/risk-profile before `all_tools_with_runtime`;
         // the provider uri is a dead address so the turn fails after the seam
         // fires — the hook assertion is what matters, not the turn outcome.
-        let _ = super::process_message(
+        let _ = super::process_message_with_live_config(
             config,
             Some(Arc::clone(&live)),
             "live-config-forward-agent",

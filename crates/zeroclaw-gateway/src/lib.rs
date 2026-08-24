@@ -2609,7 +2609,7 @@ pub(crate) async fn gateway_forward_to_process_message(
     session_id: Option<&str>,
     origin: zeroclaw_api::ingress::TurnOrigin,
 ) -> anyhow::Result<String> {
-    zeroclaw_runtime::agent::process_message(
+    zeroclaw_runtime::agent::process_message_with_live_config(
         config,
         observe_gateway_chat_live_config_for_test(live_config),
         agent_alias,

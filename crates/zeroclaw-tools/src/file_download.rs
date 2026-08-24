@@ -87,19 +87,33 @@ pub struct FileDownloadTool {
 
 impl FileDownloadTool {
     pub fn new(security: Arc<SecurityPolicy>, config: FileDownloadConfig) -> Self {
-        Self::new_with_persistence(security, config, true, Vec::new())
+        Self::new_with_persistence(security, config, true)
     }
 
     /// Construct with an explicit persistence flag derived from the active
     /// runtime adapter's `has_filesystem_access()`. Mirrors
     /// [`super::file_write::FileWriteTool::new_with_persistence`].
     ///
-    /// The SSRF policy (`allowed_private_hosts` + `nat64_prefixes`) is resolved
-    /// from the construction-time `config` / `nat64_prefixes` snapshot on each
-    /// dispatch by the `policy_resolver`. The NAT64 prefixes are the canonical
-    /// host-level `security.nat64_prefixes` fact, passed explicitly because the
-    /// canonical owner is not the `file_download` config section.
+    /// The SSRF policy is resolved from the construction-time `config` snapshot
+    /// on each dispatch by the `policy_resolver`. This is the backward-compatible
+    /// public signature: it declares no network-specific NAT64 prefixes (the
+    /// pre-NAT64 behavior). Callers that resolve the canonical host-level
+    /// `security.nat64_prefixes` should use
+    /// [`Self::new_with_persistence_with_nat64`], and callers with a live config
+    /// handle should use [`Self::new_with_persistence_and_resolver`].
     pub fn new_with_persistence(
+        security: Arc<SecurityPolicy>,
+        config: FileDownloadConfig,
+        persistent_writes: bool,
+    ) -> Self {
+        Self::new_with_persistence_with_nat64(security, config, persistent_writes, Vec::new())
+    }
+
+    /// Construct with an explicit persistence flag and declared network-specific
+    /// NAT64 prefixes. The NAT64 prefixes are the canonical host-level
+    /// `security.nat64_prefixes` fact, passed explicitly because the canonical
+    /// owner is not the `file_download` config section.
+    pub fn new_with_persistence_with_nat64(
         security: Arc<SecurityPolicy>,
         config: FileDownloadConfig,
         persistent_writes: bool,
@@ -1370,7 +1384,6 @@ mod tests {
             test_security(tmp.path().to_path_buf(), AutonomyLevel::Full),
             config,
             false,
-            Vec::new(),
         );
 
         let result = tool
