@@ -56,7 +56,7 @@ async fn run_catalog_fetch() -> Result<Arc<Catalog>> {
 /// wall-clock adjustments), so the retry deadline is genuinely monotonic — a
 /// system clock jump cannot extend or bypass the backoff window. The offset
 /// guarantees the reading is never `0` (which is the "no prior failure"
-/// sentinel in `LAST_CATALOG_FETCH_FAILURE_UNIX`): at process start, elapsed
+/// sentinel in [`CatalogLifecycle::last_failure`]): at process start, elapsed
 /// is `0s`, which would falsely read as "no failure". Offsetting both `now`
 /// and recorded deadlines by the same constant keeps the relative backoff
 /// comparison unchanged. The production lifecycle uses this clock; lifecycle
