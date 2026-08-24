@@ -586,8 +586,7 @@ impl FileExplorerState {
             .style(theme::fill_style())
             .highlight_style(theme::selected_style());
         self.last_list_area = chunks[0];
-        let mut ls = self.list_state;
-        f.render_stateful_widget(list, chunks[0], &mut ls);
+        f.render_stateful_widget(list, chunks[0], &mut self.list_state);
 
         // Footer: selected count + search + key hints.
         let mut footer_spans: Vec<Span> = Vec::new();
@@ -869,6 +868,54 @@ mod tests {
         assert_eq!(state.list_state.selected(), Some(1));
         state.handle_key(KeyEvent::from(KeyCode::PageUp));
         assert_eq!(state.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn mouse_click_uses_offset_persisted_by_render() {
+        use crossterm::event::MouseButton;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let names: Vec<String> = (0..60).map(|i| i.to_string()).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut state = explorer_with_entries(&name_refs);
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let area = Rect::new(0, 0, 100, 40);
+        terminal
+            .draw(|f| state.render(f, area))
+            .expect("initial render");
+
+        // Page down enough times to scroll the viewport well past the top.
+        for _ in 0..5 {
+            state.handle_key(KeyEvent::from(KeyCode::PageDown));
+        }
+        terminal
+            .draw(|f| state.render(f, area))
+            .expect("render after paging");
+
+        let offset = state.list_state.offset();
+        assert!(
+            offset > 0,
+            "render must have scrolled the list past the top, got offset {offset}"
+        );
+
+        // Click the first visibly rendered row. It must resolve through the
+        // renderer's persisted offset, not a stale zero.
+        let list_area = state.last_list_area;
+        let click = MouseEvent {
+            column: list_area.x,
+            row: list_area.y,
+            kind: MouseEventKind::Down(MouseButton::Left),
+            modifiers: KeyModifiers::NONE,
+        };
+        state.handle_mouse(click);
+
+        assert_eq!(
+            state.list_state.selected(),
+            Some(offset),
+            "clicking the first visible row must select the entry at the render offset"
+        );
     }
 
     #[test]
