@@ -267,6 +267,122 @@ fn the_withheld_notice_is_recorded_once_per_config_application() {
     );
 }
 
+/// Enabling the section through `config patch` records the notice.
+///
+/// The runtime writes this notice after the initial config load and after a
+/// daemon reload. Neither of those runs when an operator flips the setting with
+/// `config patch`: the startup call saw the section disabled, so it recorded
+/// nothing, and the patch applies the new value afterwards. Once the generic
+/// validation trace stopped carrying this code, that left the transition
+/// reporting nothing at all, which is the one moment the operator most needs to
+/// be told the tool stays absent.
+///
+/// `schema_version` is written because `config patch` refuses to modify a config
+/// it would have to migrate first.
+#[test]
+fn enabling_the_section_through_config_patch_records_the_notice_once() {
+    let dir = tempfile::TempDir::new().expect("temp config dir");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "schema_version = 3\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
+         [verifiable_intent]\nenabled = false\n",
+    )
+    .expect("write config.toml");
+    let patch = dir.path().join("patch.json");
+    std::fs::write(
+        &patch,
+        r#"[{"op":"replace","path":"/verifiable_intent/enabled","value":true}]"#,
+    )
+    .expect("write patch.json");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("ZEROCLAW_CONFIG_DIR", dir.path())
+        .args(["config", "patch"])
+        .arg(&patch)
+        .output()
+        .expect("run zeroclaw config patch");
+    assert!(
+        out.status.success(),
+        "config patch must succeed, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let trace = trace_path(dir.path());
+    let body =
+        std::fs::read_to_string(&trace).unwrap_or_else(|e| panic!("read {}: {e}", trace.display()));
+    let withheld: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event["attributes"]["code"].as_str() == Some("verifiable_intent_tool_withheld")
+        })
+        .collect();
+
+    assert_eq!(
+        withheld.len(),
+        1,
+        "enabling the section must record the notice exactly once, found {}\ntrace:\n{body}",
+        withheld.len()
+    );
+    assert_eq!(
+        withheld[0]["event"]["category"].as_str(),
+        Some("system"),
+        "the record must carry the category the Logs view shows by default"
+    );
+    assert_eq!(
+        withheld[0]["attributes"]["path"].as_str(),
+        Some("verifiable_intent.enabled"),
+        "the record must name the setting the operator just changed"
+    );
+}
+
+/// A patch that leaves an already-enabled section alone must not add a second
+/// record. This is the control for the test above: without it, reporting the
+/// transition could be implemented by recording on every patch, which restores
+/// the duplicate the skip in the validation loop exists to remove.
+#[test]
+fn a_patch_that_does_not_enable_the_section_adds_no_second_record() {
+    let dir = tempfile::TempDir::new().expect("temp config dir");
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "schema_version = 3\n\n[observability]\nlog_persistence = \"rolling\"\n\n\
+         [verifiable_intent]\nenabled = true\n",
+    )
+    .expect("write config.toml");
+    let patch = dir.path().join("patch.json");
+    std::fs::write(
+        &patch,
+        r#"[{"op":"replace","path":"/observability/log_persistence","value":"rolling"}]"#,
+    )
+    .expect("write patch.json");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("ZEROCLAW_CONFIG_DIR", dir.path())
+        .args(["config", "patch"])
+        .arg(&patch)
+        .output()
+        .expect("run zeroclaw config patch");
+    assert!(out.status.success(), "config patch must succeed");
+
+    let trace = trace_path(dir.path());
+    let body =
+        std::fs::read_to_string(&trace).unwrap_or_else(|e| panic!("read {}: {e}", trace.display()));
+    let count = body
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event["attributes"]["code"].as_str() == Some("verifiable_intent_tool_withheld")
+        })
+        .count();
+
+    assert_eq!(
+        count, 1,
+        "an already-enabled section must keep its single startup record, found {count}\ntrace:\n{body}"
+    );
+}
+
 /// The negative control for the test above. Without it, a `doctor` that printed
 /// the notice unconditionally would pass every assertion there.
 #[test]

@@ -5847,6 +5847,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 };
 
+                // The withheld-capability notice is recorded once per config
+                // application, and the record written during startup describes
+                // the config as it was loaded. A patch that turns the section on
+                // is a new application of that setting, so the state before the
+                // ops run is captured here to tell that transition apart from a
+                // patch that leaves an already-enabled section alone.
+                #[cfg(feature = "agent-runtime")]
+                let verifiable_intent_was_enabled = config.verifiable_intent.enabled;
+
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
                 for (idx, op) in ops.iter().enumerate() {
@@ -6112,6 +6121,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     config_patch_fail_json_or_human(json, api_err, human)?;
                 }
                 Box::pin(config.save_dirty()).await?;
+
+                // Report the withheld tool when this patch is what enabled the
+                // section. The helper returns early while it stays disabled, so
+                // the guard is only about the already-enabled case: the startup
+                // call has recorded that one for this process, and recording it
+                // again here would restore the second copy this command used to
+                // write. The trace sink was installed before the command
+                // dispatched, so the record has somewhere to go.
+                #[cfg(feature = "agent-runtime")]
+                if !verifiable_intent_was_enabled {
+                    warn_verifiable_intent_withheld(&config);
+                }
 
                 if json {
                     let body = serde_json::json!({"saved": true, "results": results});
