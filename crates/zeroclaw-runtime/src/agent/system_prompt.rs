@@ -94,6 +94,7 @@ pub fn build_system_prompt_with_tool_calls(
         true,
         show_tool_calls,
         None,
+        true,
     )
 }
 
@@ -127,6 +128,7 @@ pub fn build_system_prompt_with_mode(
         true,
         false,
         None,
+        true,
     )
 }
 
@@ -155,6 +157,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // guidance entirely). Resolved from `RuntimeAdapter::shell_profile` so the
     // reported shell cannot drift from the executed one.
     shell_profile: Option<&ShellProfile>,
+    // Whether this turn is on a messaging channel surface. The caller owns
+    // this per-turn fact; it must not come from process-wide channel config.
+    is_messaging_channel_turn: bool,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -440,8 +445,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     }
 
-    // ── 8. Channel Capabilities (skipped in compact_context mode) ──
-    if !compact_context {
+    // ── 8. Channel Capabilities (skipped in compact_context mode, and for
+    //       surfaces that are not a messaging channel) ──
+    if !compact_context && is_messaging_channel_turn {
         prompt.push_str("## Channel Capabilities\n\n");
         prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
         prompt
@@ -562,6 +568,7 @@ mod tests {
             true,
             false,
             shell_profile,
+            false,
         )
     }
 
@@ -697,6 +704,7 @@ mod tests {
             true,
             false,
             Some(&profile),
+            false,
         );
         assert!(
             !prompt.contains("## Shell"),
@@ -830,6 +838,7 @@ mod tests {
             true,
             false,
             None,
+            true,
         )
     }
 
@@ -931,6 +940,67 @@ mod tests {
         assert!(
             !prompt.contains("## Tool Authorization"),
             "Tool Authorization should be skipped when no power tools (shell/file_write/file_edit) are registered"
+        );
+    }
+    /// The CLI / coding surface must not be told it is a messaging bot.
+    ///
+    /// `## Channel Capabilities` states that the agent's reply is delivered to a
+    /// user's channel and describes voice-note/TTS behaviour. That is correct for
+    /// chat surfaces and actively misleading everywhere else: a model running the
+    /// agent loop under it self-describes as "a personal assistant" with no coding
+    /// persona. Fails on the old behaviour, which emitted the section for every
+    /// surface.
+    #[test]
+    fn channel_capabilities_are_omitted_for_non_channel_surfaces() {
+        let ws = tempfile::tempdir().expect("tempdir");
+        let tools: Vec<(&str, &str)> = vec![("file_edit", "edit files")];
+
+        let channel = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "m",
+            &tools,
+            &[],
+            None,
+            None,
+            None,
+            true,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
+            false,
+            0,
+            true,
+            false,
+            None,
+            true,
+        );
+        let cli = build_system_prompt_with_mode_and_autonomy(
+            ws.path(),
+            "m",
+            &tools,
+            &[],
+            None,
+            None,
+            None,
+            true,
+            zeroclaw_config::schema::SkillsPromptInjectionMode::default(),
+            false,
+            0,
+            true,
+            false,
+            None,
+            false,
+        );
+
+        assert!(
+            channel.contains("Channel Capabilities"),
+            "chat surfaces must keep the channel section"
+        );
+        assert!(
+            !cli.contains("Channel Capabilities"),
+            "CLI surface must not receive the channel section"
+        );
+        assert!(
+            !cli.contains("messaging bot"),
+            "CLI surface must not be told it is a messaging bot"
         );
     }
 }
