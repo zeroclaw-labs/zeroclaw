@@ -521,6 +521,7 @@ impl Tool for ProxyConfigTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::proxy_test_lock_guard;
     use tempfile::TempDir;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
@@ -574,6 +575,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_scope_services_requires_services_entries() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -599,6 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_and_get_round_trip_proxy_scope() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
@@ -633,6 +636,7 @@ mod tests {
 
     #[tokio::test]
     async fn set_null_proxy_url_clears_existing_value() {
+        let _proxy_lock = proxy_test_lock_guard().await;
         let tmp = TempDir::new().unwrap();
         let tool = ProxyConfigTool::new(Box::pin(test_config(&tmp)).await, test_security());
 
