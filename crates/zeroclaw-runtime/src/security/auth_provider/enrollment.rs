@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use zeroclaw_config::schema::OidcConfig;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -33,7 +33,7 @@ struct EnrollmentDiscovery {
     code_challenge_methods_supported: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceGrantStart {
     pub device_code: String,
     pub user_code: String,
@@ -49,7 +49,9 @@ fn default_poll_interval() -> u64 {
     5
 }
 
-#[derive(Clone, Deserialize)]
+/// Serialize exists for the gateway enrollment API, whose whole purpose
+/// is returning the token to the enrolling client; Debug stays redacted.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EnrolledToken {
     pub access_token: String,
     #[serde(default)]
@@ -816,39 +818,37 @@ mod tests {
     async fn loopback_listener_ignores_wrong_state_and_returns_the_matching_code() {
         let listener = LoopbackListener::bind().await.unwrap();
         let base = listener.redirect_uri();
-        let wait = tokio::spawn(async move {
-            listener
-                .wait_for_code("good-state", Duration::from_secs(5))
+        let wait = listener.wait_for_code("good-state", Duration::from_secs(5));
+        let drive = async {
+            // Wrong state: answered, ignored, the wait continues.
+            let resp = reqwest::get(format!("{base}?code=evil&state=bad-state"))
                 .await
-        });
-        // Wrong state: answered, ignored, the wait continues.
-        let resp = reqwest::get(format!("{base}?code=evil&state=bad-state"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status().as_u16(), 404);
-        // Matching state: the code comes back and the listener is done.
-        let resp = reqwest::get(format!("{base}?code=real-code&state=good-state"))
-            .await
-            .unwrap();
-        assert_eq!(resp.status().as_u16(), 200);
-        assert_eq!(wait.await.unwrap().unwrap(), "real-code");
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 404);
+            // Matching state: the code comes back and the listener is done.
+            let resp = reqwest::get(format!("{base}?code=real-code&state=good-state"))
+                .await
+                .unwrap();
+            assert_eq!(resp.status().as_u16(), 200);
+        };
+        let (code, ()) = tokio::join!(wait, drive);
+        assert_eq!(code.unwrap(), "real-code");
     }
 
     #[tokio::test]
     async fn loopback_listener_fails_the_flow_on_an_idp_error() {
         let listener = LoopbackListener::bind().await.unwrap();
         let base = listener.redirect_uri();
-        let wait = tokio::spawn(async move {
-            listener
-                .wait_for_code("good-state", Duration::from_secs(5))
-                .await
-        });
-        reqwest::get(format!(
-            "{base}?error=access_denied&error_description=user+rejected&state=good-state"
-        ))
-        .await
-        .unwrap();
-        let err = wait.await.unwrap().unwrap_err();
+        let wait = listener.wait_for_code("good-state", Duration::from_secs(5));
+        let drive = async {
+            reqwest::get(format!(
+                "{base}?error=access_denied&error_description=user+rejected&state=good-state"
+            ))
+            .await
+            .unwrap();
+        };
+        let (result, ()) = tokio::join!(wait, drive);
+        let err = result.unwrap_err();
         assert!(err.to_string().contains("access_denied"), "{err}");
         assert!(err.to_string().contains("user rejected"), "{err}");
     }

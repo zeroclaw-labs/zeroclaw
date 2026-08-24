@@ -12,6 +12,7 @@ pub mod api;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
+pub mod api_oidc;
 pub mod api_pairing;
 pub mod api_personality;
 #[cfg(feature = "plugins-wasm")]
@@ -410,7 +411,7 @@ fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
         .and_then(parse_client_ip)
 }
 
-fn client_key_from_request(
+pub(crate) fn client_key_from_request(
     peer_addr: Option<SocketAddr>,
     headers: &HeaderMap,
     trust_forwarded_headers: bool,
@@ -1719,6 +1720,7 @@ pub async fn run_gateway(
     // Build router with middleware
     let inner = Router::new()
         .merge(config_admin_router(&inbound_auth))
+        .merge(api_oidc::routes())
         // ── Admin routes (for CLI management) ──
         .route("/admin/shutdown", post(handle_admin_shutdown))
         .route("/admin/reload", post(handle_admin_reload))
