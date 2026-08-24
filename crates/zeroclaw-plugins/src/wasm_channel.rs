@@ -105,6 +105,33 @@ fn build_linker(http: bool) -> Result<Linker<PluginState>> {
     Ok(linker)
 }
 
+/// Build the sandboxed store backing a channel plugin.
+///
+/// Channel outbound HTTP is intentionally UNAVAILABLE on this host build: the
+/// store is constructed WITHOUT [`PluginStoreSpec::with_granted_http`], so even
+/// a channel whose manifest grants `HttpClient` receives no `wasi:http` surface.
+/// [`PluginState::http_enabled`] is therefore false, [`build_linker`] never
+/// wires `wasi:http`, and the guest cannot reach the network at all — genuinely
+/// unavailable, not "deny-all".
+///
+/// The reason this is fail-closed rather than governed: enabling `wasi:http`
+/// here would attach `wasmtime_wasi_http::p2::default_hooks()` — UNRESTRICTED
+/// egress with no destination allowlist, no metadata/loopback denial, no DNS
+/// pinning, and no connection budget. That is a fresh instance of the egress
+/// SSRF hole (issue 9395), which making channel construction a production
+/// caller must not introduce. Egress-governed channel HTTP is a follow-up that
+/// threads the `EgressHostService` through channel construction on top of the
+/// `PluginEgressHooks` work (issue 9582); until that lands, the channel surface
+/// stays off.
+fn new_channel_store(
+    scope: crate::instance::PluginInstanceScope,
+    services: PluginHostServices,
+    limits: crate::component::PluginLimits,
+    inbound: InboundQueue,
+) -> Store<PluginState> {
+    crate::component::new_store(PluginStoreSpec::new(scope, services, limits).with_inbound(inbound))
+}
+
 impl WasmChannel {
     pub async fn from_wasm(
         endpoint: PluginChannelEndpoint,
@@ -180,10 +207,19 @@ impl ChannelInstanceFactory {
         endpoint: &PluginChannelEndpoint,
         inbound: InboundQueue,
     ) -> Result<ChannelInstance> {
-        let mut store = crate::component::new_store(
-            PluginStoreSpec::new(endpoint.scope().clone(), self.services.clone(), self.limits)
-                .with_granted_http()
-                .with_inbound(inbound),
+        // Channel outbound HTTP is intentionally withheld: routing through
+        // `new_channel_store` builds the store WITHOUT `with_granted_http`, so
+        // even a channel whose manifest grants `HttpClient` receives no
+        // `wasi:http` surface. Granting it would attach the ungoverned
+        // `default_hooks()` egress (a fresh instance of the SSRF hole, issue
+        // 9395); `new_channel_store` carries the full rationale and the issue
+        // 9582 egress-governed follow-up. Config and secrets still reach the
+        // guest through the live host services threaded into the store here.
+        let mut store = new_channel_store(
+            endpoint.scope().clone(),
+            self.services.clone(),
+            self.limits,
+            inbound,
         );
         let http = store.data().http_enabled();
         let linker = build_linker(http)?;
@@ -883,6 +919,42 @@ mod tests {
         // A subsequent successful poll clears the condition.
         mark_poll_healthy(&flag, true);
         assert!(poll_health_ok(&flag), "recovers after a clean poll");
+    }
+
+    #[test]
+    fn channel_http_surface_is_unavailable_even_when_granted() {
+        // Regression for the channel-activation egress hole. Making
+        // `WasmChannel::from_wasm` a production caller must NOT grant channels a
+        // usable outbound-HTTP surface on this host build: enabling `wasi:http`
+        // would attach the ungoverned `default_hooks()` egress (a fresh instance
+        // of the egress SSRF hole, issue 9395). The store is the security
+        // boundary, so a channel whose manifest GRANTS `HttpClient` must still
+        // carry no `wasi:http` context — the surface is unavailable, not
+        // "deny-all".
+        let granted_scope = crate::instance::test_scope(
+            PluginCapability::Channel,
+            "main",
+            [crate::PluginPermission::HttpClient],
+        );
+        assert!(
+            granted_scope
+                .grants()
+                .allows(crate::PluginPermission::HttpClient),
+            "precondition: the channel scope must actually grant HttpClient"
+        );
+
+        let store = new_channel_store(
+            granted_scope,
+            crate::services::test_host_services(),
+            crate::component::test_limits(0),
+            InboundQueue::default(),
+        );
+
+        assert!(
+            !store.data().http_enabled(),
+            "a channel that grants HttpClient must NOT receive an outbound-HTTP \
+             surface: ungoverned default_hooks() egress is the SSRF hole"
+        );
     }
 
     #[tokio::test]

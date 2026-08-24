@@ -12,8 +12,6 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock, RwLock};
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use zeroclaw_api::attribution::Attributable;
 use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_plugins::component::{HostInboundMessage, PluginLimits};
@@ -86,9 +84,11 @@ fn manifest() -> PluginManifest {
         wasm_path: Some("channel-fixture.wasm".to_string()),
         capabilities: vec![PluginCapability::Channel],
         // Every fixture channel is ConfigRead-granted so the typed-config and
-        // scoped-secret contract is exercised on every instantiation, and
-        // HttpClient-granted so the deadline tests can drive a real outbound
-        // request; the HTTP grant is inert unless a send targets an http:// URL.
+        // scoped-secret contract is exercised on every instantiation. The
+        // HttpClient grant is kept but inert: the host withholds `wasi:http`
+        // from channels (see `new_channel_store`), so a channel that grants
+        // HttpClient still receives no outbound-HTTP surface. The deadline
+        // tests therefore drive guest compute (a `spin` message), not network.
         permissions: vec![PluginPermission::ConfigRead, PluginPermission::HttpClient],
         config_schema: Some(serde_json::json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -191,56 +191,15 @@ async fn channel_with(
 }
 
 async fn channel_with_timeout(binding: &str, timeout: Duration) -> WasmChannel {
+    // u64::MAX fuel guarantees the wall-clock deadline, not fuel exhaustion,
+    // interrupts a spinning guest send — the store-discard path under test.
     channel_with(
         binding,
         vec![PluginPermission::HttpClient],
         &HashMap::new(),
-        limits_with_timeout(timeout),
+        limits_with(u64::MAX, timeout),
     )
     .await
-}
-
-/// One-request server that drips a byte every two seconds so a send against
-/// it can only end at the host wall-clock deadline.
-async fn drip_server() -> (String, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind drip server");
-    let address = listener.local_addr().expect("drip server address");
-    let task = ::zeroclaw_spawn::spawn!(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept drip request");
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request).await;
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nx")
-            .await
-            .expect("write drip head");
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            if stream.write_all(b"x").await.is_err() {
-                break;
-            }
-        }
-    });
-    (format!("http://{address}/body"), task)
-}
-
-/// One-request server that answers immediately with a small 200 response.
-async fn ok_server() -> (String, tokio::task::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind ok server");
-    let address = listener.local_addr().expect("ok server address");
-    let task = ::zeroclaw_spawn::spawn!(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept ok request");
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request).await;
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .await
-            .expect("write ok response");
-    });
-    (format!("http://{address}/body"), task)
 }
 
 fn outbound(content: &str, recipient: &str) -> SendMessage {
@@ -406,127 +365,61 @@ async fn channel_listener_stops_when_receiver_closes() {
 async fn timed_out_channel_call_releases_lock_and_recreates_instance() {
     let channel = channel_with_timeout("recreate", Duration::from_millis(500)).await;
 
-    let drip_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind drip server");
-    let drip_address = drip_listener.local_addr().expect("drip server address");
-    let drip_server = ::zeroclaw_spawn::spawn!(async move {
-        let (mut stream, _) = drip_listener.accept().await.expect("accept drip request");
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request).await;
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000000\r\n\r\nx")
-            .await
-            .expect("write drip head");
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            if stream.write_all(b"x").await.is_err() {
-                break;
-            }
-        }
-    });
-    let mut dripping = outbound("", "room");
-    dripping.content = format!("http://{drip_address}/body");
+    // A spinning send outlives the 500ms wall-clock deadline; the host must
+    // interrupt it, discard the store, and release the slot lock. Channels have
+    // no outbound-HTTP surface, so the slow operation is guest compute.
     let error = channel
-        .send(&dripping)
+        .send(&outbound("spin until the deadline", "room"))
         .await
-        .expect_err("dripping send must hit the host deadline");
+        .expect_err("spinning send must hit the host deadline");
     assert!(
         error.to_string().contains("wall-clock deadline"),
         "unexpected error: {error:#}"
     );
-    drip_server.abort();
 
-    let healthy_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind healthy server");
-    let healthy_address = healthy_listener
-        .local_addr()
-        .expect("healthy server address");
-    let healthy_server = ::zeroclaw_spawn::spawn!(async move {
-        let (mut stream, _) = healthy_listener
-            .accept()
-            .await
-            .expect("accept healthy request");
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request).await;
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .await
-            .expect("write healthy response");
-    });
-    let mut healthy = outbound("", "room");
-    healthy.content = format!("http://{healthy_address}/body");
-    tokio::time::timeout(Duration::from_secs(2), channel.send(&healthy))
-        .await
-        .expect("recreated channel call is not stranded behind the old lock")
-        .expect("recreated channel handles a healthy request");
-    healthy_server.await.expect("healthy server task");
+    // The recreated instance handles a normal send instead of stranding behind
+    // the discarded store's lock.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        channel.send(&outbound("v1:token-recreate", "room")),
+    )
+    .await
+    .expect("recreated channel call is not stranded behind the old lock")
+    .expect("recreated channel handles a healthy request");
 }
 
 #[tokio::test]
 async fn externally_cancelled_channel_call_discards_store_and_recreates() {
+    // A generous timeout ensures the deadline does not fire; external
+    // cancellation, not the wall clock, is what discards the store here.
     let channel = Arc::new(channel_with_timeout("cancel", Duration::from_secs(5)).await);
 
-    let stalled_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind stalled server");
-    let stalled_address = stalled_listener
-        .local_addr()
-        .expect("stalled server address");
-    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
-    let stalled_server = ::zeroclaw_spawn::spawn!(async move {
-        let (mut stream, _) = stalled_listener
-            .accept()
-            .await
-            .expect("accept stalled request");
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request).await;
-        let _ = accepted_tx.send(());
-        tokio::time::sleep(Duration::from_secs(5)).await;
-    });
-
-    let mut stalled = outbound("", "room");
-    stalled.content = format!("http://{stalled_address}/body");
+    // A spinning send is in flight; external cancellation (task abort) must drop
+    // the in-flight guest call and discard its store rather than resuming it.
     let cancelled_channel = Arc::clone(&channel);
-    let call = ::zeroclaw_spawn::spawn!(async move { cancelled_channel.send(&stalled).await });
-    accepted_rx
-        .await
-        .expect("guest call reached the async HTTP host import");
+    let call = ::zeroclaw_spawn::spawn!(async move {
+        cancelled_channel
+            .send(&outbound("spin until cancelled", "room"))
+            .await
+    });
+    // Give the guest time to enter the spin before cancelling.
+    tokio::time::sleep(Duration::from_millis(200)).await;
     call.abort();
     assert!(
         call.await
             .expect_err("call task was aborted")
             .is_cancelled(),
-        "external cancellation must drop the in-flight host call"
+        "external cancellation must drop the in-flight guest call"
     );
-    stalled_server.abort();
 
-    let healthy_listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind post-cancel server");
-    let healthy_address = healthy_listener
-        .local_addr()
-        .expect("post-cancel server address");
-    let healthy_server = ::zeroclaw_spawn::spawn!(async move {
-        let (mut stream, _) = healthy_listener
-            .accept()
-            .await
-            .expect("accept post-cancel request");
-        let mut request = [0_u8; 4096];
-        let _ = stream.read(&mut request).await;
-        stream
-            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
-            .await
-            .expect("write post-cancel response");
-    });
-    let mut healthy = outbound("", "room");
-    healthy.content = format!("http://{healthy_address}/body");
-    tokio::time::timeout(Duration::from_secs(2), channel.send(&healthy))
-        .await
-        .expect("cancelled call released the channel lock")
-        .expect("fresh channel instance served the healthy call");
-    healthy_server.await.expect("post-cancel server task");
+    // The fresh instance serves a normal send once the lock is released.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        channel.send(&outbound("v1:token-cancel", "room")),
+    )
+    .await
+    .expect("cancelled call released the channel lock")
+    .expect("fresh channel instance served the healthy call");
 }
 
 /// The factory's `configure` snapshot is generation-scoped: reconstruction
@@ -545,7 +438,9 @@ async fn reconstruction_replays_the_constructor_generation_config_snapshot() {
             zeroclaw_plugins::PluginPermission::ConfigRead,
         ],
         &config,
-        limits_with_timeout(Duration::from_millis(500)),
+        // u64::MAX fuel so the wall-clock deadline, not fuel exhaustion,
+        // interrupts the spinning send and forces reconstruction.
+        limits_with(u64::MAX, Duration::from_millis(500)),
     )
     .await;
     assert_eq!(
@@ -554,30 +449,30 @@ async fn reconstruction_replays_the_constructor_generation_config_snapshot() {
         "the ConfigRead-granted snapshot must reach the guest's configure"
     );
 
-    let (drip_url, drip_task) = drip_server().await;
-    let mut dripping = outbound("", "room");
-    dripping.content = drip_url;
+    // A spinning send outlives the deadline, forcing store discard and
+    // reconstruction against the same constructor-generation config snapshot.
     let error = channel
-        .send(&dripping)
+        .send(&outbound("spin until the deadline", "room"))
         .await
-        .expect_err("dripping send must hit the host deadline");
+        .expect_err("spinning send must hit the host deadline");
     assert!(
         error.to_string().contains("wall-clock deadline"),
         "unexpected error: {error:#}"
     );
-    drip_task.abort();
 
-    let (ok_url, ok_task) = ok_server().await;
-    let mut healthy = outbound("", "room");
-    healthy.content = ok_url;
-    tokio::time::timeout(Duration::from_secs(2), channel.send(&healthy))
-        .await
-        .expect("reconstructed channel call is not stranded")
-        .expect(
-            "reconstruction replayed the constructor-generation config, so the \
-             config-derived metadata matched and the instance was admitted",
-        );
-    ok_task.await.expect("ok server task");
+    // The reconstructed instance serves a normal send; its config-derived
+    // metadata still matches because the constructor-generation snapshot was
+    // replayed.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        channel.send(&outbound("v1:token-config-generation", "room")),
+    )
+    .await
+    .expect("reconstructed channel call is not stranded")
+    .expect(
+        "reconstruction replayed the constructor-generation config, so the \
+         config-derived metadata matched and the instance was admitted",
+    );
     assert_eq!(
         channel.self_handle().as_deref(),
         Some("@from-config"),

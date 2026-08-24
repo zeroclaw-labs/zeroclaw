@@ -22,7 +22,10 @@ async fn main(_spawner: Spawner) {
     let mut config = Config::default();
     config.baudrate = 115_200;
 
-    let mut usart = Uart::new_blocking(p.USART2, p.PA3, p.PA2, config).unwrap();
+    let Ok(mut usart) = Uart::new_blocking(p.USART2, p.PA3, p.PA2, config) else {
+        defmt::error!("failed to initialize USART2");
+        return;
+    };
     let mut led = Output::new(p.PA5, Level::Low, Speed::Low);
 
     info!("ZeroClaw Nucleo firmware ready on USART2 (115200)");
