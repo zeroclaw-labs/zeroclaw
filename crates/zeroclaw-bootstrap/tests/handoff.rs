@@ -43,6 +43,19 @@ fn verifies_a_well_formed_advertisement() {
     let rendered = verified.render();
     assert!(rendered.contains("control protocol  1.0"));
     assert!(rendered.contains("capability digest sha256:"));
+    // Handoff names the route's destination and stays honest about it.
+    assert!(
+        rendered.contains("configure this instance"),
+        "handoff must name configure as the destination:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("zeroclaw control genesis"),
+        "handoff must point at genesis when there is no trust root yet:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("read-only until an operator enables mutations"),
+        "handoff must stay honest that the surface is read-only by default:\n{rendered}"
+    );
 }
 
 #[test]

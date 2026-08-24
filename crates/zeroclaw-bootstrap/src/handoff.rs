@@ -174,6 +174,13 @@ pub struct VerifiedHandoff {
 
 impl VerifiedHandoff {
     /// Human-readable verification summary.
+    ///
+    /// The trailing `next` block names the route's destination: once handoff
+    /// execs the server, configuration happens on the control surface. It stays
+    /// honest about what that surface is — read-only by default, genesis first
+    /// when the instance has no trust root, and mutations gated behind the
+    /// separate operator enablement ceremony — so the reader never mistakes
+    /// "configure" for "mutate without approval".
     pub fn render(&self) -> String {
         format!(
             "Handoff verification\n\
@@ -182,7 +189,10 @@ impl VerifiedHandoff {
              \x20 control protocol  {} (accepted range {})\n\
              \x20 config schema     {}\n\
              \x20 capabilities      {}\n\
-             \x20 capability digest {}\n",
+             \x20 capability digest {}\n\
+             \x20 next              configure this instance on the control server this hands off to:\n\
+             \x20                   run `zeroclaw control genesis` first if it has no trust root yet;\n\
+             \x20                   the surface is read-only until an operator enables mutations\n",
             self.binary_digest,
             self.verified_version,
             self.advertisement.control_protocol_version,

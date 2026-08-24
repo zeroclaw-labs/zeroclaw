@@ -40,6 +40,30 @@ pub enum BinaryState {
     },
 }
 
+/// The single next step in the entry-point route, as a stable machine-readable
+/// token. Either the instance is present and the harness moves on to configure
+/// it, or it must be installed first. The token is derived from the
+/// [`Recommendation`]; it is never a second source of truth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NextAction {
+    /// ZeroClaw is installed and verified: connect to the control server with
+    /// `handoff` and configure the instance there.
+    Configure,
+    /// ZeroClaw is absent or unverifiable: `plan`, then `install`, then
+    /// `handoff` — installation always needs a human-approved plan digest.
+    Install,
+}
+
+impl NextAction {
+    /// Stable lowercase token a harness can branch on without parsing prose.
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Configure => "configure",
+            Self::Install => "install",
+        }
+    }
+}
+
 /// What the launcher suggests the operator do next.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recommendation {
@@ -52,15 +76,35 @@ pub enum Recommendation {
 }
 
 impl Recommendation {
-    /// Label for status output.
+    /// Label for status output. Each variant names the explicit two-branch
+    /// entry route and its `configure` destination, so a reader (human or
+    /// harness) sees not only the current state but the next step to reach the
+    /// control surface.
     pub fn label(&self) -> &'static str {
         match self {
-            Self::PlanInstall => "no ZeroClaw binary found — run `plan` to review an install",
-            Self::ReadyForHandoff => "verified binary present — `handoff` can proceed",
+            Self::PlanInstall => {
+                "ZeroClaw is not installed — run `plan`, then `install`, then `handoff` \
+                 to install and configure this instance"
+            }
+            Self::ReadyForHandoff => {
+                "ZeroClaw is installed — run `handoff` to connect to the control server \
+                 and configure this instance"
+            }
             Self::PlanRepair => {
                 "a file exists at the install path but its version could not be verified — \
-                 run `plan` to review a repair; nothing was executed or replaced"
+                 run `plan`, then `install`, then `handoff` to repair and configure this \
+                 instance; nothing was executed or replaced"
             }
+        }
+    }
+
+    /// The route's next step as a machine-readable token. A verified install is
+    /// ready to configure; an absent or unverifiable one must be installed (or
+    /// repaired) first. This is resolved from the recommendation, not stored.
+    pub fn next_action(&self) -> NextAction {
+        match self {
+            Self::ReadyForHandoff => NextAction::Configure,
+            Self::PlanInstall | Self::PlanRepair => NextAction::Install,
         }
     }
 }
@@ -212,7 +256,11 @@ impl BootstrapStatus {
                 digest.as_deref().unwrap_or("unreadable"),
             )),
         }
-        out.push_str(&format!("\n  {}\n", self.recommendation.label()));
+        out.push_str(&format!(
+            "\n  next action       {}\n  {}\n",
+            self.recommendation.next_action().token(),
+            self.recommendation.label()
+        ));
         out
     }
 }
@@ -265,5 +313,44 @@ mod tests {
             inspect_binary(Path::new("/nonexistent/zeroclaw-bootstrap-test")),
             BinaryState::Absent
         );
+    }
+
+    #[test]
+    fn the_next_action_routes_installed_to_configure_and_absent_to_install() {
+        assert_eq!(
+            Recommendation::ReadyForHandoff.next_action(),
+            NextAction::Configure
+        );
+        assert_eq!(
+            Recommendation::ReadyForHandoff.next_action().token(),
+            "configure"
+        );
+        // Absent and unverifiable both install (or repair) before configuring.
+        assert_eq!(
+            Recommendation::PlanInstall.next_action(),
+            NextAction::Install
+        );
+        assert_eq!(
+            Recommendation::PlanRepair.next_action(),
+            NextAction::Install
+        );
+        assert_eq!(Recommendation::PlanInstall.next_action().token(), "install");
+    }
+
+    #[test]
+    fn every_label_names_configure_and_its_route() {
+        // Installed: the destination is named and reached through `handoff`.
+        let installed = Recommendation::ReadyForHandoff.label();
+        assert!(installed.contains("installed"));
+        assert!(installed.contains("handoff"));
+        assert!(installed.contains("configure"));
+
+        // Absent: the full plan -> install -> handoff -> configure route.
+        let absent = Recommendation::PlanInstall.label();
+        assert!(absent.contains("not installed"));
+        assert!(absent.contains("plan"));
+        assert!(absent.contains("install"));
+        assert!(absent.contains("handoff"));
+        assert!(absent.contains("configure"));
     }
 }

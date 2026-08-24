@@ -25,7 +25,25 @@ fn reports_an_absent_binary_and_recommends_planning() {
         report.target.expect("published target").triple,
         "x86_64-unknown-linux-gnu"
     );
-    assert!(report.render().contains("existing binary   none"));
+
+    // The absent branch routes the harness through the full install path and
+    // names `configure` as the destination, with a machine-readable token.
+    let rendered = report.render();
+    assert!(rendered.contains("existing binary   none"));
+    assert!(
+        rendered.contains("next action       install"),
+        "absent status must emit the machine-readable install token:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ZeroClaw is not installed"),
+        "absent status must state the instance is not installed:\n{rendered}"
+    );
+    for step in ["plan", "install", "handoff", "configure"] {
+        assert!(
+            rendered.contains(step),
+            "absent status must name `{step}` in the route:\n{rendered}"
+        );
+    }
 }
 
 #[test]
@@ -69,7 +87,25 @@ fn verifies_a_binary_that_reports_a_zeroclaw_version() {
         other => panic!("expected a verified binary, got {other:?}"),
     }
     assert_eq!(report.recommendation, Recommendation::ReadyForHandoff);
-    assert!(report.render().contains("0.8.4 (verified)"));
+
+    // The installed branch routes straight to `handoff` and names `configure`
+    // as the destination, with a machine-readable token.
+    let rendered = report.render();
+    assert!(rendered.contains("0.8.4 (verified)"));
+    assert!(
+        rendered.contains("next action       configure"),
+        "installed status must emit the machine-readable configure token:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("ZeroClaw is installed"),
+        "installed status must state the instance is installed:\n{rendered}"
+    );
+    for step in ["handoff", "configure"] {
+        assert!(
+            rendered.contains(step),
+            "installed status must name `{step}` in the route:\n{rendered}"
+        );
+    }
 }
 
 #[cfg(unix)]

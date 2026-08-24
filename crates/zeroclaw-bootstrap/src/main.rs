@@ -100,7 +100,8 @@ fn run(cli: Cli) -> Result<(), BootstrapError> {
             println!("  artifact sha256   {}", outcome.artifact_digest);
             println!("  binary sha256     {}", outcome.binary_digest);
             println!(
-                "\nHand off with:\n  zeroclaw-bootstrap handoff --expect-binary-sha256 {}",
+                "\nInstalled. Now connect and configure this instance by handing off with:\n  \
+                 zeroclaw-bootstrap handoff --expect-binary-sha256 {}",
                 outcome.binary_digest
             );
             Ok(())
