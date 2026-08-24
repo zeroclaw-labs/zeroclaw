@@ -20885,9 +20885,25 @@ impl Config {
         // Non-fatal validation warnings: surfaced both via tracing (CLI sees
         // on stderr) and via Config::collect_warnings (gateway HTTP returns
         // structured to dashboard callers). Single source of truth lives in
-        // collect_warnings; emit each one to tracing here so the existing
-        // log behavior is preserved.
+        // collect_warnings; emit them to tracing here so the existing log
+        // behavior is preserved, with the single documented exception below.
         for w in self.collect_warnings() {
+            // One code is held back from this loop on purpose. The runtime
+            // already records the withheld-capability notice itself, with an
+            // explicit `System` category and the same code and path, once at
+            // every config application. Records emitted here carry no category
+            // and are stored as `internal`, which the dashboard Logs view hides
+            // by default, so tracing it here as well leaves a hidden second copy
+            // of a notice an operator is supposed to read. Every command that
+            // loads config a second time inside a live process writes that pair.
+            //
+            // `collect_warnings` still returns it, so `zeroclaw doctor` and the
+            // config API report it exactly as before; only this tracing copy is
+            // dropped. The change that re-registers the tool retires this skip
+            // together with the runtime record it defers to.
+            if w.code == crate::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD {
+                continue;
+            }
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

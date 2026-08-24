@@ -186,6 +186,87 @@ fn trace_is_the_channel_that_disappears_and_doctor_is_the_one_that_does_not() {
     }
 }
 
+/// One config application records the notice once.
+///
+/// `Config::validate()` traces every entry from `collect_warnings()` and sets no
+/// category on them, so each persists as `internal`, which the Logs view hides
+/// by default. The runtime separately writes this one notice with an explicit
+/// `system` category and its warning code. Any command that loads config a
+/// second time while the trace writer is already installed therefore recorded
+/// the same fact twice: once visible, once hidden.
+///
+/// `peripheral add` has exactly that shape at the process boundary. The
+/// dispatcher loads config and installs the writer, then the subcommand loads
+/// config again. The daemon reload arm does the same thing, and no test here can
+/// drive a reload, so this covers the ordering rather than the daemon.
+#[test]
+fn the_withheld_notice_is_recorded_once_per_config_application() {
+    let dir = tempfile::TempDir::new().expect("temp config dir");
+    write_config(dir.path(), true, "rolling");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_zeroclaw"))
+        .env("ZEROCLAW_CONFIG_DIR", dir.path())
+        .args(["peripheral", "add", "rpi-gpio", "native"])
+        .output()
+        .expect("run zeroclaw peripheral add");
+    assert!(
+        out.status.success(),
+        "peripheral add must succeed, got {:?}\nstdout:\n{}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+
+    let trace = trace_path(dir.path());
+    let body =
+        std::fs::read_to_string(&trace).unwrap_or_else(|e| panic!("read {}: {e}", trace.display()));
+    let events: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+
+    let withheld: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| {
+            event["attributes"]["code"].as_str() == Some("verifiable_intent_tool_withheld")
+        })
+        .collect();
+
+    assert_eq!(
+        withheld.len(),
+        1,
+        "the notice must be recorded once, found {}:\n{}",
+        withheld.len(),
+        withheld
+            .iter()
+            .map(|event| format!(
+                "  category={:?} message={:?}",
+                event["event"]["category"].as_str(),
+                event["message"].as_str()
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        withheld[0]["event"]["category"].as_str(),
+        Some("system"),
+        "the surviving record must be the categorised one, not the hidden copy"
+    );
+
+    // Positive control over the same trace. Without it, a count of one could be
+    // produced by tracing having stopped working, and the assertion above would
+    // pass for the wrong reason. This code is raised by the same
+    // `collect_warnings()` list on this same config, so it proves the generic
+    // path still traces and that the exclusion reaches one code only.
+    let control = events.iter().any(|event| {
+        event["attributes"]["code"].as_str() == Some("memory_semantic_search_without_embedder")
+    });
+    assert!(
+        control,
+        "control: validate() must still trace other warning codes\ntrace:\n{body}"
+    );
+}
+
 /// The negative control for the test above. Without it, a `doctor` that printed
 /// the notice unconditionally would pass every assertion there.
 #[test]
