@@ -1036,6 +1036,7 @@ impl Tool for FileDownloadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{RuntimeProxyGuard, proxy_test_lock_guard};
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
@@ -1044,53 +1045,7 @@ mod tests {
     use wiremock::matchers::{header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
     use zeroclaw_config::autonomy::AutonomyLevel;
-    use zeroclaw_config::schema::{ProxyConfig, ProxyScope, set_runtime_proxy_config};
-
-    /// Serializes the process-global runtime proxy config against every
-    /// `execute()` test. `execute()` reads `runtime_proxy_config()` at dispatch
-    /// time (to surface the conflicting-proxy error that mirrors http_request /
-    /// web_fetch); the real-request execute tests and the proxy-bypass tests
-    /// both touch that global, so they must not run concurrently — holding this
-    /// lock in every test that reads or writes the global makes the suite
-    /// deterministic instead of racing on shared proxy state.
-    static PROXY_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> =
-        std::sync::OnceLock::new();
-
-    /// RAII guard that installs a runtime proxy config for a test and restores
-    /// the default (proxy disabled) on drop — including on panic, so a failing
-    /// proxy-bypass test cannot leak its config into sibling tests. Serializes
-    /// against real-request execute tests via [`PROXY_TEST_LOCK`].
-    struct RuntimeProxyGuard {
-        _lock: tokio::sync::MutexGuard<'static, ()>,
-    }
-
-    impl RuntimeProxyGuard {
-        async fn install(config: ProxyConfig) -> Self {
-            let _lock = PROXY_TEST_LOCK
-                .get_or_init(|| tokio::sync::Mutex::new(()))
-                .lock()
-                .await;
-            set_runtime_proxy_config(config);
-            RuntimeProxyGuard { _lock }
-        }
-    }
-
-    impl Drop for RuntimeProxyGuard {
-        fn drop(&mut self) {
-            set_runtime_proxy_config(ProxyConfig::default());
-        }
-    }
-
-    /// Acquire the proxy test lock for a real-request execute test, so it does
-    /// not race with a sibling test that toggles the process-global runtime
-    /// proxy. `execute()` reads the global at dispatch time; holding the lock
-    /// for the test's whole duration keeps proxy state stable while reading it.
-    async fn proxy_test_lock_guard() -> tokio::sync::MutexGuard<'static, ()> {
-        PROXY_TEST_LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await
-    }
+    use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
 
     /// Scoped cleanup for the process-wide log broadcast hook: clears the hook
     /// on drop so a panicking assertion cannot leak the installed hook into
