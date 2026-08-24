@@ -63,6 +63,14 @@ enum Operation {
         #[arg(long, value_name = "SHA256")]
         expect_binary_sha256: Option<String>,
     },
+    /// Serve the same four operations as MCP tools over stdio (JSON-RPC 2.0).
+    ///
+    /// A harness speaks one uniform MCP interface for first-run: this
+    /// pre-install surface while ZeroClaw is absent, then `bootstrap.handoff`
+    /// replaces this process with `zeroclaw control --mcp` on the same pipe.
+    /// Installing still requires a human running `install --approve`; no MCP
+    /// call can install.
+    Mcp,
 }
 
 fn main() -> ExitCode {
@@ -119,6 +127,7 @@ fn run(cli: Cli) -> Result<(), BootstrapError> {
             }
             handoff::exec_control_server(&binary_path).map(|_| ())
         }
+        Operation::Mcp => zeroclaw_bootstrap::mcp::run_stdio_server(),
     }
 }
 

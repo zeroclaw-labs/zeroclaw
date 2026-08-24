@@ -54,6 +54,7 @@ pub mod error;
 pub mod fetch;
 pub mod handoff;
 pub mod install;
+pub mod mcp;
 pub mod origin;
 pub mod plan;
 pub mod status;
