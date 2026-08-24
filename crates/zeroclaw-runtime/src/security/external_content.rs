@@ -255,7 +255,7 @@ fn marker_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         Regex::new(r"(?i)<{2,}\s*(end[\s_-]*)?external[\s_-]*untrusted[\s_-]*content\b[^>]*>{2,}|(?:end[\s_-]*)?external[\s_-]*untrusted[\s_-]*content")
-            .unwrap()
+            .expect("static external-content marker regex must compile")
     })
 }
 
@@ -265,13 +265,16 @@ fn special_token_regex() -> &'static Regex {
         Regex::new(
             r"(?i)<\|(?:im_start|im_end|system|user|assistant|tool|begin_of_text|end_of_text|eot_id|start_header_id|end_header_id|reserved_special_token_\d+)\|>|\[/?(?:INST|SYS)\]|<s>|</s>",
         )
-        .unwrap()
+        .expect("static special-token regex must compile")
     })
 }
 
 fn reserved_special_token_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?i)<\|reserved_special_token_\d+\|>").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"(?i)<\|reserved_special_token_\d+\|>")
+            .expect("static reserved-token regex must compile")
+    })
 }
 
 #[cfg(test)]
