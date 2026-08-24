@@ -2420,7 +2420,9 @@ impl Agent {
                     &self.multimodal_config,
                     &self.model_provider_name,
                     &effective_model,
-                ) {
+                )
+                .await
+                {
                     Ok(resolved) => resolved,
                     Err(error) => {
                         let _ = self.trim_history(Some(&turn_id));
@@ -2767,7 +2769,9 @@ impl Agent {
                     &self.multimodal_config,
                     &self.model_provider_name,
                     &effective_model,
-                ) {
+                )
+                .await
+                {
                     Ok(resolved) => resolved,
                     Err(error) => {
                         let notice = self.trim_history(Some(&turn_id));

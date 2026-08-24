@@ -882,6 +882,8 @@ channel-runtime-thinking-invalid = 未知 thinking 等级 `{ $raw }`。使用 `/
 channel-runtime-provider-turn-init-failed =
     ⚠️ 初始化 model_provider `{ $provider }` 失败。请运行 `/models` 选择另一个 model_provider。
     详情：{ $error }
+channel-runtime-media-catalog-unavailable =
+    ⚠️ 无法检查 `{ $provider }` 是否支持图像输入，因为其模型目录暂时不可用（{ $error }）。图像未转发，也未发送任何请求。请稍后重试。
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` 不可用 — 已由 **{ $actual }**（`{ $model }`）响应
     切换模型：/models

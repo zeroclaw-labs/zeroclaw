@@ -1014,6 +1014,8 @@ channel-runtime-thinking-invalid = Unknown thinking level `{ $raw }`. Use `/thin
 channel-runtime-provider-turn-init-failed =
     ⚠️ Failed to initialize model_provider `{ $provider }`. Please run `/models` to choose another model_provider.
     Details: { $error }
+channel-runtime-media-catalog-unavailable =
+    ⚠️ Cannot check whether `{ $provider }` supports image input because its model catalog is temporarily unavailable ({ $error }). The image was not forwarded and no request was sent. Please try again shortly.
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` unavailable — response from **{ $actual }** (`{ $model }`)
     Switch model: /models

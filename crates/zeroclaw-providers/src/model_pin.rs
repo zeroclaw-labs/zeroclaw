@@ -87,6 +87,22 @@ impl ModelProvider for ModelPinnedProvider {
         self.inner.capabilities_for_model(&self.pinned_model)
     }
 
+    async fn resolve_capabilities_for_model(
+        &self,
+        _model: &str,
+    ) -> anyhow::Result<super::traits::ProviderCapabilities> {
+        // The pinned model selects the effective capabilities; delegate the
+        // whole resolve (warm + query) so a catalog outage on the inner
+        // provider fails the turn instead of degrading to the family default.
+        self.inner
+            .resolve_capabilities_for_model(&self.pinned_model)
+            .await
+    }
+
+    async fn warm_capabilities_metadata(&self) {
+        self.inner.warm_capabilities_metadata().await
+    }
+
     fn has_mixed_native_tool_support_for_model(&self, _model: &str) -> bool {
         self.inner
             .has_mixed_native_tool_support_for_model(&self.pinned_model)
@@ -246,6 +262,60 @@ impl zeroclaw_api::attribution::Attributable for ModelPinnedProvider {
 mod tests {
     use super::*;
     use crate::traits::ProviderCapabilities;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct WarmRecordingMock {
+        warm_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WarmRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.warm_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl zeroclaw_api::attribution::Attributable for WarmRecordingMock {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "WarmRecordingMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_capabilities_metadata_delegates_to_inner() {
+        let warm_calls = Arc::new(AtomicUsize::new(0));
+        let pinned = ModelPinnedProvider::builder("pinned")
+            .pinned_model("pinned-model")
+            .inner(Box::new(WarmRecordingMock {
+                warm_calls: Arc::clone(&warm_calls),
+            }))
+            .build();
+
+        pinned.warm_capabilities_metadata().await;
+
+        assert_eq!(
+            warm_calls.load(Ordering::SeqCst),
+            1,
+            "warm_capabilities_metadata must delegate to the pinned inner provider"
+        );
+    }
 
     struct ModelAwareCapabilityProvider;
 

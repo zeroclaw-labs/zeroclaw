@@ -523,6 +523,36 @@ pub trait ModelProvider: Send + Sync + crate::attribution::Attributable {
         capabilities
     }
 
+    /// Resolve the effective capabilities for `model`, atomically warming any
+    /// metadata the query depends on (e.g. a cached model catalog).
+    ///
+    /// Unlike a [`Self::warm_capabilities_metadata`] call followed by
+    /// [`Self::capabilities_for_model`], a failure to load that metadata
+    /// surfaces as an `Err` instead of silently degrading to the family
+    /// default. A caller at an image gate must treat an `Err` as "capability
+    /// unknown", never as "no vision": a transient metadata outage must not be
+    /// interpreted as an authoritative negative capability result that strips
+    /// an image attachment and dispatches a text-only request.
+    ///
+    /// Default implementation warms any metadata first, then queries — the same
+    /// "atomically warming" order wrapper providers rely on — and mirrors
+    /// [`Self::capabilities_for_model`] for providers whose capability query has
+    /// no external metadata to warm (`warm` is a no-op there).
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<ProviderCapabilities> {
+        self.warm_capabilities_metadata().await;
+        Ok(self.capabilities_for_model(model))
+    }
+
+    /// Warm any process-wide metadata the synchronous [`Self::capabilities_for_model`]
+    /// may depend on (e.g. a cached model catalog). Called once per turn from
+    /// async context, before the capability gate runs, so the sync query can
+    /// resolve model-aware capabilities instead of silently falling back to the
+    /// family default. Default no-op.
+    async fn warm_capabilities_metadata(&self) {}
+
     /// Whether the selected request can reach both native-tool and text-only
     /// candidates.
     ///
@@ -805,6 +835,17 @@ impl<T: ModelProvider + ?Sized> ModelProvider for Arc<T> {
 
     fn capabilities_for_model(&self, model: &str) -> ProviderCapabilities {
         self.as_ref().capabilities_for_model(model)
+    }
+
+    async fn warm_capabilities_metadata(&self) {
+        self.as_ref().warm_capabilities_metadata().await
+    }
+
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<ProviderCapabilities> {
+        self.as_ref().resolve_capabilities_for_model(model).await
     }
 
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
@@ -1143,5 +1184,58 @@ mod turn_order_tests {
         let mut msgs: Vec<ChatMessage> = vec![];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert!(msgs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod arc_delegation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct WarmRecordingMock {
+        warm_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WarmRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.warm_calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl crate::attribution::Attributable for WarmRecordingMock {
+        fn role(&self) -> crate::attribution::Role {
+            crate::attribution::Role::Provider(crate::attribution::ProviderKind::Model(
+                crate::attribution::ModelProviderKind::Custom,
+            ))
+        }
+        fn alias(&self) -> &str {
+            "WarmRecordingMock"
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_blanket_delegates_warm_capabilities_metadata() {
+        let warm_calls = Arc::new(AtomicUsize::new(0));
+        let wrapped: Arc<dyn ModelProvider> = Arc::new(WarmRecordingMock {
+            warm_calls: Arc::clone(&warm_calls),
+        });
+
+        wrapped.warm_capabilities_metadata().await;
+
+        assert_eq!(
+            warm_calls.load(Ordering::SeqCst),
+            1,
+            "the Arc<T> blanket must delegate warm_capabilities_metadata to the inner provider"
+        );
     }
 }

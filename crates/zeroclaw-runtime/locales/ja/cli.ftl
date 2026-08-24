@@ -883,6 +883,8 @@ channel-runtime-thinking-invalid = 不明な thinking レベル `{ $raw }` で�
 channel-runtime-provider-turn-init-failed =
     ⚠️ model_provider `{ $provider }` の初期化に失敗しました。`/models` を実行して別の model_provider を選択してください。
     詳細: { $error }
+channel-runtime-media-catalog-unavailable =
+    ⚠️ `{ $provider }` が画像入力に対応しているか確認できませんでした（モデルカタログが一時的に利用不可です: { $error }）。画像は転送されず、リクエストも送信されませんでした。しばらくして再試行してください。
 channel-runtime-fallback-footer =
     ⚡ `{ $requested }` は利用できません — **{ $actual }**（`{ $model }`）からの応答
     モデル切り替え: /models

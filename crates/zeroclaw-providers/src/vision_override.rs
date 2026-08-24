@@ -66,6 +66,31 @@ impl ModelProvider for VisionOverrideProvider {
         capabilities
     }
 
+    async fn resolve_capabilities_for_model(
+        &self,
+        model: &str,
+    ) -> anyhow::Result<super::traits::ProviderCapabilities> {
+        // An explicit `Some(true/false)` vision override is authoritative and
+        // needs no catalog fetch, so short-circuit before the async inner
+        // resolve: an image-bearing turn for such an alias must not start or
+        // wait on the models.dev fetch (or a downstream outage) just to confirm
+        // a decision that is already known. Non-vision capability fields still
+        // come from the inner provider's model-aware (sync) lookup.
+        if let Some(supports_vision) = self.supports_vision {
+            let mut capabilities = self.inner.capabilities_for_model(model);
+            capabilities.vision = supports_vision;
+            return Ok(capabilities);
+        }
+        // A `None` override fully delegates to the inner provider and propagates
+        // its error, so a catalog/outage failure surfaces as `Err` (capability
+        // unknown) rather than being swallowed into `Ok(vision=false)`.
+        self.inner.resolve_capabilities_for_model(model).await
+    }
+
+    async fn warm_capabilities_metadata(&self) {
+        self.inner.warm_capabilities_metadata().await
+    }
+
     fn has_mixed_native_tool_support_for_model(&self, model: &str) -> bool {
         self.inner.has_mixed_native_tool_support_for_model(model)
     }
@@ -297,6 +322,55 @@ mod tests {
         );
     }
 
+    struct WarmRecordingMock {
+        warm_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for WarmRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn warm_capabilities_metadata(&self) {
+            self.warm_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    impl Attributable for WarmRecordingMock {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Anthropic))
+        }
+        fn alias(&self) -> &str {
+            "warm_recording_mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn warm_capabilities_metadata_delegates_to_inner() {
+        let warm_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapped = VisionOverrideProvider::new(
+            Box::new(WarmRecordingMock {
+                warm_calls: std::sync::Arc::clone(&warm_calls),
+            }),
+            true,
+        );
+
+        wrapped.warm_capabilities_metadata().await;
+
+        assert_eq!(
+            warm_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "warm_capabilities_metadata must delegate to the inner provider"
+        );
+    }
+
     struct ModelAwareCapabilityFake;
 
     impl Attributable for ModelAwareCapabilityFake {
@@ -332,6 +406,68 @@ mod tests {
         ) -> anyhow::Result<String> {
             Ok(String::new())
         }
+    }
+
+    /// Records whether the async `resolve_capabilities_for_model` is ever
+    /// delegated to. Used to prove that an explicit vision override short-
+    /// circuits before the (network-bound) inner resolve.
+    struct ResolveRecordingMock {
+        resolve_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for ResolveRecordingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok(String::new())
+        }
+
+        async fn resolve_capabilities_for_model(
+            &self,
+            _model: &str,
+        ) -> anyhow::Result<ProviderCapabilities> {
+            self.resolve_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ProviderCapabilities::default())
+        }
+    }
+    impl Attributable for ResolveRecordingMock {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+        fn alias(&self) -> &str {
+            "resolve_recording_mock"
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_override_short_circuits_before_inner_resolve() {
+        let resolve_calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let wrapped = VisionOverrideProvider::new(
+            Box::new(ResolveRecordingMock {
+                resolve_calls: std::sync::Arc::clone(&resolve_calls),
+            }),
+            true,
+        );
+
+        let capabilities = wrapped
+            .resolve_capabilities_for_model("some-model")
+            .await
+            .expect("an explicit override resolves synchronously without an outage");
+        assert!(
+            capabilities.vision,
+            "the explicit Some(true) override applies"
+        );
+        assert_eq!(
+            resolve_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an explicit vision override must not invoke the inner async resolve"
+        );
     }
 
     #[test]
@@ -373,5 +509,68 @@ mod tests {
         let stable_inner = VisionOverrideProvider::factory_leaf(Box::new(PricedVisionFake), None);
         let stable = VisionOverrideProvider::new(Box::new(stable_inner), false);
         assert!(stable.has_stable_request_identity("model"));
+    }
+
+    /// Build the factory-shaped chain
+    /// `VisionOverrideProvider → ModelPinnedProvider → ReliableModelProvider`
+    /// around a credentialed compatible provider with a `models_dev_key`, given
+    /// an optional explicit vision override.
+    fn build_factory_chain(vision_override: Option<bool>) -> VisionOverrideProvider {
+        let compatible = crate::compatible::OpenAiCompatibleModelProvider::builder("test")
+            .display_name("factory-chain")
+            .base_url("https://example.com/v1")
+            .credential(Some("fake-key"))
+            .auth_style(crate::compatible::AuthStyle::Bearer)
+            .models_dev_key("factory-chain-key")
+            .build();
+        let reliable = crate::reliable::ReliableModelProvider::new(
+            "reliable-alias",
+            vec![("compatible".to_string(), Box::new(compatible))],
+            0,
+            100,
+        );
+        let pinned = crate::model_pin::ModelPinnedProvider::builder("pin-alias")
+            .pinned_model("some-model")
+            .inner(Box::new(reliable))
+            .build();
+        VisionOverrideProvider::factory_leaf(Box::new(pinned), vision_override)
+    }
+
+    /// A catalog outage on a credentialed compatible provider must surface as
+    /// `Err` through the entire factory-shaped chain, so an image gate can
+    /// treat the vision decision as unknown instead of silently stripping the
+    /// attachment. The outage is forced through the isolated resolve seam (a
+    /// fresh local cache + failing lifecycle), never the process-global
+    /// `CACHED_CATALOG` — so this test is order-independent.
+    #[tokio::test]
+    async fn factory_chain_forwarding_surfaces_catalog_outage() {
+        use crate::models_dev::ResolveCatalogIsolationGuard;
+        let _guard = ResolveCatalogIsolationGuard::install_with_failing_fetch().await;
+
+        let chain = build_factory_chain(None);
+        let result = chain.resolve_capabilities_for_model("some-model").await;
+        assert!(
+            result.is_err(),
+            "a catalog outbreak must fail the resolve through the whole chain, got {result:?}"
+        );
+    }
+
+    /// An explicit `Some(true)` override is authoritative: even when the inner
+    /// catalog fetch would fail, the known vision decision wins and the chain
+    /// returns `Ok` with `vision == true`.
+    #[tokio::test]
+    async fn factory_chain_explicit_override_is_authoritative_over_outage() {
+        use crate::models_dev::ResolveCatalogIsolationGuard;
+        let _guard = ResolveCatalogIsolationGuard::install_with_failing_fetch().await;
+
+        let chain = build_factory_chain(Some(true));
+        let capabilities = chain
+            .resolve_capabilities_for_model("some-model")
+            .await
+            .expect("an explicit vision override must stay authoritative over a catalog outbreak");
+        assert!(
+            capabilities.vision,
+            "an explicit Some(true) override must win even when the catalog fails"
+        );
     }
 }
