@@ -597,3 +597,8 @@ zc-config-footer-action-new-line = new line
 zc-config-field-edit-hint = { $keys } → press to edit
 
 zc-doctor-log-path = log: { $path }
+
+zc-oidc-enroll-visit = To sign in, visit { $uri } and enter code { $code }
+zc-oidc-enroll-waiting = Waiting for identity-provider approval (the code expires in { $seconds } seconds)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } is set with no auth_token. Set [connection.wss] enroll_url to the gateway's HTTP origin to sign in interactively, or export ZEROCLAW_AUTH_TOKEN (see: zeroclaw oidc login).
+zc-oidc-enroll-done = Signed in. The token is held for this session only; export ZEROCLAW_AUTH_TOKEN to skip enrollment next time.

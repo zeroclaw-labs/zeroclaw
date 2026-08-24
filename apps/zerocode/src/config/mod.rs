@@ -153,6 +153,14 @@ pub(crate) struct WssSection {
     /// to the daemon's `native` pairing provider when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_provider: Option<String>,
+    /// Gateway HTTP origin for interactive OIDC enrollment (e.g.
+    /// `https://gateway.example.com:9090`). Used only when
+    /// `auth_provider` names an `oidc.<alias>` provider and no
+    /// `auth_token` is available: zerocode then runs the device grant
+    /// through the gateway's enrollment API before connecting. The
+    /// token is held for the session only, never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enroll_url: Option<String>,
     #[serde(default, skip_serializing_if = "WssTlsSection::is_empty")]
     pub tls: WssTlsSection,
     /// Reach the daemon through a nominated relay at this `host:port` instead of
@@ -187,6 +195,7 @@ impl WssSection {
             && self.reprobe_secs.is_none()
             && self.auth_token.is_none()
             && self.auth_provider.is_none()
+            && self.enroll_url.is_none()
     }
 }
 

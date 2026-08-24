@@ -507,3 +507,8 @@ zc-config-footer-action-new-line = nueva línea
 zc-config-field-edit-hint = { $keys } → presiona para editar
 
 zc-doctor-log-path = log: { $path }
+
+zc-oidc-enroll-visit = Para iniciar sesión, abre { $uri } e introduce el código { $code }
+zc-oidc-enroll-waiting = Esperando la aprobación del proveedor de identidad (el código caduca en { $seconds } segundos)...
+zc-oidc-enroll-missing-url = auth_provider { $provider } está configurado sin auth_token. Configura [connection.wss] enroll_url con el origen HTTP de la pasarela para iniciar sesión interactivamente, o exporta ZEROCLAW_AUTH_TOKEN (ver: zeroclaw oidc login).
+zc-oidc-enroll-done = Sesión iniciada. El token se conserva solo durante esta sesión; exporta ZEROCLAW_AUTH_TOKEN para omitir la inscripción la próxima vez.

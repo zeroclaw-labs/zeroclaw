@@ -507,3 +507,8 @@ zc-config-footer-action-new-line = 换行
 zc-config-field-edit-hint = { $keys } → 按下以编辑
 
 zc-doctor-log-path = 日志：{ $path }
+
+zc-oidc-enroll-visit = 要登录,请打开 { $uri } 并输入代码 { $code }
+zc-oidc-enroll-waiting = 正在等待身份提供方批准(代码将在 { $seconds } 秒后过期)...
+zc-oidc-enroll-missing-url = 已设置 auth_provider { $provider } 但没有 auth_token。请将 [connection.wss] enroll_url 设置为网关的 HTTP 源以交互式登录,或导出 ZEROCLAW_AUTH_TOKEN(参见:zeroclaw oidc login)。
+zc-oidc-enroll-done = 已登录。令牌仅在本次会话中保留;导出 ZEROCLAW_AUTH_TOKEN 可跳过下次注册。
