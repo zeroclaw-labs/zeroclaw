@@ -139,7 +139,7 @@ Send a message to the agent and receive a response.
 
 **Response 200 (duplicate — idempotency key match):**
 ```json
-{"status": "duplicate", "idempotent": true, "message": "Request already processed for this idempotency key"}
+{"status": "duplicate", "idempotent": true, "message": "A prior request already reserved this idempotency key; no new dispatch was started"}
 ```
 
 **Response 401:**
@@ -446,10 +446,6 @@ These are incoming webhook endpoints for specific messaging channels. They're se
 ### WhatsApp (Meta Cloud API)
 - `GET /whatsapp` — verification (echoes `hub.challenge`)
 - `POST /whatsapp` — incoming messages (signature verified via `X-Hub-Signature-256`)
-
-### WATI (WhatsApp Business)
-- `GET /wati` — verification (echoes `challenge`)
-- `POST /wati` — incoming messages
 
 ### Linq (iMessage/RCS/SMS)
 - `POST /linq` — incoming messages (signature verified via `X-Webhook-Signature` + `X-Webhook-Timestamp`)

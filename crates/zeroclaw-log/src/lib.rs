@@ -22,6 +22,7 @@ pub mod __private {
     pub use ::serde_json;
     pub use ::tracing;
     pub use ::uuid;
+    pub use ::zeroclaw_api;
 }
 
 pub use broadcast::{
@@ -64,10 +65,13 @@ pub mod field {
 pub use migrate::migrate_legacy_jsonl_in_place;
 pub use observer_bridge::{clear_observer_bridge, set_observer_bridge};
 pub use reader::{LogFilter, LogPage, current_log_path, find_event_by_id, load_page};
-pub use subscriber::{install_global_subscriber, try_install_capture_subscriber};
+pub use subscriber::{
+    install_global_subscriber, try_install_capture_subscriber, try_install_line_sink_for_tests,
+};
 pub use tool_io::{ToolIoCapture, capture_llm_request, capture_tool_input, capture_tool_output};
 pub use writer::{
-    flush_for_test, init_from_config, llm_request_payload_policy, record_event, runtime_trace_path,
+    active_log_path, flush_for_test, init_from_config, llm_request_payload_policy, record_event,
+    runtime_trace_path,
 };
 
 mod r#macro;

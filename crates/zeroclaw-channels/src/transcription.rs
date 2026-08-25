@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use reqwest::multipart::{Form, Part};
+use reqwest::{
+    header::HeaderValue,
+    multipart::{Form, Part},
+};
 
 use zeroclaw_config::providers::{TranscriptionProviderEntry, TranscriptionProviders};
 use zeroclaw_config::schema::{Config, TranscriptionConfig};
@@ -12,6 +15,9 @@ const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
 /// Request timeout for transcription API calls (seconds).
 const TRANSCRIPTION_TIMEOUT_SECS: u64 = 120;
+
+const GOOGLE_STT_ENDPOINT: &str = "https://speech.googleapis.com/v1/speech:recognize";
+const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
 
 // ── Audio utilities ─────────────────────────────────────────────
 
@@ -648,6 +654,24 @@ impl GoogleSttProvider {
                 .unwrap_or_else(|| "en-US".to_string()),
         })
     }
+
+    fn sensitive_api_key_header(&self) -> Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(&self.api_key).map_err(|_| {
+            anyhow::Error::msg("Google STT API key contains invalid header characters")
+        })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    fn build_request(&self, request_body: &serde_json::Value) -> Result<reqwest::RequestBuilder> {
+        Ok(
+            zeroclaw_config::schema::build_runtime_proxy_client("transcription.google")
+                .post(GOOGLE_STT_ENDPOINT)
+                .header(GOOGLE_API_KEY_HEADER, self.sensitive_api_key_header()?)
+                .json(request_body)
+                .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS)),
+        )
+    }
 }
 
 #[async_trait]
@@ -666,8 +690,6 @@ impl TranscriptionProvider for GoogleSttProvider {
 
     async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
         let (normalized_name, _) = validate_audio(audio_data, file_name)?;
-
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.google");
 
         let encoding = match normalized_name
             .rsplit_once('.')
@@ -697,15 +719,8 @@ impl TranscriptionProvider for GoogleSttProvider {
             }
         });
 
-        let url = format!(
-            "https://speech.googleapis.com/v1/speech:recognize?key={}",
-            self.api_key
-        );
-
-        let resp = client
-            .post(&url)
-            .json(&request_body)
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
+        let resp = self
+            .build_request(&request_body)?
             .send()
             .await
             .context("Failed to send transcription request to Google STT")?;
@@ -735,15 +750,19 @@ impl TranscriptionProvider for GoogleSttProvider {
 pub struct LocalWhisperProvider {
     alias: String,
     url: String,
-    bearer_token: String,
+    bearer_token: Option<String>,
     max_audio_bytes: usize,
     timeout_secs: u64,
 }
 
 impl LocalWhisperProvider {
-    /// Build from config. Fails if `url` or `bearer_token` is empty, if `url`
-    /// is not a valid HTTP/HTTPS URL (scheme must be `http` or `https`), if
-    /// `max_audio_bytes` is zero, or if `timeout_secs` is zero.
+    /// Build from config. Fails if `url` is empty, if `url` is not a valid
+    /// HTTP/HTTPS URL (scheme must be `http` or `https`), if `max_audio_bytes`
+    /// is zero, or if `timeout_secs` is zero.
+    ///
+    /// `bearer_token` is optional: absent, empty, or whitespace-only all mean
+    /// "send no `Authorization` header", which is what a loopback whisper.cpp
+    /// server expects.
     pub fn from_config(
         alias: &str,
         config: &zeroclaw_config::schema::LocalWhisperConfig,
@@ -759,11 +778,27 @@ impl LocalWhisperProvider {
             parsed.scheme()
         );
 
-        let bearer_token = match config.bearer_token.as_deref().map(str::trim) {
-            None => anyhow::bail!("local_whisper: `bearer_token` must be set"),
-            Some("") => anyhow::bail!("local_whisper: `bearer_token` must not be empty"),
-            Some(t) => t.to_string(),
-        };
+        // `bearer_token` is OPTIONAL: the canonical local_whisper deployment is
+        // `whisper.cpp`'s own server bound to loopback, which implements no
+        // authentication at all — there is no token to supply. Requiring one
+        // made the only self-hosted STT backend impossible to configure: the
+        // field could be neither omitted nor left blank, and `from_config`
+        // returning `Err` means `TranscriptionManager` logs
+        // "local_whisper config invalid, provider skipped" and registers
+        // nothing. The agent then runs with NO transcription while looking
+        // healthy — no request is ever attempted, so there is no HTTP error to
+        // notice.
+        //
+        // An empty or whitespace-only value is treated as absent rather than as
+        // an error, so an unset key and a blank key behave the same way.
+        // Remote deployments behind a reverse proxy that DOES check auth still
+        // work by setting the value.
+        let bearer_token = config
+            .bearer_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
 
         anyhow::ensure!(
             config.max_audio_bytes > 0,
@@ -828,9 +863,15 @@ impl TranscriptionProvider for LocalWhisperProvider {
             .file_name(normalized_name)
             .mime_str(mime)?;
 
-        let resp = client
-            .post(&self.url)
-            .bearer_auth(&self.bearer_token)
+        let mut req = client.post(&self.url);
+        // Only send `Authorization` when a token is configured. whisper.cpp's
+        // server ignores unknown headers, but a proxy in front of it may reject
+        // a malformed or unexpected credential outright.
+        if let Some(token) = self.bearer_token.as_deref() {
+            req = req.bearer_auth(token);
+        }
+
+        let resp = req
             .multipart(Form::new().part("file", file_part))
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
             .send()
@@ -1692,6 +1733,61 @@ mod tests {
     }
 
     #[test]
+    fn google_stt_request_uses_sensitive_header_without_url_credential() {
+        let provider = GoogleSttProvider {
+            alias: "default".to_string(),
+            api_key: "api-key-123".to_string(),
+            language_code: "en-US".to_string(),
+        };
+        let body = serde_json::json!({
+            "config": { "languageCode": "en-US" },
+            "audio": { "content": "dGVzdA==" },
+        });
+
+        let request = provider.build_request(&body).unwrap().build().unwrap();
+
+        assert_eq!(request.url().as_str(), GOOGLE_STT_ENDPOINT);
+        assert!(!request.url().as_str().contains("api-key-123"));
+        assert!(!request.url().query_pairs().any(|(name, _)| name == "key"));
+
+        let header = request
+            .headers()
+            .get(GOOGLE_API_KEY_HEADER)
+            .expect("Google API key header");
+        assert_eq!(header.to_str().unwrap(), "api-key-123");
+        assert!(header.is_sensitive());
+
+        let payload = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .expect("JSON request body should be buffered");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(payload).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn google_stt_request_rejects_malformed_header_without_echoing_key() {
+        let api_key = "api-key-123\r\nleaked";
+        let provider = GoogleSttProvider {
+            alias: "default".to_string(),
+            api_key: api_key.to_string(),
+            language_code: "en-US".to_string(),
+        };
+
+        let err = match provider.build_request(&serde_json::json!({})) {
+            Ok(_) => panic!("malformed Google STT API key should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Google STT API key contains invalid header characters"
+        );
+        assert!(!err.to_string().contains(api_key));
+    }
+
+    #[test]
     fn manager_rejects_zero_global_max_audio_bytes() {
         let config = TranscriptionConfig {
             max_audio_bytes: Some(0),
@@ -1842,30 +1938,52 @@ mod tests {
         assert!(err.to_string().contains("http or https"), "got: {err}");
     }
 
+    // These two cases previously asserted that a missing or empty
+    // `bearer_token` was a hard error. That contract made the primary
+    // local_whisper deployment — whisper.cpp's own loopback server, which has
+    // no authentication — impossible to configure: the field could be neither
+    // omitted nor left blank. The tests are inverted rather than deleted so the
+    // reversal of intent stays visible in history.
     #[test]
-    fn local_whisper_rejects_empty_bearer_token() {
+    fn local_whisper_accepts_empty_bearer_token_as_absent() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.bearer_token = Some(String::new());
-        let err = LocalWhisperProvider::from_config("local_whisper", &cfg)
-            .err()
-            .unwrap();
+        let provider = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .expect("empty bearer_token must be accepted as 'no auth'");
         assert!(
-            err.to_string().contains("`bearer_token` must not be empty"),
-            "got: {err}"
+            provider.bearer_token.is_none(),
+            "empty token must normalize to None, not Some(\"\")"
         );
     }
 
     #[test]
-    fn local_whisper_rejects_missing_bearer_token() {
+    fn local_whisper_accepts_whitespace_bearer_token_as_absent() {
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.bearer_token = Some("   ".to_string());
+        let provider = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .expect("whitespace-only bearer_token must be accepted as 'no auth'");
+        assert!(
+            provider.bearer_token.is_none(),
+            "whitespace-only token must normalize to None"
+        );
+    }
+
+    #[test]
+    fn local_whisper_accepts_missing_bearer_token() {
         let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
         cfg.bearer_token = None;
-        let err = LocalWhisperProvider::from_config("local_whisper", &cfg)
-            .err()
-            .unwrap();
-        assert!(
-            err.to_string().contains("`bearer_token` must be set"),
-            "got: {err}"
-        );
+        let provider = LocalWhisperProvider::from_config("local_whisper", &cfg)
+            .expect("absent bearer_token must be accepted — whisper.cpp needs no auth");
+        assert!(provider.bearer_token.is_none());
+    }
+
+    #[test]
+    fn local_whisper_preserves_configured_bearer_token() {
+        // The inverse must still hold: a real token is kept verbatim, so
+        // deployments behind an authenticating proxy are unaffected.
+        let cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        let provider = LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
+        assert_eq!(provider.bearer_token.as_deref(), Some("test-token"));
     }
 
     #[test]
@@ -2006,7 +2124,7 @@ mod tests {
         assert_eq!(provider.max_audio_bytes, 25 * 1024 * 1024);
         assert_eq!(provider.timeout_secs, 300);
         assert_eq!(provider.url, "http://127.0.0.1:9999/v1/transcribe");
-        assert_eq!(provider.bearer_token, "test-token");
+        assert_eq!(provider.bearer_token.as_deref(), Some("test-token"));
     }
 
     /// Child-struct serde round-trip: TOML serialize + deserialize on a
@@ -2199,8 +2317,15 @@ mod tests {
         // registration. When transcription is enabled and no other provider
         // section is set, the safety net in TranscriptionManager surfaces
         // the error rather than returning a useless empty manager.
+        //
+        // The trigger is an INVALID URL SCHEME. This test previously used an
+        // empty `bearer_token`, which is no longer a misconfiguration: a
+        // loopback whisper.cpp server has no auth, so a blank token is the
+        // normal case. Re-anchored on a defect that is still genuinely a
+        // defect, so the safety-net invariant keeps being tested instead of
+        // being deleted along with the obsolete trigger.
         let mut bad_cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
-        bad_cfg.bearer_token = Some(String::new());
+        bad_cfg.url = "ftp://127.0.0.1:9999/v1/transcribe".to_string();
         let config = TranscriptionConfig {
             local_whisper: Some(bad_cfg),
             enabled: true,
@@ -2212,6 +2337,29 @@ mod tests {
             err.to_string()
                 .contains("no transcription provider registered"),
             "expected 'no transcription provider registered' from manager safety net, got: {err}"
+        );
+    }
+
+    #[test]
+    fn local_whisper_registers_with_blank_bearer_token() {
+        // The regression this PR exists to prevent: a blank token must produce
+        // a WORKING provider, not a skipped one. Before the fix this config
+        // logged "local_whisper config invalid, provider skipped" and left the
+        // agent with no STT at all while looking healthy.
+        let mut cfg = local_whisper_config("http://127.0.0.1:9999/v1/transcribe");
+        cfg.bearer_token = Some(String::new());
+        let config = TranscriptionConfig {
+            local_whisper: Some(cfg),
+            enabled: true,
+            ..TranscriptionConfig::default()
+        };
+
+        let manager = TranscriptionManager::new(&config)
+            .expect("blank bearer_token must not prevent provider registration");
+        assert!(
+            manager.available_providers().contains(&"local_whisper"),
+            "expected local_whisper registered with a blank token, got {:?}",
+            manager.available_providers()
         );
     }
 
@@ -2255,6 +2403,38 @@ mod tests {
     }
 
     // ── LocalWhisperProvider HTTP mock tests ────────────────────
+
+    #[tokio::test]
+    async fn local_whisper_omits_auth_header_when_no_token() {
+        // The wire-level half of the fix. `from_config` accepting `None` is not
+        // enough: what matters is that no `Authorization` header reaches the
+        // server. This mock only matches requests WITHOUT that header, so if
+        // the header is ever sent again the request goes unmatched and the call
+        // fails — catching a regression the unit test alone cannot see.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/inference"))
+            .and(|req: &wiremock::Request| !req.headers.contains_key("authorization"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"text": "sin auth"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut cfg = local_whisper_config(&format!("{}/inference", server.uri()));
+        cfg.bearer_token = None;
+        let provider = LocalWhisperProvider::from_config("local_whisper", &cfg).unwrap();
+
+        let result = provider
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .expect("request without Authorization must succeed against an unauthenticated server");
+        assert_eq!(result, "sin auth");
+    }
 
     #[tokio::test]
     async fn local_whisper_returns_text_from_response() {

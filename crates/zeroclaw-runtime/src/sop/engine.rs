@@ -1242,10 +1242,11 @@ impl SopEngine {
         }
     }
 
-    /// Load/reload SOPs from the configured directory.
-    pub fn reload(&mut self, workspace_dir: &Path) {
+    /// Load/reload SOPs from the configured directory, resolved against
+    /// `install_root` (the install root, `config_path`'s parent).
+    pub fn reload(&mut self, install_root: &Path) {
         self.sops = load_sops(
-            workspace_dir,
+            install_root,
             self.config.sops_dir.as_deref(),
             super::parse_execution_mode(&self.config.default_execution_mode),
         );
@@ -1732,6 +1733,7 @@ impl SopEngine {
             total_steps: u32::try_from(sop.steps.len()).unwrap_or(u32::MAX),
             started_at: now_iso8601(),
             completed_at: None,
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
@@ -1910,12 +1912,14 @@ impl SopEngine {
                 );
                 recorded.status = SopStepStatus::Failed;
                 recorded.output = full_reason;
-            } else if serde_json::from_str::<Value>(&result.output).is_err()
-                && output != Value::String(result.output.clone())
-            {
+            } else if jsonish_value(&result.output) != output {
                 // Canonicalize a schema-validated recovery at the model-output
                 // boundary. Downstream piping, retry, replay, and persisted run
-                // data can then keep their exact JSON-or-string parser.
+                // data re-parse the recorded text with the exact JSON-or-string
+                // parser, so the record must hold whatever value validation
+                // accepted — a fenced object recovered from prose and a
+                // double-encoded object unwrapped from a JSON string both
+                // differ from that re-parse until rewritten here.
                 recorded.output = output.to_string();
             }
         }
@@ -4824,6 +4828,33 @@ impl SopEngine {
             .find(|r| r.sop_name == sop_name)
     }
 
+    /// Attach the terminal cause to the run record itself, so a failed run
+    /// carries its own explanation wherever it is read back from (the store,
+    /// the Runs surface, `sop_status`) rather than only in a transcript that
+    /// may not exist for daemon-driven SOPs. Only `Failed` gets a cause; other
+    /// terminal statuses have nothing to explain.
+    fn stamp_failure_reason(run: &mut SopRun, status: SopRunStatus, reason: Option<&str>) {
+        if status == SopRunStatus::Failed {
+            run.failure_reason = reason.map(str::to_string);
+        }
+    }
+
+    /// Append the terminal `run_failed` audit row, mirroring the way the event
+    /// log already explains gates and promotions. Emitted only after the
+    /// terminal write succeeded, so a retained (failed-to-persist) run never
+    /// leaves a phantom failure row behind.
+    fn record_run_failed_event(&self, run_id: &str, status: SopRunStatus, reason: Option<&str>) {
+        if status != SopRunStatus::Failed {
+            return;
+        }
+        self.record_transition_event(
+            run_id,
+            "run_failed",
+            reason.map(str::to_string),
+            ::serde_json::json!({}),
+        );
+    }
+
     pub fn finish_run(
         &mut self,
         run_id: &str,
@@ -4837,9 +4868,11 @@ impl SopEngine {
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
         run.status = status;
         run.completed_at = Some(now_iso8601());
+        Self::stamp_failure_reason(&mut run, status, reason.as_deref());
         let sop_name = run.sop_name.clone();
         let run_id_owned = run.run_id.clone();
         self.persist_terminal(&run)?;
+        self.record_run_failed_event(run_id, status, reason.as_deref());
         self.claims_pending_persist.remove(run_id);
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.active_runs.remove(run_id);
@@ -4884,9 +4917,11 @@ impl SopEngine {
             .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
         run.status = status;
         run.completed_at = Some(now_iso8601());
+        Self::stamp_failure_reason(&mut run, status, reason.as_deref());
         let sop_name = run.sop_name.clone();
         let run_id_owned = run.run_id.clone();
         self.persist_terminal_with_gate_event(&run, event)?;
+        self.record_run_failed_event(run_id, status, reason.as_deref());
         self.claims_pending_persist.remove(run_id);
         self.claims_retained_after_terminal_rollback.remove(run_id);
         self.active_runs.remove(run_id);
@@ -6820,6 +6855,58 @@ mod tests {
     }
 
     #[test]
+    fn double_encoded_step_output_validates_and_pipes_as_declared_object() {
+        let mut sop = test_sop(
+            "schema-double-encoded-output",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        );
+        sop.steps[0].schema = Some(StepSchema {
+            input: None,
+            output: Some(required_object_schema("ok")),
+        });
+        sop.steps[1].schema = Some(StepSchema {
+            input: Some(required_object_schema("ok")),
+            output: None,
+        });
+        let mut engine = engine_with_sops(vec![sop]);
+        let action = engine
+            .start_run("schema-double-encoded-output", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Completed,
+                    output: serde_json::to_string(r#"{"ok":true}"#).unwrap(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::ExecuteStep { ref step, .. } if step.number == 2),
+            "the unwrapped object must satisfy step 1 output and step 2 input schemas"
+        );
+        assert_eq!(
+            engine.active_runs()[&run_id].step_results[0].output,
+            r#"{"ok":true}"#,
+            "the record must hold the canonical object, not the escaped string"
+        );
+        assert_eq!(
+            super::step_input_value(&engine.active_runs()[&run_id], 2),
+            serde_json::json!({"ok": true}),
+            "the next step must be piped the object, not a string"
+        );
+    }
+
+    #[test]
     fn wrapped_step_output_validates_and_pipes_as_declared_object() {
         let mut sop = test_sop(
             "schema-wrapped-output",
@@ -7235,6 +7322,110 @@ mod tests {
         assert!(matches!(action, SopRunAction::ExecuteStep { .. }));
     }
 
+    // ── Failure cause retention ────────────
+
+    /// A failed run must record WHY it failed. Regression coverage: the
+    /// reason was accepted by `finish_run` and dropped, so a terminal `failed`
+    /// row carried no cause and the event log had no terminal failure row —
+    /// leaving unattended runs undiagnosable once the transcript was gone.
+    #[test]
+    fn failed_run_retains_its_failure_reason_and_records_a_terminal_event() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // Default `on_failure` is `Fail`, so a failed step result routes
+        // straight to a terminal failure carrying the step's output as cause.
+        let action = engine
+            .advance_step(
+                &run_id,
+                SopStepResult {
+                    step_number: 1,
+                    status: SopStepStatus::Failed,
+                    output: "disk quota exceeded".into(),
+                    started_at: now_iso8601(),
+                    completed_at: Some(now_iso8601()),
+                    effective_agent: None,
+                    tool_calls: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(action, SopRunAction::Failed { .. }));
+
+        // 1. The in-memory terminal record explains itself.
+        let finished = engine.get_run(&run_id).expect("a retained terminal run");
+        assert_eq!(finished.status, SopRunStatus::Failed);
+        let reason = finished
+            .failure_reason
+            .as_deref()
+            .expect("a failed run must record its cause, not just its status");
+        assert!(
+            reason.contains("disk quota exceeded"),
+            "the cause must name what actually went wrong, got: {reason}"
+        );
+
+        // 2. The durable terminal row carries it too — this is what an operator
+        //    reads back from `runs.db` after a restart, with no transcript.
+        let persisted = store
+            .load_run(&run_id)
+            .unwrap()
+            .expect("a terminal row in the store");
+        assert_eq!(persisted.run.status, SopRunStatus::Failed);
+        assert_eq!(
+            persisted.run.failure_reason.as_deref(),
+            Some(reason),
+            "the persisted terminal row must carry the same cause as the in-memory record"
+        );
+
+        // 3. The audit trail explains the terminal transition the way it already
+        //    explains gates and promotions.
+        let events = engine.run_events(&run_id).unwrap();
+        let failure_event = events
+            .iter()
+            .find(|event| event.kind == "run_failed")
+            .expect("a terminal failure must append a run_failed audit row");
+        assert_eq!(failure_event.reason.as_deref(), Some(reason));
+    }
+
+    /// The cause is failure-only: completing or cancelling a run must not
+    /// invent one, and must not append a `run_failed` audit row.
+    #[test]
+    fn non_failed_terminal_runs_record_no_failure_cause() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine.cancel_run(&run_id).unwrap();
+
+        let finished = engine.get_run(&run_id).expect("a retained terminal run");
+        assert_eq!(finished.status, SopRunStatus::Cancelled);
+        assert!(
+            finished.failure_reason.is_none(),
+            "a cancelled run has no failure to explain"
+        );
+        assert!(
+            engine
+                .run_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "run_failed"),
+            "only a Failed terminal transition may append a run_failed row"
+        );
+    }
+
     // ── Concurrency ─────────────────────────────────────
 
     #[test]
@@ -7363,6 +7554,7 @@ mod tests {
                 total_steps: 2,
                 started_at: now.clone(),
                 completed_at: None,
+                failure_reason: None,
                 step_results: Vec::new(),
                 waiting_since: Some(now),
                 llm_calls_saved: 0,
@@ -7413,6 +7605,7 @@ mod tests {
                     total_steps: 2,
                     started_at: now.clone(),
                     completed_at: None,
+                    failure_reason: None,
                     step_results: Vec::new(),
                     waiting_since: Some(now.clone()),
                     llm_calls_saved: 0,
@@ -7456,6 +7649,7 @@ mod tests {
                 total_steps: 1,
                 started_at: now.clone(),
                 completed_at: None,
+                failure_reason: None,
                 step_results: Vec::new(),
                 waiting_since: None,
                 llm_calls_saved: 0,
@@ -8136,6 +8330,7 @@ mod tests {
                 total_steps: 2,
                 started_at: now.clone(),
                 completed_at: None,
+                failure_reason: None,
                 step_results: Vec::new(),
                 waiting_since: None,
                 llm_calls_saved: 0,
@@ -8667,6 +8862,7 @@ mod tests {
             total_steps: 2,
             started_at: now_iso8601(),
             completed_at: None,
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
@@ -9551,6 +9747,7 @@ mod tests {
             total_steps: 2,
             started_at: now.clone(),
             completed_at: None,
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: Some(now.clone()),
             llm_calls_saved: 0,
@@ -9604,6 +9801,7 @@ mod tests {
             total_steps: 2,
             started_at: now.clone(),
             completed_at: None,
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: Some(now.clone()),
             llm_calls_saved: 0,
@@ -9672,6 +9870,7 @@ mod tests {
             total_steps: 2,
             started_at: now.clone(),
             completed_at: None,
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: Some(now.clone()),
             llm_calls_saved: 0,
@@ -11436,6 +11635,7 @@ mod tests {
                 total_steps: 2,
                 started_at: now.clone(),
                 completed_at: None,
+                failure_reason: None,
                 step_results: Vec::new(),
                 waiting_since: Some(now),
                 llm_calls_saved: 0,
@@ -13672,11 +13872,21 @@ type = "manual"
             .last_finished_run("cp-deny")
             .expect("denied run reached the finished list");
         assert_eq!(run.status, SopRunStatus::Failed);
+        let failure_reason = run
+            .failure_reason
+            .as_deref()
+            .expect("a denied checkpoint must retain its terminal reason");
+        assert!(failure_reason.contains("not appropriate"));
         let events = engine.run_events(&run_id).unwrap_or_default();
         assert!(
             events.iter().any(|ev| ev.kind == "gate_resolved"),
             "checkpoint deny must append a gate_resolved ledger row: {events:?}"
         );
+        let failure_event = events
+            .iter()
+            .find(|event| event.kind == "run_failed")
+            .expect("checkpoint denial must append a terminal failure row");
+        assert_eq!(failure_event.reason.as_deref(), Some(failure_reason));
     }
 
     /// `capability(noop) -> checkpoint(edit: body) -> capability(noop)`: the
@@ -14275,6 +14485,7 @@ type = "manual"
             total_steps: 2,
             started_at: now_iso8601(),
             completed_at: None,
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: Some(now_iso8601()),
             llm_calls_saved: 0,
@@ -14319,6 +14530,7 @@ type = "manual"
             total_steps: 2,
             started_at: now_iso8601(),
             completed_at: None,
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,
@@ -14915,6 +15127,7 @@ type = "manual"
             total_steps: 1,
             started_at: now_iso8601(),
             completed_at: None,
+            failure_reason: None,
             step_results: Vec::new(),
             waiting_since: None,
             llm_calls_saved: 0,

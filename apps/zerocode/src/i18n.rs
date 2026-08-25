@@ -84,8 +84,12 @@ fn load_strings(locale: &str) -> HashMap<String, String> {
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier: LanguageIdentifier =
-        locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+    let language_identifier: LanguageIdentifier = match locale.parse() {
+        Ok(identifier) => identifier,
+        Err(_) => "en"
+            .parse()
+            .expect("static English Fluent locale must parse"),
+    };
     let mut bundle = FluentBundle::new(vec![language_identifier]);
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);
@@ -129,7 +133,7 @@ fn load_ftl_from_disk(locale: &str) -> Option<String> {
 /// `client::resolve_config_dir`: the `--config-dir` flag (passed to `init` and
 /// cached in `CONFIG_DIR`) first, then `ZEROCLAW_CONFIG_DIR`, then `~/.zeroclaw`.
 /// This keeps the FTL read path aligned with the flag the rest of zerocode uses.
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     if let Some(dir) = CONFIG_DIR.get() {
         return dir.clone();
     }
@@ -179,8 +183,12 @@ fn format_ftl_message(
 ) -> Option<String> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier: LanguageIdentifier =
-        locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+    let language_identifier: LanguageIdentifier = match locale.parse() {
+        Ok(identifier) => identifier,
+        Err(_) => "en"
+            .parse()
+            .expect("static English Fluent locale must parse"),
+    };
     let mut bundle = FluentBundle::new(vec![language_identifier]);
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);
@@ -227,6 +235,82 @@ mod tests {
         .unwrap();
         assert!(mismatch.contains("0.8.1"));
         assert!(mismatch.contains("0.8.0"));
+    }
+
+    // Every Config-pane key the zerocode UI section renders must resolve
+    // through the *same* Fluent bundle the TUI uses, never falling back to the
+    // raw `{key}` identifier. Code and catalog can drift independently, so this
+    // pins the exact keys `zerocode_pane.rs` looks up for the Todo tracker UI.
+    #[test]
+    fn todo_tracker_config_keys_resolve() {
+        let map = format_ftl_messages(EN_FTL, "en");
+        const KEYS: &[&str] = &[
+            // Section tabs
+            "zc-zerocode-tab-todo-tracker",
+            // Todo tracker section
+            "zc-zerocode-tracker-title",
+            "zc-zerocode-tracker-enabled",
+            "zc-zerocode-tracker-enabled-at-start",
+            "zc-zerocode-tracker-location",
+            "zc-zerocode-tracker-width",
+            "zc-zerocode-tracker-max-height",
+            "zc-zerocode-tracker-saved",
+            "zc-zerocode-tracker-saved-env-override",
+            "zc-zerocode-tracker-saved-resolve-error",
+            "zc-zerocode-tracker-saved-still-invalid",
+            "zc-zerocode-tracker-edit-refused",
+            "zc-zerocode-tracker-edit-number",
+            "zc-zerocode-tracker-edit-bool",
+            "zc-zerocode-tracker-edit-location",
+            // Shared Config-pane validation/status keys
+            "zc-zerocode-config-invalid-number",
+            "zc-zerocode-config-positive-required",
+            "zc-zerocode-config-save-mismatch",
+            // Help hints
+            "zc-zerocode-help-todo-tracker",
+        ];
+        for key in KEYS {
+            let value = map
+                .get(*key)
+                .unwrap_or_else(|| panic!("catalog missing Config-pane key `{key}`"));
+            assert!(
+                !value.is_empty(),
+                "catalog key `{key}` resolved to an empty string"
+            );
+            // `t()` must not fall back to the raw `{key}` brace form.
+            assert_ne!(
+                t(key),
+                format!("{{{key}}}"),
+                "key `{key}` renders as its raw identifier instead of a translation"
+            );
+        }
+        let save_failed = format_ftl_message(
+            EN_FTL,
+            "en",
+            "zc-zerocode-config-save-failed",
+            &[("error", "disk unavailable")],
+        )
+        .expect("argument-bearing Config-pane save error key must format");
+        assert!(save_failed.contains("disk unavailable"));
+        assert_ne!(
+            t_args(
+                "zc-zerocode-config-save-failed",
+                &[("error", "disk unavailable")]
+            ),
+            "{zc-zerocode-config-save-failed}"
+        );
+
+        // The malformed-section prompt carries the parser detail, so it is
+        // argument-bearing too and cannot be checked by the no-arg loop above.
+        let load_error = format_ftl_message(
+            EN_FTL,
+            "en",
+            "zc-zerocode-tracker-load-error",
+            &[("error", "invalid type: string")],
+        )
+        .expect("argument-bearing tracker load error key must format");
+        assert!(load_error.contains("invalid type: string"));
+        assert!(load_error.contains("[todotracker]"));
     }
 
     #[test]
@@ -281,6 +365,90 @@ mod tests {
             )
             .unwrap_or_else(|| panic!("spawned-daemon failure must format for {locale}"));
             assert!(failure.contains("test failure"));
+        }
+    }
+
+    #[test]
+    fn doctor_persistence_keys_present_in_all_builtin_catalogues() {
+        // The Doctor view surfaces four persistence keys in the detail panel.
+        // Every shipped catalogue must define them so the operator-facing
+        // diagnostics never fall back to a bare `{key}` placeholder.
+        let catalogues = [
+            ("en", EN_FTL),
+            ("es", include_str!("../locales/es/zerocode.ftl")),
+            ("fr", include_str!("../locales/fr/zerocode.ftl")),
+            ("ja", include_str!("../locales/ja/zerocode.ftl")),
+            ("zh-CN", include_str!("../locales/zh-CN/zerocode.ftl")),
+        ];
+
+        for (locale, source) in catalogues {
+            for key in [
+                "zc-doctor-error-daemon-timeout",
+                "zc-doctor-partial-banner",
+                "zc-doctor-partial-hint",
+            ] {
+                assert!(
+                    format_ftl_message(source, locale, key, &[]).is_some(),
+                    "{key} must be defined for {locale}"
+                );
+            }
+
+            let log_path = format_ftl_message(
+                source,
+                locale,
+                "zc-doctor-log-path",
+                &[("path", "/tmp/trace-2026-08-01.jsonl")],
+            )
+            .unwrap_or_else(|| panic!("zc-doctor-log-path must format for {locale}"));
+            assert!(
+                log_path.contains("/tmp/trace-2026-08-01.jsonl"),
+                "zc-doctor-log-path must embed the resolved path for {locale}: {log_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_process_labels_are_explicit_in_all_builtin_catalogues() {
+        let catalogues = [
+            ("en", EN_FTL, "Daemon Memory", "Daemon CPU"),
+            (
+                "es",
+                include_str!("../locales/es/zerocode.ftl"),
+                "Memoria del demonio",
+                "CPU del demonio",
+            ),
+            (
+                "fr",
+                include_str!("../locales/fr/zerocode.ftl"),
+                "Mémoire du démon",
+                "CPU du démon",
+            ),
+            (
+                "ja",
+                include_str!("../locales/ja/zerocode.ftl"),
+                "デーモンメモリ",
+                "デーモン CPU",
+            ),
+            (
+                "zh-CN",
+                include_str!("../locales/zh-CN/zerocode.ftl"),
+                "守护进程内存",
+                "守护进程 CPU",
+            ),
+        ];
+
+        for (locale, source, expected_memory, expected_cpu) in catalogues {
+            assert_eq!(
+                format_ftl_message(source, locale, "zc-dashboard-label-daemon-memory", &[],)
+                    .as_deref(),
+                Some(expected_memory),
+                "daemon memory label for {locale}"
+            );
+            assert_eq!(
+                format_ftl_message(source, locale, "zc-dashboard-label-daemon-cpu", &[]).as_deref(),
+                Some(expected_cpu),
+                "daemon CPU label for {locale}"
+            );
         }
     }
 

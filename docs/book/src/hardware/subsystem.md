@@ -15,7 +15,7 @@ Transports the subsystem speaks:
 
 See [Peripherals design](./hardware-peripherals-design.md) for the architecture
 and the per-board setup guides ([Nucleo](./nucleo-setup.md),
-[Arduino Uno Q](./arduino-uno-q-setup.md), [Aardvark](./aardvark.md),
+[Arduino Uno Q](./arduino-uno-q-setup.md),
 [Raspberry Pi](./raspberry-pi-setup.md), [Android](./android-setup.md)) for
 wiring each one up.
 
@@ -42,10 +42,6 @@ The hardware features are `hardware` (core subsystem), `peripheral-rpi`
 With the `hardware` feature, the agent gains these built-in tools:
 
 {{#include ../_snippets/hardware-tools-base.md}}
-
-When an Aardvark adapter is connected at startup, these additional tools load:
-
-{{#include ../_snippets/hardware-tools-aardvark.md}}
 
 All tool invocations go through the same [security policy](../security/overview.md) as any other tool. Hardware tools only reach the device paths explicitly listed in `[[peripherals.boards]]` entries:
 
@@ -80,7 +76,6 @@ The stock systemd unit sets `SupplementaryGroups=gpio spi i2c`.
 Hardware tools can brick things. Real, expensive things.
 
 - `pico_flash` writes firmware; a bad image can brick the board. The tool requires operator approval at `Supervised` autonomy regardless of autonomy level; there's no way to auto-approve it.
-- `i2c_write` / `spi_transfer` to device addresses the agent doesn't know can damage sensors.
 - GPIO writes that conflict with external drivers (voltage fights) damage pins.
 
 For production deployments with untrusted channels exposed, keep hardware tools off non-CLI channels via the global `autonomy.non_cli_excluded_tools` list (the schema has no per-channel `tools_deny` field). Tools listed there are omitted from the tool specs sent to the model on every non-CLI channel (Discord, Telegram, Bluesky, etc.). The local CLI still sees them.

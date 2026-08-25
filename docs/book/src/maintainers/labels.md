@@ -121,7 +121,7 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `runtime` | `src/runtime/**`, `crates/zeroclaw-runtime/src/**` |
 | `quickstart` | `crates/zeroclaw-runtime/src/quickstart/**`, `crates/zeroclaw-gateway/src/api_quickstart.rs`, `apps/zerocode/src/quickstart_pane.rs`, `web/src/pages/quickstart/**` |
 | `desktop` | `apps/tauri/**` |
-| `hardware` | `src/hardware/**`, `crates/zeroclaw-hardware/**`, `crates/robot-kit/**`, `crates/aardvark-sys/**`, `firmware/**` |
+| `hardware` | `src/hardware/**`, `crates/zeroclaw-hardware/**`, `firmware/**` |
 | `web` | `web/**` |
 | `zerocode` | `apps/zerocode/**` |
 | `provider` | `src/providers/**`, `crates/zeroclaw-providers/src/**` |
@@ -223,7 +223,6 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:slack` | `slack.rs` |
 | `channel:telegram` | `telegram.rs` |
 | `channel:twitter` | `twitter.rs` |
-| `channel:wati` | `wati.rs` |
 | `channel:wechat` | `crates/zeroclaw-channels/src/wechat.rs` |
 | `channel:webhook` | `webhook.rs` |
 | `channel:wecom` | `wecom.rs`, `wecom_ws.rs` |
@@ -383,7 +382,8 @@ Applied manually: the auto-response automation that used to handle these was rem
 |---|---|
 | `r:needs-repro` | Incomplete bug report; request a deterministic repro |
 | `r:support` | Usage / help item better handled outside the bug backlog |
-| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. This is not a stale warning by itself. |
+| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. For RFCs, apply it after a `REVISE` outcome while the author prepares the revision; remove it and restore `needs-maintainer-review` when a revised stable proposal is ready for Core action. This is not a stale warning by itself. |
+| `needs-maintainer-review` | A maintainer decision, review, or vote action is pending. On RFCs, use this while substantive Core discussion or ratification action is needed; remove it when the decision is recorded or the next action moves to the author or implementation. This label does not imply acceptance, ownership, or stale protection. |
 | `stale-candidate` | Dormant PR that is a candidate for closing. Follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). Issue stale passes use `status:stale` instead. |
 
 ## Workflow labels
@@ -392,6 +392,7 @@ Applied manually to make cross-artifact coordination visible. These labels do no
 
 | Label | Purpose |
 |---|---|
+| `do-not-merge` | Explicit maintainer or governance hold on a PR. Use it with `status:blocked` when a PR is held by an external dependency, policy decision, or prerequisite that GitHub's native review and check state does not enforce, especially when the PR otherwise appears mergeable. When applying it, leave a PR comment that names the blocker, the condition for removing `do-not-merge` and any companion blocked label, and the checks required before merge; reviews and linked issues may support that record but do not replace it. Pair it with `needs-maintainer-review` when a high-risk PR is explicitly routed for another independent Core Team approval. Use it for future-line work that must not land on the active release line. Do not apply it merely for pending CI, draft state, a behind branch, ordinary review, or active `CHANGES_REQUESTED`. Remove it only after the recorded condition clears and a maintainer rechecks the current native review state, required checks, mergeability, [Definition of Done](./pr-workflow.md#definition-of-done-dod), and [merge checklist](./pr-workflow.md#maintainer-merge-checklist). |
 | `follow-up` | Scope deliberately carved out from a parent issue or PR; link the parent so the relationship is visible |
 | `release-gate` | Finding or work item that must be reconciled for the named release gate |
 | `stacked` | PR depends on another PR; include an explicit `Depends on #...` reference and merge it after its base |

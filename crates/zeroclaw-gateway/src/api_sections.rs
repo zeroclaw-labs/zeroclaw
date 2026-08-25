@@ -1388,7 +1388,6 @@ mod tests {
                 ),
             ),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: std::sync::Arc::new(zeroclaw_runtime::security::pairing::PairingGuard::new(
                 false,
                 &[],
@@ -1412,8 +1411,6 @@ mod tests {
             nextcloud_talk: std::collections::HashMap::new(),
             #[cfg(feature = "channel-nextcloud")]
             nextcloud_talk_webhook_secret: std::collections::HashMap::new(),
-            #[cfg(feature = "channel-wati")]
-            wati: std::collections::HashMap::new(),
             #[cfg(feature = "channel-email")]
             gmail_push: None,
             observer: std::sync::Arc::new(zeroclaw_runtime::observability::NoopObserver),

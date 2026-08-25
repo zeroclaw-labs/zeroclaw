@@ -7,12 +7,14 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::schema::Config;
 
 pub struct CronAddTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    runtime: Arc<dyn RuntimeAdapter>,
     /// Owning agent — the alias of the agent whose tool loop registered
     /// this tool instance. Cron jobs created here are validated against
     /// this agent's risk profile and run as this agent.
@@ -20,16 +22,31 @@ pub struct CronAddTool {
 }
 
 impl CronAddTool {
+    pub fn new_with_runtime(
+        config: Arc<Config>,
+        security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
+        runtime: Arc<dyn RuntimeAdapter>,
+    ) -> Self {
+        Self {
+            config,
+            security,
+            runtime,
+            agent_alias: agent_alias.into(),
+        }
+    }
+
+    #[cfg(test)]
     pub fn new(
         config: Arc<Config>,
         security: Arc<SecurityPolicy>,
         agent_alias: impl Into<String>,
     ) -> Self {
-        Self {
-            config,
-            security,
-            agent_alias: agent_alias.into(),
-        }
+        let runtime = Arc::from(
+            crate::platform::create_runtime(&config.runtime)
+                .expect("test config must construct its runtime"),
+        );
+        Self::new_with_runtime(config, security, agent_alias, runtime)
     }
 
     fn plain_string_schedule_error(raw: &str) -> Option<String> {
@@ -256,7 +273,7 @@ impl Tool for CronAddTool {
                 },
                 "delivery": {
                     "type": "object",
-                    "description": "Optional delivery config to send job output to a channel after each run. When provided, all three of mode, channel, and to are expected.",
+                    "description": "Optional delivery config to send job output to a channel after each run. When created from a chat turn, omitted fields default to announcing back to that conversation.",
                     "properties": {
                         "mode": {
                             "type": "string",
@@ -265,8 +282,8 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": cron::CRON_DELIVERY_SCHEMA_CHANNELS,
-                            "description": "Channel type to deliver output to"
+                            "pattern": cron::cron_delivery_channel_pattern(),
+                            "description": "Channel to deliver output to: either a channel type ('telegram') or a configured instance's composite key ('telegram.work'). Supported types: telegram, discord, slack, mattermost, matrix, qq, whatsapp, webhook, lark, feishu, dingtalk, wechat, signal, email. From a chat turn this resolves to that conversation's own channel instance; pass the composite key to deliver elsewhere."
                         },
                         "to": {
                             "type": "string",
@@ -366,7 +383,15 @@ impl Tool for CronAddTool {
                 });
             }
             None => {
-                if args.get("prompt").is_some() {
+                // Infer agent only when prompt has non-blank content. A present
+                // but null/empty/whitespace `prompt` key must not forge Agent
+                // (and then fail "Missing 'prompt'") when a shell command is
+                // supplied — match the content check used below for agent jobs.
+                if args
+                    .get("prompt")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|prompt| !prompt.trim().is_empty())
+                {
                     JobType::Agent
                 } else {
                     JobType::Shell
@@ -410,11 +435,16 @@ impl Tool for CronAddTool {
                     }
                 };
 
-                if let Err(reason) = self.security.validate_command_execution(command, approved) {
+                if let Err(reason) = cron::validate_shell_command_with_security(
+                    self.runtime.as_ref(),
+                    &self.security,
+                    command,
+                    approved,
+                ) {
                     return Ok(ToolResult {
                         success: false,
                         output: ToolOutput::default(),
-                        error: Some(reason),
+                        error: Some(reason.to_string()),
                     });
                 }
 
@@ -427,8 +457,10 @@ impl Tool for CronAddTool {
                     Err(error) => return Ok(schedule_error_result(error)),
                 };
 
-                cron::add_shell_job_with_approval(
+                cron::add_shell_job_with_runtime(
                     &self.config,
+                    self.runtime.as_ref(),
+                    &self.security,
                     &self.agent_alias,
                     name,
                     schedule,
@@ -1087,6 +1119,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn blank_or_null_prompt_without_job_type_infers_shell_when_command_present() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        for prompt in [json!(null), json!(""), json!("   ")] {
+            let result = tool
+                .execute(json!({
+                    "schedule": { "kind": "cron", "expr": "*/5 * * * *" },
+                    "command": "echo ok",
+                    "prompt": prompt,
+                }))
+                .await
+                .unwrap();
+            assert!(
+                result.success,
+                "prompt={prompt:?} should infer shell, got error={:?}",
+                result.error
+            );
+        }
+
+        let jobs = cron::list_jobs(&cfg).unwrap();
+        assert_eq!(jobs.len(), 3);
+        assert!(jobs.iter().all(|job| job.command == "echo ok"));
+    }
+
+    #[tokio::test]
     async fn agent_job_persists_allowed_tools() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -1161,18 +1220,36 @@ mod tests {
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
 
         let schema = tool.parameters_schema();
-        let values: Vec<&str> = schema["properties"]["delivery"]["properties"]["channel"]["enum"]
-            .as_array()
-            .expect("delivery.channel must have an enum")
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect();
+        let pattern = schema["properties"]["delivery"]["properties"]["channel"]["pattern"]
+            .as_str()
+            .expect("delivery.channel must declare a pattern")
+            .to_string();
+        let channel = regex::Regex::new(&pattern).expect("delivery.channel pattern must compile");
 
-        assert_eq!(values.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
-        assert!(values.contains(&"dingtalk"));
-        assert!(values.contains(&"wechat"));
-        assert!(values.contains(&"signal"));
-        assert!(values.contains(&"email"));
+        // Every supported type is still admitted on its own ...
+        for supported in cron::CRON_DELIVERY_SCHEMA_CHANNELS {
+            assert!(
+                channel.is_match(supported),
+                "{supported} must be a valid delivery channel"
+            );
+        }
+        assert!(channel.is_match("dingtalk"));
+        assert!(channel.is_match("wechat"));
+        assert!(channel.is_match("signal"));
+        assert!(channel.is_match("email"));
+
+        // ... and so is the composite key the description tells the model to use.
+        assert!(
+            channel.is_match("telegram.work"),
+            "an aliased instance must satisfy the declared schema"
+        );
+        assert!(channel.is_match("discord.team-2"));
+        assert!(channel.is_match("telegram.pa_telegram"));
+
+        // Guidance is still machine-readable: unknown types stay rejected.
+        assert!(!channel.is_match("sms"));
+        assert!(!channel.is_match("telegram."));
+        assert!(!channel.is_match("telegram.work.extra"));
     }
 
     #[tokio::test]
@@ -1182,17 +1259,17 @@ mod tests {
         let tool = CronAddTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
         let schema = tool.parameters_schema();
 
-        let channel_enum = schema["properties"]["delivery"]["properties"]["channel"]["enum"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let pattern = schema["properties"]["delivery"]["properties"]["channel"]["pattern"]
+            .as_str()
+            .expect("delivery.channel must declare a pattern");
+        let channel = regex::Regex::new(pattern).expect("channel pattern must compile");
         assert!(
-            channel_enum.iter().any(|value| value == "webhook"),
-            "delivery.channel enum must include webhook"
+            channel.is_match("webhook"),
+            "delivery.channel must admit webhook"
         );
         assert!(
-            channel_enum.iter().any(|value| value == "whatsapp"),
-            "delivery.channel enum must include whatsapp"
+            channel.is_match("whatsapp"),
+            "delivery.channel must admit whatsapp"
         );
 
         let delivery_props = schema["properties"]["delivery"]["properties"]

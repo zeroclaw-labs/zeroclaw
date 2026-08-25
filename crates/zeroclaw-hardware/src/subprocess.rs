@@ -7,11 +7,11 @@ use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::time::{Duration, timeout};
-use zeroclaw_api::attribution::ToolKind;
+use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 
-tool_attribution!(SubprocessTool, ToolKind::Plugin);
+tool_attribution!(SubprocessTool, ToolKind::Plugin, ToolProvenance::Extension);
 
 /// Subprocess timeout — kill the child process after this many seconds.
 const SUBPROCESS_TIMEOUT_SECS: u64 = 10;
@@ -328,6 +328,7 @@ async fn collect_stderr(handle: Option<tokio::process::ChildStderr>) -> String {
 mod tests {
     use super::*;
     use crate::manifest::{ExecConfig, ParameterDef, ToolManifest, ToolMeta};
+    use zeroclaw_api::attribution::Attributable;
 
     fn make_manifest(name: &str, params: Vec<ParameterDef>) -> ToolManifest {
         ToolManifest {
@@ -360,6 +361,14 @@ mod tests {
         let tool = SubprocessTool::new(m, PathBuf::from("/bin/true"));
         assert_eq!(tool.name(), "gpio_test");
         assert_eq!(tool.description(), "Test tool: gpio_test");
+    }
+
+    #[test]
+    fn manifest_loaded_subprocess_is_an_extension() {
+        let tool =
+            SubprocessTool::new(make_manifest("browser", vec![]), PathBuf::from("/bin/true"));
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
     }
 
     #[test]

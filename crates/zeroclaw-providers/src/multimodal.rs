@@ -3,11 +3,14 @@ use reqwest::Client;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use zeroclaw_api::media::{
+    PROVIDER_IMAGE_MIME_TYPES, image_mime_from_extension, image_mime_from_magic,
+    is_provider_image_mime,
+};
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
@@ -111,6 +114,161 @@ pub enum MultimodalError {
     LocalReadFailed { input: String, reason: String },
 }
 
+/// Why a candidate image reference cannot be sent as an inline base64 image
+/// block.
+///
+/// Deliberately a small copy type rather than a [`MultimodalError`]: the
+/// checker below runs over the whole replayed conversation on every turn, and
+/// an owned error would allocate for every rejected reference on that path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ImageDataUriRejection {
+    /// Not a `data:` URI at all — a filesystem path, an `http(s)` URL, or prose.
+    NotADataUri,
+    /// A `data:` URI whose header does not declare `;base64`.
+    NotBase64Encoded,
+    /// Media type outside [`PROVIDER_IMAGE_MIME_TYPES`].
+    UnsupportedMediaType,
+    /// Payload is empty or is not canonical padded base64.
+    MalformedBase64,
+    /// Encoded payload exceeds the caller's per-image ceiling.
+    TooLarge,
+}
+
+impl std::fmt::Display for ImageDataUriRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match self {
+            Self::NotADataUri => "not a base64 data URI",
+            Self::NotBase64Encoded => "data URI is not base64-encoded",
+            Self::UnsupportedMediaType => "unsupported image media type",
+            Self::MalformedBase64 => "malformed base64 payload",
+            Self::TooLarge => "image payload exceeds the per-image ceiling",
+        };
+        f.write_str(reason)
+    }
+}
+
+/// Splits a `data:` image reference into its media type and base64 payload,
+/// checking the structure without decoding it.
+///
+/// Both halves of the returned pair borrow from `candidate`; a caller that
+/// needs an owned lowercase media type allocates it once when it builds its
+/// wire block. `encoded_ceiling` is measured on the **encoded** payload
+/// length, unlike `max_bytes` elsewhere in this module, which counts decoded
+/// bytes.
+///
+/// This performs no decoding, no filesystem access and no network I/O on
+/// purpose. Provider adapters call it while converting an entire replayed
+/// history on every turn, so decoding here would mean re-decoding and
+/// re-encoding every image in the conversation once per turn.
+///
+/// It splits and structurally checks. It does not claim the payload decodes to
+/// a real image — nothing short of an image decoder can claim that.
+pub(crate) fn split_base64_image_data_uri(
+    candidate: &str,
+    encoded_ceiling: usize,
+) -> Result<(&str, &str), ImageDataUriRejection> {
+    let rest = candidate
+        .strip_prefix("data:")
+        .ok_or(ImageDataUriRejection::NotADataUri)?;
+    let Some(comma) = rest.find(',') else {
+        return Err(ImageDataUriRejection::NotADataUri);
+    };
+
+    let header = &rest[..comma];
+    let payload = rest[comma + 1..].trim();
+
+    // Matched case-sensitively, exactly as `normalize_data_uri` does, but on a
+    // whole parameter rather than a substring. `contains(";base64")` also
+    // accepted `;base64foo`, which the Anthropic adapter's residual sweep
+    // declines to sweep because it requires an exact `base64` parameter — so
+    // such a header fell between the two and left raw base64 in a text position.
+    // The parameter may sit anywhere in the list, which is what the sweep allows.
+    if !header
+        .split(';')
+        .skip(1)
+        .any(|parameter| parameter == "base64")
+    {
+        return Err(ImageDataUriRejection::NotBase64Encoded);
+    }
+
+    let media_type = header.split(';').next().unwrap_or_default().trim();
+    if !PROVIDER_IMAGE_MIME_TYPES
+        .iter()
+        .any(|allowed| allowed.eq_ignore_ascii_case(media_type))
+    {
+        return Err(ImageDataUriRejection::UnsupportedMediaType);
+    }
+
+    // Checked before the character scan so an oversized payload costs one
+    // comparison rather than a full pass.
+    if payload.len() > encoded_ceiling {
+        return Err(ImageDataUriRejection::TooLarge);
+    }
+
+    if !is_canonical_base64_payload(payload) {
+        return Err(ImageDataUriRejection::MalformedBase64);
+    }
+
+    Ok((media_type, payload))
+}
+
+/// True when `payload` is canonical padded base64 in the standard alphabet:
+/// non-empty, a multiple of four characters, at most two trailing `=`, and the
+/// padding bits of the final quartet zero.
+///
+/// The final-quartet check is what stops a payload like `AB==` — correct
+/// length, legal characters — from passing here and then failing a strict
+/// decoder on the provider's side.
+fn is_canonical_base64_payload(payload: &str) -> bool {
+    if payload.is_empty() || !payload.len().is_multiple_of(4) {
+        return false;
+    }
+
+    let bytes = payload.as_bytes();
+    let pad = bytes.iter().rev().take_while(|b| **b == b'=').count();
+    if pad > 2 {
+        return false;
+    }
+
+    let body = &bytes[..bytes.len() - pad];
+    if !body.iter().all(|b| is_standard_base64_char(*b)) {
+        return false;
+    }
+
+    // `len % 4 == 0` and non-empty means `len >= 4`, so with `pad <= 2` the
+    // body always has at least the two characters indexed below.
+    match pad {
+        // `xyz=` carries 18 bits of payload in 24 bits of encoding: the last
+        // character must have its low two bits clear.
+        1 => matches!(
+            body[body.len() - 1],
+            b'A' | b'E'
+                | b'I'
+                | b'M'
+                | b'Q'
+                | b'U'
+                | b'Y'
+                | b'c'
+                | b'g'
+                | b'k'
+                | b'o'
+                | b's'
+                | b'w'
+                | b'0'
+                | b'4'
+                | b'8'
+        ),
+        // `xy==` carries 12 bits: the last character must have its low four
+        // bits clear.
+        2 => matches!(body[body.len() - 1], b'A' | b'Q' | b'g' | b'w'),
+        _ => true,
+    }
+}
+
+fn is_standard_base64_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/'
+}
+
 fn is_loadable_image_reference(candidate: &str) -> bool {
     candidate.starts_with('/')
         || candidate.starts_with("http://")
@@ -171,6 +329,17 @@ fn collapse_wrapped_marker(raw: &str) -> String {
         out.push(ch);
     }
     out.trim().to_string()
+}
+
+/// True when `content` holds an image marker, terminated or not.
+///
+/// This is how a provider adapter tells *residue of this crate's own marker
+/// normalization* from a data URI the author wrote deliberately. An
+/// unterminated marker is copied through by [`parse_image_markers`] verbatim,
+/// prefix included, so the prefix is present in both the input and the cleaned
+/// output whenever residue is possible.
+pub(crate) fn carries_image_marker(content: &str) -> bool {
+    content.contains(IMAGE_MARKER_PREFIX)
 }
 
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
@@ -282,7 +451,7 @@ pub fn strip_media_markers(text: &str) -> String {
             r"(?i)\[(?:{}):[^\]]*\]",
             MEDIA_MARKER_KINDS.join("|")
         ))
-        .unwrap()
+        .expect("static media-marker regex must compile")
     });
     RE.replace_all(text, "[media attachment]").into_owned()
 }
@@ -294,7 +463,7 @@ static AUDIO_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock:
         r"(?i)\[(?:{}):([^\]]*)\]",
         AUDIO_MARKER_KINDS.join("|")
     ))
-    .unwrap()
+    .expect("static audio-marker regex must compile")
 });
 
 /// Replace audio markers (`[AUDIO:...]`, `[VOICE:...]`) whose payload is a
@@ -1230,7 +1399,7 @@ fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::R
 }
 
 fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
-    if ALLOWED_IMAGE_MIME_TYPES.contains(&mime) {
+    if is_provider_image_mime(mime) {
         return Ok(());
     }
 
@@ -1252,12 +1421,12 @@ fn detect_mime(
 
     if let Some(path) = path
         && let Some(ext) = path.extension().and_then(|value| value.to_str())
-        && let Some(mime) = mime_from_extension(ext)
+        && let Some(mime) = image_mime_from_extension(ext)
     {
         return Some(mime.to_string());
     }
 
-    mime_from_magic(bytes).map(ToString::to_string)
+    image_mime_from_magic(bytes).map(ToString::to_string)
 }
 
 fn normalize_content_type(content_type: &str) -> Option<String> {
@@ -1265,44 +1434,155 @@ fn normalize_content_type(content_type: &str) -> Option<String> {
     if mime.is_empty() { None } else { Some(mime) }
 }
 
-fn mime_from_extension(ext: &str) -> Option<&'static str> {
-    match ext.to_ascii_lowercase().as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "webp" => Some("image/webp"),
-        "gif" => Some("image/gif"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
-    }
-}
-
-fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
-        return Some("image/png");
-    }
-
-    if bytes.len() >= 3 && bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        return Some("image/jpeg");
-    }
-
-    if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
-        return Some("image/gif");
-    }
-
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
-
-    if bytes.len() >= 2 && bytes.starts_with(b"BM") {
-        return Some("image/bmp");
-    }
-
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Canonical 1x1 PNG payload: 68 characters, a multiple of four, standard
+    /// alphabet, no padding. Every accept case below uses it.
+    const CANONICAL_PNG_B64: &str =
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGMAAQAABQAB";
+
+    const TEN_MB: usize = 10 * 1024 * 1024;
+
+    // Every test in this block fails to compile before the change: the
+    // splitter and its rejection enum did not exist.
+
+    #[test]
+    fn split_data_uri_accepts_canonical_payload() {
+        let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
+        let (media_type, payload) =
+            split_base64_image_data_uri(&uri, TEN_MB).expect("canonical PNG data URI accepted");
+        assert_eq!(media_type, "image/png");
+        assert_eq!(payload, CANONICAL_PNG_B64);
+    }
+
+    #[test]
+    fn split_data_uri_accepts_uppercase_media_type_and_extra_parameters() {
+        // The allowlist comparison is case-insensitive, and the header may
+        // carry parameters before `;base64`.
+        let uri = format!("data:IMAGE/PNG;charset=binary;base64,{CANONICAL_PNG_B64}");
+        let (media_type, payload) =
+            split_base64_image_data_uri(&uri, TEN_MB).expect("upper-case media type accepted");
+        // Returned verbatim — the caller lowercases it once when it builds a
+        // wire block.
+        assert_eq!(media_type, "IMAGE/PNG");
+        assert_eq!(payload, CANONICAL_PNG_B64);
+    }
+
+    #[test]
+    fn split_data_uri_accepts_every_allowlisted_media_type() {
+        for mime in PROVIDER_IMAGE_MIME_TYPES {
+            let uri = format!("data:{mime};base64,{CANONICAL_PNG_B64}");
+            let (media_type, _) = split_base64_image_data_uri(&uri, TEN_MB)
+                .unwrap_or_else(|reason| panic!("{mime} rejected: {reason}"));
+            assert_eq!(media_type, *mime);
+        }
+    }
+
+    #[test]
+    fn split_data_uri_accepts_well_formed_padding() {
+        // `AA==` has its final-quartet padding bits clear; so does `AAA=`.
+        let two_pad = split_base64_image_data_uri("data:image/png;base64,AA==", TEN_MB);
+        assert_eq!(two_pad.map(|(_, payload)| payload), Ok("AA=="));
+        let one_pad = split_base64_image_data_uri("data:image/png;base64,AAA=", TEN_MB);
+        assert_eq!(one_pad.map(|(_, payload)| payload), Ok("AAA="));
+    }
+
+    #[test]
+    fn split_data_uri_rejects_non_data_uris() {
+        for candidate in [
+            "/tmp/screenshot.png",
+            r"C:\Users\leo\shot.png",
+            "http://example.com/a.png",
+            "https://example.com/a.png",
+            // A `data:` prefix with no comma has no payload to split.
+            "data:image/png;base64",
+        ] {
+            assert_eq!(
+                split_base64_image_data_uri(candidate, TEN_MB),
+                Err(ImageDataUriRejection::NotADataUri),
+                "expected {candidate} to be rejected as a non-data URI"
+            );
+        }
+    }
+
+    #[test]
+    fn split_data_uri_rejects_missing_base64_declaration() {
+        // Matched case-sensitively, as `normalize_data_uri` already does.
+        assert_eq!(
+            split_base64_image_data_uri("data:image/png,AAAA", TEN_MB),
+            Err(ImageDataUriRejection::NotBase64Encoded)
+        );
+        assert_eq!(
+            split_base64_image_data_uri("data:image/png;BASE64,AAAA", TEN_MB),
+            Err(ImageDataUriRejection::NotBase64Encoded)
+        );
+    }
+
+    #[test]
+    fn split_data_uri_rejects_media_types_outside_the_allowlist() {
+        for mime in ["image/svg+xml", "image/bmp", "application/pdf", ""] {
+            let uri = format!("data:{mime};base64,{CANONICAL_PNG_B64}");
+            assert_eq!(
+                split_base64_image_data_uri(&uri, TEN_MB),
+                Err(ImageDataUriRejection::UnsupportedMediaType),
+                "expected {mime} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn split_data_uri_rejects_malformed_base64() {
+        for payload in [
+            // Empty payload.
+            "",
+            // Not a multiple of four. Preparation always emits canonical
+            // padded base64, so a payload this shape cannot be a real image
+            // and Anthropic's decoder would reject it.
+            "iVBORw0KGgo",
+            "/9j/4AAQSkZJRgABAQEAYABgAAD",
+            // Characters outside the standard alphabet.
+            "AAA-",
+            "AA=A",
+            // More than two padding characters.
+            "AB==CD==",
+            // Final-quartet padding bits set: both fail a strict decoder even
+            // though the length and alphabet are fine.
+            "AB==",
+            "AAB=",
+        ] {
+            let uri = format!("data:image/png;base64,{payload}");
+            assert_eq!(
+                split_base64_image_data_uri(&uri, TEN_MB),
+                Err(ImageDataUriRejection::MalformedBase64),
+                "expected payload {payload:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn split_data_uri_rejects_payloads_over_the_ceiling() {
+        let uri = format!("data:image/png;base64,{CANONICAL_PNG_B64}");
+        assert_eq!(
+            split_base64_image_data_uri(&uri, CANONICAL_PNG_B64.len() - 1),
+            Err(ImageDataUriRejection::TooLarge)
+        );
+        // Exactly at the ceiling is accepted.
+        assert!(split_base64_image_data_uri(&uri, CANONICAL_PNG_B64.len()).is_ok());
+    }
+
+    #[test]
+    fn split_data_uri_rejections_carry_a_short_reason() {
+        assert_eq!(
+            ImageDataUriRejection::TooLarge.to_string(),
+            "image payload exceeds the per-image ceiling"
+        );
+        assert_eq!(
+            ImageDataUriRejection::MalformedBase64.to_string(),
+            "malformed base64 payload"
+        );
+    }
 
     #[test]
     fn strip_media_markers_replaces_image_local_path() {

@@ -26,7 +26,7 @@ cli-config-about = ZeroClaw設定を管理
 cli-update-about = ZeroClaw更新を確認・適用
 cli-self-test-about = 診断自己テストを実行
 cli-completions-about = シェル補完スクリプトを生成
-cli-desktop-about = ZeroClawコンパニオンデスクトップアプリを起動
+cli-desktop-about = コンパニオンデスクトップアプリを起動、またはダウンロードページを開く
 cli-config-schema-about = 完全な設定JSONスキーマをstdoutにダンプ
 cli-config-list-about = すべての設定プロパティを現在の値とともにリスト表示
 cli-config-get-about = 設定プロパティ値を取得
@@ -200,9 +200,9 @@ cli-cron-long-about =
     zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
     zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
     zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-    zeroclaw cron add-every 60000 'Ping heartbeat'
-    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause TASK_ID
     zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =
@@ -316,11 +316,11 @@ cli-desktop-long-about =
 
     コンパニオンアプリは、CLI と同じゲートウェイに接続する軽量のメニューバー/システムトレイアプリケーションです。ダッシュボードへのクイックアクセス、ステータス監視、およびデバイスペアリングを提供します。
 
-    --install を使用して、プラットフォーム用の事前ビルドコンパニオンアプリをダウンロードしてください。
+    --install を使用すると、プラットフォーム用のダウンロードページが開きます。それ自体は何もインストールしません。
 
     例:
     zeroclaw desktop              # コンパニオンアプリを起動
-    zeroclaw desktop --install    # ダウンロードしてインストール
+    zeroclaw desktop --install    # ダウンロードページを開く
 channel-needs-quickstart-reply = このエージェントはまだ完全にセットアップされていません。返信する前に、オペレーターがQuickstartを実行する必要があります。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web は設定されていますが、'whatsapp-web' 機能がコンパイルされていません。
 channel-whatsapp-web-feature-missing-build = ビルド/実行: cargo build --features whatsapp-web
@@ -372,6 +372,12 @@ channel-whatsapp-web-delivery-failure-note-many = （注意：{$count}件のWhat
 channel-line-bind-success = ✅ ペアリングしました！チャットできるようになりました。
 channel-line-bind-invalid-code = ❌ 無効なコードです。もう一度お試しください。
 channel-line-bind-rate-limited = ⏳ 試行回数が多すぎます。{ $secs }秒後に再試行してください。
+channel-telegram-cmd-new-desc = 新しい会話セッションを開始
+channel-telegram-cmd-clear-desc = この会話セッションをクリア
+channel-telegram-cmd-stop-desc = 実行中のタスクをキャンセル
+channel-telegram-cmd-model-desc = 現在のモデルを表示または切り替え
+channel-telegram-cmd-models-desc = 利用可能なモデルプロバイダーを一覧表示、またはプロバイダーを切り替え
+channel-telegram-cmd-config-desc = 現在の設定を表示
 onboard-openai-auth-note =
     OpenAI認証:
     • APIキー — platform.openai.com 経由の標準APIアクセス (sk-...)
@@ -425,11 +431,12 @@ cli-sop-none = SOP が見つかりません。
 cli-sop-pending-none = 承認待ちの SOP 実行はありません。
 cli-sop-pending-header = 承認待ちの SOP 実行:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] ステップ {$step}/{$total}
+cli-sop-status-failure-reason = 失敗の理由: {$reason}
 cli-sop-ws-invalid-approval = sop approval_response には run_id と approve または deny の決定が必要です
 cli-sop-ws-resolve-failed = SOP の解決に失敗しました: {$error}
 cli-sop-ws-engine-lock-poisoned = SOP エンジンロックがポイズンされました
 cli-sop-ws-subsystem-disabled = SOP サブシステムは有効ではありません
-cli-sop-create-hint = {"  "}作成: mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}作成: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}その後 SOP.toml と SOP.md を追加します
 cli-sop-loaded-header = 読み込み済みの SOP ({$count}):
 cli-sop-none-to-validate = 検証する SOP が見つかりません。
@@ -479,7 +486,7 @@ cli-cron-added-oneshot = ✅ ワンショットcronジョブ {$id} を追加し�
 cli-cron-added-interval-agent = ✅ インターバルエージェントcronジョブ {$id} を追加しました
 cli-cron-added-interval = ✅ インターバルcronジョブ {$id} を追加しました
 cli-cron-updated = ✅ cronジョブ {$id} を更新しました
-cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory のうち少なくとも1つを指定する必要があります
+cli-cron-update-no-field = --expression、--tz、--command、--name、--allowed-tool、--uses-memory、または配信オプション（--channel、--to、--thread、--best-effort、--no-best-effort）のうち少なくとも1つを指定する必要があります
 cli-cron-removed = ✅ cronジョブ {$id} を削除しました
 cli-cron-paused = ⏸️  cronジョブ {$id} を一時停止しました
 cli-cron-resumed = ▶️  cronジョブ {$id} を再開しました
@@ -495,6 +502,8 @@ cli-cron-cmd3 = {"  "}Cmd      : {$v}
 cli-cron-at = {"  "}At    : {$v}
 cli-cron-at2 = {"  "}At  : {$v}
 cli-cron-every = {"  "}Every(ms): {$v}
+cli-cron-delivery = {"  "}配信: {$v}
+cli-cron-delivery-disabled = 無効（出力はどこにも送信されません）
 cli-no-command = コマンドが指定されていません。
 cli-press-enter = 終了するにはEnterキーを押してください...
 cli-quickstart-title = クイックスタート — 1つの動作するエージェントをエンドツーエンドで作成します。
@@ -597,6 +606,7 @@ cli-quickstart-error-channel-required = チャンネルタイプとエイリア�
 cli-quickstart-error-channel-field-not-advertised = チャンネルフィールド `{$field}` は Quickstart では使用できません
 cli-quickstart-error-channel-token-required = Telegram Bot トークンが必要です
 cli-quickstart-error-webhook-secret-required = Webhook 共有シークレットが必要です
+cli-quickstart-error-webhook-port-conflict = Webhook ポート {$port} は有効な Webhook `{$alias}` が既に使用しています — 有効な Webhook にはそれぞれ固有のポートが必要です
 cli-quickstart-error-peer-group-name-required = ピアグループ名が必要です
 cli-quickstart-error-peer-group-channel-required = ピアグループのチャンネル参照が必要です
 cli-quickstart-error-peer-group-unknown-channel = ピアグループ `{$name}` が不明なチャンネル `{$channel}` を参照しています
@@ -657,9 +667,9 @@ cli-status-service-stopped = 🔴 サービス:       停止
 cli-status-channels = チャンネル:
 cli-status-cli-always = {"  "}CLI:      ✅ 常時
 cli-status-peripherals = 周辺機器:
-cli-desktop-download = ZeroClaw コンパニオンアプリをダウンロード:
+cli-desktop-download = ZeroClaw コンパニオンアプリのダウンロードページを開きます:
 cli-desktop-homebrew = または Homebrew でインストール(近日対応予定):
-cli-desktop-linux-pkg = {"  "}お使いのアーキテクチャ用の .deb または .AppImage をダウンロードしてください。
+cli-desktop-linux-pkg = {"  "}このページには、アーキテクチャ別の .deb と .AppImage があります。
 cli-desktop-launching = ZeroClaw コンパニオンアプリを起動中...
 cli-status-version = バージョン:     {$v}
 cli-status-workspace = ワークスペース:   {$v}
@@ -715,8 +725,8 @@ cli-plugin-install-resolving = プラグインレジストリから '{$source}' 
 cli-plugin-installed-from = プラグインを {$source} からインストールしました
 cli-plugin-installed-name-version = プラグイン {$name} v{$version} をインストールしました
 cli-plugin-config-entry-seeded = '{$name}' の [[plugins.entries]] を作成しました。プラグイン設定値は `zeroclaw config set plugins.entries.{$name}.config.<key>` で設定してください。
+cli-plugin-config-entry-key = 設定エントリキー ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = 警告: '{$name}' の設定エントリ作成をスキップしました: ディスク上の [plugins] セクションが不正です。修復し、`name = "{$name}"` を含む [[plugins.entries]] ブロックを追加してから、`zeroclaw config set plugins.entries.{$name}.config.<key>` で値を設定してください。
-cli-plugin-config-entry-seed-unaddressable = 警告: '{$name}' の設定エントリ作成をスキップしました: '.' を含むプラグイン名はドット区切りの設定パスで指定できません (`config set` は '.' で分割します)。設定ファイルに `name = "{$name}"` を含む [[plugins.entries]] ブロックを手動で追加してください。
 cli-config-section-degraded = 警告: {$path} の設定セクション `{$section}` は不正なため、この実行ではデフォルト値にリセットされました。そのセクションの値は有効ではありません。`zeroclaw config migrate` を実行して解析エラーを確認し、ファイルを修復してください。
 cli-plugin-removed = プラグイン '{$name}' を削除しました。
 cli-plugin-not-found = プラグイン '{$name}' が見つかりません。
@@ -950,10 +960,13 @@ cli-doctor-context-window-ok = {$provider_ref}: コンテキストウィンド�
 cli-doctor-context-window-zero = {$provider_ref}: context_window が 0 です（無効。モデルの実際のコンテキスト上限を設定してください）
 cli-doctor-context-window-unset = {$provider_ref}: context_window が未設定です — 選択時には {$fallback} トークンのフォールバックを使用します。モデルの実際の上限を大きく下回る可能性があるため、このプロファイルに context_window を設定してください
 
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = モデル調査がタイムアウトしました。一部のプロバイダーカタログに到達できない可能性があります。Doctor を再実行して更新できます。
+
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = セキュリティ上重要な設定セクション `{$path}` が無効なため、デーモンを起動できるようデフォルト値にリセットされました。実行中のセキュリティ設定は意図したものより弱くなっている可能性があります。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
 cli-doctor-degraded-section = 設定セクション `{$path}` は不正な形式のためデフォルト値にリセットされました。このセクションの値は反映されていません。`zeroclaw config migrate` を実行してパースエラーを確認し、ファイルを修復してください。
-cli-doctor-skills-prompt-injection-mode-full-deprecated = スキルプロンプト注入モード "full" は非推奨です。明示的な full モードは移行期間中もサポートされますが、現在のデフォルトは compact です。Schema V4 で full モードが削除される前に移行してください。
 sop-approval-deferred-at-capacity = 実行スロットが満杯のため、実行 {$run_id} を再開できませんでした。承認は待機状態のままです。スロットが空いてから再試行してください。
 sop-approval-policy-unavailable = 待機中の SOP ステップを利用できないため、承認に失敗しました: {$reason}。実行は待機状態のままです。
 sop-rpc-decision-invalid-state = 実行 {$run_id} は現在の状態では解決できません。
@@ -979,6 +992,8 @@ channel-approval-btn-always = 常に
 channel-approval-tap-instruction = 下のボタンをタップしてください：
 channel-approval-reply-instruction-yesno = 返信：「{ $yes_command }」、「{ $no_command }」、または「{ $always_command }」
 channel-approval-reply-instruction-approve-deny = 「{ $approve_command }」/「{ $deny_command }」/「{ $always_command }」と返信してください。
+channel-approval-group-visibility-warning =
+    これはグループチャットのため、ここにいる全員がこのコードと上に表示されたツールの引数を見ることができます。このチャンネルの承認されたピアのみが応答できます。
 channel-telegram-approval-ack-approved = 承認しました
 channel-telegram-approval-ack-always-approved = 常に承認しました
 channel-telegram-approval-ack-denied = 拒否しました

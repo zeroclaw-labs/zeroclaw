@@ -59,6 +59,6 @@ cargo mdbook check                       # validate .po format (run before a tra
 | `docs/book/src/**/*.md` (hand-written) | `docs/book/book/<locale>/` | `mdbook build` |
 | `docs/book/src/reference/cli.md` | (same path; **gitignored**) | `cargo mdbook refs` |
 | `docs/book/src/reference/config.md` | (same path; **gitignored**) | `cargo mdbook refs` |
-| `target/doc/` (rustdoc) | `docs/book/book/api/` | `cargo doc --no-deps --workspace` |
+| `target/doc/` (rustdoc) | `docs/book/book/api/` | `cargo doc --no-deps --workspace --exclude zeroclaw-desktop` |
 
 The two `reference/*.md` files are generated from the actual `clap` derives and JSON schema in the code, never edit them by hand. Edit the `///` doc comments on the relevant Rust types instead.

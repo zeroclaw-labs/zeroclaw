@@ -69,11 +69,6 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "channel-linq"),
     },
     ChannelCompileSpec {
-        schema_name: Some("WATI"),
-        type_keys: &["wati"],
-        compiled: cfg!(feature = "channel-wati"),
-    },
-    ChannelCompileSpec {
         schema_name: Some("NextCloud Talk"),
         type_keys: &["nextcloud", "nextcloud-talk", "nextcloud_talk"],
         compiled: cfg!(feature = "channel-nextcloud"),
@@ -198,6 +193,14 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         type_keys: &["webhook"],
         compiled: cfg!(feature = "channel-webhook"),
     },
+    // Plugin channels have no `channel-*` feature of their own: whether they
+    // can run is decided by the runtime crate's WASM plugin support, so this
+    // row defers to that single source rather than restating the condition.
+    ChannelCompileSpec {
+        schema_name: Some("Plugin"),
+        type_keys: &["plugin"],
+        compiled: zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED,
+    },
     ChannelCompileSpec {
         schema_name: None,
         type_keys: &["acp-server", "acp_server"],
@@ -300,6 +303,10 @@ mod tests {
             is_channel_type_compiled("linq"),
             cfg!(feature = "channel-linq")
         );
+        assert_eq!(
+            is_channel_type_compiled("plugin"),
+            zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED
+        );
     }
 
     #[test]
@@ -341,6 +348,13 @@ mod tests {
             "default".to_string(),
             zeroclaw_config::schema::SlackConfig::default(),
         );
+        cfg.plugin.insert(
+            "mail".to_string(),
+            zeroclaw_config::schema::PluginChannelConfig {
+                package: "email-plugin".to_string(),
+                enabled: true,
+            },
+        );
 
         let names: BTreeSet<_> = configured_uncompiled_channels(&cfg)
             .into_iter()
@@ -348,6 +362,12 @@ mod tests {
             .collect();
 
         assert_eq!(names.contains("Slack"), !cfg!(feature = "channel-slack"));
+        assert_eq!(
+            names.contains("Plugin"),
+            !zeroclaw_runtime::plugin_runtime::WASM_PLUGIN_SUPPORT_COMPILED,
+            "a configured plugin channel must be reported when this build \
+             cannot execute WASM plugins"
+        );
     }
 
     #[test]

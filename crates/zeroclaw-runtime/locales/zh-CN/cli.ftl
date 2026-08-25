@@ -26,7 +26,7 @@ cli-config-about = 管理 ZeroClaw 配置
 cli-update-about = 检查并应用 ZeroClaw 更新
 cli-self-test-about = 运行诊断自检
 cli-completions-about = 生成 shell 补全脚本
-cli-desktop-about = 启动 ZeroClaw 伴侣桌面应用
+cli-desktop-about = 启动配套桌面应用，或打开其下载页面
 cli-config-schema-about = 将完整的配置 JSON Schema 输出到 stdout
 cli-config-list-about = 列出所有配置属性及其当前值
 cli-config-get-about = 获取配置属性值
@@ -199,9 +199,9 @@ cli-cron-long-about =
     zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
     zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
     zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-    zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-    zeroclaw cron add-every 60000 'Ping heartbeat'
-    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+    zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+    zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+    zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
     zeroclaw cron pause TASK_ID
     zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London
 cli-channel-long-about =
@@ -315,11 +315,11 @@ cli-desktop-long-about =
 
     配套应用是一个轻量级的菜单栏 / 系统托盘应用程序，它连接到与 CLI 相同的网关。它提供对仪表板、状态监控和设备配对的快速访问。
 
-    使用 --install 下载适用于您平台的预构建配套应用。
+    使用 --install 打开适用于您平台的下载页面。它本身不会安装任何东西。
 
     示例：
     zeroclaw desktop              # 启动配套应用
-    zeroclaw desktop --install    # 下载并安装
+    zeroclaw desktop --install    # 打开下载页面
 channel-needs-quickstart-reply = 此代理尚未完全设置。操作员需要先运行 Quickstart，然后我才能回复。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web 已配置，但未编译 'whatsapp-web' 功能。
 channel-whatsapp-web-feature-missing-build = 使用以下命令构建/运行：cargo build --features whatsapp-web
@@ -371,6 +371,12 @@ channel-whatsapp-web-delivery-failure-note-many = （注意：我无法传送 {$
 channel-line-bind-success = ✅ 已配对！现在可以聊天了。
 channel-line-bind-invalid-code = ❌ 代码无效。请重试。
 channel-line-bind-rate-limited = ⏳ 尝试次数过多。请在 { $secs }s 后重试。
+channel-telegram-cmd-new-desc = 开始新的对话会话
+channel-telegram-cmd-clear-desc = 清除此对话会话
+channel-telegram-cmd-stop-desc = 取消当前进行中的任务
+channel-telegram-cmd-model-desc = 显示或切换当前模型
+channel-telegram-cmd-models-desc = 列出可用的模型提供商或切换提供商
+channel-telegram-cmd-config-desc = 显示当前配置
 onboard-openai-auth-note =
     OpenAI 身份验证：
     • API 密钥 — 通过 platform.openai.com 的标准 API 访问（sk-...）
@@ -424,11 +430,12 @@ cli-sop-none = 未找到 SOP。
 cli-sop-pending-none = 没有等待审批的 SOP 运行。
 cli-sop-pending-header = 等待审批的 SOP 运行：
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] 步骤 {$step}/{$total}
+cli-sop-status-failure-reason = 失败原因：{$reason}
 cli-sop-ws-invalid-approval = sop approval_response 需要 run_id，以及 approve 或 deny 决策
 cli-sop-ws-resolve-failed = SOP 解析失败：{$error}
 cli-sop-ws-engine-lock-poisoned = SOP 引擎锁已中毒
 cli-sop-ws-subsystem-disabled = SOP 子系统未启用
-cli-sop-create-hint = {"  "}创建一个: mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}创建一个: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}然后添加 SOP.toml 和 SOP.md
 cli-sop-loaded-header = 已加载的 SOP ({$count}):
 cli-sop-none-to-validate = 未找到可验证的 SOP。
@@ -478,7 +485,7 @@ cli-cron-added-oneshot = ✅ 已添加一次性 cron 任务 {$id}
 cli-cron-added-interval-agent = ✅ 已添加间隔 agent cron 任务 {$id}
 cli-cron-added-interval = ✅ 已添加间隔 cron 任务 {$id}
 cli-cron-updated = ✅ 已更新 cron 任务 {$id}
-cli-cron-update-no-field = 必须至少提供 --expression、--tz、--command、--name、--allowed-tool 或 --uses-memory 中的一个
+cli-cron-update-no-field = 必须至少提供 --expression、--tz、--command、--name、--allowed-tool、--uses-memory 或投递选项（--channel、--to、--thread、--best-effort、--no-best-effort）中的一个
 cli-cron-removed = ✅ 已移除 cron 任务 {$id}
 cli-cron-paused = ⏸️  已暂停 cron 任务 {$id}
 cli-cron-resumed = ▶️  已恢复 cron 任务 {$id}
@@ -494,6 +501,8 @@ cli-cron-cmd3 = {"  "}命令      : {$v}
 cli-cron-at = {"  "}时间    : {$v}
 cli-cron-at2 = {"  "}时间  : {$v}
 cli-cron-every = {"  "}间隔(ms): {$v}
+cli-cron-delivery = {"  "}投递: {$v}
+cli-cron-delivery-disabled = 已禁用（输出不会发送到任何地方）
 cli-no-command = 未提供命令。
 cli-press-enter = 按 Enter 退出...
 cli-quickstart-title = Quickstart — 端到端创建一个可用的 agent。
@@ -596,6 +605,7 @@ cli-quickstart-error-channel-required = 必须填写通道类型和别名
 cli-quickstart-error-channel-field-not-advertised = Quickstart 中不支持通道字段 `{$field}`
 cli-quickstart-error-channel-token-required = 必须填写 Telegram Bot 令牌
 cli-quickstart-error-webhook-secret-required = 必须填写 Webhook 共享密钥
+cli-quickstart-error-webhook-port-conflict = Webhook 端口 {$port} 已被启用的 Webhook `{$alias}` 占用 — 每个启用的 Webhook 都需要各自的端口
 cli-quickstart-error-peer-group-name-required = 必须填写对等组名称
 cli-quickstart-error-peer-group-channel-required = 必须填写对等组通道引用
 cli-quickstart-error-peer-group-unknown-channel = 对等组 `{$name}` 引用了未知通道 `{$channel}`
@@ -656,9 +666,9 @@ cli-status-service-stopped = 🔴 服务：       已停止
 cli-status-channels = 通道：
 cli-status-cli-always = {"  "}CLI:      ✅ 始终
 cli-status-peripherals = 外设：
-cli-desktop-download = 下载 ZeroClaw 配套应用：
+cli-desktop-download = 正在打开 ZeroClaw 配套应用的下载页面：
 cli-desktop-homebrew = 或通过 Homebrew 安装（即将推出）：
-cli-desktop-linux-pkg = {"  "}下载适合您架构的 .deb 或 .AppImage。
+cli-desktop-linux-pkg = {"  "}该页面提供按架构分类的 .deb 和 .AppImage 下载。
 cli-desktop-launching = 正在启动 ZeroClaw 配套应用...
 cli-status-version = 版本：     {$v}
 cli-status-workspace = 工作区：   {$v}
@@ -714,8 +724,8 @@ cli-plugin-install-resolving = 正在从插件注册表解析 '{$source}'...
 cli-plugin-installed-from = 已从 {$source} 安装插件
 cli-plugin-installed-name-version = 已安装插件 {$name} v{$version}
 cli-plugin-config-entry-seeded = 已为 '{$name}' 创建 [[plugins.entries]]。使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置插件配置值。
+cli-plugin-config-entry-key = 配置条目键（{$capability}）：{$key}
 cli-plugin-config-entry-seed-skipped = 警告：已跳过为 '{$name}' 创建配置条目：磁盘上的 [plugins] 部分格式不正确。请修复它，添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块，然后使用 `zeroclaw config set plugins.entries.{$name}.config.<key>` 设置值。
-cli-plugin-config-entry-seed-unaddressable = 警告：已跳过为 '{$name}' 创建配置条目：包含 '.' 的插件名称无法通过点分配置路径寻址（`config set` 会按 '.' 分割）。请手动向配置文件添加带有 `name = "{$name}"` 的 [[plugins.entries]] 块。
 cli-config-section-degraded = 警告：{$path} 中的配置部分 `{$section}` 格式不正确，本次运行已重置为默认值。该部分中的值不会生效。请运行 `zeroclaw config migrate` 查看解析错误，然后修复文件。
 cli-plugin-removed = 已移除插件“{$name}”。
 cli-plugin-not-found = 未找到插件“{$name}”。
@@ -949,10 +959,13 @@ cli-doctor-context-window-ok = {$provider_ref}：上下文窗口：{$context_win
 cli-doctor-context-window-zero = {$provider_ref}：context_window 为 0（无效；请设置为模型的实际上下文上限）
 cli-doctor-context-window-unset = {$provider_ref}：未设置 context_window — 选择此配置时将使用 {$fallback} 个令牌的回退值；该值可能远低于模型的实际上限；请在此配置中设置 context_window
 
+# Doctor probe timeout warning — shown when model probing times out but prior
+# diagnostics (config, workspace, daemon) are preserved and returned.
+cli-doctor-probe-timeout-message = 模型探测超时。部分提供商目录可能无法访问。您可以重新运行 Doctor 来刷新。
+
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = 安全关键配置节 `{$path}` 无效，已重置为默认值以便守护进程启动；当前运行的安全态势可能弱于预期。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
 cli-doctor-degraded-section = 配置节 `{$path}` 格式错误，已重置为默认值；该节中的值当前不生效。运行 `zeroclaw config migrate` 查看解析错误，然后修复该文件。
-cli-doctor-skills-prompt-injection-mode-full-deprecated = 技能提示注入模式 "full" 已弃用。弃用过渡期内仍支持显式 full 模式，但 compact 现已成为默认值；请在 Schema V4 移除 full 模式前完成迁移。
 sop-approval-deferred-at-capacity = 执行槽位已满，无法恢复运行 {$run_id}。审批仍处于等待状态；请在槽位释放后重试。
 sop-approval-policy-unavailable = 无法使用暂停的 SOP 步骤，审批失败：{$reason}。运行仍处于等待状态。
 sop-rpc-decision-invalid-state = 运行 {$run_id} 无法在当前状态下完成决策。
@@ -978,6 +991,8 @@ channel-approval-btn-always = 始终
 channel-approval-tap-instruction = 点击下方按钮：
 channel-approval-reply-instruction-yesno = 回复：“{ $yes_command }”、“{ $no_command }” 或 “{ $always_command }”
 channel-approval-reply-instruction-approve-deny = 回复 `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`。
+channel-approval-group-visibility-warning =
+    这是群聊，因此这里的所有人都能看到此代码和上面显示的工具参数。只有该通道的授权对等方才能回复。
 channel-telegram-approval-ack-approved = 已批准
 channel-telegram-approval-ack-always-approved = 已始终批准
 channel-telegram-approval-ack-denied = 已拒绝

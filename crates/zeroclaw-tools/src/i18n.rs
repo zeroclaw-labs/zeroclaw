@@ -8,7 +8,13 @@ static TOOL_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static TOOL_FTL_SOURCES: OnceLock<ToolFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
-const EN_TOOLS_FTL: &str = include_str!("../../zeroclaw-runtime/locales/en/tools.ftl");
+/// English tool strings, embedded here rather than pulled from
+/// `zeroclaw-runtime` so the dependency direction (runtime -> tools) stays
+/// intact. The file is mirrored from the canonical runtime catalogue by
+/// `cargo generate installers tools-en-ftl`; CI fails on drift. Reading the
+/// runtime copy directly would reach outside this crate, and `cargo package`
+/// copies only the package directory.
+const EN_TOOLS_FTL: &str = include_str!("../locales/en/tools.ftl");
 
 struct ToolFtlSources {
     locale: String,
@@ -72,7 +78,12 @@ fn format_tool_string_with_args(
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+    let language_identifier = match locale.parse() {
+        Ok(identifier) => identifier,
+        Err(_) => "en"
+            .parse()
+            .expect("static English Fluent locale must parse"),
+    };
     let mut bundle = FluentBundle::new(vec![language_identifier]);
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);
@@ -105,7 +116,12 @@ fn format_ftl_message(
 ) -> Option<String> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier = locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+    let language_identifier = match locale.parse() {
+        Ok(identifier) => identifier,
+        Err(_) => "en"
+            .parse()
+            .expect("static English Fluent locale must parse"),
+    };
     let mut bundle = FluentBundle::new(vec![language_identifier]);
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);
