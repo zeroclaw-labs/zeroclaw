@@ -20,7 +20,7 @@ mod component {
     use zeroclaw::plugin::secrets::{SecretError, get as secret_get};
 
     struct FixtureChannel;
-    static HTTP_CALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    static SEND_CALL_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
     /// Optional handle taken from the host-provided `configure` payload, so
     /// host tests can observe which config generation an instance was
     /// configured with (reconstruction must replay the constructor snapshot).
@@ -88,21 +88,22 @@ mod component {
         }
 
         fn send(message: SendMessage) -> Result<(), String> {
-            // Deadline/interruption path (master): an http:// URL drives a real
-            // outbound request whose duration the host wall-clock deadline
-            // bounds; the in-flight guard proves an interrupted instance is
-            // discarded rather than resumed.
-            if message.content.starts_with("http://") {
-                if HTTP_CALL_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+            // Deadline/interruption path: a `spin` message drives an unbounded
+            // guest loop whose duration the host wall-clock deadline bounds.
+            // Channels have no outbound-HTTP surface (the host's
+            // `new_channel_store` withholds `wasi:http`), so the slow operation
+            // under test is guest compute, not a network host import. The
+            // in-flight guard proves an interrupted instance is discarded rather
+            // than resumed: a rebuilt instance is a fresh store whose flag reads
+            // false, while a wrongly resumed store would re-enter with it set.
+            if message.content.starts_with("spin") {
+                if SEND_CALL_IN_FLIGHT.swap(true, Ordering::SeqCst) {
                     return Err("interrupted channel instance was resumed".to_string());
                 }
-                waki::Client::new()
-                    .get(&message.content)
-                    .send()
-                    .and_then(waki::Response::body)
-                    .map_err(|error| error.to_string())?;
-                HTTP_CALL_IN_FLIGHT.store(false, Ordering::SeqCst);
-                return Ok(());
+                let mut value = 0_u64;
+                loop {
+                    value = std::hint::black_box(value.wrapping_add(1));
+                }
             }
             // Scoped-secret path (this PR): the message must have been composed
             // from one current config+secret revision resolved at point of use.

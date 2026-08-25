@@ -242,8 +242,44 @@ fn apply_auth_to_request(
     }
 }
 
+fn structured_api_error_message(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+
+    let nested_message = object.get("error").and_then(|error| match error {
+        serde_json::Value::Object(_) => structured_api_error_message(error),
+        serde_json::Value::String(error) => serde_json::from_str(error)
+            .ok()
+            .and_then(|nested| structured_api_error_message(&nested)),
+        _ => None,
+    });
+    if let Some(message) = nested_message {
+        return Some(message);
+    }
+
+    for key in ["message", "detail"] {
+        if let Some(message) = object
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|message| !message.is_empty())
+        {
+            return Some(message.to_string());
+        }
+    }
+
+    object
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map(str::to_string)
+}
+
 fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
-    let sanitized = super::sanitize_api_error(body);
+    let message = serde_json::from_str(body)
+        .ok()
+        .and_then(|value| structured_api_error_message(&value));
+    let sanitized = super::sanitize_api_error(message.as_deref().unwrap_or(body));
     StreamError::ModelProvider(format!("{status}: {sanitized}"))
 }
 
@@ -3782,6 +3818,33 @@ mod tests {
         assert!(error.contains("[REDACTED]"));
         assert!(!error.contains(secret));
         assert!(error.chars().count() <= 550);
+    }
+
+    #[test]
+    fn streaming_api_error_extracts_message_from_stringified_error_envelope() {
+        let message =
+            "anthropic error: Message: fetch failed Cause: AggregateError Name: TypeError";
+        let body = serde_json::json!({
+            "status": "failure",
+            "message": message,
+            "error": serde_json::json!({
+                "message": message,
+                "type": "APIError",
+                "code": "500",
+            })
+            .to_string(),
+            "error_origin_level": "api_error",
+            "provider": "anthropic",
+        })
+        .to_string();
+
+        let error =
+            streaming_api_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &body).to_string();
+
+        assert_eq!(
+            error,
+            format!("ModelProvider error: 500 Internal Server Error: {message}")
+        );
     }
 
     fn make_model_provider(

@@ -16,8 +16,12 @@ fn repository_file(name: &str) -> String {
 
 fn builder_stage<'a>(containerfile: &'a str, name: &str) -> &'a str {
     let builder = containerfile
-        .split_once(" AS builder\n")
-        .map(|(_, builder)| builder)
+        .split_once(" AS builder")
+        .and_then(|(_, builder)| {
+            builder
+                .strip_prefix("\r\n")
+                .or_else(|| builder.strip_prefix('\n'))
+        })
         .unwrap_or_else(|| panic!("{name} must define a builder stage"));
     builder.split("\nFROM ").next().unwrap_or(builder)
 }

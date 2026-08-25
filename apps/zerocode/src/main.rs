@@ -1055,6 +1055,8 @@ mod connection_tests {
             std::thread::sleep(Duration::from_millis(10));
         };
 
+        // SAFETY: `owner.id()` is the live child PID returned by `spawn`; this
+        // test sends a standard signal and does not pass pointers across FFI.
         let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, libc::SIGTERM) };
         assert_eq!(
             signal_result,
@@ -1064,6 +1066,8 @@ mod connection_tests {
         );
         assert!(owner.wait().expect("wait signal owner").success());
 
+        // SAFETY: signal 0 performs a process-existence probe only; `daemon_pid`
+        // was parsed from the child helper's PID file and no pointers are used.
         let child_probe = unsafe { libc::kill(daemon_pid as libc::pid_t, 0) };
         assert_eq!(child_probe, -1, "spawned daemon pid {daemon_pid} survived");
         assert_eq!(

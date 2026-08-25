@@ -6189,8 +6189,9 @@ impl ChatState {
         } else if !extend {
             self.browse_anchor = None;
         }
-        self.browse_cursor = Some(cur.saturating_sub(n));
-        self.scroll_entry_into_view(self.browse_cursor.unwrap());
+        let next = cur.saturating_sub(n);
+        self.browse_cursor = Some(next);
+        self.scroll_entry_into_view(next);
         self.pinned_to_bottom = false;
         self.mark_dirty_full();
     }
@@ -6209,8 +6210,9 @@ impl ChatState {
         } else if !extend {
             self.browse_anchor = None;
         }
-        self.browse_cursor = Some((cur + n).min(len - 1));
-        self.scroll_entry_into_view(self.browse_cursor.unwrap());
+        let next = cur.saturating_add(n).min(len - 1);
+        self.browse_cursor = Some(next);
+        self.scroll_entry_into_view(next);
         self.pinned_to_bottom =
             self.scroll_offset >= self.last_total_rows.saturating_sub(self.last_inner_height);
         self.mark_dirty_full();

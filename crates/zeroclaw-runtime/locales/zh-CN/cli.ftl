@@ -430,6 +430,7 @@ cli-sop-none = 未找到 SOP。
 cli-sop-pending-none = 没有等待审批的 SOP 运行。
 cli-sop-pending-header = 等待审批的 SOP 运行：
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] 步骤 {$step}/{$total}
+cli-sop-status-failure-reason = 失败原因：{$reason}
 cli-sop-ws-invalid-approval = sop approval_response 需要 run_id，以及 approve 或 deny 决策
 cli-sop-ws-resolve-failed = SOP 解析失败：{$error}
 cli-sop-ws-engine-lock-poisoned = SOP 引擎锁已中毒

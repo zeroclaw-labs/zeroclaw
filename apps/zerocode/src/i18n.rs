@@ -84,8 +84,12 @@ fn load_strings(locale: &str) -> HashMap<String, String> {
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier: LanguageIdentifier =
-        locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+    let language_identifier: LanguageIdentifier = match locale.parse() {
+        Ok(identifier) => identifier,
+        Err(_) => "en"
+            .parse()
+            .expect("static English Fluent locale must parse"),
+    };
     let mut bundle = FluentBundle::new(vec![language_identifier]);
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);
@@ -179,8 +183,12 @@ fn format_ftl_message(
 ) -> Option<String> {
     let resource =
         FluentResource::try_new(ftl_source.to_string()).unwrap_or_else(|(resource, _)| resource);
-    let language_identifier: LanguageIdentifier =
-        locale.parse().unwrap_or_else(|_| "en".parse().unwrap());
+    let language_identifier: LanguageIdentifier = match locale.parse() {
+        Ok(identifier) => identifier,
+        Err(_) => "en"
+            .parse()
+            .expect("static English Fluent locale must parse"),
+    };
     let mut bundle = FluentBundle::new(vec![language_identifier]);
     bundle.set_use_isolating(false);
     let _ = bundle.add_resource(resource);

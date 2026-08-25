@@ -179,6 +179,7 @@ cli-sop-validate-about = Validate SOP definitions
 cli-sop-show-about = Show details of an SOP
 
 cli-migrate-openclaw-about = Import memory from an OpenClaw workspace into this ZeroClaw workspace
+cli-migrate-openclaw-qdrant-unsupported = Qdrant is not currently supported as an OpenClaw migration target. Set memory.backend to sqlite, lucid, or markdown and retry.
 
 cli-agent-long-about =
     Start the AI agent loop.
@@ -506,6 +507,7 @@ cli-sop-none = No SOPs found.
 cli-sop-pending-none = No SOP runs waiting for approval.
 cli-sop-pending-header = SOP runs waiting for approval:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+cli-sop-status-failure-reason = Failure reason: {$reason}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}

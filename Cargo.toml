@@ -443,6 +443,12 @@ path = "tests/test_live.rs"
 name = "architecture"
 path = "tests/test_architecture.rs"
 
+# Cross-crate activation proof: a configured channel plugin reaching a real
+# WASM component. Needs `plugins-wasm-cranelift` and the wasm32-wasip2 target.
+[[test]]
+name = "plugin_channel_runtime_e2e"
+path = "tests/plugin_channel_runtime_e2e.rs"
+
 [[bench]]
 name = "agent_benchmarks"
 harness = false

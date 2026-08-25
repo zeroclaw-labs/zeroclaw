@@ -180,21 +180,16 @@ where
 
         // Attach source location for jump-to-source from log viewers.
         if visitor.file.is_some() || visitor.line.is_some() {
-            let map = match &mut log_event.attributes {
-                Value::Object(m) => m,
-                _ => {
-                    log_event.attributes = Value::Object(JsonMap::new());
-                    match &mut log_event.attributes {
-                        Value::Object(m) => m,
-                        _ => unreachable!(),
-                    }
-                }
-            };
-            if let Some(f) = visitor.file {
-                map.entry("_file".to_string()).or_insert(Value::String(f));
+            if !log_event.attributes.is_object() {
+                log_event.attributes = Value::Object(JsonMap::new());
             }
-            if let Some(l) = visitor.line {
-                map.entry("_line".to_string()).or_insert(Value::from(l));
+            if let Some(map) = log_event.attributes.as_object_mut() {
+                if let Some(f) = visitor.file {
+                    map.entry("_file".to_string()).or_insert(Value::String(f));
+                }
+                if let Some(l) = visitor.line {
+                    map.entry("_line".to_string()).or_insert(Value::from(l));
+                }
             }
         }
 

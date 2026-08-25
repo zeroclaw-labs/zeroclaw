@@ -2923,6 +2923,10 @@ impl Tool for ToolArcRef {
         self.inner.spec()
     }
 
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
     }
@@ -9954,6 +9958,71 @@ mod tool_arc_ref_spec_tests {
             Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
             "ToolArcRef must forward spec() so the inner Arc-shared schema \
              survives; the trait default deep-clones it every call"
+        );
+    }
+
+    /// Trigger-owning tool standing in for `send_via` behind bounded
+    /// delegation's `ToolArcRef` wrapper.
+    struct TriggerOwningTool;
+
+    impl ::zeroclaw_api::attribution::Attributable for TriggerOwningTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "trigger-owning-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TriggerOwningTool {
+        fn name(&self) -> &str {
+            "trigger_owning_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with invocation triggers"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        fn invocation_triggers(&self) -> Vec<String> {
+            vec!["send this to".into(), "as a voice message".into()]
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_invocation_triggers() {
+        // Regression: bounded delegation re-wraps every admitted parent tool
+        // in `ToolArcRef` (see the sub-tool assembly in `execute`). Without
+        // explicit forwarding the trait default returns an empty vocabulary,
+        // silently erasing a trigger-owning tool's metadata for any consumer
+        // scanning a delegate's assembled tools.
+        let inner: Arc<dyn Tool> = Arc::new(TriggerOwningTool);
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert_eq!(
+            wrapped.invocation_triggers(),
+            inner.invocation_triggers(),
+            "ToolArcRef must forward invocation_triggers(); the trait \
+             default erases the inner tool's vocabulary"
+        );
+        assert!(
+            wrapped
+                .invocation_triggers()
+                .iter()
+                .any(|t| t == "send this to"),
+            "wrapped trigger vocabulary must survive bounded delegation"
         );
     }
 }

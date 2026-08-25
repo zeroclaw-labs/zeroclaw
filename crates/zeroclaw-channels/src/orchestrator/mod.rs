@@ -9735,6 +9735,38 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+/// Fold constructed channel plugins into the configured-channel set.
+///
+/// Plugin channels join the ordinary set rather than getting a lifecycle of
+/// their own, so they inherit the existing supervised listener, its restart
+/// backoff, and the composite-key registry with no plugin-specific branches
+/// downstream. Their alias is host-issued — it comes from the admitted
+/// `PluginChannelEndpoint`, not from re-reading config — so the registry key is
+/// the same `plugin.<alias>` an agent already routes to.
+///
+/// Note the deliberate asymmetry with `collect_configured_channels`: plugin
+/// channels are constructed asynchronously, so the synchronous
+/// `build_channel_map` and `register_channels_for_tools` surfaces cannot see
+/// them. Nostr already has this shape. The consequence is that channel-addressed
+/// *tools* cannot target a plugin channel yet; inbound and outbound delivery
+/// through the supervised listener are unaffected. Closing that gap means making
+/// those two surfaces async, which is deliberately not part of this change.
+fn append_configured_plugin_channels(
+    configured: &mut Vec<ConfiguredChannel>,
+    plugin_channels: Vec<Arc<dyn Channel>>,
+) {
+    for channel in plugin_channels {
+        debug_assert_eq!(channel.name(), "plugin");
+        debug_assert!(!channel.alias().is_empty());
+        let alias = channel.alias().to_string();
+        configured.push(ConfiguredChannel {
+            display_name: "Plugin",
+            alias: Some(alias),
+            channel,
+        });
+    }
+}
+
 /// Compose the registry key for a channel given its `name()` and configured alias.
 /// Aliased channels live at `<name>.<alias>`; un-aliased singletons keep the bare name.
 pub(crate) fn composite_channel_key(name: &str, alias: Option<&str>) -> String {
@@ -11616,6 +11648,16 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
     let mut channels = collect_configured_channels(&config_arc, "health check", &[], None, None);
 
+    // Take an owned snapshot before the `.await`: the parking_lot guard is not
+    // Send and must not be held across the async constructor.
+    let plugin_config = Arc::new(config_arc.read().clone());
+    let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
+        plugin_config,
+        Some(Arc::clone(&config_arc)),
+    )
+    .await;
+    append_configured_plugin_channels(&mut channels, plugin_channels);
+
     #[cfg(feature = "channel-nostr")]
     {
         // Materialize the work list into owned values BEFORE any `.await`
@@ -12426,6 +12468,12 @@ pub async fn start_channels(
                      `channel-filesystem`; skipping Filesystem."
                 );
             }
+            let plugin_channels = zeroclaw_runtime::plugin_runtime::configured_plugin_channels(
+                Arc::new(config.clone()),
+                Some(Arc::clone(&config_arc)),
+            )
+            .await;
+            append_configured_plugin_channels(&mut configured_channels, plugin_channels);
             let channels: Vec<Arc<dyn Channel>> = configured_channels
                 .iter()
                 .map(|cc| Arc::clone(&cc.channel))
@@ -12570,7 +12618,8 @@ pub async fn start_channels(
             max_tool_iterations: config.effective_max_tool_iterations(agent_alias.as_str()),
             min_relevance_score: config.memory.min_relevance_score,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
@@ -27822,6 +27871,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     file_name: "sticker.png".to_string(),
                     data: vec![1, 2, 3, 4],
                     mime_type: Some("image/png".to_string()),
+                    marker: None,
                 }],
                 subject: None,
                 internal_sop_event: None,
@@ -29167,6 +29217,142 @@ This is an example JSON object for profile settings."#;
         }
     }
 
+    struct PluginLifecycleChannel {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for PluginLifecycleChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Plugin,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "operations"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for PluginLifecycleChannel {
+        fn name(&self) -> &str {
+            "plugin"
+        }
+
+        async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tx.closed().await;
+            Ok(())
+        }
+    }
+
+    /// A plugin channel must be an ordinary member of the configured set: it
+    /// lands under the same composite registry key an agent routes to, and it
+    /// starts and stops under the shared supervisor rather than a bespoke
+    /// plugin lifecycle.
+    #[tokio::test]
+    async fn plugin_only_channel_enters_the_shared_listener_lifecycle_with_exact_alias() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel: Arc<dyn Channel> = Arc::new(PluginLifecycleChannel {
+            calls: Arc::clone(&calls),
+        });
+        let mut configured = Vec::new();
+        append_configured_plugin_channels(&mut configured, vec![channel]);
+
+        assert_eq!(configured.len(), 1);
+        assert_eq!(configured[0].alias.as_deref(), Some("operations"));
+        let map = configured_channel_map(&configured);
+        assert!(map.contains_key("plugin.operations"));
+        assert!(map.contains_key("plugin"));
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener(
+            Arc::clone(&configured[0].channel),
+            configured[0].alias.clone(),
+            tx,
+            1,
+            1,
+            cancel.clone(),
+        );
+
+        tokio::time::timeout(Duration::from_millis(500), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("plugin-only listener must start under shared supervision");
+        drop(rx);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("plugin-only listener must stop with shared cancellation")
+            .expect("plugin-only listener task must join cleanly");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Two aliases of the same package stay individually addressable, and the
+    /// bare `plugin` key is deliberately not minted for either of them.
+    #[tokio::test]
+    async fn two_plugin_aliases_keep_distinct_composite_registry_keys() {
+        struct Aliased(&'static str);
+
+        impl ::zeroclaw_api::attribution::Attributable for Aliased {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Channel(
+                    ::zeroclaw_api::attribution::ChannelKind::Plugin,
+                )
+            }
+
+            fn alias(&self) -> &str {
+                self.0
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl Channel for Aliased {
+            fn name(&self) -> &str {
+                "plugin"
+            }
+
+            async fn send(&self, _message: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut configured = Vec::new();
+        append_configured_plugin_channels(
+            &mut configured,
+            vec![
+                Arc::new(Aliased("ops")) as Arc<dyn Channel>,
+                Arc::new(Aliased("backup")) as Arc<dyn Channel>,
+            ],
+        );
+
+        let map = configured_channel_map(&configured);
+        assert!(map.contains_key("plugin.ops"));
+        assert!(map.contains_key("plugin.backup"));
+        assert!(
+            !map.contains_key("plugin"),
+            "two instances must not collapse into a bare singleton key"
+        );
+    }
+
     #[tokio::test]
     async fn supervised_listener_marks_error_and_restarts_on_failures() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -29669,6 +29855,7 @@ This is an example JSON object for profile settings."#;
                     file_name: "route.png".to_string(),
                     data: vec![1, 2, 3, 4],
                     mime_type: Some("image/png".to_string()),
+                    marker: None,
                 }],
                 subject: None,
                 internal_sop_event: None,
@@ -29717,6 +29904,339 @@ This is an example JSON object for profile settings."#;
                 .contains("data:image/png;base64,AQIDBA=="),
             "vision provider request must contain the preserved attachment bytes: {vision_body}"
         );
+    }
+
+    /// An image uploaded "as file" through Telegram, with the media pipeline
+    /// ENABLED and a vision-capable provider, must not pick up a second,
+    /// base64-inlined `[IMAGE:data:` copy in the outgoing prompt or in stored
+    /// history. The channel emits the same re-loadable `[IMAGE:<path>]` marker
+    /// for image documents as for photos, and the pipeline recognizes it as
+    /// already marked instead of describing it again.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn telegram_image_document_with_enabled_pipeline_never_inlines_base64() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_11" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/file_11$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let telegram = crate::telegram::TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        // An extensionless image document is the historic double-describe
+        // path: it used to render as `[Document:]` while `kind()` classified
+        // it as an image, so the pipeline saw an undescribed image.
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 8,
+                "chat": { "id": 556 },
+                "from": { "username": "alice", "id": 99 },
+                "document": {
+                    "file_id": "doc11",
+                    "file_name": "upload",
+                    "mime_type": "image/jpeg",
+                    "file_size": 4
+                },
+                "caption": "please describe"
+            }
+        });
+        let msg = telegram
+            .try_parse_attachment_message(&update)
+            .await
+            .expect_parsed("image document update should parse");
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "channel must emit the path marker for image documents: {}",
+            msg.content
+        );
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+            vision: true,
+        });
+        let base_ctx = peer_prompt_test_context(
+            channels_by_name,
+            provider_impl.clone(),
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            Arc::new(vec![]),
+        );
+        let ctx = Arc::new(ChannelRuntimeContext {
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*base_ctx).clone()
+        });
+
+        process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
+
+        // Marker resolution legitimately inlines ONE base64 copy of the
+        // `[IMAGE:<path>]` marker at provider-call time; the double-describe
+        // bug added a SECOND copy via the pipeline's own annotation. Assert
+        // the annotation is absent and no message carries more than one copy.
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!calls.is_empty(), "provider must have been called");
+        for call in calls.iter() {
+            for (role, content) in call {
+                assert!(
+                    !content.contains("will be processed by vision model"),
+                    "media pipeline must not re-describe a channel-marked image \
+                     ({role}): {content}"
+                );
+                assert!(
+                    content.matches("[IMAGE:data:").count() <= 1,
+                    "outgoing {role} message must not inline the image twice: {content}"
+                );
+            }
+        }
+        drop(calls);
+
+        // The persisted user turn is the enriched content verbatim, so it must
+        // carry the path marker but never base64.
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut stored_turns = 0usize;
+        for (_, history) in histories.iter() {
+            for msg in history.iter() {
+                stored_turns += 1;
+                assert!(
+                    !msg.content.contains("IMAGE:data:"),
+                    "stored history must not persist base64: {}",
+                    msg.content
+                );
+            }
+        }
+        assert!(stored_turns > 0, "history must have stored the turn");
+    }
+
+    /// An UNSUPPORTED image document (HEIC and the extensionless
+    /// declared-`image/*` variant) the multimodal loader rejects. `kind()`
+    /// still reads the `image/*` MIME as `Image`, so before the disposition was
+    /// recorded the pipeline re-described it and added an `[IMAGE:data:...]`
+    /// copy the provider then dropped. Driven through the REAL parser and
+    /// orchestrator with the pipeline enabled and a vision provider, it must
+    /// stay a document end to end: the saved path reaches the provider and
+    /// stored history, with no image annotation, no inline base64, and no
+    /// load-failure replacement.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn telegram_unsupported_image_document_stays_a_document_end_to_end() {
+        async fn run_case(file_name: &str, mime: &str) {
+            use wiremock::matchers::{method, path_regex};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let mock_server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"/bot[^/]+/getFile$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": "documents/heic_1" }
+                })))
+                .mount(&mock_server)
+                .await;
+            // An ISO-BMFF `ftyp heic` header: recognized as neither a provider
+            // image extension nor provider image magic, so
+            // `provider_loadable_image_mime()` is `None` while `kind()` still
+            // reads the declared `image/*` MIME as `Image`.
+            let heic_bytes: Vec<u8> = vec![
+                0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0x00, 0x00,
+                0x00, 0x00,
+            ];
+            Mock::given(method("GET"))
+                .and(path_regex(r"/file/bot[^/]+/documents/heic_1$"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(heic_bytes.clone()))
+                .mount(&mock_server)
+                .await;
+
+            let workspace = tempfile::TempDir::new().unwrap();
+            let telegram = crate::telegram::TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf());
+
+            let mut document = serde_json::json!({
+                "file_id": "heic1",
+                "mime_type": mime,
+                "file_size": heic_bytes.len(),
+            });
+            // The extensionless variant carries no file name, so the declared
+            // MIME is its only image signal.
+            if !file_name.is_empty() {
+                document["file_name"] = serde_json::json!(file_name);
+            }
+            let update = serde_json::json!({
+                "message": {
+                    "message_id": 12,
+                    "chat": { "id": 557 },
+                    "from": { "username": "alice", "id": 99 },
+                    "document": document,
+                    "caption": "please describe"
+                }
+            });
+
+            let msg = telegram
+                .try_parse_attachment_message(&update)
+                .await
+                .expect_parsed("unsupported image document update should parse");
+            assert!(
+                msg.content.contains("[Document:"),
+                "an unsupported image document must render as a document \
+                 ({file_name}/{mime}): {}",
+                msg.content
+            );
+            assert!(
+                !msg.content.contains("[IMAGE:"),
+                "an unsupported image document must not earn an image marker \
+                 ({file_name}/{mime}): {}",
+                msg.content
+            );
+            let document_path = msg
+                .attachments
+                .first()
+                .and_then(|a| a.marker_target())
+                .expect("the channel must record the document target")
+                .to_string();
+
+            let channel_impl = Arc::new(TelegramRecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let mut channels_by_name = HashMap::new();
+            channels_by_name.insert(channel.name().to_string(), channel);
+
+            let provider_impl = Arc::new(HistoryCaptureModelProvider {
+                calls: std::sync::Mutex::new(Vec::new()),
+                vision: true,
+            });
+            let base_ctx = peer_prompt_test_context(
+                channels_by_name,
+                provider_impl.clone(),
+                Arc::new(zeroclaw_config::schema::Config::default()),
+                Arc::new(vec![]),
+            );
+            let ctx = Arc::new(ChannelRuntimeContext {
+                workspace_dir: Arc::new(workspace.path().to_path_buf()),
+                media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                    enabled: true,
+                    describe_images: true,
+                    ..Default::default()
+                },
+                ..(*base_ctx).clone()
+            });
+
+            process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
+
+            let calls = provider_impl
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !calls.is_empty(),
+                "provider must have been called ({file_name}/{mime})"
+            );
+            let mut document_path_reached_user_turn = false;
+            for call in calls.iter() {
+                for (role, content) in call {
+                    assert!(
+                        !content.contains("will be processed by vision model"),
+                        "an unsupported image document must not be described as an image \
+                         ({role}): {content}"
+                    );
+                    assert!(
+                        !content.contains("IMAGE:data:"),
+                        "an unsupported image document must not be inlined as base64 \
+                         ({role}): {content}"
+                    );
+                    assert!(
+                        !content.contains("could not be loaded"),
+                        "an unsupported image document must not become a load-failure note \
+                         ({role}): {content}"
+                    );
+                    if role == "user" && content.contains(&document_path) {
+                        document_path_reached_user_turn = true;
+                    }
+                }
+            }
+            assert!(
+                document_path_reached_user_turn,
+                "the document path must reach the provider on the user turn \
+                 ({file_name}/{mime})"
+            );
+            drop(calls);
+
+            let histories = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut stored_turns = 0usize;
+            let mut document_path_persisted = false;
+            for (_, history) in histories.iter() {
+                for msg in history.iter() {
+                    stored_turns += 1;
+                    assert!(
+                        !msg.content.contains("IMAGE:data:"),
+                        "stored history must not persist base64 ({file_name}/{mime}): {}",
+                        msg.content
+                    );
+                    assert!(
+                        !msg.content.contains("will be processed by vision model"),
+                        "stored history must not carry an image annotation \
+                         ({file_name}/{mime}): {}",
+                        msg.content
+                    );
+                    if msg.content.contains(&document_path) {
+                        document_path_persisted = true;
+                    }
+                }
+            }
+            assert!(
+                stored_turns > 0,
+                "history must have stored the turn ({file_name}/{mime})"
+            );
+            assert!(
+                document_path_persisted,
+                "stored history must retain the document path ({file_name}/{mime})"
+            );
+        }
+
+        // The reviewer's two boundaries: a named HEIC document, and an
+        // extensionless document whose only image signal is the declared MIME.
+        run_case("photo.heic", "image/heic").await;
+        run_case("scan", "image/heic").await;
     }
 
     #[tokio::test]

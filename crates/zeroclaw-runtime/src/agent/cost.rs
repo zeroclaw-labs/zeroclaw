@@ -252,6 +252,57 @@ pub fn record_tool_loop_cost_usage(
     record_tool_loop_cost_usage_inner(model_provider_name, model, usage, true)
 }
 
+/// Settle the immutable physical-attempt report exactly once.  Only complete
+/// usage (or a valid lower-bound observation preserved after interruption) is
+/// billable; accepted context-window fill remains a property of the selected
+/// final leaf rather than the aggregate.
+pub(crate) struct BillableProviderAttempt<'a> {
+    pub index: usize,
+    pub attempt: &'a zeroclaw_providers::dispatch::AccountedAttempt,
+    pub usage: &'a zeroclaw_providers::traits::TokenUsage,
+}
+
+/// Pure, ordered projection for current BestEffort settlement and the future
+/// task-attributed persistence caller. Invalid and missing observations never
+/// appear in this view.
+pub(crate) fn billable_provider_attempts(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) -> impl Iterator<Item = BillableProviderAttempt<'_>> {
+    use zeroclaw_providers::dispatch::AttemptUsageOutcome;
+
+    attempts.iter().enumerate().filter_map(|(index, attempt)| {
+        let usage = match attempt.outcome() {
+            AttemptUsageOutcome::Complete(usage) => Some(usage),
+            AttemptUsageOutcome::OutcomeUnknown {
+                observed: Some(usage),
+            } => Some(usage),
+            AttemptUsageOutcome::Missing
+            | AttemptUsageOutcome::Invalid { .. }
+            | AttemptUsageOutcome::OutcomeUnknown { observed: None } => None,
+        };
+        usage.map(|usage| BillableProviderAttempt {
+            index,
+            attempt,
+            usage,
+        })
+    })
+}
+
+pub(crate) fn settle_provider_attempts(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+    accepted_attempt: Option<usize>,
+) {
+    for event in billable_provider_attempts(attempts) {
+        let updates_context_window_fill = accepted_attempt == Some(event.index);
+        let _ = record_tool_loop_cost_usage_inner(
+            event.attempt.provider_ref(),
+            event.attempt.model(),
+            event.usage,
+            updates_context_window_fill,
+        );
+    }
+}
+
 fn record_tool_loop_cost_usage_inner(
     model_provider_name: &str,
     model: &str,
@@ -421,10 +472,151 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
     use zeroclaw_config::schema::{Config, DeepseekModelProviderConfig, ModelProviderConfig};
+    use zeroclaw_providers::ProviderDispatch;
+    use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
+    }
+
+    #[tokio::test]
+    async fn settlement_uses_exact_attempt_routes_models_and_record_order() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(HashMap::from([
+            (
+                "provider.first".to_string(),
+                HashMap::from([("model-a.input".to_string(), 1.0)]),
+            ),
+            (
+                "provider.second".to_string(),
+                HashMap::from([("model-b.input".to_string(), 3.0)]),
+            ),
+        ]));
+        let context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
+        let first = PricedLeaf {
+            alias: "wrapper.first",
+        };
+        let second = PricedLeaf {
+            alias: "wrapper.second",
+        };
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                scope
+                    .scope(async {
+                        assert!(
+                            with_exact_dispatch_route(
+                                "provider.first".to_string(),
+                                "model-a".to_string(),
+                                ProviderDispatch::from_ref(&first).chat(
+                                    ChatRequest {
+                                        messages: &messages,
+                                        tools: None,
+                                        thinking: None,
+                                    },
+                                    "ignored",
+                                    None,
+                                ),
+                            )
+                            .await
+                            .is_ok()
+                        );
+                        assert!(
+                            with_exact_dispatch_route(
+                                "provider.second".to_string(),
+                                "model-b".to_string(),
+                                ProviderDispatch::from_ref(&second).chat(
+                                    ChatRequest {
+                                        messages: &messages,
+                                        tools: None,
+                                        thinking: None,
+                                    },
+                                    "ignored",
+                                    None,
+                                ),
+                            )
+                            .await
+                            .is_ok()
+                        );
+                    })
+                    .await;
+                let report = scope.take();
+                settle_provider_attempts(report.attempts(), None);
+            })
+            .await;
+
+        let records = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<zeroclaw_config::cost::types::CostRecord>(line).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].usage.model, "model-a");
+        assert_eq!(records[1].usage.model, "model-b");
+        assert!((records[0].usage.cost_usd - 1.0).abs() < 1e-12);
+        assert!((records[1].usage.cost_usd - 3.0).abs() < 1e-12);
+    }
+
+    struct PricedLeaf {
+        alias: &'static str,
+    }
+
+    impl Attributable for PricedLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            self.alias
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PricedLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(1_000_000),
+                    output_tokens: Some(0),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
     }
 
     #[test]

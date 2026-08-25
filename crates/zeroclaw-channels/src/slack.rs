@@ -1108,6 +1108,7 @@ impl SlackChannel {
             file_name,
             data,
             mime_type,
+            marker: None,
         })
     }
 

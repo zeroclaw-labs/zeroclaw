@@ -121,6 +121,10 @@ pub struct CronAddBody {
     pub job_type: Option<String>,
     pub prompt: Option<String>,
     pub delivery: Option<zeroclaw_runtime::cron::DeliveryConfig>,
+    /// Agent session context: `"isolated"` (default) or `"main"`. For agent jobs,
+    /// a present value that is not one of those two names is rejected; omitted
+    /// keeps the isolated default. Same contract as the `cron_add` tool. Shell
+    /// jobs ignore this field.
     pub session_target: Option<String>,
     pub model: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
@@ -479,10 +483,13 @@ pub async fn handle_api_cron_add(
             }
         };
 
-        let session_target = session_target
-            .as_deref()
-            .map(zeroclaw_runtime::cron::SessionTarget::parse)
-            .unwrap_or_default();
+        let session_target = match session_target {
+            Some(raw) => match zeroclaw_runtime::cron::SessionTarget::try_parse(&raw) {
+                Ok(target) => target,
+                Err(e) => return bad_request(e).into_response(),
+            },
+            None => zeroclaw_runtime::cron::SessionTarget::Isolated,
+        };
 
         let default_delete = matches!(schedule, zeroclaw_runtime::cron::Schedule::At { .. });
         let delete_after_run = delete_after_run.unwrap_or(default_delete);
@@ -3869,6 +3876,174 @@ pub(crate) mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].job_type, zeroclaw_runtime::cron::JobType::Agent);
         assert_eq!(jobs[0].prompt.as_deref(), Some("summarize the latest logs"));
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Isolated
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_persists_session_target_main() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "main-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "continue in the primary session",
+                    "session_target": "main"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let config = state.config.read().clone();
+        let jobs = zeroclaw_runtime::cron::list_jobs(&config).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Main
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_accepts_session_target_case_and_whitespace() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "main-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "continue in the primary session",
+                    "session_target": "  MAIN  "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let jobs = zeroclaw_runtime::cron::list_jobs(&state.config.read().clone()).unwrap();
+        assert_eq!(
+            jobs[0].session_target,
+            zeroclaw_runtime::cron::SessionTarget::Main
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_rejects_invalid_session_target_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "typo-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "should not be created",
+                    "session_target": "shared"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        let error = json["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("session_target"),
+            "error should name the field, got {error}"
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty(),
+            "invalid session_target must not persist a job"
+        );
+    }
+
+    #[tokio::test]
+    async fn cron_api_agent_job_rejects_empty_session_target_as_bad_request() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let state = test_state(with_test_agent(config));
+
+        let response = handle_api_cron_add(
+            State(state.clone()),
+            HeaderMap::new(),
+            Json(
+                serde_json::from_value::<CronAddBody>(serde_json::json!({
+                    "name": "empty-session-job",
+                    "agent": "test-agent",
+                    "schedule": "*/5 * * * *",
+                    "job_type": "agent",
+                    "prompt": "should not be created",
+                    "session_target": "   "
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let json = response_json(response).await;
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session_target")
+        );
+        assert!(
+            zeroclaw_runtime::cron::list_jobs(&state.config.read().clone())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

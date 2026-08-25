@@ -13,13 +13,10 @@ and understand crate setup, the `__config` rule, logging, and install. It is
 checked against `wit/v0/channel.wit` and the host adapter in
 `crates/zeroclaw-plugins/src/wasm_channel.rs`.
 
-> **Wiring status.** The host side of channel plugins is complete and
-> unit-covered: `WasmChannel` implements the runtime's `Channel` trait, and
-> `PluginHost::channel_plugin_details()` exposes discovered channel plugins.
-> The remaining seam is orchestrator registration plus the per-vendor host
-> listener; until that lands, a channel plugin loads and passes its contract
-> tests but is not yet constructed by a running daemon. Build against the
-> contract now; the contract is what freezes.
+> **Wiring status.** Channel plugins are constructed by a running daemon. An
+> installed package bound through `[channels.plugin.<alias>]` is admitted at
+> startup and supervised exactly like a native channel. See
+> [Activating a channel plugin](#activating-a-channel-plugin) below.
 
 ## The lifecycle
 
@@ -281,7 +278,9 @@ before guest code runs instead of starting a channel without required config.
 Each channel instance selects the `plugins.entries` key derived from its full
 package, `channel` capability, and binding identity while reusing this one
 package-owned schema. Identical aliases in different packages therefore remain
-isolated.
+isolated. The install and info commands cannot create this key because they do
+not own the configured channel alias; their automatic print and seed behavior
+is tool-only, so a channel instance's entry is written by hand.
 
 Call `config.get` and `secrets.get` inside each operation that uses them. The
 host resolves at most one canonical revision for that call and drops its view
@@ -298,6 +297,82 @@ effective `config_read` grant can load, but `config.get` and `secrets.get` retur
 static discovery, after resolver/validation failure, or when the shared host-call
 budget is exhausted. `secrets.get` additionally returns `not-found` for a name
 that is absent or not marked `x-secret = true`.
+
+## Activating a channel plugin
+
+An installed package does nothing until an operator binds it to a logical
+channel instance. The binding names the package and nothing else; the alias
+is the instance's identity:
+
+```toml
+[plugins]
+enabled = true
+
+[channels.plugin.operations]
+package = "acme.chat"
+enabled = true
+
+[agents.support]
+channels = ["plugin.operations"]
+```
+
+The alias becomes an ordinary channel reference, so `plugin.operations` is
+routed, supervised, restarted, and addressed exactly like `telegram.main`.
+Two aliases may name one package; each gets its own instance, its own store,
+and its own `plugins.entries` key, so they share no state.
+
+An instance is admitted only when all of the following hold. Each is a
+deliberate fail-closed gate, and a declaration that misses one is inert rather
+than half-started:
+
+- `plugins.enabled` is true.
+- The declaration's `enabled` is true.
+- The named package is installed and its manifest declares the `channel`
+  capability.
+- Some **enabled** agent lists `plugin.<alias>` in its `channels`. An
+  unreferenced binding would run a listener with nowhere to deliver.
+
+Admission happens before any guest code runs: it is decided from manifests the
+package host already verified, so a package whose component is corrupt is
+planned and rejected identically to one that is sound. A package that passes
+admission but then fails to construct is logged and skipped, so one broken
+plugin cannot stop the daemon from starting your other channels.
+
+`plugins.max_active_instances` caps how many logical instances are admitted
+across all capabilities. Explicit channel bindings rank ahead of
+auto-discovered tools and skills, so a full plugin directory cannot displace a
+channel the operator configured by hand.
+
+The same admitted set drives all three loaders: the channel loader, the tool
+registry, and the plugin-skill loader. The ceiling is therefore one shared
+budget rather than a per-capability one. A package that provides both a channel and a
+tool really does spend two slots, and a tool or skill over the ceiling is not
+constructed at all. Admission is a pure function of your current config and
+installed packages: it holds no counter, so the tool registries rebuilt per
+agent, per CLI run, per delegate, and per SOP execution each re-derive the same
+set instead of exhausting the ceiling over a long-running daemon's lifetime.
+
+Tool and skill instances are *auto-discovered*, so they are admitted only when
+`plugins.auto_discover` is true. Explicit `[channels.plugin.<alias>]`
+declarations do not need it. With `plugins.enabled = true` and
+`auto_discover = false`, you get exactly the channel bindings you declared and
+nothing else.
+
+> **Migrating from `plugins.max_plugins`.** The old key was never enforced and
+> has been replaced by `plugins.max_active_instances`. The two count different
+> things: the old key counted installed packages, the new one counts admitted
+> logical instances, so a package providing both a channel and a tool consumes
+> two. Because the units differ, an existing `max_plugins` value is **not**
+> carried over: it is ignored, and the new key takes its default. Set
+> `max_active_instances` explicitly if you relied on a non-default ceiling.
+
+### What is not wired yet
+
+Plugin channels are constructed asynchronously, after the synchronous
+channel-map surfaces have already been built. Channel-addressed *tools*
+therefore cannot target a plugin channel yet. Inbound polling and outbound
+delivery through the supervised listener are unaffected; only tool-side
+addressing is missing.
 
 ## Build and install
 

@@ -13621,7 +13621,6 @@ name = "zeroclaw-channel-plugin-fixture"
 version = "0.0.0"
 dependencies = [
  "serde_json",
- "waki",
  "wit-bindgen 0.51.0",
 ]
 
