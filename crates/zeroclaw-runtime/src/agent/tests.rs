@@ -751,12 +751,9 @@ async fn history_trims_after_max_messages() {
         retained_messages.len(),
         max_history,
     );
-    let mut turns = retained_messages.chunks_exact(2);
-    assert!(
-        turns.remainder().is_empty(),
-        "history must retain whole turns"
-    );
-    assert!(turns.all(|turn| matches!(
+    let (turns, remainder) = retained_messages.as_chunks::<2>();
+    assert!(remainder.is_empty(), "history must retain whole turns");
+    assert!(turns.iter().all(|turn| matches!(
         turn,
         [ConversationMessage::Chat(user), ConversationMessage::Chat(assistant)]
             if user.role == "user" && assistant.role == "assistant"
@@ -883,7 +880,7 @@ async fn xml_dispatcher_does_not_send_tool_specs() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn turn_handles_empty_text_response() {
+async fn turn_rejects_empty_text_response() {
     let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: Some(String::new()),
         tool_calls: vec![],
@@ -893,12 +890,18 @@ async fn turn_handles_empty_text_response() {
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+    let err = agent
+        .turn("hi")
+        .await
+        .expect_err("empty terminal response must fail");
+    assert_eq!(
+        err.to_string(),
+        "provider completed without final text or tool calls"
+    );
 }
 
 #[tokio::test]
-async fn turn_handles_none_text_response() {
+async fn turn_rejects_none_text_response() {
     let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
         text: None,
         tool_calls: vec![],
@@ -908,9 +911,52 @@ async fn turn_handles_none_text_response() {
 
     let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
 
-    // Should not panic — falls back to empty string
-    let response = agent.turn("hi").await.unwrap();
-    assert!(response.is_empty());
+    let err = agent
+        .turn("hi")
+        .await
+        .expect_err("missing terminal text must fail");
+    assert_eq!(
+        err.to_string(),
+        "provider completed without final text or tool calls"
+    );
+}
+
+#[tokio::test]
+async fn turn_rejects_think_tag_only_response_and_records_usage() {
+    use crate::agent::cost::{
+        TOOL_LOOP_COST_TRACKING_CONTEXT, TOOL_LOOP_TURN_USAGE, ToolLoopCostTrackingContext,
+        TurnUsage,
+    };
+
+    let model_provider = Box::new(ScriptedModelProvider::new(vec![ChatResponse {
+        text: Some("<think>internal reasoning</think>".to_string()),
+        tool_calls: vec![],
+        usage: Some(zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cached_input_tokens: None,
+        }),
+        reasoning_content: None,
+    }]));
+    let mut agent = build_agent_with(model_provider, vec![], Box::new(NativeToolDispatcher));
+    let cost_context = ToolLoopCostTrackingContext::usage_only();
+    let turn_usage = Arc::new(parking_lot::Mutex::new(TurnUsage::default()));
+
+    let error = TOOL_LOOP_TURN_USAGE
+        .scope(
+            Some(Arc::clone(&turn_usage)),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(Some(cost_context), agent.turn("hi")),
+        )
+        .await
+        .expect_err("think-only terminal response must fail");
+
+    assert_eq!(
+        error.to_string(),
+        "provider completed without final text or tool calls"
+    );
+    let recorded = *turn_usage.lock();
+    assert_eq!(recorded.input_tokens, 10);
+    assert_eq!(recorded.output_tokens, 5);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

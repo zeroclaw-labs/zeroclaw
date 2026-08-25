@@ -4,11 +4,11 @@ use crate::PluginCapability;
 use crate::component::PluginLimits;
 use crate::instance::PluginInstanceScope;
 use crate::runtime;
+use crate::services::PluginHostServices;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::collections::HashMap;
 use std::path::PathBuf;
-use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
+use zeroclaw_api::attribution::{Attributable, Role, ToolKind, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolResult};
 
 /// A tool backed by a WASM plugin function.
@@ -18,13 +18,13 @@ pub struct WasmTool {
     parameters_schema: Value,
     wasm_path: PathBuf,
     scope: PluginInstanceScope,
-    config: HashMap<String, String>,
+    services: PluginHostServices,
     limits: PluginLimits,
 }
 
 impl Attributable for WasmTool {
     fn role(&self) -> Role {
-        Role::Tool(ToolKind::Plugin)
+        Role::Tool(ToolKind::WasmPlugin)
     }
 
     fn alias(&self) -> &str {
@@ -34,26 +34,32 @@ impl Attributable for WasmTool {
         // component logging under distinct plugin attributes.
         &self.name
     }
+
+    fn tool_provenance(&self) -> ToolProvenance {
+        ToolProvenance::Extension
+    }
 }
 
 impl WasmTool {
+    /// Build an adapter from already-read metadata and a live host-service bundle.
     pub fn new(
         name: String,
         description: String,
         parameters_schema: Value,
         wasm_path: PathBuf,
         scope: PluginInstanceScope,
-        config: HashMap<String, String>,
+        services: PluginHostServices,
         limits: PluginLimits,
     ) -> anyhow::Result<Self> {
         scope.require_capability(PluginCapability::Tool)?;
+        services.resolve_config(&scope)?;
         Ok(Self {
             name,
             description,
             parameters_schema,
             wasm_path,
             scope,
-            config,
+            services,
             limits,
         })
     }
@@ -61,19 +67,23 @@ impl WasmTool {
     /// Create a `WasmTool` by loading its required metadata exports.
     ///
     /// Components that cannot be loaded, instantiated, or queried are rejected
-    /// instead of being registered with synthetic metadata.
+    /// instead of being registered with synthetic metadata. `services` must
+    /// resolve canonical live config under the supplied instance scope.
     pub fn from_wasm(
         wasm_path: PathBuf,
         scope: PluginInstanceScope,
-        config: HashMap<String, String>,
+        services: PluginHostServices,
         limits: PluginLimits,
     ) -> anyhow::Result<Self> {
         scope.require_capability(PluginCapability::Tool)?;
+        services.resolve_config(&scope)?;
         let probe = {
             let wasm_path = wasm_path.clone();
             let scope = scope.clone();
+            let services = services.clone();
             block_probe(async move {
-                let mut plugin = runtime::create_plugin(&wasm_path, &scope, limits).await?;
+                let mut plugin =
+                    runtime::create_plugin(&wasm_path, &scope, &services, limits).await?;
                 runtime::call_tool_metadata(&mut plugin).await
             })
         };
@@ -85,7 +95,7 @@ impl WasmTool {
             parameters_schema: meta.parameters_schema,
             wasm_path,
             scope,
-            config,
+            services,
             limits,
         })
     }
@@ -128,14 +138,23 @@ impl Tool for WasmTool {
 
     async fn execute(&self, args: Value) -> anyhow::Result<ToolResult> {
         let args_json = serde_json::to_vec(&args)?;
-        let mut plugin = runtime::create_plugin(&self.wasm_path, &self.scope, self.limits).await?;
-        runtime::call_execute(&mut plugin, &args_json, &self.config).await
+        self.services.resolve_config(&self.scope)?;
+        let mut plugin =
+            runtime::create_plugin(&self.wasm_path, &self.scope, &self.services, self.limits)
+                .await?;
+        runtime::call_execute(&mut plugin, &args_json).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PluginConfigResolver;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use zeroclaw_api::attribution::{Attributable, Role, ToolKind};
 
     fn tool_scope() -> PluginInstanceScope {
         crate::instance::test_scope(PluginCapability::Tool, "redaction-primary", [])
@@ -150,13 +169,14 @@ mod tests {
             schema.clone(),
             PathBuf::from("/tmp/plugin.wasm"),
             tool_scope(),
-            HashMap::new(),
+            crate::services::test_host_services(),
             crate::component::test_limits(1_000),
         )
         .expect("tool scope matches adapter");
         assert_eq!(tool.name(), "redact");
         assert_eq!(tool.description(), "does things");
         assert_eq!(tool.parameters_schema(), schema);
+        assert_eq!(tool.role(), Role::Tool(ToolKind::WasmPlugin));
         assert_eq!(tool.alias(), "redact");
         assert_eq!(tool.scope.id().package(), "fixture");
         assert_eq!(tool.scope.id().capability(), PluginCapability::Tool);
@@ -172,7 +192,27 @@ mod tests {
             serde_json::json!({}),
             PathBuf::from("/tmp/plugin.wasm"),
             scope,
-            HashMap::new(),
+            crate::services::test_host_services(),
+            crate::component::test_limits(0),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn new_rejects_invalid_config() {
+        let services = PluginHostServices::new(PluginConfigResolver::new(|_| {
+            Err(crate::error::PluginError::InvalidConfig(
+                "invalid-constructor-config".to_string(),
+            ))
+        }));
+        let result = WasmTool::new(
+            "my_tool".to_string(),
+            "does things".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/tmp/plugin.wasm"),
+            tool_scope(),
+            services,
             crate::component::test_limits(0),
         );
 
@@ -184,10 +224,61 @@ mod tests {
         let result = WasmTool::from_wasm(
             PathBuf::from("/path/that/must/not/exist.wasm"),
             tool_scope(),
-            HashMap::new(),
+            crate::services::test_host_services(),
             crate::component::test_limits(0),
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn from_wasm_validates_config_before_loading_guest_code() {
+        let services = PluginHostServices::new(PluginConfigResolver::new(|_| {
+            Err(crate::error::PluginError::InvalidConfig(
+                "invalid-before-load".to_string(),
+            ))
+        }));
+        let error = WasmTool::from_wasm(
+            PathBuf::from("/path/that/must/not/exist.wasm"),
+            tool_scope(),
+            services,
+            crate::component::test_limits(0),
+        )
+        .err()
+        .expect("invalid config must reject registration");
+
+        assert!(error.to_string().contains("invalid-before-load"));
+    }
+
+    #[tokio::test]
+    async fn execute_revalidates_live_config_before_loading_guest_code() {
+        let reject = Arc::new(AtomicBool::new(false));
+        let reject_for_resolver = Arc::clone(&reject);
+        let services = PluginHostServices::new(PluginConfigResolver::new(move |scope| {
+            if reject_for_resolver.load(Ordering::Relaxed) {
+                return Err(crate::error::PluginError::InvalidConfig(
+                    "invalid-before-execute".to_string(),
+                ));
+            }
+            crate::services::test_host_services().resolve_config(scope)
+        }));
+        let tool = WasmTool::new(
+            "my_tool".to_string(),
+            "does things".to_string(),
+            serde_json::json!({}),
+            PathBuf::from("/path/that/must/not/exist.wasm"),
+            tool_scope(),
+            services,
+            crate::component::test_limits(0),
+        )
+        .expect("initial live config must be valid");
+
+        reject.store(true, Ordering::Relaxed);
+        let error = tool
+            .execute(serde_json::json!({}))
+            .await
+            .expect_err("live config must be revalidated before loading guest code");
+
+        assert!(error.to_string().contains("invalid-before-execute"));
     }
 }

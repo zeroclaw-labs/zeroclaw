@@ -18,7 +18,7 @@ zeroclaw-runtime.workspace = true
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools.workspace = true
 anyhow = "1.0"
-lru = "0.16"
+lru = "0.18.2"
 rumqttc = { version = "0.25", optional = true }
 notify = { version = "6", optional = true }
 glob = { version = "0.3", optional = true }
@@ -140,7 +140,7 @@ wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcd
 waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
 serde-big-array = { version = "0.5", optional = true }
 
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.18.1", optional = true }
 whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true }
 whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
@@ -275,6 +275,9 @@ channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal"]
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = [
   "http1",
@@ -297,4 +300,8 @@ matrix-sdk-test = "0.18"
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"
-tokio = { version = "1.50", features = ["macros", "rt-multi-thread"] }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs, so a
+# duration-sensitive regression can assert the deadline the channel actually
+# waits without the suite sleeping for it. Dev-only, and the same feature
+# zeroclaw-providers already carries for the same reason.
+tokio = { version = "1.50", features = ["macros", "rt-multi-thread", "test-util"] }

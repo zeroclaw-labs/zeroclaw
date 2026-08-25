@@ -384,6 +384,8 @@ struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
     #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
     usage: Option<AnthropicUsage>,
 }
 
@@ -512,16 +514,7 @@ impl AnthropicModelProvider {
     ) -> reqwest::RequestBuilder {
         let is_setup = Self::is_setup_token(credential);
         let len = credential.len();
-        let head: String = credential.chars().take(8).collect();
-        let tail: String = credential
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if is_setup { "Authorization" } else { "x-api-key" }, "credential_len": len, "credential_head": head, "credential_tail": tail})), "Anthropic auth header applied");
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if is_setup { "Authorization" } else { "x-api-key" }, "credential_len": len})), "Anthropic auth header applied");
         if is_setup {
             request
                 .header("Authorization", format!("Bearer {credential}"))
@@ -1172,15 +1165,11 @@ impl AnthropicModelProvider {
                     // finished list for the same thing: `dedupe_tool_results_by_id`
                     // only sees duplicates that already share a message, and this
                     // is what puts them there.
-                    if native_messages
-                        .last()
-                        .is_some_and(|m| m.role == tool_msg.role)
+                    if let Some(last) = native_messages
+                        .last_mut()
+                        .filter(|message| message.role == tool_msg.role)
                     {
-                        native_messages
-                            .last_mut()
-                            .unwrap()
-                            .content
-                            .extend(tool_msg.content);
+                        last.content.extend(tool_msg.content);
                     } else {
                         native_messages.push(tool_msg);
                     }
@@ -1306,12 +1295,11 @@ impl AnthropicModelProvider {
                     // Merge into previous user message if present (e.g.
                     // when a user message immediately follows tool results
                     // which are also role "user" in Anthropic's format).
-                    if native_messages.last().is_some_and(|m| m.role == "user") {
-                        native_messages
-                            .last_mut()
-                            .unwrap()
-                            .content
-                            .extend(content_blocks);
+                    if let Some(last) = native_messages
+                        .last_mut()
+                        .filter(|message| message.role == "user")
+                    {
+                        last.content.extend(content_blocks);
                     } else {
                         native_messages.push(NativeMessage {
                             role: "user".to_string(),
@@ -1752,6 +1740,9 @@ impl AnthropicModelProvider {
     }
 
     fn parse_native_response(response: NativeChatResponse) -> ProviderChatResponse {
+        let stop_reason = response.stop_reason.as_deref().unwrap_or("unknown");
+        let content_block_count = response.content.len();
+        let mut content_block_types = Vec::with_capacity(content_block_count);
         let mut text_parts = Vec::new();
         let mut thinking_parts = Vec::new();
         let mut tool_calls = Vec::new();
@@ -1774,7 +1765,8 @@ impl AnthropicModelProvider {
         });
 
         for block in response.content {
-            match block.kind.as_str() {
+            let kind = block.kind;
+            match kind.as_str() {
                 "text" => {
                     if let Some(text) = block.text.map(|t| t.trim().to_string())
                         && !text.is_empty()
@@ -1795,21 +1787,21 @@ impl AnthropicModelProvider {
                 }
                 "tool_use" => {
                     let name = block.name.unwrap_or_default();
-                    if name.is_empty() {
-                        continue;
+                    if !name.is_empty() {
+                        let arguments = block
+                            .input
+                            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+                        tool_calls.push(ProviderToolCall {
+                            id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                            name,
+                            arguments: arguments.to_string(),
+                            extra_content: None,
+                        });
                     }
-                    let arguments = block
-                        .input
-                        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
-                    tool_calls.push(ProviderToolCall {
-                        id: block.id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                        name,
-                        arguments: arguments.to_string(),
-                        extra_content: None,
-                    });
                 }
                 _ => {}
             }
+            content_block_types.push(kind);
         }
 
         let reasoning_content = if thinking_parts.is_empty() {
@@ -1818,7 +1810,7 @@ impl AnthropicModelProvider {
             Some(thinking_parts.join("\n"))
         };
 
-        ProviderChatResponse {
+        let parsed = ProviderChatResponse {
             text: if text_parts.is_empty() {
                 None
             } else {
@@ -1827,7 +1819,47 @@ impl AnthropicModelProvider {
             tool_calls,
             usage,
             reasoning_content,
+        };
+
+        if parsed.is_semantically_empty_terminal() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_category(::zeroclaw_log::EventCategory::Provider)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "provider": "anthropic",
+                        "stop_reason": stop_reason,
+                        "content_block_count": content_block_count,
+                        "content_block_types": content_block_types,
+                        "native_tool_call_count": parsed.tool_calls.len(),
+                        "has_reasoning": parsed.reasoning_content.is_some(),
+                    })),
+                "Anthropic response completed without final text or tool calls"
+            );
         }
+
+        parsed
+    }
+
+    /// Project a native completion into the legacy string-only API without
+    /// erasing the terminal semantic cause required by Reliable and SOP
+    /// delivery boundaries.
+    fn require_terminal_text(parsed: ProviderChatResponse) -> anyhow::Result<String> {
+        if parsed.is_semantically_empty_terminal() {
+            return Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            ));
+        }
+        parsed.text.ok_or_else(|| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "anthropic: empty text in response"
+            );
+            anyhow::Error::msg("No response from Anthropic")
+        })
     }
 
     /// Resolve thinking parameters for an API request. Returns the effective
@@ -1942,6 +1974,13 @@ impl AnthropicModelProvider {
         let mut cached_input_tokens: Option<u64> = None;
         let mut cache_creation_input_tokens: Option<u64> = None;
 
+        // The block summary only feeds the DEBUG `message_stop` event. Avoid
+        // per-block String and map allocations when that event is disabled.
+        let collect_debug_metadata = ::zeroclaw_log::debug_enabled();
+        let mut last_stop_reason: Option<String> = None;
+        let mut content_block_count = 0usize;
+        let mut content_block_types =
+            collect_debug_metadata.then(std::collections::BTreeMap::<String, usize>::new);
         loop {
             let line = match lines.next_line().await {
                 Ok(Some(line)) => line,
@@ -2013,6 +2052,12 @@ impl AnthropicModelProvider {
                             .get("type")
                             .and_then(|t| t.as_str())
                             .unwrap_or_default();
+                        if let Some(content_block_types) = content_block_types.as_mut() {
+                            content_block_count = content_block_count.saturating_add(1);
+                            *content_block_types
+                                .entry(block_type.to_string())
+                                .or_default() += 1;
+                        }
                         if block_type == "tool_use" {
                             if let Some(id) = tool_id.take() {
                                 let name = tool_name.take().unwrap_or_default();
@@ -2092,6 +2137,9 @@ impl AnthropicModelProvider {
                         .and_then(|d| d.get("stop_reason"))
                         .and_then(|s| s.as_str())
                         .unwrap_or("none");
+                    if stop_reason != "none" && collect_debug_metadata {
+                        last_stop_reason = Some(stop_reason.to_string());
+                    }
                     // Anthropic's running-total: each `message_delta`
                     // supersedes the previous one, so we always overwrite.
                     let observed_output = event
@@ -2117,11 +2165,21 @@ impl AnthropicModelProvider {
                     }
                 }
                 "message_stop" => {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                        "stream: message_stop"
-                    );
+                    if collect_debug_metadata {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "stop_reason": last_stop_reason.as_deref().unwrap_or("unknown"),
+                                "content_block_count": content_block_count,
+                                "content_block_types": content_block_types,
+                            })),
+                            "stream: message_stop"
+                        );
+                    }
                     if input_tokens.is_some()
                         || output_tokens.is_some()
                         || cached_input_tokens.is_some()
@@ -2191,7 +2249,7 @@ impl ModelProvider for AnthropicModelProvider {
                 "anthropic: no credentials configured"
             );
             anyhow::Error::msg(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
+                "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
             )
         })?;
 
@@ -2243,15 +2301,7 @@ impl ModelProvider for AnthropicModelProvider {
 
         let chat_response: NativeChatResponse = response.json().await?;
         let parsed = Self::parse_native_response(chat_response);
-        parsed.text.ok_or_else(|| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
-                "anthropic: empty text in response"
-            );
-            anyhow::Error::msg("No response from Anthropic")
-        })
+        Self::require_terminal_text(parsed)
     }
 
     async fn chat(
@@ -2269,7 +2319,7 @@ impl ModelProvider for AnthropicModelProvider {
                 "anthropic: no credentials configured"
             );
             anyhow::Error::msg(
-                "Anthropic credentials not set. Set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN (setup-token).",
+                "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
             )
         })?;
 
@@ -2463,7 +2513,8 @@ impl ModelProvider for AnthropicModelProvider {
             None => {
                 return stream::once(async {
                     Err(StreamError::ModelProvider(
-                        "Anthropic credentials not set".to_string(),
+                        "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+                            .to_string(),
                     ))
                 })
                 .boxed();
@@ -3370,9 +3421,52 @@ data: {\"type\":\"message_stop\"}\n\n";
             .await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("credentials not set"),
-            "Expected key error, got: {err}"
+        assert_eq!(
+            err,
+            "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_fails_without_credential() {
+        let p = AnthropicModelProvider::builder("test").build();
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let result = p.chat(request, "claude-sonnet-4-5", Some(0.7)).await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_chat_without_credential_returns_error() {
+        let p = AnthropicModelProvider::builder("test").build();
+        let messages = vec![ChatMessage::user("hello")];
+        let request = ProviderChatRequest {
+            messages: &messages,
+            tools: None,
+            thinking: None,
+        };
+        let mut stream = p.stream_chat(
+            request,
+            "claude-sonnet-4-5",
+            Some(0.7),
+            StreamOptions {
+                enabled: true,
+                count_tokens: false,
+            },
+        );
+        let first = stream.next().await.expect("stream should yield an event");
+        assert!(first.is_err(), "expected error without credential");
+        assert_eq!(
+            first.unwrap_err().to_string(),
+            "ModelProvider error: Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure."
         );
     }
 
@@ -3443,6 +3537,99 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(request.headers().get("authorization").is_none());
         assert!(request.headers().get("anthropic-beta").is_none());
+    }
+
+    #[test]
+    fn apply_auth_log_omits_credentials_for_regular_and_setup_tokens() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let model_provider = AnthropicModelProvider::builder("test").build();
+        for (credential, expected_header) in [
+            ("sk-ant-api-key-secret", "x-api-key"),
+            ("sk-ant-oat01-setup-token-secret", "Authorization"),
+        ] {
+            model_provider
+                .apply_auth(
+                    model_provider
+                        .http_client()
+                        .get("https://api.anthropic.com/v1/models"),
+                    credential,
+                )
+                .build()
+                .expect("request should build");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let event = 'search: loop {
+                while let Ok(event) = rx.try_recv() {
+                    let matches_message = event.get("message").and_then(|value| value.as_str())
+                        == Some("Anthropic auth header applied");
+                    let matches_source = event
+                        .get("attributes")
+                        .and_then(|attributes| attributes.get("_file"))
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|file| {
+                            // `file!()` uses the host separator, so normalize
+                            // before matching the `/`-spelled module path.
+                            file.replace('\\', "/")
+                                .ends_with("zeroclaw-providers/src/anthropic.rs")
+                        });
+                    let matches_auth = event.get("attributes").is_some_and(|attributes| {
+                        attributes.get("header").and_then(|value| value.as_str())
+                            == Some(expected_header)
+                            && attributes
+                                .get("credential_len")
+                                .and_then(|value| value.as_u64())
+                                == Some(credential.len() as u64)
+                    });
+                    if matches_message && matches_source && matches_auth {
+                        break 'search event;
+                    }
+                }
+
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "apply_auth should emit the expected canonical log event"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+
+            let attrs = event.get("attributes").expect("attributes present");
+            assert_eq!(attrs["header"].as_str(), Some(expected_header));
+            assert_eq!(
+                attrs["credential_len"].as_u64(),
+                Some(credential.len() as u64)
+            );
+            assert!(attrs.get("credential_head").is_none());
+            assert!(attrs.get("credential_tail").is_none());
+            let former_head: String = credential.chars().take(8).collect();
+            let former_tail: String = credential
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let serialized = event.to_string();
+            assert!(
+                !serialized.contains(credential),
+                "authentication event must not contain credential material"
+            );
+            assert!(
+                !serialized.contains(&former_head),
+                "authentication event must not contain the credential prefix"
+            );
+            assert!(
+                !serialized.contains(&former_tail),
+                "authentication event must not contain the credential suffix"
+            );
+        }
+
+        zeroclaw_log::clear_broadcast_hook();
     }
 
     #[tokio::test]
@@ -4363,6 +4550,39 @@ data: {\"type\":\"message_stop\"}\n\n";
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let result = AnthropicModelProvider::parse_native_response(resp);
         assert!(result.usage.is_none());
+    }
+
+    #[test]
+    fn string_projection_preserves_semantic_empty_terminal_cause() {
+        let json = r#"{
+            "stop_reason": "end_turn",
+            "content": [{"type": "thinking", "thinking": "internal only"}]
+        }"#;
+        let response: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let error = AnthropicModelProvider::require_terminal_text(
+            AnthropicModelProvider::parse_native_response(response),
+        )
+        .expect_err("thinking alone is not a string-only final answer");
+
+        assert!(error.chain().any(|cause| {
+            cause.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>()
+        }));
+    }
+
+    #[test]
+    fn native_response_with_only_nonterminal_blocks_is_semantically_empty() {
+        let json = r#"{
+            "stop_reason": "end_turn",
+            "content": [
+                {"type": "thinking", "thinking": "internal only", "signature": "sig"},
+                {"type": "unknown_future_block"}
+            ]
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let result = AnthropicModelProvider::parse_native_response(resp);
+
+        assert!(result.is_semantically_empty_terminal());
+        assert!(result.reasoning_content.is_some());
     }
 
     #[test]

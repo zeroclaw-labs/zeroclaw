@@ -71,11 +71,27 @@ impl SessionTarget {
         }
     }
 
+    /// Parse a session target, treating any non-`main` value (including typos)
+    /// as isolated. Prefer [`Self::try_parse`] at user-input boundaries so an
+    /// invalid value is rejected instead of silently becoming isolated.
     pub fn parse(raw: &str) -> Self {
         if raw.eq_ignore_ascii_case("main") {
             Self::Main
         } else {
             Self::Isolated
+        }
+    }
+
+    /// Parse a session target from user input. `isolated` and `main` are
+    /// accepted case-insensitively after trim; anything else is an error.
+    pub fn try_parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        match trimmed.to_ascii_lowercase().as_str() {
+            "isolated" => Ok(Self::Isolated),
+            "main" => Ok(Self::Main),
+            _ => Err(format!(
+                "Invalid session_target '{trimmed}'. Expected one of: 'isolated', 'main'"
+            )),
         }
     }
 }
@@ -268,5 +284,38 @@ mod tests {
     fn job_type_try_from_rejects_invalid_values() {
         assert!(JobType::try_from("").is_err());
         assert!(JobType::try_from("unknown").is_err());
+    }
+
+    #[test]
+    fn session_target_try_parse_accepts_known_values_case_insensitive() {
+        assert_eq!(
+            SessionTarget::try_parse("isolated").unwrap(),
+            SessionTarget::Isolated
+        );
+        assert_eq!(
+            SessionTarget::try_parse("MAIN").unwrap(),
+            SessionTarget::Main
+        );
+        assert_eq!(
+            SessionTarget::try_parse("  main  ").unwrap(),
+            SessionTarget::Main
+        );
+    }
+
+    #[test]
+    fn session_target_try_parse_rejects_empty_and_unknown_values() {
+        assert!(SessionTarget::try_parse("").is_err());
+        assert!(SessionTarget::try_parse("   ").is_err());
+        let err = SessionTarget::try_parse("shared").unwrap_err();
+        assert!(err.contains("session_target"));
+        assert!(err.contains("isolated"));
+        assert!(err.contains("main"));
+    }
+
+    #[test]
+    fn session_target_parse_keeps_unknown_values_isolated_for_stored_rows() {
+        assert_eq!(SessionTarget::parse("main"), SessionTarget::Main);
+        assert_eq!(SessionTarget::parse("shared"), SessionTarget::Isolated);
+        assert_eq!(SessionTarget::parse(""), SessionTarget::Isolated);
     }
 }

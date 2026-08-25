@@ -231,12 +231,83 @@ fn merge_config_and_live_rates(
     )
 }
 
-/// Record token usage from an LLM response via the task-local cost tracker.
-/// Returns `(total_tokens, cost_usd)` on success, `None` when not scoped or no usage.
+/// Record usage from a rejected provider attempt without replacing the accepted
+/// response's context-window fill.
+pub fn record_rejected_tool_loop_cost_usage(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    record_tool_loop_cost_usage_inner(model_provider_name, model, usage, false)
+}
+
+/// Record token usage from an accepted LLM response via the task-local cost
+/// tracker. Returns `(total_tokens, cost_usd)` on success, `None` when not
+/// scoped or no usage.
 pub fn record_tool_loop_cost_usage(
     model_provider_name: &str,
     model: &str,
     usage: &zeroclaw_providers::traits::TokenUsage,
+) -> Option<(u64, f64)> {
+    record_tool_loop_cost_usage_inner(model_provider_name, model, usage, true)
+}
+
+/// Settle the immutable physical-attempt report exactly once.  Only complete
+/// usage (or a valid lower-bound observation preserved after interruption) is
+/// billable; accepted context-window fill remains a property of the selected
+/// final leaf rather than the aggregate.
+pub(crate) struct BillableProviderAttempt<'a> {
+    pub index: usize,
+    pub attempt: &'a zeroclaw_providers::dispatch::AccountedAttempt,
+    pub usage: &'a zeroclaw_providers::traits::TokenUsage,
+}
+
+/// Pure, ordered projection for current BestEffort settlement and the future
+/// task-attributed persistence caller. Invalid and missing observations never
+/// appear in this view.
+pub(crate) fn billable_provider_attempts(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+) -> impl Iterator<Item = BillableProviderAttempt<'_>> {
+    use zeroclaw_providers::dispatch::AttemptUsageOutcome;
+
+    attempts.iter().enumerate().filter_map(|(index, attempt)| {
+        let usage = match attempt.outcome() {
+            AttemptUsageOutcome::Complete(usage) => Some(usage),
+            AttemptUsageOutcome::OutcomeUnknown {
+                observed: Some(usage),
+            } => Some(usage),
+            AttemptUsageOutcome::Missing
+            | AttemptUsageOutcome::Invalid { .. }
+            | AttemptUsageOutcome::OutcomeUnknown { observed: None } => None,
+        };
+        usage.map(|usage| BillableProviderAttempt {
+            index,
+            attempt,
+            usage,
+        })
+    })
+}
+
+pub(crate) fn settle_provider_attempts(
+    attempts: &[zeroclaw_providers::dispatch::AccountedAttempt],
+    accepted_attempt: Option<usize>,
+) {
+    for event in billable_provider_attempts(attempts) {
+        let updates_context_window_fill = accepted_attempt == Some(event.index);
+        let _ = record_tool_loop_cost_usage_inner(
+            event.attempt.provider_ref(),
+            event.attempt.model(),
+            event.usage,
+            updates_context_window_fill,
+        );
+    }
+}
+
+fn record_tool_loop_cost_usage_inner(
+    model_provider_name: &str,
+    model: &str,
+    usage: &zeroclaw_providers::traits::TokenUsage,
+    updates_context_window_fill: bool,
 ) -> Option<(u64, f64)> {
     let input_tokens = usage.input_tokens.unwrap_or(0);
     let output_tokens = usage.output_tokens.unwrap_or(0);
@@ -307,10 +378,12 @@ pub fn record_tool_loop_cost_usage(
             usage.input_tokens = usage.input_tokens.saturating_add(input_tokens);
             usage.output_tokens = usage.output_tokens.saturating_add(output_tokens);
             usage.cost_usd += cost_usage.cost_usd;
-            // Replace (not accumulate) last_input_tokens with the absolute
-            // provider-reported prompt size — this is the accurate "context
-            // window fill" measure (see TurnUsage doc comment).
-            usage.last_input_tokens = input_tokens;
+            if updates_context_window_fill {
+                // Replace (not accumulate) last_input_tokens with the absolute
+                // accepted provider-reported prompt size — this is the accurate
+                // "context window fill" measure (see TurnUsage doc comment).
+                usage.last_input_tokens = input_tokens;
+            }
             true
         } else {
             false
@@ -321,9 +394,11 @@ pub fn record_tool_loop_cost_usage(
         turn_usage.input_tokens = turn_usage.input_tokens.saturating_add(input_tokens);
         turn_usage.output_tokens = turn_usage.output_tokens.saturating_add(output_tokens);
         turn_usage.cost_usd += cost_usage.cost_usd;
-        // Replace (not accumulate) last_input_tokens with the absolute
-        // provider-reported prompt size.
-        turn_usage.last_input_tokens = input_tokens;
+        if updates_context_window_fill {
+            // Replace (not accumulate) last_input_tokens with the absolute
+            // accepted provider-reported prompt size.
+            turn_usage.last_input_tokens = input_tokens;
+        }
     }
 
     if let Some(tracker) = &ctx.tracker
@@ -397,10 +472,151 @@ pub fn check_tool_loop_budget() -> Option<BudgetCheck> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_api::attribution::{Attributable, ModelProviderKind, ProviderKind, Role};
+    use zeroclaw_api::model_provider::{ChatMessage, ChatRequest, ChatResponse, ModelProvider};
     use zeroclaw_config::schema::{Config, DeepseekModelProviderConfig, ModelProviderConfig};
+    use zeroclaw_providers::ProviderDispatch;
+    use zeroclaw_providers::dispatch::{AccountedChatScope, with_exact_dispatch_route};
 
     fn fresh_seen() -> Mutex<HashSet<(String, String)>> {
         Mutex::new(HashSet::new())
+    }
+
+    #[tokio::test]
+    async fn settlement_uses_exact_attempt_routes_models_and_record_order() {
+        let workspace = tempfile::TempDir::new().unwrap();
+        let tracker = Arc::new(
+            CostTracker::new(
+                zeroclaw_config::schema::CostConfig {
+                    enabled: true,
+                    ..Default::default()
+                },
+                workspace.path(),
+            )
+            .unwrap(),
+        );
+        let pricing = Arc::new(HashMap::from([
+            (
+                "provider.first".to_string(),
+                HashMap::from([("model-a.input".to_string(), 1.0)]),
+            ),
+            (
+                "provider.second".to_string(),
+                HashMap::from([("model-b.input".to_string(), 3.0)]),
+            ),
+        ]));
+        let context = ToolLoopCostTrackingContext::new(Arc::clone(&tracker), pricing);
+        let first = PricedLeaf {
+            alias: "wrapper.first",
+        };
+        let second = PricedLeaf {
+            alias: "wrapper.second",
+        };
+        let messages = vec![ChatMessage::user("hello")];
+        let scope = AccountedChatScope::new();
+
+        TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                scope
+                    .scope(async {
+                        assert!(
+                            with_exact_dispatch_route(
+                                "provider.first".to_string(),
+                                "model-a".to_string(),
+                                ProviderDispatch::from_ref(&first).chat(
+                                    ChatRequest {
+                                        messages: &messages,
+                                        tools: None,
+                                        thinking: None,
+                                    },
+                                    "ignored",
+                                    None,
+                                ),
+                            )
+                            .await
+                            .is_ok()
+                        );
+                        assert!(
+                            with_exact_dispatch_route(
+                                "provider.second".to_string(),
+                                "model-b".to_string(),
+                                ProviderDispatch::from_ref(&second).chat(
+                                    ChatRequest {
+                                        messages: &messages,
+                                        tools: None,
+                                        thinking: None,
+                                    },
+                                    "ignored",
+                                    None,
+                                ),
+                            )
+                            .await
+                            .is_ok()
+                        );
+                    })
+                    .await;
+                let report = scope.take();
+                settle_provider_attempts(report.attempts(), None);
+            })
+            .await;
+
+        let records = std::fs::read_to_string(workspace.path().join("state").join("costs.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<zeroclaw_config::cost::types::CostRecord>(line).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].usage.model, "model-a");
+        assert_eq!(records[1].usage.model, "model-b");
+        assert!((records[0].usage.cost_usd - 1.0).abs() < 1e-12);
+        assert!((records[1].usage.cost_usd - 3.0).abs() < 1e-12);
+    }
+
+    struct PricedLeaf {
+        alias: &'static str,
+    }
+
+    impl Attributable for PricedLeaf {
+        fn role(&self) -> Role {
+            Role::Provider(ProviderKind::Model(ModelProviderKind::Custom))
+        }
+
+        fn alias(&self) -> &str {
+            self.alias
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for PricedLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: Some(zeroclaw_providers::traits::TokenUsage {
+                    input_tokens: Some(1_000_000),
+                    output_tokens: Some(0),
+                    cached_input_tokens: None,
+                }),
+                reasoning_content: None,
+            })
+        }
     }
 
     #[test]
@@ -510,6 +726,79 @@ mod tests {
             provider_pricing(&type_keyed, "openai.default").is_none(),
             "fallback must not resolve a provider type absent from the map"
         );
+    }
+
+    #[test]
+    fn provider_pricing_resolves_exact_alias_when_type_is_ambiguous() {
+        let pricing = HashMap::from([
+            (
+                "openai.fast".to_string(),
+                HashMap::from([
+                    ("gpt-4o-mini.input".to_string(), 0.15),
+                    ("gpt-4o-mini.output".to_string(), 0.60),
+                ]),
+            ),
+            (
+                "openai.smart".to_string(),
+                HashMap::from([
+                    ("gpt-4o.input".to_string(), 2.50),
+                    ("gpt-4o.output".to_string(), 10.00),
+                ]),
+            ),
+        ]);
+
+        let fast = provider_pricing(&pricing, "openai.fast").unwrap();
+        assert_eq!(fast.get("gpt-4o-mini.input"), Some(&0.15));
+        assert!(!fast.contains_key("gpt-4o.input"));
+        assert!(provider_pricing(&pricing, "openai").is_none());
+    }
+
+    #[test]
+    fn build_pricing_keeps_same_type_aliases_distinct() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o-mini.input".to_string(), 0.15),
+                        ("gpt-4o-mini.output".to_string(), 0.60),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "smart".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o.input".to_string(), 2.50),
+                        ("gpt-4o.output".to_string(), 10.00),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let pricing = build_model_provider_pricing(&config);
+        assert_eq!(
+            provider_pricing(&pricing, "openai.fast")
+                .unwrap()
+                .get("gpt-4o-mini.input"),
+            Some(&0.15)
+        );
+        assert_eq!(
+            provider_pricing(&pricing, "openai.smart")
+                .unwrap()
+                .get("gpt-4o.output"),
+            Some(&10.00)
+        );
+        assert!(provider_pricing(&pricing, "openai").is_none());
     }
 
     #[test]
@@ -801,6 +1090,42 @@ mod tests {
         assert_eq!(recorded.input_tokens, 5_000);
         assert_eq!(recorded.output_tokens, 200);
         assert!((recorded.cost_usd - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rejected_usage_accumulates_cost_without_replacing_context_window_fill() {
+        let turn_usage = Arc::new(Mutex::new(TurnUsage::default()));
+        let rejected = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(80),
+            output_tokens: Some(5),
+            cached_input_tokens: Some(0),
+        };
+        let accepted = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(80),
+            output_tokens: Some(7),
+            cached_input_tokens: Some(0),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(TOOL_LOOP_TURN_USAGE.scope(
+            Some(Arc::clone(&turn_usage)),
+            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                Some(ToolLoopCostTrackingContext::usage_only()),
+                async {
+                    assert!(
+                        record_rejected_tool_loop_cost_usage("test", "test", &rejected).is_some()
+                    );
+                    assert!(record_tool_loop_cost_usage("test", "test", &accepted).is_some());
+                },
+            ),
+        ));
+
+        let usage = *turn_usage.lock();
+        assert_eq!(usage.input_tokens, 160, "both attempts remain billed");
+        assert_eq!(usage.output_tokens, 12, "both attempts remain billed");
+        assert_eq!(
+            usage.last_input_tokens, 80,
+            "only the accepted attempt controls context-window fill"
+        );
     }
 
     #[test]

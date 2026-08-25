@@ -89,7 +89,6 @@
 "channel:cli":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/cli.rs"
           - "crates/zeroclaw-channels/src/cli.rs"
 
 "channel:dingtalk":
@@ -102,9 +101,8 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/channels/discord.rs"
-          - "src/channels/discord_history.rs"
-          - "crates/zeroclaw-channels/src/discord.rs"
-          - "crates/zeroclaw-channels/src/discord_history.rs"
+          - "crates/zeroclaw-channels/src/discord/**"
+          - "crates/zeroclaw-channels/src/discord_slash_state.rs"
 
 "channel:email":
   - changed-files:
@@ -165,7 +163,7 @@
 "channel:mqtt":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/channels/mqtt.rs"
+          - "crates/zeroclaw-channels/src/orchestrator/mqtt.rs"
 
 "channel:nextcloud-talk":
   - changed-files:
@@ -237,7 +235,6 @@
       - any-glob-to-any-file:
           - "src/channels/wecom.rs"
           - "crates/zeroclaw-channels/src/wecom.rs"
-          - "src/channels/wecom_ws.rs"
           - "crates/zeroclaw-channels/src/wecom_ws.rs"
 
 "channel:whatsapp":
@@ -366,7 +363,6 @@
 "runtime":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/runtime/**"
           - "crates/zeroclaw-runtime/src/**"
 
 "runtime:wasm":
@@ -394,8 +390,6 @@
       - any-glob-to-any-file:
           - "src/hardware/**"
           - "crates/zeroclaw-hardware/**"
-          - "crates/robot-kit/**"
-          - "crates/aardvark-sys/**"
           - "firmware/**"
 
 "web":
@@ -417,77 +411,66 @@
 "provider:anthropic":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/anthropic.rs"
           - "crates/zeroclaw-providers/src/anthropic.rs"
 
 "provider:azure-openai":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/azure_openai.rs"
           - "crates/zeroclaw-providers/src/azure_openai.rs"
 
 "provider:bedrock":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/bedrock.rs"
           - "crates/zeroclaw-providers/src/bedrock.rs"
 
 "provider:claude-code":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/claude_code.rs"
-          - "crates/zeroclaw-providers/src/claude_code.rs"
+          - "crates/zeroclaw-tools/src/claude_code.rs"
+          - "crates/zeroclaw-tools/src/claude_code_runner.rs"
+          - "src/tools/claude_code.rs"
+          - "src/tools/claude_code_runner.rs"
 
 "provider:compatible":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/compatible.rs"
           - "crates/zeroclaw-providers/src/compatible.rs"
 
 "provider:copilot":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/copilot.rs"
           - "crates/zeroclaw-providers/src/copilot.rs"
 
 "provider:gemini":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/gemini.rs"
-          - "src/providers/gemini_cli.rs"
           - "crates/zeroclaw-providers/src/gemini.rs"
           - "crates/zeroclaw-providers/src/gemini_cli.rs"
 
 "provider:glm":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/glm.rs"
           - "crates/zeroclaw-providers/src/glm.rs"
 
 "provider:kilocli":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/kilocli.rs"
           - "crates/zeroclaw-providers/src/kilocli.rs"
 
 "provider:ollama":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/ollama.rs"
           - "crates/zeroclaw-providers/src/ollama.rs"
 
 "provider:openai":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/openai.rs"
-          - "src/providers/openai_codex.rs"
           - "crates/zeroclaw-providers/src/openai.rs"
           - "crates/zeroclaw-providers/src/openai_codex.rs"
 
 "provider:openrouter":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/openrouter.rs"
           - "crates/zeroclaw-providers/src/openrouter.rs"
 
 "provider:reliable":
@@ -503,7 +486,6 @@
 "provider:telnyx":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/providers/telnyx.rs"
           - "crates/zeroclaw-providers/src/telnyx.rs"
 
 "service":
@@ -553,12 +535,6 @@
 "tool:cron":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/cron_add.rs"
-          - "src/tools/cron_list.rs"
-          - "src/tools/cron_remove.rs"
-          - "src/tools/cron_run.rs"
-          - "src/tools/cron_runs.rs"
-          - "src/tools/cron_update.rs"
           - "crates/zeroclaw-runtime/src/tools/cron_add.rs"
           - "crates/zeroclaw-runtime/src/tools/cron_common.rs"
           - "crates/zeroclaw-runtime/src/tools/cron_list.rs"
@@ -576,7 +552,6 @@
   - changed-files:
       - any-glob-to-any-file:
           - "src/tools/file_edit.rs"
-          - "src/tools/file_read.rs"
           - "src/tools/file_write.rs"
           - "src/tools/glob_search.rs"
           - "src/tools/content_search.rs"
@@ -625,14 +600,11 @@
 "tool:microsoft365":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/microsoft365/**"
           - "crates/zeroclaw-tools/src/microsoft365/**"
 
 "tool:shell":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/shell.rs"
-          - "src/tools/node_tool.rs"
           - "src/tools/cli_discovery.rs"
           - "crates/zeroclaw-runtime/src/tools/shell.rs"
           - "crates/zeroclaw-gateway/src/node_tool.rs"
@@ -641,11 +613,6 @@
 "tool:sop":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/sop_advance.rs"
-          - "src/tools/sop_approve.rs"
-          - "src/tools/sop_execute.rs"
-          - "src/tools/sop_list.rs"
-          - "src/tools/sop_status.rs"
           - "crates/zeroclaw-runtime/src/tools/sop_advance.rs"
           - "crates/zeroclaw-runtime/src/tools/sop_approve.rs"
           - "crates/zeroclaw-runtime/src/tools/sop_execute.rs"
@@ -667,8 +634,6 @@
 "tool:security":
   - changed-files:
       - any-glob-to-any-file:
-          - "src/tools/security_ops.rs"
-          - "src/tools/verifiable_intent.rs"
           - "crates/zeroclaw-runtime/src/tools/security_ops.rs"
           - "crates/zeroclaw-runtime/src/tools/verifiable_intent.rs"
 

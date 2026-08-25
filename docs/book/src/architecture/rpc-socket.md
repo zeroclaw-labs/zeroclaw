@@ -82,6 +82,37 @@ the operating system:
 | `session/cancel` | client -> daemon | Cancel an in-flight turn |
 | `status` | client -> daemon | Server version, protocol version, active session list |
 | `session/update` | daemon -> client | Streaming notification during a turn (text chunks, tool calls, approvals) |
+| `elicitation/create` | daemon -> client | Request interactive input for ask-user and poll flows |
+
+### Bidirectional requests
+
+Either side may send a request on the established socket. The receiver must
+answer with the same `id` and exactly one of `result` or `error`. Each peer uses
+its own `zc-out-<number>` sequence for outbound requests; the prefix is not a
+globally unique namespace. Correlation remains directional: each peer matches
+responses only against its own pending-request map, so the same textual ID can
+be in flight independently in opposite directions.
+
+```json
+{"jsonrpc":"2.0","method":"elicitation/create","params":{"message":"Continue?"},"id":"zc-out-0"}
+{"jsonrpc":"2.0","result":{"action":"accept","content":{"answer":"yes"}},"id":"zc-out-0"}
+```
+
+An explicit `"result": null` is a successful response and still resolves the
+pending caller. An `error` object resolves it as a failure. If the peer does not
+answer, the initiating ask-user or poll operation retains its existing timeout
+behavior.
+
+Every frame must be a JSON object with `"jsonrpc": "2.0"`. Requests require a
+string `method`; when present, `params` must be an object or array. Responses
+require a string, numeric, or null `id` and exactly one response member. Invalid
+JSON produces `-32700` (parse error). A malformed request-shaped envelope
+produces `-32600` (invalid request), using its valid request ID when one can be
+recovered. A malformed response-shaped envelope is logged without frame
+contents and dropped without a reply, because echoing its ID could complete an
+unrelated request in the opposite direction. Direction-ambiguous envelopes use
+`id: null`. Unknown valid response IDs are likewise logged and ignored rather
+than answered, preventing response loops.
 
 ### Turn streaming
 

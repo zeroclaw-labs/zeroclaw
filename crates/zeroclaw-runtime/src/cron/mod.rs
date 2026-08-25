@@ -1,5 +1,6 @@
 use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
+use zeroclaw_api::runtime_traits::RuntimeAdapter;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 mod schedule;
@@ -44,6 +45,23 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "email",
 ];
 
+/// JSON Schema `pattern` for a cron delivery channel.
+///
+/// Accepts either a bare channel type (`telegram`) or a configured instance's
+/// composite key (`telegram.work`). The tool descriptions recommend the
+/// composite form, and a bare-type enum would reject exactly what they
+/// recommend — `cron_update` in particular has no other unambiguous way to
+/// select one instance in a multi-instance setup.
+///
+/// Built from `CRON_DELIVERY_SCHEMA_CHANNELS` so the supported types stay
+/// declared once.
+pub(crate) fn cron_delivery_channel_pattern() -> String {
+    format!(
+        "^({})(\\.[A-Za-z0-9_-]+)?$",
+        CRON_DELIVERY_SCHEMA_CHANNELS.join("|")
+    )
+}
+
 /// Validate a shell command against an agent's security policy
 /// (allowlist + risk gate). `agent_alias` names the agent under whose
 /// risk profile the command will run. Returns `Ok(())` if the command
@@ -55,18 +73,20 @@ pub fn validate_shell_command(
     approved: bool,
 ) -> Result<()> {
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
-    validate_shell_command_with_security(&security, command, approved)
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    validate_shell_command_with_security(runtime.as_ref(), &security, command, approved)
 }
 
 /// Validate a shell command using an existing `SecurityPolicy` instance.
 /// Preferred when the caller already holds a `SecurityPolicy` (e.g. scheduler).
 pub fn validate_shell_command_with_security(
+    runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
     command: &str,
     approved: bool,
 ) -> Result<()> {
     security
-        .validate_command_execution(command, approved)
+        .validate_command_execution_for_shell(command, approved, runtime.shell_dialect())
         .map(|_| ())
         .map_err(|reason| {
             ::zeroclaw_log::record!(
@@ -78,6 +98,56 @@ pub fn validate_shell_command_with_security(
             );
             anyhow::Error::msg(format!("blocked by security policy: {reason}"))
         })
+}
+
+pub(crate) fn add_shell_job_with_runtime(
+    config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+) -> Result<CronJob> {
+    add_shell_job_with_runtime_and_format(
+        config,
+        runtime,
+        security,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        approved,
+        CronShellOutputFormat::default(),
+    )
+}
+
+fn add_shell_job_with_runtime_and_format(
+    config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+    shell_output_format: CronShellOutputFormat,
+) -> Result<CronJob> {
+    validate_shell_command_with_security(runtime, security, command, approved)?;
+    validate_delivery_config(delivery.as_ref())?;
+    store::add_shell_job_with_format(
+        config,
+        agent_alias,
+        name,
+        schedule,
+        command,
+        delivery,
+        shell_output_format,
+    )
 }
 
 pub fn validate_delivery_config(delivery: Option<&DeliveryConfig>) -> Result<()> {
@@ -141,22 +211,45 @@ pub fn add_shell_job_with_approval_and_format(
     approved: bool,
     shell_output_format: CronShellOutputFormat,
 ) -> Result<CronJob> {
-    validate_shell_command(config, agent_alias, command, approved)?;
-    validate_delivery_config(delivery.as_ref())?;
-    store::add_shell_job_with_format(
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    add_shell_job_with_runtime_and_format(
         config,
+        runtime.as_ref(),
+        &security,
         agent_alias,
         name,
         schedule,
         command,
         delivery,
+        approved,
         shell_output_format,
     )
 }
 
-/// Update a shell job's command with security validation.
-/// Validates the new command (if changed) against the named agent's
-/// risk profile before persisting.
+/// Agent jobs execute [`CronJob::prompt`], not [`CronJob::command`]. Callers
+/// that only have a `command` field (CLI `--command`, some tool payloads)
+/// must not persist that text on the unused command column or run shell-policy
+/// validation against a natural-language prompt. Matches `PATCH /api/cron`
+/// (`command.or(prompt)` on agent jobs).
+fn remap_agent_command_patch(
+    config: &Config,
+    job_id: &str,
+    mut patch: CronJobPatch,
+) -> Result<CronJobPatch> {
+    if patch.command.is_none() {
+        return Ok(patch);
+    }
+    let existing = get_job(config, job_id)?;
+    if existing.job_type == JobType::Agent {
+        patch.prompt = patch.command.take().or(patch.prompt);
+    }
+    Ok(patch)
+}
+
+/// Update a job with security validation for shell-command patches.
+/// Validates a new shell command against the named agent's risk profile
+/// before persisting. Agent jobs remap `command` onto `prompt` first.
 pub fn update_shell_job_with_approval(
     config: &Config,
     agent_alias: &str,
@@ -164,8 +257,27 @@ pub fn update_shell_job_with_approval(
     patch: CronJobPatch,
     approved: bool,
 ) -> Result<CronJob> {
+    let patch = remap_agent_command_patch(config, job_id, patch)?;
+    if patch.command.is_none() {
+        return update_job(config, job_id, patch);
+    }
+
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    update_shell_job_with_runtime(config, runtime.as_ref(), &security, job_id, patch, approved)
+}
+
+pub(crate) fn update_shell_job_with_runtime(
+    config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    job_id: &str,
+    patch: CronJobPatch,
+    approved: bool,
+) -> Result<CronJob> {
+    let patch = remap_agent_command_patch(config, job_id, patch)?;
     if let Some(command) = patch.command.as_deref() {
-        validate_shell_command(config, agent_alias, command, approved)?;
+        validate_shell_command_with_security(runtime, security, command, approved)?;
     }
     update_job(config, job_id, patch)
 }
@@ -176,11 +288,45 @@ pub fn add_once_validated(
     agent_alias: &str,
     delay: &str,
     command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+) -> Result<CronJob> {
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    add_once_validated_with_runtime(
+        config,
+        runtime.as_ref(),
+        &security,
+        agent_alias,
+        delay,
+        command,
+        delivery,
+        approved,
+    )
+}
+
+pub(crate) fn add_once_validated_with_runtime(
+    config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    delay: &str,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
     let duration = parse_delay(delay)?;
     let at = chrono::Utc::now() + duration;
-    add_once_at_validated(config, agent_alias, at, command, approved)
+    add_once_at_validated_with_runtime(
+        config,
+        runtime,
+        security,
+        agent_alias,
+        at,
+        command,
+        delivery,
+        approved,
+    )
 }
 
 /// Create a one-shot validated shell job at an absolute timestamp.
@@ -189,10 +335,45 @@ pub fn add_once_at_validated(
     agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
+    delivery: Option<DeliveryConfig>,
+    approved: bool,
+) -> Result<CronJob> {
+    let security = SecurityPolicy::for_agent(config, agent_alias)?;
+    let runtime = crate::platform::create_runtime(&config.runtime)?;
+    add_once_at_validated_with_runtime(
+        config,
+        runtime.as_ref(),
+        &security,
+        agent_alias,
+        at,
+        command,
+        delivery,
+        approved,
+    )
+}
+
+pub(crate) fn add_once_at_validated_with_runtime(
+    config: &Config,
+    runtime: &dyn RuntimeAdapter,
+    security: &SecurityPolicy,
+    agent_alias: &str,
+    at: chrono::DateTime<chrono::Utc>,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
     approved: bool,
 ) -> Result<CronJob> {
     let schedule = Schedule::At { at };
-    add_shell_job_with_approval(config, agent_alias, None, schedule, command, None, approved)
+    add_shell_job_with_runtime(
+        config,
+        runtime,
+        security,
+        agent_alias,
+        None,
+        schedule,
+        command,
+        delivery,
+        approved,
+    )
 }
 
 // Convenience wrappers for CLI paths (default approved=false).
@@ -230,8 +411,14 @@ pub fn add_job(
 }
 
 #[allow(clippy::needless_pass_by_value)]
-pub fn add_once(config: &Config, agent_alias: &str, delay: &str, command: &str) -> Result<CronJob> {
-    add_once_validated(config, agent_alias, delay, command, false)
+pub fn add_once(
+    config: &Config,
+    agent_alias: &str,
+    delay: &str,
+    command: &str,
+    delivery: Option<DeliveryConfig>,
+) -> Result<CronJob> {
+    add_once_validated(config, agent_alias, delay, command, delivery, false)
 }
 
 pub fn add_once_at(
@@ -239,8 +426,9 @@ pub fn add_once_at(
     agent_alias: &str,
     at: chrono::DateTime<chrono::Utc>,
     command: &str,
+    delivery: Option<DeliveryConfig>,
 ) -> Result<CronJob> {
-    add_once_at_validated(config, agent_alias, at, command, false)
+    add_once_at_validated(config, agent_alias, at, command, delivery, false)
 }
 
 pub fn pause_job(config: &Config, id: &str) -> Result<CronJob> {
@@ -332,9 +520,14 @@ mod security_validation_tests {
             &zeroclaw_config::schema::RiskProfileConfig::default(),
             &config.data_dir,
         );
+        let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
         // Simulate scheduler validation path
-        let result =
-            validate_shell_command_with_security(&security, "curl https://example.com", false);
+        let result = validate_shell_command_with_security(
+            runtime.as_ref(),
+            &security,
+            "curl https://example.com",
+            false,
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -372,5 +565,219 @@ mod validate_delivery_tests {
             best_effort: true,
         };
         validate_delivery_config(Some(&delivery)).expect("webhook without thread_id must validate");
+    }
+}
+
+#[cfg(test)]
+mod remap_agent_command_tests {
+    use super::*;
+    use crate::security::AutonomyLevel;
+    use tempfile::TempDir;
+
+    const TEST_AGENT: &str = "test-agent";
+
+    fn test_config(tmp: &TempDir) -> Config {
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default()
+            .level = AutonomyLevel::Supervised;
+        config
+            .runtime_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", TEST_AGENT)
+            .expect("known family");
+        config.agents.entry(TEST_AGENT.to_string()).or_insert(
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn update_maps_command_patch_onto_agent_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "old prompt",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let updated = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                command: Some("summarize the overnight logs".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            updated.prompt.as_deref(),
+            Some("summarize the overnight logs")
+        );
+        assert_eq!(updated.command, "");
+        assert_eq!(updated.job_type, JobType::Agent);
+    }
+
+    #[test]
+    fn update_keeps_shell_command_patches_on_the_command_column() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, TEST_AGENT, "*/5 * * * *", "echo old").unwrap();
+
+        let updated = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                command: Some("echo new".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(updated.command, "echo new");
+        assert_eq!(updated.prompt, None);
+        assert_eq!(updated.job_type, JobType::Shell);
+    }
+
+    #[test]
+    fn update_does_not_run_shell_policy_against_an_agent_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "old prompt",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let updated = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                command: Some("curl https://example.com".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .expect("agent prompt text must not be validated as a shell command");
+
+        assert_eq!(updated.prompt.as_deref(), Some("curl https://example.com"));
+        assert_eq!(updated.command, "");
+    }
+
+    #[test]
+    fn update_still_blocks_disallowed_shell_command_patches() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, TEST_AGENT, "*/5 * * * *", "echo old").unwrap();
+
+        let err = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                command: Some("curl https://example.com".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .expect_err("shell jobs must still validate --command against policy");
+
+        assert!(
+            err.to_string().contains("blocked by security policy"),
+            "unexpected error: {err}"
+        );
+        let unchanged = get_job(&config, &job.id).unwrap();
+        assert_eq!(unchanged.command, "echo old");
+    }
+
+    #[test]
+    fn update_name_only_leaves_agent_prompt_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "keep this prompt",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let updated = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                name: Some("morning-digest".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(updated.name.as_deref(), Some("morning-digest"));
+        assert_eq!(updated.prompt.as_deref(), Some("keep this prompt"));
+        assert_eq!(updated.command, "");
     }
 }

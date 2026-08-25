@@ -20,9 +20,9 @@ use zeroclaw_config::schema::Config;
 
 use zeroclaw_api::jsonrpc::error_codes::*;
 use zeroclaw_api::jsonrpc::{
-    JSONRPC_VERSION, JsonRpcError, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
-    RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest, SopRunResponse,
-    SopRunsRequest, SopSaveRequest, SopSelectRequest,
+    JSONRPC_VERSION, JsonRpcError, JsonRpcFrame, JsonRpcFrameErrorKind, JsonRpcNotification,
+    JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
+    SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
@@ -513,6 +513,11 @@ impl RpcDispatcher {
         self.tui_id = tui_id;
     }
 
+    #[cfg(test)]
+    pub fn rpc_for_test(&self) -> Arc<RpcOutbound> {
+        Arc::clone(&self.rpc)
+    }
+
     /// Construct a pre-authenticated dispatcher sharing the same context and
     /// RPC outbound as `self`. Used to run long-lived methods (e.g.
     /// `session/prompt`) in a spawned task so the read loop remains live.
@@ -648,8 +653,8 @@ impl RpcDispatcher {
     }
 
     async fn process_line(&mut self, line: &str) {
-        let req: JsonRpcRequest = match serde_json::from_str(line) {
-            Ok(r) => r,
+        let value: Value = match serde_json::from_str(line) {
+            Ok(value) => value,
             Err(e) => {
                 self.send_error(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
                     .await;
@@ -657,15 +662,67 @@ impl RpcDispatcher {
             }
         };
 
-        // Bidirectional RPC: responses to our outbound requests.
-        if req.method.is_empty() {
-            if let Some(id) = req.id.as_ref().and_then(Value::as_str) {
-                self.rpc.dispatch_response(id, Some(req.params), None);
+        let frame = match JsonRpcFrame::from_value(value) {
+            Ok(frame) => frame,
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_category(::zeroclaw_log::EventCategory::Agent)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(serde_json::json!({ "line_len": line.len() })),
+                    "Rejected invalid JSON-RPC frame"
+                );
+                match e.kind() {
+                    JsonRpcFrameErrorKind::Request => {
+                        let id = e.request_id().cloned().unwrap_or(Value::Null);
+                        self.send_error(id, INVALID_REQUEST, &format!("Invalid request: {e}"))
+                            .await;
+                    }
+                    JsonRpcFrameErrorKind::Response => {}
+                    JsonRpcFrameErrorKind::Ambiguous => {
+                        self.send_error(
+                            Value::Null,
+                            INVALID_REQUEST,
+                            &format!("Invalid request: {e}"),
+                        )
+                        .await;
+                    }
+                }
+                return;
             }
-            return;
-        }
+        };
 
-        let id = req.id.clone().unwrap_or(Value::Null);
+        let req = match frame {
+            JsonRpcFrame::Request(req) => req,
+            JsonRpcFrame::Response { id, result } => {
+                if let Some(id_key) = response_id_key(&id) {
+                    if !self.rpc.dispatch_validated_response(&id_key, result) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            "Dropped JSON-RPC response with an unknown ID"
+                        );
+                    }
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Agent)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        "Dropped JSON-RPC response with an uncorrelatable null ID"
+                    );
+                }
+                return;
+            }
+        };
+
+        let req_id = req.id.clone().unwrap_or(Value::Null);
         let is_notification = req.id.is_none();
 
         let method = match Method::from_wire(&req.method) {
@@ -673,7 +730,7 @@ impl RpcDispatcher {
             None => {
                 if !is_notification {
                     self.send_error(
-                        id,
+                        req_id,
                         METHOD_NOT_FOUND,
                         &format!("Unknown method: {}", req.method),
                     )
@@ -685,7 +742,7 @@ impl RpcDispatcher {
 
         if !self.authenticated && method != Method::Initialize {
             if !is_notification {
-                self.send_error(id, AUTH_REQUIRED, "First call must be 'initialize'")
+                self.send_error(req_id, AUTH_REQUIRED, "First call must be 'initialize'")
                     .await;
             }
             return;
@@ -708,7 +765,7 @@ impl RpcDispatcher {
                 // The response (empty {} or error) is kept only so legacy
                 // request-form callers don't park forever.
                 let handle = self.spawn_handle();
-                let id_clone = id;
+                let id_clone = req_id.clone();
                 let params_clone = req.params.clone();
                 let is_notif = is_notification;
                 zeroclaw_spawn::spawn!(async move {
@@ -840,8 +897,8 @@ impl RpcDispatcher {
         }
 
         match result {
-            Ok(v) => self.send_result(id, v).await,
-            Err(e) => self.send_error(id, e.code, &e.message).await,
+            Ok(v) => self.send_result(req_id, v).await,
+            Err(e) => self.send_error(req_id, e.code, &e.message).await,
         }
     }
 
@@ -1040,10 +1097,11 @@ impl RpcDispatcher {
         self.handle_session_messages(params).await
     }
 
-    /// Drive a full JSON-RPC request line through the dispatcher from an
-    /// external integration test, including notification emission on the
-    /// outbound channel. Mirrors the transport `process_line` path.
-    pub async fn process_line_for_test(&mut self, line: &str) {
+    /// Drive a full JSON-RPC request line through the dispatcher from a unit
+    /// test, including notification emission on the outbound channel. Mirrors
+    /// the transport `process_line` path.
+    #[cfg(test)]
+    async fn process_line_for_test(&mut self, line: &str) {
         self.process_line(line).await;
     }
 
@@ -2017,6 +2075,7 @@ impl RpcDispatcher {
                 })
             }
             Err(e) => {
+                let user_message = e.user_message().map(str::to_owned);
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -2035,10 +2094,15 @@ impl RpcDispatcher {
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
-                    format!("turn failed: {e}"),
+                    user_message
+                        .clone()
+                        .unwrap_or_else(|| format!("turn failed: {e}")),
                 )
                 .await;
-                Err(rpc_err(INTERNAL_ERROR, e.to_string()))
+                Err(rpc_err(
+                    INTERNAL_ERROR,
+                    user_message.unwrap_or_else(|| e.to_string()),
+                ))
             }
         }
     }
@@ -2118,6 +2182,7 @@ impl RpcDispatcher {
                 let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                     &agent_cfg,
                     model_provider.as_ref(),
+                    &model_name,
                 );
                 (
                     model_provider,
@@ -2744,55 +2809,70 @@ impl RpcDispatcher {
         let req: ConfigSetParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        {
-            let mut config = self.ctx.config.write();
-            if config.ensure_map_key_for_path(&req.prop) {
-                // Refused to vivify the reserved `default` agent: return a
-                // reserved error rather than a downstream "Unknown property".
-                return Err(rpc_err(
-                    INVALID_PARAMS,
-                    "alias `default` is reserved and cannot be created",
-                ));
-            }
-            let info = config
-                .prop_fields()
-                .into_iter()
-                .find(|f| f.name == req.prop);
-            // Polymorphic value: strings pass through, everything else coerced.
-            let value_str = match &req.value {
-                Value::String(s) => s.clone(),
-                other => zeroclaw_config::typed_value::coerce_for_set_prop(
-                    other,
-                    info.as_ref().map(|i| i.kind),
-                )
-                .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
-            };
-            // Reject the masked sentinel for secrets — surfaces echo the
-            // masked display value back when no real edit happened, and
-            // letting that through silently clobbers the live secret with
-            // the literal masked string.
-            let is_secret_prop = info
-                .as_ref()
-                .is_some_and(|i| i.is_secret || i.derived_from_secret)
-                || zeroclaw_config::schema::Config::prop_is_secret(&req.prop);
-            if is_secret_prop
-                && (value_str == zeroclaw_config::traits::MASKED_SECRET
-                    || value_str == "****"
-                    || value_str.is_empty())
-            {
-                return Err(rpc_err(
-                    INVALID_PARAMS,
-                    format!(
-                        "Refusing to overwrite secret `{}` with a masked or empty value",
-                        req.prop
-                    ),
-                ));
-            }
-            config
-                .set_prop_persistent(&req.prop, &value_str)
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
+        // Clone the live config and perform every mutation — alias creation,
+        // field lookup, value coercion, masked-secret validation, and the
+        // persistent write — on the working copy. Any early error simply
+        // returns and drops the clone, so a partially-applied attempt (e.g. a
+        // freshly auto-created alias followed by a coercion failure) is
+        // discarded as one unit and can never leave a phantom entry on the
+        // live config. Only a fully successful mutation is committed, by
+        // swapping the snapshot in under `config_write_guard`. This keeps
+        // alias-creation ownership inside `zeroclaw-config` and commit
+        // orchestration inside the runtime, rather than mirroring config
+        // transaction semantics through a tracked tuple.
+        // `Config` is a large aggregate; box the working clone so it lives on
+        // the heap rather than inflating this async fn's stack frame across the
+        // awaits below.
+        let mut config = Box::new(self.ctx.config.read().clone());
+        if config.ensure_map_key_for_path(&req.prop) {
+            // Refused to vivify the reserved `default` agent: return a
+            // reserved error rather than a downstream "Unknown property".
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "alias `default` is reserved and cannot be created",
+            ));
         }
-        self.flush_config(&config_write_guard).await?;
+        let info = config
+            .prop_fields()
+            .into_iter()
+            .find(|f| f.name == req.prop);
+        // Polymorphic value: strings pass through, everything else coerced.
+        let value_str = match &req.value {
+            Value::String(s) => s.clone(),
+            other => match zeroclaw_config::typed_value::coerce_for_set_prop(
+                other,
+                info.as_ref().map(|i| i.kind),
+            ) {
+                Ok(coerced) => coerced,
+                Err(e) => return Err(rpc_err(INVALID_PARAMS, e.message)),
+            },
+        };
+        // Reject the masked sentinel for secrets — surfaces echo the
+        // masked display value back when no real edit happened, and
+        // letting that through silently clobbers the live secret with
+        // the literal masked string.
+        let is_secret_prop = info
+            .as_ref()
+            .is_some_and(|i| i.is_secret || i.derived_from_secret)
+            || zeroclaw_config::schema::Config::prop_is_secret(&req.prop);
+        if is_secret_prop
+            && (value_str == zeroclaw_config::traits::MASKED_SECRET
+                || value_str == "****"
+                || value_str.is_empty())
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "Refusing to overwrite secret `{}` with a masked or empty value",
+                    req.prop
+                ),
+            ));
+        }
+        if let Err(e) = config.set_prop_persistent(&req.prop, &value_str) {
+            return Err(rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")));
+        }
+        self.save_and_swap_config(*config, &config_write_guard)
+            .await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -2969,6 +3049,7 @@ impl RpcDispatcher {
                         let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                             &agent_cfg,
                             model_provider.as_ref(),
+                            &model_name,
                         );
                         (
                             model_provider,
@@ -4122,8 +4203,8 @@ impl RpcDispatcher {
 
     fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
         let config = self.ctx.config.read();
-        let workspace = config.shared_workspace_dir();
-        let dir = crate::sop::resolve_sops_dir(&workspace, config.sop.sops_dir.as_deref());
+        let install_root = config.install_root_dir();
+        let dir = crate::sop::resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
         let mode = crate::sop::parse_execution_mode(&config.sop.default_execution_mode);
         (dir, mode)
     }
@@ -4615,6 +4696,15 @@ impl RpcDispatcher {
             "quickstart: daemon reload signalled"
         );
         self.schedule_daemon_reload(crate::quickstart::Surface::Tui.as_str())
+    }
+}
+
+fn response_id_key(id: &Value) -> Option<String> {
+    match id {
+        Value::String(id) => Some(id.clone()),
+        Value::Number(id) => Some(id.to_string()),
+        Value::Null => None,
+        _ => unreachable!("validated JSON-RPC ID"),
     }
 }
 
@@ -5651,6 +5741,36 @@ mod tests {
             .handle_sops_runs(&serde_json::json!({ "sop": "some-sop" }))
             .expect_err("missing engine must error");
         assert_eq!(err.code, INTERNAL_ERROR);
+    }
+
+    // The `sop list` create-hint tells users to author under `<shared>/sops`;
+    // this locks the CLI scan root (sops_dir_and_mode) to that same path when
+    // sops_dir is unset, so the hint can never drift from where we actually
+    // read.
+    #[test]
+    fn sops_list_scan_root_matches_shared_sops_create_hint() {
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        assert!(
+            config.sop.sops_dir.is_none(),
+            "default config must leave sops_dir unset so the hint path applies",
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let d = RpcDispatcher::new(ctx, tx, "test-peer-sopscan:pid=1".into());
+
+        let (dir, _mode) = d.sops_dir_and_mode();
+        assert_eq!(dir, tmp.path().join("shared").join("sops"));
     }
 
     fn make_checkpoint_rpc_dispatcher(
@@ -8461,6 +8581,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_set_rejects_ambiguous_dotted_resource_path_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            zeroclaw_config::schema::ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+        cfg.cost.rates.providers.models.openai.insert(
+            "gpt-4.1.input_per_mtok".to_string(),
+            zeroclaw_config::schema::ModelCostRates {
+                input_per_mtok: Some(2.0),
+                ..Default::default()
+            },
+        );
+        cfg.save().await.expect("seed colliding resource keys");
+        let prior_disk = std::fs::read_to_string(&config_path).unwrap();
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "value": 9.9
+            }))
+            .await;
+        let err = res.expect_err("ambiguous resource path must fail closed");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\\\"gpt-4.1.input_per_mtok\\\"]"),
+            "RPC error must name the whole-entry interpretation: {message}"
+        );
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\\\"gpt-4.1\\\"].input_per_mtok"),
+            "RPC error must name the field interpretation: {message}"
+        );
+
+        let live = dispatcher.ctx.config.read();
+        assert_eq!(
+            live.cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(1.0),
+            "the field interpretation must remain unchanged"
+        );
+        assert_eq!(
+            live.cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1.input_per_mtok")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(2.0),
+            "the exact-key interpretation must remain unchanged"
+        );
+        drop(live);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            prior_disk,
+            "a rejected config/set must not rewrite the on-disk config"
+        );
+    }
+
+    #[tokio::test]
     async fn config_set_still_materializes_operator_chosen_alias() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
@@ -8506,6 +8697,160 @@ mod tests {
             stored.as_deref(),
             Some("sk-real-test-key"),
             "real secret must land in memory as plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_persists_dotted_dynamic_secret_keys_for_existing_and_fresh_aliases() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.secrets.encrypt = false;
+        cfg.create_map_key("providers.models.openai", "existing")
+            .expect("create the existing provider alias");
+        cfg.providers
+            .models
+            .openai
+            .get_mut("existing")
+            .expect("existing provider alias must be present")
+            .base
+            .model = Some("gpt-4o".to_string());
+        cfg.save().await.expect("seed the on-disk config");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        let existing = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.existing.extra_headers.X-Trace.level",
+                "value": "existing-value"
+            }))
+            .await;
+        assert!(
+            existing.is_ok(),
+            "config/set must accept a dotted key on an existing alias: {existing:?}"
+        );
+
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap_or_else(|e| {
+            panic!("config must reload after existing-alias write: {e}\n{disk}")
+        });
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("existing")
+                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
+                .map(String::as_str),
+            Some("existing-value"),
+            "RPC success must mean the literal dotted key survived save/reload"
+        );
+
+        let fresh = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.fresh.extra_headers.X-Trace.level",
+                "value": "fresh-value"
+            }))
+            .await;
+        assert!(
+            fresh.is_ok(),
+            "config/set must materialize an alias for a first dotted dynamic-map write: {fresh:?}"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
+                .map(String::as_str),
+            Some("fresh-value"),
+            "new alias and dotted key must be published to live config"
+        );
+
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk)
+            .unwrap_or_else(|e| panic!("config must reload after fresh-alias write: {e}\n{disk}"));
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
+                .map(String::as_str),
+            Some("fresh-value"),
+            "fresh alias dotted key must survive the RPC save/reload boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_post_rename_sync_failure_still_commits_disk_live_and_backup() {
+        // Production-boundary regression for the post-rename durability fault:
+        // the injected failure is driven through `config/set` itself (not the
+        // write helper), proving the RPC reports committed success, disk and
+        // live config agree on the new value, and the prior file is retained
+        // as `.bak`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = make_secret_test_config(&tmp);
+        cfg.save().await.expect("seed the on-disk config");
+        let prior_disk = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("seeded config must exist on disk");
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let config_path = tmp.path().join("config.toml");
+        zeroclaw_config::schema::arm_post_replace_sync_failure_for_test(&config_path);
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.anthropic.default.api_key",
+                "value": "sk-post-rename-sync-key"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "a post-rename sync fault must still report a committed config/set: {res:?}"
+        );
+        assert!(
+            !zeroclaw_config::schema::post_replace_sync_failure_armed(&config_path),
+            "the injected fault must actually fire inside the config/set save path"
+        );
+
+        let live = dispatcher
+            .ctx
+            .config
+            .read()
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .and_then(|e| e.base.api_key.clone());
+        assert_eq!(
+            live.as_deref(),
+            Some("sk-post-rename-sync-key"),
+            "live config must hold the committed value"
+        );
+
+        let disk = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("config.toml must survive the injected fault");
+        assert!(
+            disk.contains("api_key"),
+            "disk must contain the replacement config: {disk}"
+        );
+        assert_ne!(
+            disk, prior_disk,
+            "disk must hold the new file, not the pre-fault one"
+        );
+
+        let backup = tokio::fs::read_to_string(tmp.path().join("config.toml.bak"))
+            .await
+            .expect("durability uncertainty must retain the pre-replace backup");
+        assert_eq!(
+            backup, prior_disk,
+            ".bak must contain the prior on-disk config"
         );
     }
 
@@ -8770,6 +9115,108 @@ mod tests {
             stored.as_deref(),
             Some("sk-live-secret"),
             "live secret must NOT be clobbered by a masked write"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_unknown_field_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.anthropic.new_bot.not_a_real_field",
+            "value": "anything"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set on an unknown tail field must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot")),
+            "the alias auto-created to resolve the write must be rolled back, \
+             not left as a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_bad_value_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.openai.new_bot.temperature",
+            "value": "abc"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with an unparsable value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot")),
+            "a set_prop value failure after alias auto-creation must roll the \
+             alias back, not leave a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_coercion_failure_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        // Non-string JSON value so the failure happens in coerce_for_set_prop,
+        // not in the later set_prop parse.
+        let params = json!({
+            "prop": "providers.models.openai.new_bot3.temperature",
+            "value": {"not": "a-float"}
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with an uncoercible value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot3")),
+            "a value coercion failure after alias auto-creation must roll the \
+             alias back, not leave a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_masked_secret_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.openai.new_bot2.api_key",
+            "value": "****"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with a masked secret value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot2")),
+            "the masked-secret rejection after alias auto-creation must roll \
+             the alias back, not leave a phantom in the live daemon config"
         );
     }
 
@@ -10033,6 +10480,270 @@ mod tests {
             1,
             "session_end must fire when a real session is closed"
         );
+    }
+
+    fn make_bidi_test_dispatcher() -> (RpcDispatcher, tokio::sync::mpsc::Receiver<String>) {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(zeroclaw_config::schema::Config::default(), sessions);
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer-bidi:pid=1".into());
+        dispatcher.authenticated = true;
+        (dispatcher, rx)
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_success_response_to_pending_caller() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter =
+            zeroclaw_spawn::spawn!(async move { rpc.request("ask_user", json!({"q": "?"})).await });
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame =
+            format!(r#"{{"jsonrpc":"2.0","id":"{expected_id}","result":{{"answer":"blue"}}}}"#);
+        dispatcher.process_line_for_test(&frame).await;
+
+        let out = waiter.await.expect("waiter task join").expect("rpc result");
+        assert_eq!(out, json!({"answer": "blue"}));
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_error_response_to_pending_caller() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter = zeroclaw_spawn::spawn!(async move { rpc.request("poll", json!({})).await });
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame = format!(
+            r#"{{"jsonrpc":"2.0","id":"{expected_id}","error":{{"code":-32601,"message":"nope"}}}}"#
+        );
+        dispatcher.process_line_for_test(&frame).await;
+
+        let err = waiter
+            .await
+            .expect("waiter task join")
+            .expect_err("rpc error");
+        assert_eq!(err.code, -32601);
+        assert_eq!(err.message, "nope");
+    }
+
+    #[tokio::test]
+    async fn process_line_routes_explicit_null_result_response() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        let rpc = dispatcher.rpc_for_test();
+
+        let waiter =
+            zeroclaw_spawn::spawn!(
+                async move { rpc.request("ask_user", json!({"q": "skip"})).await }
+            );
+
+        let _sent = rx.recv().await.expect("outbound request sent");
+        let expected_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        let frame = format!(r#"{{"jsonrpc":"2.0","id":"{expected_id}","result":null}}"#);
+        dispatcher.process_line_for_test(&frame).await;
+
+        let out = waiter.await.expect("waiter task join").expect("rpc result");
+        assert_eq!(out, Value::Null);
+    }
+
+    async fn assert_process_line_error(line: &str, code: i32, id: Value) {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        Box::pin(dispatcher.process_line_for_test(line)).await;
+
+        let response = rx.try_recv().expect("JSON-RPC error response");
+        let response: Value = serde_json::from_str(&response).expect("valid response JSON");
+        assert_eq!(response["error"]["code"], json!(code), "line: {line}");
+        assert_eq!(response["id"], id, "line: {line}");
+    }
+
+    async fn assert_process_line_drops_invalid_response(line: &str) {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        Box::pin(dispatcher.process_line_for_test(line)).await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "an invalid response must not produce another response: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_line_distinguishes_syntax_and_envelope_errors() {
+        assert_process_line_error("{", PARSE_ERROR, Value::Null).await;
+
+        let invalid_requests = [
+            (r#"{"jsonrpc":"1.0","method":"status","id":1}"#, json!(1)),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":true,"id":7}"#,
+                json!(7),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":null,"id":8}"#,
+                json!(8),
+            ),
+            (
+                r#"{"jsonrpc":"2.0","method":"status","params":null}"#,
+                Value::Null,
+            ),
+        ];
+
+        for (line, id) in invalid_requests {
+            assert_process_line_error(line, INVALID_REQUEST, id).await;
+        }
+
+        let ambiguous = [
+            "null",
+            r#"{"jsonrpc":"2.0"}"#,
+            r#"{"jsonrpc":"2.0","id":3}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":6}"#,
+            r#"{"jsonrpc":"2.0","method":null,"id":null}"#,
+            r#"{"jsonrpc":"2.0","method":"status","id":9,"result":true}"#,
+        ];
+        for line in ambiguous {
+            assert_process_line_error(line, INVALID_REQUEST, Value::Null).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn process_line_drops_malformed_response_frames_without_reply() {
+        let invalid_responses = [
+            r#"{"id":"zc-out-0","result":true}"#,
+            r#"{"jsonrpc":"1.0","id":"zc-out-0","result":true}"#,
+            r#"{"jsonrpc":"2.0","result":true}"#,
+            r#"{"jsonrpc":"2.0","id":2,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":null,"result":true,"error":{"code":-1,"message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":"bad","message":"bad"}}"#,
+            r#"{"jsonrpc":"2.0","id":{"nested":5},"result":true}"#,
+            r#"{"jsonrpc":"2.0","id":10,"result":true,"params":{}}"#,
+        ];
+
+        for line in invalid_responses {
+            assert_process_line_drops_invalid_response(line).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_frames_cannot_complete_opposite_direction_same_id_request() {
+        let (mut dispatcher, mut daemon_writer_rx) = make_bidi_test_dispatcher();
+        let daemon_rpc = dispatcher.rpc_for_test();
+        let daemon_wait_rpc = Arc::clone(&daemon_rpc);
+        let daemon_waiter = zeroclaw_spawn::spawn!(async move {
+            daemon_wait_rpc.request("ask_user", json!({"q": "?"})).await
+        });
+
+        let daemon_request: Value = serde_json::from_str(
+            &daemon_writer_rx
+                .recv()
+                .await
+                .expect("daemon outbound request"),
+        )
+        .expect("valid daemon request");
+
+        let (client_writer_tx, mut client_writer_rx) = tokio::sync::mpsc::channel(4);
+        let client_rpc = Arc::new(RpcOutbound::new(client_writer_tx));
+        let client_wait_rpc = Arc::clone(&client_rpc);
+        let client_waiter =
+            zeroclaw_spawn::spawn!(
+                async move { client_wait_rpc.request("status", Value::Null).await }
+            );
+        let client_request: Value = serde_json::from_str(
+            &client_writer_rx
+                .recv()
+                .await
+                .expect("client outbound request"),
+        )
+        .expect("valid client request");
+
+        let shared_id = format!("{}0", zeroclaw_api::jsonrpc::OUTBOUND_ID_PREFIX);
+        assert_eq!(daemon_request["id"], json!(&shared_id));
+        assert_eq!(client_request["id"], json!(&shared_id));
+
+        let malformed = format!(
+            r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":null,"error":{{"code":-32600,"message":"bad"}}}}"#
+        );
+        Box::pin(dispatcher.process_line_for_test(&malformed)).await;
+
+        assert!(
+            matches!(
+                daemon_writer_rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "malformed response must not generate a same-ID reply"
+        );
+        assert_eq!(daemon_rpc.pending_count(), 1);
+        assert_eq!(client_rpc.pending_count(), 1);
+
+        let malformed_methods = [
+            format!(r#"{{"jsonrpc":"2.0","method":null,"id":"{shared_id}"}}"#),
+            format!(r#"{{"jsonrpc":"2.0","method":null,"id":"{shared_id}","result":true}}"#),
+        ];
+        for malformed_method in malformed_methods {
+            Box::pin(dispatcher.process_line_for_test(&malformed_method)).await;
+
+            let error_response: Value = serde_json::from_str(
+                &daemon_writer_rx
+                    .try_recv()
+                    .expect("invalid-request response"),
+            )
+            .expect("valid JSON-RPC response");
+            assert_eq!(error_response["id"], Value::Null);
+            assert_eq!(error_response["error"]["code"], json!(INVALID_REQUEST));
+            assert_eq!(daemon_rpc.pending_count(), 1);
+            assert_eq!(client_rpc.pending_count(), 1);
+        }
+
+        let valid_daemon_response =
+            format!(r#"{{"jsonrpc":"2.0","id":"{shared_id}","result":{{"answer":"blue"}}}}"#);
+        Box::pin(dispatcher.process_line_for_test(&valid_daemon_response)).await;
+        let daemon_result = tokio::time::timeout(std::time::Duration::from_secs(1), daemon_waiter)
+            .await
+            .expect("daemon request remained resolvable")
+            .expect("daemon waiter task")
+            .expect("daemon result");
+        assert_eq!(daemon_result, json!({"answer": "blue"}));
+        assert_eq!(client_rpc.pending_count(), 1);
+
+        assert!(client_rpc.dispatch_validated_response(&shared_id, Ok(json!({"status": "ready"}))));
+        let client_result = tokio::time::timeout(std::time::Duration::from_secs(1), client_waiter)
+            .await
+            .expect("client request remained resolvable")
+            .expect("client waiter task")
+            .expect("client result");
+        assert_eq!(client_result, json!({"status": "ready"}));
+    }
+
+    #[tokio::test]
+    async fn process_line_drops_unknown_valid_response_without_reply() {
+        let (mut dispatcher, mut rx) = make_bidi_test_dispatcher();
+        dispatcher
+            .process_line_for_test(r#"{"jsonrpc":"2.0","id":"unknown","result":true}"#)
+            .await;
+
+        assert!(
+            matches!(
+                rx.try_recv(),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            ),
+            "a valid response with an unknown ID must not start a response loop"
+        );
+    }
+
+    #[test]
+    fn response_id_key_accepts_string_and_numeric_ids() {
+        assert_eq!(
+            response_id_key(&json!("zc-out-1")).as_deref(),
+            Some("zc-out-1")
+        );
+        assert_eq!(response_id_key(&json!(42)).as_deref(), Some("42"));
+        assert_eq!(response_id_key(&Value::Null), None);
     }
 
     // ── config_write_lock races ─────────────────────────────────
