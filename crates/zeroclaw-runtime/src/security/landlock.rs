@@ -267,6 +267,11 @@ impl Sandbox for LandlockSandbox {
         // `Drop for RulesetCreated` remain fork-safe — no heap allocation,
         // no lock acquisition, no async-signal-unsafe calls between fork()
         // and exec().
+        //
+        // SAFETY: the closure obeys `pre_exec`'s post-fork restrictions for
+        // the reasons above: its captured state is child-local, the audited
+        // landlock operations are fork-safe, and every error path is
+        // allocation-free.
         unsafe {
             cmd.pre_exec(move || {
                 if let Some(rs) = ruleset.take() {

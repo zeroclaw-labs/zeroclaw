@@ -26,7 +26,7 @@ cli-config-about = Gestiona la configuración de ZeroClaw
 cli-update-about = Comprueba y aplica las actualizaciones de ZeroClaw
 cli-self-test-about = Ejecuta autopruebas de diagnóstico
 cli-completions-about = Genera scripts de autocompletado del shell
-cli-desktop-about = Inicia la aplicación de escritorio complementaria de ZeroClaw
+cli-desktop-about = Inicia la aplicación de escritorio complementaria, o abre su página de descarga
 cli-config-schema-about = Vuelca el esquema JSON de configuración completo en stdout
 cli-config-list-about = Lista todas las propiedades de configuración con los valores actuales
 cli-config-get-about = Obtiene el valor de una propiedad de configuración
@@ -316,11 +316,11 @@ cli-desktop-long-about =
 
     La aplicación complementaria es una aplicación ligera de barra de menú / bandeja del sistema que se conecta al mismo gateway que la CLI. Proporciona acceso rápido al panel, monitoreo de estado y emparejamiento de dispositivos.
 
-    Usa --install para descargar la aplicación complementaria precompilada para tu plataforma.
+    Usa --install para abrir la página de descarga para tu plataforma. No instala nada por sí mismo.
 
     Ejemplos:
     zeroclaw desktop              # lanzar la aplicación complementaria
-    zeroclaw desktop --install    # descargarla e instalarla
+    zeroclaw desktop --install    # abrir la página de descarga
 channel-needs-quickstart-reply = Este agente aún no está completamente configurado. El operador debe ejecutar Quickstart antes de que pueda responder.
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web está configurado pero la característica 'whatsapp-web' no está compilada.
 channel-whatsapp-web-feature-missing-build = Compila/ejecuta con: cargo build --features whatsapp-web
@@ -431,6 +431,7 @@ cli-sop-none = No se encontraron SOP.
 cli-sop-pending-none = No hay ejecuciones de SOP esperando aprobación.
 cli-sop-pending-header = Ejecuciones de SOP esperando aprobación:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] paso {$step}/{$total}
+cli-sop-status-failure-reason = Motivo del fallo: {$reason}
 cli-sop-ws-invalid-approval = sop approval_response requiere run_id y una decisión approve o deny
 cli-sop-ws-resolve-failed = error al resolver SOP: {$error}
 cli-sop-ws-engine-lock-poisoned = bloqueo del motor SOP envenenado
@@ -605,6 +606,7 @@ cli-quickstart-error-channel-required = se requieren tipo de canal y alias
 cli-quickstart-error-channel-field-not-advertised = el campo de canal `{$field}` no está disponible en Quickstart
 cli-quickstart-error-channel-token-required = se requiere el token del bot de Telegram
 cli-quickstart-error-webhook-secret-required = se requiere el secreto compartido del webhook
+cli-quickstart-error-webhook-port-conflict = el puerto de webhook {$port} ya está en uso por el webhook habilitado `{$alias}` — cada webhook habilitado necesita su propio puerto
 cli-quickstart-error-peer-group-name-required = se requiere el nombre del grupo de pares
 cli-quickstart-error-peer-group-channel-required = se requiere la referencia de canal del grupo de pares
 cli-quickstart-error-peer-group-unknown-channel = el grupo de pares `{$name}` referencia un canal desconocido `{$channel}`
@@ -665,9 +667,9 @@ cli-status-service-stopped = 🔴 Servicio:       detenido
 cli-status-channels = Canales:
 cli-status-cli-always = {"  "}CLI:      ✅ siempre
 cli-status-peripherals = Periféricos:
-cli-desktop-download = Descarga la aplicación complementaria de ZeroClaw:
+cli-desktop-download = Abriendo la página de descargas de la aplicación complementaria ZeroClaw:
 cli-desktop-homebrew = O instálala con Homebrew (próximamente):
-cli-desktop-linux-pkg = {"  "}Descarga el .deb o .AppImage para tu arquitectura.
+cli-desktop-linux-pkg = {"  "}La página ofrece archivos .deb y .AppImage para tu arquitectura.
 cli-desktop-launching = Iniciando la aplicación complementaria de ZeroClaw...
 cli-status-version = Versión:     {$v}
 cli-status-workspace = Espacio de trabajo:   {$v}

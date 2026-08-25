@@ -198,12 +198,19 @@ impl RecoveryBarrier {
         }
     }
 
+    fn needed_epoch(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        match self.needed_epoch.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Publish that the observed epoch now needs recovery before any further
     /// write. Idempotent for a given epoch; a newer epoch supersedes an older
     /// pending one. This is intentionally synchronous (no `.await`) so it takes
     /// effect the instant an outcome becomes unknown.
     fn arm(&self, epoch: u64) {
-        let mut needed = self.needed_epoch.lock().unwrap();
+        let mut needed = self.needed_epoch();
         match *needed {
             Some(existing) if existing >= epoch => {}
             _ => *needed = Some(epoch),
@@ -214,7 +221,7 @@ impl RecoveryBarrier {
     /// for `recovered_epoch`, then wake any waiting writers.
     fn finish(&self, recovered_epoch: u64) {
         {
-            let mut needed = self.needed_epoch.lock().unwrap();
+            let mut needed = self.needed_epoch();
             if matches!(*needed, Some(pending) if pending <= recovered_epoch) {
                 *needed = None;
             }
@@ -234,7 +241,7 @@ impl RecoveryBarrier {
     }
 
     fn recovery_pending(&self) -> bool {
-        self.needed_epoch.lock().unwrap().is_some()
+        self.needed_epoch().is_some()
     }
 }
 
@@ -951,9 +958,9 @@ impl McpRegistry {
                 _request: &JsonRpcRequest,
                 _lifecycle: &McpRequestLifecycle,
             ) -> Result<JsonRpcResponse> {
-                unreachable!(
-                    "for_test_with_server_count registry is only used for server_count/Arc equality"
-                )
+                Err(anyhow::Error::msg(
+                    "for_test_with_server_count transport does not support requests",
+                ))
             }
 
             async fn close(&self) -> Result<()> {
@@ -1104,10 +1111,9 @@ impl McpRegistry {
                 _request: &JsonRpcRequest,
                 _lifecycle: &McpRequestLifecycle,
             ) -> Result<JsonRpcResponse> {
-                unreachable!(
-                    "for_test_make_stub_server is only used for identity / \
-                     ptr_eq / server_count assertions — never for actual tool calls"
-                )
+                Err(anyhow::Error::msg(
+                    "for_test_make_stub_server transport does not support requests",
+                ))
             }
 
             async fn close(&self) -> Result<()> {

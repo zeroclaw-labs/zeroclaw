@@ -421,6 +421,9 @@ const EDGE_TTS_REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(
 #[cfg(unix)]
 fn graceful_kill(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id() {
+        // SAFETY: `pid` comes from this live child handle; `kill` receives no
+        // pointers, and failure (including a raced child exit) is deliberately
+        // handled as best-effort cleanup.
         let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
     }
 }
@@ -1016,7 +1019,9 @@ impl TtsManager {
                 "google" => GoogleTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
                 "edge" => EdgeTtsProvider::new(alias, instance).map(|p| Box::new(p) as _),
                 "piper" => Ok(Box::new(PiperTtsProvider::new(alias, instance)) as _),
-                _ => unreachable!("TtsProviders typed slots cover all 5 families"),
+                _ => Err(anyhow::Error::msg(format!(
+                    "unsupported typed TTS family: {family}"
+                ))),
             };
             match result {
                 Ok(p) => {
@@ -1718,6 +1723,8 @@ mod tests {
 
     #[cfg(unix)]
     fn edge_tts_fixture_process_exists(pid: u32) -> std::io::Result<bool> {
+        // SAFETY: signal 0 only probes the PID recorded by the fixture; no
+        // pointers cross FFI and all documented error cases are handled below.
         if unsafe { libc::kill(pid as i32, 0) } == 0 {
             return Ok(true);
         }
@@ -2160,6 +2167,8 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
+        // SAFETY: signal 0 is a non-mutating existence probe for the PID
+        // returned by `Child::id`; no pointers cross the FFI boundary.
         let still_alive = unsafe { libc::kill(child_pid as i32, 0) } == 0;
         assert!(
             !still_alive,

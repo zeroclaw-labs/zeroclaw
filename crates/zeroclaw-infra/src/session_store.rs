@@ -614,6 +614,7 @@ mod tests {
         writeln!(file, r#"{{"role":"user","content":"ok"}}"#).unwrap();
         writeln!(file, "corrupt line").unwrap();
         writeln!(file, r#"{{"role":"assistant","content":"hi"}}"#).unwrap();
+        drop(file);
 
         store.compact(key).unwrap();
 

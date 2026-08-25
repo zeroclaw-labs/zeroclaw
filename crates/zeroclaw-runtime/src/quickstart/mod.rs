@@ -1477,6 +1477,11 @@ fn apply_channels(
                         ));
                         continue;
                     }
+                    if family == "webhook"
+                        && !validate_enabled_webhook_port(config, alias, idx, errors, ctx)
+                    {
+                        continue;
+                    }
                     refs.push(reference.clone());
                 } else {
                     errors.push(QuickstartError::for_surface(
@@ -1632,6 +1637,12 @@ fn apply_channels(
                     failed = true;
                 }
                 if !failed
+                    && config_channel_type == "webhook"
+                    && !validate_enabled_webhook_port(&staged, alias, idx, errors, ctx)
+                {
+                    failed = true;
+                }
+                if !failed
                     && config_channel_type == "telegram"
                     && let Some(telegram) = staged.channels.telegram.get(alias)
                     && let Err(err) = telegram.validate_bot_token(alias)
@@ -1689,6 +1700,72 @@ fn apply_channels(
 fn channel_exists(config: &Config, channel_type: &str, alias: &str) -> bool {
     let probe = format!("channels.{channel_type}.{alias}.enabled");
     config.get_prop(&probe).is_ok()
+}
+
+/// Validate one enabled webhook selection against the complete staged config.
+///
+/// Both fresh and existing selectors pass through this boundary so choosing a
+/// preconfigured webhook cannot bypass the same-port rule enforced while a new
+/// alias is staged. Returns `true` for disabled aliases because they do not
+/// start listeners.
+fn validate_enabled_webhook_port(
+    config: &Config,
+    alias: &str,
+    index: usize,
+    errors: &mut Vec<QuickstartError>,
+    ctx: Option<&RunCtx>,
+) -> bool {
+    let Some(webhook) = config.channels.webhook.get(alias) else {
+        return true;
+    };
+    if !webhook.enabled {
+        return true;
+    }
+    let port = webhook.port;
+    let Some(other) = conflicting_enabled_webhook_alias(config, alias, port).map(str::to_string)
+    else {
+        return true;
+    };
+    let port_text = port.to_string();
+    errors.push(QuickstartError::for_surface(
+        ctx,
+        QuickstartStep::Channels,
+        format!("channels[{index}].fields.port"),
+        format!(
+            "webhook port {port_text} is already used by enabled webhook `{other}` — each enabled webhook needs its own port"
+        ),
+        "cli-quickstart-error-webhook-port-conflict",
+        &[("port", port_text.as_str()), ("alias", other.as_str())],
+    ));
+    false
+}
+
+/// Find an already-enabled webhook alias that would claim `port`.
+///
+/// The webhook listener binds `0.0.0.0:<port>` — [`WebhookConfig`] has no
+/// host/interface knob — so the port alone identifies the listen address and
+/// two enabled aliases sharing one are guaranteed to collide at bind time.
+/// Disabled aliases never start a listener, so they never conflict.
+///
+/// `config` here is the *staged* post-apply config, so this sees both aliases
+/// already persisted and the fresh aliases staged earlier in the same
+/// submission. `alias` (the entry being validated) is skipped so an entry
+/// never conflicts with itself. Matches are minimised by alias name to keep
+/// the reported conflict stable across `HashMap` iteration order.
+fn conflicting_enabled_webhook_alias<'a>(
+    config: &'a Config,
+    alias: &str,
+    port: u16,
+) -> Option<&'a str> {
+    config
+        .channels
+        .webhook
+        .iter()
+        .filter(|(other, webhook)| {
+            other.as_str() != alias && webhook.enabled && webhook.port == port
+        })
+        .map(|(other, _)| other.as_str())
+        .min()
 }
 
 // ── Peer groups ────────────────────────────────────────────────────
@@ -3012,6 +3089,241 @@ mod tests {
         assert_eq!(
             cfg.channels.webhook["inbound"].port,
             zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
+        );
+    }
+
+    /// Two enabled webhook aliases staged in one submission that both land on
+    /// the default port must be rejected: the orchestrator starts one listener
+    /// per alias and only one can bind `0.0.0.0:8090`.
+    #[test]
+    fn webhook_channel_rejects_duplicate_enabled_ports_within_submission() {
+        let mut cfg = Config::default();
+        let channels = vec![
+            SelectorChoice::Fresh(fresh_channel("webhook", "first", &[("secret", "secret-a")])),
+            SelectorChoice::Fresh(fresh_channel(
+                "webhook",
+                "second",
+                &[("secret", "secret-b")],
+            )),
+        ];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert_eq!(
+            refs,
+            ["webhook.first"],
+            "only the first alias may claim the default port"
+        );
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[1].fields.port"
+                    && error.message.contains("8090")
+                    && error.message.contains("first")
+            }),
+            "port conflict must be reported on the second entry's port field; got {errors:?}"
+        );
+        assert!(
+            !cfg.channels.webhook.contains_key("second"),
+            "conflicting alias must not be persisted"
+        );
+    }
+
+    /// The conflict check must also see aliases that already exist in the
+    /// config, not just the ones staged in this submission.
+    #[test]
+    fn webhook_channel_rejects_duplicate_enabled_port_against_existing_alias() {
+        let mut cfg = Config::default();
+        cfg.channels.webhook.insert(
+            "existing".into(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                ..Default::default()
+            },
+        );
+        let channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "shared-secret")],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(refs.is_empty(), "conflicting alias must not be bound");
+        assert!(
+            errors.iter().any(|error| {
+                error.field == "channels[0].fields.port" && error.message.contains("existing")
+            }),
+            "existing enabled alias must be reported as the conflict; got {errors:?}"
+        );
+        assert!(!cfg.channels.webhook.contains_key("inbound"));
+    }
+
+    #[test]
+    fn webhook_channel_rejects_existing_selection_with_duplicate_enabled_port() {
+        let mut cfg = Config::default();
+        for alias in ["already-active", "selected"] {
+            cfg.channels.webhook.insert(
+                alias.into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                    ..Default::default()
+                },
+            );
+        }
+        let before_dirty_paths = cfg.dirty_paths.clone();
+        let channels = vec![SelectorChoice::Existing("webhook.selected".into())];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(
+            refs.is_empty(),
+            "the conflicting existing alias must not be bound"
+        );
+        assert!(errors.iter().any(|error| {
+            error.field == "channels[0].fields.port"
+                && error.message.contains("8090")
+                && error.message.contains("already-active")
+        }));
+        assert_eq!(cfg.dirty_paths, before_dirty_paths);
+        assert_eq!(cfg.channels.webhook.len(), 2);
+        assert!(cfg.channels.webhook.values().all(|webhook| {
+            webhook.enabled && webhook.port == zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
+        }));
+    }
+
+    #[tokio::test]
+    async fn existing_webhook_conflict_preserves_saved_config_and_cli_field_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("data"),
+            ..Default::default()
+        };
+        for alias in ["already-active", "selected"] {
+            config.channels.webhook.insert(
+                alias.into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                    ..Default::default()
+                },
+            );
+        }
+        config.save().await.unwrap();
+        let before = std::fs::read_to_string(&config.config_path).unwrap();
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Existing("webhook.selected".into())];
+
+        let errors = apply_with_surface(submission, &mut config, Surface::Cli)
+            .await
+            .expect_err("an existing same-port webhook must be rejected");
+
+        assert!(errors.iter().any(|error| {
+            error.field == "channels[0].fields.port"
+                && error.message
+                    == "webhook port 8090 is already used by enabled webhook `already-active` — \
+                        each enabled webhook needs its own port"
+        }));
+        let after = std::fs::read_to_string(&config.config_path).unwrap();
+        assert_eq!(
+            after, before,
+            "a rejected Quickstart apply must not rewrite config.toml"
+        );
+        let reloaded: Config = toml::from_str(&after).unwrap();
+        assert!(!reloaded.agents.contains_key("bot"));
+        assert_eq!(reloaded.channels.webhook.len(), 2);
+    }
+
+    /// A disabled webhook never starts a listener, so it must not block a new
+    /// alias from taking the same port.
+    #[test]
+    fn webhook_channel_allows_duplicate_port_when_existing_alias_is_disabled() {
+        let mut cfg = Config::default();
+        cfg.channels.webhook.insert(
+            "parked".into(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled: false,
+                port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                ..Default::default()
+            },
+        );
+        let channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "shared-secret")],
+        ))];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply errors: {errors:?}");
+        assert_eq!(refs, ["webhook.inbound"]);
+        assert_eq!(
+            cfg.channels.webhook["inbound"].port,
+            zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
+        );
+    }
+
+    /// Distinct ports are the supported multi-webhook setup and must pass.
+    #[test]
+    fn webhook_channel_allows_distinct_enabled_ports() {
+        let mut cfg = Config::default();
+        let channels = vec![
+            SelectorChoice::Fresh(fresh_channel("webhook", "first", &[("secret", "secret-a")])),
+            SelectorChoice::Fresh(fresh_channel(
+                "webhook",
+                "second",
+                &[("port", "9191"), ("secret", "secret-b")],
+            )),
+        ];
+        let mut errors = Vec::new();
+
+        let refs = apply_channels(&mut cfg, &channels, &mut errors, None);
+
+        assert!(errors.is_empty(), "apply errors: {errors:?}");
+        assert_eq!(refs, ["webhook.first", "webhook.second"]);
+        assert_eq!(
+            cfg.channels.webhook["first"].port,
+            zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT
+        );
+        assert_eq!(cfg.channels.webhook["second"].port, 9191);
+    }
+
+    #[test]
+    fn webhook_channel_cli_reports_webhook_port_conflict_error() {
+        let mut cfg = Config::default();
+        cfg.channels.webhook.insert(
+            "existing".into(),
+            zeroclaw_config::schema::WebhookConfig {
+                enabled: true,
+                port: zeroclaw_config::schema::DEFAULT_WEBHOOK_CHANNEL_PORT,
+                ..Default::default()
+            },
+        );
+        let mut submission = fresh_submission("bot");
+        submission.channels = vec![SelectorChoice::Fresh(fresh_channel(
+            "webhook",
+            "inbound",
+            &[("secret", "shared-secret")],
+        ))];
+
+        let errors = validate_only_with_surface(&submission, &cfg, Surface::Cli)
+            .expect_err("duplicate enabled webhook port must be rejected");
+
+        assert!(
+            errors.iter().any(|error| {
+                error.field == "channels[0].fields.port"
+                    && error.message
+                        == "webhook port 8090 is already used by enabled webhook `existing` — \
+                            each enabled webhook needs its own port"
+            }),
+            "CLI surface must render the localized conflict string; got {errors:?}"
         );
     }
 

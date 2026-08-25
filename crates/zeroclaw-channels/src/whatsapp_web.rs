@@ -316,6 +316,8 @@ pub struct WhatsAppWebChannel {
     /// `[whatsapp.ws_url]` — replaces the legacy `WHATSAPP_WS_URL` env-var
     /// read.
     ws_url: Option<String>,
+    /// Display name announced to contacts (optional)
+    push_name: Option<String>,
     /// The alias key under `[channels.whatsapp.<alias>]` this handle is
     /// bound to. Used to scope peer-group writes and resolver lookups.
     alias: String,
@@ -435,6 +437,7 @@ impl WhatsAppWebChannel {
         let pair_phone = config.pair_phone.clone();
         let pair_code = config.pair_code.clone();
         let ws_url = config.ws_url.clone();
+        let push_name = config.push_name.clone();
         let mention_only = config.mention_only;
         let passive_group_context = config.passive_group_context;
         let mode = config.mode.clone();
@@ -465,6 +468,7 @@ impl WhatsAppWebChannel {
             pair_phone,
             pair_code,
             ws_url,
+            push_name,
             alias: alias.into(),
             peer_resolver,
             mention_only,
@@ -1487,6 +1491,7 @@ impl WhatsAppWebChannel {
             file_name,
             data,
             mime_type,
+            marker: None,
         });
     }
 
@@ -1906,6 +1911,14 @@ impl WhatsAppWebChannel {
             .await
             .map_err(|e| anyhow::Error::msg(format!("WhatsApp location send failed: {e}")))?;
         Ok(())
+    }
+
+    /// The display name to push, or `None` when it is unset, blank, or
+    /// already what the device announces.
+    #[cfg(feature = "whatsapp-web")]
+    fn push_name_to_apply<'a>(configured: Option<&'a str>, current: &str) -> Option<&'a str> {
+        let desired = configured?.trim();
+        (!desired.is_empty() && desired != current.trim()).then_some(desired)
     }
 
     // ── Mention detection helpers (used when mention_only is enabled) ──
@@ -2472,7 +2485,7 @@ impl Channel for WhatsAppWebChannel {
             .map(|vs| vs.contains(&message.recipient))
             .unwrap_or(false);
 
-        if is_voice_chat && self.tts_manager.is_some() {
+        if is_voice_chat && let Some(tts_manager) = self.tts_manager.clone() {
             let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
@@ -2498,7 +2511,6 @@ impl Channel for WhatsAppWebChannel {
                 let client_clone = client.clone();
                 let to_clone = to.clone();
                 let recipient = message.recipient.clone();
-                let tts_manager = self.tts_manager.clone().unwrap();
                 zeroclaw_spawn::spawn!(async move {
                     // Wait 10 seconds — long enough for the agent to finish its
                     // full tool chain and send the final answer.
@@ -2787,6 +2799,7 @@ impl Channel for WhatsAppWebChannel {
                 transcription_manager: self.transcription_manager.clone(),
                 voice_chats: self.voice_chats.clone(),
             };
+            let configured_push_name = self.push_name.clone();
 
             let mut builder = Bot::builder()
                 .with_backend(backend)
@@ -2810,6 +2823,7 @@ impl Channel for WhatsAppWebChannel {
                     let bot_lid_inner = bot_lid_clone.clone();
                     let persist_inner = persist_clone.clone();
                     let inbound_context = inbound_context.clone();
+                    let configured_push_name = configured_push_name.clone();
                     async move {
                         // whatsapp-rust 0.6: event handlers receive `Arc<Event>`
                         // per so we match against `&*event` to get a
@@ -2847,6 +2861,25 @@ impl Channel for WhatsAppWebChannel {
                                             Self::store_jid_digits(&bot_lid_inner, lid.user())
                                     {
                                         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("resolved bot LID from device: {}", digits));
+                                    }
+                                }
+                                // `Bot::builder().with_push_name()` is not used: it writes
+                                // the local store pre-connect and the server's
+                                // `setting_pushName` sync overwrites it. Connected fires
+                                // after that sync, so the device snapshot is authoritative
+                                // and comparing against it keeps reconnects from emitting a
+                                // redundant app-state patch.
+                                if let Some(desired) = WhatsAppWebChannel::push_name_to_apply(
+                                    configured_push_name.as_deref(),
+                                    &device.push_name,
+                                ) {
+                                    match client.profile().set_push_name(desired).await {
+                                        Ok(()) => {
+                                            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note), &format!("set WhatsApp push name (configured len={}, previous len={})", desired.len(), device.push_name.len()));
+                                        }
+                                        Err(e) => {
+                                            ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown), &format!("failed to set WhatsApp push name (configured len={}); keeping the account's current name: {e}", desired.len()));
+                                        }
                                     }
                                 }
                                 // Persist the linked account as an authorized
@@ -5118,6 +5151,59 @@ mod tests {
         );
         assert_eq!(*ch.bot_phone.lock(), Some("919211916069".to_string()));
         assert_eq!(*ch.bot_lid.lock(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn constructor_carries_push_name_from_config() {
+        let mk = |push_name: Option<&str>| {
+            let cfg = zeroclaw_config::schema::WhatsAppConfig {
+                enabled: true,
+                session_path: Some("/tmp/test.db".into()),
+                push_name: push_name.map(Into::into),
+                ..Default::default()
+            };
+            WhatsAppWebChannel::new(
+                &cfg,
+                "whatsapp_web_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                Arc::new(Vec::new),
+            )
+        };
+        assert_eq!(mk(Some("סוכן")).push_name.as_deref(), Some("סוכן"));
+        assert_eq!(mk(None).push_name, None);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn push_name_to_apply_sends_only_on_a_real_difference() {
+        // Multi-byte throughout, so any byte-slicing of the value shows up here.
+        let non_ascii = "סוכן – שירות";
+        assert!(non_ascii.len() > non_ascii.chars().count());
+
+        // (configured, name the device announces, name to send)
+        let cases: [(Option<&str>, &str, Option<&str>); 11] = [
+            (None, "Galaxy S21", None),
+            (None, "", None),
+            (Some(""), "Old", None),
+            (Some("   \t "), "Old", None),
+            (Some("ZeroClawAgent"), "Galaxy S21", Some("ZeroClawAgent")),
+            (Some("ZeroClawAgent"), "", Some("ZeroClawAgent")),
+            (Some("ZeroClawAgent"), "ZeroClawAgent", None),
+            (Some("  ZeroClawAgent  "), "ZeroClawAgent", None),
+            (Some(non_ascii), "Galaxy S21", Some(non_ascii)),
+            (Some(non_ascii), non_ascii, None),
+            // A value that is a strict byte-prefix of the device's name is
+            // still a difference.
+            (Some("סוכן"), "סוכנת", Some("סוכן")),
+        ];
+        for (configured, current, want) in cases {
+            assert_eq!(
+                WhatsAppWebChannel::push_name_to_apply(configured, current),
+                want,
+                "configured {configured:?} against device {current:?}"
+            );
+        }
     }
 
     #[test]

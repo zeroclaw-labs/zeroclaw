@@ -45,6 +45,23 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "email",
 ];
 
+/// JSON Schema `pattern` for a cron delivery channel.
+///
+/// Accepts either a bare channel type (`telegram`) or a configured instance's
+/// composite key (`telegram.work`). The tool descriptions recommend the
+/// composite form, and a bare-type enum would reject exactly what they
+/// recommend — `cron_update` in particular has no other unambiguous way to
+/// select one instance in a multi-instance setup.
+///
+/// Built from `CRON_DELIVERY_SCHEMA_CHANNELS` so the supported types stay
+/// declared once.
+pub(crate) fn cron_delivery_channel_pattern() -> String {
+    format!(
+        "^({})(\\.[A-Za-z0-9_-]+)?$",
+        CRON_DELIVERY_SCHEMA_CHANNELS.join("|")
+    )
+}
+
 /// Validate a shell command against an agent's security policy
 /// (allowlist + risk gate). `agent_alias` names the agent under whose
 /// risk profile the command will run. Returns `Ok(())` if the command

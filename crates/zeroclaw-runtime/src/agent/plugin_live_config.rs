@@ -126,7 +126,7 @@ fn install_fixture_plugin(plugins_root: &std::path::Path) -> String {
     let manifest: PluginManifest =
         toml::from_str(FIXTURE_MANIFEST).expect("fixture manifest parses");
     // The same admission the production registry performs, so the key below is
-    // the one `plugin_config_resolver` will look up.
+    // the one `plugin_host_services` will look up.
     let scope = PluginInstanceScope::for_package_binding(
         &manifest,
         PluginCapability::Tool,
@@ -177,6 +177,9 @@ fn live_agent_config(tmp: &TempDir, plugins_root: &std::path::Path, instance_key
     );
 
     config.plugins.enabled = true;
+    // The fixture is a package-bound tool instance, which the activation plan
+    // admits only under auto-discovery.
+    config.plugins.auto_discover = true;
     config.plugins.plugins_dir = plugins_root.display().to_string();
     config.plugins.entries = vec![PluginEntryConfig {
         name: instance_key.to_string(),

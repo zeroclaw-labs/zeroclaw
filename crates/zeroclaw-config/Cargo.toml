@@ -10,9 +10,9 @@ publish = false
 zeroclaw-log.workspace = true
 zeroclaw-api.workspace = true
 zeroclaw-macros.workspace = true
-# ADR-013: `plugins.entries[].egress_hosts` validates against the one shared
-# egress grammar in `zeroclaw_infra::net_guard`. Reimplementing the grammar here
-# would give a security-relevant rule two definitions that can drift apart.
+# `plugins.entries[].egress_hosts` validates against the one shared egress
+# grammar in `zeroclaw_infra::net_guard`. Reimplementing the grammar here would
+# give a security-relevant rule two definitions that can drift apart.
 zeroclaw-infra.workspace = true
 anyhow = "1.0"
 clap = { version = "4.5", optional = true, default-features = false, features = ["std", "derive"] }
@@ -65,3 +65,6 @@ default = ["schema-export", "clap"]
 schema-export = ["dep:schemars"]
 clap = ["dep:clap"]
 memory-postgres = ["dep:postgres"]
+# Test-only fault-injection hooks (post-replace sync failure). Enabled by
+# downstream dev-dependencies only; never by a production dependency.
+test-helpers = []

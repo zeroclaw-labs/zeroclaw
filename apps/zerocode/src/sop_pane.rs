@@ -49,6 +49,11 @@ pub(crate) struct SopPane {
     /// and rendered as the leading icon on each list row.
     run_status: std::collections::HashMap<String, SopRunStatusView>,
     last_runs_poll: Option<std::time::Instant>,
+    /// Gates every mutating surface (run, create, edit, delete, checkpoint
+    /// decisions) while leaving selection, graph viewing, run overlays, and
+    /// panning live. The TUI ships as a status view first; authoring and run
+    /// controls stay behind this flag until they are green-lit.
+    read_only: bool,
     /// The receiver is the single source of truth for whether a refresh is in
     /// flight. Keeping the RPC off the event loop prevents a degraded daemon
     /// from freezing input and rendering for the client timeout window.
@@ -416,6 +421,17 @@ fn trigger_source_walk(registry: &crate::client::TriggerSourceRegistryView) -> V
     sources
 }
 
+/// Actions gated off while the pane is a read-only status view. Everything
+/// that mutates SOPs or run state (run, authoring, checkpoint decisions) is
+/// blocked; selection, graph viewing, run watching, and panning stay live.
+fn blocked_when_read_only(action: crate::keymap::SopTabAction) -> bool {
+    use crate::keymap::SopTabAction as S;
+    matches!(
+        action,
+        S::Run | S::New | S::Edit | S::Delete | S::Approve | S::Deny
+    )
+}
+
 fn failure_label(f: &StepFailure) -> String {
     match f {
         StepFailure::Fail => "fail".to_string(),
@@ -507,6 +523,7 @@ impl SopPane {
             pan_drag: None,
             run_status: std::collections::HashMap::new(),
             last_runs_poll: None,
+            read_only: true,
             runs_poll_rx: None,
             runs_poll_stale: false,
         }
@@ -517,6 +534,40 @@ impl SopPane {
             .selected()
             .and_then(|i| self.names.get(i))
             .map(String::as_str)
+    }
+
+    /// Whether the pane currently owns a text prompt.
+    ///
+    /// The read-only surface keeps Watch available, so its run-id prompt must
+    /// suppress global text chords just like the other zerocode inputs. Keep
+    /// this derived from the prompt buffers rather than introducing parallel
+    /// focus state.
+    pub(crate) fn wants_text_input(&self) -> bool {
+        self.run_input.is_some() || self.run_payload_input.is_some()
+    }
+
+    /// Let an active, non-empty prompt keep word-navigation chords that would
+    /// otherwise switch the global pane.
+    pub(crate) fn claims_pane_navigation(&self, key: &crossterm::event::KeyEvent) -> bool {
+        let has_text = self
+            .run_input
+            .as_ref()
+            .or(self.run_payload_input.as_ref())
+            .is_some_and(|buffer| !buffer.is_empty());
+        has_text && crate::keymap::input_bar_claims_pane_navigation(key)
+    }
+
+    /// Route bracketed paste into whichever SOP prompt is active.
+    pub(crate) fn handle_paste(&mut self, text: &str) {
+        if let Some(buffer) = self.run_input.as_mut() {
+            // Run IDs are single-line identifiers. Ignore terminal control
+            // characters rather than letting pasted newlines corrupt the RPC
+            // argument or trigger unrelated global handling.
+            buffer.extend(text.chars().filter(|character| !character.is_control()));
+        } else if let Some(buffer) = self.run_payload_input.as_mut() {
+            // JSON permits insignificant whitespace, including newlines.
+            buffer.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        }
     }
 
     /// Called on every event-loop tick while the SOP pane is focused. A single
@@ -727,6 +778,9 @@ impl SopPane {
             Some(SopTabAction::Up) => self.select_prev(),
             Some(SopTabAction::Down) => self.select_next(),
             Some(SopTabAction::Enter) => self.load_selected_graph().await,
+            // Mutating actions are inert while the pane is a read-only status
+            // view; Watch stays live because it only loads a run overlay.
+            Some(action) if self.read_only && blocked_when_read_only(action) => {}
             Some(SopTabAction::Run) => self.start_run_payload().await,
             Some(SopTabAction::Watch) => self.run_input = Some(String::new()),
             Some(SopTabAction::New) => {
@@ -812,7 +866,9 @@ impl SopPane {
                 {
                     if self.editor.is_some() {
                         self.focus_editor_step(step);
-                    } else {
+                    } else if !self.read_only {
+                        // Node clicks open the step editor, a mutating
+                        // surface — inert in the read-only status view.
                         self.open_editor_for_step(step).await;
                     }
                     return;
@@ -1443,6 +1499,21 @@ impl SopPane {
 
     pub(crate) fn help_context(&self) -> crate::widgets::HelpNode {
         use crate::keymap::SopTabAction as S;
+        if self.read_only {
+            // Advertise only the surfaces that are live in the read-only
+            // status view; mutating chords are inert and stay out of help.
+            return crate::widgets::HelpNode::entries(crate::help::entries_for([
+                S::Up,
+                S::Down,
+                S::Enter,
+                S::Watch,
+                S::Toggle,
+                S::PanLeft,
+                S::PanRight,
+                S::PanUp,
+                S::PanDown,
+            ]));
+        }
         crate::widgets::HelpNode::entries(crate::help::entries_for([
             S::Up,
             S::Down,
@@ -1585,9 +1656,13 @@ impl SopPane {
         };
         if empty {
             let msg = if editor.is_some() {
-                "(no steps; Ctrl+n to add, then click handles to wire)"
+                "(no steps; Ctrl+n to add, then click handles to wire)".to_string()
+            } else if self.read_only {
+                // Authoring keys are inert in the read-only status view;
+                // don't advertise them.
+                crate::i18n::t("zc-sop-empty-read-only")
             } else {
-                "(no nodes; press n to author, e to edit)"
+                "(no nodes; press n to author, e to edit)".to_string()
             };
             f.render_widget(Paragraph::new(msg).wrap(Wrap { trim: false }), inner);
             return;
@@ -2376,10 +2451,63 @@ fn render_node_card(
 
 #[cfg(test)]
 mod tests {
-    use super::{CARD_H, CARD_W, COL_GAP, ROW_GAP, layout_slots, trigger_source_walk};
-    use crate::client::NodePosition;
-    use crate::client::{BoundTriggerSourceView, GraphLayout, TriggerSourceRegistryView};
+    use super::{CARD_H, CARD_W, COL_GAP, ROW_GAP, SopPane, layout_slots, trigger_source_walk};
+    use crate::client::{
+        BoundTriggerSourceView, GraphLayout, NodePosition, RpcClient, TriggerSourceRegistryView,
+    };
+    use crate::jsonrpc::RpcOutbound;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn test_pane() -> SopPane {
+        let (tx, _rx) = mpsc::channel::<String>(4);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        SopPane::new(Arc::new(RpcClient::with_rpc(rpc)))
+    }
+
+    #[test]
+    fn read_only_gate_blocks_exactly_the_mutating_actions() {
+        use crate::keymap::SopTabAction as S;
+        // Mutating surfaces stay inert in the status view.
+        for action in [S::Run, S::New, S::Edit, S::Delete, S::Approve, S::Deny] {
+            assert!(super::blocked_when_read_only(action), "{action:?}");
+        }
+        // Selection, viewing, watching, and panning stay live.
+        for action in [
+            S::Up,
+            S::Down,
+            S::Enter,
+            S::Watch,
+            S::Toggle,
+            S::PanLeft,
+            S::PanRight,
+            S::PanUp,
+            S::PanDown,
+        ] {
+            assert!(!super::blocked_when_read_only(action), "{action:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_prompt_owns_text_navigation_and_bracketed_paste() {
+        let mut pane = test_pane();
+        assert!(!pane.wants_text_input());
+
+        pane.run_input = Some(String::new());
+        assert!(pane.wants_text_input());
+        assert!(!pane.claims_pane_navigation(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT,)));
+
+        pane.handle_paste("run-123\r\n");
+        assert_eq!(pane.run_input.as_deref(), Some("run-123"));
+        assert!(pane.claims_pane_navigation(&KeyEvent::new(KeyCode::Left, KeyModifiers::ALT,)));
+    }
+
+    #[test]
+    fn read_only_empty_state_comes_from_fluent_catalogue() {
+        assert_eq!(crate::i18n::t("zc-sop-empty-read-only"), "(no nodes)");
+    }
 
     #[test]
     fn honored_toml_coords_land_on_matching_slot() {

@@ -794,6 +794,7 @@ mod tests {
             total_steps: 1,
             started_at: last_progress.to_string(),
             completed_at: None,
+            failure_reason: None,
             step_results: vec![],
             waiting_since: None,
             llm_calls_saved: 0,
@@ -836,6 +837,35 @@ mod tests {
         );
         assert_eq!(s.backend(), "sqlite");
         assert!(s.health_check());
+    }
+
+    #[test]
+    fn failed_run_reason_survives_file_backed_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("runs.db");
+
+        {
+            let store = SqliteRunStore::open(&db).unwrap();
+            store
+                .save_run(&run("failed", SopRunStatus::Running, "1"))
+                .unwrap();
+
+            let mut terminal = run("failed", SopRunStatus::Failed, "2");
+            terminal.revision = 1;
+            terminal.run.failure_reason = Some("disk quota exceeded".to_string());
+            store.finish_run("failed", &terminal).unwrap();
+        }
+
+        let reopened = SqliteRunStore::open(&db).unwrap();
+        let persisted = reopened
+            .load_run("failed")
+            .unwrap()
+            .expect("failed terminal run remains readable after reopening SQLite");
+        assert_eq!(persisted.run.status, SopRunStatus::Failed);
+        assert_eq!(
+            persisted.run.failure_reason.as_deref(),
+            Some("disk quota exceeded")
+        );
     }
 
     #[test]

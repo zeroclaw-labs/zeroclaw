@@ -44,5 +44,6 @@ wasmtime-wasi-http = { version = "47.0.3", default-features = false, features = 
 
 [dev-dependencies]
 tempfile = "3.26"
+tokio = { version = "1.50", default-features = false, features = ["io-util", "net"] }
 zeroclaw-config = { path = "../zeroclaw-config" }
 zeroclaw-spawn.workspace = true

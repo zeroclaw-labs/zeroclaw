@@ -52,6 +52,11 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "memory.embeddings",
     "tunnel.custom",
     "transcription.groq",
+    "transcription.openai",
+    "transcription.deepgram",
+    "transcription.assemblyai",
+    "transcription.google",
+    "transcription.local_whisper",
 ];
 
 const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
@@ -262,13 +267,6 @@ pub struct Config {
     #[nested]
     #[group = "Agent"]
     pub heartbeat: HeartbeatConfig,
-
-    /// ZeroCode live task tracker (`[todotracker]`), the read-only
-    /// TodoWrite visual tracker in the Code pane.
-    #[serde(default)]
-    #[nested]
-    #[group = "Operations"]
-    pub todotracker: TodoTrackerConfig,
 
     /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
     ///
@@ -6956,6 +6954,17 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
+    /// Optional shared secret for the gateway's generic `POST /webhook` and
+    /// `POST /sop/*` routes. Requests must send the exact value in
+    /// `X-Webhook-Secret`. This is intentionally separate from
+    /// `[channels.webhook.<alias>].secret`, which authenticates that channel's
+    /// own listener with an HMAC signature.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub webhook_secret: Option<String>,
+
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
     #[serde(default)]
@@ -7107,6 +7116,7 @@ impl Default for GatewayConfig {
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            webhook_secret: None,
             trust_forwarded_headers: false,
             path_prefix: None,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
@@ -8518,12 +8528,23 @@ pub struct PluginsConfig {
     /// Directory where plugins are stored
     #[serde(default = "default_plugins_dir")]
     pub plugins_dir: String,
-    /// Auto-discover and load plugins on startup
+    /// Auto-discover and load plugins on startup (default: false)
+    ///
+    /// This gates the package-bound *tool* and *skill* instances the activation
+    /// plan discovers from installed manifests. Explicit
+    /// `[channels.plugin.<alias>]` declarations are operator-named, not
+    /// discovered, so they activate without it.
     #[serde(default)]
     pub auto_discover: bool,
-    /// Maximum number of plugins that can be loaded
-    #[serde(default = "default_max_plugins")]
-    pub max_plugins: usize,
+    /// Maximum number of logical plugin instances admitted across capabilities.
+    ///
+    /// This counts admitted *instances*, not installed packages: one package
+    /// that provides both a channel binding and a tool consumes two. It
+    /// replaces the never-enforced `plugins.max_plugins` key, which counted
+    /// packages; because the units differ, an old `max_plugins` value is not
+    /// carried over. See the plugin activation docs for the migration note.
+    #[serde(default = "default_max_active_plugin_instances")]
+    pub max_active_instances: usize,
     /// Plugin signature verification security settings
     #[serde(default)]
     #[nested]
@@ -8621,8 +8642,10 @@ impl Default for PluginSecurityConfig {
 ///
 /// Bounds a single plugin call so a runaway or malicious component traps
 /// instead of hanging the host or exhausting memory. `call_fuel` caps
-/// instructions per call; the memory, table, and instance ceilings bound a
-/// store's growth. Every value is operator-tunable and validated as non-zero.
+/// instructions per call; `call_timeout_ms` caps elapsed wall-clock time,
+/// including time awaiting async host imports; the memory, table, and instance
+/// ceilings bound a store's growth. Every value is operator-tunable and
+/// validated as non-zero.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.limits"]
@@ -8639,6 +8662,9 @@ pub struct PluginLimitsConfig {
     /// Maximum component instances a plugin store may create.
     #[serde(default = "default_plugin_max_instances")]
     pub max_instances: usize,
+    /// Wall-clock deadline for one plugin export call, in milliseconds.
+    #[serde(default = "default_plugin_call_timeout_ms")]
+    pub call_timeout_ms: u64,
     /// Maximum live host-owned network connections per logical plugin instance,
     /// shared across every transport and every store belonging to it.
     ///
@@ -8664,6 +8690,10 @@ fn default_plugin_max_instances() -> usize {
     64
 }
 
+fn default_plugin_call_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_plugin_max_connections_per_instance() -> usize {
     16
 }
@@ -8675,6 +8705,7 @@ impl Default for PluginLimitsConfig {
             max_memory_mb: default_plugin_max_memory_mb(),
             max_table_elements: default_plugin_max_table_elements(),
             max_instances: default_plugin_max_instances(),
+            call_timeout_ms: default_plugin_call_timeout_ms(),
             max_connections_per_instance: default_plugin_max_connections_per_instance(),
         }
     }
@@ -8684,7 +8715,7 @@ fn default_plugins_dir() -> String {
     default_path_under_config_dir("plugins")
 }
 
-fn default_max_plugins() -> usize {
+fn default_max_active_plugin_instances() -> usize {
     50
 }
 
@@ -8694,7 +8725,7 @@ impl Default for PluginsConfig {
             enabled: false,
             plugins_dir: default_plugins_dir(),
             auto_discover: false,
-            max_plugins: default_max_plugins(),
+            max_active_instances: default_max_active_plugin_instances(),
             security: PluginSecurityConfig::default(),
             limits: PluginLimitsConfig::default(),
             entries: Vec::new(),
@@ -10053,6 +10084,33 @@ fn validate_plugin_entries(config: &PluginsConfig) -> Result<()> {
         if !seen.insert(instance_key) {
             anyhow::bail!("plugins.entries contains a duplicate instance key");
         }
+    }
+    Ok(())
+}
+
+/// Reject a `[channels.plugin.<alias>]` declaration the activation loader could
+/// never resolve to an installed package.
+///
+/// The alias uses the shared config alias grammar because it becomes the
+/// channel's registry alias (`plugin.<alias>`); the package uses the shared
+/// plugin package-name grammar so config and manifest admission agree on one
+/// spelling. Aliases are visited in sorted order so the reported failure is
+/// stable across runs regardless of map iteration order.
+fn validate_plugin_channel_instances(config: &ChannelsConfig) -> Result<()> {
+    let mut aliases: Vec<_> = config.plugin.keys().collect();
+    aliases.sort_unstable();
+    for alias in aliases {
+        crate::helpers::validate_alias_key(alias)
+            .map_err(|error| anyhow::Error::msg(format!("channels.plugin.{alias}: {error}")))?;
+        let declaration = &config.plugin[alias];
+        if declaration.package.trim() != declaration.package {
+            anyhow::bail!(
+                "channels.plugin.{alias}.package must not have leading or trailing whitespace"
+            );
+        }
+        zeroclaw_api::plugin::validate_plugin_package_name(&declaration.package).map_err(
+            |error| anyhow::Error::msg(format!("channels.plugin.{alias}.package: {error}")),
+        )?;
     }
     Ok(())
 }
@@ -13293,74 +13351,6 @@ impl Default for HeartbeatConfig {
     }
 }
 
-// ── TodoTracker ──────────────────────────────────────────────────
-
-/// Location of the ZeroCode TodoWrite tracker panel.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
-)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum TodoTrackerLocation {
-    /// Horizontal strip between the transcript and the input bar (Claude Code style).
-    Bottom,
-    /// Vertical side panel on the left.
-    Left,
-    /// Vertical side panel on the right (OpenCode style). Default.
-    #[default]
-    Right,
-}
-
-/// ZeroCode live task tracker configuration (`[todotracker]` section).
-///
-/// Read-only visual tracker driven by the model's `TodoWrite` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "todotracker"]
-pub struct TodoTrackerConfig {
-    /// Master switch. When `false` the tracker never renders and never
-    /// auto-pops. Default: `true`.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Whether the panel is visible at launch (when `enabled`). When
-    /// `false` it stays hidden until toggled or auto-popped by the first
-    /// plan. Default: `false`.
-    #[serde(default)]
-    pub enabled_at_start: bool,
-    /// Panel location: `bottom` (between transcript and input), `left`,
-    /// or `right` (default).
-    #[serde(default)]
-    pub location: TodoTrackerLocation,
-    /// Side-panel target column width (left/right). Runtime-clamped to at
-    /// most half the terminal width. Ignored for `bottom`. Default: `32`.
-    #[serde(default = "default_todotracker_width")]
-    pub width: u16,
-    /// Bottom-strip maximum height in rows (grows up to this). Ignored for
-    /// left/right. Default: `5`.
-    #[serde(default = "default_todotracker_max_height")]
-    pub max_height: u16,
-}
-
-fn default_todotracker_width() -> u16 {
-    32
-}
-
-fn default_todotracker_max_height() -> u16 {
-    5
-}
-
-impl Default for TodoTrackerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            enabled_at_start: false,
-            location: TodoTrackerLocation::Right,
-            width: default_todotracker_width(),
-            max_height: default_todotracker_max_height(),
-        }
-    }
-}
-
 // ── Cron ────────────────────────────────────────────────────────
 
 /// A declarative cron job definition (`[cron.<alias>]`).
@@ -13493,7 +13483,10 @@ pub struct DeliveryConfigDecl {
     /// Delivery mode: `"none"` or `"announce"`.
     #[serde(default = "default_delivery_mode")]
     pub mode: String,
-    /// Channel name (e.g. `"telegram"`, `"discord"`).
+    /// Channel to deliver to, as `<type>.<alias>` (e.g.
+    /// `"telegram.work"`, `"discord.ops"`). A bare type (`"telegram"`)
+    /// resolves only while that type has exactly one configured instance,
+    /// so prefer the aliased form.
     #[serde(default)]
     pub channel: Option<String>,
     /// Target/recipient identifier.
@@ -13900,6 +13893,12 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub filesystem: HashMap<String, FilesystemConfig>,
+    /// WASM channel plugin instances (`[channels.plugin.<alias>]`).
+    /// The declaration selects a package and logical binding only; operator
+    /// values remain in the instance-keyed `plugins.entries` store.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub plugin: HashMap<String, PluginChannelConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -14161,6 +14160,12 @@ impl ChannelsConfig {
                 desc: "HTTP endpoint",
                 configured: !self.webhook.is_empty(),
             },
+            ChannelInfo {
+                kind: "plugin",
+                name: "Plugin",
+                desc: "installed WASM channel plugin",
+                configured: !self.plugin.is_empty(),
+            },
         ]
     }
 
@@ -14205,6 +14210,7 @@ impl ChannelsConfig {
             || self.amqp.values().any(|c| c.enabled)
             || self.filesystem.values().any(|c| c.enabled)
             || self.git.values().any(|c| c.enabled)
+            || self.plugin.values().any(|c| c.enabled)
     }
 
     /// One `(canonical_name, configured, deliverable)` row per channel in the
@@ -14214,7 +14220,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -14251,6 +14257,7 @@ impl ChannelsConfig {
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
             ("filesystem", !self.filesystem.is_empty(), false),
+            ("plugin", !self.plugin.is_empty(), true),
         ]
     }
 
@@ -14336,6 +14343,7 @@ impl Default for ChannelsConfig {
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -14344,6 +14352,34 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+        }
+    }
+}
+
+/// Host-owned declaration of one installed channel-plugin binding.
+///
+/// This declaration is the complete operator-facing surface for a logical
+/// channel instance: it names the installed package and whether the binding may
+/// be admitted. It deliberately carries no plugin values — those stay in the
+/// instance-keyed `plugins.entries` store so one plugin's secrets are never
+/// reachable from another instance's declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.plugin"]
+pub struct PluginChannelConfig {
+    /// Canonical package name from the installed plugin manifest.
+    #[serde(default)]
+    pub package: String,
+    /// Whether this logical instance may be admitted at channel startup.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PluginChannelConfig {
+    fn default() -> Self {
+        Self {
+            package: String::new(),
+            enabled: true,
         }
     }
 }
@@ -15808,6 +15844,12 @@ pub struct WhatsAppConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub ws_url: Option<String>,
+    /// Display name announced to contacts (Web mode, optional)
+    /// Applied on connect when it differs from the name the linked device
+    /// already carries; leave unset to keep the account's own name
+    #[tab(Connection)]
+    #[serde(default)]
+    pub push_name: Option<String>,
     /// When true, only respond to messages that @-mention the bot in groups (Web mode only).
     /// Direct messages are always processed.
     /// Bot identity is resolved from the wa-rs device at runtime; `pair_phone` seeds it on first connect.
@@ -18799,7 +18841,6 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -20246,7 +20287,7 @@ impl Config {
             (true, true) => "http_request and web_fetch",
             (true, false) => "http_request",
             (false, true) => "web_fetch",
-            (false, false) => unreachable!(),
+            (false, false) => return,
         };
         warnings.push(crate::validation_warnings::ValidationWarning::new(
             "proxy_conflicts_with_dns_pinned_tools",
@@ -21756,6 +21797,7 @@ impl Config {
         }
 
         validate_plugin_entries(&self.plugins)?;
+        validate_plugin_channel_instances(&self.channels)?;
 
         // MCP
         if self.mcp.enabled {
@@ -22526,6 +22568,13 @@ impl Config {
             }
         }
 
+        if self.plugins.max_active_instances == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.max_active_instances",
+                "plugins.max_active_instances must be greater than 0; a zero ceiling rejects every logical plugin instance"
+            );
+        }
         if self.plugins.limits.call_fuel == 0 {
             validation_bail!(
                 InvalidNumericRange,
@@ -22554,6 +22603,13 @@ impl Config {
                 "plugins.limits.max_instances must be greater than 0; a zero ceiling rejects every plugin at instantiation"
             );
         }
+        if self.plugins.limits.call_timeout_ms == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.call_timeout_ms",
+                "plugins.limits.call_timeout_ms must be greater than 0; a zero deadline aborts every plugin call before it runs"
+            );
+        }
         if self.plugins.limits.max_connections_per_instance == 0 {
             validation_bail!(
                 InvalidNumericRange,
@@ -22562,31 +22618,40 @@ impl Config {
             );
         }
 
-        // The granted egress allowlist is a security control, so a
-        // malformed entry is a hard config error rather than a silently
-        // dropped line. Both lists validate against the one shared strict
-        // grammar in `zeroclaw_infra::net_guard`.
+        // The granted egress allowlist is a security control, so a malformed
+        // entry is a hard config error rather than a silently dropped line.
+        // Both lists validate against the one shared strict grammar in
+        // `zeroclaw_infra::net_guard`, including containment of the private
+        // address carveout by the host grant.
         for entry in &self.plugins.entries {
-            for (field, patterns) in [
-                ("egress_hosts", &entry.egress_hosts),
-                ("egress_allow_private", &entry.egress_allow_private),
-            ] {
-                let path = format!("plugins.entries.{}.{field}", entry.name);
-                if let Err(e) =
-                    zeroclaw_infra::net_guard::normalize_egress_patterns(patterns, &path)
-                {
-                    validation_bail!(InvalidFormat, path.clone(), "{}", e);
+            let hosts = {
+                let path = format!("plugins.entries.{}.egress_hosts", entry.name);
+                match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &entry.egress_hosts,
+                    &path,
+                ) {
+                    Ok(patterns) => patterns,
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
                 }
-            }
+            };
+            let private = {
+                let path = format!("plugins.entries.{}.egress_allow_private", entry.name);
+                match zeroclaw_infra::net_guard::normalize_egress_patterns(
+                    &entry.egress_allow_private,
+                    &path,
+                ) {
+                    Ok(patterns) => patterns,
+                    Err(e) => validation_bail!(InvalidFormat, path, "{}", e),
+                }
+            };
 
             // A carveout for a host that was never granted is almost always a
             // typo, and silently ignoring it leaves an operator believing they
             // opened a path they did not.
-            for private in &entry.egress_allow_private {
-                if !zeroclaw_infra::net_guard::egress_host_matches(
-                    private.trim_start_matches("*."),
-                    &entry.egress_hosts,
-                ) && !entry.egress_hosts.iter().any(|h| h == private)
+            for private in &private {
+                if !hosts
+                    .iter()
+                    .any(|grant| zeroclaw_infra::net_guard::egress_pattern_contains(grant, private))
                 {
                     validation_bail!(
                         InvalidFormat,
@@ -22615,6 +22680,18 @@ impl Config {
     /// produce. Returns `false` in every other case (created, already existed, or
     /// the path is not a map-keyed entry). The bool is advisory; statement-callers
     /// that do not distinguish the reserved case may ignore it.
+    ///
+    /// When it newly creates the alias, it also guarantees no phantom is left
+    /// behind: if `path` still doesn't resolve afterward (e.g. an unknown tail
+    /// field), the just-created alias is rolled back before returning, so the
+    /// caller never observes a half-materialized entry from this probe alone.
+    ///
+    /// Failures that happen *after* this returns (value coercion, a masked
+    /// secret, or a `set_prop` parse error) are the caller's to contain. The
+    /// RPC `config_set` path does so by mutating a cloned `Config` and only
+    /// committing it on full success, so a discarded attempt drops the alias
+    /// with the clone — no tracked-tuple mirror of config transaction state is
+    /// exposed to the runtime.
     ///
     /// `#[resource_key]` sections are excluded. Their keys are values drawn from
     /// another domain (model id, voice, tool name) and may themselves contain
@@ -22677,7 +22754,21 @@ impl Config {
             );
             return true;
         }
-        let _ = self.create_map_key(section, alias);
+        // Roll back on the same `Ok(true)` == "newly created" signal the CLI
+        // helper `ensure_map_key_for_prop_path` (src/main.rs) uses: never gate
+        // this on the earlier `get_map_keys` pre-check, or a bogus tail field
+        // on an already-existing alias would delete a legitimate config entry.
+        if matches!(self.create_map_key(section, alias), Ok(true))
+            && self.get_prop(path).is_err()
+            // A missing entry under a dynamic secret map is a valid first
+            // write, not an unknown schema tail. `get_prop` can only read
+            // keys that already exist, while the generated `set_prop`
+            // intentionally inserts them. The static secret classifier
+            // recognizes the map prefix without requiring the key to exist.
+            && !Self::prop_is_secret(path)
+        {
+            let _ = self.delete_map_key(section, alias);
+        }
         false
     }
 
@@ -22685,13 +22776,50 @@ impl Config {
         self.dirty_paths.clear();
     }
 
+    /// Refuse paths whose bytes identify both a complete live map key and a
+    /// field below a shorter live key. Mutation routes to the shorter key,
+    /// while whole-entry persistence must treat the exact key as canonical;
+    /// rejecting before either operation keeps memory and disk aligned.
+    fn reject_ambiguous_persistent_map_key_path(&self, name: &str) -> Result<()> {
+        let Some(section) = find_map_key_section_for_path(name) else {
+            return Ok(());
+        };
+        let remainder = &name[section.path.len() + 1..];
+        let Some(keys) = self.get_map_keys(section.path) else {
+            return Ok(());
+        };
+        if !keys.iter().any(|key| key == remainder) {
+            return Ok(());
+        }
+
+        let Some((field_key, inner_name)) = crate::helpers::route_hashmap_path(
+            name,
+            "",
+            section.path,
+            "",
+            keys.iter().map(String::as_str),
+        ) else {
+            return Ok(());
+        };
+
+        anyhow::bail!(
+            "Ambiguous config path `{name}`: it could mean the map entry `{}[{:?}]` or property `{}[{:?}].{inner_name}`. Refusing to choose; rename one of the colliding map keys",
+            section.path,
+            remainder,
+            section.path,
+            field_key,
+        )
+    }
+
     pub fn set_prop_persistent(&mut self, name: &str, value_str: &str) -> Result<()> {
+        self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_prop(name, value_str)?;
         self.mark_dirty(name);
         Ok(())
     }
 
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
+        self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_secret(name, value)?;
         self.mark_dirty(name);
         Ok(())
@@ -22915,8 +23043,78 @@ fn restore_onepassword_references_for_save(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PostReplaceSync {
+    Real,
+    #[cfg(any(test, feature = "test-helpers"))]
+    FailForTest,
+}
+
+/// Test-only fault injection: when armed for a specific config path, the
+/// next atomic write to that path simulates a post-rename directory sync
+/// failure. This lets downstream crates (e.g. the runtime's `config/set`
+/// RPC tests) drive the injected fault through the full production save
+/// path instead of calling the write helper directly. Keying by path keeps
+/// concurrently running tests from consuming each other's fault.
+/// Unreachable from production builds: the hook only exists under `test`
+/// or the `test-helpers` feature, which no production dependency enables.
+#[cfg(any(test, feature = "test-helpers"))]
+static FAIL_POST_REPLACE_SYNC_FOR_PATHS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm a one-shot post-rename sync failure for the next atomic write to
+/// `config_path`.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn arm_post_replace_sync_failure_for_test(config_path: &Path) {
+    FAIL_POST_REPLACE_SYNC_FOR_PATHS
+        .lock()
+        .unwrap()
+        .push(config_path.to_path_buf());
+}
+
+/// Whether an armed post-rename sync failure is still pending for
+/// `config_path`. Tests use this to prove the fault actually fired (the
+/// entry is consumed) rather than being bypassed by a save path that never
+/// reached the atomic writer.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn post_replace_sync_failure_armed(config_path: &Path) -> bool {
+    FAIL_POST_REPLACE_SYNC_FOR_PATHS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p == config_path)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn take_post_replace_sync_failure(config_path: &Path) -> bool {
+    let mut armed = FAIL_POST_REPLACE_SYNC_FOR_PATHS.lock().unwrap();
+    if let Some(idx) = armed.iter().position(|p| p == config_path) {
+        armed.swap_remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
 /// Atomic write shared by `save()` and `save_dirty()`.
 async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if take_post_replace_sync_failure(config_path) {
+        return write_config_atomically_with_sync(
+            config_path,
+            toml_str,
+            PostReplaceSync::FailForTest,
+        )
+        .await;
+    }
+    write_config_atomically_with_sync(config_path, toml_str, PostReplaceSync::Real).await
+}
+
+async fn write_config_atomically_with_sync(
+    config_path: &Path,
+    toml_str: &str,
+    post_replace_sync: PostReplaceSync,
+) -> Result<()> {
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -22927,6 +23125,11 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
             parent_dir.display()
         )
     })?;
+
+    // Open and sync the directory before replacement so permission, handle,
+    // and platform failures are reported while disk and live config are still
+    // unchanged. A second sync after rename establishes rename durability.
+    sync_directory(parent_dir).await?;
 
     let file_name = config_path
         .file_name()
@@ -22964,6 +23167,36 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
                 backup_path.display()
             )
         })?;
+        // The post-rename uncertainty path retains this copy as recovery
+        // material, so make that promise durable before the replacement can
+        // become visible. `copy` alone only establishes an immediately
+        // readable file; syncing both its contents and the parent directory
+        // pins the backup data and directory entry across a crash. Any failure
+        // here is still pre-commit and therefore returns with `config.toml`
+        // unchanged.
+        // The handle must carry write access: on Windows `sync_all` reaches
+        // `FlushFileBuffers`, which rejects a handle opened without
+        // `GENERIC_WRITE`. `write(true)` without `truncate`/`create_new`
+        // keeps the freshly copied bytes intact and only widens the access
+        // rights, so the fsync below is portable rather than Unix-only.
+        let backup_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backup_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to open config backup for fsync: {}",
+                    backup_path.display()
+                )
+            })?;
+        backup_file
+            .sync_all()
+            .await
+            .with_context(|| format!("Failed to fsync config backup: {}", backup_path.display()))?;
+        sync_directory(parent_dir)
+            .await
+            .context("Failed to fsync config backup directory entry before atomic replace")?;
     }
 
     if let Err(e) = fs::rename(&temp_path, config_path).await {
@@ -22993,9 +23226,34 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
         }
     }
 
-    sync_directory(parent_dir).await?;
-
-    if had_existing_config {
+    let post_replace_sync_result = match post_replace_sync {
+        PostReplaceSync::Real => sync_directory(parent_dir).await,
+        #[cfg(any(test, feature = "test-helpers"))]
+        PostReplaceSync::FailForTest => Err(anyhow::Error::msg(
+            "injected post-replace directory sync failure",
+        )),
+    };
+    if let Err(err) = post_replace_sync_result {
+        // The rename is already visible and the replacement file itself was
+        // fsynced before it moved. Returning an error here would make callers
+        // keep the old live snapshot even though disk contains the new one.
+        // Report the durability uncertainty, keep the backup for recovery,
+        // and classify the save as committed so save-then-swap callers install
+        // the matching snapshot.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "config.directory_sync_after_replace_failed",
+                    "path": config_path.display().to_string(),
+                    "backup_path": had_existing_config
+                        .then(|| backup_path.display().to_string()),
+                    "error": err.to_string(),
+                })),
+            "Config replacement committed but directory durability sync failed; keeping backup"
+        );
+    } else if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
     }
 
@@ -23449,15 +23707,19 @@ fn apply_dirty_map_key_path(
         // Same dash-aware segment resolution `apply_dirty_natural_key_path`
         // uses for its inner suffix, rooted at the matched key's own
         // serialized table so kebab inner segments (`tool-timeout-secs`)
-        // resolve to the snake struct field on disk.
+        // resolve to the snake struct field on disk. Consult the matching
+        // on-disk table too: when a dotted dynamic-map key is being deleted,
+        // it is absent from memory by definition but still needs to resolve
+        // as one opaque segment in the document.
         let key_table = mem_table
             .and_then(|t| t.get(key))
             .and_then(|v| v.as_table());
+        let doc_key_table = doc_table
+            .and_then(|t| t.get(key))
+            .and_then(|item| item.as_table_like());
         let inner_raw: Vec<&str> = inner.split('.').collect();
-        let inner_segments: Vec<String> = match key_table {
-            Some(t) => resolve_dirty_segments(t, &inner_raw),
-            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
-        };
+        let inner_segments =
+            resolve_dirty_segments_from_sources(key_table, doc_key_table, &inner_raw);
         segments.extend(inner_segments);
     }
 
@@ -23772,28 +24034,61 @@ fn prune_empty_leaves(value: &mut toml::Value) {
 }
 
 fn resolve_dirty_segments(root: &toml::Table, raw: &[&str]) -> Vec<String> {
+    resolve_dirty_segments_from_sources(Some(root), None, raw)
+}
+
+/// Resolve a dotted dirty-path suffix against the canonical serialized
+/// in-memory table and, when supplied, its on-disk counterpart.
+///
+/// Struct fields consume one segment (with the existing kebab-to-snake
+/// fallback). Map keys are different: the serialized table owns their exact
+/// spelling, and a key may itself contain dots. Longest-match the remaining
+/// suffix against keys present in either source so `X-Foo.bar` remains one
+/// segment for both writes (present in memory) and deletes (present only on
+/// disk). No parallel key registry is introduced; both views are derived from
+/// the two states `save_dirty` is already reconciling.
+fn resolve_dirty_segments_from_sources(
+    mut memory_table: Option<&toml::Table>,
+    mut document_table: Option<&dyn toml_edit::TableLike>,
+    raw: &[&str],
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(raw.len());
-    let mut current: Option<&toml::Value> = None;
-    for seg in raw {
-        let table_opt: Option<&toml::Table> = if out.is_empty() {
-            Some(root)
-        } else {
-            current.and_then(|v| v.as_table())
-        };
-        let resolved = match table_opt {
-            Some(t) if t.contains_key(*seg) => (*seg).to_string(),
-            Some(t) => {
-                let snake = seg.replace('-', "_");
-                if t.contains_key(&snake) {
+    let mut index = 0;
+    while index < raw.len() {
+        // Prefer the longest exact key from the remaining suffix. This is
+        // load-bearing for opaque HashMap keys containing dots; an ordinary
+        // struct table has no such key, so it naturally falls through to the
+        // one-segment field lookup below.
+        let exact = (index + 1..=raw.len()).rev().find_map(|end| {
+            let candidate = raw[index..end].join(".");
+            let exists_in_memory = memory_table.is_some_and(|t| t.contains_key(&candidate));
+            let exists_on_disk = document_table.is_some_and(|t| t.contains_key(&candidate));
+            (exists_in_memory || exists_on_disk).then_some((candidate, end - index))
+        });
+
+        let (resolved, consumed) = exact.unwrap_or_else(|| {
+            let segment = raw[index];
+            let snake = segment.replace('-', "_");
+            let snake_exists = memory_table.is_some_and(|t| t.contains_key(&snake))
+                || document_table.is_some_and(|t| t.contains_key(&snake));
+            (
+                if snake_exists {
                     snake
                 } else {
-                    (*seg).to_string()
-                }
-            }
-            None => (*seg).to_string(),
-        };
-        current = table_opt.and_then(|t| t.get(&resolved));
+                    segment.to_string()
+                },
+                1,
+            )
+        });
+
+        memory_table = memory_table
+            .and_then(|t| t.get(&resolved))
+            .and_then(|v| v.as_table());
+        document_table = document_table
+            .and_then(|t| t.get(&resolved))
+            .and_then(|item| item.as_table_like());
         out.push(resolved);
+        index += consumed;
     }
     out
 }
@@ -24432,31 +24727,6 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn todotracker_config_defaults() {
-        let cfg = super::TodoTrackerConfig::default();
-        assert!(cfg.enabled);
-        assert!(!cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Right);
-        assert_eq!(cfg.width, 32);
-        assert_eq!(cfg.max_height, 5);
-    }
-
-    #[::core::prelude::v1::test]
-    fn todotracker_config_parses_from_toml() {
-        let toml = r#"
-enabled = true
-enabled_at_start = true
-location = "bottom"
-width = 40
-max_height = 8
-"#;
-        let cfg: super::TodoTrackerConfig = toml::from_str(toml).unwrap();
-        assert!(cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Bottom);
-        assert_eq!(cfg.width, 40);
-        assert_eq!(cfg.max_height, 8);
-    }
-
     /// The whole point of splitting the accessor: an operator-facing caller
     /// must be able to tell "unconfigured" from a real 32,000, which a bare
     /// `usize` cannot express.
@@ -25949,6 +26219,19 @@ enabled = true
     }
 
     #[test]
+    async fn validate_accepts_canonical_equivalent_ipv6_and_wildcard_carveouts() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["[::1]", "*.example.com"],
+            &["[::1]", "*.sub.example.com"],
+        ));
+
+        config
+            .validate()
+            .expect("equivalent IPv6 and narrower wildcard grants must validate");
+    }
+
+    #[test]
     async fn validate_rejects_an_allow_all_egress_entry() {
         let mut config = Config::default();
         config
@@ -26001,6 +26284,21 @@ enabled = true
             text.contains("egress_allow_private"),
             "error must name the offending path; got: {text}"
         );
+        assert!(text.contains("not granted by egress_hosts"), "got: {text}");
+    }
+
+    #[test]
+    async fn validate_rejects_a_wildcard_carveout_for_an_exact_apex_grant() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["example.com"],
+            &["*.example.com"],
+        ));
+        let err = config
+            .validate()
+            .expect_err("a wildcard carveout must not widen an exact grant");
+        let text = err.to_string();
+        assert!(text.contains("egress_allow_private"), "got: {text}");
         assert!(text.contains("not granted by egress_hosts"), "got: {text}");
     }
 
@@ -26086,6 +26384,32 @@ enabled = true
             .expect_err("zero call_fuel must be rejected");
         assert!(
             err.to_string().contains("plugins.limits.call_fuel"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
+    async fn plugin_call_timeout_defaults_and_deserializes_compatibly() {
+        assert_eq!(PluginLimitsConfig::default().call_timeout_ms, 30_000);
+
+        let limits: PluginLimitsConfig =
+            toml::from_str("call_fuel = 42").expect("legacy limits deserialize");
+        assert_eq!(limits.call_fuel, 42);
+        assert_eq!(
+            limits.call_timeout_ms, 30_000,
+            "omitting the additive field keeps the host-safe default"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_call_timeout() {
+        let mut config = Config::default();
+        config.plugins.limits.call_timeout_ms = 0;
+        let err = config
+            .validate()
+            .expect_err("zero call_timeout_ms must be rejected");
+        assert!(
+            err.to_string().contains("plugins.limits.call_timeout_ms"),
             "error must name the offending path; got: {err}"
         );
     }
@@ -27398,7 +27722,6 @@ auto_save = true
                 to: Some("123456".into()),
                 ..HeartbeatConfig::default()
             },
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
@@ -27456,6 +27779,7 @@ auto_save = true
                 mqtt: HashMap::new(),
                 amqp: HashMap::new(),
                 filesystem: HashMap::new(),
+                plugin: HashMap::new(),
                 message_timeout_secs: 300,
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
@@ -28202,6 +28526,90 @@ default_temperature = 0.7
     }
 
     #[tokio::test]
+    async fn post_replace_sync_failure_keeps_disk_commit_and_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_post_replace_sync_failure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+
+        let result = write_config_atomically_with_sync(
+            &config_path,
+            "schema_version = 2\n",
+            PostReplaceSync::FailForTest,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a post-replace sync fault must report a committed save: {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "the successful rename is the canonical on-disk result"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup_path).await.unwrap(),
+            "schema_version = 1\n",
+            "durability uncertainty must retain the pre-replace backup"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn save_over_existing_config_syncs_backup_on_every_platform() {
+        // The backup fsync runs on the ordinary save-over-existing-config
+        // path, so the handle it uses must be valid at runtime, not merely
+        // compile. Opening the `.bak` copy read-only builds everywhere but
+        // fails under Windows `FlushFileBuffers`, which requires write
+        // access. Executing the real path here turns that into a test
+        // failure wherever the suite runs instead of a review-only catch.
+        // The companion fault-injection test asserts the retained backup
+        // still holds the pre-replace bytes, which is what proves the
+        // widened access rights do not truncate the recovery copy.
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_save_over_existing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+
+        let result = write_config_atomically_with_sync(
+            &config_path,
+            "schema_version = 2\n",
+            PostReplaceSync::Real,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "saving over an existing config must not fail while syncing the backup: {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "the replacement must be visible after a committed save"
+        );
+        assert!(
+            !backup_path.exists(),
+            "a fully durable save consumes the backup rather than leaving it behind"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn config_save_prunes_unchanged_default_blocks() {
         // Fresh-init config without any operator edits should write a
         // tiny config.toml — only `schema_version` and any operator-
@@ -28333,7 +28741,6 @@ default_temperature = 0.7
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -28548,6 +28955,7 @@ default_temperature = 0.7
                 ..Default::default()
             },
         );
+        config.gateway.webhook_secret = Some("gateway-ingress-credential".into());
 
         // MCP server: HTTP headers map carries an Authorization Bearer
         // token; the new `#[secret]` on `HashMap<String, String>` must
@@ -28585,6 +28993,7 @@ default_temperature = 0.7
             "Bearer otel-credential",
             "Bearer upload-credential",
             "Bearer http-request-credential",
+            "gateway-ingress-credential",
             "mcp-env-credential",
             "Bearer mcp-cred",
             "tenant-42",
@@ -28772,6 +29181,14 @@ default_temperature = 0.7
         assert_eq!(
             store.decrypt(webhook_secret).unwrap(),
             "webhook-shared-secret"
+        );
+        let gateway_webhook_secret = stored.gateway.webhook_secret.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(
+            gateway_webhook_secret
+        ));
+        assert_eq!(
+            store.decrypt(gateway_webhook_secret).unwrap(),
+            "gateway-ingress-credential"
         );
 
         // MCP server headers — every value must be encrypted; the keys
@@ -29273,6 +29690,7 @@ allowed_users = ["@u:matrix.org"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -29534,6 +29952,7 @@ bot_token = "xoxb-tok"
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29569,6 +29988,7 @@ bot_token = "xoxb-tok"
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29601,6 +30021,30 @@ bot_token = "xoxb-tok"
         let parsed: WhatsAppConfig =
             serde_json::from_str(r#"{"passive_group_context":true}"#).unwrap();
         assert!(parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn whatsapp_config_push_name_absent_stays_none_and_round_trips_non_ascii() {
+        let parsed: WhatsAppConfig = serde_json::from_str("{}").unwrap();
+        assert!(parsed.push_name.is_none());
+
+        let name = "סוכן – שירות";
+        let wc = WhatsAppConfig {
+            push_name: Some(name.into()),
+            ..Default::default()
+        };
+        let parsed: WhatsAppConfig = toml::from_str(&toml::to_string(&wc).unwrap()).unwrap();
+        assert_eq!(parsed.push_name.as_deref(), Some(name));
+    }
+
+    #[test]
+    async fn whatsapp_config_push_name_is_not_a_web_selector() {
+        let wc = WhatsAppConfig {
+            push_name: Some("ZeroClawAgent".into()),
+            ..Default::default()
+        };
+        assert!(!wc.has_web_selector());
+        assert_eq!(wc.backend_type(), "cloud");
     }
 
     #[test]
@@ -29640,6 +30084,7 @@ allowed_numbers = ["+1", "+2"]
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29672,6 +30117,7 @@ allowed_numbers = ["+1", "+2"]
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29751,6 +30197,7 @@ allowed_numbers = ["+1", "+2"]
                     pair_phone: None,
                     pair_code: None,
                     ws_url: None,
+                    push_name: None,
                     mention_only: false,
                     passive_group_context: false,
                     interrupt_on_new_message: false,
@@ -29794,6 +30241,7 @@ allowed_numbers = ["+1", "+2"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -29882,6 +30330,7 @@ allowed_numbers = ["+1", "+2"]
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
+            webhook_secret: None,
             trust_forwarded_headers: true,
             path_prefix: Some("/zeroclaw".into()),
             rate_limit_max_keys: 2048,
@@ -31756,6 +32205,32 @@ api_token = "tok"
     }
 
     #[test]
+    async fn proxy_config_accepts_transcription_service_selectors() {
+        let mut proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            scope: ProxyScope::Services,
+            ..ProxyConfig::default()
+        };
+
+        for selector in [
+            "transcription.groq",
+            "transcription.openai",
+            "transcription.deepgram",
+            "transcription.assemblyai",
+            "transcription.google",
+            "transcription.local_whisper",
+            "transcription.*",
+        ] {
+            proxy.services = vec![selector.to_string()];
+            assert!(
+                proxy.validate().is_ok(),
+                "exact transcription selector `{selector}` should validate"
+            );
+        }
+    }
+
+    #[test]
     async fn collect_warnings_surfaces_dns_pinned_proxy_conflicts() {
         let proxy_url = Some("http://proxy.example:3128".to_string());
 
@@ -32642,6 +33117,67 @@ group_policy = "disabled"
         );
     }
 
+    #[test]
+    async fn set_prop_persistent_rejects_ambiguous_dotted_map_key_path_before_mutation() {
+        let mut config = Config::default();
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1.input_per_mtok".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(2.0),
+                ..Default::default()
+            },
+        );
+
+        let path = "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok";
+        let err = config
+            .set_prop_persistent(path, "9.9")
+            .expect_err("colliding whole-key and field interpretations must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\"gpt-4.1.input_per_mtok\"]"),
+            "error must name the whole-entry interpretation: {message}"
+        );
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\"gpt-4.1\"].input_per_mtok"),
+            "error must name the field interpretation: {message}"
+        );
+        assert_eq!(
+            config
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(1.0),
+            "rejection must happen before the shorter key's field is mutated"
+        );
+        assert_eq!(
+            config
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1.input_per_mtok")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(2.0),
+            "rejection must not mutate the exact-key entry"
+        );
+        assert!(
+            !config.dirty_paths.contains(path),
+            "a rejected path must not be recorded as persistable"
+        );
+    }
+
     /// Control for `save_dirty_persists_dotted_map_key_field`: a dot-free
     /// resource key must keep working through the same map-key-section
     /// branch (it's no longer special-cased out — every `HashMap<String,
@@ -32895,6 +33431,121 @@ group_policy = "disabled"
         assert!(
             msg.contains("cost.rates.providers.models.openai.ghost-model.input_per_mtok"),
             "error must name the offending dirty path; got: {msg}"
+        );
+    }
+
+    /// A dynamic secret map (`#[secret] HashMap<String, String>`, e.g.
+    /// `extra_headers`) treats its whole non-empty suffix as ONE opaque
+    /// key — `set_prop` stores the literal `"X-Foo.bar"`. The dirty
+    /// writer must not re-split that key at dots into `X-Foo` → `bar`,
+    /// or `write_or_delete_leaf` finds nothing, takes the delete branch,
+    /// and `save_dirty` returns `Ok(())` having written nothing: the
+    /// operator sees success and the value is gone at next reload.
+    #[test]
+    async fn save_dirty_writes_dotted_dynamic_secret_map_key_as_one_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [providers.models.openai.fresh]\n\
+             model = \"gpt-4o\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .create_map_key("providers.models.openai", "fresh")
+            .expect("seed the alias");
+
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo.bar";
+        config
+            .set_prop_persistent(path, "header-value")
+            .expect("a dotted dynamic secret-map key must be insertable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .map(String::as_str),
+            Some("header-value"),
+            "precondition: set_prop stores ONE literal HashMap key"
+        );
+
+        config.save_dirty().await.expect("save_dirty must succeed");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written)
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .map(String::as_str),
+            Some("header-value"),
+            "a dotted dynamic secret-map key must round-trip through disk as the \
+             literal key `set_prop` stored, not be split at dots and dropped; got:\n{written}"
+        );
+    }
+
+    /// Unset half of the same contract: clearing a dotted dynamic
+    /// secret-map key must remove the literal on-disk entry rather than
+    /// hunting for a nested `bar` table that never existed.
+    #[test]
+    async fn save_dirty_removes_dotted_dynamic_secret_map_key_as_one_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [providers.models.openai.fresh]\n\
+             model = \"gpt-4o\"\n\n\
+             [providers.models.openai.fresh.extra_headers]\n\
+             \"X-Foo.bar\" = \"header-value\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config: Config = toml::from_str(&seed).unwrap();
+        config.config_path = config_path.clone();
+        config.secrets.encrypt = false;
+        assert!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .is_some_and(|p| p.base.extra_headers.contains_key("X-Foo.bar")),
+            "precondition: seeded dotted header key must load"
+        );
+
+        config
+            .providers
+            .models
+            .openai
+            .get_mut("fresh")
+            .unwrap()
+            .base
+            .extra_headers
+            .remove("X-Foo.bar");
+        config.mark_dirty("providers.models.openai.fresh.extra_headers.X-Foo.bar");
+        config.save_dirty().await.expect("save_dirty must succeed");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("X-Foo.bar"),
+            "unsetting a dotted dynamic secret-map key must delete the literal \
+             on-disk entry; got:\n{written}"
         );
     }
 
@@ -36882,6 +37533,70 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     }
 
     #[test]
+    async fn ensure_map_key_for_path_rolls_back_alias_when_tail_field_unknown() {
+        let mut config = Config::default();
+        let path = "providers.models.anthropic.default.not_a_real_field";
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "precondition: alias must not exist yet"
+        );
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "the just-created alias must be rolled back when the tail field can't resolve"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_keeps_preexisting_alias_on_unknown_tail_field() {
+        let mut config = Config::default();
+        config
+            .create_map_key("providers.models.anthropic", "default")
+            .expect("seed a pre-existing alias");
+
+        let refused =
+            config.ensure_map_key_for_path("providers.models.anthropic.default.not_a_real_field");
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| keys.iter().any(|k| k == "default")),
+            "a pre-existing alias must never be deleted for a typo'd tail field"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_preserves_first_dynamic_secret_map_write() {
+        let mut config = Config::default();
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo";
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        config
+            .set_prop(path, "bar")
+            .expect("a new dynamic secret-map key must be insertable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Foo"))
+                .map(String::as_str),
+            Some("bar")
+        );
+    }
+
+    #[test]
     async fn create_map_key_rejects_unknown_section() {
         let mut config = Config::default();
         let err = config
@@ -38819,6 +39534,164 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
+    }
+
+    #[test]
+    async fn plugin_channel_instance_uses_ordinary_agent_channel_reference() {
+        let mut config = multi_agent_test_config();
+        config.channels.plugin.insert(
+            "operations".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+        config.agents.get_mut("alpha").unwrap().channels =
+            vec![crate::providers::ChannelRef::new("plugin.operations")];
+
+        config
+            .validate()
+            .expect("plugin channel aliases use the shared dotted reference validator");
+        assert_eq!(config.agent_for_channel("plugin.operations"), Some("alpha"));
+    }
+
+    #[test]
+    async fn plugin_channel_instances_allow_two_aliases_for_one_package() {
+        let mut config = multi_agent_test_config();
+        for alias in ["primary", "backup"] {
+            config.channels.plugin.insert(
+                alias.to_string(),
+                PluginChannelConfig {
+                    package: "acme.chat".to_string(),
+                    enabled: true,
+                },
+            );
+        }
+
+        config
+            .validate()
+            .expect("one package may back isolated logical instances");
+        assert!(config.channels.has_any_enabled());
+    }
+
+    #[test]
+    async fn plugin_channel_instance_rejects_invalid_alias_or_package() {
+        let mut config = multi_agent_test_config();
+        config.channels.plugin.insert(
+            "bad-alias".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+        let error = config
+            .validate()
+            .expect_err("plugin aliases use canonical config-key grammar");
+        assert!(
+            error.to_string().contains("channels.plugin.bad-alias"),
+            "{error}"
+        );
+
+        config.channels.plugin.clear();
+        config.channels.plugin.insert(
+            "primary".to_string(),
+            PluginChannelConfig {
+                package: "Acme Chat".to_string(),
+                enabled: true,
+            },
+        );
+        let error = config
+            .validate()
+            .expect_err("plugin packages use canonical manifest grammar");
+        assert!(
+            error
+                .to_string()
+                .contains("channels.plugin.primary.package"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    async fn plugin_channel_instance_rejects_an_empty_package() {
+        let mut config = multi_agent_test_config();
+        config
+            .channels
+            .plugin
+            .insert("primary".to_string(), PluginChannelConfig::default());
+
+        let error = config
+            .validate()
+            .expect_err("a declaration with no package can never resolve to an installed plugin");
+        assert!(
+            error
+                .to_string()
+                .contains("channels.plugin.primary.package"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    async fn disabled_plugin_channel_instance_does_not_start_the_supervisor() {
+        let mut channels = ChannelsConfig {
+            cli: false,
+            ..ChannelsConfig::default()
+        };
+        channels.plugin.insert(
+            "paused".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: false,
+            },
+        );
+
+        assert!(!channels.has_any_enabled());
+    }
+
+    #[test]
+    async fn plugin_channel_is_a_known_configured_and_deliverable_channel() {
+        let mut channels = ChannelsConfig::default();
+        assert!(
+            !channels
+                .channel_presence()
+                .iter()
+                .any(|(name, configured, _)| *name == "plugin" && *configured)
+        );
+
+        channels.plugin.insert(
+            "operations".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+
+        let row = channels
+            .channel_presence()
+            .into_iter()
+            .find(|(name, _, _)| *name == "plugin")
+            .expect("plugin must appear in the canonical channel registry");
+        assert_eq!(row, ("plugin", true, true));
+        assert!(
+            channels
+                .channels()
+                .iter()
+                .any(|info| info.kind == "plugin" && info.configured)
+        );
+        assert!(crate::schema::v2::V3_CHANNEL_TYPES.contains(&"plugin"));
+    }
+
+    #[test]
+    async fn zero_active_plugin_instance_ceiling_is_rejected() {
+        let mut config = multi_agent_test_config();
+        config.plugins.max_active_instances = 0;
+
+        let error = config
+            .validate()
+            .expect_err("a zero ceiling admits nothing and is always an operator mistake");
+        assert!(
+            error.to_string().contains("plugins.max_active_instances"),
+            "{error}"
+        );
     }
 
     #[test]

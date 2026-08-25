@@ -3,11 +3,14 @@ use reqwest::Client;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use zeroclaw_api::media::{
+    PROVIDER_IMAGE_MIME_TYPES, image_mime_from_extension, image_mime_from_magic,
+    is_provider_image_mime,
+};
 use zeroclaw_api::model_provider::ChatMessage;
 use zeroclaw_config::schema::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
-const ALLOWED_IMAGE_MIME_TYPES: &[&str] = &["image/png", "image/jpeg", "image/webp", "image/gif"];
 
 /// Per-path cache for resolved local image data URIs. Keyed by absolute
 /// path; stores `(len, mtime)` for freshness checks (`(0, 0)` sentinel
@@ -123,7 +126,7 @@ pub(crate) enum ImageDataUriRejection {
     NotADataUri,
     /// A `data:` URI whose header does not declare `;base64`.
     NotBase64Encoded,
-    /// Media type outside [`ALLOWED_IMAGE_MIME_TYPES`].
+    /// Media type outside [`PROVIDER_IMAGE_MIME_TYPES`].
     UnsupportedMediaType,
     /// Payload is empty or is not canonical padded base64.
     MalformedBase64,
@@ -189,7 +192,7 @@ pub(crate) fn split_base64_image_data_uri(
     }
 
     let media_type = header.split(';').next().unwrap_or_default().trim();
-    if !ALLOWED_IMAGE_MIME_TYPES
+    if !PROVIDER_IMAGE_MIME_TYPES
         .iter()
         .any(|allowed| allowed.eq_ignore_ascii_case(media_type))
     {
@@ -448,7 +451,7 @@ pub fn strip_media_markers(text: &str) -> String {
             r"(?i)\[(?:{}):[^\]]*\]",
             MEDIA_MARKER_KINDS.join("|")
         ))
-        .unwrap()
+        .expect("static media-marker regex must compile")
     });
     RE.replace_all(text, "[media attachment]").into_owned()
 }
@@ -460,7 +463,7 @@ static AUDIO_MARKER_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock:
         r"(?i)\[(?:{}):([^\]]*)\]",
         AUDIO_MARKER_KINDS.join("|")
     ))
-    .unwrap()
+    .expect("static audio-marker regex must compile")
 });
 
 /// Replace audio markers (`[AUDIO:...]`, `[VOICE:...]`) whose payload is a
@@ -1396,7 +1399,7 @@ fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::R
 }
 
 fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
-    if ALLOWED_IMAGE_MIME_TYPES.contains(&mime) {
+    if is_provider_image_mime(mime) {
         return Ok(());
     }
 
@@ -1418,52 +1421,17 @@ fn detect_mime(
 
     if let Some(path) = path
         && let Some(ext) = path.extension().and_then(|value| value.to_str())
-        && let Some(mime) = mime_from_extension(ext)
+        && let Some(mime) = image_mime_from_extension(ext)
     {
         return Some(mime.to_string());
     }
 
-    mime_from_magic(bytes).map(ToString::to_string)
+    image_mime_from_magic(bytes).map(ToString::to_string)
 }
 
 fn normalize_content_type(content_type: &str) -> Option<String> {
     let mime = content_type.split(';').next()?.trim().to_ascii_lowercase();
     if mime.is_empty() { None } else { Some(mime) }
-}
-
-fn mime_from_extension(ext: &str) -> Option<&'static str> {
-    match ext.to_ascii_lowercase().as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "webp" => Some("image/webp"),
-        "gif" => Some("image/gif"),
-        "bmp" => Some("image/bmp"),
-        _ => None,
-    }
-}
-
-fn mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
-        return Some("image/png");
-    }
-
-    if bytes.len() >= 3 && bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        return Some("image/jpeg");
-    }
-
-    if bytes.len() >= 6 && (bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
-        return Some("image/gif");
-    }
-
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
-
-    if bytes.len() >= 2 && bytes.starts_with(b"BM") {
-        return Some("image/bmp");
-    }
-
-    None
 }
 
 #[cfg(test)]
@@ -1504,7 +1472,7 @@ mod tests {
 
     #[test]
     fn split_data_uri_accepts_every_allowlisted_media_type() {
-        for mime in ALLOWED_IMAGE_MIME_TYPES {
+        for mime in PROVIDER_IMAGE_MIME_TYPES {
             let uri = format!("data:{mime};base64,{CANONICAL_PNG_B64}");
             let (media_type, _) = split_base64_image_data_uri(&uri, TEN_MB)
                 .unwrap_or_else(|reason| panic!("{mime} rejected: {reason}"));

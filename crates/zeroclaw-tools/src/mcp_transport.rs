@@ -2607,7 +2607,18 @@ mod tests {
         let error = HttpTransport::new(&config)
             .err()
             .expect("a directory must not be read as a CA bundle");
-        assert!(error.to_string().contains("must name a regular file"));
+        // The directory is refused by whichever layer sees it first. POSIX
+        // opens it and rejects the classified handle; Windows cannot open a
+        // directory as a file at all (`OpenOptions::open` needs
+        // `FILE_FLAG_BACKUP_SEMANTICS`, which the loader deliberately does not
+        // pass), so the refusal surfaces as the read failure instead. Either
+        // way the directory never reaches the PEM parser.
+        let message = error.to_string();
+        assert!(
+            message.contains("must name a regular file")
+                || message.contains("cannot read TLS CA certificate"),
+            "a directory CA path must be refused, got: {message}"
+        );
     }
 
     #[cfg(unix)]

@@ -80,12 +80,14 @@ impl ActionTracker {
         state.committed.len()
     }
 
+    #[cfg(test)]
     fn used(&self) -> usize {
+        self.used_at(Instant::now())
+    }
+
+    fn used_at(&self, now: Instant) -> usize {
         let mut state = self.state.lock();
-        retain_actions_after(
-            &mut state.committed,
-            Instant::now().checked_sub(ACTION_WINDOW),
-        );
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
         state.committed.len() + state.in_flight
     }
 
@@ -261,8 +263,12 @@ impl PerSenderTracker {
     }
 
     pub fn is_exhausted(&self, key: &str, max: u32) -> bool {
+        self.is_exhausted_at(key, max, Instant::now())
+    }
+
+    fn is_exhausted_at(&self, key: &str, max: u32, now: Instant) -> bool {
         let mut buckets = self.buckets.lock();
-        let used = buckets.get(key).map_or(0, ActionTracker::used);
+        let used = buckets.get(key).map_or(0, |tracker| tracker.used_at(now));
         if used == 0 {
             buckets.remove(key);
         }
@@ -1022,8 +1028,9 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                         current.push(ch);
                         // Detect `<<` (heredoc) but not `<<<` (here-string).
                         if chars.peek() == Some(&'<') {
-                            let second = chars.next().unwrap();
-                            current.push(second);
+                            if let Some(second) = chars.next() {
+                                current.push(second);
+                            }
                             if chars.peek() != Some(&'<') {
                                 reading_heredoc_word = true;
                             }
@@ -1171,7 +1178,7 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
             r"\d*>[ ]?/dev/({})(\s|[;&|)]|$)",
             safe_device_redirect_names_pattern()
         ))
-        .unwrap()
+        .expect("static safe-device redirect regex must compile")
     });
 
     let safe = re.replace_all(command, "$2").to_string();
@@ -5889,16 +5896,16 @@ mod tests {
     fn expired_success_is_evicted_when_budget_is_read() {
         let tracker = PerSenderTracker::new();
         assert!(tracker.record_within("expired-sender", 1));
-        {
+        let after_window = {
             let buckets = tracker.buckets.lock();
             let action_tracker = buckets.get("expired-sender").expect("sender bucket");
-            let mut state = action_tracker.state.lock();
-            state.committed[0] = Instant::now()
-                .checked_sub(ACTION_WINDOW + Duration::from_secs(1))
-                .expect("test timestamp");
-        }
+            let state = action_tracker.state.lock();
+            state.committed[0]
+                .checked_add(ACTION_WINDOW + Duration::from_secs(1))
+                .expect("test timestamp")
+        };
 
-        assert!(!tracker.is_exhausted("expired-sender", 1));
+        assert!(!tracker.is_exhausted_at("expired-sender", 1, after_window));
         assert!(!tracker.buckets.lock().contains_key("expired-sender"));
     }
 
