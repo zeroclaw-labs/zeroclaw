@@ -957,7 +957,22 @@ fn source_identity_matches_inner(
                 || actual_uri.starts_with("https://api.stepfun.com/")
                 || actual_uri.starts_with("https://api.stepfun.ai/");
             if is_variant_uri && family == "stepfun" {
-                return false;
+                // The reference itself may be `stepfun-intl`, whose normalized
+                // identity carries the same variant URI as an extra. In that
+                // case the early URI check must not reject before the
+                // expected-extra equality below is evaluated — only a genuinely
+                // bare `stepfun` reference should fail closed against an
+                // intl-only producer.
+                let expects_this_uri = expected_extras.iter().any(|(field, expected)| {
+                    *field == "uri"
+                        && expected.as_str().is_some_and(|s| {
+                            s == actual_uri
+                                || s.trim_end_matches('/') == actual_uri.trim_end_matches('/')
+                        })
+                });
+                if !expects_this_uri {
+                    return false;
+                }
             }
             // Otherwise, allow bare reference to match URI-bearing alias
             // (e.g. custom:https://... or llamacpp with user-provided URI).

@@ -2385,6 +2385,47 @@ vision_model_provider = "stepfun"
     }
 
     #[test]
+    fn v2_stepfun_intl_reference_rewrites_to_its_own_alias() {
+        // `stepfun-intl` normalizes to `stepfun.default` with the intl URI.
+        // A bare `stepfun-intl` reference whose variant identity matches the
+        // sole producer must rewrite to the dotted alias so the migrated
+        // credential and URI reach the alias-aware vision factory, while a
+        // bare `stepfun` reference stays fail-closed (see the companion
+        // negative test above).
+        let raw = r#"
+schema_version = 2
+
+[providers.models.stepfun-intl]
+api_key = "test-key"
+model = "vision-model"
+
+[multimodal]
+vision_model_provider = "stepfun-intl"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("stepfun.default"),
+            "stepfun-intl reference must rewrite to stepfun.default when it is the sole producer"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("stepfun", "default")
+            .expect("stepfun-intl must materialize at stepfun.default");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://api.stepfun.com/intl/v1"),
+            "the variant alias must retain its intl uri"
+        );
+        assert_eq!(
+            alias.api_key.as_deref(),
+            Some("test-key"),
+            "the migrated alias must retain the credential"
+        );
+    }
+
+    #[test]
     fn v2_bare_family_with_oauth_variant_stays_fail_closed() {
         // `openai-codex` adds `wire_api = responses` + `requires_openai_auth`;
         // a bare `openai` reference must not accept that variant producer.
