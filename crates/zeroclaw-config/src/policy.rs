@@ -26,8 +26,15 @@ pub enum ToolOperation {
 /// Sliding-window action tracker for rate limiting.
 #[derive(Debug)]
 pub struct ActionTracker {
-    /// Timestamps of recent actions (kept within the last hour).
-    actions: Mutex<Vec<Instant>>,
+    state: Mutex<ActionTrackerState>,
+}
+
+#[derive(Debug)]
+struct ActionTrackerState {
+    /// Timestamps of successful actions (kept within the last hour).
+    committed: Vec<Instant>,
+    /// Calls admitted by a wrapper but not yet completed.
+    in_flight: usize,
 }
 
 const ACTION_WINDOW: Duration = Duration::from_secs(3600);
@@ -47,32 +54,110 @@ impl Default for ActionTracker {
 impl ActionTracker {
     pub fn new() -> Self {
         Self {
-            actions: Mutex::new(Vec::new()),
+            state: Mutex::new(ActionTrackerState {
+                committed: Vec::new(),
+                in_flight: 0,
+            }),
         }
     }
 
     /// Record an action and return the current count within the window.
     pub fn record(&self) -> usize {
-        let mut actions = self.actions.lock();
+        let mut state = self.state.lock();
         let now = Instant::now();
-        retain_actions_after(&mut actions, now.checked_sub(ACTION_WINDOW));
-        actions.push(now);
-        actions.len()
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
+        state.committed.push(now);
+        state.committed.len()
     }
 
     /// Count of actions in the current window without recording.
     pub fn count(&self) -> usize {
-        let mut actions = self.actions.lock();
-        retain_actions_after(&mut actions, Instant::now().checked_sub(ACTION_WINDOW));
-        actions.len()
+        let mut state = self.state.lock();
+        retain_actions_after(
+            &mut state.committed,
+            Instant::now().checked_sub(ACTION_WINDOW),
+        );
+        state.committed.len()
+    }
+
+    #[cfg(test)]
+    fn used(&self) -> usize {
+        self.used_at(Instant::now())
+    }
+
+    fn used_at(&self, now: Instant) -> usize {
+        let mut state = self.state.lock();
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
+        state.committed.len() + state.in_flight
+    }
+
+    fn try_record(&self, max: u32) -> bool {
+        if max == 0 {
+            return false;
+        }
+
+        let mut state = self.state.lock();
+        let now = Instant::now();
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
+        if state.committed.len() + state.in_flight >= max as usize {
+            return false;
+        }
+        state.committed.push(now);
+        true
+    }
+
+    fn reserve(&self, max: u32) -> bool {
+        if max == 0 {
+            return false;
+        }
+
+        let mut state = self.state.lock();
+        retain_actions_after(
+            &mut state.committed,
+            Instant::now().checked_sub(ACTION_WINDOW),
+        );
+        if state.committed.len() + state.in_flight >= max as usize {
+            return false;
+        }
+        state.in_flight += 1;
+        true
+    }
+
+    fn commit(&self) -> bool {
+        let mut state = self.state.lock();
+        if state.in_flight == 0 {
+            return false;
+        }
+        state.in_flight -= 1;
+        let now = Instant::now();
+        retain_actions_after(&mut state.committed, now.checked_sub(ACTION_WINDOW));
+        state.committed.push(now);
+        true
+    }
+
+    fn release(&self) -> (bool, bool) {
+        let mut state = self.state.lock();
+        if state.in_flight == 0 {
+            return (false, false);
+        }
+        state.in_flight -= 1;
+        retain_actions_after(
+            &mut state.committed,
+            Instant::now().checked_sub(ACTION_WINDOW),
+        );
+        let is_empty = state.committed.is_empty() && state.in_flight == 0;
+        (true, is_empty)
     }
 }
 
 impl Clone for ActionTracker {
     fn clone(&self) -> Self {
-        let actions = self.actions.lock();
+        let state = self.state.lock();
         Self {
-            actions: Mutex::new(actions.clone()),
+            state: Mutex::new(ActionTrackerState {
+                committed: state.committed.clone(),
+                in_flight: 0,
+            }),
         }
     }
 }
@@ -111,13 +196,64 @@ impl PerSenderTracker {
         self.record_within(&key, max)
     }
 
-    /// Record one action for `key`. Allows the action when count == max (≤ max);
-    /// blocks and returns false when count > max.
+    /// Record one action for `key` when a slot remains.
+    /// Rejected attempts are not recorded.
     pub fn record_within(&self, key: &str, max: u32) -> bool {
+        if max == 0 {
+            return false;
+        }
         let mut buckets = self.buckets.lock();
         let tracker = buckets.entry(key.to_string()).or_default();
-        let count = tracker.record();
-        count <= max as usize
+        tracker.try_record(max)
+    }
+
+    /// Atomically reserve one action slot for the current sender.
+    pub fn reserve_for_current(&self, max: u32) -> Option<ActionReservation> {
+        let key = Self::current_key();
+        self.reserve_within(key, max)
+    }
+
+    fn reserve_within(&self, key: String, max: u32) -> Option<ActionReservation> {
+        if max == 0 {
+            return None;
+        }
+        {
+            let mut buckets = self.buckets.lock();
+            let admitted = match buckets.get(&key) {
+                Some(tracker) => tracker.reserve(max),
+                None => {
+                    let tracker = ActionTracker::new();
+                    let admitted = tracker.reserve(max);
+                    buckets.insert(key.clone(), tracker);
+                    admitted
+                }
+            };
+            if !admitted {
+                return None;
+            }
+        }
+        Some(ActionReservation {
+            tracker: self.clone(),
+            key,
+            finished: false,
+        })
+    }
+
+    fn commit_reservation(&self, key: &str) -> bool {
+        let buckets = self.buckets.lock();
+        buckets.get(key).is_some_and(ActionTracker::commit)
+    }
+
+    fn release_reservation(&self, key: &str) -> bool {
+        let mut buckets = self.buckets.lock();
+        let Some(tracker) = buckets.get(key) else {
+            return false;
+        };
+        let (released, remove_bucket) = tracker.release();
+        if remove_bucket {
+            buckets.remove(key);
+        }
+        released
     }
 
     /// Check if the current sender is at or over the limit (without recording).
@@ -127,13 +263,42 @@ impl PerSenderTracker {
     }
 
     pub fn is_exhausted(&self, key: &str, max: u32) -> bool {
-        if max == 0 {
-            return true;
-        }
+        self.is_exhausted_at(key, max, Instant::now())
+    }
+
+    fn is_exhausted_at(&self, key: &str, max: u32, now: Instant) -> bool {
         let mut buckets = self.buckets.lock();
-        match buckets.get_mut(key) {
-            Some(tracker) => tracker.count() >= max as usize,
-            None => false,
+        let used = buckets.get(key).map_or(0, |tracker| tracker.used_at(now));
+        if used == 0 {
+            buckets.remove(key);
+        }
+        max == 0 || used >= max as usize
+    }
+}
+
+/// One sender-scoped in-flight action slot.
+///
+/// Dropping an uncommitted reservation releases only this invocation's slot.
+#[must_use = "dropping the reservation releases the action slot"]
+pub struct ActionReservation {
+    tracker: PerSenderTracker,
+    key: String,
+    finished: bool,
+}
+
+impl ActionReservation {
+    /// Convert this in-flight slot into one committed action.
+    pub fn commit(mut self) {
+        let committed = self.tracker.commit_reservation(&self.key);
+        assert!(committed, "owned action reservation must still exist");
+        self.finished = true;
+    }
+}
+
+impl Drop for ActionReservation {
+    fn drop(&mut self) {
+        if !self.finished {
+            let _ = self.tracker.release_reservation(&self.key);
         }
     }
 }
@@ -863,8 +1028,9 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                         current.push(ch);
                         // Detect `<<` (heredoc) but not `<<<` (here-string).
                         if chars.peek() == Some(&'<') {
-                            let second = chars.next().unwrap();
-                            current.push(second);
+                            if let Some(second) = chars.next() {
+                                current.push(second);
+                            }
                             if chars.peek() != Some(&'<') {
                                 reading_heredoc_word = true;
                             }
@@ -1012,7 +1178,7 @@ fn contains_unsafe_output_redirect_for_shell(command: &str, dialect: ShellDialec
             r"\d*>[ ]?/dev/({})(\s|[;&|)]|$)",
             safe_device_redirect_names_pattern()
         ))
-        .unwrap()
+        .expect("static safe-device redirect regex must compile")
     });
 
     let safe = re.replace_all(command, "$2").to_string();
@@ -3020,10 +3186,8 @@ impl SecurityPolicy {
     // no side effects. Act operations must pass both the autonomy gate
     // (not read-only) and the sliding-window rate limiter.
 
-    /// Enforce policy for a tool operation.
-    /// Read operations are always allowed by autonomy/rate gates.
-    /// Act operations require non-readonly autonomy and available action budget.
-    pub fn enforce_tool_operation(
+    /// Check whether autonomy permits a tool operation without recording it.
+    pub fn authorize_tool_operation(
         &self,
         operation: ToolOperation,
         operation_name: &str,
@@ -3036,14 +3200,27 @@ impl SecurityPolicy {
                         "Security policy: read-only mode, cannot perform '{operation_name}'"
                     ));
                 }
-
-                if !self.record_action() {
-                    return Err("Rate limit exceeded: action budget exhausted".to_string());
-                }
-
                 Ok(())
             }
         }
+    }
+
+    /// Enforce policy and record an action for callers without a rate-limit wrapper.
+    pub fn enforce_tool_operation(
+        &self,
+        operation: ToolOperation,
+        operation_name: &str,
+    ) -> Result<(), String> {
+        self.authorize_tool_operation(operation, operation_name)?;
+        if operation == ToolOperation::Act && !self.record_action() {
+            return Err("Rate limit exceeded: action budget exhausted".to_string());
+        }
+        Ok(())
+    }
+
+    /// Atomically reserve one action slot for a production-wrapped invocation.
+    pub fn reserve_action(&self) -> Option<ActionReservation> {
+        self.tracker.reserve_for_current(self.max_actions_per_hour)
     }
 
     /// Record an action for the current sender and check if rate-limited.
@@ -3866,6 +4043,25 @@ mod tests {
             .enforce_tool_operation(ToolOperation::Act, "memory_store")
             .unwrap_err();
         assert!(err.contains("Rate limit exceeded"));
+    }
+
+    #[test]
+    fn authorize_tool_operation_does_not_consume_rate_budget() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 1,
+            ..default_policy()
+        };
+
+        assert!(
+            p.authorize_tool_operation(ToolOperation::Act, "coding_agent")
+                .is_ok()
+        );
+        assert!(
+            p.authorize_tool_operation(ToolOperation::Act, "coding_agent")
+                .is_ok()
+        );
+        assert!(p.record_action(), "authorization must leave the slot free");
+        assert!(!p.record_action(), "the committed action must consume it");
     }
 
     // ── is_command_allowed ───────────────────────────────────
@@ -4742,6 +4938,16 @@ mod tests {
         assert_eq!(cloned.count(), 2); // clone is independent
     }
 
+    #[test]
+    fn action_tracker_clone_does_not_copy_in_flight_usage() {
+        let tracker = ActionTracker::new();
+        assert!(tracker.reserve(1));
+
+        let cloned = tracker.clone();
+
+        assert_eq!(cloned.used(), 0);
+    }
+
     // ── Edge cases: command injection ────────────────────────
 
     #[test]
@@ -5609,6 +5815,98 @@ mod tests {
             ..SecurityPolicy::default()
         };
         assert!(!p.record_action());
+        assert!(p.reserve_action().is_none());
+    }
+
+    #[test]
+    fn action_reservation_drop_releases_exact_slot() {
+        let p = SecurityPolicy {
+            max_actions_per_hour: 2,
+            ..SecurityPolicy::default()
+        };
+
+        let first = p.reserve_action().expect("first reservation");
+        let second = p.reserve_action().expect("second reservation");
+        assert!(p.reserve_action().is_none(), "both slots are reserved");
+
+        drop(first);
+        let replacement = p.reserve_action().expect("only first slot was released");
+        second.commit();
+        assert!(
+            p.reserve_action().is_none(),
+            "second reservation committed while replacement remains in flight"
+        );
+
+        drop(replacement);
+        let final_slot = p.reserve_action().expect("replacement slot was released");
+        final_slot.commit();
+        assert!(p.reserve_action().is_none(), "both slots are now committed");
+    }
+
+    #[test]
+    fn action_reservations_are_isolated_by_sender() {
+        let tracker = PerSenderTracker::new();
+        let sender_a = tracker
+            .reserve_within("sender-a".to_string(), 1)
+            .expect("sender A reservation");
+
+        assert!(
+            tracker.reserve_within("sender-a".to_string(), 1).is_none(),
+            "sender A has no second slot"
+        );
+        let sender_b = tracker
+            .reserve_within("sender-b".to_string(), 1)
+            .expect("sender B has an independent slot");
+
+        sender_a.commit();
+        drop(sender_b);
+        assert!(
+            tracker.reserve_within("sender-b".to_string(), 1).is_some(),
+            "releasing sender B is independent from sender A's commit"
+        );
+    }
+
+    #[test]
+    fn released_reservation_removes_empty_sender_bucket() {
+        let tracker = PerSenderTracker::new();
+        let reservation = tracker
+            .reserve_within("ephemeral-sender".to_string(), 1)
+            .expect("reservation");
+        assert!(tracker.buckets.lock().contains_key("ephemeral-sender"));
+
+        drop(reservation);
+
+        assert!(!tracker.buckets.lock().contains_key("ephemeral-sender"));
+    }
+
+    #[test]
+    fn zero_budget_does_not_create_sender_bucket() {
+        let tracker = PerSenderTracker::new();
+
+        assert!(!tracker.record_within("zero-budget", 0));
+        assert!(
+            tracker
+                .reserve_within("zero-budget".to_string(), 0)
+                .is_none()
+        );
+        assert!(tracker.buckets.lock().is_empty());
+    }
+
+    #[test]
+    fn expired_success_is_evicted_when_budget_is_read() {
+        let tracker = PerSenderTracker::new();
+        assert!(tracker.record_within("expired-sender", 1));
+        let after_window = {
+            let buckets = tracker.buckets.lock();
+            let action_tracker = buckets.get("expired-sender").expect("sender bucket");
+            let state = action_tracker.state.lock();
+            state.committed[0]
+                .checked_add(ACTION_WINDOW + Duration::from_secs(1))
+                .expect("test timestamp")
+        };
+
+        assert!(!tracker.is_exhausted_at("expired-sender", 1, after_window));
+        assert!(!tracker.buckets.lock().contains_key("expired-sender"));
     }
 
     #[test]
@@ -7373,14 +7671,14 @@ mod tests {
     #[test]
     fn per_sender_tracker_isolates_counts() {
         let t = PerSenderTracker::new();
-        // sender A hits limit=2 on 3rd call
-        assert!(t.record_within("chat_a", 2)); // count=1 ≤ 2 → ok
-        assert!(t.record_within("chat_a", 2)); // count=2 ≤ 2 → ok
-        assert!(!t.record_within("chat_a", 2)); // count=3 > 2 → blocked
+        // sender A rejects its third call without recording it
+        assert!(t.record_within("chat_a", 2)); // count=1
+        assert!(t.record_within("chat_a", 2)); // count=2
+        assert!(!t.record_within("chat_a", 2)); // remains count=2
         // sender B is unaffected — its bucket is empty
-        assert!(t.record_within("chat_b", 2)); // count=1 ≤ 2 → ok
-        assert!(t.record_within("chat_b", 2)); // count=2 ≤ 2 → ok
-        assert!(!t.record_within("chat_b", 2)); // count=3 > 2 → blocked
+        assert!(t.record_within("chat_b", 2)); // count=1
+        assert!(t.record_within("chat_b", 2)); // count=2
+        assert!(!t.record_within("chat_b", 2)); // remains count=2
     }
 
     #[test]

@@ -109,7 +109,7 @@ impl Tool for CronUpdateTool {
                         },
                         "command": {
                             "type": "string",
-                            "description": "New shell command (for shell jobs)"
+                            "description": "New shell command for shell jobs, or agent prompt for agent jobs"
                         },
                         "prompt": {
                             "type": "string",
@@ -186,8 +186,8 @@ impl Tool for CronUpdateTool {
                                 },
                                 "channel": {
                                     "type": "string",
-                                    "enum": cron::CRON_DELIVERY_SCHEMA_CHANNELS,
-                                    "description": "Channel type to deliver output to"
+                                    "pattern": cron::cron_delivery_channel_pattern(),
+                                    "description": "Channel to deliver output to. Use '<type>.<alias>' (e.g. 'telegram.work'); a bare type resolves only while that type has one configured instance. Supported types: telegram, discord, slack, mattermost, matrix, qq, whatsapp, webhook, lark, feishu, dingtalk, wechat, signal, email. Unlike cron_add, this patch is never filled in from the current conversation."
                                 },
                                 "to": {
                                     "type": "string",
@@ -627,6 +627,11 @@ mod tests {
                 "patch schema missing field: {field}"
             );
         }
+        assert_eq!(
+            patch_props["command"]["description"].as_str(),
+            Some("New shell command for shell jobs, or agent prompt for agent jobs"),
+            "command description must document the agent-job compatibility mapping"
+        );
 
         // patch.schedule is a oneOf with exactly 3 variants: cron, at, every
         let one_of = schema["properties"]["patch"]["properties"]["schedule"]["oneOf"]
@@ -707,17 +712,28 @@ mod tests {
             "at description should require explicit Z or offset: {at_description}"
         );
 
-        // patch.delivery.channel enum covers all supported channels
-        let channel_enum = schema["properties"]["patch"]["properties"]["delivery"]["properties"]
-            ["channel"]["enum"]
-            .as_array()
-            .expect("patch.delivery.channel must have an enum");
-        let channel_strs: Vec<&str> = channel_enum.iter().filter_map(|v| v.as_str()).collect();
-        assert_eq!(channel_strs.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
-        assert!(channel_strs.contains(&"dingtalk"));
-        assert!(channel_strs.contains(&"wechat"));
-        assert!(channel_strs.contains(&"signal"));
-        assert!(channel_strs.contains(&"email"));
+        // patch.delivery.channel admits every supported type AND the composite key.
+        // cron_update is the case that needs the alias form: this patch is never
+        // filled in from the conversation, so a composite key is the only
+        // unambiguous way to name one instance in a multi-instance setup.
+        let pattern = schema["properties"]["patch"]["properties"]["delivery"]["properties"]
+            ["channel"]["pattern"]
+            .as_str()
+            .expect("patch.delivery.channel must declare a pattern")
+            .to_string();
+        let channel = regex::Regex::new(&pattern).expect("channel pattern must compile");
+        for supported in cron::CRON_DELIVERY_SCHEMA_CHANNELS {
+            assert!(channel.is_match(supported), "{supported} must be valid");
+        }
+        assert!(channel.is_match("dingtalk"));
+        assert!(channel.is_match("wechat"));
+        assert!(channel.is_match("signal"));
+        assert!(channel.is_match("email"));
+        assert!(
+            channel.is_match("telegram.work"),
+            "cron_update must accept the aliased form its description recommends"
+        );
+        assert!(!channel.is_match("sms"));
 
         // patch.delivery exposes thread_id so the webhook channel can route callbacks
         // back to the originating conversation.
@@ -751,25 +767,24 @@ mod tests {
         let add_schema = add_tool.parameters_schema();
         let update_schema = update_tool.parameters_schema();
 
-        let add_channels: Vec<&str> = add_schema["properties"]["delivery"]["properties"]["channel"]
-            ["enum"]
-            .as_array()
-            .expect("cron_add delivery.channel must have an enum")
-            .iter()
-            .filter_map(|value| value.as_str())
-            .collect();
-        let update_channels: Vec<&str> =
+        let add_pattern = add_schema["properties"]["delivery"]["properties"]["channel"]["pattern"]
+            .as_str()
+            .expect("cron_add delivery.channel must declare a pattern");
+        let update_pattern =
             update_schema["properties"]["patch"]["properties"]["delivery"]["properties"]["channel"]
-                ["enum"]
-                .as_array()
-                .expect("cron_update patch.delivery.channel must have an enum")
-                .iter()
-                .filter_map(|value| value.as_str())
-                .collect();
+                ["pattern"]
+                .as_str()
+                .expect("cron_update patch.delivery.channel must declare a pattern");
 
-        assert_eq!(add_channels, update_channels);
-        assert_eq!(add_channels.as_slice(), cron::CRON_DELIVERY_SCHEMA_CHANNELS);
-        assert!(add_channels.contains(&"dingtalk"));
+        // Both tools must describe the same channel surface, or a value the model
+        // learns from one becomes invalid in the other.
+        assert_eq!(add_pattern, update_pattern);
+        let channel = regex::Regex::new(update_pattern).expect("channel pattern must compile");
+        for supported in cron::CRON_DELIVERY_SCHEMA_CHANNELS {
+            assert!(channel.is_match(supported), "{supported} must be valid");
+        }
+        assert!(channel.is_match("telegram.work"));
+        assert!(channel.is_match("dingtalk"));
     }
 
     #[tokio::test]
@@ -850,6 +865,56 @@ mod tests {
             cron::get_job(&cfg, &job.id).unwrap().allowed_tools,
             None,
             "empty allowed_tools patch should clear to None"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_patch_on_agent_job_updates_prompt_without_shell_policy() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        let risk_profile = config.risk_profiles.entry(TEST_AGENT.into()).or_default();
+        risk_profile.level = AutonomyLevel::Supervised;
+        risk_profile.allowed_commands = vec!["echo".into()];
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let cfg = Arc::new(config);
+        let job = cron::add_agent_job(
+            &cfg,
+            TEST_AGENT,
+            None,
+            crate::cron::Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "old prompt",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+        let tool = CronUpdateTool::new(cfg.clone(), test_security(&cfg), TEST_AGENT);
+
+        let result = tool
+            .execute(json!({
+                "job_id": job.id,
+                "patch": { "command": "curl https://example.com" }
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        let updated = cron::get_job(&cfg, &job.id).unwrap();
+        assert_eq!(updated.prompt.as_deref(), Some("curl https://example.com"));
+        assert_eq!(
+            updated.command, "",
+            "agent jobs must not persist patch.command on the unused command column"
         );
     }
 

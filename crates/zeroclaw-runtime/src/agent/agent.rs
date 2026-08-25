@@ -1,6 +1,6 @@
 use crate::agent::dispatcher::{NativeToolDispatcher, ToolDispatcher, XmlToolDispatcher};
 use crate::agent::eval::AutoClassifyExt;
-use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::agent::prompt::{PromptContext, SystemPromptBuilder, append_timestamp_orientation};
 use crate::approval::ApprovalManager;
 use crate::observability::{self, Observer, ObserverEvent};
 use crate::platform;
@@ -76,7 +76,7 @@ pub fn build_session_model_provider(
         &model_provider_runtime_options,
     )?;
 
-    Ok((model_provider, model_provider_name, model_name))
+    Ok((model_provider, model_provider_ref.to_string(), model_name))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -85,11 +85,17 @@ pub fn build_session_model_provider(
 pub fn tool_dispatcher_for_provider(
     agent_cfg: &zeroclaw_config::schema::AliasedAgentConfig,
     model_provider: &dyn ModelProvider,
+    model: &str,
 ) -> Box<dyn ToolDispatcher> {
     match agent_cfg.resolved.tool_dispatcher.as_str() {
         "native" => Box::new(NativeToolDispatcher),
         "xml" => Box::new(XmlToolDispatcher),
-        _ if model_provider.supports_native_tools() => Box::new(NativeToolDispatcher),
+        _ if model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling =>
+        {
+            Box::new(NativeToolDispatcher)
+        }
         _ => Box::new(XmlToolDispatcher),
     }
 }
@@ -357,6 +363,10 @@ pub struct Agent {
     security_summary: Option<String>,
     /// Autonomy level from config; controls safety prompt instructions.
     autonomy_level: crate::security::AutonomyLevel,
+    /// The shell this agent's runtime adapter will spawn, so the system
+    /// prompt reports the dialect the agent actually executes under.
+    /// `None` for a shell-less runtime.
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     /// Cross-channel HITL: resolved from the active risk profile's
     /// `approval_route`. When set, the per-turn approval bridge asks the named
     /// approver channel (bounded + fail-closed) instead of the originating
@@ -391,6 +401,20 @@ pub struct Agent {
     channel_name: String,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    /// The `DelegateTool` this Agent's registry registered, in its concrete
+    /// type. Test-only: `tools` erases it behind `dyn Tool`, so a regression
+    /// otherwise cannot drive the *constructed* delegate's nested-registry
+    /// build and can only re-derive the wiring by hand - which is precisely
+    /// what must not be trusted for live-config threading. `None` when the
+    /// agent has no configured delegation targets.
+    ///
+    /// `allow(dead_code)`: its only reader is the delegated live-config
+    /// regression, which additionally needs `plugins-wasm-cranelift` to have a
+    /// plugin tool to execute at all. Under a narrower test feature set the
+    /// field is written and never read.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Drop for Agent {
@@ -509,6 +533,7 @@ pub struct AgentBuilder {
     response_cache: Option<Arc<zeroclaw_memory::response_cache::ResponseCache>>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
     approval_route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     mcp_pinned_section: Option<String>,
@@ -521,6 +546,8 @@ pub struct AgentBuilder {
     provider_switch_config: Option<ProviderSwitchConfig>,
     #[cfg(test)]
     turn_datetime: Option<Arc<dyn Fn() -> chrono::DateTime<chrono::Local> + Send + Sync>>,
+    #[cfg(test)]
+    delegate_tool: Option<Arc<crate::tools::DelegateTool>>,
 }
 
 impl Default for AgentBuilder {
@@ -559,6 +586,7 @@ impl AgentBuilder {
             response_cache: None,
             security_summary: None,
             autonomy_level: None,
+            shell_profile: None,
             approval_route: None,
             activated_tools: None,
             mcp_pinned_section: None,
@@ -571,6 +599,8 @@ impl AgentBuilder {
             provider_switch_config: None,
             #[cfg(test)]
             turn_datetime: None,
+            #[cfg(test)]
+            delegate_tool: None,
         }
     }
 
@@ -738,6 +768,19 @@ impl AgentBuilder {
         self
     }
 
+    /// Set the shell reported in the system prompt.
+    ///
+    /// Pass `RuntimeAdapter::shell_profile()` from the same adapter the
+    /// agent's tools were built with, so the prompt cannot name a shell other
+    /// than the one that will execute. Unset means no shell is reported.
+    pub fn shell_profile(
+        mut self,
+        profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
+    ) -> Self {
+        self.shell_profile = profile;
+        self
+    }
+
     pub fn approval_route(
         mut self,
         route: Option<zeroclaw_config::autonomy::ApprovalRoute>,
@@ -782,6 +825,14 @@ impl AgentBuilder {
 
     pub fn channel_name(mut self, name: String) -> Self {
         self.channel_name = Some(name);
+        self
+    }
+
+    /// Retain the concrete `DelegateTool` the registry built, for regressions
+    /// that must drive the *constructed* delegate rather than a hand-rolled one.
+    #[cfg(test)]
+    fn delegate_tool(mut self, delegate_tool: Option<Arc<crate::tools::DelegateTool>>) -> Self {
+        self.delegate_tool = delegate_tool;
         self
     }
 
@@ -923,6 +974,7 @@ impl AgentBuilder {
             autonomy_level: self
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
+            shell_profile: self.shell_profile,
             activated_tools: self.activated_tools,
             mcp_pinned_section: self.mcp_pinned_section.unwrap_or_default(),
             mcp_deferred_section: self.mcp_deferred_section.unwrap_or_default(),
@@ -935,6 +987,8 @@ impl AgentBuilder {
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(test)]
             turn_datetime: self.turn_datetime,
+            #[cfg(test)]
+            delegate_tool: self.delegate_tool,
         })
     }
 }
@@ -974,6 +1028,21 @@ impl Agent {
         }
 
         chrono::Local::now()
+    }
+
+    /// Prefixes a user message with the current date/time in the labeled
+    /// shape both embedded Agent turn paths store in history, including the
+    /// streamed path used by RPC and ACP. Other runtime owners format their
+    /// own user-message envelopes independently.
+    fn enrich_user_message(&self, user_message: &str) -> String {
+        let now = self.current_turn_datetime();
+        let (year, month, day) = (now.year(), now.month(), now.day());
+        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
+        let tz = now.format("%Z");
+        let date_str =
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
+
+        format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
     }
 
     pub fn set_channel_name(&mut self, name: String) {
@@ -1142,8 +1211,7 @@ impl Agent {
             });
         }
 
-        let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = format!("[{now}] {user_message}");
+        let enriched = self.enrich_user_message(user_message);
 
         let user_msg = ConversationMessage::Chat(ChatMessage::user(enriched));
         new_msgs.push(user_msg.clone());
@@ -1540,13 +1608,14 @@ impl Agent {
             None
         };
 
-        // SOP loading is gated on `[sop] sops_dir`: unset disables all SOP
-        // runtime behavior, matching the documented rollback path.
+        // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset (or
+        // empty) by default, so SOP runtime behavior is off until an operator
+        // opts in by setting a directory.
         // If caller provided an engine (daemon path), use it; otherwise
         // build our own (CLI/standalone path) only when the gate is set.
         let (sop_engine, sop_audit) = match (sop_engine, sop_audit) {
             (Some(engine), Some(audit)) => (Some(engine), Some(audit)),
-            (None, None) if config.sop.sops_dir.is_some() => {
+            (None, None) if config.sop.runtime_enabled() => {
                 let mem: Arc<dyn zeroclaw_memory::Memory> =
                     zeroclaw_memory::create_memory_for_agent(config, agent_alias, None).await?;
                 // CLI / standalone path: no channel map is wired here, so the route
@@ -1555,6 +1624,7 @@ impl Agent {
                 let (engine, audit) = crate::sop::build_sop_engine(
                     config.sop.clone(),
                     &config.data_dir,
+                    &config.install_root_dir(),
                     mem,
                     Default::default(),
                 );
@@ -1584,12 +1654,25 @@ impl Agent {
             tui_env,
             sop_engine,
             sop_audit,
-            None,
+            // Daemon-backed constructors supply the shared handle; tools that
+            // resolve config per call (plugin tools, `send_via` authority) must
+            // follow reloads rather than this call's `config` snapshot. `None`
+            // here would silently pin them to startup state for the Agent's
+            // whole lifetime. One-shot callers pass `None` and keep the
+            // documented snapshot fallback.
+            live_config.clone(),
         );
         // Skills are loaded here and handed to `assemble`, which owns skill
         // registration and resolves builtin/MCP elevation against the pre-filter
         // arcs internally. Bundle-aware via `[agents.<alias>].skill_bundles`.
         let skills = crate::skills::load_skills_for_agent_from_config(config, agent_alias);
+        // Captured before `assemble` consumes the result: the concrete delegate
+        // instance this registry built, so live-config regressions can drive its
+        // nested-registry construction instead of re-deriving the wiring.
+        #[cfg(test)]
+        let built_delegate_tool = all_tools_result.delegate_tool.clone();
+        // Capture before `runtime` is moved into `ScopedAssembly`.
+        let shell_profile = runtime.shell_profile();
         let assembled = crate::tools::scoped::ScopedToolRegistry::assemble(
             crate::tools::scoped::ScopedAssembly {
                 config,
@@ -1668,7 +1751,8 @@ impl Agent {
                 &provider_runtime_options,
             )?;
 
-        let tool_dispatcher = tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref());
+        let tool_dispatcher =
+            tool_dispatcher_for_provider(agent_cfg, model_provider.as_ref(), &model_name);
 
         let route_model_by_hint: HashMap<String, String> = config
             .model_routes
@@ -1709,7 +1793,10 @@ impl Agent {
                 Arc::new(move || max)
             };
 
-        let mut agent = Agent::builder()
+        let builder = Agent::builder();
+        #[cfg(test)]
+        let builder = builder.delegate_tool(built_delegate_tool);
+        let mut agent = builder
             .model_provider(model_provider)
             .tools(tools)
             .memory(memory.clone())
@@ -1723,6 +1810,7 @@ impl Agent {
                 ),
             )
             .prompt_builder(SystemPromptBuilder::with_defaults())
+            .shell_profile(shell_profile)
             .config(
                 config
                     .resolved_agent_config(agent_alias)
@@ -1732,7 +1820,7 @@ impl Agent {
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
-            .model_provider_name(provider_name.to_string())
+            .model_provider_name(provider_ref.clone())
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
@@ -1893,6 +1981,22 @@ impl Agent {
         fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
         event_tx: &tokio::sync::mpsc::Sender<TurnEvent>,
     ) -> String {
+        let with_notice = Self::format_model_fallback_notice(response.clone(), fallback);
+        if with_notice == response {
+            return response;
+        }
+        let Some(delta) = with_notice.strip_prefix(&response) else {
+            return response;
+        };
+        let delta = delta.to_string();
+        let _ = event_tx.send(TurnEvent::Chunk { delta }).await;
+        with_notice
+    }
+
+    fn format_model_fallback_notice(
+        response: String,
+        fallback: Option<&zeroclaw_providers::reliable::ProviderFallbackInfo>,
+    ) -> String {
         let Some(fallback) = fallback else {
             return response;
         };
@@ -1912,21 +2016,22 @@ impl Agent {
                 ("actual_provider", fallback.actual_provider.as_str()),
             ],
         );
-        let delta = format!("\n\n{notice}");
-        let _ = event_tx
-            .send(TurnEvent::Chunk {
-                delta: delta.clone(),
-            })
-            .await;
         if response.is_empty() {
             notice
         } else {
-            format!("{response}{delta}")
+            format!("{response}\n\n{notice}")
         }
     }
 
     fn build_system_prompt(&self) -> Result<String> {
         self.build_system_prompt_with_dispatcher(self.tool_dispatcher.as_ref())
+    }
+
+    fn tool_protocol_prompts(&self) -> Result<Arc<crate::agent::turn::ToolProtocolPrompts>> {
+        Ok(Arc::new(crate::agent::turn::ToolProtocolPrompts::new(
+            self.build_system_prompt_with_dispatcher(&NativeToolDispatcher)?,
+            self.build_system_prompt_with_dispatcher(&XmlToolDispatcher)?,
+        )))
     }
 
     fn build_system_prompt_with_dispatcher(
@@ -1955,8 +2060,10 @@ impl Agent {
                 && !prompt_tools.is_empty(),
             security_summary: self.security_summary.clone(),
             autonomy_level: self.autonomy_level,
+            shell_profile: self.shell_profile.clone(),
         };
         let mut prompt = self.prompt_builder.build(&ctx)?;
+        append_timestamp_orientation(&mut prompt);
         let receipts = &self.config.resolved.tool_receipts;
         if receipts.enabled && receipts.inject_system_prompt {
             prompt.push_str(crate::agent::tool_receipts::SYSTEM_PROMPT_ADDENDUM);
@@ -1991,7 +2098,11 @@ impl Agent {
         &mut self,
         loop_history: &mut [ChatMessage],
     ) -> Result<()> {
-        let dispatcher = tool_dispatcher_for_provider(&self.config, self.model_provider.as_ref());
+        let dispatcher = tool_dispatcher_for_provider(
+            &self.config,
+            self.model_provider.as_ref(),
+            &self.model_name,
+        );
         self.rebuild_system_prompt_for_dispatcher(dispatcher.as_ref())?;
 
         let Some(ConversationMessage::Chat(persisted)) = self.history.first() else {
@@ -2302,14 +2413,7 @@ impl Agent {
             });
         }
 
-        let now = self.current_turn_datetime();
-        let (year, month, day) = (now.year(), now.month(), now.day());
-        let (hour, minute, second) = (now.hour(), now.minute(), now.second());
-        let tz = now.format("%Z");
-        let date_str =
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
-
-        let enriched = format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}");
+        let enriched = self.enrich_user_message(user_message);
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
@@ -2331,17 +2435,25 @@ impl Agent {
                         return Err(error);
                     }
                 };
-            let active_provider: &dyn ModelProvider = vision_provider_box
-                .as_ref()
-                .map(|resolved| resolved.provider.as_ref())
-                .unwrap_or(self.model_provider.as_ref());
-            tool_dispatcher_for_provider(&self.config, active_provider)
+            let (active_provider, active_model): (&dyn ModelProvider, &str) =
+                vision_provider_box.as_ref().map_or(
+                    (self.model_provider.as_ref(), effective_model.as_str()),
+                    |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
+                );
+            tool_dispatcher_for_provider(&self.config, active_provider, active_model)
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
             let _ = self.trim_history(Some(&turn_id));
             return Err(error);
         }
+        let tool_protocol_prompts = match self.tool_protocol_prompts() {
+            Ok(prompts) => prompts,
+            Err(error) => {
+                let _ = self.trim_history(Some(&turn_id));
+                return Err(error);
+            }
+        };
 
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
@@ -2373,11 +2485,11 @@ impl Agent {
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
         let mut loop_new_messages: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
-
         let knobs = crate::agent::loop_::LoopKnobs {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::ErrorAtCap,
             detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
         // E3 never had pattern-based loop detection; default pacing turns it
         // on. Keep the embedder contract (an N-step identical-args tool chain
@@ -2479,22 +2591,25 @@ impl Agent {
             ),
         );
         // Context-window recovery can change the provider-visible transcript
-        // without changing provider/model identity. Capture the resilient
-        // wrapper's recovery record only when this turn could write a cache
-        // entry. Boxing mirrors the streamed path and keeps the extra scoped
-        // future off the worker stack in debug builds.
-        let (loop_result, turn_provider_recovery) = if cache_key.is_some() {
+        // without changing provider/model identity. Capture that fact
+        // independently from final-response fallback attribution. Box before
+        // entering either task-local scope: boxing inside a nested async block
+        // still captures the large turn-loop future on the worker stack.
+        let turn_loop = Box::pin(turn_loop);
+        let (loop_result, turn_provider_recovery, turn_provider_context_truncated) =
             zeroclaw_providers::reliable::scope_provider_fallback(async {
-                let result = Box::pin(turn_loop).await;
+                let result = crate::agent::turn::scope_tool_protocol_prompts(
+                    Arc::clone(&tool_protocol_prompts),
+                    turn_loop,
+                )
+                .await;
                 (
                     result,
                     zeroclaw_providers::reliable::take_last_provider_fallback(),
+                    zeroclaw_providers::reliable::take_last_provider_context_truncation(),
                 )
             })
-            .await
-        } else {
-            (turn_loop.await, None)
-        };
+            .await;
 
         // Feed the accumulated per-call usage into the AgentEnd guard before
         // any return below drops it — including the error path, which must
@@ -2524,12 +2639,15 @@ impl Agent {
         };
 
         let response = self.append_receipts_block(response, receipt_scope.as_ref());
+        let response =
+            Self::format_model_fallback_notice(response, turn_provider_recovery.as_ref());
 
         // Store in the response cache only when the turn was a single
         // tool-free exchange (exactly one assistant message), mirroring the
         // old "no tool calls" put condition.
         if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
             && turn_provider_recovery.is_none()
+            && !turn_provider_context_truncated
             && loop_new_messages.len() == 2
             && loop_new_messages
                 .last()
@@ -2633,8 +2751,8 @@ impl Agent {
         // task-local record inside `zeroclaw_providers::reliable`, consumed
         // once per round below; this is a per-turn transient resolved at
         // use-time, never stored on the agent.
-        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo> =
-            None;
+        let mut turn_provider_recovery: Option<zeroclaw_providers::reliable::ProviderFallbackInfo>;
+        let mut turn_provider_context_truncated = false;
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
@@ -2669,11 +2787,12 @@ impl Agent {
                         });
                     }
                 };
-            let active_provider: &dyn ModelProvider = vision_provider_box
-                .as_ref()
-                .map(|resolved| resolved.provider.as_ref())
-                .unwrap_or(self.model_provider.as_ref());
-            tool_dispatcher_for_provider(&self.config, active_provider)
+            let (active_provider, active_model): (&dyn ModelProvider, &str) =
+                vision_provider_box.as_ref().map_or(
+                    (self.model_provider.as_ref(), effective_model.as_str()),
+                    |resolved| (resolved.provider.as_ref(), resolved.model.as_str()),
+                );
+            tool_dispatcher_for_provider(&self.config, active_provider, active_model)
         };
 
         if let Err(error) = self.rebuild_system_prompt_for_dispatcher(active_dispatcher.as_ref()) {
@@ -2685,6 +2804,18 @@ impl Agent {
                 new_messages: new_msgs,
             });
         }
+        let tool_protocol_prompts = match self.tool_protocol_prompts() {
+            Ok(prompts) => prompts,
+            Err(error) => {
+                let notice = self.trim_history(Some(&turn_id));
+                forward_history_trim_notice(&event_tx, notice).await;
+                return Err(StreamedTurnError {
+                    error,
+                    committed_response: String::new(),
+                    new_messages: new_msgs,
+                });
+            }
+        };
 
         let provider_messages = active_dispatcher.to_provider_messages(&self.history);
         let cache_key = self.response_cache_key_for_messages(&provider_messages, &effective_model);
@@ -2721,7 +2852,6 @@ impl Agent {
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
-
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
                 Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
@@ -2734,6 +2864,7 @@ impl Agent {
             dedup_enabled: false,
             max_iteration_behavior: crate::agent::loop_::MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: false,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
         };
         // The streaming engine never had pattern-based loop detection; default
         // pacing turns it on. Keep the embedder contract until this surface
@@ -2807,8 +2938,7 @@ impl Agent {
                         turn_id: Some(turn_id.clone()),
                     });
                 }
-                let now = self.current_turn_datetime().format("%Y-%m-%d %H:%M:%S %Z");
-                let enriched = format!("[{now}] {steering_message}");
+                let enriched = self.enrich_user_message(&steering_message);
                 round_added.push(ChatMessage::user(enriched));
             }
             let round_loop = crate::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
@@ -2905,24 +3035,29 @@ impl Agent {
             );
             // Scope the provider-fallback task-local around the round so the
             // resilient wrapper's requested-vs-served record is visible here,
-            // then read it immediately (same pattern as the channels
-            // orchestrator's `scope_provider_fallback` wrapping). Box::pin
-            // moves the round future to the heap: nesting it inside another
-            // async block otherwise grows the turn future past the tokio
-            // worker stack in debug builds (observed live as a worker-thread
-            // stack overflow aborting the gateway).
-            let (loop_result, round_fallback) =
+            // then read it immediately. Box before adding the prompt scope so
+            // the nested task-locals do not capture the full round future on
+            // the worker stack in debug builds.
+            let round_loop = Box::pin(round_loop);
+            let (loop_result, round_fallback, round_context_truncated) =
                 zeroclaw_providers::reliable::scope_provider_fallback(async {
-                    let result = Box::pin(round_loop).await;
+                    let result = crate::agent::turn::scope_tool_protocol_prompts(
+                        Arc::clone(&tool_protocol_prompts),
+                        round_loop,
+                    )
+                    .await;
                     (
                         result,
                         zeroclaw_providers::reliable::take_last_provider_fallback(),
+                        zeroclaw_providers::reliable::take_last_provider_context_truncation(),
                     )
                 })
                 .await;
-            if round_fallback.is_some() {
-                turn_provider_recovery = round_fallback;
-            }
+            // Each accepted round owns the recovery presentation state. A
+            // later primary/direct response must clear an earlier fallback,
+            // rather than leaving its notice attached to the final answer.
+            turn_provider_recovery = round_fallback;
+            turn_provider_context_truncated |= round_context_truncated;
 
             // Feed cumulative usage into the AgentEnd guard before any return
             // below drops it — the error paths must still report usage from
@@ -2973,6 +3108,7 @@ impl Agent {
                     // exchange, mirroring the old "no tool calls" condition.
                     if single_text_exchange
                         && turn_provider_recovery.is_none()
+                        && !turn_provider_context_truncated
                         && let (Some(cache), Some(key)) = (&self.response_cache, &cache_key)
                     {
                         #[allow(clippy::cast_possible_truncation)]
@@ -3196,6 +3332,14 @@ mod safety_net;
 #[path = "parity.rs"]
 mod parity;
 
+// Live-config plugin regression (child module so it can read the constructed
+// Agent's tool registry the same way `mod tests` does). Needs a WASM compiler
+// on the host: `WasmTool::from_wasm` refuses to register a tool it cannot load,
+// so a runtime-only plugin backend has no plugin tool to execute.
+#[cfg(all(test, feature = "plugins-wasm-cranelift"))]
+#[path = "plugin_live_config.rs"]
+mod plugin_live_config;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3228,6 +3372,29 @@ mod tests {
             err.to_string().contains("no `model` configured"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn build_session_model_provider_returns_full_canonical_ref() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let (_provider, provider_ref, model) =
+            build_session_model_provider(&config, "openai.fast", None).unwrap();
+
+        assert_eq!(provider_ref, "openai.fast");
+        assert_eq!(model, "gpt-4o-mini");
     }
 
     zeroclaw_api::mock_tool_attribution!(
@@ -3398,10 +3565,38 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[test]
+    fn fallback_notice_fluent_key_stays_localized_without_new_keys() {
+        let args = [
+            ("requested_model", "requested-model"),
+            ("requested_provider", "primary"),
+            ("actual_model", "served-model"),
+            ("actual_provider", "fallback"),
+        ];
+        let english =
+            crate::i18n::get_english_cli_string_with_args("turn-model-fallback-notice", &args);
+        let french = crate::i18n::get_disk_override_cli_string_for_test(
+            "fr",
+            include_str!("../../locales/fr/cli.ftl"),
+            "turn-model-fallback-notice",
+            &args,
+        );
+
+        assert_ne!(french, "{turn-model-fallback-notice}");
+        assert_ne!(french, english, "French must not fall back to English");
+        for (_, value) in args {
+            assert!(
+                french.contains(value),
+                "localized fallback notice lost {value}"
+            );
+        }
+    }
+
     #[derive(Clone, Copy)]
     enum RuntimeStreamPlan {
         Unsupported,
         Text(&'static str),
+        EmptyWithUsage,
         Error,
     }
 
@@ -3460,6 +3655,17 @@ mod tests {
                 RuntimeStreamPlan::Text(text) => futures_util::stream::iter(vec![
                     Ok(zeroclaw_providers::traits::StreamEvent::TextDelta(
                         zeroclaw_providers::traits::StreamChunk::delta(text),
+                    )),
+                    Ok(zeroclaw_providers::traits::StreamEvent::Final),
+                ])
+                .boxed(),
+                RuntimeStreamPlan::EmptyWithUsage => futures_util::stream::iter(vec![
+                    Ok(zeroclaw_providers::traits::StreamEvent::Usage(
+                        zeroclaw_providers::traits::TokenUsage {
+                            input_tokens: Some(13),
+                            output_tokens: Some(7),
+                            cached_input_tokens: None,
+                        },
                     )),
                     Ok(zeroclaw_providers::traits::StreamEvent::Final),
                 ])
@@ -3655,6 +3861,225 @@ mod tests {
         assert_eq!(
             outcome.response, "primary final",
             "failed fallback streams must not leave stale fallback notice state"
+        );
+    }
+
+    /// A billed fallback stream is only a transport candidate. If its final
+    /// response is semantically empty and Reliable recovers to primary chat,
+    /// neither the Agent result nor its chunks may retain the fallback notice.
+    #[tokio::test]
+    async fn streamed_empty_fallback_recovery_does_not_leak_a_provider_notice() {
+        let reliable = streaming_probe_reliable_provider(
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::Unsupported,
+                chat_text: Some("primary recovery"),
+            },
+            RuntimeStreamingProbeProvider {
+                stream: RuntimeStreamPlan::EmptyWithUsage,
+                chat_text: None,
+            },
+        );
+
+        let mut agent = blank_input_agent(Box::new(reliable));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let outcome = agent
+            .turn_streamed_with_steering_state("hello", tx, None, None)
+            .await
+            .expect("primary recovery must succeed after an empty fallback stream");
+
+        assert_eq!(outcome.response, "primary recovery");
+        let mut chunks = String::new();
+        while let Ok(TurnEvent::Chunk { delta }) = rx.try_recv() {
+            chunks.push_str(&delta);
+        }
+        assert!(
+            !chunks.contains("provider-served") && !chunks.contains("provider-requested"),
+            "rejected fallback must not leak its notice into streamed chunks: {chunks}"
+        );
+    }
+
+    /// A tool-call response is accepted for this iteration, but its recovery
+    /// record must be replaced by the route of the final accepted answer.
+    #[tokio::test]
+    async fn tool_call_then_final_fallback_surfaces_exactly_one_final_notice() {
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".to_string(),
+                    Box::new(ToolThenFailingModelProvider {
+                        calls: std::sync::atomic::AtomicUsize::new(0),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(MockModelProvider {
+                        responses: Mutex::new(vec![zeroclaw_providers::ChatResponse {
+                            text: Some("fallback final".to_string()),
+                            tool_calls: vec![],
+                            usage: None,
+                            reasoning_content: None,
+                        }]),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("test memory must initialize"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(vec![Box::new(MockTool)])
+            .memory(memory)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("test agent must initialize");
+
+        let response = agent.turn("run the tool").await.expect("turn must recover");
+        assert_eq!(
+            response.matches("fallback").count(),
+            2,
+            "final text plus one notice"
+        );
+        assert!(
+            response.contains("primary"),
+            "notice identifies the requested route"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_tool_call_then_primary_final_clears_the_stale_notice() {
+        struct PrimaryFailsOnceThenFinal(std::sync::atomic::AtomicUsize);
+        struct FallbackToolCall;
+
+        macro_rules! attributable {
+            ($type:ty, $alias:literal) => {
+                impl ::zeroclaw_api::attribution::Attributable for $type {
+                    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                        ::zeroclaw_api::attribution::Role::Provider(
+                            ::zeroclaw_api::attribution::ProviderKind::Model(
+                                ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                            ),
+                        )
+                    }
+                    fn alias(&self) -> &str {
+                        $alias
+                    }
+                }
+            };
+        }
+        attributable!(PrimaryFailsOnceThenFinal, "PrimaryFailsOnceThenFinal");
+        attributable!(FallbackToolCall, "FallbackToolCall");
+
+        #[async_trait]
+        impl ModelProvider for PrimaryFailsOnceThenFinal {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("unused".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    anyhow::bail!("primary unavailable for first tool request");
+                }
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("primary final".into()),
+                    tool_calls: vec![],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+        #[async_trait]
+        impl ModelProvider for FallbackToolCall {
+            async fn chat_with_system(
+                &self,
+                _: Option<&str>,
+                _: &str,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<String> {
+                Ok("unused".into())
+            }
+            async fn chat(
+                &self,
+                _: ChatRequest<'_>,
+                _: &str,
+                _: Option<f64>,
+            ) -> Result<zeroclaw_providers::ChatResponse> {
+                Ok(zeroclaw_providers::ChatResponse {
+                    text: Some("tool request".into()),
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: "fallback-tool".into(),
+                        name: "echo".into(),
+                        arguments: "{}".into(),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+        }
+
+        let reliable = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(PrimaryFailsOnceThenFinal(
+                        std::sync::atomic::AtomicUsize::new(0),
+                    )) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(FallbackToolCall) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(reliable))
+            .tools(vec![Box::new(MockTool)])
+            .memory(Arc::from(
+                zeroclaw_memory::create_memory(
+                    &zeroclaw_config::schema::MemoryConfig {
+                        backend: "none".into(),
+                        ..Default::default()
+                    },
+                    std::path::Path::new("/tmp"),
+                    None,
+                )
+                .expect("test memory must initialize"),
+            ))
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .build()
+            .expect("test agent must initialize");
+
+        assert_eq!(
+            agent.turn("run the tool").await.expect("turn must recover"),
+            "primary final"
         );
     }
 
@@ -3958,6 +4383,89 @@ mod tests {
             self.seen_inputs
                 .lock()
                 .push((messages.to_vec(), model.to_string()));
+        }
+    }
+
+    struct SelectingBeforeLlmHook {
+        model: String,
+        system_suffix: Option<String>,
+    }
+
+    #[async_trait]
+    impl crate::hooks::HookHandler for SelectingBeforeLlmHook {
+        fn name(&self) -> &str {
+            "select-before-llm"
+        }
+
+        async fn before_llm_call(
+            &self,
+            messages: &mut Vec<ChatMessage>,
+            model: &mut String,
+        ) -> crate::hooks::HookResult<()> {
+            if let Some(suffix) = &self.system_suffix
+                && let Some(system) = messages.iter_mut().find(|message| message.role == "system")
+            {
+                system.content.push_str(suffix);
+            }
+            *model = self.model.clone();
+            crate::hooks::HookResult::Continue(())
+        }
+    }
+
+    type CapturedToolProtocolRequests = Arc<Mutex<Vec<(String, bool, Vec<ChatMessage>)>>>;
+
+    struct HookProtocolCaptureProvider {
+        supports_native: bool,
+        requests: CapturedToolProtocolRequests,
+    }
+
+    #[async_trait]
+    impl ModelProvider for HookProtocolCaptureProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            Ok("unexpected legacy request".into())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<zeroclaw_providers::ChatResponse> {
+            self.requests.lock().push((
+                model.to_string(),
+                request.tools.is_some(),
+                request.messages.to_vec(),
+            ));
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some("routed response".into()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+
+        fn supports_native_tools(&self) -> bool {
+            self.supports_native
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for HookProtocolCaptureProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "HookProtocolCaptureProvider"
         }
     }
 
@@ -4684,6 +5192,39 @@ mod tests {
             )
         }
 
+        #[test]
+        fn dispatcher_selection_uses_the_selected_routes_tool_capability() {
+            let (native_default, _) = capturing_provider(true);
+            let (text_route, _) = capturing_provider(false);
+            let router = zeroclaw_providers::router::RouterModelProvider::new(
+                "test",
+                vec![
+                    ("default".to_string(), native_default),
+                    ("text".to_string(), text_route),
+                ],
+                vec![(
+                    "text".to_string(),
+                    zeroclaw_providers::router::Route {
+                        provider_name: "text".to_string(),
+                        model: "text-model".to_string(),
+                    },
+                )],
+                "native-model".to_string(),
+            );
+            let config = zeroclaw_config::schema::AliasedAgentConfig::default();
+
+            assert!(
+                tool_dispatcher_for_provider(&config, &router, "native-model")
+                    .should_send_tool_specs(),
+                "the default native route must select the native dispatcher"
+            );
+            assert!(
+                !tool_dispatcher_for_provider(&config, &router, "hint:text")
+                    .should_send_tool_specs(),
+                "the hinted text-only route must select the XML dispatcher"
+            );
+        }
+
         fn test_agent_with_provider(
             provider: Box<dyn ModelProvider>,
             tools: Vec<Box<dyn Tool>>,
@@ -4722,6 +5263,42 @@ mod tests {
                 builder = builder.multimodal_config(mm);
             }
             builder.build().expect("agent builder should succeed")
+        }
+
+        #[tokio::test]
+        async fn streamed_agent_request_pairs_timestamp_orientation_with_labeled_user_text() {
+            let (provider, captured) = capturing_provider(true);
+            let mut agent = test_agent_with_provider(provider, Vec::new());
+            let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
+
+            agent
+                .turn_streamed_with_steering_state("hi from zerocode", event_tx, None, None)
+                .await
+                .expect("streamed Agent turn should succeed");
+
+            let captured = captured.lock();
+            let first_request = captured.first().expect("provider request captured");
+            let system = first_request
+                .iter()
+                .find(|message| message.role == "system")
+                .expect("system prompt");
+            let user = first_request
+                .iter()
+                .find(|message| message.role == "user")
+                .expect("user message");
+
+            assert!(
+                system
+                    .content
+                    .contains("timestamp metadata added by the runtime"),
+                "Agent prompt must explain its runtime-owned user envelope"
+            );
+            assert!(
+                user.content.starts_with("[CURRENT DATE & TIME:")
+                    && user.content.ends_with("\n\nhi from zerocode"),
+                "provider must receive the labeled envelope and original text: {}",
+                user.content
+            );
         }
 
         #[test]
@@ -5294,6 +5871,97 @@ mod tests {
             "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
             result.err().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn from_config_preserves_alias_for_cost_recording() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext,
+            build_model_provider_pricing, record_tool_loop_cost_usage,
+        };
+        use crate::cost::CostTracker;
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.cost.enabled = true;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o-mini.input".to_string(), 0.15),
+                        ("gpt-4o-mini.output".to_string(), 0.60),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "smart".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o.input".to_string(), 2.50),
+                        ("gpt-4o.output".to_string(), 10.00),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let agent = Agent::from_config(&config, "test-agent").await.unwrap();
+        assert_eq!(agent.model_provider_name, "openai.fast");
+
+        let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(build_model_provider_pricing(&config)),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            cached_input_tokens: Some(0),
+        };
+
+        let (_, cost_usd) = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                record_tool_loop_cost_usage(&agent.model_provider_name, &agent.model_name, &usage)
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            (cost_usd - 0.75).abs() < 1e-12,
+            "selected alias must charge its own rates, not the sibling's $12.50"
+        );
+        let summary = tracker.get_summary().unwrap();
+        assert!((summary.daily_cost_usd - 0.75).abs() < 1e-12);
     }
 
     #[test]
@@ -7692,6 +8360,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn before_llm_hook_uses_selected_route_for_complete_tool_protocol() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let default_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let text_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let router = zeroclaw_providers::router::RouterModelProvider::new(
+            "hook-router",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(HookProtocolCaptureProvider {
+                        supports_native: true,
+                        requests: Arc::clone(&default_requests),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text".into(),
+                    Box::new(HookProtocolCaptureProvider {
+                        supports_native: false,
+                        requests: Arc::clone(&text_requests),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            vec![(
+                "text".into(),
+                zeroclaw_providers::router::Route {
+                    provider_name: "text".into(),
+                    model: "text-model".into(),
+                },
+            )],
+            "native-model".into(),
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(SelectingBeforeLlmHook {
+            model: "hint:text".into(),
+            system_suffix: Some("\n\nHook-owned system mutation.".into()),
+        }));
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(router))
+            .model_provider_name("hook-router".into())
+            .model_name("native-model".into())
+            .tools(vec![Box::new(MockTool)])
+            .memory(memory)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .hook_runner(Some(Arc::new(hooks)))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent should build");
+
+        assert_eq!(
+            agent.turn("use the selected route").await.unwrap(),
+            "routed response"
+        );
+        assert!(
+            default_requests.lock().is_empty(),
+            "the pre-hook default route must not receive the request"
+        );
+        let requests = text_requests.lock();
+        assert_eq!(
+            requests.len(),
+            1,
+            "the selected route must receive one request"
+        );
+        let (model, sent_native_tools, messages) = &requests[0];
+        assert_eq!(model, "text-model");
+        assert!(
+            !sent_native_tools,
+            "the text-only selected route must not receive native tool specs"
+        );
+        let system_prompt = messages
+            .iter()
+            .find(|message| message.role == "system")
+            .expect("provider request must include a system prompt")
+            .content
+            .as_str();
+        assert!(system_prompt.contains("## Tools"));
+        assert!(system_prompt.contains("## Tool Use Protocol"));
+        assert!(system_prompt.contains("<tool_call>"));
+        assert!(system_prompt.contains("echo"));
+        assert!(system_prompt.contains("Parameters"));
+        assert!(
+            system_prompt.contains("Hook-owned system mutation."),
+            "the protocol refresh must preserve hook-owned system changes"
+        );
+    }
+
+    #[tokio::test]
+    async fn before_llm_hook_rejects_strict_mixed_selected_route_before_dispatch() {
+        let tmp = tempfile::tempdir().expect("temp workspace");
+        let default_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let native_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let text_requests: CapturedToolProtocolRequests = Arc::new(Mutex::new(Vec::new()));
+        let mixed = zeroclaw_providers::reliable::ReliableModelProvider::new(
+            "mixed",
+            vec![
+                (
+                    "native".into(),
+                    Box::new(HookProtocolCaptureProvider {
+                        supports_native: true,
+                        requests: Arc::clone(&native_requests),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "text".into(),
+                    Box::new(HookProtocolCaptureProvider {
+                        supports_native: false,
+                        requests: Arc::clone(&text_requests),
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            0,
+            0,
+        );
+        let router = zeroclaw_providers::router::RouterModelProvider::new(
+            "hook-router",
+            vec![
+                (
+                    "default".into(),
+                    Box::new(HookProtocolCaptureProvider {
+                        supports_native: true,
+                        requests: Arc::clone(&default_requests),
+                    }) as Box<dyn ModelProvider>,
+                ),
+                ("mixed".into(), Box::new(mixed) as Box<dyn ModelProvider>),
+            ],
+            vec![(
+                "mixed".into(),
+                zeroclaw_providers::router::Route {
+                    provider_name: "mixed".into(),
+                    model: "mixed-model".into(),
+                },
+            )],
+            "native-model".into(),
+        );
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let memory: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, tmp.path(), None)
+                .expect("memory creation should succeed"),
+        );
+        let mut hooks = crate::hooks::HookRunner::new();
+        hooks.register(Box::new(SelectingBeforeLlmHook {
+            model: "hint:mixed".into(),
+            system_suffix: None,
+        }));
+        let config = zeroclaw_config::schema::AliasedAgentConfig {
+            resolved: zeroclaw_config::schema::ResolvedRuntime {
+                strict_tool_parsing: true,
+                ..Default::default()
+            },
+            ..zeroclaw_config::schema::AliasedAgentConfig::default()
+        };
+        let mut agent = Agent::builder()
+            .model_provider(Box::new(router))
+            .model_provider_name("hook-router".into())
+            .model_name("native-model".into())
+            .tools(vec![Box::new(MockTool)])
+            .memory(memory)
+            .observer(Arc::from(crate::observability::NoopObserver {}))
+            .hook_runner(Some(Arc::new(hooks)))
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .config(config)
+            .workspace_dir(tmp.path().to_path_buf())
+            .build()
+            .expect("agent should build");
+
+        let error = agent
+            .turn("use the selected mixed route")
+            .await
+            .expect_err("strict mixed selected route must fail before dispatch");
+        assert!(
+            error
+                .to_string()
+                .contains("Strict tool parsing cannot run a fallback chain"),
+            "unexpected error: {error}"
+        );
+        assert!(default_requests.lock().is_empty());
+        assert!(native_requests.lock().is_empty());
+        assert!(text_requests.lock().is_empty());
+    }
+
+    #[tokio::test]
     async fn before_llm_hook_selected_model_attributes_provider_failure() {
         let tmp = tempfile::tempdir().expect("temp workspace");
         let memory_cfg = zeroclaw_config::schema::MemoryConfig {
@@ -8797,6 +9657,24 @@ mod tests {
                 .any(|(role, content)| { *role == "user" && content.contains("second") }),
             "accepted steering must be retained as its own user turn"
         );
+        // The steering turn must reach history in the SAME canonical
+        // labeled envelope as the initial streamed user message. A bare
+        // `[timestamp] text` prefix is the log/API-payload shape this
+        // change exists to remove, so assert the exact envelope rather
+        // than only that the text survived.
+        let committed_steering = new_chat_messages
+            .iter()
+            .find(|(role, content)| *role == "user" && content.contains("second"))
+            .expect("accepted steering must be retained as its own user turn")
+            .1;
+        assert!(
+            committed_steering.starts_with("[CURRENT DATE & TIME: "),
+            "committed steering must carry the labeled envelope, got: {committed_steering}"
+        );
+        assert!(
+            committed_steering.ends_with("]\n\nsecond"),
+            "committed steering must end with the raw user text after the envelope, got: {committed_steering}"
+        );
 
         let seen = seen_messages.lock();
         assert_eq!(seen.len(), 2);
@@ -8807,12 +9685,22 @@ mod tests {
                 .any(|msg| msg.role == "assistant" && msg.content == "draft"),
             "second provider call must see the committed streamed assistant text"
         );
+        let provider_steering = second_call
+            .iter()
+            .filter(|msg| msg.role == "user")
+            .find(|msg| msg.content.contains("second"))
+            .expect("second provider call must include the accepted steering user message");
         assert!(
-            second_call
-                .iter()
-                .filter(|msg| msg.role == "user")
-                .any(|msg| msg.content.contains("second")),
-            "second provider call must include the accepted steering user message"
+            provider_steering
+                .content
+                .starts_with("[CURRENT DATE & TIME: "),
+            "the provider must receive the steering turn in the labeled envelope, got: {}",
+            provider_steering.content
+        );
+        assert!(
+            provider_steering.content.ends_with("]\n\nsecond"),
+            "the provider's steering turn must end with the raw user text, got: {}",
+            provider_steering.content
         );
     }
 
@@ -10832,6 +11720,112 @@ mod tests {
              provider/model (ollama/llama3); captured events: {events:?}"
         );
         drop(events);
+    }
+
+    fn turn_datetime_agent(
+        model_provider: Box<dyn ModelProvider>,
+        fixed: chrono::DateTime<chrono::Local>,
+    ) -> Agent {
+        let memory_cfg = zeroclaw_config::schema::MemoryConfig {
+            backend: "none".into(),
+            ..zeroclaw_config::schema::MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> = Arc::from(
+            zeroclaw_memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
+                .expect("memory creation should succeed with valid config"),
+        );
+        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
+        Agent::builder()
+            .model_provider(model_provider)
+            .tools(Vec::new())
+            .memory(mem)
+            .observer(observer)
+            .tool_dispatcher(Box::new(NativeToolDispatcher))
+            .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .turn_datetime(move || fixed)
+            .build()
+            .expect("agent builder should succeed with valid config")
+    }
+
+    fn stored_user_message(agent: &Agent) -> String {
+        agent
+            .history()
+            .iter()
+            .find_map(|m| match m {
+                ConversationMessage::Chat(chat) if chat.role == "user" => {
+                    Some(chat.content.clone())
+                }
+                _ => None,
+            })
+            .expect("a user message must be stored in history")
+    }
+
+    #[tokio::test]
+    async fn streamed_history_uses_labeled_shape_not_bare_timestamp() {
+        let fixed = chrono::Local
+            .with_ymd_and_hms(2026, 3, 14, 9, 30, 0)
+            .single()
+            .expect("fixed local test timestamp");
+        let model_provider = Box::new(MockModelProvider {
+            responses: Mutex::new(Vec::new()),
+        });
+        let mut agent = turn_datetime_agent(model_provider, fixed);
+
+        let mut new_msgs = Vec::new();
+        agent
+            .append_streamed_user_message_to_history("hello there", &mut new_msgs, "test-turn")
+            .await;
+
+        let stored = stored_user_message(&agent);
+        assert!(
+            stored.starts_with("[CURRENT DATE & TIME: 2026-03-14 09:30:00"),
+            "streamed history must use the labeled shape, got: {stored}"
+        );
+        assert!(
+            stored.contains("hello there"),
+            "stored message must retain the original text: {stored}"
+        );
+        assert!(
+            !stored.starts_with("[2026-03-14 09:30:00"),
+            "streamed history must not fall back to the bare `[{{ts}}] {{msg}}` shape: {stored}"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_and_non_streamed_enrichment_match_for_same_clock_and_message() {
+        let fixed = chrono::Local
+            .with_ymd_and_hms(2026, 3, 14, 9, 30, 0)
+            .single()
+            .expect("fixed local test timestamp");
+
+        let mut streamed_agent = turn_datetime_agent(
+            Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }),
+            fixed,
+        );
+        let mut new_msgs = Vec::new();
+        streamed_agent
+            .append_streamed_user_message_to_history("same message", &mut new_msgs, "turn-a")
+            .await;
+        let streamed_content = stored_user_message(&streamed_agent);
+
+        let mut non_streamed_agent = turn_datetime_agent(
+            Box::new(MockModelProvider {
+                responses: Mutex::new(Vec::new()),
+            }),
+            fixed,
+        );
+        non_streamed_agent
+            .turn("same message")
+            .await
+            .expect("turn should succeed");
+        let non_streamed_content = stored_user_message(&non_streamed_agent);
+
+        assert_eq!(
+            streamed_content, non_streamed_content,
+            "streamed and non-streamed enrichment must be byte-identical for the same clock and message"
+        );
     }
 }
 

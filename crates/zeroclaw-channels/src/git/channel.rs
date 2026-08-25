@@ -702,7 +702,7 @@ fn split_comment_text(text: &str, max_len: usize) -> Vec<String> {
             chunks.push(remaining.to_string());
             break;
         }
-        let limit = crate::util::floor_char_boundary(remaining, max_len);
+        let limit = remaining.floor_char_boundary(max_len);
         let split_at = remaining[..limit]
             .rfind("\n\n")
             .or_else(|| remaining[..limit].rfind('\n'))

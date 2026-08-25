@@ -4,6 +4,17 @@ The runtime can wrap tool invocations in an OS-level sandbox that restricts file
 
 Sandbox settings live on a risk profile. Each agent points at a risk profile via `agents.<alias>.risk_profile`; the agent's sandbox enable/backend are read from that profile.
 
+**CLI model providers (for example `grok_cli`):** the external CLI is outside
+ZeroClaw's native tool-approval path. Risk-profile sandboxing above does not
+confine it. The `grok_cli` ACP provider therefore injects `--sandbox strict`,
+`--permission-mode dontAsk`, and an empty built-in tool set by default, and it
+rejects ACP permission requests (selecting `reject_once` when the CLI offers
+it, otherwise cancelling the request). Explicit bypass flags in alias
+`extra_args` instead select the request's `allow_once` option; this does not
+disable Grok's active OS sandbox or override its deny rules. Other permission
+modes remain fail closed. See
+[Catalog → Grok Build CLI](../providers/catalog.md#grok-build-cli-slot-grok_cli).
+
 `sandbox_enabled = false` (or `sandbox_backend = "none"`) disables sandboxing for tools running under this profile. See the canonical [Minimal working example](../providers/configuration.md#minimal-working-example) for how a risk profile slots into the rest of the config.
 
 ## Auto-detection
@@ -70,6 +81,8 @@ shell = "pwsh"        # PowerShell 7+   -> pwsh -NoProfile -NonInteractive -Comm
 `powershell` and `pwsh` (as a bare name resolved via `PATH`, or an absolute path such as `"C:\\Program Files\\PowerShell\\7\\pwsh.exe"`) run through PowerShell; any other value (including the default `sh` and an explicit `cmd`) runs through `cmd.exe /C`, matching the historical behaviour. Only an empty/whitespace value is rejected; the interpreter is located at spawn time.
 
 The shell tool, shell-backed skill tools, and cron/schedule shell jobs all use this runtime selection. The runtime also reports the shell dialect to security policy, so policy validates the same language that will execute the command.
+
+The same runtime selection is reported to the model. The system prompt's `## Runtime` line carries a `Shell:` field naming the configured interpreter (`bash`, `zsh`, `pwsh`, `powershell`, `cmd`), and when a registered tool takes a model-authored command (`shell`, `cron_add`, `cron_update`, `schedule`) a `## Shell` section lists the command forms that dialect accepts, so the model writes `Get-ChildItem` under PowerShell and `dir /a` under `cmd.exe` instead of guessing from the OS name. Both come from the same adapter that builds the command, so the reported shell cannot drift from the executed one. Runtimes without shell access (such as WASM) omit both. Deletion advice in the safety section follows the dialect too: `trash` is only suggested where it exists.
 
 PowerShell policy accepts a bounded grammar: simple command invocations, plain or quoted arguments, and pipelines. Simple variable reads such as `$PSHOME` and `$PSVersionTable.PSVersion` are limited to a standalone `Write-Output`/`echo` command so they cannot hide filesystem paths from later commands. Expressions and alternate invocation forms, including subexpressions, parentheses, script blocks, type literals/static method calls, call operators, redirection, statement separators, backtick escapes, scoped variables such as `$env:NAME`, PowerShell provider paths, direct script execution, and nested command interpreters, are classified as high risk. PowerShell-only command names are not added to the cross-dialect default allowlist; add the cmdlets you need to `allowed_commands`, or opt into `"*"` with the corresponding approval and high-risk settings. Known mutation cmdlets follow the medium/high-risk approval gates; unknown bare commands and `Verb-Noun` cmdlets are high risk by default.
 

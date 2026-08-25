@@ -33,7 +33,7 @@ const OPENRC_STDOUT_LOG: &str = "/var/log/zeroclaw/access.log";
 const OPENRC_STDERR_LOG: &str = "/var/log/zeroclaw/error.log";
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_LOG_PENDING_BYTES: usize = 1024 * 1024;
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 const LAUNCHD_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(any(target_os = "macos", test))]
 const LAUNCHD_PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -1668,6 +1668,7 @@ fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn shell_single_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }

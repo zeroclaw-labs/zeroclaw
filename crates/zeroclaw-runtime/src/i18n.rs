@@ -11,12 +11,14 @@ static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_FTL_SOURCES: OnceLock<CliFtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
-/// The canonical locale registry, embedded from repo-root `locales.toml` at
-/// compile time. Parsed once into a `'static` list so callers (e.g. the RPC
-/// `locales/list` handler) get a long-lived reference with no runtime file I/O.
+/// The canonical locale registry. Repo-root `locales.toml` remains the single
+/// place a locale is added; `cargo generate installers runtime-locales` renders
+/// it into `generated_locales.rs` inside this crate, and CI fails on drift.
+///
+/// This used to be `include_str!("../../../locales.toml")`. That reaches outside
+/// the crate directory, and `cargo package` copies only the package directory,
+/// so the read made this crate unpublishable.
 static AVAILABLE_LOCALES: OnceLock<Vec<LocaleOption>> = OnceLock::new();
-
-const LOCALES_TOML: &str = include_str!("../../../locales.toml");
 
 /// One selectable locale: its `code` (e.g. `ja`) and display `label`
 /// (e.g. `日本語`).
@@ -31,24 +33,13 @@ pub struct LocaleOption {
 pub fn available_locales() -> &'static [LocaleOption] {
     AVAILABLE_LOCALES
         .get_or_init(|| {
-            let table: toml::Value =
-                toml::from_str(LOCALES_TOML).expect("embedded locales.toml is valid TOML");
-            table
-                .get("locale")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|e| {
-                            let code = e.get("code").and_then(|v| v.as_str())?;
-                            let label = e.get("label").and_then(|v| v.as_str())?;
-                            Some(LocaleOption {
-                                code: code.to_string(),
-                                label: label.to_string(),
-                            })
-                        })
-                        .collect()
+            crate::generated_locales::AVAILABLE_LOCALES
+                .iter()
+                .map(|o| LocaleOption {
+                    code: o.code.to_string(),
+                    label: o.label.to_string(),
                 })
-                .unwrap_or_default()
+                .collect()
         })
         .as_slice()
 }
@@ -152,13 +143,24 @@ fn load_descriptions(locale: &str) -> HashMap<String, String> {
 }
 
 fn load_cli_strings(locale: &str) -> HashMap<String, String> {
+    let disk = (locale != "en")
+        .then(|| load_ftl_from_disk(locale, "cli.ftl"))
+        .flatten();
+    load_cli_strings_from_sources(locale, builtin_cli_ftl_source(locale), disk.as_deref())
+}
+
+fn load_cli_strings_from_sources(
+    locale: &str,
+    builtin: Option<&str>,
+    disk: Option<&str>,
+) -> HashMap<String, String> {
     let mut map = format_ftl_messages(include_str!("../locales/en/cli.ftl"), "en");
     if locale != "en" {
-        if let Some(locale_ftl) = builtin_cli_ftl_source(locale) {
+        if let Some(locale_ftl) = builtin {
             map.extend(format_ftl_messages(locale_ftl, locale));
         }
-        if let Some(locale_ftl) = load_ftl_from_disk(locale, "cli.ftl") {
-            map.extend(format_ftl_messages(&locale_ftl, locale));
+        if let Some(locale_ftl) = disk {
+            map.extend(format_ftl_messages(locale_ftl, locale));
         }
     }
     map
@@ -485,6 +487,134 @@ mod tests {
     }
 
     #[test]
+    fn telegram_command_menu_descriptions_are_translated_per_locale() {
+        // Pin the exact English wording as an independent oracle: the
+        // telegram.rs tests now resolve their expectations through this same
+        // catalog, so they can no longer catch an accidental change to the
+        // English text. This literal comparison can.
+        let keys = [
+            (
+                "channel-telegram-cmd-new-desc",
+                "Start a new conversation session",
+            ),
+            (
+                "channel-telegram-cmd-clear-desc",
+                "Clear this conversation session",
+            ),
+            (
+                "channel-telegram-cmd-stop-desc",
+                "Cancel the current in-flight task",
+            ),
+            (
+                "channel-telegram-cmd-model-desc",
+                "Show or switch the current model",
+            ),
+            (
+                "channel-telegram-cmd-models-desc",
+                "List available model_providers or switch model_provider",
+            ),
+            (
+                "channel-telegram-cmd-config-desc",
+                "Show current configuration",
+            ),
+        ];
+
+        // These descriptions are sent to Telegram's setMyCommands, which rejects
+        // the whole request if any description exceeds its length limit. The
+        // channel layer truncates skill/tool descriptions at a conservative cap;
+        // the built-in menu descriptions bypass that truncation, so guard their
+        // length (across every locale) here instead — an over-long translation
+        // then fails this test rather than breaking command registration at
+        // runtime. Keep in sync with TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN.
+        const MAX_DESC_CHARS: usize = 100;
+
+        // Read the checked-in sources directly. The runtime loader deliberately
+        // overlays per-user disk catalogs, but those overrides must not be able
+        // to mask a missing or stale translation in the committed catalog.
+        let en_map = format_ftl_messages(include_str!("../locales/en/cli.ftl"), "en");
+        let locale_maps = [
+            (
+                "es",
+                format_ftl_messages(include_str!("../locales/es/cli.ftl"), "es"),
+            ),
+            (
+                "fr",
+                format_ftl_messages(include_str!("../locales/fr/cli.ftl"), "fr"),
+            ),
+            (
+                "ja",
+                format_ftl_messages(include_str!("../locales/ja/cli.ftl"), "ja"),
+            ),
+            (
+                "zh-CN",
+                format_ftl_messages(include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+            ),
+        ];
+        for (key, expected_en) in keys {
+            let en_value = en_map
+                .get(key)
+                .unwrap_or_else(|| panic!("missing en value for {key}"));
+            assert!(
+                !en_value.is_empty(),
+                "en value for {key} should not be empty"
+            );
+            assert!(
+                !en_value.starts_with('{'),
+                "en value for {key} resolved to the missing-key sentinel: {en_value}"
+            );
+            assert_eq!(
+                en_value, expected_en,
+                "en value for {key} should match the pinned English wording"
+            );
+            assert!(
+                en_value.chars().count() <= MAX_DESC_CHARS,
+                "en value for {key} is {} chars, over the {MAX_DESC_CHARS}-char Telegram menu cap: {en_value}",
+                en_value.chars().count()
+            );
+
+            for (locale, map) in &locale_maps {
+                let value = map
+                    .get(key)
+                    .unwrap_or_else(|| panic!("missing {locale} value for {key}"));
+                assert!(
+                    !value.is_empty(),
+                    "{locale} value for {key} should not be empty"
+                );
+                assert!(
+                    !value.starts_with('{'),
+                    "{locale} value for {key} resolved to the missing-key sentinel: {value}"
+                );
+                assert_ne!(
+                    value, en_value,
+                    "{locale} value for {key} should be translated, not just the English fallback"
+                );
+                assert!(
+                    value.chars().count() <= MAX_DESC_CHARS,
+                    "{locale} value for {key} is {} chars, over the {MAX_DESC_CHARS}-char Telegram menu cap: {value}",
+                    value.chars().count()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn telegram_command_description_falls_back_to_english_when_locale_key_is_missing() {
+        // Exercise the same no-argument map-loading path used by
+        // `get_required_cli_string`, with a valid built-in locale catalog that
+        // intentionally omits the key under test.
+        let map = load_cli_strings_from_sources(
+            "fr",
+            Some("channel-telegram-cmd-clear-desc = Effacer cette session de conversation"),
+            None,
+        );
+        let rendered = map
+            .get("channel-telegram-cmd-new-desc")
+            .expect("missing French command description should fall back to English");
+
+        assert_eq!(rendered, "Start a new conversation session");
+    }
+
+    #[test]
     fn disk_approval_override_cannot_rewrite_parser_commands() {
         let sources = CliFtlSources {
             locale: "es".to_string(),
@@ -736,6 +866,23 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn plugin_config_entry_key_formats_in_every_builtin_locale() {
+        let args = [("capability", "Tool"), ("key", "zpi1_fixture")];
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            let value = format_ftl_message(source, locale, "cli-plugin-config-entry-key", &args)
+                .unwrap_or_else(|| panic!("plugin config entry key should format in {locale}"));
+            assert!(value.contains("Tool"));
+            assert!(value.contains("zpi1_fixture"));
         }
     }
 

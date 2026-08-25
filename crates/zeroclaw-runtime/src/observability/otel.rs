@@ -10,7 +10,7 @@ use opentelemetry_sdk::metrics::SdkMeterProvider;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::SystemTime;
 use zeroclaw_config::schema::OtelContentPolicy;
 
@@ -933,6 +933,31 @@ impl Observer for OtelObserver {
     }
 }
 
+fn strip_runtime_user_timestamp_prefix(content: &str) -> &str {
+    const LABEL: &str = "[CURRENT DATE & TIME:";
+    static TIMESTAMP_PATTERN: OnceLock<regex::Regex> = OnceLock::new();
+
+    let Some(rest) = content.strip_prefix(LABEL) else {
+        return content;
+    };
+    let Some(bracket_end) = rest.find(']') else {
+        return content;
+    };
+    let timestamp = rest[..bracket_end].trim();
+    let timestamp_regex = TIMESTAMP_PATTERN.get_or_init(|| {
+        regex::Regex::new(r"^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+$")
+            .expect("the runtime timestamp pattern is a valid fixed regex")
+    });
+    if !timestamp_regex.is_match(timestamp) {
+        return content;
+    }
+    let after_label = &rest[bracket_end + 1..];
+    after_label
+        .strip_prefix("\r\n\r\n")
+        .or_else(|| after_label.strip_prefix("\n\n"))
+        .unwrap_or(content)
+}
+
 fn strip_first_complete_block(content: &mut String, start_marker: &str, end_marker: &str) {
     let Some(start) = content.find(start_marker) else {
         return;
@@ -953,7 +978,9 @@ fn clean_for_display(content: &str) -> String {
     strip_first_complete_block(&mut cleaned, "<thinking>", "</thinking>");
     strip_first_complete_block(&mut cleaned, "<think>", "</think>");
 
-    // Remove timestamp patterns like [2026-06-30 16:44:51 +08:00]
+    // Preserve the pre-existing cleanup for bare timestamps. The labeled
+    // runtime envelope is removed only at the role-aware agent-message export
+    // boundary so user-authored examples later in the message remain intact.
     let timestamp_regex =
         regex::Regex::new(r"\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+\S+\]").unwrap();
     cleaned = timestamp_regex.replace_all(&cleaned, "").to_string();
@@ -981,7 +1008,12 @@ fn process_agent_message(
     policy: OtelContentPolicy,
     max_chars: usize,
 ) -> Option<String> {
-    let cleaned = clean_for_display(content);
+    let display_content = if role == "user" {
+        strip_runtime_user_timestamp_prefix(content)
+    } else {
+        content
+    };
+    let cleaned = clean_for_display(display_content);
     let processed = if policy == OtelContentPolicy::Redacted {
         truncate_field(&cleaned, max_chars)
     } else {
@@ -1097,10 +1129,15 @@ fn message_attrs(
                 .input
                 .iter()
                 .map(|m| {
-                    let content = if policy == OtelContentPolicy::Redacted {
-                        truncate_field(&m.content, max_chars).unwrap_or_else(|| m.content.clone())
+                    let source = if m.role == "user" {
+                        strip_runtime_user_timestamp_prefix(&m.content)
                     } else {
-                        m.content.clone()
+                        &m.content
+                    };
+                    let content = if policy == OtelContentPolicy::Redacted {
+                        truncate_field(source, max_chars).unwrap_or_else(|| source.to_string())
+                    } else {
+                        source.to_string()
                     };
                     serde_json::json!({ "role": m.role, "content": content })
                 })
@@ -1234,6 +1271,47 @@ mod tests {
         assert_eq!(output[0]["content"], "hello");
         assert_eq!(output[0]["tool_calls"][0]["name"], "shell");
         assert_eq!(output[0]["tool_calls"][0]["arguments"]["cmd"], "ls");
+    }
+
+    #[test]
+    fn message_attrs_strips_only_leading_runtime_user_envelopes() {
+        let snap = LlmMessageSnapshot {
+            input: vec![
+                MessageSnapshot {
+                    role: "user".into(),
+                    content: "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\n\nordinary question"
+                        .into(),
+                },
+                MessageSnapshot {
+                    role: "assistant".into(),
+                    content: "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\n\nquoted answer"
+                        .into(),
+                },
+                MessageSnapshot {
+                    role: "user".into(),
+                    content:
+                        "Preserve this example: [CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]"
+                            .into(),
+                },
+            ],
+            output_text: None,
+            output_tool_calls: vec![],
+            system_instructions: None,
+        };
+
+        let attrs = message_attrs(&Some(snap), genai_full_config());
+        let input: serde_json::Value =
+            serde_json::from_str(&attr_value(&attrs, "gen_ai.input.messages").unwrap()).unwrap();
+
+        assert_eq!(input[0]["content"], "ordinary question");
+        assert_eq!(
+            input[1]["content"],
+            "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\n\nquoted answer"
+        );
+        assert_eq!(
+            input[2]["content"],
+            "Preserve this example: [CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]"
+        );
     }
 
     #[test]
@@ -1924,6 +2002,33 @@ mod tests {
     }
 
     #[test]
+    fn process_agent_message_strips_leading_runtime_user_envelope() {
+        let val = process_agent_message(
+            "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\n\nordinary question",
+            "user",
+            OtelContentPolicy::Full,
+            10_000,
+        )
+        .expect("aggregate agent input attribute");
+        let parsed: serde_json::Value = serde_json::from_str(&val).unwrap();
+        assert_eq!(parsed[0]["role"], "user");
+        assert_eq!(parsed[0]["content"], "ordinary question");
+    }
+
+    #[test]
+    fn process_agent_message_preserves_leading_timestamp_text_for_assistant() {
+        let content = "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\n\nquoted assistant answer";
+        let val = process_agent_message(content, "assistant", OtelContentPolicy::Full, 10_000)
+            .expect("aggregate agent output attribute");
+        let parsed: serde_json::Value = serde_json::from_str(&val).unwrap();
+        assert_eq!(parsed[0]["role"], "assistant");
+        assert_eq!(
+            parsed[0]["content"],
+            "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\nquoted assistant answer"
+        );
+    }
+
+    #[test]
     fn process_agent_message_redacted_truncates() {
         // Truncation drops the content entirely → None.
         assert!(process_agent_message("abcdef", "user", OtelContentPolicy::Redacted, 0,).is_none());
@@ -1987,6 +2092,28 @@ mod tests {
         let input = "Hello world[2026-06-30 16:44:51 UTC]";
         let cleaned = clean_for_display(input);
         assert_eq!(cleaned, "Hello world");
+    }
+
+    #[test]
+    fn strip_runtime_user_timestamp_prefix_removes_numeric_timezone() {
+        let input = "[CURRENT DATE & TIME: 2026-06-30 16:44:51 +08:00]\n\nHello world";
+        assert_eq!(strip_runtime_user_timestamp_prefix(input), "Hello world");
+    }
+
+    #[test]
+    fn strip_runtime_user_timestamp_prefix_removes_named_timezone() {
+        let input = "[CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC]\n\nWhat is the weather today";
+        assert_eq!(
+            strip_runtime_user_timestamp_prefix(input),
+            "What is the weather today"
+        );
+    }
+
+    #[test]
+    fn clean_for_display_preserves_labeled_timestamp_examples_in_message_body() {
+        let input = "Explain [CURRENT DATE & TIME: 2026-06-30 16:44:51 UTC] as a literal example";
+        let cleaned = clean_for_display(input);
+        assert_eq!(cleaned, input);
     }
 
     #[test]

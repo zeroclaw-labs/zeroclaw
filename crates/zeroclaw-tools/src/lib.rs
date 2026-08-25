@@ -89,6 +89,9 @@ pub mod web_search_provider_routing;
 pub mod web_search_tool;
 pub mod wrappers;
 
+#[cfg(all(test, unix))]
+mod coding_agent_budget_tests;
+
 pub const MEMORY_TOOL_NAMES: &[&str] = &[
     "memory_store",
     "memory_recall",

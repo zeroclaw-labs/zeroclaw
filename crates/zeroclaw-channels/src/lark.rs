@@ -312,9 +312,7 @@ fn build_resolved_approval_card(
         ChannelApprovalResponse::Approve => ("✅", "Approved", "green"),
         ChannelApprovalResponse::AlwaysApprove => ("✅✅", "Approved (always)", "green"),
         ChannelApprovalResponse::Deny => ("❌", "Denied", "red"),
-        ChannelApprovalResponse::DenyWithEdit { .. } => {
-            unreachable!("DenyWithEdit is only valid for ACP channels")
-        }
+        ChannelApprovalResponse::DenyWithEdit { .. } => ("❌", "Denied", "red"),
     };
 
     serde_json::json!({
@@ -2929,11 +2927,11 @@ impl Channel for LarkChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        !matches!(self.stream_mode, StreamMode::Off)
+        matches!(self.stream_mode, StreamMode::Partial)
     }
 
     async fn send_draft(&self, message: &SendMessage) -> anyhow::Result<Option<String>> {
-        if matches!(self.stream_mode, StreamMode::Off) {
+        if !matches!(self.stream_mode, StreamMode::Partial) {
             return Ok(None);
         }
 
@@ -3758,7 +3756,7 @@ fn lark_is_text_filename(name: &str) -> bool {
 
 fn lark_inline_text_file_preview(text: Cow<'_, str>) -> String {
     if text.len() > 50_000 {
-        let end = crate::util::floor_char_boundary(text.as_ref(), 50_000);
+        let end = text.floor_char_boundary(50_000);
         format!("{}...\n[truncated]", &text[..end])
     } else {
         text.into_owned()
@@ -5584,6 +5582,13 @@ mod tests {
                 "Approved (always)",
             ),
             (ChannelApprovalResponse::Deny, "red", "Denied"),
+            (
+                ChannelApprovalResponse::DenyWithEdit {
+                    replacement: "edited".to_string(),
+                },
+                "red",
+                "Denied",
+            ),
         ] {
             let card = build_resolved_approval_card("shell", "args", decision.clone());
             assert_eq!(

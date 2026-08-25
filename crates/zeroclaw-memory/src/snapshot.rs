@@ -3,7 +3,6 @@
 use anyhow::Result;
 use chrono::Local;
 use rusqlite::{Connection, params};
-use std::fmt::Write;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -65,17 +64,19 @@ pub fn export_snapshot(workspace_dir: &Path) -> Result<usize> {
     output.push_str(SNAPSHOT_HEADER);
 
     let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-    write!(output, "**Last exported:** {now}\n\n").unwrap();
-    write!(output, "**Total core memories:** {}\n\n---\n\n", rows.len()).unwrap();
+    output.push_str(&format!("**Last exported:** {now}\n\n"));
+    output.push_str(&format!(
+        "**Total core memories:** {}\n\n---\n\n",
+        rows.len()
+    ));
 
     for (key, content, _category, created_at, updated_at) in &rows {
-        write!(output, "### 🔑 `{key}`\n\n").unwrap();
-        write!(output, "{content}\n\n").unwrap();
-        write!(
-            output,
+        output.push_str(&format!("### 🔑 `{key}`\n\n"));
+        output.push_str(content);
+        output.push_str("\n\n");
+        output.push_str(&format!(
             "*Created: {created_at} | Updated: {updated_at}*\n\n---\n\n"
-        )
-        .unwrap();
+        ));
     }
 
     let snapshot_path = snapshot_path(workspace_dir);

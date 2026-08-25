@@ -499,7 +499,9 @@ impl Tool for ProxyConfigTool {
                     "disable" => Box::pin(self.handle_disable(&args)).await,
                     "apply_env" => self.handle_apply_env(),
                     "clear_env" => self.handle_clear_env(),
-                    _ => unreachable!("handled above"),
+                    _ => Err(anyhow::Error::msg(format!(
+                        "Unknown proxy action after validation: {action}"
+                    ))),
                 }
             }
             _ => anyhow::bail!(

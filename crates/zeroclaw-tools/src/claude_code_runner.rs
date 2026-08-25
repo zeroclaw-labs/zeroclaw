@@ -53,7 +53,7 @@ impl ClaudeCodeRunnerTool {
     }
 
     #[cfg(all(test, unix))]
-    fn with_tmux_binary(mut self, tmux_binary: PathBuf) -> Self {
+    pub(crate) fn with_tmux_binary(mut self, tmux_binary: PathBuf) -> Self {
         self.tmux_binary = tmux_binary;
         self
     }
@@ -110,10 +110,10 @@ impl Tool for ClaudeCodeRunnerTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
-        // Enforce act policy
+        // The production wrapper owns accounting; the adapter owns authorization.
         if let Err(error) = self
             .security
-            .enforce_tool_operation(ToolOperation::Act, "claude_code_runner")
+            .authorize_tool_operation(ToolOperation::Act, "claude_code_runner")
         {
             return Ok(ToolResult {
                 success: false,
@@ -526,8 +526,14 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool =
-            ClaudeCodeRunnerTool::new(security, test_config(), "http://localhost:3000".into());
+        let tool = crate::wrappers::RateLimitedTool::new(
+            ClaudeCodeRunnerTool::new(
+                security.clone(),
+                test_config(),
+                "http://localhost:3000".into(),
+            ),
+            security,
+        );
         let result = tool
             .execute(json!({"prompt": "hello"}))
             .await

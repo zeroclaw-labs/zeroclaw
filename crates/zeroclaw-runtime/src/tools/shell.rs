@@ -48,6 +48,9 @@ impl Drop for ChildGroupGuard {
                 .with_attrs(::serde_json::json!({ "pgid": pgid, "signal": "SIGKILL" })),
             "shell tool reaping child process group"
         );
+        // SAFETY: `pgid` was published only after the spawned child created
+        // its own process group; a negative PID targets that group, and this
+        // best-effort signal call passes no pointers.
         unsafe {
             libc::kill(-pgid, libc::SIGKILL);
         }
@@ -150,8 +153,16 @@ fn decode_output(bytes: &[u8]) -> String {
     use windows::Win32::Globalization::GetACP;
     use windows::Win32::System::Console::GetConsoleOutputCP;
 
-    let cp = unsafe { GetConsoleOutputCP() };
-    let cp = if cp == 0 { unsafe { GetACP() } } else { cp };
+    // SAFETY: both Win32 functions are parameter-free code-page queries. A
+    // zero console code page selects the documented system ANSI fallback.
+    let cp = unsafe {
+        let console_cp = GetConsoleOutputCP();
+        if console_cp == 0 {
+            GetACP()
+        } else {
+            console_cp
+        }
+    };
 
     decode_output_with_code_page(bytes, cp)
 }
@@ -635,6 +646,21 @@ mod tests {
         })
     }
 
+    fn test_security_with_allowed_commands(
+        autonomy: AutonomyLevel,
+        commands: &[&str],
+    ) -> Arc<SecurityPolicy> {
+        Arc::new(SecurityPolicy {
+            autonomy,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: commands
+                .iter()
+                .map(|command| (*command).to_string())
+                .collect(),
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[cfg(unix)]
     fn unrestricted_shell_test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -672,7 +698,7 @@ mod tests {
 
     #[cfg(windows)]
     fn medium_risk_write_command() -> &'static str {
-        "copy /Y NUL zeroclaw_shell_approval_test"
+        "copy NUL zeroclaw_shell_approval_test"
     }
 
     #[cfg(not(windows))]
@@ -693,6 +719,27 @@ mod tests {
     /// `PathGuardedTool`. Tests exercise this exact shape.
     fn wrapped_shell(security: Arc<SecurityPolicy>) -> RateLimitedTool<ShellTool> {
         RateLimitedTool::new(ShellTool::new(security.clone(), test_runtime()), security)
+    }
+
+    /// A forbidden path argument is refused by whichever guard sees it first,
+    /// and the two guards word it differently. On a Windows shell dialect the
+    /// policy's own scan inside `validate_command_execution_for_shell` runs
+    /// before the tool body and reports `Command blocked: forbidden path
+    /// argument`; on POSIX dialects that scan is skipped (an operator may
+    /// legitimately allow absolute arguments there) and the refusal comes from
+    /// the shell tool's workspace scan as `Path blocked by security policy`.
+    /// Both are the same verdict, so assert the refusal rather than one
+    /// platform's phrasing.
+    fn assert_path_argument_blocked(result: &ToolResult, context: &str) {
+        assert!(
+            !result.success,
+            "{context}: the forbidden path argument must be refused, got: {result:?}"
+        );
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(
+            error.contains("Path blocked") || error.contains("forbidden path argument"),
+            "{context}: expected a path-guard refusal, got: {error:?}"
+        );
     }
 
     #[test]
@@ -1267,19 +1314,15 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_absolute_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["cat"],
+        ));
         let result = tool
             .execute(json!({"command": format!("cat {}", absolute_path_outside_workspace())}))
             .await
             .expect("absolute path argument should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "absolute path argument");
     }
 
     /// End-to-end regression for the shell workspace-boundary bypass: driving
@@ -1339,53 +1382,41 @@ mod tests {
 
     #[tokio::test]
     async fn shell_blocks_option_assignment_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["grep"],
+        ));
         let result = tool
             .execute(json!({"command": format!("grep --file={} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("option-assigned forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "option-assigned forbidden path");
     }
 
     #[tokio::test]
     async fn shell_blocks_short_option_attached_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["grep"],
+        ));
         let result = tool
             .execute(json!({"command": format!("grep -f{} root ./src", absolute_path_outside_workspace())}))
             .await
             .expect("short option attached forbidden path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "short option attached forbidden path");
     }
 
     #[tokio::test]
     async fn shell_blocks_tilde_user_path_argument() {
-        let tool = wrapped_shell(test_security(AutonomyLevel::Supervised));
+        let tool = wrapped_shell(test_security_with_allowed_commands(
+            AutonomyLevel::Supervised,
+            &["cat"],
+        ));
         let result = tool
             .execute(json!({"command": "cat ~root/.ssh/id_rsa"}))
             .await
             .expect("tilde-user path should be blocked");
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("Path blocked")
-        );
+        assert_path_argument_blocked(&result, "tilde-user path");
     }
 
     #[tokio::test]
@@ -1605,10 +1636,11 @@ mod tests {
 
     #[tokio::test]
     async fn shell_requires_approval_for_medium_risk_command() {
+        let workspace = tempfile::TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec![medium_risk_write_base().into()],
-            workspace_dir: std::env::temp_dir(),
+            workspace_dir: workspace.path().to_path_buf(),
             ..SecurityPolicy::default()
         });
 
@@ -1633,10 +1665,7 @@ mod tests {
             }))
             .await
             .expect("approved command execution should succeed");
-        assert!(allowed.success);
-
-        let _ =
-            tokio::fs::remove_file(std::env::temp_dir().join("zeroclaw_shell_approval_test")).await;
+        assert!(allowed.success, "{:?}", allowed.error);
     }
 
     // ── shell timeout enforcement tests ─────────────────

@@ -6,6 +6,9 @@
 //! Agent runtime — orchestration, security, observability, cron, SOP, skills, hardware, and more.
 
 pub mod cli_input;
+/// Locale table rendered from repo-root `locales.toml` by
+/// `cargo generate installers runtime-locales`. Generated, not hand-edited.
+mod generated_locales;
 pub mod identity;
 pub mod migration;
 pub mod util;
@@ -28,6 +31,7 @@ pub mod nodes;
 pub mod observability;
 pub mod peers;
 pub mod platform;
+pub mod plugin_runtime;
 pub mod process_stats;
 pub mod quickstart;
 pub mod rag;
