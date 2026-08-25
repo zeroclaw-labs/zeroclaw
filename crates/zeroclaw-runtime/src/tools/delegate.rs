@@ -152,6 +152,15 @@ pub struct DelegateTool {
     /// time. When unset (legacy unit-test constructors), DelegateTool falls
     /// back to using `self.security` for the spawned inner DelegateTool.
     root_config: Option<Arc<Config>>,
+    /// The daemon's shared live-config handle, when the registry that built
+    /// this tool had one. `root_config` above is a *snapshot* taken at
+    /// construction; every nested registry this tool builds must additionally
+    /// receive this handle so the target's per-execution resolvers (plugin
+    /// `[plugins.entries.config]`, `send_via` peer-group authority) follow
+    /// config reloads and credential rotation instead of the startup snapshot.
+    /// `None` for one-shot / non-daemon callers, which keep the documented
+    /// snapshot fallback.
+    live_config: Option<Arc<RwLock<Config>>>,
     /// Alias of the agent that owns this DelegateTool. Excluded from the
     /// advertised roster so an agent is never offered itself as a
     /// delegation target. Empty when unset (legacy unit-test constructors).
@@ -209,8 +218,8 @@ impl DelegateAction {
     }
 }
 
-struct IndependentTargetTools {
-    tools: Vec<Box<dyn Tool>>,
+pub(crate) struct IndependentTargetTools {
+    pub(crate) tools: Vec<Box<dyn Tool>>,
     /// The deferred-MCP + pinned-resources system-prompt section (empty unless
     /// the target has granted MCP bundles under deferred loading).
     deferred_section: String,
@@ -267,6 +276,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -314,6 +324,7 @@ impl DelegateTool {
             runtime_profiles: Arc::new(HashMap::new()),
             skill_bundles: Arc::new(HashMap::new()),
             root_config: None,
+            live_config: None,
             caller_alias: String::new(),
         }
     }
@@ -417,6 +428,21 @@ impl DelegateTool {
         self
     }
 
+    /// Attach the daemon's shared live-config handle alongside
+    /// [`Self::with_root_config`].
+    ///
+    /// `with_root_config` supplies the snapshot this tool reads synchronously
+    /// (reachability, target mode, per-target policy). This supplies the handle
+    /// that every *nested* registry built for a delegated target needs so its
+    /// per-execution resolvers follow reloads. Passing `None` is the documented
+    /// one-shot behavior and keeps the snapshot fallback; dropping the handle
+    /// when the caller has one silently pins delegated plugin tools to startup
+    /// config for the parent's whole lifetime.
+    pub fn with_live_config(mut self, live_config: Option<Arc<RwLock<Config>>>) -> Self {
+        self.live_config = live_config;
+        self
+    }
+
     /// Set the owning agent's alias so it can be excluded from the
     /// advertised delegation roster (an agent must never delegate to
     /// itself).
@@ -425,7 +451,10 @@ impl DelegateTool {
         self
     }
 
-    fn policy_for_target(&self, target_alias: &str) -> anyhow::Result<Arc<SecurityPolicy>> {
+    pub(crate) fn policy_for_target(
+        &self,
+        target_alias: &str,
+    ) -> anyhow::Result<Arc<SecurityPolicy>> {
         let Some(config) = self.root_config.as_ref() else {
             return Ok(Arc::clone(&self.security));
         };
@@ -688,7 +717,7 @@ impl DelegateTool {
         ]
     }
 
-    async fn independent_agentic_tools_for_target(
+    pub(crate) async fn independent_agentic_tools_for_target(
         &self,
         agent_name: &str,
         target_policy: Arc<SecurityPolicy>,
@@ -752,7 +781,15 @@ impl DelegateTool {
             None,
             None,
             None,
-            None,
+            // The delegated target's registry is built once, here, but its
+            // plugin tools and `send_via` authority resolve per execution. They
+            // must resolve against the daemon's shared handle, not the
+            // `root_config` snapshot this DelegateTool captured at
+            // construction - otherwise a reload or credential rotation is
+            // invisible to every delegated plugin tool for the parent's whole
+            // lifetime. `None` only when the parent registry itself had no live
+            // handle (one-shot callers), which keeps the snapshot fallback.
+            self.live_config.clone(),
         );
 
         let target_workspace = config.agent_workspace_dir(agent_name);
@@ -1610,6 +1647,9 @@ impl DelegateTool {
         let runtime_profiles = Arc::clone(&self.runtime_profiles);
         let skill_bundles = Arc::clone(&self.skill_bundles);
         let root_config = self.root_config.clone();
+        // Carried, not dropped: the background task rebuilds a DelegateTool that
+        // will construct its own nested registries.
+        let live_config = self.live_config.clone();
         let caller_alias = self.caller_alias.clone();
         let memory = self.memory.clone();
         let parent_session_key = current_tool_loop_session_key();
@@ -1635,6 +1675,7 @@ impl DelegateTool {
                     runtime_profiles,
                     skill_bundles,
                     root_config,
+                    live_config,
                     caller_alias,
                 };
 
@@ -1858,6 +1899,9 @@ impl DelegateTool {
             let skill_bundles = Arc::clone(&self.skill_bundles);
             let receipt_scope = parent_receipt_scope.clone();
             let root_config = self.root_config.clone();
+            // Carried, not dropped: each fan-out task rebuilds a DelegateTool
+            // that will construct its own nested registries.
+            let live_config = self.live_config.clone();
             let caller_alias = self.caller_alias.clone();
             let session_key = parent_session_key.clone();
             let memory = self.memory.clone();
@@ -1883,6 +1927,7 @@ impl DelegateTool {
                         runtime_profiles,
                         skill_bundles,
                         root_config,
+                        live_config,
                         caller_alias,
                     };
                     let agent_name_for_return = agent_name.clone();
@@ -2844,6 +2889,9 @@ impl ::zeroclaw_api::attribution::Attributable for ToolArcRef {
     fn alias(&self) -> &str {
         self.inner.alias()
     }
+    fn tool_provenance(&self) -> ::zeroclaw_api::attribution::ToolProvenance {
+        self.inner.tool_provenance()
+    }
 }
 
 #[async_trait]
@@ -2873,6 +2921,10 @@ impl Tool for ToolArcRef {
     // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
     fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
         self.inner.spec()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -9906,6 +9958,71 @@ mod tool_arc_ref_spec_tests {
             Arc::ptr_eq(&wrapped.spec().parameters, &inner_params),
             "ToolArcRef must forward spec() so the inner Arc-shared schema \
              survives; the trait default deep-clones it every call"
+        );
+    }
+
+    /// Trigger-owning tool standing in for `send_via` behind bounded
+    /// delegation's `ToolArcRef` wrapper.
+    struct TriggerOwningTool;
+
+    impl ::zeroclaw_api::attribution::Attributable for TriggerOwningTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            "trigger-owning-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for TriggerOwningTool {
+        fn name(&self) -> &str {
+            "trigger_owning_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test tool with invocation triggers"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        fn invocation_triggers(&self) -> Vec<String> {
+            vec!["send this to".into(), "as a voice message".into()]
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[test]
+    fn tool_arc_ref_forwards_invocation_triggers() {
+        // Regression: bounded delegation re-wraps every admitted parent tool
+        // in `ToolArcRef` (see the sub-tool assembly in `execute`). Without
+        // explicit forwarding the trait default returns an empty vocabulary,
+        // silently erasing a trigger-owning tool's metadata for any consumer
+        // scanning a delegate's assembled tools.
+        let inner: Arc<dyn Tool> = Arc::new(TriggerOwningTool);
+        let wrapped = ToolArcRef::new(Arc::clone(&inner));
+
+        assert_eq!(
+            wrapped.invocation_triggers(),
+            inner.invocation_triggers(),
+            "ToolArcRef must forward invocation_triggers(); the trait \
+             default erases the inner tool's vocabulary"
+        );
+        assert!(
+            wrapped
+                .invocation_triggers()
+                .iter()
+                .any(|t| t == "send this to"),
+            "wrapped trigger vocabulary must survive bounded delegation"
         );
     }
 }

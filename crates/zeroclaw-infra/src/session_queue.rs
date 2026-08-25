@@ -97,7 +97,12 @@ impl SessionActorQueue {
                 .clone();
 
             #[cfg(test)]
-            if let Some(hook) = self.registration_hook.lock().unwrap().as_ref() {
+            let registration_hook = match self.registration_hook.lock() {
+                Ok(hook) => hook,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            #[cfg(test)]
+            if let Some(hook) = registration_hook.as_ref() {
                 hook();
             }
 

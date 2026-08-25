@@ -61,6 +61,63 @@ pub fn try_install_capture_subscriber() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
+/// Test support: install a process-global subscriber that hands every
+/// formatted event line to `sink`, exactly where the stderr fmt layer would
+/// write. Lets an integration test in another crate observe, and deliberately
+/// stall, the terminal write path without naming `tracing` types outside this
+/// crate. The sink runs unlocked on whichever thread emits the event, so a
+/// sink that blocks on one event models a wedged consumer of that event
+/// without serializing every other thread's unrelated writes behind it.
+/// Mirrors the production wiring by stacking [`LogCaptureLayer`] under the
+/// terminal layer, so `attribution_span!` scopes carry their attribution
+/// extensions and both the structured and terminal outputs behave as in a
+/// real daemon. Returns `false` when a global subscriber was already
+/// installed.
+#[doc(hidden)]
+pub fn try_install_line_sink_for_tests(sink: impl Fn(&str) + Send + Sync + 'static) -> bool {
+    use std::sync::Arc;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    type SharedSink = Arc<dyn Fn(&str) + Send + Sync>;
+
+    #[derive(Clone)]
+    struct SinkMakeWriter(SharedSink);
+    struct SinkGuard(SharedSink);
+
+    impl std::io::Write for SinkGuard {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let line = String::from_utf8_lossy(buf);
+            (self.0)(&line);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for SinkMakeWriter {
+        type Writer = SinkGuard;
+        fn make_writer(&'a self) -> Self::Writer {
+            SinkGuard(self.0.clone())
+        }
+    }
+
+    let shared: SharedSink = Arc::new(sink);
+    // INFO floor: keeps third-party TRACE/DEBUG chatter (e.g. wasmtime
+    // internals) from serializing through the sink while still delivering
+    // every `record!`-level event a test would assert on.
+    let fmt_layer = fmt::layer()
+        .fmt_fields(RedactEphemeralFields)
+        .with_writer(SinkMakeWriter(shared))
+        .with_ansi(false)
+        .event_format(AgentAliasFormatter::new())
+        .with_filter(EnvFilter::new("info"));
+    let subscriber = tracing_subscriber::registry()
+        .with(LogCaptureLayer)
+        .with(fmt_layer);
+    tracing::subscriber::set_global_default(subscriber).is_ok()
+}
+
 /// Field formatter that renders event fields exactly like the default
 /// formatter but drops the `zc_ephemeral_attrs` transport field, so
 /// short-lived pairing credentials (QR payloads, pair codes) never reach the

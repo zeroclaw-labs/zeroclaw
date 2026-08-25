@@ -26,7 +26,7 @@ cli-config-about = ZeroClaw設定を管理
 cli-update-about = ZeroClaw更新を確認・適用
 cli-self-test-about = 診断自己テストを実行
 cli-completions-about = シェル補完スクリプトを生成
-cli-desktop-about = ZeroClawコンパニオンデスクトップアプリを起動
+cli-desktop-about = コンパニオンデスクトップアプリを起動、またはダウンロードページを開く
 cli-config-schema-about = 完全な設定JSONスキーマをstdoutにダンプ
 cli-config-list-about = すべての設定プロパティを現在の値とともにリスト表示
 cli-config-get-about = 設定プロパティ値を取得
@@ -316,11 +316,11 @@ cli-desktop-long-about =
 
     コンパニオンアプリは、CLI と同じゲートウェイに接続する軽量のメニューバー/システムトレイアプリケーションです。ダッシュボードへのクイックアクセス、ステータス監視、およびデバイスペアリングを提供します。
 
-    --install を使用して、プラットフォーム用の事前ビルドコンパニオンアプリをダウンロードしてください。
+    --install を使用すると、プラットフォーム用のダウンロードページが開きます。それ自体は何もインストールしません。
 
     例:
     zeroclaw desktop              # コンパニオンアプリを起動
-    zeroclaw desktop --install    # ダウンロードしてインストール
+    zeroclaw desktop --install    # ダウンロードページを開く
 channel-needs-quickstart-reply = このエージェントはまだ完全にセットアップされていません。返信する前に、オペレーターがQuickstartを実行する必要があります。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web は設定されていますが、'whatsapp-web' 機能がコンパイルされていません。
 channel-whatsapp-web-feature-missing-build = ビルド/実行: cargo build --features whatsapp-web
@@ -372,6 +372,12 @@ channel-whatsapp-web-delivery-failure-note-many = （注意：{$count}件のWhat
 channel-line-bind-success = ✅ ペアリングしました！チャットできるようになりました。
 channel-line-bind-invalid-code = ❌ 無効なコードです。もう一度お試しください。
 channel-line-bind-rate-limited = ⏳ 試行回数が多すぎます。{ $secs }秒後に再試行してください。
+channel-telegram-cmd-new-desc = 新しい会話セッションを開始
+channel-telegram-cmd-clear-desc = この会話セッションをクリア
+channel-telegram-cmd-stop-desc = 実行中のタスクをキャンセル
+channel-telegram-cmd-model-desc = 現在のモデルを表示または切り替え
+channel-telegram-cmd-models-desc = 利用可能なモデルプロバイダーを一覧表示、またはプロバイダーを切り替え
+channel-telegram-cmd-config-desc = 現在の設定を表示
 onboard-openai-auth-note =
     OpenAI認証:
     • APIキー — platform.openai.com 経由の標準APIアクセス (sk-...)
@@ -425,6 +431,7 @@ cli-sop-none = SOP が見つかりません。
 cli-sop-pending-none = 承認待ちの SOP 実行はありません。
 cli-sop-pending-header = 承認待ちの SOP 実行:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] ステップ {$step}/{$total}
+cli-sop-status-failure-reason = 失敗の理由: {$reason}
 cli-sop-ws-invalid-approval = sop approval_response には run_id と approve または deny の決定が必要です
 cli-sop-ws-resolve-failed = SOP の解決に失敗しました: {$error}
 cli-sop-ws-engine-lock-poisoned = SOP エンジンロックがポイズンされました
@@ -599,6 +606,7 @@ cli-quickstart-error-channel-required = チャンネルタイプとエイリア�
 cli-quickstart-error-channel-field-not-advertised = チャンネルフィールド `{$field}` は Quickstart では使用できません
 cli-quickstart-error-channel-token-required = Telegram Bot トークンが必要です
 cli-quickstart-error-webhook-secret-required = Webhook 共有シークレットが必要です
+cli-quickstart-error-webhook-port-conflict = Webhook ポート {$port} は有効な Webhook `{$alias}` が既に使用しています — 有効な Webhook にはそれぞれ固有のポートが必要です
 cli-quickstart-error-peer-group-name-required = ピアグループ名が必要です
 cli-quickstart-error-peer-group-channel-required = ピアグループのチャンネル参照が必要です
 cli-quickstart-error-peer-group-unknown-channel = ピアグループ `{$name}` が不明なチャンネル `{$channel}` を参照しています
@@ -659,9 +667,9 @@ cli-status-service-stopped = 🔴 サービス:       停止
 cli-status-channels = チャンネル:
 cli-status-cli-always = {"  "}CLI:      ✅ 常時
 cli-status-peripherals = 周辺機器:
-cli-desktop-download = ZeroClaw コンパニオンアプリをダウンロード:
+cli-desktop-download = ZeroClaw コンパニオンアプリのダウンロードページを開きます:
 cli-desktop-homebrew = または Homebrew でインストール(近日対応予定):
-cli-desktop-linux-pkg = {"  "}お使いのアーキテクチャ用の .deb または .AppImage をダウンロードしてください。
+cli-desktop-linux-pkg = {"  "}このページには、アーキテクチャ別の .deb と .AppImage があります。
 cli-desktop-launching = ZeroClaw コンパニオンアプリを起動中...
 cli-status-version = バージョン:     {$v}
 cli-status-workspace = ワークスペース:   {$v}
@@ -717,8 +725,8 @@ cli-plugin-install-resolving = プラグインレジストリから '{$source}' 
 cli-plugin-installed-from = プラグインを {$source} からインストールしました
 cli-plugin-installed-name-version = プラグイン {$name} v{$version} をインストールしました
 cli-plugin-config-entry-seeded = '{$name}' の [[plugins.entries]] を作成しました。プラグイン設定値は `zeroclaw config set plugins.entries.{$name}.config.<key>` で設定してください。
+cli-plugin-config-entry-key = 設定エントリキー ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = 警告: '{$name}' の設定エントリ作成をスキップしました: ディスク上の [plugins] セクションが不正です。修復し、`name = "{$name}"` を含む [[plugins.entries]] ブロックを追加してから、`zeroclaw config set plugins.entries.{$name}.config.<key>` で値を設定してください。
-cli-plugin-config-entry-seed-unaddressable = 警告: '{$name}' の設定エントリ作成をスキップしました: '.' を含むプラグイン名はドット区切りの設定パスで指定できません (`config set` は '.' で分割します)。設定ファイルに `name = "{$name}"` を含む [[plugins.entries]] ブロックを手動で追加してください。
 cli-config-section-degraded = 警告: {$path} の設定セクション `{$section}` は不正なため、この実行ではデフォルト値にリセットされました。そのセクションの値は有効ではありません。`zeroclaw config migrate` を実行して解析エラーを確認し、ファイルを修復してください。
 cli-plugin-removed = プラグイン '{$name}' を削除しました。
 cli-plugin-not-found = プラグイン '{$name}' が見つかりません。

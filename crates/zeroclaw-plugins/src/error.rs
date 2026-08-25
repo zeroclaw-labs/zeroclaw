@@ -10,6 +10,9 @@ pub enum PluginError {
     #[error("invalid manifest: {0}")]
     InvalidManifest(String),
 
+    #[error("invalid plugin config: {0}")]
+    InvalidConfig(String),
+
     #[error("invalid plugin instance identity: {0}")]
     InvalidInstanceId(String),
 

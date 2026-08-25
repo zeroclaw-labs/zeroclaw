@@ -1255,7 +1255,11 @@ impl GeminiModelProvider {
                             (token, proj)
                         }
                         GeminiAuth::ManagedOAuth => {
-                            let auth_service = self.auth_service.as_ref().unwrap();
+                            let Some(auth_service) = self.auth_service.as_ref() else {
+                                return Err(anyhow::Error::msg(
+                                    "Gemini managed OAuth requires an auth service",
+                                ));
+                            };
                             let token = auth_service
                                 .get_valid_gemini_access_token(
                                     self.auth_profile_override.as_deref(),
@@ -1281,7 +1285,11 @@ impl GeminiModelProvider {
                             let proj = self.resolve_oauth_project(&token).await?;
                             (token, proj)
                         }
-                        _ => unreachable!(),
+                        _ => {
+                            return Err(anyhow::Error::msg(
+                                "Gemini retry reached a non-refreshable authentication mode",
+                            ));
+                        }
                     };
                     oauth_token = Some(new_token);
                     project = Some(new_project);

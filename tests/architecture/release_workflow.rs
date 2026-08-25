@@ -6,7 +6,63 @@
 
 use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+
+fn bash_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Resolve the interpreter that runs the POSIX release scripts below.
+///
+/// `Command::new("bash")` is not safe on Windows: `CreateProcess` searches the
+/// system directory before `PATH`, and Windows ships a WSL launcher stub at
+/// `%SystemRoot%\System32\bash.exe`. The GitHub Windows images carry that stub
+/// without a WSL distribution, so it exits non-zero without running the script
+/// and without writing anything to stderr — every script-driven gate here then
+/// fails with an empty diagnostic. Resolve Git for Windows' Bash explicitly
+/// (the same interpreter the workflow's own `shell: bash` steps use) and only
+/// fall back to bare name resolution when no real Bash can be located.
+fn bash_command() -> Command {
+    Command::new(bash_program())
+}
+
+#[cfg(not(windows))]
+fn bash_program() -> PathBuf {
+    PathBuf::from("bash")
+}
+
+#[cfg(windows)]
+fn bash_program() -> PathBuf {
+    let git_bash = ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"]
+        .into_iter()
+        .filter_map(std::env::var_os)
+        .map(|root| PathBuf::from(root).join("Git").join("bin").join("bash.exe"));
+
+    let on_path = std::env::var_os("PATH")
+        .map(|paths| {
+            std::env::split_paths(&paths)
+                .filter(|directory| !is_windows_system_directory(directory))
+                .map(|directory| directory.join("bash.exe"))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    git_bash
+        .chain(on_path)
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from("bash"))
+}
+
+/// The WSL stub lives in the system directory; nothing else named `bash.exe`
+/// is expected there, so excluding it is enough to reach a real interpreter.
+#[cfg(windows)]
+fn is_windows_system_directory(directory: &Path) -> bool {
+    directory.file_name().is_some_and(|name| {
+        let name = name.to_string_lossy().to_ascii_lowercase();
+        name == "system32" || name == "syswow64"
+    })
+}
 
 fn workflow(name: &str) -> String {
     let workflow_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -14,6 +70,20 @@ fn workflow(name: &str) -> String {
         .join(name);
     fs::read_to_string(&workflow_path)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", workflow_path.display()))
+}
+
+/// Render everything a failed script run can tell us.
+///
+/// A misresolved or non-functional interpreter fails with an empty stderr, so
+/// an assertion that reports stderr alone leaves nothing to diagnose. Include
+/// the exit status and stdout as well.
+fn command_diagnostics(output: &std::process::Output) -> String {
+    format!(
+        "status={:?} stdout={:?} stderr={:?}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
 }
 
 fn assert_command_failure(
@@ -280,18 +350,20 @@ fn package_publishers_use_canonical_sources_and_scoped_credentials() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let source_srcinfo = root.join("dist/aur/.SRCINFO");
     let source_pkgbuild = root.join("dist/aur/PKGBUILD");
-    let source_guard = Command::new("bash")
-        .arg(root.join("scripts/release/aur_version_guard.sh"))
-        .arg(&source_srcinfo)
-        .arg(&source_srcinfo)
-        .arg(&source_pkgbuild)
-        .arg(&source_pkgbuild)
+    let source_guard = bash_command()
+        .arg(bash_path(
+            &root.join("scripts/release/aur_version_guard.sh"),
+        ))
+        .arg(bash_path(&source_srcinfo))
+        .arg(bash_path(&source_srcinfo))
+        .arg(bash_path(&source_pkgbuild))
+        .arg(bash_path(&source_pkgbuild))
         .output()
         .expect("validate checked-in AUR package metadata");
     assert!(
         source_guard.status.success(),
         "checked-in PKGBUILD and .SRCINFO version tuples must agree: {}",
-        String::from_utf8_lossy(&source_guard.stderr)
+        command_diagnostics(&source_guard)
     );
 
     let freshness = workflow("aur-freshness-check.yml");
@@ -344,16 +416,16 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         fs::write(&current_srcinfo, current_metadata).expect("write current AUR .SRCINFO");
         fs::write(&target_pkgbuild, target_build).expect("write target AUR PKGBUILD");
         fs::write(&current_pkgbuild, current_build).expect("write current AUR PKGBUILD");
-        let mut command = Command::new("bash");
-        command.arg(&guard_script);
+        let mut command = bash_command();
+        command.arg(bash_path(&guard_script));
         if allow_downgrade {
             command.arg("--allow-downgrade");
         }
         command
-            .arg(&target_srcinfo)
-            .arg(&current_srcinfo)
-            .arg(&target_pkgbuild)
-            .arg(&current_pkgbuild)
+            .arg(bash_path(&target_srcinfo))
+            .arg(bash_path(&current_srcinfo))
+            .arg(bash_path(&target_pkgbuild))
+            .arg(bash_path(&current_pkgbuild))
             .output()
             .expect("run AUR monotonic package guard")
     };
@@ -364,7 +436,7 @@ fn aur_publisher_rejects_stale_release_downgrades() {
     assert!(
         output.status.success(),
         "an unchanged package must be idempotent: {}",
-        String::from_utf8_lossy(&output.stderr)
+        command_diagnostics(&output)
     );
 
     for (target, current) in [("1.2.4", "1.2.3"), ("1.10.0", "1.9.9")] {
@@ -378,7 +450,7 @@ fn aur_publisher_rejects_stale_release_downgrades() {
         assert!(
             output.status.success(),
             "target {target} should be allowed over {current}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            command_diagnostics(&output)
         );
     }
 
@@ -525,12 +597,12 @@ fn aur_publisher_rejects_stale_release_downgrades() {
     fs::write(&target_pkgbuild, &same_build).expect("restore target AUR PKGBUILD");
     fs::remove_file(&current_srcinfo).expect("remove current AUR .SRCINFO");
     fs::remove_file(&current_pkgbuild).expect("remove current AUR PKGBUILD");
-    let output = Command::new("bash")
-        .arg(&guard_script)
-        .arg(&target_srcinfo)
-        .arg(&current_srcinfo)
-        .arg(&target_pkgbuild)
-        .arg(&current_pkgbuild)
+    let output = bash_command()
+        .arg(bash_path(&guard_script))
+        .arg(bash_path(&target_srcinfo))
+        .arg(bash_path(&current_srcinfo))
+        .arg(bash_path(&target_pkgbuild))
+        .arg(bash_path(&current_pkgbuild))
         .output()
         .expect("run AUR guard with missing current metadata");
     assert_command_failure(
@@ -541,12 +613,12 @@ fn aur_publisher_rejects_stale_release_downgrades() {
     );
 
     fs::write(&current_srcinfo, &equal).expect("restore only current AUR .SRCINFO");
-    let output = Command::new("bash")
-        .arg(&guard_script)
-        .arg(&target_srcinfo)
-        .arg(&current_srcinfo)
-        .arg(&target_pkgbuild)
-        .arg(&current_pkgbuild)
+    let output = bash_command()
+        .arg(bash_path(&guard_script))
+        .arg(bash_path(&target_srcinfo))
+        .arg(bash_path(&current_srcinfo))
+        .arg(bash_path(&target_pkgbuild))
+        .arg(bash_path(&current_pkgbuild))
         .output()
         .expect("run AUR guard with partial current metadata");
     assert_command_failure(
@@ -566,9 +638,9 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
                     credential_canary: &str,
                     bucket_repo: Option<&str>,
                     bucket_token: Option<&str>| {
-        let mut command = Command::new("bash");
+        let mut command = bash_command();
         command
-            .arg(&gate)
+            .arg(bash_path(&gate))
             .env("DRY_RUN", dry_run)
             .env("CREDENTIAL_CANARY", credential_canary)
             .env_remove("SCOOP_BUCKET_REPO")
@@ -586,7 +658,7 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
     assert!(
         generic_dry_run.status.success(),
         "a generic dry run may omit bucket credentials: {}",
-        String::from_utf8_lossy(&generic_dry_run.stderr)
+        command_diagnostics(&generic_dry_run)
     );
     assert_eq!(generic_dry_run.stdout, b"skip\n");
 
@@ -610,7 +682,7 @@ fn scoop_credential_canary_fails_closed_without_weakening_generic_dry_runs() {
     assert!(
         configured_canary.status.success(),
         "configured credential canary must reach the authorization probe: {}",
-        String::from_utf8_lossy(&configured_canary.stderr)
+        command_diagnostics(&configured_canary)
     );
     assert_eq!(configured_canary.stdout, b"probe\n");
 
@@ -867,16 +939,16 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
     )
     .expect("write temporary Scoop manifest");
 
-    let output = Command::new("bash")
-        .arg(&metadata_script)
-        .arg(&manifest_path)
+    let output = bash_command()
+        .arg(bash_path(&metadata_script))
+        .arg(bash_path(&manifest_path))
         .arg("1.2.3")
         .output()
         .expect("run Scoop metadata materializer");
     assert!(
         output.status.success(),
         "Scoop metadata materializer failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        command_diagnostics(&output)
     );
     let metadata: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("parse Scoop publisher metadata");
@@ -891,9 +963,9 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
         "https://downloads.example.test/renamed/repository/releases/v1.2.3/SHA256SUMS"
     );
 
-    let output = Command::new("bash")
-        .arg(&metadata_script)
-        .arg(&manifest_path)
+    let output = bash_command()
+        .arg(bash_path(&metadata_script))
+        .arg(bash_path(&manifest_path))
         .arg("v1.2.3")
         .output()
         .expect("run Scoop version validation");
@@ -919,9 +991,9 @@ fn scoop_publisher_metadata_follows_canonical_url_template() {
             serde_json::to_vec(&invalid_manifest).expect("serialize invalid Scoop manifest"),
         )
         .expect("write invalid Scoop manifest");
-        let output = Command::new("bash")
-            .arg(&metadata_script)
-            .arg(&manifest_path)
+        let output = bash_command()
+            .arg(bash_path(&metadata_script))
+            .arg(bash_path(&manifest_path))
             .arg("1.2.3")
             .output()
             .expect("run Scoop metadata validation");

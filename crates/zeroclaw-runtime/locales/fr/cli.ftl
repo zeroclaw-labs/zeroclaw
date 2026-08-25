@@ -26,7 +26,7 @@ cli-config-about = Gérer la configuration de ZeroClaw
 cli-update-about = Vérifier et appliquer les mises à jour de ZeroClaw
 cli-self-test-about = Exécuter les tests d'autodiagnostic
 cli-completions-about = Générer des scripts d'achèvement de shell
-cli-desktop-about = Lancer l'application de bureau companion ZeroClaw
+cli-desktop-about = Lancer l'application de bureau compagnon, ou ouvrir sa page de téléchargement
 cli-config-schema-about = Afficher le schéma JSON complet de la configuration sur stdout
 cli-config-list-about = Lister toutes les propriétés de configuration avec leurs valeurs actuelles
 cli-config-get-about = Obtenir la valeur d'une propriété de configuration
@@ -319,11 +319,11 @@ cli-desktop-long-about =
 
     L'application compagnon est une application légère pour la barre de menu / zone de dénombrement du système qui se connecte au même pont que la CLI. Elle fournit un accès rapide au tableau de bord, à la supervision de l'état et à l'appairage des appareils.
 
-    Utilisez --install pour télécharger l'application compagnon pré-construite pour votre plateforme.
+    Utilisez --install pour ouvrir la page de téléchargement pour votre plateforme. Cela n'installe rien en soi.
 
     Exemples :
     zeroclaw desktop              # lancer l'application compagnon
-    zeroclaw desktop --install    # télécharger et l'installer
+    zeroclaw desktop --install    # ouvrir la page de téléchargement
 channel-needs-quickstart-reply = Cet agent n'est pas encore entièrement configuré. L'opérateur doit exécuter Quickstart avant que je puisse répondre.
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web est configuré mais la fonctionnalité 'whatsapp-web' n'est pas compilée.
 channel-whatsapp-web-feature-missing-build = Compilez/exécutez avec : cargo build --features whatsapp-web
@@ -375,6 +375,12 @@ channel-whatsapp-web-delivery-failure-note-many = (note : je n'ai pas pu livrer 
 channel-line-bind-success = ✅ Appairé ! Vous pouvez maintenant discuter.
 channel-line-bind-invalid-code = ❌ Code invalide. Veuillez réessayer.
 channel-line-bind-rate-limited = ⏳ Trop de tentatives. Réessayez dans { $secs }s.
+channel-telegram-cmd-new-desc = Démarrer une nouvelle session de conversation
+channel-telegram-cmd-clear-desc = Effacer cette session de conversation
+channel-telegram-cmd-stop-desc = Annuler la tâche en cours
+channel-telegram-cmd-model-desc = Afficher ou changer le modèle actuel
+channel-telegram-cmd-models-desc = Lister les fournisseurs de modèles disponibles ou changer de fournisseur
+channel-telegram-cmd-config-desc = Afficher la configuration actuelle
 onboard-openai-auth-note =
     Authentification OpenAI :
     • Clé API — accès API standard via platform.openai.com (sk-...)
@@ -428,6 +434,7 @@ cli-sop-none = Aucun SOP trouvé.
 cli-sop-pending-none = Aucune exécution SOP en attente d'approbation.
 cli-sop-pending-header = Exécutions SOP en attente d'approbation :
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] étape {$step}/{$total}
+cli-sop-status-failure-reason = Motif de l’échec : {$reason}
 cli-sop-ws-invalid-approval = sop approval_response requiert run_id et une décision approve ou deny
 cli-sop-ws-resolve-failed = échec de la résolution SOP : {$error}
 cli-sop-ws-engine-lock-poisoned = verrou du moteur SOP empoisonné
@@ -602,6 +609,7 @@ cli-quickstart-error-channel-required = le type de canal et l'alias sont requis
 cli-quickstart-error-channel-field-not-advertised = le champ de canal `{$field}` n'est pas disponible dans Quickstart
 cli-quickstart-error-channel-token-required = le jeton du bot Telegram est requis
 cli-quickstart-error-webhook-secret-required = le secret partagé du webhook est requis
+cli-quickstart-error-webhook-port-conflict = le port webhook {$port} est déjà utilisé par le webhook activé `{$alias}` — chaque webhook activé doit avoir son propre port
 cli-quickstart-error-peer-group-name-required = le nom du groupe de pairs est requis
 cli-quickstart-error-peer-group-channel-required = la référence de canal du groupe de pairs est requise
 cli-quickstart-error-peer-group-unknown-channel = le groupe de pairs `{$name}` référence un canal inconnu `{$channel}`
@@ -662,9 +670,9 @@ cli-status-service-stopped = 🔴 Service :       arrêté
 cli-status-channels = Canaux :
 cli-status-cli-always = {"  "}CLI :      ✅ toujours
 cli-status-peripherals = Périphériques :
-cli-desktop-download = Téléchargez l'application compagnon ZeroClaw :
+cli-desktop-download = Ouverture de la page de téléchargement de l'application compagnon ZeroClaw :
 cli-desktop-homebrew = Ou installez via Homebrew (bientôt disponible) :
-cli-desktop-linux-pkg = {"  "}Téléchargez le fichier .deb ou .AppImage pour votre architecture.
+cli-desktop-linux-pkg = {"  "}La page propose des fichiers .deb et .AppImage selon l'architecture.
 cli-desktop-launching = Lancement de l'application compagnon ZeroClaw...
 cli-status-version = Version :     {$v}
 cli-status-workspace = Espace de travail :   {$v}
@@ -720,8 +728,8 @@ cli-plugin-install-resolving = Résolution de '{$source}' depuis le registre de 
 cli-plugin-installed-from = Plugin installé depuis {$source}
 cli-plugin-installed-name-version = Plugin {$name} v{$version} installé
 cli-plugin-config-entry-seeded = [[plugins.entries]] initialisé pour '{$name}'. Définissez les valeurs de configuration du plugin avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Clé de configuration ({$capability}) : {$key}
 cli-plugin-config-entry-seed-skipped = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : la section [plugins] sur disque est mal formée. Réparez-la, ajoutez un bloc [[plugins.entries]] avec `name = "{$name}"`, puis définissez les valeurs avec `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-seed-unaddressable = avertissement : initialisation de l'entrée de configuration ignorée pour '{$name}' : les noms de plugin contenant '.' ne peuvent pas être adressés par des chemins de configuration pointés (`config set` découpe sur '.'). Ajoutez manuellement un bloc [[plugins.entries]] avec `name = "{$name}"` au fichier de configuration.
 cli-config-section-degraded = avertissement : la section de configuration `{$section}` dans {$path} est mal formée et a été réinitialisée aux valeurs par défaut pour cette exécution. Les valeurs de cette section NE sont PAS appliquées. Exécutez `zeroclaw config migrate` pour voir l'erreur d'analyse, puis réparez le fichier.
 cli-plugin-removed = Plugin « {$name} » supprimé.
 cli-plugin-not-found = Plugin « {$name} » introuvable.

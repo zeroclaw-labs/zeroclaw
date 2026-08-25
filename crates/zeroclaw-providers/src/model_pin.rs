@@ -1,5 +1,7 @@
 use super::ModelProvider;
-use super::dispatch::ProviderDispatch;
+use super::dispatch::{
+    ProviderDispatch, mark_current_dispatch_composite, stream_as_dispatch_composite,
+};
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -147,6 +149,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_system(system_prompt, message, &self.pinned_model, temperature)
             .await
@@ -158,6 +161,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_history(messages, &self.pinned_model, temperature)
             .await
@@ -169,6 +173,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat(request, &self.pinned_model, temperature)
             .await
@@ -181,6 +186,7 @@ impl ModelProvider for ModelPinnedProvider {
         _model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         ProviderDispatch::from_ref(&*self.inner)
             .chat_with_tools(messages, tools, &self.pinned_model, temperature)
             .await
@@ -194,14 +200,14 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-        // stream_chat_with_system is not on ProviderDispatch's protected
-        // surface — the dispatcher only wraps stream_chat. Pass through.
-        self.inner.stream_chat_with_system(
-            system_prompt,
-            message,
-            &self.pinned_model,
-            temperature,
-            options,
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_system(
+                system_prompt,
+                message,
+                &self.pinned_model,
+                temperature,
+                options,
+            ),
         )
     }
 
@@ -212,9 +218,14 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
-        // Same passthrough rationale as stream_chat_with_system.
-        self.inner
-            .stream_chat_with_history(messages, &self.pinned_model, temperature, options)
+        stream_as_dispatch_composite(
+            ProviderDispatch::from_ref(&*self.inner).stream_chat_with_history(
+                messages,
+                &self.pinned_model,
+                temperature,
+                options,
+            ),
+        )
     }
 
     fn stream_chat(
@@ -224,12 +235,12 @@ impl ModelProvider for ModelPinnedProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
-        ProviderDispatch::from_ref(&*self.inner).stream_chat(
+        stream_as_dispatch_composite(ProviderDispatch::from_ref(&*self.inner).stream_chat(
             request,
             &self.pinned_model,
             temperature,
             options,
-        )
+        ))
     }
 }
 
@@ -303,6 +314,77 @@ mod tests {
         assert!(
             provider.has_mixed_native_tool_support_for_model("ignored-request-model"),
             "mixed-chain detection must be queried with the pinned model"
+        );
+    }
+
+    struct AccountedLeaf;
+
+    impl zeroclaw_api::attribution::Attributable for AccountedLeaf {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "configured.inner"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for AccountedLeaf {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            Ok(ChatResponse {
+                text: Some("ok".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn accounting_through_model_pin_keeps_inner_identity_and_pinned_model() {
+        let pinned = ModelPinnedProvider::builder("pin-wrapper")
+            .pinned_model("served-model")
+            .inner(Box::new(AccountedLeaf))
+            .build();
+        let messages = vec![ChatMessage::user("hello")];
+        let outcome = ProviderDispatch::from_ref(&pinned)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "requested-model",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        let leaf = &outcome.accounting.attempts()[0];
+        assert_eq!(
+            (leaf.provider_ref(), leaf.model()),
+            ("configured.inner", "served-model")
         );
     }
 }

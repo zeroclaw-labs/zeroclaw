@@ -9,6 +9,8 @@ mod config_schema;
 mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
 mod gateway;

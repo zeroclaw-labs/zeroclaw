@@ -52,6 +52,11 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "memory.embeddings",
     "tunnel.custom",
     "transcription.groq",
+    "transcription.openai",
+    "transcription.deepgram",
+    "transcription.assemblyai",
+    "transcription.google",
+    "transcription.local_whisper",
 ];
 
 const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
@@ -262,13 +267,6 @@ pub struct Config {
     #[nested]
     #[group = "Agent"]
     pub heartbeat: HeartbeatConfig,
-
-    /// ZeroCode live task tracker (`[todotracker]`), the read-only
-    /// TodoWrite visual tracker in the Code pane.
-    #[serde(default)]
-    #[nested]
-    #[group = "Operations"]
-    pub todotracker: TodoTrackerConfig,
 
     /// Declarative cron jobs (`[cron.<alias>]`), alias-keyed.
     ///
@@ -2697,6 +2695,49 @@ pub struct GeminiCliModelProviderConfig {
     pub binary_path: Option<String>,
 }
 
+// ── Grok Build CLI (subprocess wrapper) ──
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "providers.models.grok_cli"]
+pub struct GrokCliModelProviderConfig {
+    #[nested]
+    #[serde(flatten)]
+    pub base: ModelProviderConfig,
+    /// Path to the `grok` CLI binary. Falls back to `grok` (PATH lookup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary_path: Option<String>,
+    /// Required absolute working directory for the `grok` subprocess and ACP
+    /// session boundary. The directory must exist when the provider is built.
+    /// Project-scoped Grok config is resolved relative to this path.
+    pub working_directory: String,
+    /// Extra environment variable names inherited by the `grok`
+    /// subprocess. Values are resolved from the ZeroClaw process environment
+    /// at spawn time. The default is empty so unrelated daemon secrets remain
+    /// blocked. `XAI_API_KEY` is the sole supported provider-owned name and
+    /// enables API-key authentication when explicitly listed and non-empty;
+    /// other `XAI_*` and all `GROK_*` names are rejected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[credential_class = "legacy_env_path"]
+    pub env_passthrough: Vec<String>,
+    /// Extra global Grok long flags inserted before `agent stdio`. Known
+    /// options may put their value in the next token; other value-taking
+    /// options use `--flag=value`. Positional and short arguments are rejected.
+    /// ZeroClaw defaults to `--sandbox strict`, `--permission-mode dontAsk`,
+    /// and an empty built-in tool set. Providing the corresponding flags here
+    /// is an explicit per-alias opt-in to relax those defaults. ACP transport,
+    /// prompt/model/session, cwd, debug-file, and update-policy flags are
+    /// reserved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_args: Vec<String>,
+    /// Maximum cumulative stdout bytes accepted from `grok agent stdio` for
+    /// one ACP request. When unset, ZeroClaw uses 4 MiB. Values must be
+    /// between 1 MiB and 64 MiB; the provider rejects invalid values when it
+    /// is constructed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_acp_stdout_bytes: Option<usize>,
+}
+
 // ── LMStudio (local default) ──
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -3329,6 +3370,7 @@ impl_default_family_endpoint! {
     BaichuanModelProviderConfig,
     GeminiModelProviderConfig,
     GeminiCliModelProviderConfig,
+    GrokCliModelProviderConfig,
     LmstudioModelProviderConfig,
     LlamacppModelProviderConfig,
     SglangModelProviderConfig,
@@ -5039,6 +5081,17 @@ pub struct McpServerConfig {
     /// warning. Read once per run (not refreshed; no subscriptions).
     #[serde(default)]
     pub pinned_resources: Vec<String>,
+    /// Absolute path to a PEM-encoded CA certificate or bundle to trust in
+    /// addition to the default roots for this server's HTTP/SSE transport.
+    ///
+    /// Certificate and hostname verification remain enabled. The path must
+    /// name a regular file no larger than 1 MiB; a missing, unreadable, empty,
+    /// oversized, non-regular, or invalid file is a hard connection error
+    /// rather than a fallback to the default trust store. When set, the
+    /// configured URL and any advertised SSE message endpoint must use HTTPS;
+    /// plaintext URLs and downgrade redirects are rejected. Ignored by stdio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca_cert_path: Option<String>,
 }
 
 /// External MCP client configuration (`[mcp]` section).
@@ -6901,6 +6954,17 @@ pub struct GatewayConfig {
     #[serde(default = "default_webhook_rate_limit")]
     pub webhook_rate_limit_per_minute: u32,
 
+    /// Optional shared secret for the gateway's generic `POST /webhook` and
+    /// `POST /sop/*` routes. Requests must send the exact value in
+    /// `X-Webhook-Secret`. This is intentionally separate from
+    /// `[channels.webhook.<alias>].secret`, which authenticates that channel's
+    /// own listener with an HMAC signature.
+    #[serde(default)]
+    #[secret]
+    #[credential_class = "encrypted_secret"]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub webhook_secret: Option<String>,
+
     /// Trust proxy-forwarded client IP headers (`X-Forwarded-For`, `X-Real-IP`).
     /// Disabled by default; enable only behind a trusted reverse proxy.
     #[serde(default)]
@@ -7052,6 +7116,7 @@ impl Default for GatewayConfig {
             paired_tokens: Vec::new(),
             pair_rate_limit_per_minute: default_pair_rate_limit(),
             webhook_rate_limit_per_minute: default_webhook_rate_limit(),
+            webhook_secret: None,
             trust_forwarded_headers: false,
             path_prefix: None,
             rate_limit_max_keys: default_gateway_rate_limit_max_keys(),
@@ -8406,8 +8471,14 @@ fn default_linkedin_api_version() -> String {
     "202602".to_string()
 }
 
-/// Per-plugin config section keyed by plugin alias; values are secret so they
-/// encrypt at rest under the same adjacent `.secret_key` as every other secret.
+/// More than one canonical config row exists for the same plugin instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("duplicate plugin config entries for one instance key")]
+pub struct DuplicatePluginConfigEntry;
+
+/// Per-instance plugin config keyed by the host-derived `PluginInstanceId`
+/// config-entry key; values are secret so they encrypt at rest under the same
+/// adjacent `.secret_key` as every other secret.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.entries"]
@@ -8457,12 +8528,23 @@ pub struct PluginsConfig {
     /// Directory where plugins are stored
     #[serde(default = "default_plugins_dir")]
     pub plugins_dir: String,
-    /// Auto-discover and load plugins on startup
+    /// Auto-discover and load plugins on startup (default: false)
+    ///
+    /// This gates the package-bound *tool* and *skill* instances the activation
+    /// plan discovers from installed manifests. Explicit
+    /// `[channels.plugin.<alias>]` declarations are operator-named, not
+    /// discovered, so they activate without it.
     #[serde(default)]
     pub auto_discover: bool,
-    /// Maximum number of plugins that can be loaded
-    #[serde(default = "default_max_plugins")]
-    pub max_plugins: usize,
+    /// Maximum number of logical plugin instances admitted across capabilities.
+    ///
+    /// This counts admitted *instances*, not installed packages: one package
+    /// that provides both a channel binding and a tool consumes two. It
+    /// replaces the never-enforced `plugins.max_plugins` key, which counted
+    /// packages; because the units differ, an old `max_plugins` value is not
+    /// carried over. See the plugin activation docs for the migration note.
+    #[serde(default = "default_max_active_plugin_instances")]
+    pub max_active_instances: usize,
     /// Plugin signature verification security settings
     #[serde(default)]
     #[nested]
@@ -8478,12 +8560,19 @@ pub struct PluginsConfig {
 }
 
 impl PluginsConfig {
-    #[must_use]
-    pub fn entry_config(&self, alias: &str) -> Option<&HashMap<String, String>> {
-        self.entries
+    pub fn entry_config(
+        &self,
+        instance_key: &str,
+    ) -> Result<Option<&HashMap<String, String>>, DuplicatePluginConfigEntry> {
+        let mut matches = self
+            .entries
             .iter()
-            .find(|e| e.name == alias)
-            .map(|e| &e.config)
+            .filter(|entry| entry.name == instance_key);
+        let first = matches.next().map(|entry| &entry.config);
+        if matches.next().is_some() {
+            return Err(DuplicatePluginConfigEntry);
+        }
+        Ok(first)
     }
 
     /// The granted egress allowlist and private-address carveout for `alias`,
@@ -8553,8 +8642,10 @@ impl Default for PluginSecurityConfig {
 ///
 /// Bounds a single plugin call so a runaway or malicious component traps
 /// instead of hanging the host or exhausting memory. `call_fuel` caps
-/// instructions per call; the memory, table, and instance ceilings bound a
-/// store's growth. Every value is operator-tunable and validated as non-zero.
+/// instructions per call; `call_timeout_ms` caps elapsed wall-clock time,
+/// including time awaiting async host imports; the memory, table, and instance
+/// ceilings bound a store's growth. Every value is operator-tunable and
+/// validated as non-zero.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "plugins.limits"]
@@ -8571,6 +8662,9 @@ pub struct PluginLimitsConfig {
     /// Maximum component instances a plugin store may create.
     #[serde(default = "default_plugin_max_instances")]
     pub max_instances: usize,
+    /// Wall-clock deadline for one plugin export call, in milliseconds.
+    #[serde(default = "default_plugin_call_timeout_ms")]
+    pub call_timeout_ms: u64,
     /// Maximum live host-owned network connections per logical plugin instance,
     /// shared across every transport and every store belonging to it.
     ///
@@ -8596,6 +8690,10 @@ fn default_plugin_max_instances() -> usize {
     64
 }
 
+fn default_plugin_call_timeout_ms() -> u64 {
+    30_000
+}
+
 fn default_plugin_max_connections_per_instance() -> usize {
     16
 }
@@ -8607,6 +8705,7 @@ impl Default for PluginLimitsConfig {
             max_memory_mb: default_plugin_max_memory_mb(),
             max_table_elements: default_plugin_max_table_elements(),
             max_instances: default_plugin_max_instances(),
+            call_timeout_ms: default_plugin_call_timeout_ms(),
             max_connections_per_instance: default_plugin_max_connections_per_instance(),
         }
     }
@@ -8616,7 +8715,7 @@ fn default_plugins_dir() -> String {
     default_path_under_config_dir("plugins")
 }
 
-fn default_max_plugins() -> usize {
+fn default_max_active_plugin_instances() -> usize {
     50
 }
 
@@ -8626,7 +8725,7 @@ impl Default for PluginsConfig {
             enabled: false,
             plugins_dir: default_plugins_dir(),
             auto_discover: false,
-            max_plugins: default_max_plugins(),
+            max_active_instances: default_max_active_plugin_instances(),
             security: PluginSecurityConfig::default(),
             limits: PluginLimitsConfig::default(),
             entries: Vec::new(),
@@ -9970,6 +10069,52 @@ fn service_selector_matches(selector: &str, service_key: &str) -> bool {
 
 const MCP_MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 
+fn validate_plugin_entries(config: &PluginsConfig) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (index, entry) in config.entries.iter().enumerate() {
+        let instance_key = entry.name.trim();
+        if instance_key.is_empty() {
+            anyhow::bail!("plugins.entries[{index}].name must not be empty");
+        }
+        if instance_key != entry.name {
+            anyhow::bail!(
+                "plugins.entries[{index}].name must not have leading or trailing whitespace"
+            );
+        }
+        if !seen.insert(instance_key) {
+            anyhow::bail!("plugins.entries contains a duplicate instance key");
+        }
+    }
+    Ok(())
+}
+
+/// Reject a `[channels.plugin.<alias>]` declaration the activation loader could
+/// never resolve to an installed package.
+///
+/// The alias uses the shared config alias grammar because it becomes the
+/// channel's registry alias (`plugin.<alias>`); the package uses the shared
+/// plugin package-name grammar so config and manifest admission agree on one
+/// spelling. Aliases are visited in sorted order so the reported failure is
+/// stable across runs regardless of map iteration order.
+fn validate_plugin_channel_instances(config: &ChannelsConfig) -> Result<()> {
+    let mut aliases: Vec<_> = config.plugin.keys().collect();
+    aliases.sort_unstable();
+    for alias in aliases {
+        crate::helpers::validate_alias_key(alias)
+            .map_err(|error| anyhow::Error::msg(format!("channels.plugin.{alias}: {error}")))?;
+        let declaration = &config.plugin[alias];
+        if declaration.package.trim() != declaration.package {
+            anyhow::bail!(
+                "channels.plugin.{alias}.package must not have leading or trailing whitespace"
+            );
+        }
+        zeroclaw_api::plugin::validate_plugin_package_name(&declaration.package).map_err(
+            |error| anyhow::Error::msg(format!("channels.plugin.{alias}.package: {error}")),
+        )?;
+    }
+    Ok(())
+}
+
 fn validate_mcp_config(config: &McpConfig) -> Result<()> {
     let mut seen_names = std::collections::HashSet::new();
     for (i, server) in config.servers.iter().enumerate() {
@@ -10041,6 +10186,23 @@ fn validate_mcp_config(config: &McpConfig) -> Result<()> {
                     .with_context(|| format!("mcp.servers[{i}].url is not a valid URL"))?;
                 if !matches!(parsed.scheme(), "http" | "https") {
                     anyhow::bail!("mcp.servers[{i}].url must use http/https");
+                }
+                if let Some(ca_path) = server.tls_ca_cert_path.as_deref() {
+                    if ca_path.trim().is_empty() {
+                        validation_bail!(
+                            RequiredFieldEmpty,
+                            format!("mcp.servers[{i}].tls_ca_cert_path"),
+                            "mcp.servers[{i}].tls_ca_cert_path must not be empty"
+                        );
+                    }
+                    if !std::path::Path::new(ca_path).is_absolute() {
+                        anyhow::bail!("mcp.servers[{i}].tls_ca_cert_path must be an absolute path");
+                    }
+                    if parsed.scheme() != "https" {
+                        anyhow::bail!(
+                            "mcp.servers[{i}].url must use https when tls_ca_cert_path is set"
+                        );
+                    }
                 }
             }
         }
@@ -11532,18 +11694,27 @@ pub fn validate_memory_semantics(
 
 /// Surface WhatsApp chat-policy keys that are accepted but never consulted.
 ///
-/// `dm_policy`, `group_policy` and `self_chat_mode` are read only by the Web
-/// transport inside its `mode == Personal` block, so under `mode = "business"`
-/// they validate cleanly and have no effect. That is easy to miss because
-/// `dm_policy` DEFAULTS to `Allowlist`: a business-mode Web channel reads as
-/// restrictive while answering every DM it receives.
+/// `self_chat_mode` is read only by the Web transport inside its
+/// `mode == Personal` block, so under `mode = "business"` it validates cleanly
+/// and has no effect. `mode` selects ZeroClaw's policy posture, not a WhatsApp
+/// account type: both modes drive the same linked-device session, and the
+/// self-chat affordance is scoped to the personal branch by design.
+///
+/// `dm_policy` and `group_policy` are consulted under BOTH modes, so they are
+/// not reported here.
 ///
 /// `allowed_groups` is separate. `is_group_chat_allowed` returns true when the
-/// list is empty, and that gate does run in both modes, which makes an empty
-/// list the only group protection under `mode = "business"` and an open one.
+/// list is empty, so under `group_policy = "allowlist"` an empty list is an
+/// allowlist that admits every group. That holds under both modes.
 ///
-/// Warnings only, no behaviour change: an operator who is relying on the
-/// current defaults keeps working, and learns about it at `config validate`.
+/// Warnings only, no behaviour change to the validator itself. But be precise
+/// about WHICH reliance is reported, because this sentence used to promise more
+/// than the function delivers: under `mode = "business"` the inert-key warning
+/// covers `self_chat_mode` ONLY. `dm_policy` and `group_policy` are now live in
+/// business mode, so an operator who was relying on the old permissive business
+/// behaviour gets NO warning here and can start silently dropping DMs or groups
+/// under the default `allowlist`. That upgrade note belongs in the channel book
+/// and the release notes; `config validate` will not surface it for them.
 ///
 /// Called from `Config::collect_warnings`, so this reaches the CLI and the
 /// gateway dashboard on the same path as the other warnings.
@@ -11552,24 +11723,19 @@ pub fn validate_whatsapp_semantics(
     wa: &WhatsAppConfig,
 ) -> Vec<crate::validation_warnings::ValidationWarning> {
     let mut out = Vec::new();
-    if !wa.enabled || !wa.is_web_config() {
+    // Gate on the backend the runtime will actually select, not on whether a
+    // Web selector is merely present. `is_web_config` is true whenever any Web
+    // selector is set, including alongside `phone_number_id`, and that
+    // combination runs as Cloud. The Cloud transport consults none of the keys
+    // below, so diagnosing them against a Cloud channel reports a Web gate that
+    // never runs. The ambiguity itself is already surfaced separately at
+    // startup, so it is not restated here.
+    if !wa.enabled || wa.backend_type() != "web" {
         return out;
     }
 
     if wa.mode != WhatsAppWebMode::Personal {
         let mut inert: Vec<(&'static str, String)> = Vec::new();
-        if wa.dm_policy != WhatsAppChatPolicy::All {
-            inert.push((
-                "dm_policy",
-                "every direct message is answered regardless of this setting".to_string(),
-            ));
-        }
-        if wa.group_policy != WhatsAppChatPolicy::All {
-            inert.push((
-                "group_policy",
-                "group messages are not filtered by this setting".to_string(),
-            ));
-        }
         if wa.self_chat_mode {
             inert.push((
                 "self_chat_mode",
@@ -11589,7 +11755,7 @@ pub fn validate_whatsapp_semantics(
     }
 
     // An empty allowed_groups only creates UNINTENDED open access where the
-    // effective policy would otherwise have consulted the list. Two personal-mode
+    // effective policy would otherwise have consulted the list. Two
     // configurations must stay quiet:
     //
     //   group_policy = "ignore"    the channel gate drops every group message
@@ -11599,14 +11765,10 @@ pub fn validate_whatsapp_semantics(
     //   group_policy = "all"       an explicit opt-in to open group access. Warning
     //                              here reports a deliberate choice as unsafe.
     //
-    // So the warning applies to business mode (where the list is consulted no matter
-    // what group_policy says) and to personal mode with group_policy = "allowlist"
-    // (where an empty list is an allowlist that admits everything).
-    let empty_list_permits_all = if wa.mode == WhatsAppWebMode::Personal {
-        wa.group_policy == WhatsAppChatPolicy::Allowlist
-    } else {
-        true
-    };
+    // group_policy is consulted under BOTH modes, so this predicate is
+    // mode-independent: the unintended case is `allowlist`, where an empty list
+    // is an allowlist that admits every group.
+    let empty_list_permits_all = wa.group_policy == WhatsAppChatPolicy::Allowlist;
 
     if wa.allowed_groups.is_empty() && empty_list_permits_all {
         out.push(crate::validation_warnings::ValidationWarning::new(
@@ -11614,7 +11776,7 @@ pub fn validate_whatsapp_semantics(
             format!(
                 "channels.whatsapp.{alias}.allowed_groups is empty, which permits EVERY \
                  group the linked account belongs to. List the group JIDs you intend to \
-                 serve, or set group_policy = \"ignore\" under mode = \"personal\"."
+                 serve, or set group_policy = \"ignore\" to serve no group at all."
             ),
             format!("channels.whatsapp.{alias}.allowed_groups"),
         ));
@@ -13189,74 +13351,6 @@ impl Default for HeartbeatConfig {
     }
 }
 
-// ── TodoTracker ──────────────────────────────────────────────────
-
-/// Location of the ZeroCode TodoWrite tracker panel.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
-)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum TodoTrackerLocation {
-    /// Horizontal strip between the transcript and the input bar (Claude Code style).
-    Bottom,
-    /// Vertical side panel on the left.
-    Left,
-    /// Vertical side panel on the right (OpenCode style). Default.
-    #[default]
-    Right,
-}
-
-/// ZeroCode live task tracker configuration (`[todotracker]` section).
-///
-/// Read-only visual tracker driven by the model's `TodoWrite` tool.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
-#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "todotracker"]
-pub struct TodoTrackerConfig {
-    /// Master switch. When `false` the tracker never renders and never
-    /// auto-pops. Default: `true`.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Whether the panel is visible at launch (when `enabled`). When
-    /// `false` it stays hidden until toggled or auto-popped by the first
-    /// plan. Default: `false`.
-    #[serde(default)]
-    pub enabled_at_start: bool,
-    /// Panel location: `bottom` (between transcript and input), `left`,
-    /// or `right` (default).
-    #[serde(default)]
-    pub location: TodoTrackerLocation,
-    /// Side-panel target column width (left/right). Runtime-clamped to at
-    /// most half the terminal width. Ignored for `bottom`. Default: `32`.
-    #[serde(default = "default_todotracker_width")]
-    pub width: u16,
-    /// Bottom-strip maximum height in rows (grows up to this). Ignored for
-    /// left/right. Default: `5`.
-    #[serde(default = "default_todotracker_max_height")]
-    pub max_height: u16,
-}
-
-fn default_todotracker_width() -> u16 {
-    32
-}
-
-fn default_todotracker_max_height() -> u16 {
-    5
-}
-
-impl Default for TodoTrackerConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            enabled_at_start: false,
-            location: TodoTrackerLocation::Right,
-            width: default_todotracker_width(),
-            max_height: default_todotracker_max_height(),
-        }
-    }
-}
-
 // ── Cron ────────────────────────────────────────────────────────
 
 /// A declarative cron job definition (`[cron.<alias>]`).
@@ -13389,7 +13483,10 @@ pub struct DeliveryConfigDecl {
     /// Delivery mode: `"none"` or `"announce"`.
     #[serde(default = "default_delivery_mode")]
     pub mode: String,
-    /// Channel name (e.g. `"telegram"`, `"discord"`).
+    /// Channel to deliver to, as `<type>.<alias>` (e.g.
+    /// `"telegram.work"`, `"discord.ops"`). A bare type (`"telegram"`)
+    /// resolves only while that type has exactly one configured instance,
+    /// so prefer the aliased form.
     #[serde(default)]
     pub channel: Option<String>,
     /// Target/recipient identifier.
@@ -13796,6 +13893,12 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub filesystem: HashMap<String, FilesystemConfig>,
+    /// WASM channel plugin instances (`[channels.plugin.<alias>]`).
+    /// The declaration selects a package and logical binding only; operator
+    /// values remain in the instance-keyed `plugins.entries` store.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub plugin: HashMap<String, PluginChannelConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -14057,6 +14160,12 @@ impl ChannelsConfig {
                 desc: "HTTP endpoint",
                 configured: !self.webhook.is_empty(),
             },
+            ChannelInfo {
+                kind: "plugin",
+                name: "Plugin",
+                desc: "installed WASM channel plugin",
+                configured: !self.plugin.is_empty(),
+            },
         ]
     }
 
@@ -14101,6 +14210,7 @@ impl ChannelsConfig {
             || self.amqp.values().any(|c| c.enabled)
             || self.filesystem.values().any(|c| c.enabled)
             || self.git.values().any(|c| c.enabled)
+            || self.plugin.values().any(|c| c.enabled)
     }
 
     /// One `(canonical_name, configured, deliverable)` row per channel in the
@@ -14110,7 +14220,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 35] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -14147,6 +14257,7 @@ impl ChannelsConfig {
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
             ("filesystem", !self.filesystem.is_empty(), false),
+            ("plugin", !self.plugin.is_empty(), true),
         ]
     }
 
@@ -14232,6 +14343,7 @@ impl Default for ChannelsConfig {
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -14240,6 +14352,34 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+        }
+    }
+}
+
+/// Host-owned declaration of one installed channel-plugin binding.
+///
+/// This declaration is the complete operator-facing surface for a logical
+/// channel instance: it names the installed package and whether the binding may
+/// be admitted. It deliberately carries no plugin values — those stay in the
+/// instance-keyed `plugins.entries` store so one plugin's secrets are never
+/// reachable from another instance's declaration.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.plugin"]
+pub struct PluginChannelConfig {
+    /// Canonical package name from the installed plugin manifest.
+    #[serde(default)]
+    pub package: String,
+    /// Whether this logical instance may be admitted at channel startup.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for PluginChannelConfig {
+    fn default() -> Self {
+        Self {
+            package: String::new(),
+            enabled: true,
         }
     }
 }
@@ -14259,6 +14399,86 @@ pub enum StreamMode {
     /// Send the response as multiple separate messages at paragraph boundaries.
     #[serde(rename = "multi_message")]
     MultiMessage,
+}
+
+/// Matrix streaming mode for progressive response delivery.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum MatrixStreamMode {
+    /// No streaming -- send the complete response as a single message (default).
+    #[default]
+    Off,
+    /// Update a draft message with every flush interval.
+    Partial,
+    /// Stream progress into one sliding draft and send the final response as a separate message.
+    #[serde(rename = "single_message")]
+    SingleMessage,
+    /// Send the response as multiple separate messages at paragraph boundaries.
+    #[serde(rename = "multi_message")]
+    MultiMessage,
+}
+
+/// Matrix single-message reasoning visibility.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum StreamReasoningMode {
+    /// Do not emit reasoning-derived progress into the Matrix draft.
+    Off,
+    /// Emit liveness-only reasoning status ticks without raw reasoning text.
+    #[default]
+    Status,
+    /// Emit raw provider reasoning text into the Matrix progress draft.
+    Full,
+}
+
+/// Base policy for Matrix single-message tool argument progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum StreamToolArgumentBase {
+    /// Do not display any arguments unless a per-tool rule includes them.
+    None,
+    /// Use ZeroClaw's conservative per-tool recommendations.
+    #[default]
+    Safe,
+    /// Display every argument except runtime-internal fields, after leak scrubbing.
+    All,
+}
+
+/// One entry in `MatrixConfig::stream_tool_arguments`.
+///
+/// A list may contain at most one defaults entry plus independent per-tool
+/// rules. Entry order is not significant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(untagged, deny_unknown_fields)]
+pub enum StreamToolArgumentEntry {
+    /// Override inherited settings for tools without a matching rule.
+    Defaults {
+        default_base: StreamToolArgumentBase,
+        /// Override the inherited per-value character cap. `0` disables it.
+        #[serde(default)]
+        argument_chars: Option<usize>,
+    },
+    /// Override or adjust inherited settings for one exact tool name.
+    Tool {
+        tool: String,
+        #[serde(default)]
+        base: Option<StreamToolArgumentBase>,
+        #[serde(default)]
+        include: Vec<String>,
+        #[serde(default)]
+        exclude: Vec<String>,
+        /// Override the inherited per-value character cap. `0` disables it.
+        #[serde(default)]
+        argument_chars: Option<usize>,
+    },
 }
 
 /// Where a channel registers its skill slash commands. `global` (default)
@@ -14304,6 +14524,20 @@ fn default_channel_approval_timeout_secs() -> u64 {
 
 fn default_matrix_draft_update_interval_ms() -> u64 {
     1500
+}
+
+fn default_matrix_stream_draft_lines() -> usize {
+    10
+}
+
+pub const DEFAULT_STREAM_TOOL_ARGUMENT_CHARS: usize = 60;
+/// Smallest serialized Matrix message-content budget accepted by the
+/// single-message delivery path. This leaves room for a non-empty body, the
+/// JSON envelope, formatted Markdown, and an edit/reply relation.
+pub const MATRIX_MIN_MESSAGE_MAX_BYTES: usize = 512;
+
+fn default_matrix_message_max_bytes() -> usize {
+    48_000
 }
 
 /// Telegram bot channel configuration.
@@ -14457,7 +14691,13 @@ pub enum DiscordReactionScope {
 }
 
 /// Discord bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.discord"]
 #[allow(clippy::struct_excessive_bools)]
@@ -14600,6 +14840,17 @@ pub struct DiscordConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl Default for DiscordConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree. Every field here
+    /// either declares a serde default or is an `Option`, which is what
+    /// makes the empty object total.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every DiscordConfig field declares a serde default or is Option")
+    }
+}
+
 impl DiscordConfig {
     /// Validate this alias's bot-token placeholder and enabled-state rules.
     /// Mirrors `TelegramConfig::validate_bot_token`.
@@ -14627,7 +14878,13 @@ pub const DEFAULT_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 0;
 pub const MAX_SLACK_THREAD_CONTEXT_MAX_MESSAGES: usize = 50;
 
 /// Slack bot channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.slack"]
 #[allow(clippy::struct_excessive_bools)]
@@ -14690,10 +14947,8 @@ pub struct SlackConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub strict_mention_in_thread: bool,
-    /// Maximum number of prior messages prepended when ZeroClaw first
-    /// encounters a Slack thread. `0` disables automatic thread-context
-    /// hydration. When omitted, defaults to 0, so hydration is opt-in.
-    /// Maximum: 50.
+    /// Prior thread messages to hydrate on the first bot interaction. `0`
+    /// disables hydration. Maximum: 50.
     #[tab(Advanced)]
     #[serde(default)]
     pub thread_context_max_messages: Option<usize>,
@@ -14747,6 +15002,17 @@ pub struct SlackConfig {
 
 fn default_slack_draft_update_interval_ms() -> u64 {
     1200
+}
+
+impl Default for SlackConfig {
+    /// Built by deserializing an empty object, so the serde defaults are the
+    /// only source of truth and the two cannot disagree. Every field here
+    /// either declares a serde default or is an `Option`, which is what
+    /// makes the empty object total.
+    fn default() -> Self {
+        serde_json::from_str("{}")
+            .expect("every SlackConfig field declares a serde default or is Option")
+    }
 }
 
 impl ChannelConfig for SlackConfig {
@@ -15071,7 +15337,13 @@ impl ChannelConfig for IMessageConfig {
 }
 
 /// Matrix channel configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.matrix"]
 pub struct MatrixConfig {
@@ -15114,12 +15386,14 @@ pub struct MatrixConfig {
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// Streaming mode for progressive response delivery.
-    /// `"off"` (default): single message. `"partial"`: edit-in-place draft.
+    /// `"off"` (default): single final message. `"partial"`: edit-in-place draft.
+    /// `"single_message"`: progress draft plus separate final message.
     /// `"multi_message"`: paragraph-split delivery.
     #[tab(Behavior)]
     #[serde(default)]
-    pub stream_mode: StreamMode,
-    /// Minimum interval (ms) between draft message edits in Partial mode.
+    pub stream_mode: MatrixStreamMode,
+    /// Minimum interval (ms) between Matrix draft edits in Partial mode and
+    /// thinking/reasoning progress edits in SingleMessage mode.
     #[tab(Behavior)]
     #[serde(default = "default_matrix_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
@@ -15127,6 +15401,45 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default = "default_multi_message_delay_ms")]
     pub multi_message_delay_ms: u64,
+    /// Maximum number of progress lines kept in the Matrix single-message
+    /// streaming draft. Set to 0 to remove the line-count limit; all lines
+    /// still compete within one byte-bounded Matrix draft event.
+    #[tab(Behavior)]
+    #[serde(default = "default_matrix_stream_draft_lines")]
+    pub stream_draft_lines: usize,
+    /// Serialized Matrix event-content byte budget for single-message
+    /// streaming draft edits and the separate final response. The rendered
+    /// Markdown body, generated HTML, and reply/edit relation all count
+    /// toward this limit. Oversized progress drops complete oldest entries;
+    /// the separate final response retains a UTF-8-safe prefix. Values below
+    /// 512 use that minimum, which leaves room for a non-empty serialized event.
+    #[tab(Behavior)]
+    #[serde(default = "default_matrix_message_max_bytes")]
+    pub message_max_bytes: usize,
+    /// Delete the Matrix single-message progress draft before sending the final
+    /// response. When false, durable progress remains as a visible transcript;
+    /// placeholder-only drafts are still removed before the final response.
+    #[tab(Behavior)]
+    #[serde(default = "default_true")]
+    pub stream_draft_delete: bool,
+    /// Matrix single-message reasoning visibility. `"off"` suppresses
+    /// reasoning-derived draft updates, `"status"` emits liveness ticks without
+    /// raw reasoning text, and `"full"` emits raw provider reasoning text into
+    /// the progress draft.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_reasoning: StreamReasoningMode,
+    /// Tool arguments shown in Matrix single-message progress lines. Missing or
+    /// empty means the conservative `safe` defaults. Use one
+    /// `{ default_base = "none" | "safe" | "all" }` entry for inherited
+    /// settings, then exact-name tool entries with optional `base`, `include`,
+    /// `exclude`, and `argument_chars` adjustments. `argument_chars` limits
+    /// each displayed value and defaults to 60; `0` disables that limit.
+    /// Unknown tools resolve to no arguments under `safe`; every selected value
+    /// is leak-scrubbed before display.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub stream_tool_arguments: Vec<StreamToolArgumentEntry>,
     /// When true, only respond to messages that @-mention the bot in groups.
     /// Direct messages are always processed.
     #[tab(Behavior)]
@@ -15182,6 +15495,98 @@ pub struct MatrixConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl Default for MatrixConfig {
+    /// Built by deserializing an object supplying only `homeserver`, the one
+    /// field with no serde default - a Matrix channel must always name a
+    /// homeserver, so it stays required rather than gaining one. Every other
+    /// field either declares a serde default or is an `Option`, so this is
+    /// the minimal object that makes the deserialize total; those defaults
+    /// stay the only source of truth for everything but `homeserver`.
+    fn default() -> Self {
+        serde_json::from_str(r#"{"homeserver":""}"#)
+            .expect("every other MatrixConfig field declares a serde default or is Option")
+    }
+}
+
+fn validate_stream_tool_argument_names<'a>(
+    entry_path: &str,
+    field_name: &str,
+    fields: &'a [String],
+) -> Result<std::collections::HashSet<&'a str>> {
+    let mut names = std::collections::HashSet::new();
+    for (field_index, field) in fields.iter().enumerate() {
+        if field.is_empty() || field.trim() != field {
+            anyhow::bail!(
+                "{entry_path}.{field_name}[{field_index}] must be a non-empty exact argument name without surrounding whitespace"
+            );
+        }
+        if !names.insert(field.as_str()) {
+            anyhow::bail!("{entry_path}.{field_name} contains duplicate argument '{field}'");
+        }
+    }
+    Ok(names)
+}
+
+impl MatrixConfig {
+    /// Effective UTF-8 body budget for Matrix single-message streaming.
+    ///
+    /// A serialized Matrix event has fixed JSON, message, and relation
+    /// overhead in addition to UTF-8 source text. Keeping this floor avoids
+    /// accepting a budget that cannot contain even a one-scalar event.
+    pub fn effective_message_max_bytes(&self) -> usize {
+        self.message_max_bytes.max(MATRIX_MIN_MESSAGE_MAX_BYTES)
+    }
+
+    /// Validate the order-independent tool argument display policy.
+    pub fn validate_stream_tool_arguments(&self) -> Result<()> {
+        let mut saw_defaults = false;
+        let mut tools = std::collections::HashSet::new();
+
+        for (index, entry) in self.stream_tool_arguments.iter().enumerate() {
+            let entry_path = format!("stream_tool_arguments[{index}]");
+            match entry {
+                StreamToolArgumentEntry::Defaults { .. } => {
+                    if saw_defaults {
+                        anyhow::bail!(
+                            "{entry_path}.default_base duplicates the list's default_base entry"
+                        );
+                    }
+                    saw_defaults = true;
+                }
+                StreamToolArgumentEntry::Tool {
+                    tool,
+                    include,
+                    exclude,
+                    ..
+                } => {
+                    if tool.is_empty() || tool.trim() != tool {
+                        anyhow::bail!(
+                            "{entry_path}.tool must be a non-empty exact tool name without surrounding whitespace"
+                        );
+                    }
+                    if !tools.insert(tool.as_str()) {
+                        anyhow::bail!("{entry_path}.tool duplicates the rule for tool '{tool}'");
+                    }
+
+                    let included =
+                        validate_stream_tool_argument_names(&entry_path, "include", include)?;
+                    let excluded =
+                        validate_stream_tool_argument_names(&entry_path, "exclude", exclude)?;
+                    for field in &excluded {
+                        if included.contains(*field) {
+                            anyhow::bail!(
+                                "{entry_path} includes and excludes the same argument '{field}'"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl ChannelConfig for MatrixConfig {
     fn name() -> &'static str {
         "Matrix"
@@ -15191,7 +15596,14 @@ impl ChannelConfig for MatrixConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+/// Signal channel configuration.
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.signal"]
 pub struct SignalConfig {
@@ -15257,6 +15669,20 @@ pub struct SignalConfig {
     pub reply_queue_depth_max: u16,
 }
 
+impl Default for SignalConfig {
+    /// Built by deserializing an object supplying only `http_url` and
+    /// `account`, the two fields with no serde default - a Signal channel
+    /// must always name its daemon and account, so they stay required
+    /// rather than gaining one. Every other field either declares a serde
+    /// default or is an `Option`, so this is the minimal object that makes
+    /// the deserialize total; those defaults stay the only source of truth
+    /// for everything but `http_url` and `account`.
+    fn default() -> Self {
+        serde_json::from_str(r#"{"http_url":"","account":""}"#)
+            .expect("every other SignalConfig field declares a serde default or is Option")
+    }
+}
+
 impl SignalConfig {
     /// Whether both required credentials (`http_url`, `account`) are
     /// present. Mirrors `WhatsAppConfig::is_cloud_config`'s role: the
@@ -15302,28 +15728,42 @@ impl ChannelConfig for SignalConfig {
 
 /// WhatsApp Web usage mode.
 ///
-/// `Personal` treats the account as a personal phone — the bot only responds to
-/// incoming messages that pass the DM/group/self-chat policy filters.
-/// `Business` (default) responds to all incoming messages, subject only to the
-/// `allowed_numbers` allowlist.
+/// The mode no longer decides WHETHER the chat policies apply. `dm_policy` and
+/// `group_policy` are consulted under BOTH modes, and an unrecognized sender is
+/// dropped before the message is logged or dispatched either way.
+///
+/// `Personal` additionally applies the self-chat exception, so `self_chat_mode`
+/// is consulted only there.
+/// `Business` (default) is the same admission path without that exception.
+///
+/// Neither mode consults `allowed_numbers`. That is a V2 field which migrates
+/// into `peer_groups` on load, so it names no knob the current model exposes;
+/// senders resolve from `[peer_groups.<name>].external_peers` scoped to the
+/// alias.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppWebMode {
-    /// Respond to all messages passing the allowlist (default).
+    /// Respond to messages passing `dm_policy` and `group_policy` (default).
     #[default]
     Business,
-    /// Apply per-chat-type policies (dm_policy, group_policy, self_chat_mode).
+    /// As business mode, and additionally applies the self-chat semantics
+    /// (`self_chat_mode` and the fromMe handling). Both modes run the same
+    /// linked-device session, and WhatsApp can mirror an operator's own
+    /// messages as `fromMe` under either, so that scoping is a property of
+    /// this branch rather than of the account.
     Personal,
 }
 
-/// Policy for a particular WhatsApp chat type (DMs or groups) when
-/// `mode = "personal"`.
+/// Policy for a particular WhatsApp chat type (DMs or groups).
+///
+/// Applied under both `mode = "business"` and `mode = "personal"`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, zeroclaw_macros::ConfigEnum)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WhatsAppChatPolicy {
-    /// Only respond to senders on the `allowed_numbers` list (default).
+    /// Only respond to recognized senders (default). Senders are resolved from
+    /// the channel's peer group, via `[peer_groups.<name>].external_peers`.
     #[default]
     Allowlist,
     /// Ignore all messages in this chat type.
@@ -15404,6 +15844,12 @@ pub struct WhatsAppConfig {
     #[tab(Connection)]
     #[serde(default)]
     pub ws_url: Option<String>,
+    /// Display name announced to contacts (Web mode, optional)
+    /// Applied on connect when it differs from the name the linked device
+    /// already carries; leave unset to keep the account's own name
+    #[tab(Connection)]
+    #[serde(default)]
+    pub push_name: Option<String>,
     /// When true, only respond to messages that @-mention the bot in groups (Web mode only).
     /// Direct messages are always processed.
     /// Bot identity is resolved from the wa-rs device at runtime; `pair_phone` seeds it on first connect.
@@ -15421,17 +15867,19 @@ pub struct WhatsAppConfig {
     #[serde(default)]
     pub interrupt_on_new_message: bool,
     /// Usage mode for WhatsApp Web: "business" (default) or "personal".
-    /// In personal mode the bot applies dm_policy, group_policy, and
-    /// self_chat_mode to decide which chats to respond in.
+    /// `dm_policy` and `group_policy` apply under BOTH modes. Personal mode
+    /// additionally applies `self_chat_mode` and the fromMe handling; both are
+    /// scoped to the personal branch by design, not by any protocol difference
+    /// between the two modes.
     #[tab(Advanced)]
     #[serde(default)]
     pub mode: WhatsAppWebMode,
-    /// Policy for direct messages when mode = "personal".
+    /// Policy for direct messages, applied under both modes.
     /// "allowlist" (default) | "ignore" | "all".
     #[tab(Advanced)]
     #[serde(default)]
     pub dm_policy: WhatsAppChatPolicy,
-    /// Policy for group chats when mode = "personal".
+    /// Policy for group chats, applied under both modes.
     /// "allowlist" (default) | "ignore" | "all".
     #[tab(Advanced)]
     #[serde(default)]
@@ -16373,7 +16821,13 @@ pub enum LarkReceiveMode {
 
 /// Lark/Feishu configuration for messaging integration.
 /// Lark is the international version; Feishu is the Chinese version.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+///
+/// `Default` is implemented below rather than derived. A derived `Default`
+/// zeroes every field, which disagrees with the serde defaults, and for
+/// `approval_timeout_secs` that disagreement is load-bearing: `0` is an
+/// already-elapsed deadline, so an alias built in Rust would deny every
+/// approval while an alias parsed from a file waits the documented 300s.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.lark"]
 pub struct LarkConfig {
@@ -16470,6 +16924,20 @@ pub struct LarkConfig {
     #[tab(Behavior)]
     #[serde(default = "default_draft_update_interval_ms")]
     pub draft_update_interval_ms: u64,
+}
+
+impl Default for LarkConfig {
+    /// Built by deserializing an object supplying only `app_id` and
+    /// `app_secret`, the two fields with no serde default - a Lark channel
+    /// must always name its app credentials, so they stay required rather
+    /// than gaining one. Every other field either declares a serde default
+    /// or is an `Option`, so this is the minimal object that makes the
+    /// deserialize total; those defaults stay the only source of truth for
+    /// everything but `app_id` and `app_secret`.
+    fn default() -> Self {
+        serde_json::from_str(r#"{"app_id":"","app_secret":""}"#)
+            .expect("every other LarkConfig field declares a serde default or is Option")
+    }
 }
 
 impl ChannelConfig for LarkConfig {
@@ -18373,7 +18841,6 @@ impl Default for Config {
             skills: SkillsConfig::default(),
             pipeline: PipelineConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -19820,7 +20287,7 @@ impl Config {
             (true, true) => "http_request and web_fetch",
             (true, false) => "http_request",
             (false, true) => "web_fetch",
-            (false, false) => unreachable!(),
+            (false, false) => return,
         };
         warnings.push(crate::validation_warnings::ValidationWarning::new(
             "proxy_conflicts_with_dns_pinned_tools",
@@ -20561,6 +21028,12 @@ impl Config {
                 &format!("channels.telegram.{alias}.api_base_url"),
                 &tg.api_base_url,
             )?;
+        }
+
+        for (alias, matrix) in &self.channels.matrix {
+            matrix.validate_stream_tool_arguments().with_context(|| {
+                format!("invalid channels.matrix.{alias}.stream_tool_arguments")
+            })?;
         }
 
         for (alias, slack) in &self.channels.slack {
@@ -21322,6 +21795,9 @@ impl Config {
                 );
             }
         }
+
+        validate_plugin_entries(&self.plugins)?;
+        validate_plugin_channel_instances(&self.channels)?;
 
         // MCP
         if self.mcp.enabled {
@@ -22092,6 +22568,13 @@ impl Config {
             }
         }
 
+        if self.plugins.max_active_instances == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.max_active_instances",
+                "plugins.max_active_instances must be greater than 0; a zero ceiling rejects every logical plugin instance"
+            );
+        }
         if self.plugins.limits.call_fuel == 0 {
             validation_bail!(
                 InvalidNumericRange,
@@ -22118,6 +22601,13 @@ impl Config {
                 InvalidNumericRange,
                 "plugins.limits.max_instances",
                 "plugins.limits.max_instances must be greater than 0; a zero ceiling rejects every plugin at instantiation"
+            );
+        }
+        if self.plugins.limits.call_timeout_ms == 0 {
+            validation_bail!(
+                InvalidNumericRange,
+                "plugins.limits.call_timeout_ms",
+                "plugins.limits.call_timeout_ms must be greater than 0; a zero deadline aborts every plugin call before it runs"
             );
         }
         if self.plugins.limits.max_connections_per_instance == 0 {
@@ -22182,6 +22672,18 @@ impl Config {
     /// the path is not a map-keyed entry). The bool is advisory; statement-callers
     /// that do not distinguish the reserved case may ignore it.
     ///
+    /// When it newly creates the alias, it also guarantees no phantom is left
+    /// behind: if `path` still doesn't resolve afterward (e.g. an unknown tail
+    /// field), the just-created alias is rolled back before returning, so the
+    /// caller never observes a half-materialized entry from this probe alone.
+    ///
+    /// Failures that happen *after* this returns (value coercion, a masked
+    /// secret, or a `set_prop` parse error) are the caller's to contain. The
+    /// RPC `config_set` path does so by mutating a cloned `Config` and only
+    /// committing it on full success, so a discarded attempt drops the alias
+    /// with the clone — no tracked-tuple mirror of config transaction state is
+    /// exposed to the runtime.
+    ///
     /// `#[resource_key]` sections are excluded. Their keys are values drawn from
     /// another domain (model id, voice, tool name) and may themselves contain
     /// dots, so the first-dot split below would read
@@ -22243,7 +22745,21 @@ impl Config {
             );
             return true;
         }
-        let _ = self.create_map_key(section, alias);
+        // Roll back on the same `Ok(true)` == "newly created" signal the CLI
+        // helper `ensure_map_key_for_prop_path` (src/main.rs) uses: never gate
+        // this on the earlier `get_map_keys` pre-check, or a bogus tail field
+        // on an already-existing alias would delete a legitimate config entry.
+        if matches!(self.create_map_key(section, alias), Ok(true))
+            && self.get_prop(path).is_err()
+            // A missing entry under a dynamic secret map is a valid first
+            // write, not an unknown schema tail. `get_prop` can only read
+            // keys that already exist, while the generated `set_prop`
+            // intentionally inserts them. The static secret classifier
+            // recognizes the map prefix without requiring the key to exist.
+            && !Self::prop_is_secret(path)
+        {
+            let _ = self.delete_map_key(section, alias);
+        }
         false
     }
 
@@ -22251,13 +22767,50 @@ impl Config {
         self.dirty_paths.clear();
     }
 
+    /// Refuse paths whose bytes identify both a complete live map key and a
+    /// field below a shorter live key. Mutation routes to the shorter key,
+    /// while whole-entry persistence must treat the exact key as canonical;
+    /// rejecting before either operation keeps memory and disk aligned.
+    fn reject_ambiguous_persistent_map_key_path(&self, name: &str) -> Result<()> {
+        let Some(section) = find_map_key_section_for_path(name) else {
+            return Ok(());
+        };
+        let remainder = &name[section.path.len() + 1..];
+        let Some(keys) = self.get_map_keys(section.path) else {
+            return Ok(());
+        };
+        if !keys.iter().any(|key| key == remainder) {
+            return Ok(());
+        }
+
+        let Some((field_key, inner_name)) = crate::helpers::route_hashmap_path(
+            name,
+            "",
+            section.path,
+            "",
+            keys.iter().map(String::as_str),
+        ) else {
+            return Ok(());
+        };
+
+        anyhow::bail!(
+            "Ambiguous config path `{name}`: it could mean the map entry `{}[{:?}]` or property `{}[{:?}].{inner_name}`. Refusing to choose; rename one of the colliding map keys",
+            section.path,
+            remainder,
+            section.path,
+            field_key,
+        )
+    }
+
     pub fn set_prop_persistent(&mut self, name: &str, value_str: &str) -> Result<()> {
+        self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_prop(name, value_str)?;
         self.mark_dirty(name);
         Ok(())
     }
 
     pub fn set_secret_persistent(&mut self, name: &str, value: String) -> Result<()> {
+        self.reject_ambiguous_persistent_map_key_path(name)?;
         self.set_secret(name, value)?;
         self.mark_dirty(name);
         Ok(())
@@ -22481,8 +23034,78 @@ fn restore_onepassword_references_for_save(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PostReplaceSync {
+    Real,
+    #[cfg(any(test, feature = "test-helpers"))]
+    FailForTest,
+}
+
+/// Test-only fault injection: when armed for a specific config path, the
+/// next atomic write to that path simulates a post-rename directory sync
+/// failure. This lets downstream crates (e.g. the runtime's `config/set`
+/// RPC tests) drive the injected fault through the full production save
+/// path instead of calling the write helper directly. Keying by path keeps
+/// concurrently running tests from consuming each other's fault.
+/// Unreachable from production builds: the hook only exists under `test`
+/// or the `test-helpers` feature, which no production dependency enables.
+#[cfg(any(test, feature = "test-helpers"))]
+static FAIL_POST_REPLACE_SYNC_FOR_PATHS: std::sync::Mutex<Vec<std::path::PathBuf>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Arm a one-shot post-rename sync failure for the next atomic write to
+/// `config_path`.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn arm_post_replace_sync_failure_for_test(config_path: &Path) {
+    FAIL_POST_REPLACE_SYNC_FOR_PATHS
+        .lock()
+        .unwrap()
+        .push(config_path.to_path_buf());
+}
+
+/// Whether an armed post-rename sync failure is still pending for
+/// `config_path`. Tests use this to prove the fault actually fired (the
+/// entry is consumed) rather than being bypassed by a save path that never
+/// reached the atomic writer.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn post_replace_sync_failure_armed(config_path: &Path) -> bool {
+    FAIL_POST_REPLACE_SYNC_FOR_PATHS
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|p| p == config_path)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn take_post_replace_sync_failure(config_path: &Path) -> bool {
+    let mut armed = FAIL_POST_REPLACE_SYNC_FOR_PATHS.lock().unwrap();
+    if let Some(idx) = armed.iter().position(|p| p == config_path) {
+        armed.swap_remove(idx);
+        true
+    } else {
+        false
+    }
+}
+
 /// Atomic write shared by `save()` and `save_dirty()`.
 async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<()> {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if take_post_replace_sync_failure(config_path) {
+        return write_config_atomically_with_sync(
+            config_path,
+            toml_str,
+            PostReplaceSync::FailForTest,
+        )
+        .await;
+    }
+    write_config_atomically_with_sync(config_path, toml_str, PostReplaceSync::Real).await
+}
+
+async fn write_config_atomically_with_sync(
+    config_path: &Path,
+    toml_str: &str,
+    post_replace_sync: PostReplaceSync,
+) -> Result<()> {
     let parent_dir = config_path
         .parent()
         .context("Config path must have a parent directory")?;
@@ -22493,6 +23116,11 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
             parent_dir.display()
         )
     })?;
+
+    // Open and sync the directory before replacement so permission, handle,
+    // and platform failures are reported while disk and live config are still
+    // unchanged. A second sync after rename establishes rename durability.
+    sync_directory(parent_dir).await?;
 
     let file_name = config_path
         .file_name()
@@ -22530,6 +23158,36 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
                 backup_path.display()
             )
         })?;
+        // The post-rename uncertainty path retains this copy as recovery
+        // material, so make that promise durable before the replacement can
+        // become visible. `copy` alone only establishes an immediately
+        // readable file; syncing both its contents and the parent directory
+        // pins the backup data and directory entry across a crash. Any failure
+        // here is still pre-commit and therefore returns with `config.toml`
+        // unchanged.
+        // The handle must carry write access: on Windows `sync_all` reaches
+        // `FlushFileBuffers`, which rejects a handle opened without
+        // `GENERIC_WRITE`. `write(true)` without `truncate`/`create_new`
+        // keeps the freshly copied bytes intact and only widens the access
+        // rights, so the fsync below is portable rather than Unix-only.
+        let backup_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&backup_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to open config backup for fsync: {}",
+                    backup_path.display()
+                )
+            })?;
+        backup_file
+            .sync_all()
+            .await
+            .with_context(|| format!("Failed to fsync config backup: {}", backup_path.display()))?;
+        sync_directory(parent_dir)
+            .await
+            .context("Failed to fsync config backup directory entry before atomic replace")?;
     }
 
     if let Err(e) = fs::rename(&temp_path, config_path).await {
@@ -22559,9 +23217,34 @@ async fn write_config_atomically(config_path: &Path, toml_str: &str) -> Result<(
         }
     }
 
-    sync_directory(parent_dir).await?;
-
-    if had_existing_config {
+    let post_replace_sync_result = match post_replace_sync {
+        PostReplaceSync::Real => sync_directory(parent_dir).await,
+        #[cfg(any(test, feature = "test-helpers"))]
+        PostReplaceSync::FailForTest => Err(anyhow::Error::msg(
+            "injected post-replace directory sync failure",
+        )),
+    };
+    if let Err(err) = post_replace_sync_result {
+        // The rename is already visible and the replacement file itself was
+        // fsynced before it moved. Returning an error here would make callers
+        // keep the old live snapshot even though disk contains the new one.
+        // Report the durability uncertainty, keep the backup for recovery,
+        // and classify the save as committed so save-then-swap callers install
+        // the matching snapshot.
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error_key": "config.directory_sync_after_replace_failed",
+                    "path": config_path.display().to_string(),
+                    "backup_path": had_existing_config
+                        .then(|| backup_path.display().to_string()),
+                    "error": err.to_string(),
+                })),
+            "Config replacement committed but directory durability sync failed; keeping backup"
+        );
+    } else if had_existing_config {
         let _ = fs::remove_file(&backup_path).await;
     }
 
@@ -23015,15 +23698,19 @@ fn apply_dirty_map_key_path(
         // Same dash-aware segment resolution `apply_dirty_natural_key_path`
         // uses for its inner suffix, rooted at the matched key's own
         // serialized table so kebab inner segments (`tool-timeout-secs`)
-        // resolve to the snake struct field on disk.
+        // resolve to the snake struct field on disk. Consult the matching
+        // on-disk table too: when a dotted dynamic-map key is being deleted,
+        // it is absent from memory by definition but still needs to resolve
+        // as one opaque segment in the document.
         let key_table = mem_table
             .and_then(|t| t.get(key))
             .and_then(|v| v.as_table());
+        let doc_key_table = doc_table
+            .and_then(|t| t.get(key))
+            .and_then(|item| item.as_table_like());
         let inner_raw: Vec<&str> = inner.split('.').collect();
-        let inner_segments: Vec<String> = match key_table {
-            Some(t) => resolve_dirty_segments(t, &inner_raw),
-            None => inner_raw.iter().map(|s| (*s).to_string()).collect(),
-        };
+        let inner_segments =
+            resolve_dirty_segments_from_sources(key_table, doc_key_table, &inner_raw);
         segments.extend(inner_segments);
     }
 
@@ -23338,28 +24025,61 @@ fn prune_empty_leaves(value: &mut toml::Value) {
 }
 
 fn resolve_dirty_segments(root: &toml::Table, raw: &[&str]) -> Vec<String> {
+    resolve_dirty_segments_from_sources(Some(root), None, raw)
+}
+
+/// Resolve a dotted dirty-path suffix against the canonical serialized
+/// in-memory table and, when supplied, its on-disk counterpart.
+///
+/// Struct fields consume one segment (with the existing kebab-to-snake
+/// fallback). Map keys are different: the serialized table owns their exact
+/// spelling, and a key may itself contain dots. Longest-match the remaining
+/// suffix against keys present in either source so `X-Foo.bar` remains one
+/// segment for both writes (present in memory) and deletes (present only on
+/// disk). No parallel key registry is introduced; both views are derived from
+/// the two states `save_dirty` is already reconciling.
+fn resolve_dirty_segments_from_sources(
+    mut memory_table: Option<&toml::Table>,
+    mut document_table: Option<&dyn toml_edit::TableLike>,
+    raw: &[&str],
+) -> Vec<String> {
     let mut out: Vec<String> = Vec::with_capacity(raw.len());
-    let mut current: Option<&toml::Value> = None;
-    for seg in raw {
-        let table_opt: Option<&toml::Table> = if out.is_empty() {
-            Some(root)
-        } else {
-            current.and_then(|v| v.as_table())
-        };
-        let resolved = match table_opt {
-            Some(t) if t.contains_key(*seg) => (*seg).to_string(),
-            Some(t) => {
-                let snake = seg.replace('-', "_");
-                if t.contains_key(&snake) {
+    let mut index = 0;
+    while index < raw.len() {
+        // Prefer the longest exact key from the remaining suffix. This is
+        // load-bearing for opaque HashMap keys containing dots; an ordinary
+        // struct table has no such key, so it naturally falls through to the
+        // one-segment field lookup below.
+        let exact = (index + 1..=raw.len()).rev().find_map(|end| {
+            let candidate = raw[index..end].join(".");
+            let exists_in_memory = memory_table.is_some_and(|t| t.contains_key(&candidate));
+            let exists_on_disk = document_table.is_some_and(|t| t.contains_key(&candidate));
+            (exists_in_memory || exists_on_disk).then_some((candidate, end - index))
+        });
+
+        let (resolved, consumed) = exact.unwrap_or_else(|| {
+            let segment = raw[index];
+            let snake = segment.replace('-', "_");
+            let snake_exists = memory_table.is_some_and(|t| t.contains_key(&snake))
+                || document_table.is_some_and(|t| t.contains_key(&snake));
+            (
+                if snake_exists {
                     snake
                 } else {
-                    (*seg).to_string()
-                }
-            }
-            None => (*seg).to_string(),
-        };
-        current = table_opt.and_then(|t| t.get(&resolved));
+                    segment.to_string()
+                },
+                1,
+            )
+        });
+
+        memory_table = memory_table
+            .and_then(|t| t.get(&resolved))
+            .and_then(|v| v.as_table());
+        document_table = document_table
+            .and_then(|t| t.get(&resolved))
+            .and_then(|item| item.as_table_like());
         out.push(resolved);
+        index += consumed;
     }
     out
 }
@@ -23998,31 +24718,6 @@ mod tests {
     }
 
     #[::core::prelude::v1::test]
-    fn todotracker_config_defaults() {
-        let cfg = super::TodoTrackerConfig::default();
-        assert!(cfg.enabled);
-        assert!(!cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Right);
-        assert_eq!(cfg.width, 32);
-        assert_eq!(cfg.max_height, 5);
-    }
-
-    #[::core::prelude::v1::test]
-    fn todotracker_config_parses_from_toml() {
-        let toml = r#"
-enabled = true
-enabled_at_start = true
-location = "bottom"
-width = 40
-max_height = 8
-"#;
-        let cfg: super::TodoTrackerConfig = toml::from_str(toml).unwrap();
-        assert!(cfg.enabled_at_start);
-        assert_eq!(cfg.location, super::TodoTrackerLocation::Bottom);
-        assert_eq!(cfg.width, 40);
-        assert_eq!(cfg.max_height, 8);
-    }
-
     /// The whole point of splitting the accessor: an operator-facing caller
     /// must be able to tell "unconfigured" from a real 32,000, which a bare
     /// `usize` cannot express.
@@ -24083,6 +24778,32 @@ max_height = 8
         )
         .unwrap();
         assert_eq!(cfg.pinned_resources, vec!["file:///a", "file:///b"]);
+    }
+
+    #[::core::prelude::v1::test]
+    fn mcp_server_config_tls_ca_cert_path_defaults_none_and_round_trips() {
+        let cfg: McpServerConfig = serde_json::from_str(r#"{"name":"s","command":"x"}"#).unwrap();
+        assert!(cfg.tls_ca_cert_path.is_none());
+        assert!(
+            !serde_json::to_value(&cfg)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("tls_ca_cert_path")
+        );
+
+        let cfg: McpServerConfig = serde_json::from_str(
+            r#"{"name":"s","transport":"http","url":"https://example.invalid/mcp","tls_ca_cert_path":"/etc/zeroclaw/internal-ca.pem"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.tls_ca_cert_path.as_deref(),
+            Some("/etc/zeroclaw/internal-ca.pem")
+        );
+        assert_eq!(
+            serde_json::to_value(&cfg).unwrap()["tls_ca_cert_path"],
+            "/etc/zeroclaw/internal-ca.pem"
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -24240,15 +24961,48 @@ max_height = 8
             ..Default::default()
         });
 
-        let fal = plugins.entry_config("image_gen_fal").unwrap();
+        let fal = plugins.entry_config("image_gen_fal").unwrap().unwrap();
         assert_eq!(fal.get("api_key").map(String::as_str), Some("secret-a"));
         assert!(fal.get("base_url").is_none());
 
-        let sd = plugins.entry_config("sd_webui").unwrap();
+        let sd = plugins.entry_config("sd_webui").unwrap().unwrap();
         assert_eq!(sd.get("base_url").map(String::as_str), Some("http://host"));
         assert!(sd.get("api_key").is_none());
 
-        assert!(plugins.entry_config("unknown").is_none());
+        assert!(plugins.entry_config("unknown").unwrap().is_none());
+
+        plugins.entries.push(super::PluginEntryConfig {
+            name: "image_gen_fal".into(),
+            config: std::collections::HashMap::new(),
+            ..Default::default()
+        });
+        assert_eq!(
+            plugins.entry_config("image_gen_fal"),
+            Err(super::DuplicatePluginConfigEntry),
+            "duplicate canonical rows must fail closed"
+        );
+    }
+
+    #[test]
+    async fn config_validation_rejects_duplicate_plugin_instance_keys() {
+        let mut config = Config::default();
+        config.plugins.entries = vec![
+            super::PluginEntryConfig {
+                name: "zpi1_same".into(),
+                config: std::collections::HashMap::new(),
+                ..Default::default()
+            },
+            super::PluginEntryConfig {
+                name: "zpi1_same".into(),
+                config: std::collections::HashMap::new(),
+                ..Default::default()
+            },
+        ];
+
+        let error = config
+            .validate()
+            .expect_err("duplicate plugin instance keys must invalidate config");
+        assert!(error.to_string().contains("duplicate instance key"));
     }
 
     #[test]
@@ -25598,6 +26352,32 @@ enabled = true
     }
 
     #[test]
+    async fn plugin_call_timeout_defaults_and_deserializes_compatibly() {
+        assert_eq!(PluginLimitsConfig::default().call_timeout_ms, 30_000);
+
+        let limits: PluginLimitsConfig =
+            toml::from_str("call_fuel = 42").expect("legacy limits deserialize");
+        assert_eq!(limits.call_fuel, 42);
+        assert_eq!(
+            limits.call_timeout_ms, 30_000,
+            "omitting the additive field keeps the host-safe default"
+        );
+    }
+
+    #[test]
+    async fn validate_rejects_zero_plugin_call_timeout() {
+        let mut config = Config::default();
+        config.plugins.limits.call_timeout_ms = 0;
+        let err = config
+            .validate()
+            .expect_err("zero call_timeout_ms must be rejected");
+        assert!(
+            err.to_string().contains("plugins.limits.call_timeout_ms"),
+            "error must name the offending path; got: {err}"
+        );
+    }
+
+    #[test]
     async fn validate_rejects_zero_plugin_max_memory() {
         let mut config = Config::default();
         config.plugins.limits.max_memory_mb = 0;
@@ -26695,6 +27475,32 @@ auto_save = true
         assert!(parsed.temperature_override.is_none());
     }
 
+    #[::core::prelude::v1::test]
+    fn grok_cli_alias_requires_working_directory() {
+        let error = toml::from_str::<GrokCliModelProviderConfig>("model = \"grok-4.5\"")
+            .expect_err("missing ACP session boundary must fail");
+        assert!(error.to_string().contains("working_directory"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn grok_cli_alias_deserializes_explicit_working_directory() {
+        let parsed: GrokCliModelProviderConfig = toml::from_str(
+            r#"
+                model = "grok-4.5"
+                working_directory = "/srv/zeroclaw/workspace"
+                env_passthrough = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+                max_acp_stdout_bytes = 8388608
+            "#,
+        )
+        .expect("explicit Grok ACP cwd");
+        assert_eq!(parsed.working_directory, "/srv/zeroclaw/workspace");
+        assert_eq!(
+            parsed.env_passthrough,
+            ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"]
+        );
+        assert_eq!(parsed.max_acp_stdout_bytes, Some(8_388_608));
+    }
+
     #[test]
     async fn channels_default() {
         let c = ChannelsConfig::default();
@@ -26879,7 +27685,6 @@ auto_save = true
                 to: Some("123456".into()),
                 ..HeartbeatConfig::default()
             },
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
@@ -26937,6 +27742,7 @@ auto_save = true
                 mqtt: HashMap::new(),
                 amqp: HashMap::new(),
                 filesystem: HashMap::new(),
+                plugin: HashMap::new(),
                 message_timeout_secs: 300,
                 max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
                 ack_reactions: true,
@@ -27683,6 +28489,90 @@ default_temperature = 0.7
     }
 
     #[tokio::test]
+    async fn post_replace_sync_failure_keeps_disk_commit_and_backup() {
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_post_replace_sync_failure_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+
+        let result = write_config_atomically_with_sync(
+            &config_path,
+            "schema_version = 2\n",
+            PostReplaceSync::FailForTest,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "a post-replace sync fault must report a committed save: {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "the successful rename is the canonical on-disk result"
+        );
+        assert_eq!(
+            fs::read_to_string(&backup_path).await.unwrap(),
+            "schema_version = 1\n",
+            "durability uncertainty must retain the pre-replace backup"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn save_over_existing_config_syncs_backup_on_every_platform() {
+        // The backup fsync runs on the ordinary save-over-existing-config
+        // path, so the handle it uses must be valid at runtime, not merely
+        // compile. Opening the `.bak` copy read-only builds everywhere but
+        // fails under Windows `FlushFileBuffers`, which requires write
+        // access. Executing the real path here turns that into a test
+        // failure wherever the suite runs instead of a review-only catch.
+        // The companion fault-injection test asserts the retained backup
+        // still holds the pre-replace bytes, which is what proves the
+        // widened access rights do not truncate the recovery copy.
+        let dir = std::env::temp_dir().join(format!(
+            "zeroclaw_test_save_over_existing_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).await.unwrap();
+        let config_path = dir.join("config.toml");
+        let backup_path = dir.join("config.toml.bak");
+        fs::write(&config_path, "schema_version = 1\n")
+            .await
+            .unwrap();
+
+        let result = write_config_atomically_with_sync(
+            &config_path,
+            "schema_version = 2\n",
+            PostReplaceSync::Real,
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "saving over an existing config must not fail while syncing the backup: {result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).await.unwrap(),
+            "schema_version = 2\n",
+            "the replacement must be visible after a committed save"
+        );
+        assert!(
+            !backup_path.exists(),
+            "a fully durable save consumes the backup rather than leaving it behind"
+        );
+
+        let _ = fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
     async fn config_save_prunes_unchanged_default_blocks() {
         // Fresh-init config without any operator edits should write a
         // tiny config.toml — only `schema_version` and any operator-
@@ -27814,7 +28704,6 @@ default_temperature = 0.7
             pipeline: PipelineConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             heartbeat: HeartbeatConfig::default(),
-            todotracker: TodoTrackerConfig::default(),
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
@@ -28029,6 +28918,7 @@ default_temperature = 0.7
                 ..Default::default()
             },
         );
+        config.gateway.webhook_secret = Some("gateway-ingress-credential".into());
 
         // MCP server: HTTP headers map carries an Authorization Bearer
         // token; the new `#[secret]` on `HashMap<String, String>` must
@@ -28066,6 +28956,7 @@ default_temperature = 0.7
             "Bearer otel-credential",
             "Bearer upload-credential",
             "Bearer http-request-credential",
+            "gateway-ingress-credential",
             "mcp-env-credential",
             "Bearer mcp-cred",
             "tenant-42",
@@ -28254,6 +29145,14 @@ default_temperature = 0.7
             store.decrypt(webhook_secret).unwrap(),
             "webhook-shared-secret"
         );
+        let gateway_webhook_secret = stored.gateway.webhook_secret.as_deref().unwrap();
+        assert!(crate::secrets::SecretStore::is_encrypted(
+            gateway_webhook_secret
+        ));
+        assert_eq!(
+            store.decrypt(gateway_webhook_secret).unwrap(),
+            "gateway-ingress-credential"
+        );
 
         // MCP server headers — every value must be encrypted; the keys
         // stay plaintext (TOML table headers are not secret).
@@ -28368,6 +29267,19 @@ default_temperature = 0.7
     }
 
     #[test]
+    async fn telegram_config_rejects_matrix_single_message_stream_mode() {
+        let err = toml::from_str::<TelegramConfig>(
+            r#"
+bot_token = "tok"
+stream_mode = "single_message"
+"#,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("single_message"));
+    }
+
+    #[test]
     async fn discord_config_serde() {
         let dc = DiscordConfig {
             enabled: true,
@@ -28468,9 +29380,14 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             device_id: Some("DEVICE123".into()),
             allowed_rooms: vec!["!room123:matrix.org".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28503,9 +29420,14 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
             device_id: None,
             allowed_rooms: vec!["!abc:synapse.local".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -28520,6 +29442,50 @@ allowed_contacts = ["+1234567890", "user@icloud.com"]
         let parsed: MatrixConfig = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.homeserver, "https://synapse.local:8448");
         assert_eq!(parsed.allowed_rooms.len(), 1);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_defaults_to_zero() {
+        let parsed: SlackConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.thread_context_max_messages, None);
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_deserializes_explicit_value() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":7}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(7));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 7);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_allows_zero_to_disable_backfill() {
+        let parsed: SlackConfig =
+            serde_json::from_str(r#"{"thread_context_max_messages":0}"#).unwrap();
+        assert_eq!(parsed.thread_context_max_messages, Some(0));
+        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
+    }
+
+    #[test]
+    async fn slack_thread_context_max_messages_rejects_values_above_slack_fetch_limit() {
+        let mut config = Config::default();
+        config.channels.slack.insert(
+            "default".to_string(),
+            SlackConfig {
+                thread_context_max_messages: Some(51),
+                ..Default::default()
+            },
+        );
+
+        let err = config
+            .validate()
+            .expect_err("values above the Slack fetch limit must be rejected")
+            .to_string();
+        assert!(
+            err.contains("channels.slack.default.thread_context_max_messages"),
+            "unexpected validation error: {err}",
+        );
     }
 
     #[test]
@@ -28640,9 +29606,14 @@ allowed_users = ["@u:matrix.org"]
                     device_id: None,
                     allowed_rooms: vec!["!r:m".into()],
                     interrupt_on_new_message: false,
-                    stream_mode: StreamMode::default(),
+                    stream_mode: MatrixStreamMode::default(),
                     draft_update_interval_ms: 1500,
                     multi_message_delay_ms: 800,
+                    stream_draft_lines: 10,
+                    message_max_bytes: 48_000,
+                    stream_draft_delete: true,
+                    stream_reasoning: StreamReasoningMode::Status,
+                    stream_tool_arguments: vec![],
                     recovery_key: None,
                     mention_only: false,
                     password: None,
@@ -28682,6 +29653,7 @@ allowed_users = ["@u:matrix.org"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -28791,50 +29763,6 @@ allowed_users = ["U111"]
         assert_eq!(parsed.thread_replies, Some(false));
         assert!(!parsed.interrupt_on_new_message);
         assert!(!parsed.mention_only);
-    }
-
-    #[test]
-    async fn slack_thread_context_max_messages_defaults_to_zero() {
-        let parsed: SlackConfig = serde_json::from_str("{}").unwrap();
-        assert_eq!(parsed.thread_context_max_messages, None);
-        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
-    }
-
-    #[test]
-    async fn slack_thread_context_max_messages_deserializes_explicit_value() {
-        let parsed: SlackConfig =
-            serde_json::from_str(r#"{"thread_context_max_messages":7}"#).unwrap();
-        assert_eq!(parsed.thread_context_max_messages, Some(7));
-        assert_eq!(parsed.effective_thread_context_max_messages(), 7);
-    }
-
-    #[test]
-    async fn slack_thread_context_max_messages_allows_zero_to_disable_backfill() {
-        let parsed: SlackConfig =
-            serde_json::from_str(r#"{"thread_context_max_messages":0}"#).unwrap();
-        assert_eq!(parsed.thread_context_max_messages, Some(0));
-        assert_eq!(parsed.effective_thread_context_max_messages(), 0);
-    }
-
-    #[test]
-    async fn slack_thread_context_max_messages_rejects_values_above_slack_fetch_limit() {
-        let mut config = Config::default();
-        config.channels.slack.insert(
-            "default".to_string(),
-            SlackConfig {
-                thread_context_max_messages: Some(51),
-                ..Default::default()
-            },
-        );
-
-        let err = config
-            .validate()
-            .expect_err("values above the Slack fetch limit must be rejected")
-            .to_string();
-        assert!(
-            err.contains("channels.slack.default.thread_context_max_messages"),
-            "unexpected validation error: {err}",
-        );
     }
 
     #[test]
@@ -28987,6 +29915,7 @@ bot_token = "xoxb-tok"
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29022,6 +29951,7 @@ bot_token = "xoxb-tok"
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29054,6 +29984,30 @@ bot_token = "xoxb-tok"
         let parsed: WhatsAppConfig =
             serde_json::from_str(r#"{"passive_group_context":true}"#).unwrap();
         assert!(parsed.passive_group_context);
+    }
+
+    #[test]
+    async fn whatsapp_config_push_name_absent_stays_none_and_round_trips_non_ascii() {
+        let parsed: WhatsAppConfig = serde_json::from_str("{}").unwrap();
+        assert!(parsed.push_name.is_none());
+
+        let name = "סוכן – שירות";
+        let wc = WhatsAppConfig {
+            push_name: Some(name.into()),
+            ..Default::default()
+        };
+        let parsed: WhatsAppConfig = toml::from_str(&toml::to_string(&wc).unwrap()).unwrap();
+        assert_eq!(parsed.push_name.as_deref(), Some(name));
+    }
+
+    #[test]
+    async fn whatsapp_config_push_name_is_not_a_web_selector() {
+        let wc = WhatsAppConfig {
+            push_name: Some("ZeroClawAgent".into()),
+            ..Default::default()
+        };
+        assert!(!wc.has_web_selector());
+        assert_eq!(wc.backend_type(), "cloud");
     }
 
     #[test]
@@ -29093,6 +30047,7 @@ allowed_numbers = ["+1", "+2"]
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29125,6 +30080,7 @@ allowed_numbers = ["+1", "+2"]
             pair_phone: None,
             pair_code: None,
             ws_url: None,
+            push_name: None,
             mention_only: false,
             passive_group_context: false,
             interrupt_on_new_message: false,
@@ -29204,6 +30160,7 @@ allowed_numbers = ["+1", "+2"]
                     pair_phone: None,
                     pair_code: None,
                     ws_url: None,
+                    push_name: None,
                     mention_only: false,
                     passive_group_context: false,
                     interrupt_on_new_message: false,
@@ -29247,6 +30204,7 @@ allowed_numbers = ["+1", "+2"]
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
+            plugin: HashMap::new(),
             message_timeout_secs: 300,
             max_concurrent_per_channel: default_channel_max_concurrent_per_channel(),
             ack_reactions: true,
@@ -29335,6 +30293,7 @@ allowed_numbers = ["+1", "+2"]
             paired_tokens: vec!["zc_test_token".into()],
             pair_rate_limit_per_minute: 12,
             webhook_rate_limit_per_minute: 80,
+            webhook_secret: None,
             trust_forwarded_headers: true,
             path_prefix: Some("/zeroclaw".into()),
             rate_limit_max_keys: 2048,
@@ -31209,6 +32168,32 @@ api_token = "tok"
     }
 
     #[test]
+    async fn proxy_config_accepts_transcription_service_selectors() {
+        let mut proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://127.0.0.1:7890".into()),
+            scope: ProxyScope::Services,
+            ..ProxyConfig::default()
+        };
+
+        for selector in [
+            "transcription.groq",
+            "transcription.openai",
+            "transcription.deepgram",
+            "transcription.assemblyai",
+            "transcription.google",
+            "transcription.local_whisper",
+            "transcription.*",
+        ] {
+            proxy.services = vec![selector.to_string()];
+            assert!(
+                proxy.validate().is_ok(),
+                "exact transcription selector `{selector}` should validate"
+            );
+        }
+    }
+
+    #[test]
     async fn collect_warnings_surfaces_dns_pinned_proxy_conflicts() {
         let proxy_url = Some("http://proxy.example:3128".to_string());
 
@@ -32095,6 +33080,67 @@ group_policy = "disabled"
         );
     }
 
+    #[test]
+    async fn set_prop_persistent_rejects_ambiguous_dotted_map_key_path_before_mutation() {
+        let mut config = Config::default();
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+        config.cost.rates.providers.models.openai.insert(
+            "gpt-4.1.input_per_mtok".to_string(),
+            ModelCostRates {
+                input_per_mtok: Some(2.0),
+                ..Default::default()
+            },
+        );
+
+        let path = "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok";
+        let err = config
+            .set_prop_persistent(path, "9.9")
+            .expect_err("colliding whole-key and field interpretations must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\"gpt-4.1.input_per_mtok\"]"),
+            "error must name the whole-entry interpretation: {message}"
+        );
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\"gpt-4.1\"].input_per_mtok"),
+            "error must name the field interpretation: {message}"
+        );
+        assert_eq!(
+            config
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(1.0),
+            "rejection must happen before the shorter key's field is mutated"
+        );
+        assert_eq!(
+            config
+                .cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1.input_per_mtok")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(2.0),
+            "rejection must not mutate the exact-key entry"
+        );
+        assert!(
+            !config.dirty_paths.contains(path),
+            "a rejected path must not be recorded as persistable"
+        );
+    }
+
     /// Control for `save_dirty_persists_dotted_map_key_field`: a dot-free
     /// resource key must keep working through the same map-key-section
     /// branch (it's no longer special-cased out — every `HashMap<String,
@@ -32348,6 +33394,121 @@ group_policy = "disabled"
         assert!(
             msg.contains("cost.rates.providers.models.openai.ghost-model.input_per_mtok"),
             "error must name the offending dirty path; got: {msg}"
+        );
+    }
+
+    /// A dynamic secret map (`#[secret] HashMap<String, String>`, e.g.
+    /// `extra_headers`) treats its whole non-empty suffix as ONE opaque
+    /// key — `set_prop` stores the literal `"X-Foo.bar"`. The dirty
+    /// writer must not re-split that key at dots into `X-Foo` → `bar`,
+    /// or `write_or_delete_leaf` finds nothing, takes the delete branch,
+    /// and `save_dirty` returns `Ok(())` having written nothing: the
+    /// operator sees success and the value is gone at next reload.
+    #[test]
+    async fn save_dirty_writes_dotted_dynamic_secret_map_key_as_one_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [providers.models.openai.fresh]\n\
+             model = \"gpt-4o\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Default::default()
+        };
+        config.secrets.encrypt = false;
+        config
+            .create_map_key("providers.models.openai", "fresh")
+            .expect("seed the alias");
+
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo.bar";
+        config
+            .set_prop_persistent(path, "header-value")
+            .expect("a dotted dynamic secret-map key must be insertable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .map(String::as_str),
+            Some("header-value"),
+            "precondition: set_prop stores ONE literal HashMap key"
+        );
+
+        config.save_dirty().await.expect("save_dirty must succeed");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: Config = toml::from_str(&written)
+            .unwrap_or_else(|e| panic!("rewritten config must reparse: {e}\n---\n{written}"));
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|p| p.base.extra_headers.get("X-Foo.bar"))
+                .map(String::as_str),
+            Some("header-value"),
+            "a dotted dynamic secret-map key must round-trip through disk as the \
+             literal key `set_prop` stored, not be split at dots and dropped; got:\n{written}"
+        );
+    }
+
+    /// Unset half of the same contract: clearing a dotted dynamic
+    /// secret-map key must remove the literal on-disk entry rather than
+    /// hunting for a nested `bar` table that never existed.
+    #[test]
+    async fn save_dirty_removes_dotted_dynamic_secret_map_key_as_one_segment() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        let seed = format!(
+            "schema_version = {}\n\n\
+             [providers.models.openai.fresh]\n\
+             model = \"gpt-4o\"\n\n\
+             [providers.models.openai.fresh.extra_headers]\n\
+             \"X-Foo.bar\" = \"header-value\"\n",
+            crate::migration::CURRENT_SCHEMA_VERSION
+        );
+        std::fs::write(&config_path, &seed).unwrap();
+
+        let mut config: Config = toml::from_str(&seed).unwrap();
+        config.config_path = config_path.clone();
+        config.secrets.encrypt = false;
+        assert!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .is_some_and(|p| p.base.extra_headers.contains_key("X-Foo.bar")),
+            "precondition: seeded dotted header key must load"
+        );
+
+        config
+            .providers
+            .models
+            .openai
+            .get_mut("fresh")
+            .unwrap()
+            .base
+            .extra_headers
+            .remove("X-Foo.bar");
+        config.mark_dirty("providers.models.openai.fresh.extra_headers.X-Foo.bar");
+        config.save_dirty().await.expect("save_dirty must succeed");
+
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !written.contains("X-Foo.bar"),
+            "unsetting a dotted dynamic secret-map key must delete the literal \
+             on-disk entry; got:\n{written}"
         );
     }
 
@@ -33346,6 +34507,97 @@ high_entropy_tokens = false
     }
 
     #[test]
+    async fn validate_mcp_config_enforces_custom_ca_invariants_through_config() {
+        let absolute_ca = std::env::temp_dir().join("zeroclaw-test-ca.pem");
+        let absolute_ca_string = absolute_ca.to_string_lossy().into_owned();
+
+        let mut config = Config::default();
+        config.mcp.servers = vec![
+            http_server("public", "http://localhost:8080/mcp"),
+            McpServerConfig {
+                name: "private".into(),
+                transport: McpTransport::Sse,
+                url: Some("https://internal.example.invalid/sse".into()),
+                tls_ca_cert_path: Some(absolute_ca_string.clone()),
+                ..Default::default()
+            },
+        ];
+        config
+            .validate()
+            .expect("unset and valid custom-CA configurations should validate");
+
+        for (path, url, expected) in [
+            (
+                String::new(),
+                "https://internal.example.invalid/mcp",
+                "must not be empty",
+            ),
+            (
+                "relative-ca.pem".to_string(),
+                "https://internal.example.invalid/mcp",
+                "must be an absolute path",
+            ),
+            (
+                absolute_ca_string,
+                "http://internal.example.invalid/mcp",
+                "must use https when tls_ca_cert_path is set",
+            ),
+        ] {
+            let mut config = Config::default();
+            config.mcp.servers = vec![McpServerConfig {
+                name: "private".into(),
+                transport: McpTransport::Http,
+                url: Some(url.into()),
+                tls_ca_cert_path: Some(path),
+                ..Default::default()
+            }];
+            let error = config
+                .validate()
+                .expect_err("invalid custom-CA configuration must fail validation");
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?}, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    async fn mcp_custom_ca_configured_and_unset_survive_save_and_reload() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let absolute_ca = dir.path().join("internal-ca.pem");
+        let mut config = Config {
+            config_path: dir.path().join("config.toml"),
+            data_dir: dir.path().join("workspace"),
+            ..Default::default()
+        };
+        config.mcp.servers = vec![
+            http_server("public", "https://public.example.invalid/mcp"),
+            McpServerConfig {
+                name: "private".into(),
+                transport: McpTransport::Sse,
+                url: Some("https://private.example.invalid/sse".into()),
+                tls_ca_cert_path: Some(absolute_ca.to_string_lossy().into_owned()),
+                ..Default::default()
+            },
+        ];
+
+        config.save().await.unwrap();
+        let raw = tokio::fs::read_to_string(&config.config_path)
+            .await
+            .unwrap();
+        let loaded: Config = crate::migration::migrate_to_current(&raw).unwrap();
+        loaded
+            .validate()
+            .expect("saved custom-CA configuration should validate after reload");
+        assert_eq!(loaded.mcp.servers.len(), 2);
+        assert!(loaded.mcp.servers[0].tls_ca_cert_path.is_none());
+        assert_eq!(
+            loaded.mcp.servers[1].tls_ca_cert_path.as_deref(),
+            Some(absolute_ca.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
     async fn validate_mcp_config_rejects_empty_name() {
         let cfg = McpConfig {
             enabled: true,
@@ -34233,9 +35485,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34267,9 +35524,26 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::Safe,
+                    argument_chars: Some(80),
+                },
+                StreamToolArgumentEntry::Tool {
+                    tool: "delegate".into(),
+                    base: Some(StreamToolArgumentBase::None),
+                    include: vec!["agent".into(), "background".into()],
+                    exclude: vec![],
+                    argument_chars: Some(0),
+                },
+            ],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34294,9 +35568,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34322,9 +35601,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34361,9 +35645,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
-                stream_mode: StreamMode::default(),
+                stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 recovery_key: None,
                 mention_only: false,
                 password: None,
@@ -34399,9 +35688,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
-                stream_mode: StreamMode::default(),
+                stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 recovery_key: None,
                 mention_only: false,
                 password: None,
@@ -34442,9 +35736,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
                 device_id: None,
                 allowed_rooms: vec!["!r:m".into()],
                 interrupt_on_new_message: false,
-                stream_mode: StreamMode::default(),
+                stream_mode: MatrixStreamMode::default(),
                 draft_update_interval_ms: 1500,
                 multi_message_delay_ms: 800,
+                stream_draft_lines: 10,
+                message_max_bytes: 48_000,
+                stream_draft_delete: true,
+                stream_reasoning: StreamReasoningMode::Status,
+                stream_tool_arguments: vec![],
                 mention_only: false,
                 recovery_key: None,
                 password: None,
@@ -34553,9 +35852,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34592,9 +35896,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34627,9 +35936,14 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34657,9 +35971,26 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             device_id: None,
             allowed_rooms: vec!["!r:m".into()],
             interrupt_on_new_message: false,
-            stream_mode: StreamMode::default(),
+            stream_mode: MatrixStreamMode::default(),
             draft_update_interval_ms: 1500,
             multi_message_delay_ms: 800,
+            stream_draft_lines: 10,
+            message_max_bytes: 48_000,
+            stream_draft_delete: true,
+            stream_reasoning: StreamReasoningMode::Status,
+            stream_tool_arguments: vec![
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::Safe,
+                    argument_chars: Some(80),
+                },
+                StreamToolArgumentEntry::Tool {
+                    tool: "delegate".into(),
+                    base: Some(StreamToolArgumentBase::None),
+                    include: vec!["agent".into(), "background".into()],
+                    exclude: vec![],
+                    argument_chars: Some(0),
+                },
+            ],
             recovery_key: None,
             mention_only: false,
             password: None,
@@ -34702,6 +36033,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let stream = by_name["channels.matrix.stream_mode"];
         assert!(stream.is_enum());
         assert!(stream.enum_variants.is_some());
+        let reasoning = by_name["channels.matrix.stream_reasoning"];
+        assert!(reasoning.is_enum());
+        assert_eq!(reasoning.display_value, "status");
+        let tool_arguments = by_name["channels.matrix.stream_tool_arguments"];
+        assert_eq!(tool_arguments.kind, crate::traits::PropKind::ObjectArray);
 
         // Secret field — masked
         let token = by_name["channels.matrix.access_token"];
@@ -34870,11 +36206,125 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             mx.get_prop("channels.matrix.user_id").unwrap(),
             "@bot:m.org"
         );
+        assert_eq!(
+            mx.get_prop("channels.matrix.stream_reasoning").unwrap(),
+            "status"
+        );
         assert_eq!(mx.get_prop("channels.matrix.device_id").unwrap(), "<unset>");
         // Secrets return masked value
         assert_eq!(
             mx.get_prop("channels.matrix.access_token").unwrap(),
             "**** (encrypted)"
+        );
+    }
+
+    #[test]
+    async fn matrix_stream_tool_arguments_deserialize_from_compact_toml() {
+        let matrix: MatrixConfig = toml::from_str(
+            r#"
+homeserver = "https://matrix.example"
+stream_tool_arguments = [
+    { default_base = "safe", argument_chars = 120 },
+    { tool = "delegate", base = "none", include = ["agent", "background", "prompt"], argument_chars = 0 },
+    { tool = "mock_tool", base = "all", exclude = ["token"] },
+]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(matrix.stream_tool_arguments.len(), 3);
+        assert_eq!(
+            matrix.stream_tool_arguments[0],
+            StreamToolArgumentEntry::Defaults {
+                default_base: StreamToolArgumentBase::Safe,
+                argument_chars: Some(120),
+            }
+        );
+        assert!(matrix.validate_stream_tool_arguments().is_ok());
+    }
+
+    #[::core::prelude::v1::test]
+    fn matrix_message_budget_clamps_values_below_one_unicode_scalar() {
+        for message_max_bytes in 0..MATRIX_MIN_MESSAGE_MAX_BYTES {
+            let matrix = MatrixConfig {
+                message_max_bytes,
+                ..Default::default()
+            };
+            assert_eq!(
+                matrix.effective_message_max_bytes(),
+                MATRIX_MIN_MESSAGE_MAX_BYTES
+            );
+        }
+
+        let matrix = MatrixConfig {
+            message_max_bytes: MATRIX_MIN_MESSAGE_MAX_BYTES + 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            matrix.effective_message_max_bytes(),
+            MATRIX_MIN_MESSAGE_MAX_BYTES + 1
+        );
+    }
+
+    #[test]
+    async fn matrix_stream_tool_arguments_reject_ambiguous_rules() {
+        let matrix = MatrixConfig {
+            stream_tool_arguments: vec![
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::Safe,
+                    argument_chars: None,
+                },
+                StreamToolArgumentEntry::Defaults {
+                    default_base: StreamToolArgumentBase::None,
+                    argument_chars: Some(0),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(
+            matrix
+                .validate_stream_tool_arguments()
+                .unwrap_err()
+                .to_string()
+                .contains("duplicates")
+        );
+
+        let matrix = MatrixConfig {
+            stream_tool_arguments: vec![StreamToolArgumentEntry::Tool {
+                tool: "delegate".into(),
+                base: None,
+                include: vec!["prompt".into()],
+                exclude: vec!["prompt".into()],
+                argument_chars: None,
+            }],
+            ..Default::default()
+        };
+        assert!(
+            matrix
+                .validate_stream_tool_arguments()
+                .unwrap_err()
+                .to_string()
+                .contains("includes and excludes")
+        );
+    }
+
+    #[test]
+    async fn matrix_stream_tool_arguments_round_trip_through_configurable_prop() {
+        let mut matrix = MatrixConfig::default();
+        matrix
+            .set_prop(
+                "channels.matrix.stream_tool_arguments",
+                r#"[{"default_base":"none"},{"tool":"shell","base":"all","exclude":["command"]}]"#,
+            )
+            .unwrap();
+
+        assert_eq!(matrix.stream_tool_arguments.len(), 2);
+        assert!(matrix.validate_stream_tool_arguments().is_ok());
+        assert!(
+            matrix
+                .get_prop("channels.matrix.stream_tool_arguments")
+                .unwrap()
+                .contains("shell")
         );
     }
 
@@ -34943,11 +36393,23 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = test_matrix_config();
         mx.set_prop("channels.matrix.stream_mode", "partial")
             .unwrap();
-        assert_eq!(mx.stream_mode, StreamMode::Partial);
+        assert_eq!(mx.stream_mode, MatrixStreamMode::Partial);
+
+        mx.set_prop("channels.matrix.stream_mode", "single_message")
+            .unwrap();
+        assert_eq!(mx.stream_mode, MatrixStreamMode::SingleMessage);
 
         mx.set_prop("channels.matrix.stream_mode", "multi_message")
             .unwrap();
-        assert_eq!(mx.stream_mode, StreamMode::MultiMessage);
+        assert_eq!(mx.stream_mode, MatrixStreamMode::MultiMessage);
+
+        mx.set_prop("channels.matrix.stream_reasoning", "off")
+            .unwrap();
+        assert_eq!(mx.stream_reasoning, StreamReasoningMode::Off);
+
+        mx.set_prop("channels.matrix.stream_reasoning", "full")
+            .unwrap();
+        assert_eq!(mx.stream_reasoning, StreamReasoningMode::Full);
     }
 
     #[test]
@@ -34955,6 +36417,11 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let mut mx = test_matrix_config();
         let err = mx
             .set_prop("channels.matrix.stream_mode", "invalid")
+            .unwrap_err();
+        assert!(err.to_string().contains("expected one of"));
+
+        let err = mx
+            .set_prop("channels.matrix.stream_reasoning", "raw")
             .unwrap_err();
         assert!(err.to_string().contains("expected one of"));
     }
@@ -35466,7 +36933,17 @@ api_key = "op://zeroclaw/provider/openai-api-key"
         let variants = (stream_field.enum_variants.unwrap())();
         assert!(variants.contains(&"off".to_string()));
         assert!(variants.contains(&"partial".to_string()));
+        assert!(variants.contains(&"single_message".to_string()));
         assert!(variants.contains(&"multi_message".to_string()));
+    }
+
+    #[test]
+    async fn shared_stream_mode_excludes_matrix_single_message_variant() {
+        let shared = serde_json::from_str::<StreamMode>(r#""single_message""#);
+        assert!(shared.is_err());
+
+        let matrix = serde_json::from_str::<MatrixStreamMode>(r#""single_message""#).unwrap();
+        assert_eq!(matrix, MatrixStreamMode::SingleMessage);
     }
 
     #[test]
@@ -35525,40 +37002,61 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     #[test]
     async fn create_map_key_seeds_plugin_entry_and_routes_config_set() {
         // The `zeroclaw plugin install` seeding path: a fresh
-        // `[[plugins.entries]]` entry named after the plugin must make
-        // `config set plugins.entries.<name>.config.<key>` routable;
+        // `[[plugins.entries]]` entry named with the canonical instance key
+        // must make `config set plugins.entries.<instance>.config.<key>` routable;
         // natural-key path routing only matches keys already present in
         // live config.
-        let mut config = Config::default();
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_path = temp.path().join("config.toml");
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Config::default()
+        };
+        let instance_key = "zpi1_WyJmaXh0dXJlLnBsdWdpbiIsInRvb2wiLCJtYWluLnh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh44KC-Il0";
         let created = config
-            .create_map_key("plugins.entries", "weather-tool")
+            .create_map_key("plugins.entries", instance_key)
             .expect("plugins.entries must accept new natural-key entries");
         assert!(created, "first add should report created=true");
         assert_eq!(config.plugins.entries.len(), 1);
-        assert_eq!(config.plugins.entries[0].name, "weather-tool");
+        assert_eq!(config.plugins.entries[0].name, instance_key);
+        config.mark_dirty(&format!("plugins.entries.{instance_key}"));
+        config.save_dirty().await.unwrap();
 
         config
-            .set_prop("plugins.entries.weather-tool.config.api_key", "sk-test")
+            .set_prop_persistent(
+                &format!("plugins.entries.{instance_key}.config.api_key"),
+                "sk-test",
+            )
             .expect("config set must route through the seeded entry");
+        config.save_dirty().await.unwrap();
         assert_eq!(
             config
                 .plugins
-                .entry_config("weather-tool")
+                .entry_config(instance_key)
+                .unwrap()
                 .and_then(|c| c.get("api_key"))
                 .map(String::as_str),
             Some("sk-test")
         );
+        let written = std::fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains(instance_key));
+        assert!(written.contains("api_key"));
+        assert!(
+            !written.contains("sk-test"),
+            "plugin config values must remain encrypted on disk"
+        );
 
         // Idempotent: reinstalling must not clobber operator values.
         let again = config
-            .create_map_key("plugins.entries", "weather-tool")
+            .create_map_key("plugins.entries", instance_key)
             .expect("second add still resolves the section");
         assert!(!again, "duplicate add should report created=false");
         assert_eq!(config.plugins.entries.len(), 1);
         assert_eq!(
             config
                 .plugins
-                .entry_config("weather-tool")
+                .entry_config(instance_key)
+                .unwrap()
                 .and_then(|c| c.get("api_key"))
                 .map(String::as_str),
             Some("sk-test"),
@@ -35998,6 +37496,70 @@ api_key = "op://zeroclaw/provider/openai-api-key"
     }
 
     #[test]
+    async fn ensure_map_key_for_path_rolls_back_alias_when_tail_field_unknown() {
+        let mut config = Config::default();
+        let path = "providers.models.anthropic.default.not_a_real_field";
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "precondition: alias must not exist yet"
+        );
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "default")),
+            "the just-created alias must be rolled back when the tail field can't resolve"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_keeps_preexisting_alias_on_unknown_tail_field() {
+        let mut config = Config::default();
+        config
+            .create_map_key("providers.models.anthropic", "default")
+            .expect("seed a pre-existing alias");
+
+        let refused =
+            config.ensure_map_key_for_path("providers.models.anthropic.default.not_a_real_field");
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        assert!(
+            config
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| keys.iter().any(|k| k == "default")),
+            "a pre-existing alias must never be deleted for a typo'd tail field"
+        );
+    }
+
+    #[test]
+    async fn ensure_map_key_for_path_preserves_first_dynamic_secret_map_write() {
+        let mut config = Config::default();
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo";
+
+        let refused = config.ensure_map_key_for_path(path);
+
+        assert!(!refused, "not the reserved-agent refusal path");
+        config
+            .set_prop(path, "bar")
+            .expect("a new dynamic secret-map key must be insertable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Foo"))
+                .map(String::as_str),
+            Some("bar")
+        );
+    }
+
+    #[test]
     async fn create_map_key_rejects_unknown_section() {
         let mut config = Config::default();
         let err = config
@@ -36406,6 +37968,26 @@ model = "gpt-4o"
     }
 
     #[test]
+    async fn create_map_key_inserts_matrix_streaming_defaults() {
+        let mut config = Config::default();
+        config
+            .create_map_key("channels.matrix", "default")
+            .expect("create_map_key should insert a default matrix entry");
+
+        let matrix = config
+            .channels
+            .matrix
+            .get("default")
+            .expect("matrix default alias should exist");
+        assert_eq!(matrix.stream_mode, MatrixStreamMode::Off);
+        assert_eq!(matrix.draft_update_interval_ms, 1500);
+        assert_eq!(matrix.multi_message_delay_ms, 800);
+        assert_eq!(matrix.stream_draft_lines, 10);
+        assert_eq!(matrix.message_max_bytes, 48_000);
+        assert!(matrix.stream_draft_delete);
+    }
+
+    #[test]
     async fn deserialized_matrix_set_prop_round_trips_vec_string() {
         // Mirror the real-world daemon flow: config loaded from disk where
         // [channels.matrix] is present (possibly with all default fields),
@@ -36766,6 +38348,116 @@ allowed_users = []
             config.channels.matrix.get("default").unwrap().homeserver,
             "https://m.org"
         );
+    }
+
+    /// Regression: a bare `zeroclaw config init` (no
+    /// section — `init_defaults(None)`) must produce a config.toml that
+    /// strictly reloads. Before the fix, `init_defaults` unconditionally
+    /// scaffolded every `#[nested] Option<T>` field from
+    /// `T::default()`, including structs with a required non-defaulted
+    /// `String` leaf (`GatewayTlsConfig::cert_path`/`key_path`,
+    /// `LocalWhisperConfig::url`, `OpenVpnTunnelConfig::config_file`).
+    /// Those leaves default to `""`, which `prune_empty_leaves` strips
+    /// on save, leaving a partial sub-table (kept alive by a non-empty
+    /// sibling like `enabled`/`max_audio_bytes`/`connect_timeout_secs`)
+    /// that fails strict deserialization with `missing field ...` — the
+    /// exact failure `zeroclaw config migrate` hits and exits 1 on.
+    ///
+    /// Mirrors the production boundary of
+    /// `local_whisper_config_init_preserves_transcription_section`
+    /// (crates/zeroclaw-channels/src/transcription.rs) but drives a bare
+    /// full init instead of an exact-prefix one.
+    #[test]
+    async fn config_init_full_produces_strict_roundtrippable_config() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+
+        // Pre-create config.toml (mirrors `load_or_init`) so `save_dirty`
+        // below takes the incremental existing-document path, not the
+        // full-save fallback for a missing file.
+        Config {
+            config_path: config_path.clone(),
+            ..Config::default()
+        }
+        .save()
+        .await
+        .unwrap();
+
+        // The real scaffold: bare `config init`, no section targeted —
+        // the exact call `ConfigCommands::Init { section: None }` makes.
+        let mut config = Config {
+            config_path: config_path.clone(),
+            ..Config::default()
+        };
+        let initialized = config.init_defaults(None);
+
+        // The three required-field sections must be omitted by a bare
+        // init (that is the fix); the fully-defaulted siblings must still
+        // be scaffolded. Asserting both sides here catches an over-broad
+        // `init_requires_explicit_config` predicate that skips too much —
+        // which the strict-reload assert below would otherwise pass
+        // silently (a missing section only looks "even more absent").
+        assert!(
+            !initialized.iter().any(|s| {
+                *s == "gateway.tls" || *s == "transcription.local_whisper" || *s == "tunnel.openvpn"
+            }),
+            "required-field sections must be omitted by bare init, got: {initialized:?}"
+        );
+        assert!(
+            initialized.contains(&"transcription.openai")
+                && initialized.contains(&"tunnel.tailscale"),
+            "fully-defaulted sibling sections must still scaffold on bare init, got: {initialized:?}"
+        );
+
+        for s in &initialized {
+            config.mark_dirty(s);
+        }
+        config.save_dirty().await.unwrap();
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+
+        // STRICT assert — this is what `config migrate` runs; it exits 1
+        // today on unpatched code.
+        assert!(
+            crate::migration::migrate_to_current(&contents).is_ok(),
+            "fresh full `config init` must strictly deserialize; err: {:?}",
+            crate::migration::migrate_to_current(&contents).err()
+        );
+
+        // RESILIENT assert — even the salvage path must not have to drop
+        // an entire parent section on a fresh, untouched init.
+        let salv = crate::migration::migrate_to_current_salvaged(&contents);
+        assert!(
+            !salv
+                .dropped
+                .iter()
+                .any(|p| p == "gateway" || p == "transcription" || p == "tunnel"),
+            "no parent section may be salvage-reset on a fresh init, dropped: {:?}",
+            salv.dropped
+        );
+    }
+
+    /// The gate's other side: explicitly targeting a required-field
+    /// section (as `zeroclaw config init <section>` and the dashboard
+    /// section picker both do) must still scaffold it so the operator can
+    /// fill in the required fields. `transcription.local_whisper` already
+    /// has this coverage via the channels-crate test
+    /// `local_whisper_config_init_preserves_transcription_section`; this
+    /// locks the same behavior for the two remaining sections.
+    #[test]
+    async fn config_init_explicit_prefix_still_scaffolds_required_field_sections() {
+        for section in ["gateway.tls", "tunnel.openvpn"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let mut config = Config {
+                config_path: tmp.path().join("config.toml"),
+                ..Config::default()
+            };
+            let initialized = config.init_defaults(Some(section));
+            assert!(
+                initialized.contains(&section),
+                "explicit `config init {section}` must scaffold the section, got: {initialized:?}"
+            );
+        }
     }
 
     #[test]
@@ -37401,6 +39093,10 @@ allowed_users = []
 
         let whatsapp: WhatsAppConfig = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 300);
+
+        let lark: LarkConfig =
+            serde_json::from_str(r#"{"app_id":"cli_1","app_secret":"secret"}"#).unwrap();
+        assert_eq!(lark.approval_timeout_secs, 300);
     }
 
     /// The test above proves the SERDE path. It says nothing about the RUST
@@ -37518,6 +39214,216 @@ allowed_users = []
         );
     }
 
+    /// Sibling to `whatsapp_rust_default_waits_rather_than_denying`, for the
+    /// other five channel configs that carried the same split: a derived
+    /// `Default` zeroed `approval_timeout_secs` while serde supplied 300, so
+    /// a config built in Rust rather than parsed from a file denied every
+    /// approval instantly.
+    #[test]
+    async fn channel_rust_default_waits_rather_than_denying() {
+        assert_eq!(
+            DiscordConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            SlackConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            MatrixConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            SignalConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+        assert_eq!(
+            LarkConfig::default().approval_timeout_secs,
+            default_channel_approval_timeout_secs()
+        );
+    }
+
+    /// Sibling to `whatsapp_rust_default_matches_serde_default`, pinning the
+    /// whole struct rather than the one field for the other five channel
+    /// configs, so a field added later with a serde default but no matching
+    /// Rust default fails here instead of reaching an operator.
+    #[test]
+    async fn channel_rust_default_matches_serde_default() {
+        assert_eq!(
+            serde_json::to_value(DiscordConfig::default()).unwrap(),
+            serde_json::to_value(serde_json::from_str::<DiscordConfig>("{}").unwrap()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(SlackConfig::default()).unwrap(),
+            serde_json::to_value(serde_json::from_str::<SlackConfig>("{}").unwrap()).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(MatrixConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<MatrixConfig>(r#"{"homeserver":""}"#).unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(SignalConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<SignalConfig>(r#"{"http_url":"","account":""}"#).unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(LarkConfig::default()).unwrap(),
+            serde_json::to_value(
+                serde_json::from_str::<LarkConfig>(r#"{"app_id":"","app_secret":""}"#).unwrap()
+            )
+            .unwrap()
+        );
+    }
+
+    /// Sibling to `whatsapp_explicit_zero_timeout_is_preserved`: an operator
+    /// who deliberately writes `approval_timeout_secs = 0` keeps that zero.
+    /// The fix above changes what an UNSET field means, and must not take
+    /// away the ability to refuse every gated tool deliberately.
+    #[test]
+    async fn channel_explicit_zero_timeout_is_preserved() {
+        let discord: DiscordConfig =
+            serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(discord.approval_timeout_secs, 0);
+
+        let slack: SlackConfig = serde_json::from_str(r#"{"approval_timeout_secs":0}"#).unwrap();
+        assert_eq!(slack.approval_timeout_secs, 0);
+
+        let matrix: MatrixConfig = serde_json::from_str(
+            r#"{"homeserver":"https://matrix.example.com","approval_timeout_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(matrix.approval_timeout_secs, 0);
+
+        let signal: SignalConfig = serde_json::from_str(
+            r#"{"http_url":"http://localhost","account":"+1","approval_timeout_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(signal.approval_timeout_secs, 0);
+
+        let lark: LarkConfig = serde_json::from_str(
+            r#"{"app_id":"cli_1","app_secret":"secret","approval_timeout_secs":0}"#,
+        )
+        .unwrap();
+        assert_eq!(lark.approval_timeout_secs, 0);
+    }
+
+    /// Generates the sibling of
+    /// `whatsapp_alias_created_through_the_map_key_surface_reloads_waiting`
+    /// for the other five channel configs, rather than hand-duplicating the
+    /// lifecycle five times: create an alias through the supported map-key
+    /// surface, save, reload, with `approval_timeout_secs` omitted
+    /// throughout - the case that broke. `$setup` fills in whatever fields
+    /// a given channel type requires beyond `enabled` so the persisted
+    /// alias round-trips; it never touches `approval_timeout_secs`.
+    macro_rules! channel_alias_reloads_waiting_test {
+        ($test_name:ident, $section:literal, $field:ident, |$cfg:ident| $setup:block) => {
+            #[test]
+            async fn $test_name() {
+                let tmp = tempfile::TempDir::new().unwrap();
+                let config_path = tmp.path().join("config.toml");
+                std::fs::write(
+                    &config_path,
+                    format!(
+                        "schema_version = {}\n",
+                        crate::migration::CURRENT_SCHEMA_VERSION
+                    ),
+                )
+                .unwrap();
+
+                let mut config = Config {
+                    config_path: config_path.clone(),
+                    ..Default::default()
+                };
+
+                let created = config
+                    .create_map_key($section, "shop")
+                    .expect(concat!($section, " must be a map-keyed section"));
+                assert!(
+                    created,
+                    "a fresh alias must be created, not silently reused"
+                );
+
+                {
+                    let $cfg = config.channels.$field.get_mut("shop").unwrap();
+                    $setup
+                }
+
+                config.mark_dirty(&format!("{}.shop", $section));
+
+                config.save_dirty().await.unwrap();
+
+                let written = std::fs::read_to_string(&config_path).unwrap();
+                assert!(
+                    !written.contains("approval_timeout_secs = 0"),
+                    "creating an alias must not persist an already-elapsed approval deadline; \
+                     got:\n{written}"
+                );
+
+                let reparsed: Config = toml::from_str(&written).unwrap();
+                let shop = reparsed
+                    .channels
+                    .$field
+                    .get("shop")
+                    .expect("the created alias must survive save and reload");
+                assert_eq!(
+                    shop.approval_timeout_secs,
+                    default_channel_approval_timeout_secs(),
+                    "an alias whose approval_timeout_secs was never set must reload waiting \
+                     the documented timeout, not denying at once"
+                );
+            }
+        };
+    }
+
+    channel_alias_reloads_waiting_test!(
+        discord_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.discord",
+        discord,
+        |_cfg| {}
+    );
+    channel_alias_reloads_waiting_test!(
+        slack_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.slack",
+        slack,
+        |_cfg| {}
+    );
+    // Matrix requires `homeserver`; set it before saving so the alias
+    // round-trips, same as an operator filling in a required field through
+    // the dashboard would. `approval_timeout_secs` stays untouched.
+    channel_alias_reloads_waiting_test!(
+        matrix_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.matrix",
+        matrix,
+        |cfg| {
+            cfg.homeserver = "https://matrix.example.com".to_string();
+        }
+    );
+    // Signal requires `http_url` and `account`; same reasoning as Matrix.
+    channel_alias_reloads_waiting_test!(
+        signal_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.signal",
+        signal,
+        |cfg| {
+            cfg.http_url = "http://127.0.0.1:8686".to_string();
+            cfg.account = "+15555550123".to_string();
+        }
+    );
+    // Lark requires `app_id` and `app_secret`; same reasoning as Matrix.
+    channel_alias_reloads_waiting_test!(
+        lark_alias_created_through_the_map_key_surface_reloads_waiting,
+        "channels.lark",
+        lark,
+        |cfg| {
+            cfg.app_id = "cli_test".to_string();
+            cfg.app_secret = "secret_test".to_string();
+        }
+    );
+
     #[test]
     async fn channel_approval_timeout_secs_explicit_override() {
         let discord: DiscordConfig =
@@ -37543,6 +39449,12 @@ allowed_users = []
         let whatsapp: WhatsAppConfig =
             serde_json::from_str(r#"{"approval_timeout_secs":180}"#).unwrap();
         assert_eq!(whatsapp.approval_timeout_secs, 180);
+
+        let lark: LarkConfig = serde_json::from_str(
+            r#"{"app_id":"cli_1","app_secret":"secret","approval_timeout_secs":75}"#,
+        )
+        .unwrap();
+        assert_eq!(lark.approval_timeout_secs, 75);
     }
 
     // ── Multi-agent cross-reference validators ─────────────────────
@@ -37585,6 +39497,164 @@ allowed_users = []
         config.agents.insert("alpha".to_string(), agent);
 
         config
+    }
+
+    #[test]
+    async fn plugin_channel_instance_uses_ordinary_agent_channel_reference() {
+        let mut config = multi_agent_test_config();
+        config.channels.plugin.insert(
+            "operations".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+        config.agents.get_mut("alpha").unwrap().channels =
+            vec![crate::providers::ChannelRef::new("plugin.operations")];
+
+        config
+            .validate()
+            .expect("plugin channel aliases use the shared dotted reference validator");
+        assert_eq!(config.agent_for_channel("plugin.operations"), Some("alpha"));
+    }
+
+    #[test]
+    async fn plugin_channel_instances_allow_two_aliases_for_one_package() {
+        let mut config = multi_agent_test_config();
+        for alias in ["primary", "backup"] {
+            config.channels.plugin.insert(
+                alias.to_string(),
+                PluginChannelConfig {
+                    package: "acme.chat".to_string(),
+                    enabled: true,
+                },
+            );
+        }
+
+        config
+            .validate()
+            .expect("one package may back isolated logical instances");
+        assert!(config.channels.has_any_enabled());
+    }
+
+    #[test]
+    async fn plugin_channel_instance_rejects_invalid_alias_or_package() {
+        let mut config = multi_agent_test_config();
+        config.channels.plugin.insert(
+            "bad-alias".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+        let error = config
+            .validate()
+            .expect_err("plugin aliases use canonical config-key grammar");
+        assert!(
+            error.to_string().contains("channels.plugin.bad-alias"),
+            "{error}"
+        );
+
+        config.channels.plugin.clear();
+        config.channels.plugin.insert(
+            "primary".to_string(),
+            PluginChannelConfig {
+                package: "Acme Chat".to_string(),
+                enabled: true,
+            },
+        );
+        let error = config
+            .validate()
+            .expect_err("plugin packages use canonical manifest grammar");
+        assert!(
+            error
+                .to_string()
+                .contains("channels.plugin.primary.package"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    async fn plugin_channel_instance_rejects_an_empty_package() {
+        let mut config = multi_agent_test_config();
+        config
+            .channels
+            .plugin
+            .insert("primary".to_string(), PluginChannelConfig::default());
+
+        let error = config
+            .validate()
+            .expect_err("a declaration with no package can never resolve to an installed plugin");
+        assert!(
+            error
+                .to_string()
+                .contains("channels.plugin.primary.package"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    async fn disabled_plugin_channel_instance_does_not_start_the_supervisor() {
+        let mut channels = ChannelsConfig {
+            cli: false,
+            ..ChannelsConfig::default()
+        };
+        channels.plugin.insert(
+            "paused".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: false,
+            },
+        );
+
+        assert!(!channels.has_any_enabled());
+    }
+
+    #[test]
+    async fn plugin_channel_is_a_known_configured_and_deliverable_channel() {
+        let mut channels = ChannelsConfig::default();
+        assert!(
+            !channels
+                .channel_presence()
+                .iter()
+                .any(|(name, configured, _)| *name == "plugin" && *configured)
+        );
+
+        channels.plugin.insert(
+            "operations".to_string(),
+            PluginChannelConfig {
+                package: "acme.chat".to_string(),
+                enabled: true,
+            },
+        );
+
+        let row = channels
+            .channel_presence()
+            .into_iter()
+            .find(|(name, _, _)| *name == "plugin")
+            .expect("plugin must appear in the canonical channel registry");
+        assert_eq!(row, ("plugin", true, true));
+        assert!(
+            channels
+                .channels()
+                .iter()
+                .any(|info| info.kind == "plugin" && info.configured)
+        );
+        assert!(crate::schema::v2::V3_CHANNEL_TYPES.contains(&"plugin"));
+    }
+
+    #[test]
+    async fn zero_active_plugin_instance_ceiling_is_rejected() {
+        let mut config = multi_agent_test_config();
+        config.plugins.max_active_instances = 0;
+
+        let error = config
+            .validate()
+            .expect_err("a zero ceiling admits nothing and is always an operator mistake");
+        assert!(
+            error.to_string().contains("plugins.max_active_instances"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -38804,24 +40874,100 @@ allowed_users = []
     const WA_INERT_WARNING: &str = "whatsapp_chat_policy_inert";
     const WA_OPEN_GROUPS_WARNING: &str = "whatsapp_empty_group_allowlist_permits_all";
 
-    /// A Web channel in business mode: the chat policies are accepted and never
-    /// consulted, and dm_policy DEFAULTS to allowlist, so the operator believes
-    /// the channel is gated when every DM is answered.
+    /// A config carrying both `phone_number_id` and a Web selector runs as
+    /// Cloud, and the Cloud transport consults none of the Web chat-policy
+    /// keys. Diagnosing them here would describe a gate that never runs, and
+    /// the open-groups warning in particular would report unintended group
+    /// access on a channel whose Web group gate is not in the path.
+    ///
+    /// The second half is the control: strip `phone_number_id` so the same
+    /// keys select the Web backend, and both warnings must return. Without it
+    /// this test would also pass against a validator that had been switched
+    /// off entirely.
     #[test]
-    async fn whatsapp_business_mode_flags_inert_chat_policies() {
+    async fn whatsapp_mixed_selectors_run_as_cloud_and_report_no_web_policy_warnings() {
+        let mixed = r#"
+[channels.whatsapp.shop]
+enabled = true
+phone_number_id = "1234567890"
+access_token = "token"
+verify_token = "verify"
+session_path = "/tmp/wa-session"
+mode = "business"
+self_chat_mode = true
+group_policy = "allowlist"
+allowed_groups = []
+"#;
+        let cfg: Config = toml::from_str(mixed).unwrap();
+        assert_eq!(
+            cfg.channels.whatsapp["shop"].backend_type(),
+            "cloud",
+            "a Cloud selector must win over a Web selector, or this test is not \
+             exercising the mixed case"
+        );
+        assert!(
+            warnings_with_code(&cfg, WA_INERT_WARNING).is_empty(),
+            "a Cloud-backed channel must not be diagnosed against the Web chat-policy gate"
+        );
+        assert!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "the Web group gate is not in a Cloud channel's path, so an empty \
+             allowed_groups grants no group access here"
+        );
+
+        let web_only = r#"
+[channels.whatsapp.shop]
+enabled = true
+session_path = "/tmp/wa-session"
+mode = "business"
+self_chat_mode = true
+group_policy = "allowlist"
+allowed_groups = []
+"#;
+        let cfg: Config = toml::from_str(web_only).unwrap();
+        assert_eq!(cfg.channels.whatsapp["shop"].backend_type(), "web");
+        assert!(
+            !warnings_with_code(&cfg, WA_INERT_WARNING).is_empty(),
+            "removing the Cloud selector must restore the inert-key diagnostic"
+        );
+        assert!(
+            !warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "removing the Cloud selector must restore the open-groups diagnostic"
+        );
+    }
+
+    /// A Web channel in business mode: `dm_policy` and `group_policy` are
+    /// consulted under both modes, so calling them inert would now be false.
+    /// `self_chat_mode` is read only inside the personal branch, so it is the
+    /// one key that stays inert here.
+    #[test]
+    async fn whatsapp_business_mode_flags_only_self_chat_mode() {
         let toml = r#"
 [channels.whatsapp.shop]
 enabled = true
 mode = "business"
 session_path = "/tmp/wa-session"
+self_chat_mode = true
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         let warnings = warnings_with_code(&cfg, WA_INERT_WARNING);
         assert!(
-            warnings
+            !warnings
                 .iter()
                 .any(|w| w.path == "channels.whatsapp.shop.dm_policy"),
-            "default dm_policy under business mode must be flagged: {warnings:?}"
+            "dm_policy is enforced under both modes and must not be reported inert: {warnings:?}"
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.path == "channels.whatsapp.shop.group_policy"),
+            "group_policy is enforced under both modes and must not be reported inert: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.path == "channels.whatsapp.shop.self_chat_mode"),
+            "self_chat_mode has no business-mode equivalent and stays inert: {warnings:?}"
         );
         assert!(
             warnings.iter().any(|w| w.message.contains("personal")),
@@ -38946,9 +41092,9 @@ group_policy = "all"
         );
     }
 
-    /// Business mode never consults group_policy, so the list is the only gate
-    /// and an empty one really does admit every group. This is the positive
-    /// case that must survive narrowing the warning.
+    /// The default group_policy is `allowlist`, so an empty list really does
+    /// admit every group. This is the positive case that must survive narrowing
+    /// the warning.
     #[test]
     async fn whatsapp_business_empty_allowed_groups_is_flagged() {
         let toml = r#"
@@ -38967,12 +41113,11 @@ session_path = "/tmp/wa-session"
         assert_eq!(warnings[0].path, "channels.whatsapp.shop.allowed_groups");
     }
 
-    /// Business mode ignores group_policy entirely, so even the value that
-    /// silences the warning under personal mode must NOT silence it here.
-    /// Without this, narrowing the check could be over-applied and reopen the
-    /// original bug from the other side.
+    /// Business mode now consults group_policy, so `ignore` closes group access
+    /// there exactly as it does under personal mode. Warning that an empty list
+    /// "permits EVERY group" would be false for this configuration.
     #[test]
-    async fn whatsapp_business_ignore_group_policy_still_flagged() {
+    async fn whatsapp_business_ignore_group_policy_is_not_flagged() {
         let toml = r#"
 [channels.whatsapp.shop]
 enabled = true
@@ -38981,11 +41126,10 @@ session_path = "/tmp/wa-session"
 group_policy = "ignore"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
-        assert_eq!(
-            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).len(),
-            1,
-            "group_policy is inert under business mode, so it must not silence \
-             the open-groups warning"
+        assert!(
+            warnings_with_code(&cfg, WA_OPEN_GROUPS_WARNING).is_empty(),
+            "group_policy = \"ignore\" drops every group message under both modes, \
+             so the open-groups warning must not fire"
         );
     }
 

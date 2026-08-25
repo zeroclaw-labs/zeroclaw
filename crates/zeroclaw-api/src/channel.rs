@@ -623,6 +623,16 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
+    /// Send the completed assistant response for a turn.
+    ///
+    /// Most channels use the ordinary send path. Channels with delivery
+    /// policy that applies only to final responses can override this without
+    /// changing the shared message shape or affecting system and approval
+    /// sends.
+    async fn send_final(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.send(message).await
+    }
+
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
 
@@ -801,6 +811,23 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         _message_id: &str,
         _text: &str,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Show a batch of progress/status updates as one coalesced draft update.
+    ///
+    /// Channels with expensive edit APIs should override this so an upstream
+    /// burst does not turn into one awaited network edit per progress item.
+    async fn update_draft_progress_batch(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        texts: &[String],
+    ) -> anyhow::Result<()> {
+        for text in texts {
+            self.update_draft_progress(recipient, message_id, text)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1168,6 +1195,7 @@ mod tests {
                 file_name: "test.pdf".to_string(),
                 data: vec![1, 2, 3],
                 mime_type: Some("application/pdf".to_string()),
+                marker: None,
             },
         ]);
 

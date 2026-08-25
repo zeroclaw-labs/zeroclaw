@@ -39,8 +39,6 @@ glob = "0.3"
 hex = "0.4"
 hmac = "0.12"
 hostname = "0.4.2"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-indicatif = "0.18"
 lru = "0.18.2"
 mime_guess = "2"
 nanohtml2text = "0.2"
@@ -111,6 +109,13 @@ schema-export = ["dep:schemars", "zeroclaw-config/schema-export", "zeroclaw-sop-
 
 browser-native = []
 plugins-wasm = ["dep:zeroclaw-plugins", "zeroclaw-plugins/plugins-wasmtime"]
+# Adds the Cranelift JIT to the plugin host so a `.wasm` component can be
+# compiled on the host instead of requiring a precompiled `.cwasm`. Production
+# builds get this through the root crate's feature of the same name; the runtime
+# crate declares it so the live-Agent plugin regression can be compiled and run
+# against a real component (`WasmTool::from_wasm` refuses to register a tool it
+# cannot load, so a runtime-only backend has no plugin tool to execute).
+plugins-wasm-cranelift = ["plugins-wasm", "zeroclaw-plugins/plugins-wasm-cranelift"]
 webauthn = []
 sandbox-bubblewrap = []
 
@@ -127,6 +132,9 @@ wiremock = "0.6"
 # retry-regression tests. Not in default deps so
 # the helper is unreachable from production builds.
 zeroclaw-tools = { workspace = true, features = ["test-helpers"] }
+# Test-only config fault injection for the config/set post-rename sync
+# regression. Same pattern as zeroclaw-tools above.
+zeroclaw-config = { workspace = true, features = ["test-helpers"] }
 
 # Channel features (forwarded to zeroclaw-channels)
 

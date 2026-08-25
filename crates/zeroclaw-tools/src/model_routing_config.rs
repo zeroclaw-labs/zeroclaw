@@ -1187,7 +1187,9 @@ impl Tool for ModelRoutingConfigTool {
                     "remove_scenario" => Box::pin(self.handle_remove_scenario(&args)).await,
                     "upsert_agent" => Box::pin(self.handle_upsert_agent(&args)).await,
                     "remove_agent" => Box::pin(self.handle_remove_agent(&args)).await,
-                    _ => unreachable!("validated above"),
+                    _ => Err(anyhow::Error::msg(format!(
+                        "Unknown model-routing action after validation: {action}"
+                    ))),
                 }
             }
             _ => anyhow::bail!(
