@@ -464,6 +464,33 @@ pub fn persist_model_cache(
 
     let cache_path = cache_dir.join(MODEL_CACHE_FILE);
 
+    // Cross-process advisory lock around the whole read-merge-publish
+    // sequence. The publish itself is collision-safe (exclusive temp file +
+    // atomic rename), but without serialization two concurrent refreshes can
+    // both read the same pre-refresh snapshot and the second rename silently
+    // discards the first one's provider entry — the lost-update window the
+    // collision-safe publish left open. Blocking (rather than failing) lets overlapping
+    // refreshes complete in sequence; the lock releases when the guard drops.
+    let lock_path = cache_dir.join(format!("{MODEL_CACHE_FILE}.lock"));
+    let cache_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "Failed to open model cache lock file at {}",
+                lock_path.display()
+            )
+        })?;
+    cache_lock.lock().with_context(|| {
+        format!(
+            "Failed to lock model cache for refresh at {}",
+            lock_path.display()
+        )
+    })?;
+
     // Load existing cache, starting fresh only when the file is genuinely
     // absent. A malformed or unreadable existing file is left untouched and
     // reported rather than silently replaced with a single-provider cache.
@@ -2237,6 +2264,45 @@ mod tests {
         assert_eq!(
             canonicalize_provider_ref("openrouter.work"),
             "openrouter.work"
+        );
+    }
+
+    /// Lost-update regression: concurrent refreshes for different providers
+    /// each read-merge-publish the whole cache file, so without the advisory
+    /// lock one publish can silently drop another's entry. Every concurrently
+    /// written provider must survive.
+    #[test]
+    fn persist_model_cache_concurrent_refreshes_keep_every_provider() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+
+        let providers: Vec<String> = (0..8).map(|i| format!("provider{i}")).collect();
+        std::thread::scope(|scope| {
+            for provider in &providers {
+                let config = &config;
+                scope.spawn(move || {
+                    for round in 0..5 {
+                        persist_model_cache(config, provider, &[format!("m{round}")]).unwrap();
+                    }
+                });
+            }
+        });
+
+        let raw = std::fs::read_to_string(tmp.path().join("state/models_cache.json")).unwrap();
+        let cache: zeroclaw_config::schema::ModelCacheState = serde_json::from_str(&raw).unwrap();
+        let mut cached: Vec<&str> = cache
+            .entries
+            .iter()
+            .map(|e| e.model_provider.as_str())
+            .collect();
+        cached.sort_unstable();
+        let expected: Vec<String> = providers
+            .iter()
+            .map(|p| canonicalize_provider_ref(p))
+            .collect();
+        assert_eq!(
+            cached, expected,
+            "a concurrent refresh must not lose another provider's entry"
         );
     }
 

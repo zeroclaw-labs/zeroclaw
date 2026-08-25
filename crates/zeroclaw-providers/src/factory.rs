@@ -76,10 +76,12 @@ pub(crate) trait FamilyProviderFactory {
 }
 
 fn fixed_family_endpoint<T: FamilyProviderFactory>() -> &'static str {
-    match T::ENDPOINT {
-        ProviderEndpoint::Fixed(url) => url,
-        _ => unreachable!("fixed endpoint helper used for a non-fixed provider family"),
-    }
+    // INVARIANT: this helper is called only by factory implementations whose
+    // associated endpoint is declared `Fixed`; registry tests enumerate the
+    // canonical families and enforce that classification.
+    T::ENDPOINT
+        .fixed_url()
+        .expect("fixed endpoint helper requires a fixed provider family")
 }
 
 /// Spec trait for OpenAI-compatible families. Implementing this gives a

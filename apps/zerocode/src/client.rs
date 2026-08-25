@@ -406,6 +406,20 @@ pub enum ConnectionState {
     Disconnected { reason: String },
 }
 
+fn replace_connection_state(state: &Mutex<ConnectionState>, next: ConnectionState) {
+    match state.lock() {
+        Ok(mut state) => *state = next,
+        Err(poisoned) => *poisoned.into_inner() = next,
+    }
+}
+
+fn clone_connection_state(state: &Mutex<ConnectionState>) -> ConnectionState {
+    match state.lock() {
+        Ok(state) => state.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
 /// The TUI and daemon are built from the same package version and do not
 /// promise cross-version wire compatibility.
 #[derive(Debug)]
@@ -683,15 +697,21 @@ impl RpcClient {
                 buf.clear();
                 match reader.read_line(&mut buf).await {
                     Ok(0) => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: "EOF (daemon closed connection)".to_string(),
-                        };
+                        replace_connection_state(
+                            &conn_state_for_reader,
+                            ConnectionState::Disconnected {
+                                reason: "EOF (daemon closed connection)".to_string(),
+                            },
+                        );
                         break;
                     }
                     Err(e) => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: e.to_string(),
-                        };
+                        replace_connection_state(
+                            &conn_state_for_reader,
+                            ConnectionState::Disconnected {
+                                reason: e.to_string(),
+                            },
+                        );
                         break;
                     }
                     Ok(_) => {}
@@ -839,22 +859,30 @@ impl RpcClient {
                         let reason = frame
                             .map(|f| f.reason.to_string())
                             .unwrap_or_else(|| "server closed connection".to_string());
-                        *conn_state_for_reader.lock().unwrap() =
-                            ConnectionState::Disconnected { reason };
+                        replace_connection_state(
+                            &conn_state_for_reader,
+                            ConnectionState::Disconnected { reason },
+                        );
                         break;
                     }
                     Some(Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_))) => continue,
                     Some(Ok(Message::Binary(_))) => continue,
                     Some(Err(e)) => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: e.to_string(),
-                        };
+                        replace_connection_state(
+                            &conn_state_for_reader,
+                            ConnectionState::Disconnected {
+                                reason: e.to_string(),
+                            },
+                        );
                         break;
                     }
                     None => {
-                        *conn_state_for_reader.lock().unwrap() = ConnectionState::Disconnected {
-                            reason: "EOF (WSS connection closed)".to_string(),
-                        };
+                        replace_connection_state(
+                            &conn_state_for_reader,
+                            ConnectionState::Disconnected {
+                                reason: "EOF (WSS connection closed)".to_string(),
+                            },
+                        );
                         break;
                     }
                 }
@@ -1006,7 +1034,7 @@ impl RpcClient {
 
     /// Current connection state. Cheap mutex read, safe to call on every frame.
     pub fn connection_state(&self) -> ConnectionState {
-        self.connection_state.lock().unwrap().clone()
+        clone_connection_state(&self.connection_state)
     }
 
     // ── Notifications ─────────────────────────────────────────────

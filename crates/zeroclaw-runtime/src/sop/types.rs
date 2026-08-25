@@ -150,7 +150,7 @@ pub enum SopTrigger {
         #[serde(default)]
         condition: Option<String>,
     },
-    /// Inbound HTTP request. Defined and matched, but no live route feeds it.
+    /// Inbound HTTP request. Live: gateway `/sop/*` and SOP-first `/webhook` routes.
     #[trigger(display = "path")]
     Webhook {
         /// Request path matched exactly against the event path.
@@ -795,6 +795,12 @@ pub struct SopRun {
     pub total_steps: u32,
     pub started_at: String,
     pub completed_at: Option<String>,
+    /// Why this run reached a `Failed` terminal state, captured at the
+    /// transition that failed it. `None` while the run is live and for runs
+    /// that ended any other way. Serialized only when present, so runs
+    /// persisted before this field existed round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     pub step_results: Vec<SopStepResult>,
     /// ISO-8601 timestamp when the run entered WaitingApproval (for timeout tracking).
     #[serde(default)]
@@ -1420,6 +1426,7 @@ path = "/sop/test"
             total_steps: 5,
             started_at: "2026-02-19T12:00:00Z".into(),
             completed_at: None,
+            failure_reason: None,
             step_results: vec![SopStepResult {
                 effective_agent: None,
                 step_number: 1,

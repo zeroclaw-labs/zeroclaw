@@ -107,8 +107,10 @@ for the full procedure. In summary:
 ### 3) Full Platform Build (manual)
 
 1. Maintainer runs `cross-platform-build-manual.yml` via `workflow_dispatch`.
-2. Build-only across additional targets not covered by the PR build matrix.
-3. No tests, no publish. Used to verify cross-compilation health.
+2. Builds additional targets not covered by the PR matrix and independently
+   verifies the pinned Linux `cross` and Windows Tauri CLI release tools.
+3. No publish. Set `release_tools_only` to skip web and release builds and run
+   only the native release-tool smoke.
 
 ---
 

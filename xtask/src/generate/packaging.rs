@@ -339,10 +339,8 @@ mod tests {
         assert!(rendered.contains(&format!(
             "\tsource = zeroclawlabs-{version}.tar.gz::https://github.com/zeroclaw-labs/zeroclaw/archive/refs/tags/v{version}.tar.gz\n"
         )));
-        assert_eq!(
-            rendered,
-            std::fs::read_to_string(root().join("dist/aur/.SRCINFO")).unwrap()
-        );
+        let checked_in = std::fs::read_to_string(root().join("dist/aur/.SRCINFO")).unwrap();
+        assert_eq!(rendered, checked_in.replace("\r\n", "\n"));
 
         let changed = pkgbuild.replace(
             "depends=('gcc-libs' 'openssl')",

@@ -162,13 +162,15 @@ Parser behavior:
   when a step must require approval in any execution mode.
 - `- allow-tools:` and `- deny-tools:` define an explicit per-step tool scope.
 - `- input:` and `- output:` attach JSON Schema-like step boundary contracts.
-- `- when:` is a routing guard evaluated against accumulated completed-step
-  outputs after the current step finishes. When it does not match, the run
-  completes instead of dispatching another step.
+- `- when:` guards an explicit `- next:` jump and is evaluated against
+  accumulated completed-step outputs after the current step finishes. A
+  matching guard takes the explicit jump. A false guard advances to the next
+  linear step (`current_step + 1`), or completes when the current step is
+  terminal.
 - `- next:` and `- depends_on:` route non-linear runs. Ineligible routed steps
   are marked `skipped` and leave the run `pending` instead of dispatching.
-- `- when:` guards an explicit `- next:` jump; when the condition is false, the
-  run advances to the next linear step (`current_step + 1`) instead of completing.
+- `- terminal: true` completes the run instead of advancing to another step.
+  The final step also completes when it has no linear successor.
 - `- on_failure:` accepts `fail`, `retry:<count>`, or `goto:<step>` and is
   enforced for reported step failures and output schema failures.
 - `- mode:` overrides the SOP execution mode for that step.
@@ -177,6 +179,55 @@ Parser behavior:
   it for an unpoliced gate. A step that names a policy absent from
   `[sop.approval].policies` fails closed (the gate stays waiting) rather than
   clearing on a single approval.
+
+### Copyable conditional-routing example
+
+This complete `SOP.md` routes critical alerts through an approved remediation
+step while recording other alerts without remediation:
+
+```md
+# Alert triage
+
+Classify an incoming alert, remediate critical alerts, and notify the operator.
+
+## Steps
+
+1. **Classify alert** - Normalize the incoming alert severity.
+   - output: {"type":"object","required":["severity"],"properties":{"severity":{"type":"string"}}}
+   - when: $.steps.1.severity == "critical"
+   - next: 3
+
+2. **Record routine alert** - Add the non-critical alert to the incident log.
+   - tools: shell
+   - next: 4
+
+3. **Remediate critical alert** - Run the approved remediation command.
+   - tools: shell
+   - requires_confirmation: true
+   - on_failure: retry:2
+   - next: 4
+
+4. **Notify operator** - Send the outcome to the operations channel.
+   - tools: http_request
+```
+
+When step 1 outputs `{"severity":"critical"}`, its guard matches and `next`
+jumps to step 3. Any other severity falls through to step 2, whose explicit
+`next` skips remediation and joins the critical path at step 4.
+
+The loader only discovers a directory that also contains a `SOP.toml`, so pair
+the steps above with this manifest in `<sops_dir>/alert-triage/`:
+
+```toml
+[sop]
+name = "alert-triage"
+description = "Classify an incoming alert, remediate critical alerts, and notify the operator."
+
+[[triggers]]
+type = "manual"
+```
+
+Then run `zeroclaw sop validate alert-triage`, which reports the SOP as valid.
 
 ### `[sop.approval]` policies and route delivery
 

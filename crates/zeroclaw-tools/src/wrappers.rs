@@ -56,6 +56,10 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         self.inner.param_domains()
     }
 
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let reservation = match self.security.reserve_action() {
             Some(reservation) => reservation,
@@ -151,6 +155,10 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
 
     fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

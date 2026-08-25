@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -165,6 +165,12 @@ tower = { version = "0.5", default-features = false, features = ["util"], option
 # (Linux, macOS, Windows). Android/Termux uses target_os="android" and is excluded.
 
 # Uses whatsapp-rust for Bot and Client, wacore for storage traits, custom rusqlite backend avoids Diesel conflict.
+
+# Linux-only: `desktop --install` opens candidate `.desktop` entries with
+# O_NONBLOCK|O_NOFOLLOW so a FIFO or symlink planted in an XDG data dir cannot
+# block or redirect the read.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 # Installer/surface metadata: which `[features]` are internal aggregates or
 # meta toggles rather than user-selectable rows. This bit is NOT derivable from
@@ -436,6 +442,12 @@ path = "tests/test_live.rs"
 [[test]]
 name = "architecture"
 path = "tests/test_architecture.rs"
+
+# Cross-crate activation proof: a configured channel plugin reaching a real
+# WASM component. Needs `plugins-wasm-cranelift` and the wasm32-wasip2 target.
+[[test]]
+name = "plugin_channel_runtime_e2e"
+path = "tests/plugin_channel_runtime_e2e.rs"
 
 [[bench]]
 name = "agent_benchmarks"

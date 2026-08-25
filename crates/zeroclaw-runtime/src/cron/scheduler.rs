@@ -2922,7 +2922,15 @@ mod tests {
     fn cron_powershell_policy_accepts_read_only_and_rejects_expressions() {
         let mut config = Config::default();
         config.runtime.shell = Some("powershell".into());
-        let security = SecurityPolicy::default();
+        // PowerShell-only command names are deliberately absent from the
+        // cross-dialect default allowlist (see
+        // `docs/book/src/security/sandboxing.md`): an operator opts into the
+        // cmdlets they need. Grant both documented spellings so the assertions
+        // below exercise the PowerShell grammar rather than the allowlist.
+        let security = SecurityPolicy {
+            allowed_commands: vec!["Write-Output".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
         let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
 
         crate::cron::validate_shell_command_with_security(

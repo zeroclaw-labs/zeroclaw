@@ -65,3 +65,6 @@ default = ["schema-export", "clap"]
 schema-export = ["dep:schemars"]
 clap = ["dep:clap"]
 memory-postgres = ["dep:postgres"]
+# Test-only fault-injection hooks (post-replace sync failure). Enabled by
+# downstream dev-dependencies only; never by a production dependency.
+test-helpers = []

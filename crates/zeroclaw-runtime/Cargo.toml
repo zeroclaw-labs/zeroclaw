@@ -134,6 +134,9 @@ wiremock = "0.6"
 # retry-regression tests. Not in default deps so
 # the helper is unreachable from production builds.
 zeroclaw-tools = { workspace = true, features = ["test-helpers"] }
+# Test-only config fault injection for the config/set post-rename sync
+# regression. Same pattern as zeroclaw-tools above.
+zeroclaw-config = { workspace = true, features = ["test-helpers"] }
 
 # Channel features (forwarded to zeroclaw-channels)
 

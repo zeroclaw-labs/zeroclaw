@@ -27,7 +27,7 @@ cli-config-about = Manage ZeroClaw configuration
 cli-update-about = Check for and apply ZeroClaw updates
 cli-self-test-about = Run diagnostic self-tests
 cli-completions-about = Generate shell completion scripts
-cli-desktop-about = Launch the ZeroClaw companion desktop app
+cli-desktop-about = Launch the companion desktop app, or open its download page
 
 cli-config-schema-about = Dump the full configuration JSON Schema to stdout
 cli-config-list-about = List all config properties with current values
@@ -179,6 +179,7 @@ cli-sop-validate-about = Validate SOP definitions
 cli-sop-show-about = Show details of an SOP
 
 cli-migrate-openclaw-about = Import memory from an OpenClaw workspace into this ZeroClaw workspace
+cli-migrate-openclaw-qdrant-unsupported = Qdrant is not currently supported as an OpenClaw migration target. Set memory.backend to sqlite, lucid, or markdown and retry.
 
 cli-agent-long-about =
     Start the AI agent loop.
@@ -363,11 +364,11 @@ cli-desktop-long-about =
 
     The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
 
-    Use --install to download the pre-built companion app for your platform.
+    Use --install to open the download page for your platform. It does not install anything itself.
 
     Examples:
       zeroclaw desktop              # launch the companion app
-      zeroclaw desktop --install    # download and install it
+      zeroclaw desktop --install    # open the download page
 
 # Channel-side reply emitted when chat dispatch refuses because the
 # gateway has no model configured. Used by the gateway crate channel
@@ -425,6 +426,12 @@ channel-whatsapp-web-delivery-failure-note-many = (note: I could not deliver {$c
 channel-line-bind-success = ✅ Paired! You can now chat.
 channel-line-bind-invalid-code = ❌ Invalid code. Please try again.
 channel-line-bind-rate-limited = ⏳ Too many attempts. Retry in { $secs }s.
+channel-telegram-cmd-new-desc = Start a new conversation session
+channel-telegram-cmd-clear-desc = Clear this conversation session
+channel-telegram-cmd-stop-desc = Cancel the current in-flight task
+channel-telegram-cmd-model-desc = Show or switch the current model
+channel-telegram-cmd-models-desc = List available model_providers or switch model_provider
+channel-telegram-cmd-config-desc = Show current configuration
 
 # Onboarding — OpenAI auth picker
 onboard-openai-auth-note =
@@ -500,6 +507,7 @@ cli-sop-none = No SOPs found.
 cli-sop-pending-none = No SOP runs waiting for approval.
 cli-sop-pending-header = SOP runs waiting for approval:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+cli-sop-status-failure-reason = Failure reason: {$reason}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}
@@ -681,6 +689,7 @@ cli-quickstart-error-channel-required = channel type and alias are required
 cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
 cli-quickstart-error-channel-token-required = Telegram bot token is required
 cli-quickstart-error-webhook-secret-required = Webhook shared secret is required
+cli-quickstart-error-webhook-port-conflict = webhook port {$port} is already used by enabled webhook `{$alias}` — each enabled webhook needs its own port
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
@@ -743,9 +752,9 @@ cli-status-service-stopped = 🔴 Service:       stopped
 cli-status-channels = Channels:
 cli-status-cli-always = {"  "}CLI:      ✅ always
 cli-status-peripherals = Peripherals:
-cli-desktop-download = Download the ZeroClaw companion app:
+cli-desktop-download = Opening the ZeroClaw companion app download page:
 cli-desktop-homebrew = Or install via Homebrew (coming soon):
-cli-desktop-linux-pkg = {"  "}Download the .deb or .AppImage for your architecture.
+cli-desktop-linux-pkg = {"  "}The page provides .deb and .AppImage downloads by architecture.
 cli-desktop-launching = Launching ZeroClaw companion app...
 
 # ── status fields ──

@@ -312,9 +312,7 @@ fn build_resolved_approval_card(
         ChannelApprovalResponse::Approve => ("✅", "Approved", "green"),
         ChannelApprovalResponse::AlwaysApprove => ("✅✅", "Approved (always)", "green"),
         ChannelApprovalResponse::Deny => ("❌", "Denied", "red"),
-        ChannelApprovalResponse::DenyWithEdit { .. } => {
-            unreachable!("DenyWithEdit is only valid for ACP channels")
-        }
+        ChannelApprovalResponse::DenyWithEdit { .. } => ("❌", "Denied", "red"),
     };
 
     serde_json::json!({
@@ -5584,6 +5582,13 @@ mod tests {
                 "Approved (always)",
             ),
             (ChannelApprovalResponse::Deny, "red", "Denied"),
+            (
+                ChannelApprovalResponse::DenyWithEdit {
+                    replacement: "edited".to_string(),
+                },
+                "red",
+                "Denied",
+            ),
         ] {
             let card = build_resolved_approval_card("shell", "args", decision.clone());
             assert_eq!(

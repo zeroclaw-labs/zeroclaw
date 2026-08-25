@@ -76,7 +76,7 @@ pub fn build_session_model_provider(
         &model_provider_runtime_options,
     )?;
 
-    Ok((model_provider, model_provider_name, model_name))
+    Ok((model_provider, model_provider_ref.to_string(), model_name))
 }
 
 /// Resolve the tool dispatcher with the same provider-capability fallback
@@ -1806,7 +1806,7 @@ impl Agent {
             .multimodal_config(config.multimodal.clone())
             .agent_alias(agent_alias.to_string())
             .model_name(model_name)
-            .model_provider_name(provider_name.to_string())
+            .model_provider_name(provider_ref.clone())
             .temperature(agent_model_provider.and_then(|e| e.temperature))
             .workspace_dir(security.workspace_dir.clone())
             .agent_workspace_dir(agent_workspace.clone())
@@ -3365,6 +3365,29 @@ mod tests {
             err.to_string().contains("no `model` configured"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn build_session_model_provider_returns_full_canonical_ref() {
+        use zeroclaw_config::schema::{ModelProviderConfig, OpenAIModelProviderConfig};
+
+        let mut config = Config::default();
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    ..Default::default()
+                },
+            },
+        );
+
+        let (_provider, provider_ref, model) =
+            build_session_model_provider(&config, "openai.fast", None).unwrap();
+
+        assert_eq!(provider_ref, "openai.fast");
+        assert_eq!(model, "gpt-4o-mini");
     }
 
     zeroclaw_api::mock_tool_attribution!(
@@ -5805,6 +5828,97 @@ mod tests {
             "openai alias with requires_openai_auth should construct via Codex OAuth path: {}",
             result.err().unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn from_config_preserves_alias_for_cost_recording() {
+        use crate::agent::cost::{
+            TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext,
+            build_model_provider_pricing, record_tool_loop_cost_usage,
+        };
+        use crate::cost::CostTracker;
+        use tempfile::TempDir;
+        use zeroclaw_config::schema::{
+            AliasedAgentConfig, Config, ModelProviderConfig, OpenAIModelProviderConfig,
+            RiskProfileConfig,
+        };
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.cost.enabled = true;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.providers.models.openai.insert(
+            "fast".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o-mini".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o-mini.input".to_string(), 0.15),
+                        ("gpt-4o-mini.output".to_string(), 0.60),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.providers.models.openai.insert(
+            "smart".to_string(),
+            OpenAIModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("gpt-4o".to_string()),
+                    api_key: Some("test-key".to_string()),
+                    pricing: HashMap::from([
+                        ("gpt-4o.input".to_string(), 2.50),
+                        ("gpt-4o.output".to_string(), 10.00),
+                    ]),
+                    ..Default::default()
+                },
+            },
+        );
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "openai.fast".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+
+        let agent = Agent::from_config(&config, "test-agent").await.unwrap();
+        assert_eq!(agent.model_provider_name, "openai.fast");
+
+        let tracker = Arc::new(CostTracker::new(config.cost.clone(), &config.data_dir).unwrap());
+        let context = ToolLoopCostTrackingContext::new(
+            Arc::clone(&tracker),
+            Arc::new(build_model_provider_pricing(&config)),
+        );
+        let usage = zeroclaw_providers::traits::TokenUsage {
+            input_tokens: Some(1_000_000),
+            output_tokens: Some(1_000_000),
+            cached_input_tokens: Some(0),
+        };
+
+        let (_, cost_usd) = TOOL_LOOP_COST_TRACKING_CONTEXT
+            .scope(Some(context), async {
+                record_tool_loop_cost_usage(&agent.model_provider_name, &agent.model_name, &usage)
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            (cost_usd - 0.75).abs() < 1e-12,
+            "selected alias must charge its own rates, not the sibling's $12.50"
+        );
+        let summary = tracker.get_summary().unwrap();
+        assert!((summary.daily_cost_usd - 0.75).abs() < 1e-12);
     }
 
     #[test]

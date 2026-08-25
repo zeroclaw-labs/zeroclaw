@@ -12,4 +12,5 @@ doctest = false
 test = false
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
 wit-bindgen = "0.51"

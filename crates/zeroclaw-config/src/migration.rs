@@ -791,7 +791,7 @@ type MigrationStep = fn(toml::Value) -> Result<toml::Value>;
 
 const MIGRATION_STEPS: &[MigrationStep] = &[
     // V0 → V1: padding so slot 0 is never indexed. V0 does not exist.
-    |_| unreachable!("MIGRATION_STEPS[0] is a 1-indexing pad and is never invoked"),
+    Ok,
     // V1 → V2
     |value| {
         let v1: V1Config = value

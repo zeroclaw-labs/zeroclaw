@@ -213,8 +213,9 @@ pub fn ingress_kind(source: SopTriggerSource) -> SopIngressKind {
     match source {
         // Routed through `SopIngress` by the MQTT listener (orchestrator/mqtt.rs).
         SopTriggerSource::Mqtt => SopIngressKind::SharedIngress,
-        // `SopTrigger::Webhook` doc: "Defined and matched, but no live route feeds it."
-        SopTriggerSource::Webhook => SopIngressKind::NotYetLive,
+        // Routed through `dispatch_untrusted_fan_in` (-> `SopIngress`) by the gateway's
+        // `/sop/*` route and the SOP-first branch of `/webhook` (gateway/api_sop_webhook.rs).
+        SopTriggerSource::Webhook => SopIngressKind::SharedIngress,
         // `check_sop_cron_triggers` calls `dispatch_sop_event` directly with the
         // daemon's owned, non-optional engine/audit handles; never through `SopIngress`.
         SopTriggerSource::Cron => SopIngressKind::DedicatedInternalDispatch,
@@ -3125,22 +3126,63 @@ mod tests {
     /// Drift guard: every `SopTriggerSource` variant must have a classification.
     /// `ingress_kind` has no wildcard match arm, so a new variant fails to compile
     /// until it is classified there; this test documents the iterator side of that
-    /// contract by asserting each variant actually resolves to a `SopIngressKind`.
+    /// contract by asserting the SPECIFIC semantic classification of each variant,
+    /// not merely that some `SopIngressKind` came back. Accepting any variant made
+    /// the registry unable to catch a stale classification — e.g. `Webhook` sitting
+    /// at `NotYetLive` after the gateway `/sop/*` and SOP-first `/webhook` routes
+    /// began feeding it through `dispatch_untrusted_fan_in`.
     #[test]
     fn every_trigger_source_has_an_ingress_classification() {
         use strum::IntoEnumIterator;
 
+        fn expected(source: SopTriggerSource) -> SopIngressKind {
+            match source {
+                SopTriggerSource::Mqtt => SopIngressKind::SharedIngress,
+                // Live via the gateway HTTP fan-in routes.
+                SopTriggerSource::Webhook => SopIngressKind::SharedIngress,
+                SopTriggerSource::Cron => SopIngressKind::DedicatedInternalDispatch,
+                SopTriggerSource::Peripheral => SopIngressKind::NotYetLive,
+                SopTriggerSource::Filesystem => SopIngressKind::SharedIngress,
+                SopTriggerSource::Calendar => SopIngressKind::NotYetLive,
+                SopTriggerSource::Channel => SopIngressKind::SharedIngress,
+                SopTriggerSource::Manual => SopIngressKind::DedicatedInternalDispatch,
+                SopTriggerSource::Amqp => SopIngressKind::SharedIngress,
+            }
+        }
+
         for source in SopTriggerSource::iter() {
-            let kind = ingress_kind(source);
-            assert!(
-                matches!(
-                    kind,
-                    SopIngressKind::SharedIngress
-                        | SopIngressKind::DedicatedInternalDispatch
-                        | SopIngressKind::NotYetLive
-                ),
-                "SopTriggerSource::{source} classified as {kind:?}"
+            assert_eq!(
+                ingress_kind(source),
+                expected(source),
+                "SopTriggerSource::{source} has drifted from its documented ingress classification"
             );
         }
+
+        // Keep the iterator arm meaningful: a NEW variant fails at the
+        // (wildcard-free) match in `ingress_kind`, at `expected` above, and
+        // here, so the count can never silently drift out of sync.
+        assert_eq!(
+            SopTriggerSource::iter().count(),
+            9,
+            "a trigger source was added or removed — classify it above"
+        );
+    }
+
+    /// The webhook trigger source is live: the gateway routes it through
+    /// `dispatch_untrusted_fan_in`, so it is shared untrusted-transport ingress
+    /// and must never be classified as `NotYetLive` again.
+    #[test]
+    fn webhook_trigger_source_is_classified_as_live_shared_ingress() {
+        assert_eq!(
+            ingress_kind(SopTriggerSource::Webhook),
+            SopIngressKind::SharedIngress,
+            "gateway /sop/* and SOP-first /webhook feed this source through \
+             dispatch_untrusted_fan_in"
+        );
+        assert_ne!(
+            ingress_kind(SopTriggerSource::Webhook),
+            SopIngressKind::NotYetLive,
+            "the exhaustive registry must not contradict the shipped HTTP routes"
+        );
     }
 }
