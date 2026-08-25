@@ -3319,13 +3319,22 @@ schedule = { kind = "every", every_ms = 300000 }
     fn skip_missed_run_advances_recurring_job_next_run() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
+        // Keep the reference one second before a minute boundary so the test
+        // exercises the exact rollover that made the old wall-clock assertion
+        // flaky. The explicit UTC zone keeps the expected occurrence stable
+        // across developer and CI machine timezones.
+        let reference = "2026-08-25T12:34:59Z".parse::<DateTime<Utc>>().unwrap();
+        let schedule = Schedule::Cron {
+            expr: "* * * * *".to_string(),
+            tz: Some("UTC".to_string()),
+        };
 
         // Add a cron job that will be "overdue" — its next_run is set based
         // on the schedule from the current time, so we need to make it past.
-        let job = add_job(&config, "test-agent", "* * * * *", "echo test").unwrap();
+        let job = add_job_with_schedule(&config, "test-agent", &schedule, "echo test").unwrap();
 
         // Force next_run into the past so the job appears overdue.
-        let past = Utc::now() - ChronoDuration::hours(1);
+        let past = reference - ChronoDuration::hours(1);
         with_initialized_connection(&config, |conn| {
             conn.execute(
                 "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
@@ -3338,20 +3347,23 @@ schedule = { kind = "every", every_ms = 300000 }
 
         // Verify it is overdue now.
         assert!(
-            !all_overdue_jobs(&config, Utc::now()).unwrap().is_empty(),
+            !all_overdue_jobs(&config, reference).unwrap().is_empty(),
             "job with past next_run must appear in overdue"
         );
 
         // Skip the missed run.
         let reloaded = get_job(&config, &job.id).unwrap();
-        skip_missed_run(&config, &reloaded, Utc::now()).unwrap();
+        skip_missed_run(&config, &reloaded, reference).unwrap();
 
-        // The job's next_run should now be in the future.
+        // The job's next_run should be the first occurrence after the same
+        // reference instant supplied to skip_missed_run.
         let updated = get_job(&config, &job.id).unwrap();
+        let expected_next_run = "2026-08-25T12:35:00Z".parse::<DateTime<Utc>>().unwrap();
         assert!(
-            updated.next_run > Utc::now(),
+            updated.next_run > reference,
             "skip_missed_run must advance next_run to the future"
         );
+        assert_eq!(updated.next_run, expected_next_run);
         assert!(updated.enabled, "recurring job must stay enabled");
     }
 

@@ -4309,12 +4309,24 @@ mod tests {
         let saved = media[0]
             .marker_target()
             .expect("a saved attachment must record the target it rendered");
-        assert!(
-            saved.contains("discord_files/"),
+        // The recorded target is a native filesystem path, so the separator is
+        // `\` on Windows and `/` elsewhere. Walk it as a `Path` instead of
+        // matching a `/`-joined substring, which only ever held on Unix — and
+        // which made the save-name check below compare the whole path.
+        let saved_path = std::path::Path::new(saved);
+        assert_eq!(
+            saved_path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|dir| dir.to_str()),
+            Some("discord_files"),
             "expected a workspace save path, got: {saved}"
         );
         assert_ne!(
-            saved.rsplit('/').next().unwrap_or(saved),
+            saved_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(saved),
             media[0].file_name,
             "the save name must differ from the sender name, or this test proves nothing"
         );

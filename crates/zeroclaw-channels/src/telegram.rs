@@ -5177,12 +5177,14 @@ mod tests {
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let mock_server = MockServer::start().await;
+        let running_tool_text =
+            crate::util::localized_lifecycle_progress(ProgressEvent::RunningTool);
         Mock::given(method("POST"))
             .and(path_regex(r"/bot[^/]+/editMessageText$"))
             .and(body_json(serde_json::json!({
                 "chat_id": "123",
                 "message_id": 42,
-                "text": "Running tool",
+                "text": running_tool_text,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": true,
@@ -5285,7 +5287,10 @@ mod tests {
             "only the typed lifecycle event should reach Telegram"
         );
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(body["text"], "Running tool");
+        assert_eq!(
+            body["text"],
+            crate::util::localized_lifecycle_progress(ProgressEvent::RunningTool)
+        );
         let raw = String::from_utf8_lossy(&requests[0].body);
         for leaked in [
             "shell",

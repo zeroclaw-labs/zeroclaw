@@ -209,6 +209,11 @@ pub fn host_matches_allowlist(host: &str, allowed: &[String]) -> bool {
 ///
 /// Returns the human-readable reason the entry is not a legal egress pattern.
 pub fn normalize_egress_pattern(raw: &str) -> Result<String, String> {
+    if raw.trim() != raw {
+        return Err(format!(
+            "entry {raw:?} must not have leading or trailing whitespace"
+        ));
+    }
     let input = raw.trim();
     if input.is_empty() {
         return Err("entry must not be empty".to_string());
@@ -311,6 +316,37 @@ pub fn normalize_egress_patterns(patterns: &[String], label: &str) -> anyhow::Re
     out.sort_unstable();
     out.dedup();
     Ok(out)
+}
+
+/// Return whether an egress grant contains every destination matched by a
+/// carveout pattern.
+///
+/// Both arguments must already be canonicalized by
+/// [`normalize_egress_pattern`]. Exact grants contain only the same exact
+/// host. A suffix grant contains exact subdomains and narrower suffix grants,
+/// but never its apex. An exact grant can never contain a suffix grant.
+#[must_use]
+pub fn egress_pattern_contains(grant: &str, carveout: &str) -> bool {
+    let (grant_host, grant_is_suffix) = match grant.strip_prefix("*.") {
+        Some(host) => (host, true),
+        None => (grant, false),
+    };
+    let (carveout_host, carveout_is_suffix) = match carveout.strip_prefix("*.") {
+        Some(host) => (host, true),
+        None => (carveout, false),
+    };
+
+    match (grant_is_suffix, carveout_is_suffix) {
+        (true, true) => {
+            carveout_host == grant_host || carveout_host.ends_with(&format!(".{grant_host}"))
+        }
+        (true, false) => {
+            carveout_host.parse::<std::net::IpAddr>().is_err()
+                && carveout_host.ends_with(&format!(".{grant_host}"))
+        }
+        (false, false) => grant_host == carveout_host,
+        (false, true) => false,
+    }
 }
 
 /// Strict egress matching: the deny-by-default sibling of
@@ -1355,6 +1391,8 @@ mod tests {
     fn egress_pattern_rejects_empty_whitespace_and_noncanonical() {
         assert!(normalize_egress_pattern("").is_err());
         assert!(normalize_egress_pattern("   ").is_err());
+        assert!(normalize_egress_pattern(" example.com").is_err());
+        assert!(normalize_egress_pattern("example.com ").is_err());
         assert!(normalize_egress_pattern("exa mple.com").is_err());
         assert!(
             normalize_egress_pattern("EXAMPLE.com").is_err(),
@@ -1364,6 +1402,33 @@ mod tests {
             normalize_egress_pattern("example.com.").is_err(),
             "a trailing dot must be rejected, not silently stripped"
         );
+    }
+
+    #[test]
+    fn egress_pattern_containment_preserves_apex_and_wildcard_boundaries() {
+        let cases = [
+            ("example.com", "example.com", true),
+            ("example.com", "api.example.com", false),
+            ("example.com", "*.example.com", false),
+            ("*.example.com", "example.com", false),
+            ("*.example.com", "api.example.com", true),
+            ("*.example.com", "*.example.com", true),
+            ("*.example.com", "*.api.example.com", true),
+            ("*.api.example.com", "*.example.com", false),
+            ("*.example.com", "api.other.example.com", true),
+            ("1.1.1.1", "1.1.1.1", true),
+            ("*.example.com", "1.1.1.1", false),
+        ];
+        for (grant, carveout, expected) in cases {
+            assert_eq!(
+                egress_pattern_contains(grant, carveout),
+                expected,
+                "grant {grant:?}, carveout {carveout:?}"
+            );
+        }
+        let bracketed = normalize_egress_pattern("[::1]").unwrap();
+        assert_eq!(bracketed, "::1");
+        assert!(egress_pattern_contains(&bracketed, &bracketed));
     }
 
     #[test]
