@@ -274,6 +274,13 @@ impl V2Config {
                     .insert(source);
                 fold_owned.insert((family, alias));
             }
+            GlobalFold::Owned { family, alias } => {
+                // The explicit selector overlaid an equivalent existing slot.
+                // The slot keeps its existing sole producer; the ownership
+                // record alone lets the canonical-source guard rewrite a
+                // canonical-spelling reference to this slot.
+                fold_owned.insert((family, alias));
+            }
             GlobalFold::Ambiguous { family, alias } => {
                 // Bolt two distinct, never-producible sentinel sources onto the
                 // slot. The bare-rewrite only fires on exactly one equivalently
@@ -1083,11 +1090,12 @@ fn rewrite_bare_vision_provider_reference(
     // producer to name this family under its canonical spelling (a colon-URL
     // form keeps the family as its base type, so its URL identity stays
     // verifiable below), or the slot to carry an explicit fold ownership
-    // record (an explicit `default_provider` selector or the synthesized
-    // fallback — registered only when the fold created the slot, so it states
-    // ownership of this exact credential). A variant-spelled reference
-    // (`grok`, `qwen-intl`) keeps the effective-identity behavior below:
-    // naming a non-canonical spelling IS naming a differently spelled source.
+    // record (an explicit `default_provider` selector — registered when the
+    // fold created the slot or when it overlaid an equivalent existing slot,
+    // or the synthesized fallback — so it states ownership of this exact
+    // credential). A variant-spelled reference (`grok`, `qwen-intl`) keeps
+    // the effective-identity behavior below: naming a non-canonical spelling
+    // IS naming a differently spelled source.
     let sole_raw = producers.iter().next().expect("len 1");
     let (sole_base_type, _) = split_colon_url_provider(sole_raw);
     let reference_names_canonical_spelling =
@@ -1159,6 +1167,13 @@ enum GlobalFold {
     /// OpenRouter fallback, or a missing `default` alias in a single-family
     /// config); the given raw source becomes its producer.
     Producer(String),
+    /// The explicit `default_provider` selector overlaid an already-materialized
+    /// alias whose completed identity matches the selector. No second producer
+    /// is registered (the slot keeps its existing sole producer), but the
+    /// selector explicitly states ownership of that slot's folded credentials,
+    /// so the canonical-source ownership guard may still rewrite a
+    /// canonical-spelling reference to this slot.
+    Owned { family: String, alias: String },
     /// The fold wrote unowned globals into a target across multiple canonical
     /// families with no `default_provider` to establish ownership. The target
     /// must stay ambiguous: do not let the bare-vision rewrite claim it.
@@ -1405,6 +1420,7 @@ fn fold_providers_globals_into_models(
     // selector the completed alias still does not match — a distinct URL, or a
     // variant the fold could not apply — stays a separate producer so the
     // rewrite fails closed.
+    let mut overlay_owned_slot: Option<(String, String)> = None;
     if let Some(selector) = g_default_provider.as_ref().and_then(toml::Value::as_str) {
         let (raw_type, url) = split_colon_url_provider(selector);
         let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
@@ -1434,6 +1450,12 @@ fn fold_providers_globals_into_models(
             )
         {
             source_key = None;
+            // The selector overlaid an equivalent existing slot: no second
+            // producer is registered, but the selector still states ownership
+            // of this exact slot. Record it so a canonical-spelling vision
+            // reference backed only by a legacy-synonym producer can still
+            // rewrite to the credential-bearing alias.
+            overlay_owned_slot = Some((canonical.clone(), alias.clone()));
         }
     }
     if ambiguous {
@@ -1453,6 +1475,8 @@ fn fold_providers_globals_into_models(
         }
     } else if let Some(source) = source_key {
         GlobalFold::Producer(source)
+    } else if let Some((family, alias)) = overlay_owned_slot {
+        GlobalFold::Owned { family, alias }
     } else {
         GlobalFold::None
     }

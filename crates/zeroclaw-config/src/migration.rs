@@ -2041,6 +2041,90 @@ vision_model_provider = "xai"
     }
 
     #[test]
+    fn v2_equivalent_explicit_overlay_over_legacy_synonym_preserves_ownership() {
+        // The explicit `default_provider` selector targets a slot that
+        // `alias_provider_models` already materialized from a legacy-synonym
+        // model entry, and the completed alias matches the selector. The fold
+        // must not register a second producer, but it must also keep the
+        // selector's ownership record: the canonical-spelling vision reference
+        // is otherwise left on the configless path and the migrated
+        // credential-bearing alias stays unreachable.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "xai"
+api_key = "sk-global-test"
+default_model = "vision-model"
+
+[providers.models.grok]
+model = "grok-model"
+
+[multimodal]
+vision_model_provider = "xai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "an equivalent explicit overlay states ownership; the canonical reference must rewrite"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("xai", "default")
+            .expect("migrated slot must live at xai.default");
+        assert_eq!(
+            alias.api_key.as_deref(),
+            Some("sk-global-test"),
+            "the folded global credential must be preserved on the alias"
+        );
+        assert_eq!(
+            alias.model.as_deref(),
+            Some("grok-model"),
+            "the per-provider model must keep precedence over the folded global"
+        );
+    }
+
+    #[test]
+    fn v2_legacy_selector_overlay_preserves_ownership_for_canonical_reference() {
+        // Inverse spelling of the equivalent-overlay case: the selector uses
+        // the legacy synonym (`grok`) while the vision reference uses the
+        // canonical family (`xai`). The overlay must keep the ownership record
+        // so the canonical reference still rewrites.
+        let raw = r#"
+schema_version = 2
+
+[providers]
+default_provider = "grok"
+api_key = "sk-global-test"
+default_model = "vision-model"
+
+[providers.models.grok]
+model = "grok-model"
+
+[multimodal]
+vision_model_provider = "xai"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("xai.default"),
+            "a legacy-spelling selector overlay states ownership; the canonical reference must rewrite"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("xai", "default")
+            .expect("migrated slot must live at xai.default");
+        assert_eq!(
+            alias.api_key.as_deref(),
+            Some("sk-global-test"),
+            "the folded global credential must be preserved on the alias"
+        );
+    }
+
+    #[test]
     fn v2_colon_url_source_rewrites_bare_custom() {
         // A colon-URL source materializes custom.default with the uri. The
         // provenance records the unsplit key; the equivalence check must split
