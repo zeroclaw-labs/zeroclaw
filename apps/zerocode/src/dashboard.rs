@@ -1225,25 +1225,7 @@ impl Dashboard {
 
         let mut lines = Vec::new();
         if let Some(obj) = h.as_object() {
-            // Overall status
-            if let Some(uptime) = obj.get("uptime_seconds").and_then(|v| v.as_u64()) {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-uptime")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(format_uptime(uptime), theme::body_style()),
-                ]));
-            }
-            if let Some(pid) = obj.get("pid").and_then(|v| v.as_u64()) {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", crate::i18n::t("zc-dashboard-label-pid")),
-                        theme::dim_style(),
-                    ),
-                    Span::styled(pid.to_string(), theme::body_style()),
-                ]));
-            }
+            lines.extend(health_status_lines(obj));
 
             // Process stats
             if let Some(process) = obj.get("process") {
@@ -2924,10 +2906,59 @@ const OVERVIEW_STATUS_LABEL_KEYS: &[&str] = &[
     "zc-dashboard-label-daemon-cpu",
 ];
 
+const HEALTH_STATUS_LABEL_KEYS: &[&str] = &["zc-dashboard-label-uptime", "zc-dashboard-label-pid"];
+
 fn overview_status_label_width() -> usize {
-    OVERVIEW_STATUS_LABEL_KEYS
-        .iter()
-        .map(|key| crate::display_width::display_width(&crate::i18n::t(key)))
+    status_label_width(
+        OVERVIEW_STATUS_LABEL_KEYS
+            .iter()
+            .map(|key| crate::i18n::t(key)),
+    )
+}
+
+fn health_status_label_width() -> usize {
+    status_label_width(
+        HEALTH_STATUS_LABEL_KEYS
+            .iter()
+            .map(|key| crate::i18n::t(key)),
+    )
+}
+
+fn health_status_lines(obj: &serde_json::Map<String, serde_json::Value>) -> Vec<Line<'static>> {
+    let label_width = health_status_label_width();
+    let mut lines = Vec::new();
+
+    // Overall status
+    if let Some(uptime) = obj.get("uptime_seconds").and_then(|v| v.as_u64()) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                status_label("zc-dashboard-label-uptime", label_width),
+                theme::dim_style(),
+            ),
+            Span::styled(format_uptime(uptime), theme::body_style()),
+        ]));
+    }
+    if let Some(pid) = obj.get("pid").and_then(|v| v.as_u64()) {
+        lines.push(Line::from(vec![
+            Span::styled(
+                status_label("zc-dashboard-label-pid", label_width),
+                theme::dim_style(),
+            ),
+            Span::styled(pid.to_string(), theme::body_style()),
+        ]));
+    }
+
+    lines
+}
+
+fn status_label_width<I, S>(labels: I) -> usize
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    labels
+        .into_iter()
+        .map(|label| crate::display_width::display_width(label.as_ref()))
         .max()
         .unwrap_or(0)
         .saturating_add(1)
@@ -3467,6 +3498,53 @@ mod tests {
 
         assert_eq!(crate::display_width::display_width(&padded), 16);
         assert!(padded.ends_with(' '));
+    }
+
+    #[test]
+    fn status_label_width_handles_translated_labels_longer_than_default() {
+        let width = status_label_width(["Disponibilité", "PID"]);
+
+        assert_eq!(width, 14);
+        assert_eq!(
+            crate::display_width::display_width(&padded_status_label("Disponibilité", width)),
+            width
+        );
+        assert_eq!(
+            crate::display_width::display_width(&padded_status_label("PID", width)),
+            width
+        );
+    }
+
+    #[test]
+    fn health_status_lines_use_catalogue_labels_and_align_values() {
+        let health = serde_json::json!({
+            "uptime_seconds": 60_u64,
+            "pid": 1234_u64,
+        });
+        let lines = health_status_lines(health.as_object().expect("health object"));
+
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0].spans[0].content.as_ref(),
+            status_label("zc-dashboard-label-uptime", health_status_label_width())
+        );
+        assert_eq!(
+            lines[1].spans[0].content.as_ref(),
+            status_label("zc-dashboard-label-pid", health_status_label_width())
+        );
+        assert_eq!(lines[0].spans[1].content.as_ref(), "1m");
+        assert_eq!(lines[1].spans[1].content.as_ref(), "1234");
+
+        let value_columns = lines
+            .iter()
+            .map(|line| crate::display_width::display_width(line.spans[0].content.as_ref()))
+            .collect::<Vec<_>>();
+        assert_eq!(value_columns[0], value_columns[1]);
+        assert!(
+            value_columns[0]
+                > crate::display_width::display_width(&crate::i18n::t("zc-dashboard-label-uptime")),
+            "translated uptime label must retain a separating cell"
+        );
     }
 
     #[test]
