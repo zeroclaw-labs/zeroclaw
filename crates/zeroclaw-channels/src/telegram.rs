@@ -1189,6 +1189,51 @@ impl TelegramChannel {
         }
     }
 
+    /// `channels.telegram.<alias>.unauthorized_message` for this alias,
+    /// read from the live config handle at send time so an operator edit
+    /// lands without rebuilding the channel. `None` whenever the handle is
+    /// unwired (one-shot senders, tests) or the alias leaves it unset.
+    fn configured_unauthorized_message(&self) -> Option<String> {
+        self.persist
+            .as_ref()?
+            .read()
+            .channels
+            .telegram
+            .get(&self.alias)?
+            .unauthorized_message
+            .clone()
+    }
+
+    /// Compose the notice an unauthorized sender receives.
+    ///
+    /// A blank `custom` falls back to the built-in copy, which has two
+    /// forms. While startup pairing is active the deployment is still being
+    /// onboarded by whoever holds the terminal, so the bind command is the
+    /// actionable next step. Once peers resolve, authorization comes from
+    /// configuration — possibly written by a control plane the sender and
+    /// the operator never touch by hand — and a terminal command is noise;
+    /// naming the identity to authorize is what the operator needs.
+    fn unauthorized_notice(
+        custom: Option<&str>,
+        pairing_active: bool,
+        bind_command: &str,
+        identity: &str,
+    ) -> String {
+        match custom.map(str::trim).filter(|text| !text.is_empty()) {
+            Some(text) => text
+                .replace("{bind_command}", bind_command)
+                .replace("{identity}", identity),
+            None if pairing_active => i18n::get_required_cli_string_with_args(
+                "channel-telegram-unauthorized-bind",
+                &[("bindCommand", bind_command)],
+            ),
+            None => i18n::get_required_cli_string_with_args(
+                "channel-telegram-unauthorized-allowlist",
+                &[("identity", identity)],
+            ),
+        }
+    }
+
     fn api_url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.api_base, self.bot_token)
     }
@@ -1988,14 +2033,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // and the bot would keep demanding approval.
         let bind_command = Self::suggested_bind_command(&self.alias, &suggested_identity);
 
-        let _ = self
-            .send(&SendMessage::new(
-                format!(
-                    "🔐 This bot requires operator approval.\n\nCopy this command to the operator terminal:\n`{bind_command}`\n\nAfter the operator runs it, send your message again."
-                ),
-                &chat_id,
-            ))
-            .await;
+        let notice = Self::unauthorized_notice(
+            self.configured_unauthorized_message().as_deref(),
+            self.pairing.is_some(),
+            &bind_command,
+            &suggested_identity,
+        );
+
+        let _ = self.send(&SendMessage::new(notice, &chat_id)).await;
 
         // Only offer the `/bind <code>` path while the channel is genuinely
         // unpaired. Once peers exist (resolved live), the one-time code is
@@ -5668,6 +5713,174 @@ mod tests {
             TelegramChannel::suggested_bind_command("alerts", "123456789"),
             "zeroclaw channel bind-telegram 123456789 --alias alerts"
         );
+    }
+
+    #[test]
+    fn unauthorized_notice_expands_placeholders_in_configured_message() {
+        // The operator's copy replaces the built-in text wholesale. Both
+        // placeholders stay available so a deployment can keep the bind
+        // command, name the identity to authorize, or carry neither.
+        assert_eq!(
+            TelegramChannel::unauthorized_notice(
+                Some("Ask support to authorize {identity}. Operator: {bind_command}"),
+                true,
+                "zeroclaw channel bind-telegram 42",
+                "42",
+            ),
+            "Ask support to authorize 42. Operator: zeroclaw channel bind-telegram 42"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_ignores_blank_configured_message() {
+        // A blank value is an unfinished config, not a request for silence:
+        // the sender still gets the built-in notice instead of whitespace.
+        let notice = TelegramChannel::unauthorized_notice(
+            Some("   \n  "),
+            true,
+            "zeroclaw channel bind-telegram 42",
+            "42",
+        );
+        assert!(
+            notice.contains("zeroclaw channel bind-telegram 42"),
+            "expected the built-in bind notice, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_carries_bind_command_while_pairing_is_active() {
+        // Startup pairing means nobody is authorized yet and whoever set the
+        // bot up holds the terminal, so the bind command is the actionable
+        // next step — the copy existing deployments already see.
+        let notice = TelegramChannel::unauthorized_notice(
+            None,
+            true,
+            "zeroclaw channel bind-telegram 42",
+            "42",
+        );
+        assert!(
+            notice.contains("zeroclaw channel bind-telegram 42"),
+            "expected the bind command in the built-in notice, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn unauthorized_notice_names_identity_once_peers_resolve() {
+        // Peers resolving means authorization already comes from
+        // configuration, possibly written by a control plane no one edits by
+        // hand. A terminal command the sender cannot run is noise; the
+        // identity the operator has to authorize is the useful part.
+        let notice = TelegramChannel::unauthorized_notice(
+            None,
+            false,
+            "zeroclaw channel bind-telegram 42",
+            "42",
+        );
+        assert!(
+            !notice.contains("bind-telegram"),
+            "config-managed authorization must not instruct a terminal bind, got: {notice}"
+        );
+        assert!(
+            notice.contains("42"),
+            "expected the sender identity in the notice, got: {notice}"
+        );
+    }
+
+    #[test]
+    fn configured_unauthorized_message_resolves_from_live_config() {
+        // Read through the live handle, not a construction-time copy, so an
+        // operator edit lands without rebuilding the channel.
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                unauthorized_message: Some("Ask support for access.".to_string()),
+                ..Default::default()
+            },
+        );
+        let config = Arc::new(RwLock::new(config));
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(Vec::new),
+            false,
+        )
+        .with_persistence(config.clone());
+        assert_eq!(
+            ch.configured_unauthorized_message().as_deref(),
+            Some("Ask support for access.")
+        );
+
+        config
+            .write()
+            .channels
+            .telegram
+            .get_mut("telegram_test_alias")
+            .expect("alias configured above")
+            .unauthorized_message = Some("Now say this instead.".to_string());
+        assert_eq!(
+            ch.configured_unauthorized_message().as_deref(),
+            Some("Now say this instead.")
+        );
+    }
+
+    /// The configured notice must reach the sender through the real
+    /// unauthorized path, not just the composer: config resolution,
+    /// placeholder expansion, and delivery in one pass.
+    #[tokio::test]
+    async fn handle_unauthorized_message_sends_configured_notice() {
+        use wiremock::MockServer;
+
+        let mock_server = MockServer::start().await;
+        mount_telegram_send_message_ok(
+            &mock_server,
+            1,
+            &[r#""chat_id":"3030""#, "Ask support to authorize 100050"],
+        )
+        .await;
+
+        let mut config = zeroclaw_config::schema::Config::default();
+        config.channels.telegram.insert(
+            "telegram_test_alias".to_string(),
+            zeroclaw_config::schema::TelegramConfig {
+                enabled: true,
+                unauthorized_message: Some("Ask support to authorize {identity}.".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let ch = TelegramChannel::new(
+            "test-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["zeroclaw_user".to_string()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_persistence(Arc::new(RwLock::new(config)));
+
+        let update = telegram_text_update(7_000, 50, 3_030, "zeroclaw_unauthorized", "hello");
+        ch.handle_unauthorized_message(&update).await;
+
+        let sent: Vec<serde_json::Value> = mock_server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path().ends_with("/sendMessage"))
+            .filter_map(|r| serde_json::from_slice(&r.body).ok())
+            .collect();
+        assert_eq!(
+            sent.len(),
+            1,
+            "expected exactly one sendMessage request, got: {sent:?}"
+        );
+        let sent_text = sent[0]
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(sent_text, "Ask support to authorize 100050.");
     }
 
     #[test]
