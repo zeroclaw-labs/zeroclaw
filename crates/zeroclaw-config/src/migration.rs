@@ -2426,6 +2426,46 @@ vision_model_provider = "stepfun-intl"
     }
 
     #[test]
+    fn v2_stepfun_intl_reference_rewrites_with_trailing_slash_uri() {
+        // Same as `v2_stepfun_intl_reference_rewrites_to_its_own_alias` but the
+        // materialized alias carries a trailing-slash operator URI. The final
+        // expected-extra equality must use slash-normalized comparison so the
+        // reference still rewrites to the dotted alias.
+        let raw = r#"
+schema_version = 2
+
+[providers.models.stepfun]
+api_key = "test-key"
+model = "vision-model"
+uri = "https://api.stepfun.com/intl/v1/"
+
+[multimodal]
+vision_model_provider = "stepfun-intl"
+"#;
+        let cfg = migrate_to_current(raw).unwrap();
+        assert_eq!(
+            cfg.multimodal.vision_model_provider.as_deref(),
+            Some("stepfun.default"),
+            "stepfun-intl reference must rewrite to stepfun.default even when the alias URI has a trailing slash"
+        );
+        let alias = cfg
+            .providers
+            .models
+            .find("stepfun", "default")
+            .expect("stepfun must materialize at stepfun.default");
+        assert_eq!(
+            alias.uri.as_deref(),
+            Some("https://api.stepfun.com/intl/v1/"),
+            "the alias must retain its trailing-slash intl uri"
+        );
+        assert_eq!(
+            alias.api_key.as_deref(),
+            Some("test-key"),
+            "the migrated alias must retain the credential"
+        );
+    }
+
+    #[test]
     fn v2_bare_family_with_oauth_variant_stays_fail_closed() {
         // `openai-codex` adds `wire_api = responses` + `requires_openai_auth`;
         // a bare `openai` reference must not accept that variant producer.

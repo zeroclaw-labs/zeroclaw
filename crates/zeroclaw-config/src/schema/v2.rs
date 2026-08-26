@@ -993,10 +993,17 @@ fn source_identity_matches_inner(
         "uri",
     ];
     // First check expected subset
-    if !expected_extras
-        .iter()
-        .all(|(field, expected)| alias_table.get(*field) == Some(expected))
-    {
+    if !expected_extras.iter().all(|(field, expected)| {
+        let Some(actual) = alias_table.get(*field) else {
+            return false;
+        };
+        if *field == "uri"
+            && let (Some(exp_str), Some(act_str)) = (expected.as_str(), actual.as_str())
+        {
+            return exp_str.trim_end_matches('/') == act_str.trim_end_matches('/');
+        }
+        actual == expected
+    }) {
         return false;
     }
     // Then reject extra identity fields present on the alias that the
