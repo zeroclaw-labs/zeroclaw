@@ -1160,6 +1160,30 @@ impl McpRegistry {
     }
 
     /// Execute a tool by prefixed name.
+    /// Render an MCP `tools/call` result for the model.
+    ///
+    /// A `CallToolResult` carries its payload twice: once as `content[].text`
+    /// and again as `structuredContent`. Pretty-printing the whole envelope put
+    /// both copies, plus the envelope keys and indentation, into the
+    /// conversation — measured at roughly three characters stored per character
+    /// of useful text. Send the text blocks, which is what the model reads.
+    /// Results with no text block fall back to compact JSON so nothing is lost.
+    fn render_tool_result(result: &serde_json::Value) -> String {
+        let text = result
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                    .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|t| !t.is_empty());
+        text.unwrap_or_else(|| result.to_string())
+    }
+
     pub async fn call_tool(
         &self,
         prefixed_name: &str,
@@ -1178,8 +1202,7 @@ impl McpRegistry {
         let result = self.servers[*server_idx]
             .call_tool(original_name, arguments)
             .await?;
-        serde_json::to_string_pretty(&result)
-            .with_context(|| format!("failed to serialize result of MCP tool `{prefixed_name}`"))
+        Ok(Self::render_tool_result(&result))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1394,6 +1417,43 @@ impl McpRegistry {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod render_tool_result_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The model sees the text block, not the envelope and its duplicate.
+    #[test]
+    fn sends_text_block_only() {
+        let payload = r#"{"id": 15, "name": "Upper Strength"}"#;
+        let rendered = McpRegistry::render_tool_result(&json!({
+            "content": [{"type": "text", "text": payload}],
+            "structuredContent": {"id": 15, "name": "Upper Strength"},
+            "isError": false,
+        }));
+        assert_eq!(rendered, payload);
+        assert!(!rendered.contains("structuredContent"));
+    }
+
+    /// Multiple text blocks are joined, not dropped.
+    #[test]
+    fn joins_multiple_text_blocks() {
+        let rendered = McpRegistry::render_tool_result(&json!({
+            "content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}],
+        }));
+        assert_eq!(rendered, "a\nb");
+    }
+
+    /// Results with no text block still render something.
+    #[test]
+    fn falls_back_without_text_blocks() {
+        let rendered = McpRegistry::render_tool_result(&json!({
+            "content": [{"type": "image", "data": "iVBOR"}],
+        }));
+        assert!(rendered.contains("image"));
     }
 }
 
