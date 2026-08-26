@@ -361,9 +361,19 @@ impl OpenAiModelProvider {
     }
 
     fn convert_messages(messages: &[ChatMessage]) -> Vec<NativeMessage> {
+        // Reasoning is replayed verbatim to the model on every request, and it
+        // is not free: measured against qwen3-27b on llama-server, a 3,400
+        // character `reasoning_content` added 751 prompt tokens. A long
+        // tool-calling turn accumulates one block per iteration, so the cost
+        // grows with the turn while contributing nothing the model has not
+        // already acted on. Keep it on the most recent assistant message —
+        // some providers require it there — and drop the rest.
+        let last_assistant = messages.iter().rposition(|m| m.role == "assistant");
         messages
             .iter()
-            .map(|m| {
+            .enumerate()
+            .map(|(idx, m)| {
+                let keep_reasoning = Some(idx) == last_assistant;
                 if m.role == "assistant"
                     && let Ok(value) = serde_json::from_str::<serde_json::Value>(&m.content)
                     && let Some(tool_calls_value) = value.get("tool_calls")
@@ -388,10 +398,14 @@ impl OpenAiModelProvider {
                         })
                         .collect::<Vec<_>>();
                     let content = crate::request_payload::non_empty_string_field(&value, "content");
-                    let reasoning_content = value
-                        .get("reasoning_content")
-                        .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string);
+                    let reasoning_content = keep_reasoning
+                        .then(|| {
+                            value
+                                .get("reasoning_content")
+                                .and_then(serde_json::Value::as_str)
+                                .map(ToString::to_string)
+                        })
+                        .flatten();
                     return NativeMessage {
                         role: "assistant".to_string(),
                         content,
@@ -2146,6 +2160,33 @@ mod tests {
         assert_eq!(
             native[0].reasoning_content.as_deref(),
             Some("Let me think...")
+        );
+    }
+
+    /// Only the most recent assistant message replays its reasoning; earlier
+    /// ones are dropped, because the model has already acted on them.
+    #[test]
+    fn convert_messages_drops_reasoning_from_stale_assistant_messages() {
+        use zeroclaw_api::model_provider::ChatMessage;
+
+        let msg = |thought: &str| {
+            ChatMessage::assistant(
+                serde_json::json!({
+                    "content": "working",
+                    "tool_calls": [{"id": "tc_1", "name": "shell", "arguments": "{}"}],
+                    "reasoning_content": thought,
+                })
+                .to_string(),
+            )
+        };
+        let messages = vec![msg("stale thought"), msg("current thought")];
+        let native = OpenAiModelProvider::convert_messages(&messages);
+
+        assert_eq!(native.len(), 2);
+        assert!(native[0].reasoning_content.is_none());
+        assert_eq!(
+            native[1].reasoning_content.as_deref(),
+            Some("current thought")
         );
     }
 
