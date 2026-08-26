@@ -128,11 +128,12 @@ channel instance. This includes a wildcard peer group.
 ### What an unauthorized sender is told
 
 A sender outside the resolved peer set receives a notice instead of an agent
-reply. The built-in text follows the authorization path in use. While
-first-user pairing is active it carries the operator `zeroclaw channel
-bind-telegram` command. Once peers resolve, authorization already comes from
-configuration, so the notice names the identity to authorize instead of a
-command the sender cannot run.
+reply. The built-in text follows the authorization path in use. While a
+one-time pairing code is still outstanding and no peer resolves, it carries
+the operator `zeroclaw channel bind-telegram` command. Once that code is
+redeemed or any peer resolves, authorization comes from configuration, so the
+notice names the identity to authorize instead of a command the sender cannot
+run.
 
 Set `unauthorized_message` to replace that text, for example when the bot
 faces end users who belong with a support contact rather than an operator
@@ -148,9 +149,10 @@ Ask our support team to release access for {identity}.
 
 `{identity}` expands to the sender's Telegram user ID, or the username when no
 ID is available; `{bind_command}` expands to the bind command for this alias.
-The value is read from the live configuration, so an edit reaches the next
-unauthorized sender without restarting the channel. Unset or blank keeps the
-built-in notice.
+Unset or blank keeps the built-in notice. Like every other channel field, an
+edit reaches a running listener on the terms in [Restart and persistence
+behavior](#restart-and-persistence-behavior) below: a `config.toml` edit or a
+`zeroclaw config set` change applies after a daemon reload or process restart.
 
 ## 4. Start the channel and inspect it
 
