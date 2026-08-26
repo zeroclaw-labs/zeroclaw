@@ -259,8 +259,16 @@ impl ResolvedGrants {
             }
         }
         for (resource, verbs) in &other.resources {
+            // Verb sets are BTreeSet: already deterministic by construction.
             self.resources.entry(*resource).or_default().extend(verbs);
         }
+        // Canonicalize selector order so a merged value is deterministic
+        // regardless of the order profiles were merged in (audit output,
+        // snapshots, and equality all rely on this, even though the membership
+        // checks above are order-insensitive).
+        self.allowed_agents.sort();
+        self.allowed_tools.sort();
+        self.config_write_paths.sort();
     }
 }
 
@@ -386,12 +394,14 @@ mod tests {
 
     #[test]
     fn merge_order_is_irrelevant() {
-        // Deterministic union: profiles compose the same regardless of the
-        // order the resolver encounters them in.
+        // Deterministic union AS A VALUE: reverse-order merges must produce
+        // equal selector vectors and serialization, not just equal membership.
         let mut a1 = grants_with(Resource::Sessions, &[Verb::Read]);
-        a1.allowed_tools = vec!["calculator".into()];
+        a1.allowed_tools = vec!["shell".into(), "calculator".into()];
+        a1.config_write_paths = vec!["security".into()];
         let mut b1 = grants_with(Resource::Cron, &[Verb::Execute]);
-        b1.allowed_tools = vec![WILDCARD.into()];
+        b1.allowed_tools = vec!["memory".into()];
+        b1.config_write_paths = vec!["users".into(), "oidc".into()];
 
         let mut ab = a1.clone();
         ab.merge(&b1);
@@ -399,8 +409,13 @@ mod tests {
         ba.merge(&a1);
 
         assert_eq!(ab.resources, ba.resources);
-        assert!(ab.may_use_tool("anything") && ba.may_use_tool("anything"));
         assert_eq!(ab.admin, ba.admin);
+        // The canonicalization fix: full selector values are order-independent.
+        assert_eq!(ab.allowed_tools, ba.allowed_tools);
+        assert_eq!(ab.allowed_agents, ba.allowed_agents);
+        assert_eq!(ab.config_write_paths, ba.config_write_paths);
+        assert_eq!(ab.allowed_tools, vec!["calculator", "memory", "shell"]);
+        assert_eq!(ab.config_write_paths, vec!["oidc", "security", "users"]);
     }
 
     #[test]

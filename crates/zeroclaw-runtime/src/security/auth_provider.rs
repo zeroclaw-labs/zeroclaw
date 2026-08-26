@@ -195,7 +195,7 @@ impl ProviderRegistry {
                 reason: DenyReason::BadCredential,
             };
         }
-        provider.verify(credential).await
+        bind_provenance(provider.as_ref(), provider.verify(credential).await)
     }
 
     /// Route a transport-intrinsic credential (today: the kernel-supplied
@@ -228,7 +228,44 @@ impl ProviderRegistry {
                 reason: DenyReason::Misconfigured,
             };
         }
-        provider.verify(credential).await
+        bind_provenance(provider.as_ref(), provider.verify(credential).await)
+    }
+}
+
+/// Bind the selected provider to the identity it returns: reject a `Verified`
+/// outcome whose method, subject class, or provider alias does not match the
+/// provider the handshake selected. RFC 7141's trusted-provenance boundary must
+/// not depend on every provider implementation being correct — a miswired
+/// provider registered under one name cannot borrow another method, another
+/// issuer's profile mapping, or the shared-operator sentinel.
+fn bind_provenance(provider: &dyn AuthProvider, outcome: AuthOutcome) -> AuthOutcome {
+    use zeroclaw_api::principal::{AuthMethod, IdentitySubject};
+    let AuthOutcome::Verified(identity) = &outcome else {
+        return outcome;
+    };
+    let method_ok = identity.method == provider.method();
+    let subject_ok = matches!(
+        (identity.method, &identity.subject),
+        (AuthMethod::Native, IdentitySubject::SharedOperator)
+            | (AuthMethod::Peercred, IdentitySubject::SharedOperator)
+            | (AuthMethod::Peercred, IdentitySubject::Roster { .. })
+            | (AuthMethod::Oidc, IdentitySubject::Oidc { .. })
+            | (AuthMethod::Oidc, IdentitySubject::Service { .. })
+            | (AuthMethod::SharedOperator, IdentitySubject::SharedOperator)
+    );
+    // An `oidc.<alias>` provider must return that same alias: the resolver
+    // selects the issuer/profile mapping from `provider_alias`, so a mismatch
+    // could borrow a different issuer's mapping.
+    let alias_ok = match provider.name().strip_prefix("oidc.") {
+        Some(expected) => identity.provider_alias.as_deref() == Some(expected),
+        None => true,
+    };
+    if method_ok && subject_ok && alias_ok {
+        outcome
+    } else {
+        AuthOutcome::Denied {
+            reason: DenyReason::Misconfigured,
+        }
     }
 }
 
@@ -320,6 +357,86 @@ mod tests {
                 },
             }
         }
+    }
+
+    /// A miswired provider whose verify() returns an identity that does not
+    /// match its declared provenance (method / subject class / alias). Used to
+    /// prove `bind_provenance` rejects such a Verified outcome.
+    struct Miswired {
+        bad: AuthenticatedIdentity,
+    }
+
+    #[async_trait]
+    impl AuthProvider for Miswired {
+        fn name(&self) -> &str {
+            "oidc.corp"
+        }
+        fn method(&self) -> AuthMethod {
+            AuthMethod::Oidc
+        }
+        fn accepts(&self, credential: &Credential) -> bool {
+            matches!(credential, Credential::Bearer(_))
+        }
+        async fn verify(&self, _credential: &Credential) -> AuthOutcome {
+            AuthOutcome::Verified(self.bad.clone())
+        }
+    }
+
+    async fn miswired_is_denied(bad: AuthenticatedIdentity) {
+        let mut reg = ProviderRegistry::new();
+        reg.register(Arc::new(Miswired { bad })).unwrap();
+        let out = reg.resolve_named("oidc.corp", &bearer("x")).await;
+        assert!(
+            matches!(
+                out,
+                AuthOutcome::Denied {
+                    reason: DenyReason::Misconfigured
+                }
+            ),
+            "bind_provenance must reject a mismatched identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn provenance_rejects_method_mismatch() {
+        // oidc.corp returns a Native-method identity.
+        miswired_is_denied(
+            AuthenticatedIdentity::new(
+                IdentitySubject::Oidc {
+                    issuer: "https://sso".into(),
+                    subject: "s".into(),
+                },
+                AuthMethod::Native,
+            )
+            .with_provider_alias("corp"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn provenance_rejects_shared_operator_from_oidc_provider() {
+        // A non-native provider returning the shared-operator sentinel.
+        miswired_is_denied(
+            AuthenticatedIdentity::shared_operator(AuthMethod::Oidc).with_provider_alias("corp"),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn provenance_rejects_oidc_alias_mismatch() {
+        // oidc.corp returns an identity claiming a different alias, which the
+        // resolver would use to pick another issuer's mapping.
+        miswired_is_denied(
+            AuthenticatedIdentity::new(
+                IdentitySubject::Oidc {
+                    issuer: "https://sso".into(),
+                    subject: "s".into(),
+                },
+                AuthMethod::Oidc,
+            )
+            .with_provider_alias("other"),
+        )
+        .await;
     }
 
     fn bearer(token: &str) -> Credential {
