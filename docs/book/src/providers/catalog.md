@@ -417,6 +417,34 @@ The `/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing work
 > previously configured the CLI provider under the `kilo` shorthand, switch to
 > `kilocli`.
 
+### ZeroRouter: slot `zerorouter`
+
+```toml
+[providers.models.zerorouter.gateway]
+model   = "anthropic/claude-sonnet-5"
+api_key = "..."   # a ZeroRouter key (prefix `zcr_`); or inject from the env
+# uri = "https://zerorouter.ai/v1"  # a hosted or remote router; omit for the localhost default
+```
+
+Self-hosted, OpenAI-compatible LLM gateway; Bearer-token auth. ZeroRouter is a
+family of independently operated routers, so there is no canonical hosted
+default: the slot points at a locally running router at `http://localhost:8080/v1`.
+To reach the public deployment at `https://zerorouter.ai`, or any other remote
+router, set `uri` explicitly.
+
+The `/v1/models` endpoint is public (`PUBLIC_MODEL_LISTING`), so model listing
+and its prompt/completion pricing come live from the router itself without a
+credential; because it is queried live, it is the source that carries pricing
+into the cost-rates editor (this family has no models.dev or OpenRouter
+fallback). Inference does require a key: set `api_key` directly, or inject it
+from the environment the same way as any other provider key (see
+[Configuration](./configuration.md) for `api_key` resolution order).
+
+> **No built-in login.** This preset configures the provider through the
+> standard typed `api_key` path only; it does not add a device-flow login,
+> OAuth, or provider-specific credential storage. Set `api_key` (or its env
+> injection) to run inference.
+
 ---
 
 ## All slots

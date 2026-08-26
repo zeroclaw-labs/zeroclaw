@@ -514,16 +514,7 @@ impl AnthropicModelProvider {
     ) -> reqwest::RequestBuilder {
         let is_setup = Self::is_setup_token(credential);
         let len = credential.len();
-        let head: String = credential.chars().take(8).collect();
-        let tail: String = credential
-            .chars()
-            .rev()
-            .take(4)
-            .collect::<String>()
-            .chars()
-            .rev()
-            .collect();
-        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if is_setup { "Authorization" } else { "x-api-key" }, "credential_len": len, "credential_head": head, "credential_tail": tail})), "Anthropic auth header applied");
+        ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"header": if is_setup { "Authorization" } else { "x-api-key" }, "credential_len": len})), "Anthropic auth header applied");
         if is_setup {
             request
                 .header("Authorization", format!("Bearer {credential}"))
@@ -1174,15 +1165,11 @@ impl AnthropicModelProvider {
                     // finished list for the same thing: `dedupe_tool_results_by_id`
                     // only sees duplicates that already share a message, and this
                     // is what puts them there.
-                    if native_messages
-                        .last()
-                        .is_some_and(|m| m.role == tool_msg.role)
+                    if let Some(last) = native_messages
+                        .last_mut()
+                        .filter(|message| message.role == tool_msg.role)
                     {
-                        native_messages
-                            .last_mut()
-                            .unwrap()
-                            .content
-                            .extend(tool_msg.content);
+                        last.content.extend(tool_msg.content);
                     } else {
                         native_messages.push(tool_msg);
                     }
@@ -1308,12 +1295,11 @@ impl AnthropicModelProvider {
                     // Merge into previous user message if present (e.g.
                     // when a user message immediately follows tool results
                     // which are also role "user" in Anthropic's format).
-                    if native_messages.last().is_some_and(|m| m.role == "user") {
-                        native_messages
-                            .last_mut()
-                            .unwrap()
-                            .content
-                            .extend(content_blocks);
+                    if let Some(last) = native_messages
+                        .last_mut()
+                        .filter(|message| message.role == "user")
+                    {
+                        last.content.extend(content_blocks);
                     } else {
                         native_messages.push(NativeMessage {
                             role: "user".to_string(),
@@ -3551,6 +3537,99 @@ data: {\"type\":\"message_stop\"}\n\n";
         );
         assert!(request.headers().get("authorization").is_none());
         assert!(request.headers().get("anthropic-beta").is_none());
+    }
+
+    #[test]
+    fn apply_auth_log_omits_credentials_for_regular_and_setup_tokens() {
+        let _writer_guard = zeroclaw_log::__private_test_writer_lock();
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let model_provider = AnthropicModelProvider::builder("test").build();
+        for (credential, expected_header) in [
+            ("sk-ant-api-key-secret", "x-api-key"),
+            ("sk-ant-oat01-setup-token-secret", "Authorization"),
+        ] {
+            model_provider
+                .apply_auth(
+                    model_provider
+                        .http_client()
+                        .get("https://api.anthropic.com/v1/models"),
+                    credential,
+                )
+                .build()
+                .expect("request should build");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let event = 'search: loop {
+                while let Ok(event) = rx.try_recv() {
+                    let matches_message = event.get("message").and_then(|value| value.as_str())
+                        == Some("Anthropic auth header applied");
+                    let matches_source = event
+                        .get("attributes")
+                        .and_then(|attributes| attributes.get("_file"))
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|file| {
+                            // `file!()` uses the host separator, so normalize
+                            // before matching the `/`-spelled module path.
+                            file.replace('\\', "/")
+                                .ends_with("zeroclaw-providers/src/anthropic.rs")
+                        });
+                    let matches_auth = event.get("attributes").is_some_and(|attributes| {
+                        attributes.get("header").and_then(|value| value.as_str())
+                            == Some(expected_header)
+                            && attributes
+                                .get("credential_len")
+                                .and_then(|value| value.as_u64())
+                                == Some(credential.len() as u64)
+                    });
+                    if matches_message && matches_source && matches_auth {
+                        break 'search event;
+                    }
+                }
+
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "apply_auth should emit the expected canonical log event"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            };
+
+            let attrs = event.get("attributes").expect("attributes present");
+            assert_eq!(attrs["header"].as_str(), Some(expected_header));
+            assert_eq!(
+                attrs["credential_len"].as_u64(),
+                Some(credential.len() as u64)
+            );
+            assert!(attrs.get("credential_head").is_none());
+            assert!(attrs.get("credential_tail").is_none());
+            let former_head: String = credential.chars().take(8).collect();
+            let former_tail: String = credential
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            let serialized = event.to_string();
+            assert!(
+                !serialized.contains(credential),
+                "authentication event must not contain credential material"
+            );
+            assert!(
+                !serialized.contains(&former_head),
+                "authentication event must not contain the credential prefix"
+            );
+            assert!(
+                !serialized.contains(&former_tail),
+                "authentication event must not contain the credential suffix"
+            );
+        }
+
+        zeroclaw_log::clear_broadcast_hook();
     }
 
     #[tokio::test]

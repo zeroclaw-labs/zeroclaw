@@ -880,8 +880,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let ProviderCallOutcome {
             chat_result,
-            mut rejected_attempts,
-            mut provisional_stream_attempt,
+            attempts,
             accepted_route,
             streamed_live_deltas,
             streamed_protocol_suppressed,
@@ -897,15 +896,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
-        let has_accounted_rejections = !rejected_attempts.is_empty();
-        for rejected in &rejected_attempts {
-            crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                rejected.provider_ref(),
-                rejected.model(),
-                rejected.usage(),
-            );
-        }
-
         // Reliable reports its actually served candidate; direct providers
         // intentionally retain the requested route as the accounting fallback.
         let (served_provider, served_model) = accepted_route
@@ -919,18 +909,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // This runs before response-success telemetry and history mutation.
         let chat_result = chat_result.and_then(|response| {
             if response.is_semantically_empty_terminal() {
-                if let Some(rejected_stream) = provisional_stream_attempt.take()
-                    && let Some(usage) = response.usage.clone()
-                {
-                    rejected_attempts.push(rejected_stream.with_usage(usage));
-                }
-                if let Some(usage) = response.usage.as_ref() {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        served_provider,
-                        served_model,
-                        usage,
-                    );
-                }
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
                 ));
@@ -977,17 +955,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 )
             }
             Err(e) => {
-                if !has_accounted_rejections
-                    && let Some(rejected) = e.chain().find_map(|cause| {
-                        cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
-                    })
-                {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        ctx.provider_name,
-                        ctx.model,
-                        &rejected.usage,
-                    );
-                }
+                crate::agent::cost::settle_provider_attempts(&attempts, None);
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -1042,18 +1010,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // Any parser or stream-protocol guard finding rejects the transport
         // candidate, including a response that also carries native tool calls.
         if parse_issue_detected {
-            if let Some(rejected_stream) = provisional_stream_attempt.take()
-                && let Some(usage) = response_usage.clone()
-            {
-                rejected_attempts.push(rejected_stream.with_usage(usage));
-            }
-            if let Some(usage) = response_usage.as_ref() {
-                crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                    served_provider,
-                    served_model,
-                    usage,
-                );
-            }
+            crate::agent::cost::settle_provider_attempts(&attempts, None);
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -1110,6 +1067,13 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             return Ok(accumulated_display_text);
         }
 
+        // Earlier physical leaves are rejected routing/retry work. The final
+        // accepted response remains settled by `record_accepted_chat_response`
+        // so only it updates context-window telemetry.
+        crate::agent::cost::settle_provider_attempts(
+            &attempts[..attempts.len().saturating_sub(1)],
+            None,
+        );
         record_accepted_chat_response(
             &ctx,
             served_provider,

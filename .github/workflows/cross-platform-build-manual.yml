@@ -11,6 +11,11 @@ on:
         options:
           - dist
           - dist-broad
+      release_tools_only:
+        description: Skip release builds and run only the native release-tool smoke
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -20,8 +25,91 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  release-tool-smoke:
+    name: Verify release tool / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux cross
+            os: ubuntu-22.04
+            tool: cross
+          - name: Windows Tauri CLI
+            os: windows-latest
+            tool: tauri-cli
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.96.1
+
+      - name: Verify native runner and revision
+        shell: bash
+        run: |
+          test "$RUNNER_ARCH" = "X64"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          {
+            echo "### Release tool smoke / ${{ matrix.name }}"
+            echo
+            echo "- Revision: \`$GITHUB_SHA\`"
+            echo "- Runner: \`$RUNNER_OS/$RUNNER_ARCH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve Cargo bin directory
+        shell: bash
+        run: |
+          cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
+          if command -v cygpath >/dev/null 2>&1; then
+            cargo_home="$(cygpath -u "$cargo_home")"
+          fi
+          echo "RELEASE_TOOL_CARGO_BIN=${cargo_home}/bin" >> "$GITHUB_ENV"
+
+      - name: Install pinned release tool
+        shell: bash
+        run: bash scripts/ci/install_release_tool.sh "${{ matrix.tool }}"
+
+      - name: Verify cross installation
+        if: matrix.tool == 'cross'
+        shell: bash
+        run: |
+          expected_cross_path="${RELEASE_TOOL_CARGO_BIN}/cross"
+          expected_cross_util_path="${RELEASE_TOOL_CARGO_BIN}/cross-util"
+          cross_path="$(command -v cross)"
+          cross_util_path="$(command -v cross-util)"
+          test "$cross_path" = "$expected_cross_path"
+          test "$cross_util_path" = "$expected_cross_util_path"
+          test -x "$expected_cross_path"
+          test -x "$expected_cross_util_path"
+          cross_version="$(cross --version)"
+          printf '%s\n' "$cross_version"
+          {
+            echo "- cross: \`$cross_path\`"
+            echo "- cross-util: \`$cross_util_path\`"
+            echo "- cross --version: \`$cross_version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify Tauri CLI installation
+        if: matrix.tool == 'tauri-cli'
+        shell: bash
+        run: |
+          expected_tauri_path="${RELEASE_TOOL_CARGO_BIN}/cargo-tauri.exe"
+          tauri_path="$(command -v cargo-tauri.exe)"
+          test "$tauri_path" = "$expected_tauri_path"
+          test -x "$expected_tauri_path"
+          direct_version="$(cargo-tauri.exe --version)"
+          cargo_version="$(cargo tauri --version)"
+          printf '%s\n%s\n' "$direct_version" "$cargo_version"
+          {
+            echo "- cargo-tauri.exe: \`$tauri_path\`"
+            echo "- cargo-tauri.exe --version: \`$direct_version\`"
+            echo "- cargo tauri --version: \`$cargo_version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   web:
     name: Build Web Dashboard
+    if: ${{ !inputs.release_tools_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -54,6 +142,7 @@ jobs:
   build:
     name: Build ${{ inputs.distribution }} / ${{ matrix.target }}
     needs: [web]
+    if: ${{ !inputs.release_tools_only }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: ${{ inputs.distribution == 'dist-broad' && 90 || 40 }}
     strategy:

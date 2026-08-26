@@ -1,5 +1,8 @@
 use super::ModelProvider;
-use super::dispatch::ProviderDispatch;
+use super::dispatch::{
+    ProviderDispatch, mark_current_dispatch_composite, stream_with_exact_dispatch_route,
+    with_exact_dispatch_route,
+};
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -218,6 +221,7 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
 
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
@@ -226,9 +230,17 @@ impl ModelProvider for RouterModelProvider {
         // composite. Layer's `set_composite` splits it on emit.
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name.as_str(), "model": resolved_model.as_str()})), "router dispatching request");
 
-        ProviderDispatch::from_ref(&**model_provider)
-            .chat_with_system(system_prompt, message, &resolved_model, temperature)
-            .await
+        with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).chat_with_system(
+                system_prompt,
+                message,
+                &resolved_model,
+                temperature,
+            ),
+        )
+        .await
     }
 
     async fn chat_with_history(
@@ -237,11 +249,19 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, model_provider) = &self.model_providers[provider_idx];
-        ProviderDispatch::from_ref(&**model_provider)
-            .chat_with_history(messages, &resolved_model, temperature)
-            .await
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).chat_with_history(
+                messages,
+                &resolved_model,
+                temperature,
+            ),
+        )
+        .await
     }
 
     async fn chat(
@@ -250,11 +270,19 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, model_provider) = &self.model_providers[provider_idx];
-        ProviderDispatch::from_ref(&**model_provider)
-            .chat(request, &resolved_model, temperature)
-            .await
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).chat(
+                request,
+                &resolved_model,
+                temperature,
+            ),
+        )
+        .await
     }
 
     async fn chat_with_tools(
@@ -264,11 +292,20 @@ impl ModelProvider for RouterModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, model_provider) = &self.model_providers[provider_idx];
-        ProviderDispatch::from_ref(&**model_provider)
-            .chat_with_tools(messages, tools, &resolved_model, temperature)
-            .await
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).chat_with_tools(
+                messages,
+                tools,
+                &resolved_model,
+                temperature,
+            ),
+        )
+        .await
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -298,14 +335,19 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, model_provider) = &self.model_providers[provider_idx];
-        model_provider.stream_chat_with_system(
-            system_prompt,
-            message,
-            &resolved_model,
-            temperature,
-            options,
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        stream_with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_system(
+                system_prompt,
+                message,
+                &resolved_model,
+                temperature,
+                options,
+            ),
         )
     }
 
@@ -316,9 +358,19 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, model_provider) = &self.model_providers[provider_idx];
-        model_provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        stream_with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).stream_chat_with_history(
+                messages,
+                &resolved_model,
+                temperature,
+                options,
+            ),
+        )
     }
 
     fn stream_chat(
@@ -328,13 +380,18 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+        mark_current_dispatch_composite();
         let (provider_idx, resolved_model) = self.resolve(model);
-        let (_, model_provider) = &self.model_providers[provider_idx];
-        ProviderDispatch::from_ref(&**model_provider).stream_chat(
-            request,
-            &resolved_model,
-            temperature,
-            options,
+        let (provider_name, model_provider) = &self.model_providers[provider_idx];
+        stream_with_exact_dispatch_route(
+            provider_name.clone(),
+            resolved_model.clone(),
+            ProviderDispatch::from_ref(&**model_provider).stream_chat(
+                request,
+                &resolved_model,
+                temperature,
+                options,
+            ),
         )
     }
 
@@ -526,6 +583,39 @@ mod tests {
         );
 
         (router, mocks)
+    }
+
+    #[tokio::test]
+    async fn accounted_router_success_uses_selected_physical_route() {
+        let (router, _) = make_router(
+            vec![("configured.leaf", "ok")],
+            vec![("fast", "configured.leaf", "served-model")],
+        );
+        let messages = vec![ChatMessage::user("hello")];
+
+        let outcome = ProviderDispatch::from_ref(&router)
+            .chat_accounted_outcome(
+                ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "hint:fast",
+                None,
+            )
+            .await;
+
+        assert!(outcome.result.is_ok());
+        assert_eq!(outcome.accounting.attempts().len(), 1);
+        let leaf = &outcome.accounting.attempts()[0];
+        assert_eq!(leaf.provider_ref(), "configured.leaf");
+        assert_eq!(leaf.model(), "served-model");
+        let accepted = outcome
+            .accounting
+            .accepted_route()
+            .expect("the accepted route must be the physical leaf");
+        assert_eq!(accepted.provider_ref(), "configured.leaf");
+        assert_eq!(accepted.model(), "served-model");
     }
 
     // Arc<MockModelProvider> ModelProvider impl provided by blanket impl in zeroclaw-types.

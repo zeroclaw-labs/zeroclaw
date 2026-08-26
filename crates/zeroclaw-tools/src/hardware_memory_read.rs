@@ -77,8 +77,7 @@ impl Tool for HardwareMemoryReadTool {
             .or_else(|| self.boards.first().cloned())
             .unwrap_or_else(|| "nucleo-f401re".into());
 
-        let chip = Self::chip_for_board(&board);
-        if chip.is_none() {
+        let Some(_chip) = Self::chip_for_board(&board) else {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -87,7 +86,7 @@ impl Tool for HardwareMemoryReadTool {
                     board
                 )),
             });
-        }
+        };
 
         let address_str = args
             .get("address")
@@ -102,7 +101,7 @@ impl Tool for HardwareMemoryReadTool {
 
         #[cfg(feature = "probe")]
         {
-            match probe_read_memory(chip.unwrap(), _address, _length) {
+            match probe_read_memory(_chip, _address, _length) {
                 Ok(output) => {
                     return Ok(ToolResult {
                         success: true,

@@ -161,6 +161,15 @@ jobs:
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max,ignore-error=true
           build-args: ${{ matrix.cargo_flags && format('ZEROCLAW_CARGO_FLAGS={0}', matrix.cargo_flags) || '' }}
 
+      - name: Verify default production image runs as non-root
+        if: matrix.dockerfile == 'Dockerfile' && matrix.platform == 'linux/amd64'
+        run: |
+          actual_user=$(docker inspect --format='{{.Config.User}}' "${{ matrix.tag }}")
+          if [ "$actual_user" != "65534:65534" ]; then
+            echo "::error title=Unexpected container user::Expected 65534:65534, found ${actual_user:-<empty>}"
+            exit 1
+          fi
+
       - name: Smoke test Compose published gateway port
         if: matrix.gateway_smoke
         env:

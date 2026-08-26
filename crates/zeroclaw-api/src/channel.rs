@@ -1195,6 +1195,7 @@ mod tests {
                 file_name: "test.pdf".to_string(),
                 data: vec![1, 2, 3],
                 mime_type: Some("application/pdf".to_string()),
+                marker: None,
             },
         ]);
 

@@ -26,7 +26,7 @@ cli-config-about = 管理 ZeroClaw 配置
 cli-update-about = 检查并应用 ZeroClaw 更新
 cli-self-test-about = 运行诊断自检
 cli-completions-about = 生成 shell 补全脚本
-cli-desktop-about = 启动 ZeroClaw 伴侣桌面应用
+cli-desktop-about = 启动配套桌面应用，或打开其下载页面
 cli-config-schema-about = 将完整的配置 JSON Schema 输出到 stdout
 cli-config-list-about = 列出所有配置属性及其当前值
 cli-config-get-about = 获取配置属性值
@@ -315,11 +315,11 @@ cli-desktop-long-about =
 
     配套应用是一个轻量级的菜单栏 / 系统托盘应用程序，它连接到与 CLI 相同的网关。它提供对仪表板、状态监控和设备配对的快速访问。
 
-    使用 --install 下载适用于您平台的预构建配套应用。
+    使用 --install 打开适用于您平台的下载页面。它本身不会安装任何东西。
 
     示例：
     zeroclaw desktop              # 启动配套应用
-    zeroclaw desktop --install    # 下载并安装
+    zeroclaw desktop --install    # 打开下载页面
 channel-needs-quickstart-reply = 此代理尚未完全设置。操作员需要先运行 Quickstart，然后我才能回复。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web 已配置，但未编译 'whatsapp-web' 功能。
 channel-whatsapp-web-feature-missing-build = 使用以下命令构建/运行：cargo build --features whatsapp-web
@@ -371,6 +371,12 @@ channel-whatsapp-web-delivery-failure-note-many = （注意：我无法传送 {$
 channel-line-bind-success = ✅ 已配对！现在可以聊天了。
 channel-line-bind-invalid-code = ❌ 代码无效。请重试。
 channel-line-bind-rate-limited = ⏳ 尝试次数过多。请在 { $secs }s 后重试。
+channel-telegram-cmd-new-desc = 开始新的对话会话
+channel-telegram-cmd-clear-desc = 清除此对话会话
+channel-telegram-cmd-stop-desc = 取消当前进行中的任务
+channel-telegram-cmd-model-desc = 显示或切换当前模型
+channel-telegram-cmd-models-desc = 列出可用的模型提供商或切换提供商
+channel-telegram-cmd-config-desc = 显示当前配置
 onboard-openai-auth-note =
     OpenAI 身份验证：
     • API 密钥 — 通过 platform.openai.com 的标准 API 访问（sk-...）
@@ -424,6 +430,7 @@ cli-sop-none = 未找到 SOP。
 cli-sop-pending-none = 没有等待审批的 SOP 运行。
 cli-sop-pending-header = 等待审批的 SOP 运行：
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] 步骤 {$step}/{$total}
+cli-sop-status-failure-reason = 失败原因：{$reason}
 cli-sop-ws-invalid-approval = sop approval_response 需要 run_id，以及 approve 或 deny 决策
 cli-sop-ws-resolve-failed = SOP 解析失败：{$error}
 cli-sop-ws-engine-lock-poisoned = SOP 引擎锁已中毒
@@ -598,6 +605,7 @@ cli-quickstart-error-channel-required = 必须填写通道类型和别名
 cli-quickstart-error-channel-field-not-advertised = Quickstart 中不支持通道字段 `{$field}`
 cli-quickstart-error-channel-token-required = 必须填写 Telegram Bot 令牌
 cli-quickstart-error-webhook-secret-required = 必须填写 Webhook 共享密钥
+cli-quickstart-error-webhook-port-conflict = Webhook 端口 {$port} 已被启用的 Webhook `{$alias}` 占用 — 每个启用的 Webhook 都需要各自的端口
 cli-quickstart-error-peer-group-name-required = 必须填写对等组名称
 cli-quickstart-error-peer-group-channel-required = 必须填写对等组通道引用
 cli-quickstart-error-peer-group-unknown-channel = 对等组 `{$name}` 引用了未知通道 `{$channel}`
@@ -658,9 +666,9 @@ cli-status-service-stopped = 🔴 服务：       已停止
 cli-status-channels = 通道：
 cli-status-cli-always = {"  "}CLI:      ✅ 始终
 cli-status-peripherals = 外设：
-cli-desktop-download = 下载 ZeroClaw 配套应用：
+cli-desktop-download = 正在打开 ZeroClaw 配套应用的下载页面：
 cli-desktop-homebrew = 或通过 Homebrew 安装（即将推出）：
-cli-desktop-linux-pkg = {"  "}下载适合您架构的 .deb 或 .AppImage。
+cli-desktop-linux-pkg = {"  "}该页面提供按架构分类的 .deb 和 .AppImage 下载。
 cli-desktop-launching = 正在启动 ZeroClaw 配套应用...
 cli-status-version = 版本：     {$v}
 cli-status-workspace = 工作区：   {$v}

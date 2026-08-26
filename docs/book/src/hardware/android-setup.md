@@ -1,18 +1,18 @@
 # Android Setup
 
-ZeroClaw provides prebuilt binaries for Android devices.
+ZeroClaw can publish an experimental prebuilt binary for Android devices.
 
 ## Supported Architectures
 
-ZeroClaw publishes a prebuilt `aarch64-linux-android` binary for modern 64-bit
-Android devices. The full set of prebuilt release targets (derived from the
-release workflow) is:
+The stable prebuilt release targets (derived from the release workflow) are:
 
 {{#include ../_snippets/hardware-release-targets.md}}
 
-Only `aarch64-linux-android` targets Android directly. 32-bit Android
-(`armv7-linux-androideabi`) is not currently published as a prebuilt binary;
-on a 32-bit device, build from source (see below).
+`aarch64-linux-android` is the only Android target. Its release binary is
+experimental: it is attached when that build succeeds, but it is not
+guaranteed for every release. If it is absent, build from source (see below).
+32-bit Android (`armv7-linux-androideabi`) is not currently published as a
+prebuilt binary.
 
 ## Installation via Termux
 
@@ -33,15 +33,22 @@ Download from [F-Droid](https://f-droid.org/packages/com.termux/) (recommended) 
 ```sh
 # Check your architecture
 uname -m
-# aarch64 = 64-bit (prebuilt binary available)
+# aarch64 = 64-bit (experimental prebuilt binary may be available)
 # armv7l/armv8l = 32-bit (build from source — no prebuilt binary)
 
-# Download the prebuilt 64-bit (aarch64) binary
-curl -LO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-linux-android.tar.gz
-tar xzf zeroclaw-aarch64-linux-android.tar.gz
+# Optionally download the experimental 64-bit (aarch64) binary.
+# A 404 means this release did not build it; use the source build below instead.
+if curl -fLO https://github.com/zeroclaw-labs/zeroclaw/releases/latest/download/zeroclaw-aarch64-linux-android.tar.gz; then
+  tar xzf zeroclaw-aarch64-linux-android.tar.gz
+else
+  echo "Download failed. If GitHub reported 404, build from source below. Otherwise, check the error and retry."
+fi
 ```
 
 </div>
+
+Continue to the next step only after the archive extracts successfully. Otherwise,
+build from source when the asset is missing, or resolve the download error and retry.
 
 ### 3. Install and Run
 

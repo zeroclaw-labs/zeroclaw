@@ -21,7 +21,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use zeroclaw_runtime::i18n::get_required_cli_string;
@@ -30,6 +30,13 @@ use zeroclaw_runtime::i18n::get_required_cli_string;
 const CHECK_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// Upper bound on the `zeroclaw update --check` subprocess.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
 
 // ── Restart classification (advisory) ────────────────────────────
 
@@ -238,7 +245,7 @@ pub async fn handle_version_check(
 
     let use_cache = !q.force && q.version.is_none();
     if use_cache {
-        if let Some((ts, cached)) = CHECK_CACHE.lock().unwrap().as_ref() {
+        if let Some((ts, cached)) = lock_recover(&CHECK_CACHE).as_ref() {
             if ts.elapsed() < CHECK_CACHE_TTL {
                 return Json(VersionCheckResponse::from(cached)).into_response();
             }
@@ -248,7 +255,7 @@ pub async fn handle_version_check(
     match run_cli_check(q.version.as_deref()).await {
         Ok(info) => {
             if use_cache {
-                *CHECK_CACHE.lock().unwrap() = Some((Instant::now(), info.clone()));
+                *lock_recover(&CHECK_CACHE) = Some((Instant::now(), info.clone()));
             }
             Json(VersionCheckResponse::from(&info)).into_response()
         }
@@ -407,9 +414,9 @@ pub async fn handle_version_upgrade(
     }
 
     // One upgrade at a time.
-    let mut slot = UPGRADE.lock().unwrap();
+    let mut slot = lock_recover(&UPGRADE);
     if let Some(existing) = slot.as_ref() {
-        if !existing.lock().unwrap().state.is_terminal() {
+        if !lock_recover(existing).state.is_terminal() {
             return json_error(StatusCode::CONFLICT, "an upgrade is already in progress");
         }
     }
@@ -502,7 +509,7 @@ pub async fn handle_version_upgrade_status(
         return e.into_response();
     }
 
-    let slot = UPGRADE.lock().unwrap();
+    let slot = lock_recover(&UPGRADE);
     let Some(progress) = slot.as_ref() else {
         return Json(UpgradeStatusResponse {
             handoff_id: None,
@@ -517,7 +524,7 @@ pub async fn handle_version_upgrade_status(
         })
         .into_response();
     };
-    let p = progress.lock().unwrap();
+    let p = lock_recover(progress);
     if let Some(id) = q.handoff_id.as_deref() {
         if id != p.handoff_id {
             return json_error(StatusCode::NOT_FOUND, "unknown handoff_id");
@@ -538,11 +545,11 @@ pub async fn handle_version_upgrade_status(
 }
 
 fn set_state(progress: &Arc<Mutex<UpgradeProgress>>, state: UpgradeState) {
-    progress.lock().unwrap().state = state;
+    lock_recover(progress).state = state;
 }
 
 fn fail(progress: &Arc<Mutex<UpgradeProgress>>, msg: String) {
-    let mut p = progress.lock().unwrap();
+    let mut p = lock_recover(progress);
     p.state = UpgradeState::Failed;
     p.error = Some(msg);
 }
@@ -586,7 +593,7 @@ async fn pump_lines<R: AsyncRead + Unpin>(reader: R, progress: Arc<Mutex<Upgrade
     let mut lines = BufReader::new(reader).lines();
     while let Ok(Some(raw)) = lines.next_line().await {
         let line = strip_ansi(&raw);
-        let mut p = progress.lock().unwrap();
+        let mut p = lock_recover(&progress);
         if let Some(phase) = parse_phase(&line) {
             p.phase = phase;
         }
@@ -691,7 +698,7 @@ async fn run_upgrade(
 
     if !status.success() {
         let tail = {
-            let p = progress.lock().unwrap();
+            let p = lock_recover(&progress);
             p.log_tail
                 .iter()
                 .rev()
@@ -774,6 +781,20 @@ fn trigger_graceful_shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_recover_preserves_state_after_poisoning() {
+        let state = Arc::new(Mutex::new(1_u8));
+        let poisoned = state.clone();
+        let result = std::thread::spawn(move || {
+            let mut guard = poisoned.lock().expect("fresh mutex must lock");
+            *guard = 2;
+            panic!("poison test mutex");
+        })
+        .join();
+        assert!(result.is_err());
+        assert_eq!(*lock_recover(&state), 2);
+    }
 
     #[test]
     fn restart_mode_as_str_is_stable() {

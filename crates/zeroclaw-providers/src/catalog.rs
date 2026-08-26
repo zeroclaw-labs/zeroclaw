@@ -30,6 +30,9 @@ pub fn catalog_source_for(family: &str) -> Option<(Option<&'static str>, Option<
         "lmstudio" => (Some("lmstudio"), None),
         "kilocli" => (Some("kilo"), None),
         "kilo" => (Some("kilo"), None),
+        // Self-hosted gateway: prices come live from its own /v1/models
+        // (PUBLIC_MODEL_LISTING), never from models.dev or OpenRouter.
+        "zerorouter" => (None, None),
         "ovh" => (Some("ovhcloud"), None),
         // Compat families — mirrors the consts in CompatFamilySpec impls.
         "moonshot" => (Some("moonshotai"), Some("moonshotai")),

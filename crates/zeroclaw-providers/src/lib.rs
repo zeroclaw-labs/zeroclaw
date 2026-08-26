@@ -931,13 +931,41 @@ fn mentions_tools_token(message: &str) -> bool {
     false
 }
 
+/// Split a provider error message into independent clauses at `;`, newlines,
+/// and sentence-ending periods (a `.` followed by whitespace or end of
+/// input, so identifiers like `gpt-4.1` stay intact).
+///
+/// Compound provider errors can chain unrelated failures in one message;
+/// capability predicates must be evaluated within a single clause so that
+/// independent clauses cannot collectively satisfy them.
+fn error_message_clauses(message: &str) -> Vec<&str> {
+    let bytes = message.as_bytes();
+    let mut clauses = Vec::new();
+    let mut start = 0usize;
+    for (i, c) in message.char_indices() {
+        let is_boundary = match c {
+            ';' | '\n' => true,
+            '.' => bytes.get(i + 1).is_none_or(u8::is_ascii_whitespace),
+            _ => false,
+        };
+        if is_boundary {
+            clauses.push(&message[start..i]);
+            start = i + c.len_utf8();
+        }
+    }
+    clauses.push(&message[start..]);
+    clauses
+}
+
 /// Whether an endpoint explicitly rejected combining function tools with
 /// `reasoning_effort`.
 ///
 /// This predicate is intentionally narrow: callers may retry once with
 /// `reasoning_effort: "none"` only when the endpoint itself reports this exact
 /// capability mismatch. Other reasoning or tool errors must propagate
-/// unchanged.
+/// unchanged. A single clause of the message must report the relationship —
+/// unrelated clauses of a compound error (e.g. `reasoning_effort value is
+/// unsupported; tools must be an array`) do not collectively qualify.
 pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, body: &str) -> bool {
     if !matches!(
         status,
@@ -965,22 +993,30 @@ pub(crate) fn rejects_tools_with_reasoning_effort(status: reqwest::StatusCode, b
         }
         Err(_) => (body.to_ascii_lowercase(), String::new()),
     };
-    let mentions_reasoning_effort = parameter == "reasoning_effort"
-        || message.contains("reasoning_effort")
-        || message.contains("reasoning effort");
-    let mentions_tools = mentions_tools_token(&message);
-    let reports_incompatibility = [
-        "not supported",
-        "unsupported",
-        "cannot be used",
-        "can't be used",
-        "incompatible",
-        "not allowed",
-    ]
-    .iter()
-    .any(|hint| message.contains(hint));
+    let clauses = error_message_clauses(&message);
+    // The structured `param` field is message-global; letting it satisfy an
+    // arbitrary clause would recreate the cross-clause false positive, so it
+    // counts as the reasoning signal only when the message has a single
+    // substantive clause for it to describe.
+    let single_clause = clauses.iter().filter(|c| !c.trim().is_empty()).count() <= 1;
+    clauses.into_iter().any(|clause| {
+        let mentions_reasoning_effort = clause.contains("reasoning_effort")
+            || clause.contains("reasoning effort")
+            || (single_clause && parameter == "reasoning_effort");
+        let mentions_tools = mentions_tools_token(clause);
+        let reports_incompatibility = [
+            "not supported",
+            "unsupported",
+            "cannot be used",
+            "can't be used",
+            "incompatible",
+            "not allowed",
+        ]
+        .iter()
+        .any(|hint| clause.contains(hint));
 
-    mentions_reasoning_effort && mentions_tools && reports_incompatibility
+        mentions_reasoning_effort && mentions_tools && reports_incompatibility
+    })
 }
 
 /// Format an error including its full source chain and sanitize the result.
@@ -1056,6 +1092,7 @@ const KEY_PREFIX_MODEL_PROVIDERS: &[(&str, &str)] = &[
     ("xai-", "xai"),
     ("nvapi-", "nvidia"),
     ("KEY-", "telnyx"),
+    ("zcr_", "zerorouter"),
 ];
 
 fn check_api_key_prefix(model_provider_name: &str, key: &str) -> Option<&'static str> {
@@ -1995,6 +2032,7 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             ("grok_cli", "Grok Build CLI", true),
             ("kilocli", "KiloCLI", true),
             ("kilo", "Kilo", false),
+            ("zerorouter", "ZeroRouter", false),
             ("lmstudio", "LM Studio", true),
             ("llamacpp", "llama.cpp server", true),
             ("sglang", "SGLang", true),
@@ -2367,6 +2405,17 @@ mod tests {
         assert!(
             !model_provider.capabilities().native_tool_calling,
             "Venice should use prompt-guided tools, not native tool calling"
+        );
+    }
+
+    #[test]
+    fn factory_zerorouter() {
+        let model_provider = create_model_provider("zerorouter", Some("zcr_test")).unwrap();
+        // ZeroRouter speaks the OpenAI chat-completions wire: Bearer auth +
+        // native tool calling, no .without_native_tools() override.
+        assert!(
+            model_provider.capabilities().native_tool_calling,
+            "ZeroRouter should use OpenAI-compatible native tool calling"
         );
     }
 
@@ -3698,6 +3747,63 @@ mod tests {
         assert!(rejects_tools_with_reasoning_effort(
             reqwest::StatusCode::BAD_REQUEST,
             r#"{"error":{"message":"reasoning_effort cannot be used with \"tools\".","param":"reasoning_effort"}}"#
+        ));
+    }
+
+    #[test]
+    fn tool_reasoning_rejection_requires_conflict_within_one_clause() {
+        // Independent clauses of a compound error must not collectively
+        // satisfy the predicate: neither clause below reports a relationship
+        // between tools and reasoning effort, so retrying with
+        // reasoning_effort "none" would silently downgrade the operator's
+        // configured effort before the unrelated tools error propagates.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is unsupported; tools must be an array"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+            "reasoning_effort value is unsupported; tools must be an array"
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is invalid. Tools are not allowed for this endpoint."}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            "reasoning_effort is unsupported\ntools are not allowed"
+        ));
+
+        // The structured `param` field must not bridge clauses either: it is
+        // message-global, so in a compound error it cannot supply the
+        // reasoning signal for an unrelated tools clause — in either order.
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are unsupported; reasoning_effort value is invalid","param":"reasoning_effort"}}"#
+        ));
+        assert!(!rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort value is invalid; tools are unsupported","param":"reasoning_effort"}}"#
+        ));
+
+        // A single-clause structured error may rely on `param` alone for the
+        // reasoning signal.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"tools are not supported at the requested effort","param":"reasoning_effort"}}"#
+        ));
+
+        // A genuine relationship stated in one clause still matches, even
+        // when other clauses surround it.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"The request was rejected. reasoning_effort cannot be used with tools. Remove one and retry."}}"#
+        ));
+        // A sentence-internal period (e.g. a version number) is not a clause
+        // boundary.
+        assert!(rejects_tools_with_reasoning_effort(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"reasoning_effort is not supported with tools for model gpt-4.1"}}"#
         ));
     }
 
