@@ -930,6 +930,7 @@ fn validate_resolved_ips_for_ssrf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::proxy_test_lock_guard;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
     use zeroclaw_config::schema::FirecrawlConfig;
@@ -1362,6 +1363,7 @@ mod tests {
 
     #[tokio::test]
     async fn standard_fetch_with_zero_limit_returns_full_body_and_skips_firecrawl_fallback() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1555,6 +1557,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_client_uses_the_validated_address_without_second_dns_lookup() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1654,6 +1657,7 @@ mod tests {
     /// would hand the blocked URL to a third party and undo the denial.
     #[tokio::test]
     async fn cross_host_redirect_is_denied_and_never_falls_back_to_firecrawl() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         // Server B: the off-host redirect target. Must never be contacted.
         let server_b = spawn_counting_server(|_| {
             "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\
@@ -1727,6 +1731,7 @@ mod tests {
     /// rejection flag.
     #[tokio::test]
     async fn same_host_redirect_is_followed_without_tripping_the_policy_flag() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         let body = "b".repeat(200);
         let body_for_server = body.clone();
         let server = spawn_counting_server(move |path| {
@@ -2026,6 +2031,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_double_failure_returns_original_result() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2100,6 +2106,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_falls_back_to_firecrawl_on_short_body() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 

@@ -787,6 +787,7 @@ fn validate_resolved_ips_for_ssrf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::proxy_test_lock_guard;
     use reqwest::header::AUTHORIZATION;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -1195,6 +1196,7 @@ api_token = "{encrypted}"
 
     #[tokio::test]
     async fn execute_sends_auth_secret_as_authorization_header() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
             Ok(l) => l,
             Err(_) => return, // IPv6 loopback is unavailable in this environment.
@@ -1963,6 +1965,7 @@ api_token = "Bearer from-secret"
 
     #[tokio::test]
     async fn ipv6_end_to_end_real_request_over_loopback() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         let listener = match tokio::net::TcpListener::bind("[::1]:0").await {
             Ok(l) => l,
             Err(_) => return, // IPv6 not available in this environment
