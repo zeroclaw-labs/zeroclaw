@@ -1704,7 +1704,13 @@ impl Agent {
                 built: all_tools_result,
                 skills: &skills,
                 runtime,
-                caller_allowed: None,
+                // The principal's tool selector must gate deferred/MCP
+                // tools too, not only the static registry narrowed by
+                // `.allowed_tools()` below. `caller_allowed` is exact-match
+                // (no `<server>__<tool>` auto-admit escape), so an empty
+                // principal list denies every MCP tool and a named list
+                // admits only the named ones.
+                caller_allowed: principal_allowed_tools.as_deref(),
                 connect_mcp: initialize_mcp,
                 connect_peripherals: false,
                 exclude_memory,
