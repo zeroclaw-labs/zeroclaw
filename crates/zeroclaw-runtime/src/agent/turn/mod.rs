@@ -1059,6 +1059,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             let fallback =
                 crate::i18n::get_required_cli_string("channel-runtime-malformed-tool-output");
             accumulated_display_text.push_str(&fallback);
+            events::emit_posthoc_turn_chunk(event_tx.as_ref(), &fallback).await;
             if let Some(ref tx) = on_delta {
                 let _ = tx.send(StreamDelta::Text(fallback.to_string())).await;
             }
@@ -1443,6 +1444,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         turn_id,
         knobs,
         event_tx.as_ref(),
+        on_delta.as_ref(),
         turn_state.canonical.as_deref_mut(),
     )
     .await

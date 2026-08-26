@@ -2,6 +2,7 @@
 //! LLM for a tools-free final summary (with step timeout + cancel select)
 //! and return it appended to the accumulated display text, or bail.
 
+use super::StreamDelta;
 use super::knobs::{LoopKnobs, MaxIterationBehavior};
 use super::outcome::ToolLoopCancelled;
 use anyhow::{Context, Result};
@@ -27,6 +28,7 @@ pub(crate) async fn finish_after_max_iterations(
     turn_id: &str,
     knobs: &LoopKnobs,
     event_tx: Option<&Sender<TurnEvent>>,
+    on_delta: Option<&Sender<StreamDelta>>,
     mut new_messages_out: Option<&mut Vec<ChatMessage>>,
 ) -> Result<String> {
     ::zeroclaw_log::record!(
@@ -235,6 +237,9 @@ pub(crate) async fn finish_after_max_iterations(
     // narration earlier iterations already streamed, and resending it here
     // would duplicate it in the client.
     super::events::emit_posthoc_turn_chunk(event_tx, &segment).await;
+    if let Some(tx) = on_delta {
+        let _ = tx.send(StreamDelta::Text(segment.clone())).await;
+    }
     accumulated_display_text.push_str(&segment);
     Ok(accumulated_display_text)
 }
@@ -243,7 +248,7 @@ pub(crate) async fn finish_after_max_iterations(
 mod graceful_summary_metering_tests {
     use super::finish_after_max_iterations;
     use crate::agent::cost::{TOOL_LOOP_COST_TRACKING_CONTEXT, ToolLoopCostTrackingContext};
-    use crate::agent::turn::LoopKnobs;
+    use crate::agent::turn::{LoopKnobs, StreamDelta};
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -308,6 +313,7 @@ mod graceful_summary_metering_tests {
         provider: &dyn ModelProvider,
         accumulated_display_text: String,
         event_tx: Option<&Sender<TurnEvent>>,
+        on_delta: Option<&Sender<StreamDelta>>,
     ) -> anyhow::Result<String> {
         let mut history = vec![ChatMessage::user("do the work")];
         let pacing = PacingConfig::default();
@@ -325,13 +331,14 @@ mod graceful_summary_metering_tests {
             "trace-req-test",
             &knobs,
             event_tx,
+            on_delta,
             None,
         )
         .await
     }
 
     async fn run_summary(provider: &dyn ModelProvider) -> anyhow::Result<String> {
-        run_summary_with_events(provider, String::new(), None).await
+        run_summary_with_events(provider, String::new(), None, None).await
     }
 
     // The graceful summary now routes through the metered provider seam: under a
@@ -561,6 +568,7 @@ mod graceful_summary_metering_tests {
             &knobs,
             None,
             None,
+            None,
         )
         .await
         .expect("graceful summary should succeed");
@@ -590,9 +598,15 @@ mod graceful_summary_metering_tests {
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
 
-        let out = run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx))
-            .await
-            .expect("graceful summary should succeed");
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<StreamDelta>(8);
+        let out = run_summary_with_events(
+            &provider,
+            "earlier narration".to_string(),
+            Some(&tx),
+            Some(&delta_tx),
+        )
+        .await
+        .expect("graceful summary should succeed");
 
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
 
@@ -614,6 +628,14 @@ mod graceful_summary_metering_tests {
         assert!(
             !delta.contains("earlier narration"),
             "chunk must not re-send narration already streamed in earlier iterations: {delta}"
+        );
+        assert!(matches!(
+            delta_rx.recv().await,
+            Some(StreamDelta::Text(draft_delta)) if draft_delta == delta
+        ));
+        assert!(
+            delta_rx.try_recv().is_err(),
+            "summary must emit one draft delta"
         );
     }
 
@@ -665,7 +687,7 @@ mod graceful_summary_metering_tests {
             text: raw.to_string(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(8);
-        run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx))
+        run_summary_with_events(&provider, "earlier narration".to_string(), Some(&tx), None)
             .await
             .expect("graceful summary should succeed");
         let mut chunk_delta = None;
