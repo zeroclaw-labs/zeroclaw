@@ -105,7 +105,7 @@ impl From<&str> for PrincipalId {
 
 /// An agent alias a principal may bind at session start. Newtype so it never
 /// gets confused with an arbitrary `String` in grant checks.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AgentAlias(pub String);
 
 impl AgentAlias {
@@ -429,10 +429,11 @@ impl Principal {
     /// sentinel. A2A distinct-principal routing keys on this.
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
-        !matches!(
-            self.auth_method,
-            AuthMethod::None | AuthMethod::SharedOperator
-        )
+        // Subject-based, not method-based: the shared operator is identified by
+        // its canonical PrincipalId sentinel, so `shared_operator(Native)` (a
+        // supported shape) is never mistaken for a distinct authenticated
+        // identity regardless of the auth method recorded.
+        self.auth_method != AuthMethod::None && self.id.as_str() != PrincipalId::SHARED_OPERATOR
     }
 }
 
@@ -518,6 +519,22 @@ mod tests {
         assert_eq!(p.actor, ActorKind::Human);
         assert_eq!(p.trust_domain, "native");
         assert!(!p.is_authenticated());
+    }
+
+    #[test]
+    fn shared_operator_via_native_method_is_not_authenticated() {
+        // The exact shape the native provider emits: SharedOperator subject
+        // with AuthMethod::Native. is_authenticated keys on the canonical id,
+        // not the method, so a native pairing bearer is never mistaken for a
+        // distinct authenticated identity.
+        let identity = AuthenticatedIdentity::shared_operator(AuthMethod::Native);
+        let p = Principal::from_identity(&identity);
+        assert_eq!(p.id.as_str(), PrincipalId::SHARED_OPERATOR);
+        assert_eq!(p.auth_method, AuthMethod::Native);
+        assert!(
+            !p.is_authenticated(),
+            "native shared operator must not read as a distinct authenticated identity"
+        );
     }
 
     #[test]

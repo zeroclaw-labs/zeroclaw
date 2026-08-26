@@ -45,8 +45,11 @@ pub struct ResolvedPrincipal {
 pub struct OidcMapping {
     pub issuer: String,
     pub claim_path: String,
-    /// Claim value → permission-profile alias.
+    /// Claim value -> permission-profile alias (human OIDC subjects).
     pub profile_map: HashMap<String, String>,
+    /// Verified service client_id -> permission-profile alias. Service
+    /// principals resolve ONLY through this map, never `profile_map`.
+    pub service_profile_map: HashMap<String, String>,
 }
 
 /// One compiled authorization policy: everything the resolver needs at one
@@ -62,6 +65,11 @@ pub struct ResolverPolicy {
     /// it. Keyed by the EFFECTIVE principal id (`principal_id` override or
     /// entry name), which is what a local provider binds.
     pub roster: HashMap<String, Vec<String>>,
+    /// Set when two `[users]` entries resolved to the SAME effective
+    /// principal id: the roster cannot deterministically say which grants
+    /// win, so it is emptied (fail closed) and this flag lets the reload
+    /// path refuse to install the invalid replacement.
+    pub roster_conflict: bool,
 }
 
 impl ResolverPolicy {
@@ -85,28 +93,44 @@ impl ResolverPolicy {
                         issuer: entry.issuer.clone(),
                         claim_path: entry.claim_path.clone(),
                         profile_map: entry.profile_map.clone(),
+                        service_profile_map: entry.service_profile_map.clone(),
                     },
                 )
             })
             .collect();
-        let roster = config
-            .users
-            .iter()
-            .map(|(name, user)| {
-                (
-                    user.effective_principal_id(name).to_owned(),
-                    user.permission_profiles
-                        .iter()
-                        .map(|p| p.trim().to_owned())
-                        .filter(|p| !p.is_empty())
-                        .collect(),
-                )
-            })
-            .collect();
+        // Build the roster explicitly so a duplicate effective principal id
+        // is a deterministic rejection, not a HashMap insert whose winner
+        // depends on iteration order. Config validation already rejects this,
+        // but the compiler must not silently install a corrupted roster if it
+        // ever receives an unvalidated config.
+        let mut roster: HashMap<String, Vec<String>> = HashMap::new();
+        let mut roster_conflict = false;
+        for (name, user) in &config.users {
+            let pid = user.effective_principal_id(name).to_owned();
+            let profiles: Vec<String> = user
+                .permission_profiles
+                .iter()
+                .map(|p| p.trim().to_owned())
+                .filter(|p| !p.is_empty())
+                .collect();
+            if roster.insert(pid, profiles).is_some() {
+                roster_conflict = true;
+            }
+        }
+        if roster_conflict {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Two [users] entries share an effective principal_id; rejecting the whole roster (fail closed) rather than authorizing one arbitrarily. Repair the duplicate principal_id/entry name."
+            );
+            roster.clear();
+        }
         Self {
             profiles,
             oidc,
             roster,
+            roster_conflict,
         }
     }
 }
@@ -179,10 +203,23 @@ impl PrincipalResolver {
         state.1
     }
 
-    /// Re-compile from a validated config and install (see
-    /// [`Self::replace_policy`]).
+    /// Re-compile from config and install (see [`Self::replace_policy`]) —
+    /// UNLESS the new policy is invalid (a duplicate effective principal id).
+    /// An invalid replacement is rejected: the current policy stays installed
+    /// and the generation does NOT advance, so established connections keep
+    /// resolving against the last valid policy until the config is repaired.
     pub fn replace_from_config(&self, config: &Config) -> u64 {
-        self.replace_policy(ResolverPolicy::from_config(config))
+        let policy = ResolverPolicy::from_config(config);
+        if policy.roster_conflict {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "Refusing to install an authorization policy with a duplicate effective principal_id; keeping the previous policy. Repair the [users] roster and reload."
+            );
+            return self.generation();
+        }
+        self.replace_policy(policy)
     }
 
     /// Map a provider-verified identity to its canonical principal and the
@@ -222,11 +259,10 @@ impl PrincipalResolver {
                 };
                 Self::merge_profiles(policy, profile_aliases.iter().map(String::as_str))
             }
-            IdentitySubject::Oidc { issuer, .. } | IdentitySubject::Service { issuer, .. } => {
+            IdentitySubject::Oidc { issuer, .. } => {
                 // The provider alias names which [oidc.<alias>] mapping
-                // applies; the VALIDATED issuer must agree with that
-                // entry, so a mis-wired provider cannot borrow another
-                // issuer's mapping.
+                // applies; the VALIDATED issuer must agree with that entry,
+                // so a mis-wired provider cannot borrow another issuer's map.
                 let Some(alias) = identity.provider_alias.as_deref() else {
                     return Err(DenyReason::Misconfigured);
                 };
@@ -238,8 +274,7 @@ impl PrincipalResolver {
                 }
                 let values = claim_values(&identity.claims, &mapping.claim_path);
                 // Sort mapped aliases so multi-profile composition is
-                // deterministic regardless of claim ordering; drop
-                // duplicates so one profile merges once.
+                // deterministic regardless of claim ordering; drop duplicates.
                 let mut mapped: Vec<&str> = values
                     .iter()
                     .filter_map(|value| mapping.profile_map.get(value))
@@ -253,6 +288,27 @@ impl PrincipalResolver {
                     return Err(DenyReason::NotEntitled);
                 }
                 Self::merge_profiles(policy, mapped.into_iter())
+            }
+            IdentitySubject::Service { issuer, client_id } => {
+                // Service principals are actor-qualified: they resolve ONLY
+                // through service_profile_map keyed by the verified client_id,
+                // never the human profile_map, so a machine credential cannot
+                // inherit a human profile from similarly-named claims.
+                let Some(alias) = identity.provider_alias.as_deref() else {
+                    return Err(DenyReason::Misconfigured);
+                };
+                let Some(mapping) = policy.oidc.get(alias) else {
+                    return Err(DenyReason::Misconfigured);
+                };
+                if mapping.issuer != *issuer {
+                    return Err(DenyReason::Misconfigured);
+                }
+                // No explicit service mapping => authenticated, entitled to
+                // nothing (fail closed).
+                let Some(profile) = mapping.service_profile_map.get(client_id) else {
+                    return Err(DenyReason::NotEntitled);
+                };
+                Self::merge_profiles(policy, std::iter::once(profile.as_str()))
             }
             // IdentitySubject is #[non_exhaustive]: an identity class this
             // resolver does not recognize maps to nothing (fail closed).
@@ -317,6 +373,10 @@ mod tests {
                     ("zeroclaw-readers".to_string(), "reader".to_string()),
                     ("zeroclaw-ops".to_string(), "ops".to_string()),
                 ]),
+                service_profile_map: HashMap::from([(
+                    "reporting-batch".to_string(),
+                    "ops".to_string(),
+                )]),
             },
         );
 
@@ -330,6 +390,7 @@ mod tests {
             profiles,
             oidc,
             roster,
+            roster_conflict: false,
         }
     }
 
@@ -508,7 +569,33 @@ mod tests {
     }
 
     #[test]
-    fn service_identity_resolves_to_a_service_principal() {
+    fn service_identity_resolves_through_the_service_map() {
+        // A service whose verified client_id is in service_profile_map
+        // resolves to that service profile (keyed by client_id, NOT claims).
+        let resolver = PrincipalResolver::new(policy());
+        let identity = AuthenticatedIdentity::new(
+            IdentitySubject::Service {
+                issuer: "https://sso.example.com/realms/main".into(),
+                client_id: "reporting-batch".into(),
+            },
+            AuthMethod::Oidc,
+        )
+        .with_provider_alias("corp");
+        let resolved = resolver
+            .resolve(&identity)
+            .expect("mapped service resolves");
+        assert_eq!(resolved.principal.actor, ActorKind::Service);
+        assert_eq!(
+            resolved.principal.id.as_str(),
+            "svc:https%3A//sso.example.com/realms/main:reporting-batch"
+        );
+        assert!(resolved.grants.permits(Resource::Cron, Verb::Execute));
+    }
+
+    #[test]
+    fn service_without_a_service_mapping_is_denied() {
+        // A service client_id absent from service_profile_map is authenticated
+        // but entitled to nothing — even carrying claims a human would map on.
         let resolver = PrincipalResolver::new(policy());
         let claims = serde_json::json!({ "realm_access": { "roles": ["zeroclaw-ops"] } });
         let serde_json::Value::Object(claims) = claims else {
@@ -517,19 +604,101 @@ mod tests {
         let identity = AuthenticatedIdentity::new(
             IdentitySubject::Service {
                 issuer: "https://sso.example.com/realms/main".into(),
-                client_id: "reporting-batch".into(),
+                client_id: "unmapped-client".into(),
             },
             AuthMethod::Oidc,
         )
         .with_provider_alias("corp")
         .with_claims(claims);
-        let resolved = resolver.resolve(&identity).expect("service resolves");
-        assert_eq!(resolved.principal.actor, ActorKind::Service);
-        assert_eq!(
-            resolved.principal.id.as_str(),
-            "svc:https%3A//sso.example.com/realms/main:reporting-batch"
+        assert!(matches!(
+            resolver.resolve(&identity),
+            Err(DenyReason::NotEntitled)
+        ));
+    }
+
+    #[test]
+    fn identical_claims_resolve_differently_for_human_and_service() {
+        // The core RFC 7141 guarantee: the SAME claims give a human its mapped
+        // profile but do NOT leak that profile to a service (which resolves by
+        // client_id through service_profile_map, and is denied without one).
+        let resolver = PrincipalResolver::new(policy());
+        let claims = serde_json::json!({ "realm_access": { "roles": ["zeroclaw-ops"] } });
+        let serde_json::Value::Object(claims) = claims else {
+            unreachable!()
+        };
+        let human = AuthenticatedIdentity::new(
+            IdentitySubject::Oidc {
+                issuer: "https://sso.example.com/realms/main".into(),
+                subject: "alice".into(),
+            },
+            AuthMethod::Oidc,
+        )
+        .with_provider_alias("corp")
+        .with_claims(claims.clone());
+        let human_grants = resolver.resolve(&human).expect("human resolves").grants;
+        assert!(human_grants.permits(Resource::Cron, Verb::Execute));
+
+        let service = AuthenticatedIdentity::new(
+            IdentitySubject::Service {
+                issuer: "https://sso.example.com/realms/main".into(),
+                client_id: "unmapped-client".into(),
+            },
+            AuthMethod::Oidc,
+        )
+        .with_provider_alias("corp")
+        .with_claims(claims);
+        assert!(
+            matches!(resolver.resolve(&service), Err(DenyReason::NotEntitled)),
+            "identical claims must not grant a service the human profile"
         );
-        assert!(resolved.grants.permits(Resource::Cron, Verb::Execute));
+    }
+
+    #[test]
+    fn duplicate_effective_principal_id_rejects_the_roster() {
+        use zeroclaw_config::schema::UserConfig;
+        let mut config = Config::default();
+        for (name, uid, profile) in [("alice", 1u32, "reader"), ("bob", 2u32, "ops")] {
+            config.users.insert(
+                name.to_string(),
+                UserConfig {
+                    principal_id: Some("shared".to_string()),
+                    uid: Some(uid),
+                    permission_profiles: vec![profile.to_string()],
+                },
+            );
+        }
+        let policy = ResolverPolicy::from_config(&config);
+        assert!(
+            policy.roster_conflict,
+            "duplicate effective id flags conflict"
+        );
+        assert!(
+            policy.roster.is_empty(),
+            "a conflicting roster is emptied (fail closed), never overwritten by iteration order"
+        );
+    }
+
+    #[test]
+    fn reload_with_duplicate_principal_id_keeps_the_old_policy() {
+        use zeroclaw_config::schema::UserConfig;
+        let resolver = PrincipalResolver::new(policy());
+        let before = resolver.generation();
+        let mut bad = Config::default();
+        for (name, uid) in [("alice", 1u32), ("bob", 2u32)] {
+            bad.users.insert(
+                name.to_string(),
+                UserConfig {
+                    principal_id: Some("dup".to_string()),
+                    uid: Some(uid),
+                    permission_profiles: vec![],
+                },
+            );
+        }
+        let after = resolver.replace_from_config(&bad);
+        assert_eq!(
+            after, before,
+            "an invalid replacement must not install or advance the generation"
+        );
     }
 
     #[test]
@@ -612,6 +781,7 @@ mod tests {
                 issuer: "https://sso.example.com".to_string(),
                 claim_path: "groups".to_string(),
                 profile_map: HashMap::from([("ops".to_string(), "operator".to_string())]),
+                ..OidcConfig::default()
             },
         );
         config.validate().expect("valid");
