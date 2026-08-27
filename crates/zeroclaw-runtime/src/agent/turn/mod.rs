@@ -607,12 +607,13 @@ async fn enforce_reported_budget(
         ratio,
     )
     .await;
-    let mut result = crate::agent::history_trim::trim_to_reported_budget(
+    let mut result = crate::agent::history_trim::trim_to_reported_budget_with_crumb(
         taken,
         context_token_budget,
         reported_input_tokens,
         reported_population_estimated,
         tool_schema_tokens,
+        taken_had_crumb,
     );
     let mut trimmed = result.history;
     let mut trimmed_any = result.trimmed;

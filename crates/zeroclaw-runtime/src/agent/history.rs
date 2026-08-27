@@ -404,15 +404,6 @@ pub struct InteractiveSessionState {
 }
 
 impl InteractiveSessionState {
-    #[allow(dead_code)]
-    fn from_history(history: &[ChatMessage]) -> Self {
-        Self {
-            version: 2,
-            history: history.to_vec(),
-            history_has_trim_breadcrumb: false,
-        }
-    }
-
     pub fn from_history_with_crumb(history: &[ChatMessage], has_crumb: bool) -> Self {
         Self {
             version: 2,

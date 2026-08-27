@@ -243,9 +243,30 @@ pub fn trim_to_reported_budget(
     reported_population_estimated: usize,
     tool_schema_tokens: usize,
 ) -> TrimResult {
+    trim_to_reported_budget_with_crumb(
+        history,
+        budget_tokens,
+        reported_input_tokens,
+        reported_population_estimated,
+        tool_schema_tokens,
+        false,
+    )
+}
+
+/// Crumb-aware variant: when `crumb_present` is true the population carries
+/// the synthetic breadcrumb immediately after leading system messages.
+/// The breadcrumb is never counted as a turn and never dropped.
+pub fn trim_to_reported_budget_with_crumb(
+    history: Vec<ChatMessage>,
+    budget_tokens: usize,
+    reported_input_tokens: usize,
+    reported_population_estimated: usize,
+    tool_schema_tokens: usize,
+    crumb_present: bool,
+) -> TrimResult {
     let estimated = reported_population_estimated;
     if budget_tokens == 0 || reported_input_tokens <= budget_tokens || estimated == 0 {
-        let total_turns = count_turns(&history);
+        let total_turns = count_turns(&history).saturating_sub(usize::from(crumb_present));
         return TrimResult {
             tokens_before: reported_input_tokens,
             tokens_after: reported_input_tokens,
@@ -263,7 +284,7 @@ pub fn trim_to_reported_budget(
     let target_total =
         (budget_tokens as u128 * estimated as u128 / reported_input_tokens as u128).max(1) as usize;
     let scaled = target_total.saturating_sub(tool_schema_tokens).max(1);
-    let result = trim_to_recent_turns(history, scaled);
+    let result = trim_to_recent_turns_with_crumb(history, scaled, crumb_present);
     let ratio = reported_input_tokens as f64 / estimated as f64;
     TrimResult {
         tokens_before: reported_input_tokens,

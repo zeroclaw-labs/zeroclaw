@@ -1345,22 +1345,6 @@ impl Agent {
                 self.history.push(ConversationMessage::Chat(msg.clone()));
             }
         }
-        // Migration: legacy persisted histories may already contain a synthetic
-        // breadcrumb at the expected position without the flag. Recover the
-        // owner flag before trimming so `trim_history` does not misclassify it.
-        if !self.history_has_trim_breadcrumb {
-            let leading_system = self
-                .history
-                .iter()
-                .take_while(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
-                .count();
-            if let Some(ConversationMessage::Chat(first)) = self.history.get(leading_system) {
-                let crumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
-                if first.role == "user" && first.content == crumb {
-                    self.history_has_trim_breadcrumb = true;
-                }
-            }
-        }
         self.trim_history(None)
             .map(HistoryTrimNotice::into_turn_event)
     }
@@ -1391,19 +1375,6 @@ impl Agent {
                 continue;
             }
             self.history.push(msg);
-        }
-        if !self.history_has_trim_breadcrumb {
-            let leading_system = self
-                .history
-                .iter()
-                .take_while(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
-                .count();
-            if let Some(ConversationMessage::Chat(first)) = self.history.get(leading_system) {
-                let crumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
-                if first.role == "user" && first.content == crumb {
-                    self.history_has_trim_breadcrumb = true;
-                }
-            }
         }
         // Trim immediately so pre_len snapshots (taken before the first turn)
         // are always within the configured limit; otherwise a long restored
@@ -2562,6 +2533,8 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        let original_loop_history_len = loop_history.len();
+        let original_loop_history_crumb = self.history_has_trim_breadcrumb;
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
@@ -2632,10 +2605,6 @@ impl Agent {
                         },
                     ),
                     history: &mut loop_history,
-                    // The raw loop transcript is converted from the structured
-                    // history, whose crumb state the Agent already tracks; a
-                    // trim-inserted raw crumb lives only in this per-turn
-                    // buffer, so no write-back to the owner happens here.
                     history_has_trim_breadcrumb: &mut loop_history_crumb_present,
                     channel_name: &self.channel_name,
                     channel_reply_target: None,
@@ -2710,11 +2679,31 @@ impl Agent {
                 None,
             );
         }
-        // Pop the original user message (pushed before the loop) so the
-        // replayed canonical version, including the original user message.
-        self.history.pop();
-        for replayed in Self::replay_loop_messages(&loop_new_messages) {
-            self.history.push(replayed);
+        // Write back any token-budget trim that happened inside the loop to
+        // durable history. The loop owns a ChatMessage clone of the prefix;
+        // if it trimmed, the durable history must reflect that, otherwise the
+        // next turn would resend dropped context and the event's claim about
+        // retained context would be false.
+        let history_trimmed_in_loop = loop_history.len() != original_loop_history_len
+            || loop_history_crumb_present != original_loop_history_crumb;
+        if history_trimmed_in_loop {
+            let trimmed_prefix = Self::replay_loop_messages(&loop_history);
+            // self.history currently is [original_prefix (ConversationMessage) + currentUser]
+            // Replace the original prefix with the trimmed one; the current turn
+            // (loop_new_messages) will be replayed next.
+            self.history.truncate(0);
+            self.history.extend(trimmed_prefix);
+            self.history_has_trim_breadcrumb = loop_history_crumb_present;
+            for replayed in Self::replay_loop_messages(&loop_new_messages) {
+                self.history.push(replayed);
+            }
+        } else {
+            // Pop the original user message (pushed before the loop) so the
+            // replayed canonical version, including the original user message.
+            self.history.pop();
+            for replayed in Self::replay_loop_messages(&loop_new_messages) {
+                self.history.push(replayed);
+            }
         }
         let response = match loop_result {
             Ok(response) => response,
@@ -2937,6 +2926,8 @@ impl Agent {
             .rposition(|m| m.role == "user")
             .unwrap_or(provider_messages.len());
         let mut loop_history = provider_messages[..split_idx].to_vec();
+        let mut streamed_original_loop_history_len = loop_history.len();
+        let mut streamed_original_crumb = self.history_has_trim_breadcrumb;
         // Seed raw-transcript crumb provenance from the structured history's
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
@@ -3177,6 +3168,18 @@ impl Agent {
             for replayed in Self::replay_loop_messages(&round_added) {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
+            }
+            // Write back durable token-budget trim from loop_history.
+            if loop_history.len() != streamed_original_loop_history_len
+                || loop_history_crumb_present != streamed_original_crumb
+            {
+                let trimmed_prefix = Self::replay_loop_messages(&loop_history);
+                self.history.truncate(0);
+                self.history.extend(trimmed_prefix);
+                self.history.extend(new_msgs.clone());
+                self.history_has_trim_breadcrumb = loop_history_crumb_present;
+                streamed_original_loop_history_len = loop_history.len();
+                streamed_original_crumb = loop_history_crumb_present;
             }
 
             match loop_result {
