@@ -495,6 +495,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-http-proxy"
+version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29faa5d4d308266048bd7505ba55484315a890102f9345b9ff4b87de64201592"
+dependencies = [
+ "base64 0.13.1",
+ "httparse",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "async-imap"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -879,6 +891,12 @@ name = "base16ct"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd307490d624467aa6f74b0eabb77633d1f758a7b25f12bceb0b22e08d9726f6"
+
+[[package]]
+name = "base64"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
 name = "base64"
@@ -3756,6 +3774,21 @@ dependencies = [
  "libc",
  "system-deps",
  "x11",
+]
+
+[[package]]
+name = "gemini-live"
+version = "0.1.0"
+dependencies = [
+ "async-http-proxy",
+ "base64 0.22.1",
+ "futures-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
 ]
 
 [[package]]
@@ -10728,6 +10761,22 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edc5f74e248dc973e0dbb7b74c7e0d6fcc301c694ff50049504004ef4d0cdcd9"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite 0.24.0",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "tokio-tungstenite"
 version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
@@ -11105,6 +11154,26 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
+
+[[package]]
+name = "tungstenite"
+version = "0.24.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18e5b8366ee7a95b16d32197d0b2604b43a0be89dc5fac9f8e96ccafbaedda8a"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "data-encoding",
+ "http 1.4.1",
+ "httparse",
+ "log",
+ "rand 0.8.6",
+ "rustls",
+ "rustls-pki-types",
+ "sha1 0.10.6",
+ "thiserror 1.0.69",
+ "utf-8",
+]
 
 [[package]]
 name = "tungstenite"

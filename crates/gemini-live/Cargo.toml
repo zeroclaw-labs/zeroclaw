@@ -1,0 +1,21 @@
+[package]
+name = "gemini-live"
+version = "0.1.0"
+edition = "2021"
+description = "A focused Rust client for the Google Gemini Live API: wire serialization, message parsing, WebSocket transport, and a reconnect/resumption session driver."
+license = "MIT"
+repository = "https://github.com/metalmon/gemini-live"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tokio = { version = "1", features = ["rt", "net", "macros", "time", "sync"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+async-http-proxy = { version = "1.2", features = ["runtime-tokio", "basic-auth"] }
+futures-util = "0.3"
+tracing = "0.1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "net", "macros", "test-util", "time", "sync"] }
