@@ -235,6 +235,25 @@ zeroclaw service stop
 zeroclaw service start
 ```
 
+## Switching models from the chat (`/model`)
+
+Authorized senders can switch the active model interactively, without leaving
+Telegram.
+
+- `/model` (no argument) opens an inline picker with provider categories and
+  model options built from configured `[[model_routes]]`. Pages navigate via
+  inline keyboard buttons; ✗ cancels.
+- Selecting an option applies it to the **sender's session scope** — the same
+  behavior as the text form `/model <hint>` on this sender. The picker never
+  creates user- or agent-scoped overrides.
+- Route hints that would collide with the command flag syntax (`--user`,
+  `--agent`, or any `--flag`) are filtered out of the picker; use the text
+  command for those or fix the hint in `config.toml`. Unselectable options are
+  also skipped when the provider or target no longer resolves.
+- The text alternatives remain available: `/model <hint>` for a session-scoped
+  route, `/model --user <hint>` / `/model --agent <hint>` for the broader
+  scopes (if permitted), and `/models <provider>` to list models of a provider.
+
 ## Logs and troubleshooting
 
 For an installed service:

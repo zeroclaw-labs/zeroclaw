@@ -862,9 +862,14 @@ fn normalize_telegram_api_base(api_base: &str) -> String {
 
 impl TelegramChannel {
     fn is_safe_model_picker_field(value: &str) -> bool {
+        // Hints are interpolated into `/model <hint>` command syntax, where a
+        // leading `--` token has scope meaning (`--user`, `--agent`) or falls
+        // back to the help ladder. Flag-shaped hints must stay out of the
+        // picker so it can't cross the explicit scope boundary.
         !value.trim().is_empty()
             && value.len() <= TELEGRAM_MODEL_PICKER_MAX_FIELD_BYTES
             && !value.chars().any(char::is_control)
+            && !value.starts_with("--")
     }
 
     fn configured_model_provider(config: &Config, provider_ref: &str) -> bool {
@@ -6774,6 +6779,26 @@ mod tests {
                 model: "unsafe".to_string(),
                 api_key: None,
             },
+            // Regression: flag-shaped hints must not cross the `/model
+            // --user|--agent` scope boundary via the picker.
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "--user fast".to_string(),
+                model_provider: "openai.fast".to_string(),
+                model: "gpt-flag-user".to_string(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "--agent fast".to_string(),
+                model_provider: "openai.fast".to_string(),
+                model: "gpt-flag-agent".to_string(),
+                api_key: None,
+            },
+            zeroclaw_config::schema::ModelRouteConfig {
+                hint: "--flag".to_string(),
+                model_provider: "openai.fast".to_string(),
+                model: "gpt-flag-generic".to_string(),
+                api_key: None,
+            },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "current".to_string(),
                 model_provider: "anthropic.team".to_string(),
@@ -6797,6 +6822,13 @@ mod tests {
         assert!(options.iter().all(|option| option.model != "ghost"));
         assert!(options.iter().all(|option| option.hint != "duplicate"));
         assert!(options.iter().all(|option| option.hint != "unsafe\nroute"));
+        assert!(options.iter().all(|option| !option.hint.starts_with("--")));
+        assert!(options.iter().all(|option| {
+            !matches!(
+                option.model.as_str(),
+                "gpt-flag-user" | "gpt-flag-agent" | "gpt-flag-generic"
+            )
+        }));
         assert_eq!(
             options
                 .iter()
