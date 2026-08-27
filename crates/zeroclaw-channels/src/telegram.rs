@@ -901,7 +901,9 @@ impl TelegramChannel {
             && !value.chars().any(char::is_control)
             && !value.contains('`')
             && value.split_whitespace().collect::<Vec<_>>().join(" ") == value
-            && !value.split_whitespace().any(|token| token.starts_with("--"))
+            && !value
+                .split_whitespace()
+                .any(|token| token.starts_with("--"))
     }
 
     fn configured_model_provider(config: &Config, provider_ref: &str) -> bool {
@@ -7198,12 +7200,14 @@ mod tests {
             "fast --user",
         ];
         for (index, hint) in non_canonical.iter().enumerate() {
-            config.model_routes.push(zeroclaw_config::schema::ModelRouteConfig {
-                hint: (*hint).to_string(),
-                model_provider: "openai.fast".to_string(),
-                model: format!("gpt-non-canonical-{index}"),
-                api_key: None,
-            });
+            config
+                .model_routes
+                .push(zeroclaw_config::schema::ModelRouteConfig {
+                    hint: (*hint).to_string(),
+                    model_provider: "openai.fast".to_string(),
+                    model: format!("gpt-non-canonical-{index}"),
+                    api_key: None,
+                });
         }
 
         let runtime_routes = model_picker_runtime_routes(&config);
