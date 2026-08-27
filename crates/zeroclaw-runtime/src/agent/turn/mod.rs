@@ -393,9 +393,7 @@ async fn surface_oversized_dispatch_if_needed(
                         token_budget: Some(context_token_budget as u64),
                         tokens_before: Some(tokens_before),
                         tokens_after: Some(tokens_after as u64),
-                        tokens_before_source: Some(
-                            zeroclaw_api::agent::TokenCountSource::Estimated,
-                        ),
+                        tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                         tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                         unsatisfiable_floor: None,
                     })
@@ -412,9 +410,7 @@ async fn surface_oversized_dispatch_if_needed(
                     token_budget: Some(context_token_budget as u64),
                     tokens_before: Some(tokens_before),
                     tokens_after: Some(tokens_after as u64),
-                    tokens_before_source: Some(
-                        zeroclaw_api::agent::TokenCountSource::Estimated,
-                    ),
+                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                     unsatisfiable_floor: None,
                 },
