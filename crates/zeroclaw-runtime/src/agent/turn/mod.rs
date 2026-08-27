@@ -318,12 +318,19 @@ async fn surface_oversized_dispatch_if_needed(
     // Use a simple loop that re-estimates after each whole-turn drop. This
     // does not re-run the hook; the hook's transient growth is already in
     // `measured_population` and is conservatively assumed constant.
-    let mut current_estimate = crate::agent::history::estimate_history_tokens(history)
-        + tool_schema_tokens;
-    // If the caller already measured post-hook, `current_estimate` should be
-    // close to `measured_population`; use the larger as the starting point so
-    // we do not underestimate due to raw vs prepared differences.
-    let mut current_measured = std::cmp::max(current_estimate as u64, measured_population);
+    let mut current_estimate =
+        crate::agent::history::estimate_history_tokens(history) + tool_schema_tokens;
+    // Hook growth is the transient per-request delta already included in
+    // `measured_population` (post-hook) but not in `current_estimate`
+    // (durable estimate). Keep it constant across the trim loop so a
+    // varying-growth hook that adds a large payload on this iteration still
+    // requires durable history to shrink.
+    let original_estimate = current_estimate;
+    let hook_growth = measured_population.saturating_sub(original_estimate as u64);
+    let mut current_measured = (current_estimate as u64).saturating_add(hook_growth);
+    // Use the larger of the re-estimated and measured values so we do not
+    // underestimate due to raw vs prepared differences.
+    current_measured = std::cmp::max(current_measured, measured_population);
     if current_measured <= context_token_budget as u64 {
         return;
     }
@@ -338,28 +345,7 @@ async fn surface_oversized_dispatch_if_needed(
         trimmed_any = true;
         current_estimate =
             crate::agent::history::estimate_history_tokens(&trimmed_history) + tool_schema_tokens;
-        // Approximate hook growth as constant: original hook growth was
-        // `measured - estimate(original)`. For the trimmed history we keep the
-        // same growth so the decision is not artificially optimistic.
-        let hook_growth = measured_population.saturating_sub(
-            crate::agent::history::estimate_history_tokens(&{
-                // Reconstruct original estimate for hook growth: we don't have
-                // the original history now, so approximate as `measured -
-                // current_estimate_before_trim` is already captured by using
-                // `measured` as base and subtracting the delta from trimming.
-                // Simpler: assume hook growth already included and trimming
-                // reduces `current_estimate` directly.
-                // Use `current_estimate` as the new measured (tool schemas
-                // already included) — this is conservative.
-                0
-            }),
-        );
-        // For now, treat `current_estimate` as the new measured population;
-        // this is the durable part plus schemas, which is the portion trimming
-        // can affect. A large hook growth (>0) would keep it over budget and
-        // correctly surface a floor.
-        let _ = hook_growth;
-        current_measured = current_estimate as u64;
+        current_measured = (current_estimate as u64).saturating_add(hook_growth);
         if current_measured <= context_token_budget as u64 {
             break;
         }
@@ -368,10 +354,8 @@ async fn surface_oversized_dispatch_if_needed(
         // Insert breadcrumb if this is the first trim in this history's
         // lifetime, preserving the owner flag.
         let mut with_crumb = trimmed_history;
-        let new_crumb = crate::agent::history_trim::insert_breadcrumb_deduped(
-            &mut with_crumb,
-            had_crumb,
-        );
+        let new_crumb =
+            crate::agent::history_trim::insert_breadcrumb_deduped(&mut with_crumb, had_crumb);
         *crumb_present = new_crumb;
         // `dropped_messages` excludes the synthetic crumb so a repeated trim
         // does not overstate.
@@ -383,8 +367,8 @@ async fn surface_oversized_dispatch_if_needed(
         );
         let kept_turns = crate::agent::history_trim::count_turns(&with_crumb)
             .saturating_sub(usize::from(new_crumb));
-        let tokens_after = crate::agent::history::estimate_history_tokens(&with_crumb)
-            + tool_schema_tokens;
+        let tokens_after =
+            crate::agent::history::estimate_history_tokens(&with_crumb) + tool_schema_tokens;
         *history = with_crumb;
         if !hit_floor || (tokens_after as u64) <= context_token_budget as u64 {
             ::zeroclaw_log::record!(
@@ -409,7 +393,9 @@ async fn surface_oversized_dispatch_if_needed(
                         token_budget: Some(context_token_budget as u64),
                         tokens_before: Some(tokens_before),
                         tokens_after: Some(tokens_after as u64),
-                        tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                        tokens_before_source: Some(
+                            zeroclaw_api::agent::TokenCountSource::Estimated,
+                        ),
                         tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                         unsatisfiable_floor: None,
                     })
@@ -426,7 +412,9 @@ async fn surface_oversized_dispatch_if_needed(
                     token_budget: Some(context_token_budget as u64),
                     tokens_before: Some(tokens_before),
                     tokens_after: Some(tokens_after as u64),
-                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                    tokens_before_source: Some(
+                        zeroclaw_api::agent::TokenCountSource::Estimated,
+                    ),
                     tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
                     unsatisfiable_floor: None,
                 },

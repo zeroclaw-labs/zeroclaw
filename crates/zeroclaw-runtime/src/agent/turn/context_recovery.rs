@@ -111,8 +111,7 @@ pub(crate) async fn try_recover_context_overflow(
             // Insert the same model-visible breadcrumb the turn-boundary path
             // uses, owner-aware so a pre-existing crumb does not stack and a
             // genuine user turn equal to the breadcrumb is never mistaken.
-            *crumb_present =
-                insert_breadcrumb_deduped(&mut recovered_history, *crumb_present);
+            *crumb_present = insert_breadcrumb_deduped(&mut recovered_history, *crumb_present);
             // Recompute from the final recovered history (breadcrumb included)
             // so the reported count matches what the retried call sends.
             tokens_after = crate::agent::history::estimate_history_tokens(&recovered_history);

@@ -152,8 +152,8 @@ pub use super::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers,
     estimate_history_tokens, load_interactive_session_history,
     load_interactive_session_history_with_crumb, normalize_system_messages,
-    save_interactive_session_history, save_interactive_session_history_with_crumb,
-    trim_history, truncate_tool_result,
+    save_interactive_session_history, save_interactive_session_history_with_crumb, trim_history,
+    truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -2281,7 +2281,9 @@ pub async fn run(
                         }
                         if let Some(path) = session_state_file.as_deref() {
                             save_interactive_session_history_with_crumb(
-                                path, &history, history_has_trim_breadcrumb,
+                                path,
+                                &history,
+                                history_has_trim_breadcrumb,
                             )?;
                         }
                         continue;
@@ -2830,7 +2832,9 @@ pub async fn run(
 
                 if let Some(path) = session_state_file.as_deref() {
                     save_interactive_session_history_with_crumb(
-                        path, &history, history_has_trim_breadcrumb,
+                        path,
+                        &history,
+                        history_has_trim_breadcrumb,
                     )?;
                 }
             }

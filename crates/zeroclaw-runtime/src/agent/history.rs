@@ -472,7 +472,8 @@ pub fn load_interactive_session_history_with_crumb(
             // current locales and keeps a genuine user message equal to the
             // string correctly handled only when the flag says so on fresh
             // writes.
-            let breadcrumb_content = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+            let breadcrumb_content =
+                crate::i18n::get_required_cli_string("history-trim-breadcrumb");
             if first.role == "user" && first.content == breadcrumb_content {
                 has_crumb = true;
             }
