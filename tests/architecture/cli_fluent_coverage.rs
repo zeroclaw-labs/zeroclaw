@@ -13,7 +13,12 @@ use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 use syn::{Attribute, Expr, Lit, LitStr, Macro, Meta, Token};
 
-const SCAN_ROOTS: &[&str] = &["src", "crates/zeroclaw-providers/src/auth"];
+const SCAN_ROOTS: &[&str] = &[
+    "src",
+    "crates/zeroclaw-gateway/src",
+    "crates/zeroclaw-providers/src/auth",
+    "crates/zeroclaw-runtime/src/approval",
+];
 const LEGACY_ALLOWLIST: &str = include_str!("cli_fluent_legacy_allowlist.tsv");
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]

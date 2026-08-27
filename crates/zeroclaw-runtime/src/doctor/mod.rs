@@ -464,6 +464,33 @@ pub fn persist_model_cache(
 
     let cache_path = cache_dir.join(MODEL_CACHE_FILE);
 
+    // Cross-process advisory lock around the whole read-merge-publish
+    // sequence. The publish itself is collision-safe (exclusive temp file +
+    // atomic rename), but without serialization two concurrent refreshes can
+    // both read the same pre-refresh snapshot and the second rename silently
+    // discards the first one's provider entry — the lost-update window the
+    // collision-safe publish left open. Blocking (rather than failing) lets overlapping
+    // refreshes complete in sequence; the lock releases when the guard drops.
+    let lock_path = cache_dir.join(format!("{MODEL_CACHE_FILE}.lock"));
+    let cache_lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| {
+            format!(
+                "Failed to open model cache lock file at {}",
+                lock_path.display()
+            )
+        })?;
+    cache_lock.lock().with_context(|| {
+        format!(
+            "Failed to lock model cache for refresh at {}",
+            lock_path.display()
+        )
+    })?;
+
     // Load existing cache, starting fresh only when the file is genuinely
     // absent. A malformed or unreadable existing file is left untouched and
     // reported rather than silently replaced with a single-provider cache.
@@ -1380,8 +1407,33 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     for warning in config.collect_warnings() {
         items.push(DiagItem::warn(
             cat,
-            format!("{} (at {})", warning.message, warning.path),
+            format!(
+                "{} (at {})",
+                localized_validation_warning_message(&warning),
+                warning.path
+            ),
         ));
+    }
+}
+
+/// Render a validation warning as the operator-facing `doctor` line.
+///
+/// [`ValidationWarning::message`] is the stable English contract for API
+/// consumers, and its own documentation says user-facing surfaces localize from
+/// the code and fall back to the message only for unknown codes. This is that
+/// mapping for the CLI.
+///
+/// An earlier version of this helper existed for the skills prompt-injection
+/// deprecation and was removed with that warning, so the withheld-capability
+/// notice is currently its only entry.
+fn localized_validation_warning_message(
+    warning: &zeroclaw_config::validation_warnings::ValidationWarning,
+) -> String {
+    match warning.code.as_str() {
+        zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD => {
+            crate::i18n::get_required_cli_string("cli-doctor-verifiable-intent-tool-withheld")
+        }
+        _ => warning.message.clone(),
     }
 }
 
@@ -2092,6 +2144,26 @@ mod tests {
     }
 
     #[test]
+    fn diagnose_surfaces_codex_cli_security_boundary_warning() {
+        let mut config = Config::default();
+        config.codex_cli.extra_args =
+            vec!["--sandbox".to_string(), "danger-full-access".to_string()];
+
+        let results = diagnose(&config);
+        let warning = results.iter().find(|item| {
+            item.category == "config"
+                && item.severity == Severity::Warn
+                && item.message.contains("Codex CLI argument")
+                && item.message.contains("--sandbox")
+                && item.message.contains("codex_cli.extra_args[0]")
+        });
+        assert!(
+            warning.is_some(),
+            "doctor should surface the canonical Codex CLI warning: {results:?}"
+        );
+    }
+
+    #[test]
     fn degraded_sections_reported_as_warning() {
         let config = Config {
             degraded_sections: vec!["channels.telegram.default".to_string()],
@@ -2217,6 +2289,45 @@ mod tests {
         assert_eq!(
             canonicalize_provider_ref("openrouter.work"),
             "openrouter.work"
+        );
+    }
+
+    /// Lost-update regression: concurrent refreshes for different providers
+    /// each read-merge-publish the whole cache file, so without the advisory
+    /// lock one publish can silently drop another's entry. Every concurrently
+    /// written provider must survive.
+    #[test]
+    fn persist_model_cache_concurrent_refreshes_keep_every_provider() {
+        let tmp = TempDir::new().unwrap();
+        let config = config_with_install_root(&tmp);
+
+        let providers: Vec<String> = (0..8).map(|i| format!("provider{i}")).collect();
+        std::thread::scope(|scope| {
+            for provider in &providers {
+                let config = &config;
+                scope.spawn(move || {
+                    for round in 0..5 {
+                        persist_model_cache(config, provider, &[format!("m{round}")]).unwrap();
+                    }
+                });
+            }
+        });
+
+        let raw = std::fs::read_to_string(tmp.path().join("state/models_cache.json")).unwrap();
+        let cache: zeroclaw_config::schema::ModelCacheState = serde_json::from_str(&raw).unwrap();
+        let mut cached: Vec<&str> = cache
+            .entries
+            .iter()
+            .map(|e| e.model_provider.as_str())
+            .collect();
+        cached.sort_unstable();
+        let expected: Vec<String> = providers
+            .iter()
+            .map(|p| canonicalize_provider_ref(p))
+            .collect();
+        assert_eq!(
+            cached, expected,
+            "a concurrent refresh must not lose another provider's entry"
         );
     }
 
@@ -2926,6 +3037,38 @@ mod tests {
                 "expected per-agent SOUL.md diagnostic for {alias}; got {messages:?}"
             );
         }
+    }
+
+    /// `doctor` renders this warning through Fluent rather than printing the
+    /// structured message verbatim. The structured message stays English on
+    /// purpose — API consumers key off a stable contract — so the two are
+    /// asserted to differ rather than to agree.
+    #[test]
+    fn verifiable_intent_withheld_warning_uses_fluent() {
+        let structured_message = "verifiable_intent.enabled is set, but the vi_verify tool is \
+                                  withheld from the model-visible registry until a credential \
+                                  chain verifier exists.";
+        let warning = zeroclaw_config::validation_warnings::ValidationWarning::new(
+            zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD,
+            structured_message,
+            "verifiable_intent.enabled",
+        );
+
+        let expected =
+            crate::i18n::get_required_cli_string("cli-doctor-verifiable-intent-tool-withheld");
+        assert_eq!(localized_validation_warning_message(&warning), expected);
+        assert_ne!(
+            expected, structured_message,
+            "the localized line must not be the structured API message"
+        );
+        assert_ne!(
+            expected, "{cli-doctor-verifiable-intent-tool-withheld}",
+            "the Fluent key must resolve; a marker means it is absent from every catalog"
+        );
+
+        // The diagnostic path is what an operator edits, so it stays the
+        // config key rather than being folded into the localized sentence.
+        assert_eq!(warning.path, "verifiable_intent.enabled");
     }
 
     #[test]

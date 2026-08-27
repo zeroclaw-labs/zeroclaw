@@ -751,12 +751,9 @@ async fn history_trims_after_max_messages() {
         retained_messages.len(),
         max_history,
     );
-    let mut turns = retained_messages.chunks_exact(2);
-    assert!(
-        turns.remainder().is_empty(),
-        "history must retain whole turns"
-    );
-    assert!(turns.all(|turn| matches!(
+    let (turns, remainder) = retained_messages.as_chunks::<2>();
+    assert!(remainder.is_empty(), "history must retain whole turns");
+    assert!(turns.iter().all(|turn| matches!(
         turn,
         [ConversationMessage::Chat(user), ConversationMessage::Chat(assistant)]
             if user.role == "user" && assistant.role == "assistant"

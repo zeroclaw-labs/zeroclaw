@@ -338,7 +338,7 @@ impl Channel for WebhookChannel {
             }
         }
 
-        unreachable!("send loop exits via return or bail on the final attempt")
+        anyhow::bail!("webhook send exhausted retries without a terminal result")
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {

@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use zeroclaw_api::attribution::{Attributable, Role};
+use zeroclaw_api::attribution::{Attributable, Role, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -29,6 +29,9 @@ impl<T: Tool> Attributable for RateLimitedTool<T> {
     fn alias(&self) -> &str {
         self.inner.alias()
     }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.inner.tool_provenance()
+    }
 }
 
 #[async_trait]
@@ -51,6 +54,10 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
 
     fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -123,6 +130,9 @@ impl<T: Tool> Attributable for PathGuardedTool<T> {
     fn alias(&self) -> &str {
         self.inner.alias()
     }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.inner.tool_provenance()
+    }
 }
 
 #[async_trait]
@@ -145,6 +155,10 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
 
     fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {

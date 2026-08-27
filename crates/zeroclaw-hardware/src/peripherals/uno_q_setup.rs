@@ -44,12 +44,9 @@ fn deploy_remote(host: &str, bridge_dir: &std::path::Path) -> Result<()> {
     }
 
     let status = Command::new("scp")
-        .args([
-            "-r",
-            "--",
-            bridge_dir.to_str().unwrap(),
-            &format!("{}:~/ArduinoApps/", ssh_target),
-        ])
+        .args(["-r", "--"])
+        .arg(bridge_dir)
+        .arg(format!("{}:~/ArduinoApps/", ssh_target))
         .status()
         .context("scp failed")?;
     if !status.success() {
@@ -149,7 +146,8 @@ fn deploy_local(bridge_dir: Option<&std::path::Path>) -> Result<()> {
 
     println!("Starting Bridge app...");
     let status = Command::new("arduino-app-cli")
-        .args(["app", "start", dest_dir.to_str().unwrap()])
+        .args(["app", "start"])
+        .arg(&dest_dir)
         .status()
         .context("arduino-app-cli start failed")?;
     if !status.success() {

@@ -9,6 +9,8 @@ mod config_schema;
 mod cron_delivery_cli;
 mod cron_help_examples;
 mod daemon_startup_feedback;
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+mod desktop_cli_linux;
 mod direct_cli_terminal_completion;
 mod dockerignore_test;
 mod gateway;
@@ -18,6 +20,9 @@ mod plugin_feature_graph;
 mod provider_resolution;
 mod provider_schema;
 mod reply_target_field_regression;
+mod schema_export_feature_graph;
 mod security;
 mod skills_bundle_cli;
+#[cfg(feature = "agent-runtime")]
+mod verifiable_intent_notice_visibility;
 mod whatsapp_webhook_security;

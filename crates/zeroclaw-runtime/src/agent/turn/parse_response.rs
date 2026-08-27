@@ -1,6 +1,7 @@
-//! Interpretation of a successful provider chat response: observer/cost
-//! recording, native and text-fallback tool-call parsing, parse-issue
-//! detection, and assistant-history construction.
+//! Interpretation of a successful provider chat response: native and
+//! text-fallback tool-call parsing, parse-issue detection, and assistant
+//! history construction. Accepted-only telemetry is emitted by the caller
+//! after it commits the classification.
 
 use super::context::TurnCtx;
 use super::protocol_detect::{
@@ -115,64 +116,25 @@ pub(crate) struct InterpretedResponse {
     pub(crate) native_tool_calls: Vec<ToolCall>,
     pub(crate) parse_issue_detected: bool,
     pub(crate) input_tokens: Option<u64>,
+    /// Full cumulative provider usage.  The caller records this as rejected
+    /// when protocol classification rejects the response.
+    pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
 }
 
 /// Interpret a successful chat response. Takes the response by value and
 /// holds no borrows of `ctx` past the call (RUN_SHEET `turn.parse_response`).
 pub(crate) async fn interpret_chat_response(
     ctx: &TurnCtx<'_>,
+    _served_provider: &str,
     model: &str,
     resp: ChatResponse,
-    history: &[ChatMessage],
+    _history: &[ChatMessage],
     specs: &IterationToolSpecs,
     streamed_protocol_suppressed: bool,
-    llm_started_at: Instant,
     iteration: usize,
     detect_protocol_without_tools: bool,
 ) -> InterpretedResponse {
-    let (resp_input_tokens, resp_output_tokens) = resp
-        .usage
-        .as_ref()
-        .map(|u| (u.input_tokens, u.output_tokens))
-        .unwrap_or((None, None));
-
-    ctx.observer.record_event(&ObserverEvent::LlmResponse {
-        model_provider: ctx.provider_name.to_string(),
-        model: model.to_string(),
-        duration: llm_started_at.elapsed(),
-        success: true,
-        error_message: None,
-        input_tokens: resp_input_tokens,
-        output_tokens: resp_output_tokens,
-        channel: Some(ctx.channel_name.to_string()),
-        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
-        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
-        turn_id: Some(ctx.turn_id.to_string()),
-        // Credential-scrubbed prompt/completion content for OTel GenAI export;
-        // `None` unless the `observability-otel` feature is active.
-        messages: capture_llm_messages(history, Some(resp.text_or_empty()), &resp.tool_calls),
-    });
-
-    let call_cost_usd = resp
-        .usage
-        .as_ref()
-        .and_then(|usage| record_tool_loop_cost_usage(ctx.provider_name, model, usage))
-        .map(|(_total_tokens, cost_usd)| cost_usd);
-
-    // Per-LLM-call usage event, right after the observer success event
-    // (upstream E2 parity, agent.rs Usage emission).
-    if let Some(tx) = ctx.event_tx
-        && let Some(ref usage) = resp.usage
-    {
-        let _ = tx
-            .send(TurnEvent::Usage {
-                input_tokens: usage.input_tokens,
-                cached_input_tokens: usage.cached_input_tokens,
-                output_tokens: usage.output_tokens,
-                cost_usd: call_cost_usd,
-            })
-            .await;
-    }
+    let resp_input_tokens = resp.usage.as_ref().and_then(|usage| usage.input_tokens);
 
     let response_text = strip_think_tags(resp.text_or_empty());
     // Strip trailing terminal markers (`<eom>`, `<|eom|>`) from non-streaming responses.
@@ -238,7 +200,11 @@ pub(crate) async fn interpret_chat_response(
             &specs.known_tool_names,
         )
         .or_else(|| {
-            streamed_protocol_suppressed.then(|| {
+            // A guard-suppressed stream that reconstructed a valid tool call
+            // is not malformed: its envelope was deliberately withheld from
+            // display and is represented by `calls`. Keep the guard as a
+            // rejection only when parsing left no valid call to execute.
+            (streamed_protocol_suppressed && calls.is_empty()).then(|| {
                 "streaming text guard suppressed an internal tool protocol envelope".to_string()
             })
         })
@@ -259,26 +225,6 @@ pub(crate) async fn interpret_chat_response(
             "tool_call_parse_issue"
         );
     }
-
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
-            .with_category(::zeroclaw_log::EventCategory::Provider)
-            .with_outcome(::zeroclaw_log::EventOutcome::Success)
-            .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
-            .with_attrs(::serde_json::json!({
-                "model": model,
-                "iteration": iteration + 1,
-                "input_tokens": resp_input_tokens,
-                "output_tokens": resp_output_tokens,
-                "cost_usd": call_cost_usd,
-                "raw_response": scrub_credentials(&response_text),
-                "native_tool_calls": resp.tool_calls.len(),
-                "parsed_tool_calls": calls.len(),
-                "trace_id": ctx.turn_id,
-            })),
-        "llm_response"
-    );
 
     // Preserve native tool call IDs in assistant history so role=tool
     // follow-up messages can reference the exact call id.
@@ -311,7 +257,75 @@ pub(crate) async fn interpret_chat_response(
         native_tool_calls: native_calls,
         parse_issue_detected: parse_issue.is_some(),
         input_tokens: resp_input_tokens,
+        usage: resp.usage,
     }
+}
+
+/// Emit effects which are valid only after the turn loop accepts the parsed
+/// response. Keeping this separate from interpretation prevents a malformed
+/// transport success from advancing accepted accounting or success telemetry.
+pub(crate) async fn record_accepted_chat_response(
+    ctx: &TurnCtx<'_>,
+    served_provider: &str,
+    model: &str,
+    response_text: &str,
+    native_tool_calls: &[ToolCall],
+    parsed_tool_calls: usize,
+    usage: Option<&zeroclaw_providers::traits::TokenUsage>,
+    history: &[ChatMessage],
+    llm_started_at: Instant,
+    iteration: usize,
+) {
+    let input_tokens = usage.and_then(|usage| usage.input_tokens);
+    let output_tokens = usage.and_then(|usage| usage.output_tokens);
+    ctx.observer.record_event(&ObserverEvent::LlmResponse {
+        model_provider: served_provider.to_string(),
+        model: model.to_string(),
+        duration: llm_started_at.elapsed(),
+        success: true,
+        error_message: None,
+        input_tokens,
+        output_tokens,
+        channel: Some(ctx.channel_name.to_string()),
+        agent_alias: ctx.agent_alias.map(|s| s.to_string()),
+        parent_agent_alias: ctx.parent_agent_alias.map(|s| s.to_string()),
+        turn_id: Some(ctx.turn_id.to_string()),
+        messages: capture_llm_messages(history, Some(response_text), native_tool_calls),
+    });
+    let cost_usd = usage
+        .and_then(|usage| record_tool_loop_cost_usage(served_provider, model, usage))
+        .map(|(_total_tokens, cost_usd)| cost_usd);
+    if let Some(tx) = ctx.event_tx
+        && let Some(usage) = usage
+    {
+        let _ = tx
+            .send(TurnEvent::Usage {
+                input_tokens: usage.input_tokens,
+                cached_input_tokens: usage.cached_input_tokens,
+                output_tokens: usage.output_tokens,
+                cost_usd,
+            })
+            .await;
+    }
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Receive)
+            .with_category(::zeroclaw_log::EventCategory::Provider)
+            .with_outcome(::zeroclaw_log::EventOutcome::Success)
+            .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
+            .with_attrs(::serde_json::json!({
+                "model": model,
+                "iteration": iteration + 1,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost_usd,
+                "raw_response": scrub_credentials(response_text),
+                "native_tool_calls": native_tool_calls.len(),
+                "parsed_tool_calls": parsed_tool_calls,
+                "trace_id": ctx.turn_id,
+            })),
+        "llm_response"
+    );
 }
 
 #[cfg(test)]
@@ -479,6 +493,7 @@ mod cost_usd_regression_tests {
             pacing: &pacing,
             strict_tool_parsing: false,
             channel: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
             agent_alias: None,
             turn_id: "turn-cost-regression",
         };
@@ -514,7 +529,31 @@ mod cost_usd_regression_tests {
         let now = std::time::Instant::now();
         crate::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT
             .scope(Some(cost_ctx), async {
-                interpret_chat_response(&ctx, model, resp, &[], &specs, false, now, 0, false).await;
+                let interpreted = interpret_chat_response(
+                    &ctx,
+                    provider,
+                    model,
+                    resp,
+                    &[],
+                    &specs,
+                    false,
+                    0,
+                    false,
+                )
+                .await;
+                record_accepted_chat_response(
+                    &ctx,
+                    provider,
+                    model,
+                    &interpreted.response_text,
+                    &interpreted.native_tool_calls,
+                    interpreted.tool_calls.len(),
+                    interpreted.usage.as_ref(),
+                    &[],
+                    now,
+                    0,
+                )
+                .await;
             })
             .await;
 
@@ -570,5 +609,76 @@ mod cost_usd_regression_tests {
         );
 
         zeroclaw_log::clear_broadcast_hook();
+    }
+
+    #[tokio::test]
+    async fn malformed_protocol_retains_usage_without_accepted_usage_event() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(1);
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let ctx = TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "requested.provider",
+            model: "requested-model",
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: Some(&tx),
+            hooks: None,
+            dedup_exempt_tools: &dedup_exempt_tools,
+            pacing: &pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id: "malformed-protocol-usage",
+        };
+        let specs = IterationToolSpecs {
+            tool_specs: vec![crate::tools::ToolSpec::new(
+                "shell",
+                "run a command",
+                serde_json::json!({"type": "object"}),
+            )],
+            known_tool_names: HashSet::from(["shell".to_string()]),
+            use_native_tools: false,
+        };
+        let usage = TokenUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cached_input_tokens: None,
+        };
+        let interpreted = interpret_chat_response(
+            &ctx,
+            "served.provider",
+            "served-model",
+            ChatResponse {
+                text: Some(
+                    "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"pwd\"}</tool_call>"
+                        .to_string(),
+                ),
+                tool_calls: vec![],
+                usage: Some(usage.clone()),
+                reasoning_content: None,
+            },
+            &[],
+            &specs,
+            false,
+            0,
+            false,
+        )
+        .await;
+
+        assert!(interpreted.parse_issue_detected);
+        let retained_usage = interpreted.usage.expect("malformed usage must be retained");
+        assert_eq!(retained_usage.input_tokens, usage.input_tokens);
+        assert_eq!(retained_usage.output_tokens, usage.output_tokens);
+        assert!(
+            rx.try_recv().is_err(),
+            "malformed output must not emit accepted Usage"
+        );
     }
 }

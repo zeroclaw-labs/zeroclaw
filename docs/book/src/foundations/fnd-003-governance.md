@@ -1,8 +1,8 @@
 # FND-003: Team Organization, Project Governance, and Contribution Pipeline
 
-> Starting v0.7.0 · Type: Governance · Rev. 15
+> Starting v0.7.0 · Type: Governance · Rev. 16
 >
-> **Canonical reference** · Ratified by the team · Rev. 15
+> **Canonical reference** · Ratified by the team · Rev. 16
 > Original governance discussion: [#5577](https://github.com/zeroclaw-labs/zeroclaw/issues/5577)
 > Follow-up work-lane and label-governance policy: [#6808](https://github.com/zeroclaw-labs/zeroclaw/issues/6808)
 
@@ -33,6 +33,7 @@
 | 13 | 2026-07-18 | Replaced the universal ADR requirement with an explicit durable-disposition rule for accepted RFCs; reserved ADRs for significant architecture decisions ([#9136](https://github.com/zeroclaw-labs/zeroclaw/pull/9136)) |
 | 14 | 2026-07-25 | Retired the `CONTRIBUTORS.md` membership record and the `zeroclaw-core`/`zeroclaw-contributors` team names, none of which were ever created; §5.3 now names the `core-contributors` GitHub team, CODEOWNERS, and the Communication maintainer table as the real records ([#9388](https://github.com/zeroclaw-labs/zeroclaw/pull/9388)) |
 | 15 | 2026-08-10 | Narrowed the RFC trigger to four project-level categories and named the ordinary work that does not require an RFC; replaced the seven-day discussion period with 48h ordinary / 72h exceptional; defined the 72-hour vote against an immutable snapshot, the 30-day active electorate, two-ballot quorum, silence-as-approval after quorum, non-vetoing `REVISE`, and outcome precedence; made two-thirds the default threshold and reserved unanimity for expensive or irreversible decisions; retired the nonexistent parallel `rfc:*` label family; added the GitHub bridge record for Core meeting decisions ([#9499](https://github.com/zeroclaw-labs/zeroclaw/pull/9499)) |
+| 16 | 2026-08-22 | Calibrated consequence-based PR risk routing, retained `risk:manual` as an automation freeze, and required two independent Core Team approvals for `risk:high` or `domain:security` PRs ([#10192](https://github.com/zeroclaw-labs/zeroclaw/pull/10192)) |
 
 ---
 
@@ -400,14 +401,14 @@ Tier 2 has no durable membership record at present. Establishing one, or retirin
 
 The `CODEOWNERS` file makes governance automatic. It defines which paths require review from which team before a PR can merge. GitHub enforces this as a required review: the PR cannot be merged until the requirement is satisfied.
 
-The block below is the original illustrative proposal, kept for the reasoning it shows about routing by risk tier. It is not the current file and should not be copied. `.github/CODEOWNERS` already exists and is actively maintained; it routes to individual handles rather than team handles, and its paths follow the post-microkernel crate layout established in #6537. The `@zeroclaw-labs/zeroclaw-core` and `@zeroclaw-labs/zeroclaw-contributors` handles used here were never created; see §5.3. Read the live file for current routing.
+The block below is the original illustrative proposal, kept for the reasoning it shows about protected review routing. It is not the current file and should not be copied. `.github/CODEOWNERS` already exists and is actively maintained; it routes to individual handles rather than team handles, and its paths follow the post-microkernel crate layout established in #6537. The `@zeroclaw-labs/zeroclaw-core` and `@zeroclaw-labs/zeroclaw-contributors` handles used here were never created; see §5.3. Its broad routing paths are not the current `risk:high` classifier; read the live file and the [maintainer label guide](../maintainers/labels.md#risk-labels) for current routing and risk semantics.
 
 ```
-# CODEOWNERS — Automatic review routing by risk tier
-# See AGENTS.md for risk tier definitions.
+# CODEOWNERS — Automatic review routing by protected surface
+# See the maintainer label guide for risk definitions.
 # See the governance foundation doc and RFC issue template for team tier definitions.
 
-# ── High Risk: requires Core Team approval ──────────────────────────────────
+# ── Protected review routing: Core Team review ──────────────────────────────
 
 src/security/**                 @zeroclaw-labs/zeroclaw-core
 src/gateway/**                  @zeroclaw-labs/zeroclaw-core
@@ -443,7 +444,7 @@ Configure the following branch protection rules for `master`:
 | Rule | Setting | Reason |
 |---|---|---|
 | Require a pull request before merging | Enabled | No direct pushes to master, ever |
-| Require approvals | 1 for Low/Medium risk; 2 for High risk | CODEOWNERS enforcement handles the "who" |
+| Require approvals | At least 1 GitHub approval; `risk:high` or `domain:security` requires 2 independent Core Team approvals before merge | CODEOWNERS routes review; the conditional two-approval rule is an explicit merge requirement |
 | Require status checks to pass | `cargo fmt`, `cargo clippy`, `cargo test` | CI must be green before merge |
 | Require branches to be up to date | Enabled | Prevents merging stale code |
 | Require conversation resolution | Enabled | All review comments must be resolved |
@@ -452,6 +453,8 @@ Configure the following branch protection rules for `master`:
 | Allow deletions | Disabled | Protect the branch |
 
 **Why admins cannot bypass:** One of the most common mistakes in small team projects is treating branch protection as "for other people." When an admin can bypass, they will, under time pressure, in an emergency, "just this once." Then it becomes the norm. The rule must apply to everyone for it to mean anything. If there is a genuine emergency, the right response is to follow the process faster, not to skip it.
+
+GitHub's native approval count is configured per protected branch or ruleset target, not conditionally by PR label. Until a separately approved technical enforcement design has a machine-readable authority for Core Team approval, maintainers must apply the `risk:high OR domain:security` requirement through the documented merge checklist and retain an auditable review record. `risk:manual` freezes future automatic risk replacement only; it cannot lower this requirement.
 
 ### 6.3 Required Status Checks
 
@@ -490,7 +493,7 @@ A gate that flags valid architectural decisions because the tool misread the con
 
 **CODEOWNERS is the architectural compliance gate. The reviewer is the tool.**
 
-The `CODEOWNERS` configuration in §6.1 already enforces that PRs touching high-risk paths, crate boundaries, trait definitions, the dependency graph, `src/security/`, `.github/`, require review from a Core Team member. That Core Team member, equipped with the RFCs as their reference framework, is the architectural compliance check. They bring the contextual judgment that no automation can replicate.
+The `CODEOWNERS` configuration in §6.1 already routes protected review surfaces such as crate boundaries, trait definitions, the dependency graph, `src/security/`, and `.github/` to a Core Team reviewer. That routing is distinct from `risk:*` classification. The Core Team reviewer, equipped with the RFCs as their reference framework, is the architectural compliance check. They bring the contextual judgment that no automation can replicate.
 
 This is why the RFCs, the AGENTS.md files, and the documentation standards exist: not so a machine can parse them and produce a score, but so a human reviewer has a consistent, documented framework to apply. The RFC answers "why does this architecture exist." The reviewer answers "does this PR serve or undermine that why."
 
@@ -700,9 +703,9 @@ Use `#f1f5f9` (light gray) for all component labels to distinguish them visually
 
 | Label | Color | Use |
 |---|---|---|
-| `risk:low` | `#dcfce7` | Docs, tests, minor changes |
-| `risk:medium` | `#fef9c3` | Most `src/**` changes |
-| `risk:high` | `#fee2e2` | Security, gateway, runtime, CI |
+| `risk:low` | `#dcfce7` | Documentation, fixtures, generated references, and mechanical metadata with no production, compatibility, build, release, or governance effect |
+| `risk:medium` | `#fef9c3` | Ordinary behavioral production work, including most runtime, gateway, provider, channel, tool, config, application, and CI changes |
+| `risk:high` | `#fee2e2` | Concrete trust, credential, compatibility, governance, or release-authority boundary requiring deep review and two independent Core Team approvals |
 
 ### `status:` Where is this in the process?
 

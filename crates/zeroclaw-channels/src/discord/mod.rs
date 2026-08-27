@@ -13,7 +13,9 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelGatePrompt, ChannelMessage,
     GateChoiceEmphasis, SendMessage,
 };
-use zeroclaw_api::media::MediaAttachment;
+use zeroclaw_api::media::{
+    MarkerKind, MediaAttachment, RenderedMarker, provider_loadable_image_mime_for,
+};
 use zeroclaw_runtime::i18n;
 
 // Contract tier: `embed` holds the embed value object that `types`'
@@ -1220,8 +1222,6 @@ async fn process_attachments(
             downloaded_audio_bytes = Some(bytes);
         }
 
-        let marker_kind = marker_kind_for(ct, is_audio);
-
         let bytes = match downloaded_audio_bytes {
             Some(b) => b,
             None => match download_attachment_bytes(client, url, name).await {
@@ -1230,17 +1230,23 @@ async fn process_attachments(
             },
         };
 
-        let marker_target = match workspace_dir {
+        // Decide the disposition from the bytes we now hold, so the same
+        // provider-loadability contract Telegram uses applies here: an image
+        // the loader cannot reload (HEIC/TIFF/SVG/BMP) renders as a document
+        // rather than an image the shared pipeline would try to re-inline.
+        let marker_kind = marker_kind_for(ct, name, &bytes, is_audio);
+        let marker_label = discord_marker_label(marker_kind);
+        let (marker_target, saved_locally) = match workspace_dir {
             Some(dir) => match save_attachment_bytes_to_workspace(dir, name, &bytes).await {
-                Ok(local_path) => local_path.display().to_string(),
+                Ok(local_path) => (local_path.display().to_string(), true),
                 Err(e) => {
-                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": marker_kind, "error": format!("{}", e)})), "attachment save failed, falling back to url");
-                    url.to_string()
+                    ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"name": name, "kind": marker_label, "error": format!("{}", e)})), "attachment save failed, falling back to url");
+                    (url.to_string(), false)
                 }
             },
-            None => url.to_string(),
+            None => (url.to_string(), false),
         };
-        text_parts.push(format!("[{marker_kind}:{marker_target}]"));
+        text_parts.push(format!("[{marker_label}:{marker_target}]"));
 
         media.push(MediaAttachment {
             file_name: name.to_string(),
@@ -1250,6 +1256,18 @@ async fn process_attachments(
             } else {
                 Some(ct.to_string())
             },
+            // Record the exact rendered target for image URL fallbacks too.
+            // They are deliberately not treated as channel-owned by the
+            // shared pipeline: the raw bytes are available and can replace
+            // the URL without relying on remote fetching. The saved name
+            // carries a uniqueness prefix, so `file_name` alone cannot
+            // identify the marker just rendered above — record the target and
+            // disposition so a later stage reads the verdict rather than
+            // re-deciding it from the payload.
+            marker: (saved_locally || marker_kind == MarkerKind::Image).then(|| RenderedMarker {
+                target: marker_target.clone(),
+                kind: marker_kind,
+            }),
         });
     }
 
@@ -1338,19 +1356,40 @@ fn is_discord_audio_attachment(content_type: &str, filename: &str) -> bool {
     false
 }
 
-/// Map a Discord attachment's content type plus audio-detection result to
-/// the canonical outbound marker kind. Pulled out of `process_attachments`
-/// so the MIME-to-marker dispatch can be unit-tested without a live HTTP
+/// Map a Discord attachment's content type, name, and bytes plus its
+/// audio-detection result to the canonical outbound marker kind. Pulled out of
+/// `process_attachments` so the dispatch can be unit-tested without a live HTTP
 /// download.
-fn marker_kind_for(content_type: &str, is_audio: bool) -> &'static str {
+///
+/// An `image/*` content type is only an [`MarkerKind::Image`] when the provider
+/// loader would actually accept the format; the same HEIC/TIFF/SVG/BMP the
+/// Telegram path keeps out of `[IMAGE:]` markers render as documents here too,
+/// so the shared pipeline never reclassifies them into an `[IMAGE:data:...]`
+/// copy the provider rejects.
+fn marker_kind_for(content_type: &str, file_name: &str, data: &[u8], is_audio: bool) -> MarkerKind {
     if content_type.starts_with("image/") {
-        "IMAGE"
+        if provider_loadable_image_mime_for(file_name, data).is_some() {
+            MarkerKind::Image
+        } else {
+            MarkerKind::Document
+        }
     } else if is_audio {
-        "AUDIO"
+        MarkerKind::Audio
     } else if content_type.starts_with("video/") {
-        "VIDEO"
+        MarkerKind::Video
     } else {
-        "DOCUMENT"
+        MarkerKind::Document
+    }
+}
+
+/// The uppercase `[KIND:target]` label Discord renders for a disposition. The
+/// label format is Discord's own; `MarkerKind` stays channel-agnostic.
+fn discord_marker_label(kind: MarkerKind) -> &'static str {
+    match kind {
+        MarkerKind::Image => "IMAGE",
+        MarkerKind::Audio => "AUDIO",
+        MarkerKind::Video => "VIDEO",
+        MarkerKind::Document => "DOCUMENT",
     }
 }
 
@@ -3353,7 +3392,11 @@ impl Channel for DiscordChannel {
     }
 
     fn supports_draft_updates(&self) -> bool {
-        self.stream_mode != zeroclaw_config::schema::StreamMode::Off
+        matches!(
+            self.stream_mode,
+            zeroclaw_config::schema::StreamMode::Partial
+                | zeroclaw_config::schema::StreamMode::MultiMessage
+        )
     }
 
     fn supports_multi_message_streaming(&self) -> bool {
@@ -4225,6 +4268,284 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    /// Discord saves attachments under a uniqueness-prefixed name while the
+    /// envelope keeps the sender's name, so the marker target and the file
+    /// name never match. Driving the real `process_attachments` through the
+    /// real pipeline proves the two are joined by recorded provenance rather
+    /// than by name — a basename comparison sends this image twice.
+    #[tokio::test]
+    async fn saved_attachment_marker_joins_to_its_envelope_through_the_pipeline() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": format!("{}/attachments/1/photo.jpg", server.uri()),
+        })];
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        let saved = media[0]
+            .marker_target()
+            .expect("a saved attachment must record the target it rendered");
+        // The recorded target is a native filesystem path, so the separator is
+        // `\` on Windows and `/` elsewhere. Walk it as a `Path` instead of
+        // matching a `/`-joined substring, which only ever held on Unix — and
+        // which made the save-name check below compare the whole path.
+        let saved_path = std::path::Path::new(saved);
+        assert_eq!(
+            saved_path
+                .parent()
+                .and_then(|dir| dir.file_name())
+                .and_then(|dir| dir.to_str()),
+            Some("discord_files"),
+            "expected a workspace save path, got: {saved}"
+        );
+        assert_ne!(
+            saved_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(saved),
+            media[0].file_name,
+            "the save name must differ from the sender name, or this test proves nothing"
+        );
+        assert!(
+            text.contains(&format!("[IMAGE:{saved}]")),
+            "rendered text must reference exactly the recorded target: {text}"
+        );
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert_eq!(
+            enriched, text,
+            "a Discord-saved image must not be inlined a second time"
+        );
+        assert!(
+            !enriched.contains("IMAGE:data:"),
+            "no base64 copy may be added alongside the path marker: {enriched}"
+        );
+    }
+
+    /// A Discord `image/heic` upload is not a format the provider loader
+    /// accepts. It must render as a document and keep that disposition through
+    /// the shared pipeline; before the loadability contract reached Discord,
+    /// the broader `image/*` classifier marked it channel-owned as an image,
+    /// the pipeline skipped the whole attachment, and the provider then
+    /// rejected the marker it could not reload — dropping the bytes entirely.
+    #[tokio::test]
+    async fn unloadable_image_upload_stays_a_document_through_the_pipeline() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.heic"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0x00, 0x01, 0x02, 0x03]))
+            .mount(&server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.heic",
+            "content_type": "image/heic",
+            "url": format!("{}/attachments/1/photo.heic", server.uri()),
+        })];
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert_eq!(
+            media[0].marker.as_ref().map(|m| m.kind),
+            Some(MarkerKind::Document),
+            "an unloadable image must be owned as a document, not an image"
+        );
+        assert!(
+            text.contains("[DOCUMENT:") && !text.contains("[IMAGE:"),
+            "the unloadable image must render as a document marker: {text}"
+        );
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert_eq!(
+            enriched, text,
+            "a channel-owned document must not be reclassified and inlined as an image"
+        );
+        assert!(
+            !enriched.contains("IMAGE:data:"),
+            "no base64 image copy may be produced for an unloadable image: {enriched}"
+        );
+    }
+
+    /// With no workspace configured (or a failed save) the rendered target is
+    /// the attachment URL, which the default no-remote-image path will not
+    /// fetch. The typed envelope records that fallback as non-owned, so the
+    /// pipeline replaces the URL with inline data and provider preparation
+    /// sees one effective image reference without a false partial-load note.
+    #[tokio::test]
+    async fn image_with_no_workspace_is_enriched_rather_than_dropped() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": format!("{}/attachments/1/photo.jpg", server.uri()),
+        })];
+
+        // No workspace: the marker target can only be the (non-reloadable) URL.
+        let (text, media) =
+            process_attachments(&attachments, &reqwest::Client::new(), None, None).await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert!(
+            media[0].marker_target().is_some(),
+            "a URL fallback must retain its exact channel marker target"
+        );
+        assert_eq!(
+            media[0].channel_rendered_remote_image_target(),
+            attachments[0]["url"].as_str(),
+            "the URL fallback must be exposed for exact replacement"
+        );
+        assert!(
+            !media[0].channel_rendered_owned_disposition(),
+            "a remote URL fallback must not be deferred by the shared pipeline"
+        );
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert!(
+            enriched.contains("IMAGE:data:"),
+            "the loadable image's bytes must reach the provider as inline data, not be dropped: {enriched}"
+        );
+
+        let prepared = zeroclaw_providers::multimodal::prepare_messages_for_provider(
+            &[zeroclaw_api::model_provider::ChatMessage::user(enriched)],
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+        )
+        .await
+        .expect("provider preparation should accept the inline fallback image");
+        assert!(prepared.contains_images);
+        let provider_content = &prepared.messages[0].content;
+        assert_eq!(
+            provider_content.matches("data:image/jpeg;base64,").count(),
+            1,
+            "provider preparation must receive one effective image: {provider_content}"
+        );
+        assert!(
+            !provider_content.contains("could not be loaded"),
+            "a successful inline fallback must not produce a partial-load note: {provider_content}"
+        );
+        assert!(
+            !provider_content.contains(attachments[0]["url"].as_str().unwrap()),
+            "the unfetchable URL must not survive beside the inline image: {provider_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_with_failed_workspace_save_is_enriched_rather_than_dropped() {
+        use crate::orchestrator::media_pipeline::MediaPipeline;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/attachments/1/photo.jpg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/attachments/1/photo.jpg", server.uri());
+        let attachments = vec![serde_json::json!({
+            "filename": "photo.jpg",
+            "content_type": "image/jpeg",
+            "url": url,
+        })];
+        // A regular file cannot contain the `discord_files` save directory,
+        // so this exercises the same URL fallback after download succeeds.
+        let blocked_workspace = tempfile::NamedTempFile::new().unwrap();
+
+        let (text, media) = process_attachments(
+            &attachments,
+            &reqwest::Client::new(),
+            Some(blocked_workspace.path()),
+            None,
+        )
+        .await;
+
+        assert_eq!(media.len(), 1, "one attachment in, one envelope out");
+        assert_eq!(media[0].marker_target(), Some(url.as_str()));
+        assert_eq!(
+            media[0].channel_rendered_remote_image_target(),
+            Some(url.as_str())
+        );
+        assert!(!media[0].channel_rendered_owned_disposition());
+
+        let config = zeroclaw_config::schema::MediaPipelineConfig {
+            enabled: true,
+            describe_images: true,
+            ..Default::default()
+        };
+        let enriched = MediaPipeline::new(&config, None, true)
+            .process(&text, &media)
+            .await;
+
+        assert!(enriched.contains("[IMAGE:data:image/jpeg;base64,"));
+        assert!(!enriched.contains(&url));
     }
 
     #[tokio::test]
@@ -6726,28 +7047,98 @@ mod tests {
 
     #[test]
     fn marker_kind_for_classifies_each_mime_family() {
-        assert_eq!(marker_kind_for("image/png", false), "IMAGE");
-        assert_eq!(marker_kind_for("image/jpeg", false), "IMAGE");
-        assert_eq!(marker_kind_for("video/mp4", false), "VIDEO");
-        assert_eq!(marker_kind_for("application/pdf", false), "DOCUMENT");
-        assert_eq!(marker_kind_for("application/zip", false), "DOCUMENT");
-        assert_eq!(marker_kind_for("", false), "DOCUMENT");
+        assert_eq!(
+            marker_kind_for("image/png", "photo.png", b"", false),
+            MarkerKind::Image
+        );
+        assert_eq!(
+            marker_kind_for("image/jpeg", "photo.jpg", b"", false),
+            MarkerKind::Image
+        );
+        assert_eq!(
+            marker_kind_for("video/mp4", "clip.mp4", b"", false),
+            MarkerKind::Video
+        );
+        assert_eq!(
+            marker_kind_for("application/pdf", "doc.pdf", b"", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("application/zip", "archive.zip", b"", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("", "blob", b"", false),
+            MarkerKind::Document
+        );
+    }
+
+    #[test]
+    fn marker_kind_for_demotes_an_unloadable_image_to_a_document() {
+        // The provider loader rejects HEIC/TIFF/SVG/BMP, so an `image/*`
+        // content type in one of those formats must render as a document
+        // rather than an image the shared pipeline would try to re-inline.
+        assert_eq!(
+            marker_kind_for("image/heic", "photo.heic", b"", false),
+            MarkerKind::Document
+        );
+        assert_eq!(
+            marker_kind_for("image/tiff", "scan.tiff", b"", false),
+            MarkerKind::Document
+        );
+        // A recognized-but-rejected extension wins over the payload: BMP bytes
+        // that carry a PNG magic prefix stay a document, matching the loader's
+        // precedence (an unrecognized extension like `.heic` instead defers to
+        // the magic sniff, which is covered separately).
+        assert_eq!(
+            marker_kind_for(
+                "image/bmp",
+                "photo.bmp",
+                &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+                false
+            ),
+            MarkerKind::Document
+        );
+    }
+
+    #[test]
+    fn marker_kind_for_recovers_a_loadable_image_from_its_magic_bytes() {
+        // An extensionless upload still classifies as an image when the bytes
+        // carry a provider-loadable magic signature (PNG here).
+        assert_eq!(
+            marker_kind_for(
+                "image/png",
+                "photo",
+                &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A],
+                false
+            ),
+            MarkerKind::Image
+        );
     }
 
     #[test]
     fn marker_kind_for_treats_audio_flag_as_audio_regardless_of_content_type() {
         // Filename-detected audio with no content_type should still classify
         // as AUDIO, matching the unified inbound pipeline.
-        assert_eq!(marker_kind_for("", true), "AUDIO");
-        assert_eq!(marker_kind_for("application/octet-stream", true), "AUDIO");
+        assert_eq!(
+            marker_kind_for("", "clip.ogg", b"", true),
+            MarkerKind::Audio
+        );
+        assert_eq!(
+            marker_kind_for("application/octet-stream", "clip.ogg", b"", true),
+            MarkerKind::Audio
+        );
     }
 
     #[test]
     fn marker_kind_for_prefers_image_over_audio_when_content_type_is_image() {
         // Defensive: if a Discord attachment somehow tripped both heuristics,
-        // image MIME wins so vision-capable providers still receive image
-        // bytes through the MediaAttachment path.
-        assert_eq!(marker_kind_for("image/png", true), "IMAGE");
+        // a loadable image MIME wins so vision-capable providers still receive
+        // image bytes through the MediaAttachment path.
+        assert_eq!(
+            marker_kind_for("image/png", "photo.png", b"", true),
+            MarkerKind::Image
+        );
     }
 
     #[test]

@@ -228,6 +228,22 @@ impl FileExplorerState {
         self.list_state.selected()
     }
 
+    fn page_step(&self) -> usize {
+        self.last_list_area.height.max(1) as usize
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        let vis_len = self.visible_entries().len();
+        if vis_len == 0 {
+            self.list_state.select(None);
+            return;
+        }
+        let current = self.selected_idx().unwrap_or(0) as isize;
+        let max = (vis_len - 1) as isize;
+        let next = (current + delta).clamp(0, max) as usize;
+        self.list_state.select(Some(next));
+    }
+
     fn current_entry(&self) -> Option<&ExplorerEntry> {
         let visible = self.visible_entries();
         self.list_state
@@ -295,23 +311,19 @@ impl FileExplorerState {
                 ExplorerAction::None
             }
             Some(FileExplorerAction::Down) => {
-                if let Some(i) = self.selected_idx() {
-                    if i + 1 < vis_len {
-                        self.list_state.select(Some(i + 1));
-                    }
-                } else if vis_len > 0 {
-                    self.list_state.select(Some(0));
-                }
+                self.move_selection(1);
                 ExplorerAction::None
             }
             Some(FileExplorerAction::Up) => {
-                if let Some(i) = self.selected_idx() {
-                    if i > 0 {
-                        self.list_state.select(Some(i - 1));
-                    }
-                } else if vis_len > 0 {
-                    self.list_state.select(Some(0));
-                }
+                self.move_selection(-1);
+                ExplorerAction::None
+            }
+            Some(FileExplorerAction::PageDown) => {
+                self.move_selection(self.page_step() as isize);
+                ExplorerAction::None
+            }
+            Some(FileExplorerAction::PageUp) => {
+                self.move_selection(-(self.page_step() as isize));
                 ExplorerAction::None
             }
             Some(FileExplorerAction::JumpStart) => {
@@ -424,6 +436,22 @@ impl FileExplorerState {
                 let vis = self.visible_entries();
                 self.list_state
                     .select(if vis.is_empty() { None } else { Some(0) });
+                ExplorerAction::None
+            }
+            Some(FileExplorerSearchAction::Down) => {
+                self.move_selection(1);
+                ExplorerAction::None
+            }
+            Some(FileExplorerSearchAction::Up) => {
+                self.move_selection(-1);
+                ExplorerAction::None
+            }
+            Some(FileExplorerSearchAction::PageDown) => {
+                self.move_selection(self.page_step() as isize);
+                ExplorerAction::None
+            }
+            Some(FileExplorerSearchAction::PageUp) => {
+                self.move_selection(-(self.page_step() as isize));
                 ExplorerAction::None
             }
             _ => {
@@ -558,8 +586,7 @@ impl FileExplorerState {
             .style(theme::fill_style())
             .highlight_style(theme::selected_style());
         self.last_list_area = chunks[0];
-        let mut ls = self.list_state;
-        f.render_stateful_widget(list, chunks[0], &mut ls);
+        f.render_stateful_widget(list, chunks[0], &mut self.list_state);
 
         // Footer: selected count + search + key hints.
         let mut footer_spans: Vec<Span> = Vec::new();
@@ -791,5 +818,184 @@ mod tests {
 
         // First entry must be selected.
         assert_eq!(state.list_state.selected(), Some(0));
+    }
+
+    fn named_entry(name: &str) -> ExplorerEntry {
+        ExplorerEntry {
+            name: name.to_string(),
+            is_dir: false,
+            size: 0,
+            _is_hidden: false,
+            full_path: PathBuf::from(format!("/tmp/{name}")),
+        }
+    }
+
+    fn explorer_with_entries(names: &[&str]) -> FileExplorerState {
+        let mut state = FileExplorerState::new(std::env::temp_dir());
+        state.entries = names.iter().copied().map(named_entry).collect();
+        state.list_state.select(Some(0));
+        state
+    }
+
+    #[test]
+    fn ordinary_up_down_move_one_row() {
+        let mut state = explorer_with_entries(&["a", "b", "c"]);
+        assert_eq!(state.list_state.selected(), Some(0));
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(state.list_state.selected(), Some(1));
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(state.list_state.selected(), Some(2));
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(state.list_state.selected(), Some(2));
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(state.list_state.selected(), Some(1));
+    }
+
+    #[test]
+    fn ordinary_page_nav_uses_list_height_and_clamps() {
+        let mut state =
+            explorer_with_entries(&["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"]);
+        state.last_list_area = Rect::new(0, 0, 40, 5);
+        state.handle_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(state.list_state.selected(), Some(5));
+        state.handle_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(state.list_state.selected(), Some(10));
+        state.handle_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(state.list_state.selected(), Some(11));
+        state.handle_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(state.list_state.selected(), Some(6));
+        state.handle_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(state.list_state.selected(), Some(1));
+        state.handle_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(state.list_state.selected(), Some(0));
+    }
+
+    #[test]
+    fn mouse_click_uses_offset_persisted_by_render() {
+        use crossterm::event::MouseButton;
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let names: Vec<String> = (0..60).map(|i| i.to_string()).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut state = explorer_with_entries(&name_refs);
+
+        let backend = TestBackend::new(100, 40);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let area = Rect::new(0, 0, 100, 40);
+        terminal
+            .draw(|f| state.render(f, area))
+            .expect("initial render");
+
+        // Page down enough times to scroll the viewport well past the top.
+        for _ in 0..5 {
+            state.handle_key(KeyEvent::from(KeyCode::PageDown));
+        }
+        terminal
+            .draw(|f| state.render(f, area))
+            .expect("render after paging");
+
+        let offset = state.list_state.offset();
+        assert!(
+            offset > 0,
+            "render must have scrolled the list past the top, got offset {offset}"
+        );
+
+        // Click the first visibly rendered row. It must resolve through the
+        // renderer's persisted offset, not a stale zero.
+        let list_area = state.last_list_area;
+        let click = MouseEvent {
+            column: list_area.x,
+            row: list_area.y,
+            kind: MouseEventKind::Down(MouseButton::Left),
+            modifiers: KeyModifiers::NONE,
+        };
+        state.handle_mouse(click);
+
+        assert_eq!(
+            state.list_state.selected(),
+            Some(offset),
+            "clicking the first visible row must select the entry at the render offset"
+        );
+    }
+
+    #[test]
+    fn search_mode_arrows_and_pages_move_without_leaving_search() {
+        let mut state = explorer_with_entries(&[
+            "alpha.txt",
+            "beta.txt",
+            "gamma.txt",
+            "other.md",
+            "alpha2.txt",
+            "alpha3.txt",
+            "alpha4.txt",
+            "alpha5.txt",
+            "alpha6.txt",
+        ]);
+        state.last_list_area = Rect::new(0, 0, 40, 3);
+        state.handle_key(KeyEvent::from(KeyCode::Char('/')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('l')));
+        assert!(state.searching);
+        assert_eq!(state.search_query, "al");
+        assert_eq!(state.visible_entries().len(), 6);
+        assert_eq!(state.list_state.selected(), Some(0));
+
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(state.list_state.selected(), Some(1));
+        assert!(state.searching);
+        assert_eq!(state.search_query, "al");
+
+        state.handle_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(state.list_state.selected(), Some(4));
+        assert!(state.searching);
+        assert_eq!(state.search_query, "al");
+
+        state.handle_key(KeyEvent::from(KeyCode::PageDown));
+        assert_eq!(state.list_state.selected(), Some(5));
+        state.handle_key(KeyEvent::from(KeyCode::Up));
+        assert_eq!(state.list_state.selected(), Some(4));
+        state.handle_key(KeyEvent::from(KeyCode::PageUp));
+        assert_eq!(state.list_state.selected(), Some(1));
+        assert!(state.searching);
+        assert_eq!(state.search_query, "al");
+    }
+
+    #[test]
+    fn search_mode_typing_still_resets_to_first_match() {
+        let mut state = explorer_with_entries(&["alpha.txt", "also.txt", "other.md"]);
+        state.handle_key(KeyEvent::from(KeyCode::Char('/')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        assert_eq!(state.visible_entries().len(), 2);
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(state.list_state.selected(), Some(1));
+        state.handle_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(state.search_query, "al");
+        assert_eq!(state.list_state.selected(), Some(0));
+        assert!(state.searching);
+    }
+
+    #[test]
+    fn search_mode_enter_confirms_highlighted_file() {
+        let mut state = explorer_with_entries(&["alpha.txt", "beta.txt", "gamma.txt"]);
+        state.handle_key(KeyEvent::from(KeyCode::Char('/')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(action, ExplorerAction::Confirm(ref paths) if paths == &[PathBuf::from("/tmp/alpha.txt")]),
+            "Enter should confirm the highlighted filtered file"
+        );
+    }
+
+    #[test]
+    fn search_mode_enter_confirms_navigated_highlight() {
+        let mut state = explorer_with_entries(&["alpha.txt", "also.txt", "other.md"]);
+        state.handle_key(KeyEvent::from(KeyCode::Char('/')));
+        state.handle_key(KeyEvent::from(KeyCode::Char('a')));
+        state.handle_key(KeyEvent::from(KeyCode::Down));
+        let action = state.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(
+            matches!(action, ExplorerAction::Confirm(ref paths) if paths == &[PathBuf::from("/tmp/also.txt")]),
+            "Enter should confirm the row moved to while searching"
+        );
     }
 }

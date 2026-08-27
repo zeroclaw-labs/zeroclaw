@@ -155,12 +155,6 @@ The udev rule `99-act-led.rules` grants the `gpio` group write access to:
 
 This allows toggling the Pi's green ACT LED without `sudo`.
 
-### Aardvark I2C/SPI adapter
-
-If a Total Phase Aardvark adapter is connected, the `hardware` feature enables I2C/SPI communication with external devices. No extra setup is needed — the device is auto-detected via USB.
-
----
-
 ## Files Deployed to the Pi
 
 | Remote path | Source | Description |

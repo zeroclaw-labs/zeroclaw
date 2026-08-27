@@ -58,6 +58,12 @@ jobs:
           else
             prebuilt_images=true
             source_matrix='{"include":[{"dockerfile":"Dockerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-amd64","gateway_smoke":true},{"dockerfile":"Dockerfile","platform":"linux/arm64","tag":"zeroclaw-pr-source-default:build","cache-scope":"docker-source-default-arm64","gateway_smoke":false},{"dockerfile":"Dockerfile.debian","platform":"linux/amd64","tag":"zeroclaw-pr-source-debian:build","cache-scope":"docker-source-debian","gateway_smoke":false},{"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-amd64","gateway_smoke":false},{"dockerfile":"Dockerfile.alpine","platform":"linux/arm64","tag":"zeroclaw-pr-source-alpine:build","cache-scope":"docker-source-alpine-arm64","gateway_smoke":false}]}'
+            # Exercise the feature override that requires the repository WIT
+            # contract in both shell-equipped source-image variants.
+            source_matrix=$(jq -c '.include += [
+              {"dockerfile":"Dockerfile.debian","platform":"linux/amd64","tag":"zeroclaw-pr-source-debian-wasm:build","cache-scope":"docker-source-debian-wasm","gateway_smoke":false,"cargo_flags":"--features plugins-wasm-runtime-only"},
+              {"dockerfile":"Dockerfile.alpine","platform":"linux/amd64","tag":"zeroclaw-pr-source-alpine-wasm:build","cache-scope":"docker-source-alpine-wasm-amd64","gateway_smoke":false,"cargo_flags":"--features plugins-wasm-runtime-only"}
+            ]' <<< "$source_matrix")
             if [ "$containerfile_required" = true ]; then
               source_matrix=$(jq -c '.include += [{"dockerfile":"Containerfile","platform":"linux/amd64","tag":"zeroclaw-pr-source-all-features:build","cache-scope":"containerfile-source-all-features-amd64","gateway_smoke":false}]' <<< "$source_matrix")
             fi
@@ -148,11 +154,21 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           push: false
-          load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64') }}
+          load: ${{ matrix.gateway_smoke || (matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' && !matrix.cargo_flags) }}
           platforms: ${{ matrix.platform }}
           tags: ${{ matrix.tag }}
           cache-from: type=gha,scope=${{ matrix.cache-scope }}
           cache-to: type=gha,scope=${{ matrix.cache-scope }},mode=max,ignore-error=true
+          build-args: ${{ matrix.cargo_flags && format('ZEROCLAW_CARGO_FLAGS={0}', matrix.cargo_flags) || '' }}
+
+      - name: Verify default production image runs as non-root
+        if: matrix.dockerfile == 'Dockerfile' && matrix.platform == 'linux/amd64'
+        run: |
+          actual_user=$(docker inspect --format='{{.Config.User}}' "${{ matrix.tag }}")
+          if [ "$actual_user" != "65534:65534" ]; then
+            echo "::error title=Unexpected container user::Expected 65534:65534, found ${actual_user:-<empty>}"
+            exit 1
+          fi
 
       - name: Smoke test Compose published gateway port
         if: matrix.gateway_smoke
@@ -161,13 +177,13 @@ jobs:
         run: bash scripts/ci/smoke_docker_compose.sh
 
       - name: Smoke Alpine binaries
-        if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64'
+        if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' && !matrix.cargo_flags
         run: |
           docker run --rm --entrypoint zeroclaw "${{ matrix.tag }}" --version
           docker run --rm --entrypoint zerocode "${{ matrix.tag }}" --version
 
       - name: Smoke Alpine Compose runtime
-        if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64'
+        if: matrix.dockerfile == 'Dockerfile.alpine' && matrix.platform == 'linux/amd64' && !matrix.cargo_flags
         run: |
           docker tag "${{ matrix.tag }}" zeroclaw:alpine
           compose=(docker compose -f docker-compose.yml -f docker-compose.alpine.yml)

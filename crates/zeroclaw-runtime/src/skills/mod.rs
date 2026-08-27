@@ -2662,6 +2662,16 @@ pub fn install_extra_registry_skill_source(
 
 // ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
 
+/// Load the skills shipped by every skill-plugin instance the activation plan
+/// admitted.
+///
+/// The `plugins.max_active_instances` ceiling spans channels, tools, and
+/// skills, so this loader may not walk `skill_plugin_details()` directly: it
+/// derives the same admitted set from the current config and host snapshot
+/// that the channel and tool loaders derive, and skips any package whose skill
+/// binding the plan did not admit. The plan holds no counter, so loading
+/// skills repeatedly from one snapshot yields the same set instead of spending
+/// the same logical slot again.
 #[cfg(feature = "plugins-wasm")]
 pub fn load_plugin_skills_from_config(
     config: &zeroclaw_config::schema::Config,
@@ -2695,10 +2705,33 @@ pub fn load_plugin_skills_from_config(
         }
     };
 
+    let plan = match crate::plugin_runtime::PluginActivationPlan::build(config, &host) {
+        Ok(plan) => plan,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "failed to admit logical plugin skill instances"
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+
     let allow_scripts = config.skills.allow_scripts;
     let mut skills = Vec::new();
     let mut dropped = Vec::new();
     for (manifest, skills_dir) in host.skill_plugin_details() {
+        // `for_package_binding` names the skill binding after the package, so
+        // the package name is both halves of this admission lookup.
+        if !plan.admits(
+            &manifest.name,
+            zeroclaw_plugins::PluginCapability::Skill,
+            &manifest.name,
+        ) {
+            continue;
+        }
         let (raw_skills, raw_dropped) = load_skills_from_directory(&skills_dir, allow_scripts);
         for raw in raw_skills {
             skills.push(namespace_plugin_skill(&manifest.name, raw));

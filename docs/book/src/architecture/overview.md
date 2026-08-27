@@ -57,7 +57,6 @@ flowchart TB
 | `zeroclaw-spawn` | Sanctioned `tokio::spawn` wrapper (`spawn!` macro) that propagates attribution |
 | `zeroclaw-macros` | Derive macros for config, tool registration |
 | `zerocode` | Terminal UI |
-| `aardvark-sys`, `robot-kit` | Specialised hardware support |
 
 The microkernel roadmap (RFC #5574) is actively splitting `zeroclaw-runtime` further: the kernel layer will shrink to the agent loop and policy enforcement, with everything else moving behind feature flags.
 

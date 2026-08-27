@@ -1241,7 +1241,16 @@ pub fn sync_declarative_jobs(
             let expression = schedule_cron_expression(&schedule).unwrap_or_default();
             let schedule_json = serde_json::to_string(&schedule)?;
             let job_type = &decl.job_type;
-            let session_target = decl.session_target.as_deref().unwrap_or("isolated");
+            // Persist the canonical enum, not the raw config string. `try_parse`
+            // trims and lowercases; the stored-row `parse` path does not, so a
+            // value like `"  MAIN  "` would otherwise reload as Isolated.
+            let session_target = match decl.session_target.as_deref() {
+                Some(raw) => SessionTarget::try_parse(raw).map_err(|err| {
+                    anyhow::Error::msg(format!("Declarative cron job '{id}': {err}"))
+                })?,
+                None => SessionTarget::Isolated,
+            };
+            let session_target = session_target.as_str();
             let delivery = match &decl.delivery {
                 Some(d) => convert_delivery_decl(d),
                 None => DeliveryConfig::default(),
@@ -1424,6 +1433,11 @@ fn validate_decl(id: &str, decl: &zeroclaw_config::schema::CronJobDecl) -> Resul
                 "Declarative cron job '{id}': invalid job_type '{other}', expected 'shell' or 'agent'"
             );
         }
+    }
+
+    if let Some(raw) = decl.session_target.as_deref() {
+        SessionTarget::try_parse(raw)
+            .map_err(|err| anyhow::Error::msg(format!("Declarative cron job '{id}': {err}")))?;
     }
 
     Ok(())
@@ -3143,6 +3157,77 @@ mod tests {
     }
 
     #[test]
+    fn sync_validates_session_target() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_agent_decl("bad-session", "0 2 * * *", "do stuff");
+        decl.session_target = Some("shared".to_string());
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "unknown session_target must be rejected like an unknown job_type"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("session_target"), "got {err}");
+        assert!(err.contains("isolated"), "got {err}");
+        assert!(err.contains("main"), "got {err}");
+    }
+
+    #[test]
+    fn sync_agent_job_persists_session_target_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["main-session"]);
+
+        let (id, mut decl) = make_agent_decl("main-session", "*/15 * * * *", "continue the thread");
+        decl.session_target = Some("main".to_string());
+        let decls = decls_map(vec![(id, decl)]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        let job = get_job(&config, "main-session").unwrap();
+        assert_eq!(job.session_target, SessionTarget::Main);
+    }
+
+    #[test]
+    fn sync_agent_job_persists_canonical_session_target_from_whitespace_padded_main() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        seed_claiming_agent(&mut config, &["padded-main"]);
+
+        let (id, mut decl) = make_agent_decl("padded-main", "*/15 * * * *", "continue the thread");
+        decl.session_target = Some("  MAIN  ".to_string());
+        let decls = decls_map(vec![(id, decl)]);
+        sync_declarative_jobs(&config, &decls).unwrap();
+
+        // Reload through the stored-row parser, which does not trim. A raw
+        // `"  MAIN  "` column would come back Isolated and the scheduler
+        // would start a fresh session instead of main.
+        let job = get_job(&config, "padded-main").unwrap();
+        assert_eq!(job.session_target, SessionTarget::Main);
+    }
+
+    #[test]
+    fn sync_validates_session_target_on_shell_jobs() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+
+        let (id, mut decl) = make_shell_decl("bad-shell-session", "0 2 * * *", "echo ok");
+        decl.session_target = Some("shared".to_string());
+
+        let decls = decls_map(vec![(id, decl)]);
+        let result = sync_declarative_jobs(&config, &decls);
+        assert!(
+            result.is_err(),
+            "unknown session_target must fail closed for shell declarations too"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("session_target"), "got {err}");
+    }
+
+    #[test]
     fn sync_agent_job_inserts_correctly() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
@@ -3234,13 +3319,22 @@ schedule = { kind = "every", every_ms = 300000 }
     fn skip_missed_run_advances_recurring_job_next_run() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
+        // Keep the reference one second before a minute boundary so the test
+        // exercises the exact rollover that made the old wall-clock assertion
+        // flaky. The explicit UTC zone keeps the expected occurrence stable
+        // across developer and CI machine timezones.
+        let reference = "2026-08-25T12:34:59Z".parse::<DateTime<Utc>>().unwrap();
+        let schedule = Schedule::Cron {
+            expr: "* * * * *".to_string(),
+            tz: Some("UTC".to_string()),
+        };
 
         // Add a cron job that will be "overdue" — its next_run is set based
         // on the schedule from the current time, so we need to make it past.
-        let job = add_job(&config, "test-agent", "* * * * *", "echo test").unwrap();
+        let job = add_job_with_schedule(&config, "test-agent", &schedule, "echo test").unwrap();
 
         // Force next_run into the past so the job appears overdue.
-        let past = Utc::now() - ChronoDuration::hours(1);
+        let past = reference - ChronoDuration::hours(1);
         with_initialized_connection(&config, |conn| {
             conn.execute(
                 "UPDATE cron_jobs SET next_run = ?1 WHERE id = ?2",
@@ -3253,20 +3347,23 @@ schedule = { kind = "every", every_ms = 300000 }
 
         // Verify it is overdue now.
         assert!(
-            !all_overdue_jobs(&config, Utc::now()).unwrap().is_empty(),
+            !all_overdue_jobs(&config, reference).unwrap().is_empty(),
             "job with past next_run must appear in overdue"
         );
 
         // Skip the missed run.
         let reloaded = get_job(&config, &job.id).unwrap();
-        skip_missed_run(&config, &reloaded, Utc::now()).unwrap();
+        skip_missed_run(&config, &reloaded, reference).unwrap();
 
-        // The job's next_run should now be in the future.
+        // The job's next_run should be the first occurrence after the same
+        // reference instant supplied to skip_missed_run.
         let updated = get_job(&config, &job.id).unwrap();
+        let expected_next_run = "2026-08-25T12:35:00Z".parse::<DateTime<Utc>>().unwrap();
         assert!(
-            updated.next_run > Utc::now(),
+            updated.next_run > reference,
             "skip_missed_run must advance next_run to the future"
         );
+        assert_eq!(updated.next_run, expected_next_run);
         assert!(updated.enabled, "recurring job must stay enabled");
     }
 

@@ -251,6 +251,7 @@ fn built_with(tools: Vec<Box<dyn Tool>>) -> AllToolsResult {
         escalate_handle: None,
         channel_room_handle: None,
         unfiltered_tool_arcs: Vec::new(),
+        delegate_tool: None,
     }
 }
 

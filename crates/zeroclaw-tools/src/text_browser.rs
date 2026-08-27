@@ -238,9 +238,9 @@ fn validate_text_browser_url(
         .ok_or_else(|| anyhow::Error::msg("URL must include a host"))?;
 
     let bare_host = host_str.trim_start_matches('[').trim_end_matches(']');
-    let is_ipv6 = bare_host.parse::<std::net::Ipv6Addr>().is_ok();
-    let (host, display_host) = if is_ipv6 {
-        let bare = bare_host.parse::<std::net::Ipv6Addr>().unwrap().to_string();
+    let parsed_ipv6 = bare_host.parse::<std::net::Ipv6Addr>();
+    let (host, display_host) = if let Ok(bare) = parsed_ipv6 {
+        let bare = bare.to_string();
         (bare.clone(), format!("[{bare}]"))
     } else {
         let h = host_str.to_lowercase();
