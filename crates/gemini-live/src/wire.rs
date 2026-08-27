@@ -2,7 +2,7 @@
 //! Populated in Tasks 3-5.
 
 use base64::Engine as _;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::types::{Role, ServerEvent, SetupConfig};
 
@@ -232,7 +232,10 @@ pub fn build_setup(cfg: &SetupConfig) -> Value {
         "realtimeInputConfig": { "automaticActivityDetection": aad },
         "sessionResumption": { "handle": cfg.resume_handle },
         "inputAudioTranscription": {},
-        "outputAudioTranscription": {}
+        "outputAudioTranscription": {},
+        // long-running sessions: sliding-window compression keeps the
+        // session under the context cap.
+        "contextWindowCompression": { "slidingWindow": {} }
     });
 
     // Disable model "thinking" in BOTH modes for lowest latency. Per the SDK
@@ -330,7 +333,8 @@ mod tests {
         assert_eq!(setup["generationConfig"]["responseModalities"][0], "AUDIO");
         assert_eq!(setup["generationConfig"]["temperature"], TEMPERATURE as f64);
         assert_eq!(
-            setup["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
+            setup["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
+                ["voiceName"],
             "Autonoe"
         );
         assert_eq!(
@@ -404,6 +408,17 @@ mod tests {
     }
 
     #[test]
+    fn build_setup_emits_context_window_compression() {
+        let c = cfg(Model::HalfCascade, None);
+        let v = build_setup(&c);
+        let cwc = &v["setup"]["contextWindowCompression"];
+        assert!(
+            cwc.get("slidingWindow").is_some(),
+            "setup must enable sliding-window context compression, got: {v}"
+        );
+    }
+
+    #[test]
     fn resume_handle_none_serializes_null() {
         let s = build_setup(&cfg(Model::HalfCascade, None));
         assert!(s["setup"]["sessionResumption"]["handle"].is_null());
@@ -450,11 +465,9 @@ mod parse_tests {
         let from_binary = parse_server_message(text.clone().into_bytes().as_slice()).unwrap();
         assert_eq!(from_string, from_binary);
 
-        assert!(
-            from_string
-                .iter()
-                .any(|e| matches!(e, ServerEvent::OutputAudio(s) if s == &vec![0, 1, 2, 3]))
-        );
+        assert!(from_string
+            .iter()
+            .any(|e| matches!(e, ServerEvent::OutputAudio(s) if s == &vec![0, 1, 2, 3])));
         assert!(
             from_string.iter().any(|e| matches!(e,
             ServerEvent::Transcript { role: Role::Model, text, final_: false } if text == "Hello"))
