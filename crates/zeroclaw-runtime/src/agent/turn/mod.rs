@@ -1405,6 +1405,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // enforcement below reserves this measured growth instead of executing
         // hooks for estimation — a modifying `before_llm_call` handler must be
         // observed exactly once per dispatched request.
+        let pre_hook_messages = provider_request_messages.clone();
         let pre_hook_estimated =
             crate::agent::history::estimate_history_tokens(&provider_request_messages);
         let mut hook_selected_model = None;
@@ -1426,6 +1427,16 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let measured_hook_growth_tokens =
             crate::agent::history::estimate_history_tokens(&provider_request_messages)
                 .saturating_sub(pre_hook_estimated);
+        // Capture hook-added suffix (messages beyond the original prepared
+        // length) so a pre-dispatch trim can rebuild the post-hook request
+        // without re-executing the hook. This preserves a stateful one-shot
+        // handler's exactly-once semantics while still letting the current
+        // dispatch use the trimmed durable history.
+        let hook_suffix = if provider_request_messages.len() > pre_hook_messages.len() {
+            provider_request_messages[pre_hook_messages.len()..].to_vec()
+        } else {
+            Vec::new()
+        };
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
         // Only direct Agent turns scope the complete prompt variants. Preserve
         // the channel loop's existing hook/protocol behavior rather than
@@ -1469,7 +1480,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             0
         };
-        let reported_population_estimated =
+        let mut reported_population_estimated =
             crate::agent::history::estimate_history_tokens(&provider_request_messages)
                 + tool_schema_tokens;
 
@@ -1479,7 +1490,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // growth varies per iteration can still push this exact dispatch past
         // the configured budget. Attempt a whole-turn trim before declaring a
         // floor, so a removable older turn is not misreported as
-        // unsatisfiable.
+        // unsatisfiable. If trimming occurs, rebuild the post-hook request
+        // from the trimmed durable history plus the same hook suffix so the
+        // *current* dispatch actually uses the trimmed history instead of
+        // still sending the original oversized request.
+        let history_len_before = turn_state.history.len();
+        let crumb_before = turn_state.crumb_present;
         surface_oversized_dispatch_if_needed(
             turn_state.history,
             &mut turn_state.crumb_present,
@@ -1491,6 +1507,39 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await;
         *history_has_trim_breadcrumb = turn_state.crumb_present;
+        if turn_state.history.len() != history_len_before
+            || turn_state.crumb_present != crumb_before
+        {
+            // History was trimmed at the dispatch seam — rebuild the request
+            // so the provider sees the trimmed population. Preserve the hook
+            // suffix without re-executing the hook (exactly-once semantics).
+            if let Ok(new_prepared) = prepare_messages_for_iteration(
+                turn_state.history,
+                multimodal_config,
+                degrade_strip_images,
+                image_cache.as_deref_mut(),
+            )
+            .await
+            {
+                let mut new_provider_request_messages = new_prepared.messages;
+                // Re-apply the hook's appended payload, if any, so the
+                // dispatched request still carries the hook's transient growth
+                // but on top of the trimmed durable history.
+                new_provider_request_messages.extend(hook_suffix.clone());
+                // Keep the system-prompt anchor and tool-protocol framing
+                // consistent with the trimmed history.
+                refresh_prompt_anchor(&mut new_provider_request_messages, use_native_tools);
+                refresh_scoped_tool_protocol_prompt(
+                    turn_state.history,
+                    &mut new_provider_request_messages,
+                    use_native_tools,
+                );
+                provider_request_messages = new_provider_request_messages;
+                reported_population_estimated =
+                    crate::agent::history::estimate_history_tokens(&provider_request_messages)
+                        + tool_schema_tokens;
+            }
+        }
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
