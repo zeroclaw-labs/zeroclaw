@@ -448,22 +448,19 @@ pub fn load_interactive_session_history_with_crumb(
 
     remove_orphaned_tool_messages(&mut state.history);
 
-    // Migration: legacy v1 files have `history_has_trim_breadcrumb == false`
-    // by default. If the restored history already carries a breadcrumb at the
-    // expected position, recover the flag so the next trim does not misclassify.
+    // Migration: only legacy v1 files lack explicit provenance. v2 records
+    // carry an explicit `history_has_trim_breadcrumb` (true or false) — a
+    // fresh v2 session where the user legitimately sent the breadcrumb text
+    // must not be reclassified as synthetic. Infer only when the persisted
+    // version is < 2 and the flag is false.
     let mut has_crumb = state.history_has_trim_breadcrumb;
-    if !has_crumb {
+    if !has_crumb && state.version < 2 {
         let leading_system = state
             .history
             .iter()
             .take_while(|m| m.role == "system")
             .count();
         if let Some(first) = state.history.get(leading_system) {
-            // Breadcrumb text is locale-pinned English; use the current
-            // localized value as the migration signal. This matches all
-            // current locales and keeps a genuine user message equal to the
-            // string correctly handled only when the flag says so on fresh
-            // writes.
             let breadcrumb_content =
                 crate::i18n::get_required_cli_string("history-trim-breadcrumb");
             if first.role == "user" && first.content == breadcrumb_content {

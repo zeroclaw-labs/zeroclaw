@@ -291,6 +291,13 @@ async fn projected_provider_facing_tokens(
 /// authoritative for whether the provider accepts it. `kept_turns` is derived
 /// breadcrumb-aware so a leading synthetic crumb is never counted as a kept
 /// turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PreDispatchOutcome {
+    Fit,
+    Trimmed,
+    Floor,
+}
+
 async fn surface_oversized_dispatch_if_needed(
     history: &mut Vec<ChatMessage>,
     crumb_present: &mut bool,
@@ -299,9 +306,9 @@ async fn surface_oversized_dispatch_if_needed(
     context_token_budget: usize,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     observer: &dyn crate::observability::Observer,
-) {
+) -> PreDispatchOutcome {
     if context_token_budget == 0 || measured_population <= context_token_budget as u64 {
-        return;
+        return PreDispatchOutcome::Fit;
     }
     let tokens_before = measured_population;
     let had_crumb = *crumb_present;
@@ -332,7 +339,7 @@ async fn surface_oversized_dispatch_if_needed(
     // underestimate due to raw vs prepared differences.
     current_measured = std::cmp::max(current_measured, measured_population);
     if current_measured <= context_token_budget as u64 {
-        return;
+        return PreDispatchOutcome::Fit;
     }
     let mut trimmed_history = std::mem::take(history);
     loop {
@@ -423,7 +430,7 @@ async fn surface_oversized_dispatch_if_needed(
                     unsatisfiable_floor: None,
                 },
             );
-            return;
+            return PreDispatchOutcome::Trimmed;
         }
         // Trimmed but still over budget and at floor — fall through to floor
         // reporting with the honest dropped count.
@@ -472,7 +479,7 @@ async fn surface_oversized_dispatch_if_needed(
                 unsatisfiable_floor: Some(true),
             },
         );
-        return;
+        return PreDispatchOutcome::Floor;
     }
     // No trim possible — genuine floor with 0 dropped.
     let kept_turns = crate::agent::history_trim::count_turns(&trimmed_history)
@@ -520,6 +527,7 @@ async fn surface_oversized_dispatch_if_needed(
             unsatisfiable_floor: Some(true),
         },
     );
+    PreDispatchOutcome::Floor
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1505,6 +1513,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // mutations to retained messages rather than discarding them.
         let post_hook_snapshot = provider_request_messages.clone();
         let post_hook_had_crumb = crumb_before;
+        // The gate already emits an explicit `HistoryTrimmed` event with
+        // `unsatisfiable_floor: Some(true)` when nothing more can be dropped
+        // (see `surface_oversized_dispatch_if_needed`), which is the
+        // client-visible discriminator the review asked for. Dispatch still
+        // proceeds on `PreDispatchOutcome::Floor`: an oversized request that
+        // still fits the provider's actual window (this estimate is
+        // conservative) should not be refused client-side, and refusing here
+        // would turn every schema/tool-heavy floor into a hard failure
+        // instead of a best-effort, explicitly-flagged send.
         surface_oversized_dispatch_if_needed(
             turn_state.history,
             &mut turn_state.crumb_present,

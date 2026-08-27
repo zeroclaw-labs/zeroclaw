@@ -1134,6 +1134,14 @@ impl Agent {
         self.history_has_trim_breadcrumb = false;
     }
 
+    pub fn set_history_has_trim_breadcrumb(&mut self, flag: bool) {
+        self.history_has_trim_breadcrumb = flag;
+    }
+
+    pub fn history_has_trim_breadcrumb(&self) -> bool {
+        self.history_has_trim_breadcrumb
+    }
+
     fn encode_response_cache_transcript(messages: &[ChatMessage]) -> String {
         let mut transcript = String::new();
         for message in messages {
@@ -2680,26 +2688,29 @@ impl Agent {
             );
         }
         // Write back any token-budget trim that happened inside the loop to
-        // durable history. The loop owns a ChatMessage clone of the prefix;
-        // if it trimmed, the durable history must reflect that, otherwise the
-        // next turn would resend dropped context and the event's claim about
-        // retained context would be false.
-        let history_trimmed_in_loop = loop_history.len() != original_loop_history_len
+        // durable history. `loop_history` is the TurnState's history which
+        // after `sync_pending` already contains the canonical current turn
+        // (user+assistant...), so `loop_history.len()` includes both the
+        // prefix and the canonical. To detect a trim we must compare only
+        // the prefix part, not the full length which always grows via
+        // `sync_pending` and tool appends.
+        let new_prefix_len = loop_history.len().saturating_sub(loop_new_messages.len());
+        let history_trimmed_in_loop = new_prefix_len != original_loop_history_len
             || loop_history_crumb_present != original_loop_history_crumb;
         if history_trimmed_in_loop {
-            let trimmed_prefix = Self::replay_loop_messages(&loop_history);
-            // self.history currently is [original_prefix (ConversationMessage) + currentUser]
-            // Replace the original prefix with the trimmed one; the current turn
-            // (loop_new_messages) will be replayed next.
-            self.history.truncate(0);
-            self.history.extend(trimmed_prefix);
+            // The loop's history is already the authoritative full transcript
+            // (trimmed prefix + canonical). It already contains the user and
+            // assistant messages, so we can replay it directly without
+            // appending `loop_new_messages` a second time — doing so duplicated
+            // the current turn (5 messages instead of 3).
+            self.history.clear();
+            self.history
+                .extend(Self::replay_loop_messages(&loop_history));
             self.history_has_trim_breadcrumb = loop_history_crumb_present;
-            for replayed in Self::replay_loop_messages(&loop_new_messages) {
-                self.history.push(replayed);
-            }
         } else {
-            // Pop the original user message (pushed before the loop) so the
-            // replayed canonical version, including the original user message.
+            // No trim: the loop did not change the prefix. Pop the pre-loop
+            // enriched user message and replay the canonical (which may be the
+            // request-enriched form, not the raw `enriched` we pushed).
             self.history.pop();
             for replayed in Self::replay_loop_messages(&loop_new_messages) {
                 self.history.push(replayed);
@@ -2932,6 +2943,10 @@ impl Agent {
         // owner-tracked state (the conversion preserves the crumb position).
         let mut loop_history_crumb_present = self.history_has_trim_breadcrumb;
         let user_msg_for_loop: Vec<ChatMessage> = provider_messages[split_idx..].to_vec();
+        // Track total canonical ChatMessage length so prefix detection is not
+        // confused by `sync_pending` which always grows `loop_history` via the
+        // canonical. After each round, prefix_len = loop_history.len() - total_canonical_len.
+        let mut total_canonical_len = 0usize;
         let approval_bridge: Option<Box<dyn zeroclaw_api::channel::Channel>> =
             self.channel_handles.ask_user.as_ref().map(|handles| {
                 Box::new(crate::agent::approval_bridge::AskUserApprovalBridge::new(
@@ -3169,16 +3184,23 @@ impl Agent {
                 new_msgs.push(replayed.clone());
                 self.history.push(replayed);
             }
+            total_canonical_len += round_added.len();
             // Write back durable token-budget trim from loop_history.
-            if loop_history.len() != streamed_original_loop_history_len
+            // `loop_history` after this round is [trimmed_prefix + all canonical ChatMessages so far]
+            // `total_canonical_len` tracks the ChatMessage length of all canonical so far,
+            // so prefix_len = loop_history.len() - total_canonical_len.
+            let new_prefix_len = loop_history.len().saturating_sub(total_canonical_len);
+            if new_prefix_len != streamed_original_loop_history_len
                 || loop_history_crumb_present != streamed_original_crumb
             {
-                let trimmed_prefix = Self::replay_loop_messages(&loop_history);
-                self.history.truncate(0);
-                self.history.extend(trimmed_prefix);
-                self.history.extend(new_msgs.clone());
+                // The prefix was trimmed (old turns dropped or crumb inserted).
+                // Rebuild durable history from the authoritative loop_history
+                // which already contains the trimmed prefix + canonical.
+                self.history.clear();
+                self.history
+                    .extend(Self::replay_loop_messages(&loop_history));
                 self.history_has_trim_breadcrumb = loop_history_crumb_present;
-                streamed_original_loop_history_len = loop_history.len();
+                streamed_original_loop_history_len = new_prefix_len;
                 streamed_original_crumb = loop_history_crumb_present;
             }
 

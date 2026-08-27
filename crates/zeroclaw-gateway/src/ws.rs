@@ -546,7 +546,19 @@ async fn handle_socket(
     let restore_trim_event = if stored_messages.is_empty() {
         None
     } else {
-        agent.seed_history_with_event(&stored_messages)
+        let event = agent.seed_history_with_event(&stored_messages);
+        // Restore breadcrumb provenance for legacy sessions. Fresh v2 sessions
+        // where the user legitimately sent the breadcrumb text would be
+        // misclassified here; the next trim would then treat that real turn as
+        // synthetic. This is rare and the proper fix is to store the flag
+        // alongside the transcript (tracked as follow-up).
+        if let Some(first) = stored_messages.first() {
+            let crumb = zeroclaw_runtime::i18n::get_required_cli_string("history-trim-breadcrumb");
+            if first.role == "user" && first.content == crumb {
+                agent.set_history_has_trim_breadcrumb(true);
+            }
+        }
+        event
     };
 
     let (approval_event_tx, mut approval_event_rx) =
