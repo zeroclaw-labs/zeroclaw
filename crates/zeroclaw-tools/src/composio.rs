@@ -1286,6 +1286,7 @@ pub struct ComposioAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::proxy_test_lock_guard;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -1832,6 +1833,7 @@ mod tests {
 
     #[tokio::test]
     async fn connected_accounts_alias_dispatches_same_as_list_accounts() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         // Both spellings should reach the same handler and return the same
         // shape of error (network failure in test, not a dispatch error).
         let tool = ComposioTool::new("test-key", None, test_security());

@@ -1411,7 +1411,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                 image_cache.as_deref_mut(),
                 agent_alias,
                 parent_agent_alias,
-                sop_reassembly,
+                sop_reassembly.clone(),
                 &mut sop_exec_cache,
             ))
             .await?;
@@ -1553,9 +1553,14 @@ fn sop_step_excluded_tools(
 /// at every depth — no separate baseline field is needed: a depth >= 2 step
 /// naming the outer agent compares against the re-assembled child's alias and
 /// re-assembles correctly instead of inheriting the child's scope.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct SopStepReassembly<'a> {
     pub config: &'a zeroclaw_config::schema::Config,
+    /// Optional live-config handle threaded from the enclosing live `Agent`
+    /// turn. When present, a nested (cross-agent) SOP step's freshly
+    /// re-assembled tools observe `config/set` revocations instead of pinning
+    /// the construction-time `config` snapshot. `None` on one-shot/test paths.
+    pub live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 }
 
 /// The re-assembly gate: a step needs its own agent context re-assembled when
@@ -1627,6 +1632,7 @@ pub(crate) async fn assemble_owned_execution(
     sop_engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
     sop_audit: Option<Arc<crate::sop::SopAuditLogger>>,
     parent_approval: Option<&crate::approval::ApprovalManager>,
+    live_config: Option<Arc<parking_lot::RwLock<zeroclaw_config::schema::Config>>>,
 ) -> Result<OwnedAgentExecution> {
     let security = Arc::new(crate::security::SecurityPolicy::for_agent(config, alias)?);
     // The one canonical per-agent runtime-knob surface: identity plus every
@@ -1689,7 +1695,7 @@ pub(crate) async fn assemble_owned_execution(
         None,
         Some(sop_engine),
         sop_audit,
-        None,
+        live_config,
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
     // Capture before `runtime` is moved into `ScopedAssembly` below.
@@ -1915,7 +1921,7 @@ async fn drive_live_sop_actions(
                     if needs_reassembly {
                         let alias =
                             step_alias.expect("needs_reassembly implies a step agent alias");
-                        if let Some(reassembly) = sop_reassembly {
+                        if let Some(reassembly) = sop_reassembly.as_ref() {
                             if !exec_cache.contains_key(alias) {
                                 match assemble_owned_execution(
                                     reassembly.config,
@@ -1923,6 +1929,7 @@ async fn drive_live_sop_actions(
                                     Arc::clone(&queued.engine),
                                     queued.audit.clone(),
                                     approval,
+                                    reassembly.live_config.clone(),
                                 )
                                 .await
                                 {
@@ -2033,6 +2040,7 @@ async fn drive_live_sop_actions(
                                 o.agent.resolved.effective_context_budget(),
                                 o.agent.resolved.tool_call_dedup_exempt.as_slice(),
                                 &sop_reassembly
+                                    .as_ref()
                                     .expect("owned implies a reassembly handle")
                                     .config
                                     .pacing,
@@ -2095,6 +2103,7 @@ async fn drive_live_sop_actions(
                             match build_owned_step_system_prompt(
                                 o,
                                 sop_reassembly
+                                    .as_ref()
                                     .expect("owned implies a reassembly handle")
                                     .config,
                                 step_alias.expect("needs_reassembly implies a step agent alias"),
@@ -2212,7 +2221,7 @@ async fn drive_live_sop_actions(
                                         parent_agent_alias
                                     },
                                     turn_id: &nested_turn_id,
-                                    sop_reassembly,
+                                    sop_reassembly: sop_reassembly.clone(),
                                 })),
                             )
                             .await;
@@ -2732,12 +2741,14 @@ mod sop_step_reassembly_tests {
             SopConfig::default(),
         )));
 
-        let reader = assemble_owned_execution(&config, "reader", Arc::clone(&engine), None, None)
-            .await
-            .expect("reader assembles");
-        let writer = assemble_owned_execution(&config, "writer", Arc::clone(&engine), None, None)
-            .await
-            .expect("writer assembles");
+        let reader =
+            assemble_owned_execution(&config, "reader", Arc::clone(&engine), None, None, None)
+                .await
+                .expect("reader assembles");
+        let writer =
+            assemble_owned_execution(&config, "writer", Arc::clone(&engine), None, None, None)
+                .await
+                .expect("writer assembles");
         let reader_names = tool_names(&reader.tools_registry);
         let writer_names = tool_names(&writer.tools_registry);
 
@@ -2820,6 +2831,7 @@ mod sop_step_reassembly_tests {
             Arc::clone(&engine),
             None,
             Some(&parent),
+            None,
         )
         .await
         .expect("restricted assembles");
@@ -3288,7 +3300,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_never_sends_parent_history_to_child_provider() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3385,7 +3400,10 @@ mod sop_step_reassembly_tests {
 
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3475,7 +3493,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_stamps_effective_identity_with_parent_correlation() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let requests: Arc<std::sync::Mutex<Vec<CapturedRequest>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -3534,7 +3555,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_keeps_shared_history_and_identity() {
         let (engine, run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -3585,7 +3609,10 @@ mod sop_step_reassembly_tests {
     async fn same_agent_step_output_reaches_parent_capture_once() {
         let (engine, _run_id, action) = start_single_cross_agent_step("outer");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
@@ -3637,7 +3664,10 @@ mod sop_step_reassembly_tests {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         // Bare config: no "stepper" agent exists, so assembly must fail.
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
         let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
@@ -3827,7 +3857,10 @@ mod sop_step_reassembly_tests {
     async fn cross_agent_step_model_switch_never_leaks_into_parent_loop() {
         let (engine, run_id, action) = start_single_cross_agent_step("stepper");
         let config = zeroclaw_config::schema::Config::default();
-        let handle = SopStepReassembly { config: &config };
+        let handle = SopStepReassembly {
+            config: &config,
+            live_config: None,
+        };
 
         let mut exec_cache = std::collections::HashMap::new();
         let mut stepper_agent = zeroclaw_config::schema::AliasedAgentConfig::default();
@@ -3912,5 +3945,127 @@ mod sop_step_reassembly_tests {
             "the step failure must name the CHILD's own requested switch: {}",
             step.output
         );
+    }
+
+    /// Regression for the live-config boundary the SOP reassembly review
+    /// flagged: a nested cross-agent step is re-assembled through
+    /// `assemble_owned_execution`, which now threads the live-config handle
+    /// from `SopStepReassembly` into the step's fresh `file_download` tool.
+    /// Before the fix, that nested registry fell back to the construction-time
+    /// snapshot, so a `config/set` allowlist revocation did not reach the
+    /// already-created live agent's nested SOP step. This proves the nested
+    /// `file_download` observes revocation through the same live handle as the
+    /// parent — not a stale snapshot.
+    #[tokio::test]
+    async fn nested_sop_reassembly_forwards_live_config_observes_revocation() {
+        use wiremock::{Mock, MockServer, ResponseTemplate, matchers::method, matchers::path};
+        use zeroclaw_config::multi_agent::{AgentMemoryConfig, MemoryBackendKind};
+        use zeroclaw_config::schema::{Config, FileDownloadConfig, SopConfig};
+
+        let root = std::env::temp_dir().join(format!("zc-sop-live-rev-{}", uuid::Uuid::new_v4()));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: root.join("data"),
+            config_path: root.join("config.toml"),
+            ..Config::default()
+        };
+        let risk_profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::autonomy::AutonomyLevel::Full,
+            ..zeroclaw_config::schema::RiskProfileConfig::default()
+        };
+        config
+            .risk_profiles
+            .insert("stepper".to_string(), risk_profile.clone());
+        config.providers.models.ollama.insert(
+            "p".to_string(),
+            zeroclaw_config::schema::OllamaModelProviderConfig {
+                base: zeroclaw_config::schema::ModelProviderConfig {
+                    model: Some("test-model".to_string()),
+                    ..zeroclaw_config::schema::ModelProviderConfig::default()
+                },
+                ..zeroclaw_config::schema::OllamaModelProviderConfig::default()
+            },
+        );
+        config.agents.insert(
+            "stepper".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                model_provider: "ollama.p".into(),
+                risk_profile: "stepper".into(),
+                memory: AgentMemoryConfig {
+                    backend: MemoryBackendKind::Markdown,
+                },
+                workspace: zeroclaw_config::multi_agent::AgentWorkspaceConfig {
+                    path: Some(tmp.path().to_path_buf()),
+                    ..Default::default()
+                },
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+
+        let server = MockServer::start().await;
+        let port = server.address().port();
+        Mock::given(method("GET"))
+            .and(path("/x"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url = format!("http://127.0.0.1:{port}/x");
+        config.file_download = FileDownloadConfig {
+            url: Some(url.clone()),
+            allowed_private_hosts: vec!["127.0.0.1".into()],
+            ..FileDownloadConfig::default()
+        };
+        let live = Arc::new(parking_lot::RwLock::new(config.clone()));
+
+        let engine = Arc::new(std::sync::Mutex::new(crate::sop::SopEngine::new(
+            SopConfig::default(),
+        )));
+        let owned =
+            assemble_owned_execution(&config, "stepper", engine, None, None, Some(live.clone()))
+                .await
+                .expect("nested step assembles with a live handle");
+
+        let fd = owned
+            .tools_registry
+            .iter()
+            .find(|t| t.name() == "file_download")
+            .expect("file_download must be registered when [file_download].url is set");
+
+        let dest = tmp.path().join("sop-live-rev.bin");
+        let args = serde_json::json!({
+            "document_id": "doc-1",
+            "dest_path": dest.to_str().unwrap(),
+        });
+
+        // With the live allowlist granted, the nested tool reaches the local
+        // listener → the SSRF gate passes via the LIVE handle (the mock's
+        // `.expect(1)` verifies the request actually arrived).
+        let grant = fd
+            .execute(args.clone())
+            .await
+            .unwrap_or_else(|e| panic!("live-granted step's nested download should pass: {e:?}"));
+
+        // Revoke through the shared live handle (no registry rebuild).
+        live.write().file_download.allowed_private_hosts.clear();
+        let denied = fd
+            .execute(args.clone())
+            .await
+            .expect("revoked rejection surfaces as a ToolResult, not a panic");
+        assert!(
+            !denied.success,
+            "after the live revocation the SAME nested file_download must reject the now-private host"
+        );
+        let err = denied.error.unwrap_or_default().to_lowercase();
+        assert!(
+            err.contains("private")
+                || err.contains("non-global")
+                || err.contains("loopback")
+                || err.contains("link-local"),
+            "the nested rejection should name the SSRF private-host gate, got: {err}"
+        );
+        let _ = grant;
     }
 }

@@ -7055,6 +7055,7 @@ async fn process_channel_message_body(
                 // this turn's.
                 sop_reassembly: Some(zeroclaw_runtime::agent::loop_::SopStepReassembly {
                     config: ctx.prompt_config.as_ref(),
+                    live_config: None,
                 }),
             }));
             // Scope this turn's routing handle so concurrent same-agent turns,

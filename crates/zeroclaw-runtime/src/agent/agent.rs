@@ -449,6 +449,11 @@ pub struct StreamedTurnError {
 #[derive(Clone, Debug, Default)]
 pub struct ProviderSwitchConfig {
     pub config: Option<std::sync::Arc<zeroclaw_config::schema::Config>>,
+    /// Optional live-config handle so a nested (cross-agent) SOP step that is
+    /// re-assembled from this switch state observes `config/set` revocations
+    /// instead of pinning the construction-time `config` snapshot. Set on the
+    /// live daemon/gateway paths; `None` for one-shot/test builders.
+    pub live_config: Option<std::sync::Arc<parking_lot::RwLock<Config>>>,
 }
 
 /// Bundle of late-bound channel-map handles owned by an Agent. Cloning is
@@ -1781,7 +1786,7 @@ impl Agent {
         };
 
         let structured_history_cap_resolver: Arc<dyn Fn() -> usize + Send + Sync> =
-            if let Some(cap_config) = live_config {
+            if let Some(cap_config) = live_config.clone() {
                 let cap_agent_alias = agent_alias.to_string();
                 Arc::new(move || {
                     cap_config
@@ -1848,6 +1853,10 @@ impl Agent {
             .approval_manager(Some(Arc::new(approval_manager)))
             .provider_switch_config(ProviderSwitchConfig {
                 config: Some(std::sync::Arc::new(config.clone())),
+                // Thread the live handle through so a nested cross-agent SOP
+                // step re-assembled on the next turn observes `config/set`
+                // revocations instead of pinning this construction snapshot.
+                live_config: live_config.clone(),
             })
             .build()?;
 
@@ -2585,8 +2594,20 @@ impl Agent {
                     sop_reassembly: self
                         .provider_switch_config
                         .as_ref()
-                        .and_then(|c| c.config.as_deref())
-                        .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                        .and_then(|c| {
+                            c.config.as_deref().map(|config| {
+                                // Clone the live handle here (inside the closure
+                                // that still borrows `c`) so the returned tuple does
+                                // not move the borrowed config out from under it.
+                                (config, c.live_config.clone())
+                            })
+                        })
+                        .map(
+                            |(config, live_config)| crate::agent::turn::SopStepReassembly {
+                                config,
+                                live_config,
+                            },
+                        ),
                 }),
             ),
         );
@@ -3028,8 +3049,17 @@ impl Agent {
                         sop_reassembly: self
                             .provider_switch_config
                             .as_ref()
-                            .and_then(|c| c.config.as_deref())
-                            .map(|config| crate::agent::turn::SopStepReassembly { config }),
+                            .and_then(|c| {
+                                c.config
+                                    .as_deref()
+                                    .map(|config| (config, c.live_config.clone()))
+                            })
+                            .map(
+                                |(config, live_config)| crate::agent::turn::SopStepReassembly {
+                                    config,
+                                    live_config,
+                                },
+                            ),
                     }),
                 ),
             );
@@ -5817,6 +5847,127 @@ mod tests {
         assert_eq!(
             headers.get("x-title").map(String::as_str),
             Some("zeroclaw-web")
+        );
+
+        server_handle.abort();
+    }
+
+    /// Persistent-session regression for the SSRF live-config propagation
+    /// (the live-config review's Blocking 2): an Agent built through the LIVE agent builder
+    /// (`Agent::from_live_config_with_tui_env`, the WSS/RPC/ACP path) must
+    /// observe a `config/set` revocation of `file_download.allowed_private_hosts`
+    /// on the next dispatch — not keep the construction-time allowlist. This
+    /// distinguishes the persistent-session builder from a direct
+    /// `all_tools_with_runtime(Some(live))` call, which only proves the seam
+    /// when invoked directly.
+    #[tokio::test]
+    async fn live_config_agent_file_download_observes_revocation() {
+        use std::sync::Arc;
+        use tempfile::TempDir;
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{AliasedAgentConfig, Config, RiskProfileConfig};
+
+        // A mock HTTP server that serves the file_download payload on /file.
+        // The same loopback address is also used as the model-provider uri (the
+        // agent is never asked to call the model, only to execute the tool).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let server_handle = zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                axum::Router::new()
+                    .route("/file", axum::routing::get(|| async { "download-bytes" })),
+            )
+            .await
+            .unwrap();
+        });
+
+        let tmp = TempDir::new().expect("temp dir");
+        let workspace_dir = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace_dir).unwrap();
+
+        let mut config = Config {
+            data_dir: workspace_dir,
+            config_path: tmp.path().join("config.toml"),
+            ..Default::default()
+        };
+        {
+            let entry = config
+                .providers
+                .models
+                .ensure("custom", "default")
+                .expect("custom model_provider type slot");
+            entry.api_key = Some("test-key".to_string());
+            entry.model = Some("test-model".to_string());
+            entry.uri = Some(format!("http://{mock_addr}"));
+        }
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config
+            .risk_profiles
+            .insert("test-profile".to_string(), RiskProfileConfig::default());
+        config.agents.insert(
+            "test-agent".to_string(),
+            AliasedAgentConfig {
+                model_provider: "custom.default".into(),
+                risk_profile: "test-profile".into(),
+                ..Default::default()
+            },
+        );
+        // file_download enabled, pointed at the loopback mock, allowlisted.
+        config.file_download.url = Some(format!("http://{mock_addr}/file"));
+        config.file_download.allowed_private_hosts = vec!["127.0.0.1".to_string()];
+
+        let live = Arc::new(parking_lot::RwLock::new(config));
+        let agent = Agent::from_live_config_with_tui_env(
+            Arc::clone(&live),
+            "test-agent",
+            None,
+            false,
+            false,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("live-config agent must construct");
+
+        // Generation 1: the allowlist admits the loopback mock → download works.
+        let first = agent
+            .execute_tool_for_test(
+                "file_download",
+                serde_json::json!({ "document_id": "probe-1", "dest_path": "out.bin" }),
+            )
+            .await
+            .expect("file_download must be registered")
+            .expect("first dispatch must return a ToolResult");
+        assert!(first.success, "allowlisted loopback download must succeed");
+
+        // Revoke `allowed_private_hosts` via the shared live config — the exact
+        // operator action that the persistent session must observe next dispatch.
+        live.write().file_download.allowed_private_hosts.clear();
+
+        // Generation 2: the same, already-constructed agent must now reject the
+        // loopback download (private host) without a rebuild.
+        let second = agent
+            .execute_tool_for_test(
+                "file_download",
+                serde_json::json!({ "document_id": "probe-2", "dest_path": "out.bin" }),
+            )
+            .await
+            .expect("file_download must be registered")
+            .expect("second dispatch must return a ToolResult");
+        assert!(
+            !second.success,
+            "revoking the allowlist must reject the loopback download on the persistent session"
+        );
+        let msg = second.error.unwrap_or_default().to_lowercase();
+        assert!(
+            msg.contains("private")
+                || msg.contains("non-global")
+                || msg.contains("loopback")
+                || msg.contains("link-local"),
+            "the revoked persistent session must reject as private; got: {msg}"
         );
 
         server_handle.abort();
@@ -11360,6 +11511,7 @@ mod tests {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -11387,6 +11539,7 @@ mod tests {
             config: Some(std::sync::Arc::new(
                 zeroclaw_config::schema::Config::default(),
             )),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "shared-name", Some(switch_cfg));
@@ -11423,6 +11576,7 @@ mod tests {
         };
         let switch_cfg = ProviderSwitchConfig {
             config: Some(std::sync::Arc::new(route_config)),
+            live_config: None,
         };
 
         let mut agent = build_test_agent("openai", "gpt-4o-mini", Some(switch_cfg));
@@ -11617,6 +11771,7 @@ mod tests {
                 },
                 ..zeroclaw_config::schema::Config::default()
             })),
+            live_config: None,
         };
         let agent_config = zeroclaw_config::schema::AliasedAgentConfig {
             resolved: zeroclaw_config::schema::ResolvedRuntime {
