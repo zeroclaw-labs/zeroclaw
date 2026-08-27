@@ -243,7 +243,7 @@ Telegram.
 - `/model` (no argument) opens an inline picker with provider categories and
   model options built from configured `[[model_routes]]`. Pages navigate via
   inline keyboard buttons; ✗ cancels.
-- Selecting an option applies it to the **sender's session scope** — the same
+- Selecting an option applies it to the **sender's session scope**, the same
   behavior as the text form `/model <hint>` on this sender. The picker never
   creates user- or agent-scoped overrides.
 - Route hints that would collide with the command flag syntax (`--user`,
