@@ -1345,6 +1345,22 @@ impl Agent {
                 self.history.push(ConversationMessage::Chat(msg.clone()));
             }
         }
+        // Migration: legacy persisted histories may already contain a synthetic
+        // breadcrumb at the expected position without the flag. Recover the
+        // owner flag before trimming so `trim_history` does not misclassify it.
+        if !self.history_has_trim_breadcrumb {
+            let leading_system = self
+                .history
+                .iter()
+                .take_while(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+                .count();
+            if let Some(ConversationMessage::Chat(first)) = self.history.get(leading_system) {
+                let crumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+                if first.role == "user" && first.content == crumb {
+                    self.history_has_trim_breadcrumb = true;
+                }
+            }
+        }
         self.trim_history(None)
             .map(HistoryTrimNotice::into_turn_event)
     }
@@ -1375,6 +1391,19 @@ impl Agent {
                 continue;
             }
             self.history.push(msg);
+        }
+        if !self.history_has_trim_breadcrumb {
+            let leading_system = self
+                .history
+                .iter()
+                .take_while(|m| matches!(m, ConversationMessage::Chat(c) if c.role == "system"))
+                .count();
+            if let Some(ConversationMessage::Chat(first)) = self.history.get(leading_system) {
+                let crumb = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+                if first.role == "user" && first.content == crumb {
+                    self.history_has_trim_breadcrumb = true;
+                }
+            }
         }
         // Trim immediately so pre_len snapshots (taken before the first turn)
         // are always within the configured limit; otherwise a long restored

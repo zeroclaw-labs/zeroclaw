@@ -128,8 +128,32 @@ fn is_system(msg: &ChatMessage) -> bool {
 /// keeping leading system messages and at least the most recent whole turn.
 /// When `budget_tokens` is zero the history is returned untouched.
 pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> TrimResult {
-    let total_turns = count_turns(&history);
+    trim_to_recent_turns_with_crumb(history, budget_tokens, false)
+}
+
+/// Crumb-aware variant of `trim_to_recent_turns`: when `crumb_present` is
+/// true the population is assumed to carry the synthetic breadcrumb immediately
+/// after the leading system messages. That breadcrumb is never counted as a
+/// turn boundary, never dropped, and never double-counted in
+/// `dropped_messages`. The owner flag decides, not message text.
+pub fn trim_to_recent_turns_with_crumb(
+    history: Vec<ChatMessage>,
+    budget_tokens: usize,
+    crumb_present: bool,
+) -> TrimResult {
     let tokens_before = estimate_history_tokens(&history);
+    let leading_system = history.iter().take_while(|m| is_system(m)).count();
+    let crumb_offset = usize::from(crumb_present && history.len() > leading_system);
+    // `total_turns` excludes the synthetic crumb so `kept_turns` stays
+    // breadcrumb-aware. When the flag is set the crumb is at
+    // `leading_system` by contract, so the body starts after it.
+    let body_start = leading_system + crumb_offset;
+    let body = if body_start <= history.len() {
+        &history[body_start..]
+    } else {
+        &[][..]
+    };
+    let total_turns = body.iter().filter(|m| is_turn_boundary(m)).count();
     if budget_tokens == 0 || tokens_before <= budget_tokens {
         return TrimResult {
             history,
@@ -142,9 +166,7 @@ pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> 
         };
     }
 
-    let leading_system = history.iter().take_while(|m| is_system(m)).count();
-    let system: Vec<ChatMessage> = history[..leading_system].to_vec();
-    let body = &history[leading_system..];
+    let prefix: Vec<ChatMessage> = history[..body_start].to_vec();
 
     let boundaries: Vec<usize> = body
         .iter()
@@ -168,7 +190,7 @@ pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> 
     let mut start = 0usize;
     for &b in boundaries.iter().take(boundaries.len() - 1) {
         let candidate_start = next_boundary_after(&boundaries, b);
-        let mut probe = system.clone();
+        let mut probe = prefix.clone();
         probe.extend_from_slice(&body[candidate_start..]);
         start = candidate_start;
         if estimate_history_tokens(&probe) <= budget_tokens {
@@ -190,7 +212,7 @@ pub fn trim_to_recent_turns(history: Vec<ChatMessage>, budget_tokens: usize) -> 
 
     let dropped_messages = start;
     let dropped_turns = boundaries.iter().filter(|&&b| b < start).count();
-    let mut kept = system;
+    let mut kept = prefix;
     kept.extend_from_slice(&body[start..]);
     let kept_turns = total_turns - dropped_turns;
     let tokens_after = estimate_history_tokens(&kept);

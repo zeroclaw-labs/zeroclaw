@@ -150,8 +150,10 @@ pub use super::cost::{
 // History management moved to `super::history`.
 pub use super::history::{
     append_or_merge_system_message, canonicalize_tool_result_media_markers,
-    estimate_history_tokens, load_interactive_session_history, normalize_system_messages,
-    save_interactive_session_history, trim_history, truncate_tool_result,
+    estimate_history_tokens, load_interactive_session_history,
+    load_interactive_session_history_with_crumb, normalize_system_messages,
+    save_interactive_session_history, save_interactive_session_history_with_crumb,
+    trim_history, truncate_tool_result,
 };
 
 /// Minimum user-message length (in chars) for auto-save to memory.
@@ -2187,17 +2189,15 @@ pub async fn run(
                 "CLI channel factory not registered — call register_cli_channel_fn at startup",
             )();
 
-            // Persistent conversation history across turns
-            let mut history = if let Some(path) = session_state_file.as_deref() {
-                load_interactive_session_history(path, &system_prompt)?
-            } else {
-                vec![ChatMessage::system(&system_prompt)]
-            };
-            // Breadcrumb provenance for `history`, tracked beside the buffer
-            // instead of inferred from localized message text. A session file
-            // written by an earlier runtime cannot vouch for its crumb, so the
-            // record starts fresh with each process.
-            let mut history_has_trim_breadcrumb = false;
+            // Persistent conversation history across turns, with explicit
+            // breadcrumb provenance. Legacy v1 files are migrated by inspecting
+            // the restored history for a leading breadcrumb.
+            let (mut history, mut history_has_trim_breadcrumb) =
+                if let Some(path) = session_state_file.as_deref() {
+                    load_interactive_session_history_with_crumb(path, &system_prompt)?
+                } else {
+                    (vec![ChatMessage::system(&system_prompt)], false)
+                };
 
             loop {
                 print!("> ");
@@ -2263,6 +2263,7 @@ pub async fn run(
 
                         history.clear();
                         history.push(ChatMessage::system(&system_prompt));
+                        history_has_trim_breadcrumb = false;
                         // Clear conversation and daily memory
                         let mut cleared = 0;
                         for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2279,7 +2280,9 @@ pub async fn run(
                             println!("Conversation cleared.\n");
                         }
                         if let Some(path) = session_state_file.as_deref() {
-                            save_interactive_session_history(path, &history)?;
+                            save_interactive_session_history_with_crumb(
+                                path, &history, history_has_trim_breadcrumb,
+                            )?;
                         }
                         continue;
                     }
@@ -2826,7 +2829,9 @@ pub async fn run(
                 }
 
                 if let Some(path) = session_state_file.as_deref() {
-                    save_interactive_session_history(path, &history)?;
+                    save_interactive_session_history_with_crumb(
+                        path, &history, history_has_trim_breadcrumb,
+                    )?;
                 }
             }
         }
@@ -3836,6 +3841,7 @@ mod tests {
         let payload = serde_json::to_string_pretty(&InteractiveSessionState {
             version: 1,
             history: vec![ChatMessage::user("orphan")],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -3860,6 +3866,7 @@ mod tests {
                 ChatMessage::system("late loop-detection guidance"),
                 ChatMessage::user("follow-up"),
             ],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -3901,6 +3908,7 @@ mod tests {
                 ChatMessage::user("follow-up"),
                 ChatMessage::system(""),
             ],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();
@@ -3930,6 +3938,7 @@ mod tests {
                 orphan_tool,
                 ChatMessage::user("next question"),
             ],
+            history_has_trim_breadcrumb: false,
         })
         .unwrap();
         std::fs::write(&path, payload).unwrap();

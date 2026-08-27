@@ -399,13 +399,24 @@ pub fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
 pub struct InteractiveSessionState {
     pub version: u32,
     pub history: Vec<ChatMessage>,
+    #[serde(default)]
+    pub history_has_trim_breadcrumb: bool,
 }
 
 impl InteractiveSessionState {
     fn from_history(history: &[ChatMessage]) -> Self {
         Self {
-            version: 1,
+            version: 2,
             history: history.to_vec(),
+            history_has_trim_breadcrumb: false,
+        }
+    }
+
+    pub fn from_history_with_crumb(history: &[ChatMessage], has_crumb: bool) -> Self {
+        Self {
+            version: 2,
+            history: history.to_vec(),
+            history_has_trim_breadcrumb: has_crumb,
         }
     }
 }
@@ -414,8 +425,21 @@ pub fn load_interactive_session_history(
     path: &Path,
     system_prompt: &str,
 ) -> Result<Vec<ChatMessage>> {
+    let (history, _) = load_interactive_session_history_with_crumb(path, system_prompt)?;
+    Ok(history)
+}
+
+/// Load interactive history plus the persisted breadcrumb provenance. Legacy
+/// files without the flag are migrated by inspecting the restored history:
+/// if the first non-system message equals the breadcrumb string, the flag is
+/// recovered as true. This keeps the crumb classification authoritative
+/// across restarts and locale-pinned English breadcrumb text.
+pub fn load_interactive_session_history_with_crumb(
+    path: &Path,
+    system_prompt: &str,
+) -> Result<(Vec<ChatMessage>, bool)> {
     if !path.exists() {
-        return Ok(vec![ChatMessage::system(system_prompt)]);
+        return Ok((vec![ChatMessage::system(system_prompt)], false));
     }
 
     let raw = std::fs::read_to_string(path)?;
@@ -432,15 +456,48 @@ pub fn load_interactive_session_history(
 
     remove_orphaned_tool_messages(&mut state.history);
 
-    Ok(state.history)
+    // Migration: legacy v1 files have `history_has_trim_breadcrumb == false`
+    // by default. If the restored history already carries a breadcrumb at the
+    // expected position, recover the flag so the next trim does not misclassify.
+    let mut has_crumb = state.history_has_trim_breadcrumb;
+    if !has_crumb {
+        let leading_system = state
+            .history
+            .iter()
+            .take_while(|m| m.role == "system")
+            .count();
+        if let Some(first) = state.history.get(leading_system) {
+            // Breadcrumb text is locale-pinned English; use the current
+            // localized value as the migration signal. This matches all
+            // current locales and keeps a genuine user message equal to the
+            // string correctly handled only when the flag says so on fresh
+            // writes.
+            let breadcrumb_content = crate::i18n::get_required_cli_string("history-trim-breadcrumb");
+            if first.role == "user" && first.content == breadcrumb_content {
+                has_crumb = true;
+            }
+        }
+    }
+
+    Ok((state.history, has_crumb))
 }
 
 pub fn save_interactive_session_history(path: &Path, history: &[ChatMessage]) -> Result<()> {
+    save_interactive_session_history_with_crumb(path, history, false)
+}
+
+pub fn save_interactive_session_history_with_crumb(
+    path: &Path,
+    history: &[ChatMessage],
+    has_crumb: bool,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history(history))?;
+    let payload = serde_json::to_string_pretty(&InteractiveSessionState::from_history_with_crumb(
+        history, has_crumb,
+    ))?;
     std::fs::write(path, payload)?;
     Ok(())
 }

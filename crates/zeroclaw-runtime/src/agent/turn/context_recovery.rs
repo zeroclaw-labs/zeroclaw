@@ -4,7 +4,7 @@ use super::context::TurnCtx;
 use super::events::{ProgressEvent, send_progress};
 use super::outcome::is_tool_loop_cancelled;
 use crate::agent::history::estimate_history_tokens;
-use crate::agent::history_trim::trim_to_recent_turns;
+use crate::agent::history_trim::{insert_breadcrumb_deduped, trim_to_recent_turns_with_crumb};
 use crate::observability::{Observer, ObserverEvent};
 use std::time::Instant;
 use zeroclaw_providers::ChatMessage;
@@ -95,7 +95,7 @@ pub(crate) async fn try_recover_context_overflow(
         let tokens_now = estimate_history_tokens(history);
         let budget = tokens_now.saturating_mul(2) / 3;
         let owned = std::mem::take(history);
-        let result = trim_to_recent_turns(owned, budget);
+        let result = trim_to_recent_turns_with_crumb(owned, budget, *crumb_present);
         let trimmed = result.trimmed;
         let dropped_turns = result.dropped_turns;
         let dropped_messages = result.dropped_messages;
@@ -109,15 +109,10 @@ pub(crate) async fn try_recover_context_overflow(
             // work that never happens.
             send_progress(on_delta, ProgressEvent::CompactingContext).await;
             // Insert the same model-visible breadcrumb the turn-boundary path
-            // uses, after the leading system messages, so the retried provider
-            // call tells the model earlier turns were dropped (never silent to
-            // the model, not just to clients).
-            let system_count = recovered_history
-                .iter()
-                .take_while(|m| m.role == "system")
-                .count();
-            recovered_history.insert(system_count, crate::agent::history_trim::breadcrumb());
-            *crumb_present = true;
+            // uses, owner-aware so a pre-existing crumb does not stack and a
+            // genuine user turn equal to the breadcrumb is never mistaken.
+            *crumb_present =
+                insert_breadcrumb_deduped(&mut recovered_history, *crumb_present);
             // Recompute from the final recovered history (breadcrumb included)
             // so the reported count matches what the retried call sends.
             tokens_after = crate::agent::history::estimate_history_tokens(&recovered_history);
