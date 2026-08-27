@@ -1219,14 +1219,20 @@ impl WebSearchTool {
             .header("User-Agent", SERPLY_USER_AGENT)
             .header("Accept", "application/json")
             .send()
-            .await?;
+            .await
+            .map_err(|err| transport_search_failure("serply", "request", &err))?;
 
         let status = response.status();
         if !status.is_success() {
             return Err(http_search_failure("serply", status));
         }
 
-        let json: serde_json::Value = response.json().await?;
+        // The query-bearing URL also rides along on decode failures, so the
+        // response path is normalized the same way as the request path.
+        let json: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|err| transport_search_failure("serply", "response", &err))?;
         self.parse_serply_results(&json, query)
     }
 
@@ -1779,17 +1785,56 @@ fn classify_http_status(status: reqwest::StatusCode) -> SearchStatus {
 /// makes them visible to the agent.
 fn http_search_failure(provider: &str, status: reqwest::StatusCode) -> anyhow::Error {
     let search_status = classify_http_status(status);
-    let hint = match search_status {
+    anyhow::Error::msg(format!(
+        "{provider} search failed (search_status={}, http={status}). {}",
+        search_status.as_str(),
+        search_status_hint(search_status)
+    ))
+}
+
+/// Actionable hint matching a `search_status` class, shared by the HTTP-status
+/// and transport failure builders so the agent sees one vocabulary.
+fn search_status_hint(search_status: SearchStatus) -> &'static str {
+    match search_status {
         SearchStatus::Blocked | SearchStatus::Unavailable => {
             "Provider may be transiently unavailable or blocking the request; retry, or try a different provider (SearXNG, Brave, or Tavily)."
         }
         SearchStatus::ClientError => {
             "The provider refused the request; verify the query, credentials, billing or quota, and provider configuration."
         }
+    }
+}
+
+/// Build a provider transport-failure error (request send or response decode)
+/// that is safe to forward to the model.
+///
+/// `reqwest::Error` displays the request URL, and for GET providers that URL
+/// carries the model-supplied query, so the raw error must never reach the
+/// model-visible tool result (the runtime forwards `execute` errors as text).
+/// Only the provider, the failing stage and a coarse failure category survive;
+/// the URL and the error's source chain are dropped. Mirrors the
+/// `search_status=` tagging of `http_search_failure`, with `transport=` in
+/// place of `http=`.
+fn transport_search_failure(provider: &str, stage: &str, err: &reqwest::Error) -> anyhow::Error {
+    let (search_status, category) = if err.is_timeout() {
+        (SearchStatus::Unavailable, "timeout")
+    } else if err.is_connect() {
+        (SearchStatus::Unavailable, "connect")
+    } else if err.is_decode() {
+        (SearchStatus::Unavailable, "decode")
+    } else if err.is_body() {
+        (SearchStatus::Unavailable, "body")
+    } else if err.is_redirect() {
+        (SearchStatus::Unavailable, "redirect")
+    } else if err.is_builder() || err.is_request() {
+        (SearchStatus::ClientError, "request")
+    } else {
+        (SearchStatus::Unavailable, "transport")
     };
     anyhow::Error::msg(format!(
-        "{provider} search failed (search_status={}, http={status}). {hint}",
-        search_status.as_str()
+        "{provider} search failed (search_status={}, transport={category}, stage={stage}). {}",
+        search_status.as_str(),
+        search_status_hint(search_status)
     ))
 }
 
@@ -3456,6 +3501,170 @@ mod tests {
         .expect("bounded reader must reject overflow before the server closes")
         .unwrap_err();
         assert!(result.to_string().contains("1048576 byte size limit"));
+    }
+
+    // ── Serply transport-error boundary ──────────────────────────────────
+    //
+    // Serply is a GET provider, so the request URL carries the model-supplied
+    // query. `reqwest::Error` displays that URL; the runtime forwards tool
+    // errors into the model-visible history verbatim. These tests pin that a
+    // failed send or decode yields a provider-only, category-tagged error and
+    // that neither the raw query nor its percent-encoded form leaks through.
+
+    /// Long multibyte query used by the transport-error regressions. Long
+    /// enough that a leaked URL would dominate the message, multibyte so the
+    /// percent-encoded form differs from the raw text.
+    const SERPLY_PRIVATE_QUERY_FRAGMENT: &str = "私的な検索クエリ ";
+    /// Percent-encoding of `私`, the first character of the fragment above.
+    const SERPLY_PRIVATE_QUERY_ENCODED_MARKER: &str = "%E7%A7%81";
+
+    fn serply_private_query() -> String {
+        SERPLY_PRIVATE_QUERY_FRAGMENT.repeat(40)
+    }
+
+    fn assert_serply_transport_error_is_query_free(
+        err: &anyhow::Error,
+        query: &str,
+        endpoint: &str,
+    ) {
+        let message = format!("{err:#}");
+        assert!(
+            message.starts_with("serply search failed (search_status="),
+            "error must carry the provider + search_status tag: {message}"
+        );
+        assert!(
+            !message.contains(query) && !message.contains(SERPLY_PRIVATE_QUERY_FRAGMENT.trim()),
+            "raw query leaked into the model-visible error: {message}"
+        );
+        assert!(
+            !message.contains(SERPLY_PRIVATE_QUERY_ENCODED_MARKER) && !message.contains("q="),
+            "percent-encoded query leaked into the model-visible error: {message}"
+        );
+        assert!(
+            !message.contains(endpoint)
+                && !message.contains("http://")
+                && !message.contains("https://"),
+            "request URL leaked into the model-visible error: {message}"
+        );
+        assert!(
+            message.contains("Provider may be transiently unavailable"),
+            "transport failures must keep the actionable hint: {message}"
+        );
+    }
+
+    fn serply_tool_with_key(api_key: &str) -> (tempfile::TempDir, WebSearchTool) {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            format!("[web_search]\nserply_api_key = \"{api_key}\"\n"),
+        )
+        .unwrap();
+        let tool = serply_tool(config_path, false);
+        (tmp, tool)
+    }
+
+    #[tokio::test]
+    async fn test_serply_request_timeout_error_is_query_free() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"results": []}))
+                    .set_delay(Duration::from_secs(5)),
+            )
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(200))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("{}/v1/search/", server.uri());
+
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("a 5 s response against a 200 ms client timeout must fail");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=timeout, stage=request"),
+            "timeout must be classified as an unavailable request-stage failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serply_connection_refused_error_is_query_free() {
+        // Bind then drop an ephemeral port so the connect is refused
+        // deterministically without touching the network.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("http://{addr}/v1/search/");
+
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("connecting to a closed port must fail");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=connect, stage=request"),
+            "refused connection must be classified as an unavailable request-stage failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serply_response_decode_error_is_query_free() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string("<html>upstream gateway page, not JSON</html>"),
+            )
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("{}/v1/search/", server.uri());
+
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("a non-JSON 200 body must fail to decode");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=decode, stage=response"),
+            "undecodable body must be classified as an unavailable response-stage failure: {err}"
+        );
     }
 
     // ── Format characterization ──────────────────────────────────────────
