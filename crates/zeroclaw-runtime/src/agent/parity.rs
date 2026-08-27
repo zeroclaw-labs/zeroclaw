@@ -378,6 +378,7 @@ async fn parity_l2_sop_live_step_agent_isolation() {
         Arc::clone(&engine),
         None,
         None,
+        None,
     )
     .await
     .expect("assemble_owned_execution must build the restricted step agent's context");

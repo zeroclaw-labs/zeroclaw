@@ -4159,7 +4159,13 @@ const = true
         use zeroclaw_config::schema::FileDownloadConfig;
 
         let tmp = TempDir::new().unwrap();
-        let security = Arc::new(SecurityPolicy::default());
+        // Point the policy workspace at the temp dir so `dest_path: "out.bin"`
+        // resolves under the test's TempDir instead of dirtying the crate
+        // checkout (a plain `SecurityPolicy::default()` uses `.`).
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
         let mem_cfg = MemoryConfig {
             backend: "markdown".into(),
             ..MemoryConfig::default()

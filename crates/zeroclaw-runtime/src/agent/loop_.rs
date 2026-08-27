@@ -1999,6 +1999,7 @@ pub async fn run(
                                 turn_id: &turn_id,
                                 sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                     config: &config,
+                                    live_config: None,
                                 }),
                             }),
                         ),
@@ -2559,6 +2560,7 @@ pub async fn run(
                                     turn_id: &turn_id,
                                     sop_reassembly: Some(crate::agent::turn::SopStepReassembly {
                                         config: &config,
+                                        live_config: None,
                                     }),
                                 }),
                             ),
@@ -3434,7 +3436,10 @@ pub async fn process_message_with_live_config(
                     }),
                     Some(agent_alias),
                     Some(&turn_id),
-                    Some(SopStepReassembly { config: &config }),
+                    Some(SopStepReassembly {
+                        config: &config,
+                        live_config: None,
+                    }),
                 ),
             )
             .await
