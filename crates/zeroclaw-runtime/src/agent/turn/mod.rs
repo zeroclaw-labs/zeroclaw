@@ -367,8 +367,14 @@ async fn surface_oversized_dispatch_if_needed(
         );
         let kept_turns = crate::agent::history_trim::count_turns(&with_crumb)
             .saturating_sub(usize::from(new_crumb));
-        let tokens_after =
-            crate::agent::history::estimate_history_tokens(&with_crumb) + tool_schema_tokens;
+        // Include the measured hook growth so the reported `tokens_after`
+        // describes the actual post-hook dispatch, not just the durable
+        // history. Without this, a hook that appends a large payload could
+        // make the gate claim the trimmed request fits when the real
+        // dispatched population remains over budget.
+        let tokens_after = (crate::agent::history::estimate_history_tokens(&with_crumb)
+            + tool_schema_tokens) as u64
+            + hook_growth;
         *history = with_crumb;
         if !hit_floor || (tokens_after as u64) <= context_token_budget as u64 {
             ::zeroclaw_log::record!(
@@ -1490,11 +1496,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // the configured budget. Attempt a whole-turn trim before declaring a
         // floor, so a removable older turn is not misreported as
         // unsatisfiable. If trimming occurs, rebuild the post-hook request
-        // from the trimmed durable history plus the same hook suffix so the
-        // *current* dispatch actually uses the trimmed history instead of
-        // still sending the original oversized request.
+        // from the trimmed durable history while preserving the hook's
+        // mutations to retained messages (rewrite/filter/replace as well as
+        // append) without re-executing the hook (exactly-once semantics).
         let history_len_before = turn_state.history.len();
         let crumb_before = turn_state.crumb_present;
+        // Snapshot the post-hook request so trimming can preserve its
+        // mutations to retained messages rather than discarding them.
+        let post_hook_snapshot = provider_request_messages.clone();
+        let post_hook_had_crumb = crumb_before;
         surface_oversized_dispatch_if_needed(
             turn_state.history,
             &mut turn_state.crumb_present,
@@ -1510,34 +1520,59 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             || turn_state.crumb_present != crumb_before
         {
             // History was trimmed at the dispatch seam — rebuild the request
-            // so the provider sees the trimmed population. Preserve the hook
-            // suffix without re-executing the hook (exactly-once semantics).
-            if let Ok(new_prepared) = prepare_messages_for_iteration(
-                turn_state.history,
-                multimodal_config,
-                degrade_strip_images,
-                image_cache.as_deref_mut(),
-            )
-            .await
-            {
-                let mut new_provider_request_messages = new_prepared.messages;
-                // Re-apply the hook's appended payload, if any, so the
-                // dispatched request still carries the hook's transient growth
-                // but on top of the trimmed durable history.
-                new_provider_request_messages.extend(hook_suffix.clone());
-                // Keep the system-prompt anchor and tool-protocol framing
-                // consistent with the trimmed history.
-                refresh_prompt_anchor(&mut new_provider_request_messages, use_native_tools);
-                refresh_scoped_tool_protocol_prompt(
-                    turn_state.history,
-                    &mut new_provider_request_messages,
-                    use_native_tools,
-                );
-                provider_request_messages = new_provider_request_messages;
-                reported_population_estimated =
-                    crate::agent::history::estimate_history_tokens(&provider_request_messages)
-                        + tool_schema_tokens;
+            // so the provider sees the trimmed population. Preserve the hook's
+            // mutations to retained messages by trimming the already-mutated
+            // post-hook snapshot directly, rather than repreparing the trimmed
+            // durable history and losing rewrites of existing messages.
+            let mut trimmed_post_hook = post_hook_snapshot;
+            // Separate any hook-appended suffix (messages beyond the original
+            // prepared length) so turn-dropping targets the durable prefix
+            // without dropping the hook's transient growth.
+            let suffix_len = hook_suffix.len();
+            let mut suffix = Vec::new();
+            if suffix_len > 0 && trimmed_post_hook.len() >= suffix_len {
+                suffix = trimmed_post_hook.split_off(trimmed_post_hook.len() - suffix_len);
             }
+            // Drop oldest whole turns from the post-hook prefix until its
+            // turn count matches the trimmed durable history's count.
+            let durable_target_turns = crate::agent::history_trim::count_turns(turn_state.history)
+                .saturating_sub(usize::from(turn_state.crumb_present));
+            // The post-hook prefix's turn count still reflects the pre-trim
+            // durable turns plus any hook rewrites; drop until it matches.
+            while crate::agent::history_trim::count_turns(&trimmed_post_hook)
+                .saturating_sub(usize::from(post_hook_had_crumb))
+                > durable_target_turns
+            {
+                let dropped = crate::agent::history_trim::drop_oldest_whole_turn(
+                    &mut trimmed_post_hook,
+                    post_hook_had_crumb,
+                );
+                if dropped == 0 {
+                    break;
+                }
+            }
+            // If the durable trim inserted a fresh breadcrumb, mirror it in
+            // the post-hook request so the dispatched population matches the
+            // persisted history.
+            if !post_hook_had_crumb && turn_state.crumb_present {
+                crate::agent::history_trim::insert_breadcrumb_deduped(
+                    &mut trimmed_post_hook,
+                    false,
+                );
+            }
+            // Re-append the hook's transient suffix and re-apply prompt
+            // framing so the system anchor stays consistent.
+            trimmed_post_hook.extend(suffix);
+            refresh_prompt_anchor(&mut trimmed_post_hook, use_native_tools);
+            refresh_scoped_tool_protocol_prompt(
+                turn_state.history,
+                &mut trimmed_post_hook,
+                use_native_tools,
+            );
+            provider_request_messages = trimmed_post_hook;
+            reported_population_estimated =
+                crate::agent::history::estimate_history_tokens(&provider_request_messages)
+                    + tool_schema_tokens;
         }
 
         // Fail closed on the local budget BEFORE announcing the request.
@@ -2217,22 +2252,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     // request that just completed and may be stale the moment a
                     // hook flips models; the re-resolved vision route names the
                     // provider whose capability actually decides whether
-                    // schemas are serialized into the next request.
+                    // schemas are serialized into the next request. The actual
+                    // next iteration will run `before_llm_call` again and can
+                    // select a different model, so the pre-dispatch gate
+                    // (which runs after the next hook) is the authoritative
+                    // check for that transition — this post-tool projection
+                    // reserves the larger of the two populations conservatively
+                    // so a non-native→native flip does not silently overrun.
                     let next_protocol_model = next_vision
                         .as_ref()
                         .map(|resolved| resolved.model.as_str())
                         .unwrap_or(model);
                     next_specs.refresh_native_tool_mode(next_active_provider, next_protocol_model);
-                    (
-                        if next_specs.use_native_tools {
-                            crate::agent::history::estimate_tool_schema_tokens(
-                                &next_specs.tool_specs,
-                            )
-                        } else {
-                            0
-                        },
-                        next_specs.use_native_tools,
-                    )
+                    let next_tokens = if next_specs.use_native_tools {
+                        crate::agent::history::estimate_tool_schema_tokens(&next_specs.tool_specs)
+                    } else {
+                        0
+                    };
+                    // Conservative: also consider the current iteration's
+                    // schema population. A hook that flips non-native→native
+                    // on the next iteration would make the next request
+                    // native while this projection would otherwise reserve 0.
+                    // Taking the max ensures the budget decision does not
+                    // under-reserve; the pre-dispatch gate remains authoritative
+                    // for the exact next-hook-selected model.
+                    let conservative_tokens = std::cmp::max(next_tokens, tool_schema_tokens);
+                    (conservative_tokens, next_specs.use_native_tools)
                 }
                 Err(_) => (tool_schema_tokens, use_native_tools),
             };
