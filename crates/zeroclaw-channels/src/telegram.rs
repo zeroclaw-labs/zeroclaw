@@ -1651,6 +1651,15 @@ impl TelegramChannel {
         }
     }
 
+    /// Telegram's Bot API answers every method call with a JSON envelope
+    /// whose `ok` field carries the application-level result: a 2xx status
+    /// with `ok: false` means the request did not succeed. Callers that
+    /// only inspect the HTTP status would misread application-level
+    /// rejections as success.
+    fn telegram_api_envelope_ok(body: &serde_json::Value) -> bool {
+        body.get("ok").and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
     async fn answer_model_picker_callback(&self, callback_id: &str, text: String) {
         let mut body = serde_json::json!({ "callback_query_id": callback_id });
         if !text.is_empty() {
@@ -1663,17 +1672,26 @@ impl TelegramChannel {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {}
             Ok(response) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "status": response.status().as_u16(),
-                        })),
-                    "Telegram model picker callback acknowledgement failed"
-                );
+                let status = response.status();
+                let envelope_ok = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .as_ref()
+                    .is_some_and(Self::telegram_api_envelope_ok);
+                if !(status.is_success() && envelope_ok) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "status": status.as_u16(),
+                                "telegram_ok": envelope_ok,
+                            })),
+                        "Telegram model picker callback acknowledgement failed"
+                    );
+                }
             }
             Err(error) => {
                 ::zeroclaw_log::record!(
@@ -1716,18 +1734,27 @@ impl TelegramChannel {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => {}
             Ok(response) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "status": response.status().as_u16(),
-                            "picker_message_id": message_id,
-                        })),
-                    "Telegram model picker keyboard cleanup failed"
-                );
+                let status = response.status();
+                let envelope_ok = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .as_ref()
+                    .is_some_and(Self::telegram_api_envelope_ok);
+                if !(status.is_success() && envelope_ok) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "status": status.as_u16(),
+                                "telegram_ok": envelope_ok,
+                                "picker_message_id": message_id,
+                            })),
+                        "Telegram model picker keyboard cleanup failed"
+                    );
+                }
             }
             Err(error) => {
                 ::zeroclaw_log::record!(
@@ -1783,19 +1810,30 @@ impl TelegramChannel {
             .send()
             .await
         {
-            Ok(response) if response.status().is_success() => true,
             Ok(response) => {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({
-                            "status": response.status().as_u16(),
-                            "picker_message_id": message_id,
-                        })),
-                    "Telegram model picker edit failed; restoring prior keyboard"
-                );
-                false
+                let status = response.status();
+                let envelope_ok = response
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .as_ref()
+                    .is_some_and(Self::telegram_api_envelope_ok);
+                if status.is_success() && envelope_ok {
+                    true
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "status": status.as_u16(),
+                                "telegram_ok": envelope_ok,
+                                "picker_message_id": message_id,
+                            })),
+                        "Telegram model picker edit failed; restoring prior keyboard"
+                    );
+                    false
+                }
             }
             Err(error) => {
                 ::zeroclaw_log::record!(
@@ -1811,6 +1849,20 @@ impl TelegramChannel {
                 false
             }
         }
+    }
+
+    /// `Permit::send` reports no delivery result: if the receiver closed
+    /// after the reservation, the queued selection is dropped silently.
+    /// A channel that is closed after the send can never deliver the
+    /// message, so the caller must treat that handoff as failed and
+    /// restore the picker instead of confirming the switch.
+    fn deliver_model_picker_selection(
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        permit: tokio::sync::mpsc::Permit<'_, ChannelMessage>,
+        message: ChannelMessage,
+    ) -> bool {
+        permit.send(message);
+        !tx.is_closed()
     }
 
     async fn handle_model_picker_callback(
@@ -1857,7 +1909,15 @@ impl TelegramChannel {
                     .await;
                     return;
                 };
-                permit.send(*message);
+                if !Self::deliver_model_picker_selection(tx, permit, *message) {
+                    self.restore_model_picker_keyboard(previous_keyboard).await;
+                    self.answer_model_picker_callback(
+                        callback_id,
+                        i18n::get_required_cli_string("channel-telegram-model-picker-unavailable"),
+                    )
+                    .await;
+                    return;
+                }
                 tokio::join!(
                     self.disable_model_picker_keyboard(callback),
                     self.answer_model_picker_callback(
@@ -5094,6 +5154,9 @@ impl Channel for TelegramChannel {
             );
         }
         let response_body: serde_json::Value = response.json().await?;
+        if !Self::telegram_api_envelope_ok(&response_body) {
+            anyhow::bail!("Telegram sendMessage (model picker) returned a non-ok envelope");
+        }
         let picker_message_id = response_body
             .get("result")
             .and_then(|result| result.get("message_id"))
@@ -8071,6 +8134,134 @@ mod tests {
             answer_body["text"],
             i18n::get_required_cli_string("channel-telegram-model-picker-unavailable")
         );
+    }
+
+    /// A 2xx editMessageText response with `"ok": false` is an
+    /// application-level failure: the navigation must restore the previous
+    /// keyboard cohort and must not report success, exactly like a
+    /// transport-level error.
+    #[tokio::test]
+    async fn model_picker_ok_false_navigation_edit_restores_visible_keyboard_tokens() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error_code": 400,
+                "description": "Bad Request: message not found"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "main",
+            Arc::new(|| vec!["test_user".into()]),
+            false,
+        )
+        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_api_base(server.uri());
+        let open_token = uuid::Uuid::new_v4().to_string();
+        let cancel_token = uuid::Uuid::new_v4().to_string();
+        let base = PendingModelPicker {
+            created_at: Instant::now(),
+            expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
+            requesting_user_id: "123".into(),
+            reply_target: "-10042:9".into(),
+            thread_ts: Some("9".into()),
+            channel_alias: "main".into(),
+            picker_message_id: 77,
+            owner_agent_alias: "assistant".into(),
+            current: ModelPickerSelection {
+                model_provider: "openai.primary".into(),
+                model: "gpt-current".into(),
+            },
+            runtime_routes: model_picker_runtime_routes(&model_picker_config()),
+            action: ModelPickerAction::Cancel,
+        };
+        channel
+            .insert_pending_model_picker_batch(vec![(
+                open_token.clone(),
+                PendingModelPicker {
+                    action: ModelPickerAction::OpenCategory {
+                        provider_ref: "openai.primary".into(),
+                        page: 0,
+                    },
+                    ..base.clone()
+                },
+            )])
+            .await;
+        channel
+            .insert_pending_model_picker_batch(vec![(cancel_token.clone(), base)])
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        channel
+            .handle_model_picker_callback(
+                &model_picker_callback(&open_token, "test_user", -10042, 9, 77),
+                &tx,
+            )
+            .await;
+
+        let pending = channel.pending_model_pickers.lock().await;
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(
+            pending.get(&open_token).map(|state| &state.action),
+            Some(ModelPickerAction::OpenCategory { provider_ref, page })
+                if provider_ref == "openai.primary" && *page == 0
+        ));
+        assert!(matches!(
+            pending.get(&cancel_token).map(|state| &state.action),
+            Some(ModelPickerAction::Cancel)
+        ));
+        drop(pending);
+        assert!(rx.try_recv().is_err());
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let answer = requests
+            .iter()
+            .find(|request| request.url.path().ends_with("answerCallbackQuery"))
+            .expect("callback answer request");
+        let answer_body: serde_json::Value = serde_json::from_slice(&answer.body).unwrap();
+        assert_eq!(
+            answer_body["text"],
+            i18n::get_required_cli_string("channel-telegram-model-picker-unavailable")
+        );
+    }
+
+    #[test]
+    fn deliver_model_picker_selection_reports_receiver_close() {
+        // A receiver that closes after the reservation turns Permit::send
+        // into a silent drop; the handoff must report that as failure.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
+        let permit = tx.try_reserve().expect("capacity reservation");
+        drop(rx);
+        assert!(!TelegramChannel::deliver_model_picker_selection(
+            &tx,
+            permit,
+            ChannelMessage::default()
+        ));
+
+        // An open channel confirms the handoff and delivers the message.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
+        let permit = tx.try_reserve().expect("capacity reservation");
+        assert!(TelegramChannel::deliver_model_picker_selection(
+            &tx,
+            permit,
+            ChannelMessage::default()
+        ));
+        assert!(rx.try_recv().is_ok());
     }
 
     #[tokio::test]
