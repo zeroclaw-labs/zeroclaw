@@ -610,13 +610,20 @@ mod graceful_summary_metering_tests {
 
         assert!(out.contains("wrap-up summary"), "unexpected summary: {out}");
 
-        let mut chunk_delta = None;
+        let mut chunk_deltas = Vec::new();
         while let Ok(event) = rx.try_recv() {
             if let TurnEvent::Chunk { delta } = event {
-                chunk_delta = Some(delta);
+                chunk_deltas.push(delta);
             }
         }
-        let delta = chunk_delta.expect("max-iteration exit must emit a TurnEvent::Chunk");
+        assert_eq!(
+            chunk_deltas.len(),
+            1,
+            "max-iteration exit must emit exactly one TurnEvent::Chunk"
+        );
+        let delta = chunk_deltas
+            .pop()
+            .expect("max-iteration exit must emit a TurnEvent::Chunk");
         assert!(
             delta.contains("wrap-up summary"),
             "chunk must carry the summary text: {delta}"
