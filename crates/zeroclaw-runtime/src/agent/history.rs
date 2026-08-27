@@ -404,6 +404,7 @@ pub struct InteractiveSessionState {
 }
 
 impl InteractiveSessionState {
+    #[allow(dead_code)]
     fn from_history(history: &[ChatMessage]) -> Self {
         Self {
             version: 2,
