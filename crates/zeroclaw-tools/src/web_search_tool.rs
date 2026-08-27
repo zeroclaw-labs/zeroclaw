@@ -67,7 +67,12 @@ const SERPLY_USER_AGENT: &str = "ZeroClaw/1.0 (https://zeroclaw.ai)";
 /// The Bocha, AnySearch and Serply keys have no boot-time snapshot at all: they
 /// are always resolved from `config.toml` at use time, so their canonical
 /// `[web_search]` fields stay the single source of truth and rotation/removal
-/// takes effect without a restart.
+/// takes effect without a restart. The exception is a schema-mirror env
+/// override (`ZEROCLAW_web_search__anysearch_api_key`,
+/// `ZEROCLAW_web_search__serply_api_key`): the loader applies it to the
+/// in-memory `Config` only, so the runtime hands the effective value to the
+/// tool and the resolver uses it instead of the on-disk field for the lifetime
+/// of the process.
 pub struct WebSearchTool {
     /// ModelProvider selector as configured by user. Routed via model_provider aliases at runtime.
     model_provider: String,
@@ -81,6 +86,11 @@ pub struct WebSearchTool {
     /// override. The outer `Option` records that an override was applied; an
     /// inner `None` explicitly selects anonymous mode.
     anysearch_api_key_override: Option<Option<String>>,
+    /// Effective Serply credential when `ZEROCLAW_web_search__serply_api_key`
+    /// was applied by the config loader. The outer `Option` records that an
+    /// override is active; an inner `None` (blank override) means "not
+    /// configured" and must not fall back to the on-disk key.
+    serply_api_key_override: Option<Option<String>>,
     /// SearXNG instance base URL (e.g. `"https://searx.example.com"`).
     searxng_instance_url: Option<String>,
     max_results: usize,
@@ -105,6 +115,7 @@ impl WebSearchTool {
             boot_tavily_api_key: None,
             boot_jina_api_key: jina_api_key,
             anysearch_api_key_override: None,
+            serply_api_key_override: None,
             searxng_instance_url: None,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
@@ -131,6 +142,7 @@ impl WebSearchTool {
             boot_tavily_api_key: tavily_api_key,
             boot_jina_api_key: jina_api_key,
             anysearch_api_key_override: None,
+            serply_api_key_override: None,
             searxng_instance_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
@@ -166,6 +178,19 @@ impl WebSearchTool {
         tool.anysearch_api_key_override =
             anysearch_api_key_override.map(|key| key.filter(|value| !value.is_empty()));
         tool
+    }
+
+    /// Record the schema-mirror env override state for the Serply key.
+    ///
+    /// Pass `Some(value)` when the config loader applied
+    /// `ZEROCLAW_web_search__serply_api_key` (`value` is the in-memory
+    /// credential, `None` for a blank override) and `None` when no override is
+    /// active, in which case the key keeps being resolved from `config.toml`
+    /// at use time.
+    pub fn with_serply_api_key_override(mut self, override_key: Option<Option<String>>) -> Self {
+        self.serply_api_key_override =
+            override_key.map(|key| key.filter(|value| !value.is_empty()));
+        self
     }
 
     /// Resolve the Brave API key, preferring the boot-time value but falling
@@ -1082,7 +1107,33 @@ impl WebSearchTool {
         Ok(render_results(results_header(query, "AnySearch"), blocks))
     }
 
+    /// Build the "not configured" error for the Serply key, logging which
+    /// lookup produced it (`env_override` or `config`).
+    fn serply_api_key_not_configured(source: &'static str) -> anyhow::Error {
+        ::zeroclaw_log::record!(
+            ERROR,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"search_provider": "serply", "source": source})),
+            "web_search: Serply API key not configured"
+        );
+        anyhow::Error::msg(
+            "Serply API key not configured. Set [web_search] serply_api_key in \
+             config.toml (or ZEROCLAW_web_search__serply_api_key). Obtain one at \
+             https://serply.io",
+        )
+    }
+
     fn resolve_serply_api_key(&self) -> anyhow::Result<String> {
+        // A schema-mirror env override is the effective credential for this
+        // process: it wins over any stored key, and a blank override means
+        // "not configured" rather than silently sending the on-disk value.
+        if let Some(override_key) = &self.serply_api_key_override {
+            return override_key
+                .clone()
+                .ok_or_else(|| Self::serply_api_key_not_configured("env_override"));
+        }
+
         let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -1123,19 +1174,7 @@ impl WebSearchTool {
             .web_search
             .serply_api_key
             .filter(|k| !k.is_empty())
-            .ok_or_else(|| {
-                ::zeroclaw_log::record!(
-                    ERROR,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"search_provider": "serply"})),
-                    "web_search: Serply API key not configured"
-                );
-                anyhow::Error::msg(
-                    "Serply API key not configured. Set [web_search] serply_api_key in \
-                     config.toml. Obtain one at https://serply.io",
-                )
-            })?;
+            .ok_or_else(|| Self::serply_api_key_not_configured("config"))?;
 
         if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
             let zeroclaw_dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
@@ -2593,6 +2632,7 @@ mod tests {
             boot_tavily_api_key: None,
             boot_jina_api_key: None,
             anysearch_api_key_override: None,
+            serply_api_key_override: None,
             searxng_instance_url: Some("https://searx.example.com".to_string()),
             max_results: 5,
             timeout_secs: 15,
@@ -4396,6 +4436,105 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("Serply API key not configured")
+        );
+    }
+
+    #[test]
+    fn test_resolve_serply_api_key_env_override_without_disk_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "[web_search]\n").unwrap();
+        let tool = serply_tool(config_path, false)
+            .with_serply_api_key_override(Some(Some("env-only-key".to_string())));
+        assert_eq!(tool.resolve_serply_api_key().unwrap(), "env-only-key");
+    }
+
+    #[test]
+    fn test_resolve_serply_api_key_env_override_wins_over_disk_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        let tool = serply_tool(config_path.clone(), false)
+            .with_serply_api_key_override(Some(Some("env-key".to_string())));
+        assert_eq!(tool.resolve_serply_api_key().unwrap(), "env-key");
+        // The override is process-effective: on-disk edits do not displace it.
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"rotated-key\"\n",
+        )
+        .unwrap();
+        assert_eq!(tool.resolve_serply_api_key().unwrap(), "env-key");
+    }
+
+    #[test]
+    fn test_resolve_serply_api_key_blank_env_override_does_not_fall_back_to_disk() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        // `ZEROCLAW_web_search__serply_api_key=` reaches the tool either as an
+        // explicit `None` (the loader clears the `Option`) or as an empty string.
+        for blank in [None, Some(String::new())] {
+            let tool =
+                serply_tool(config_path.clone(), false).with_serply_api_key_override(Some(blank));
+            let err = tool.resolve_serply_api_key().unwrap_err().to_string();
+            assert!(err.contains("Serply API key not configured"), "{err}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_serply_request_carries_env_override_key_not_stored_key() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search/"))
+            .and(header("x-api-key", "env-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"results": []})),
+            )
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            "[web_search]\nserply_api_key = \"stored-key\"\n",
+        )
+        .unwrap();
+        let tool = serply_tool(config_path, false)
+            .with_serply_api_key_override(Some(Some("env-key".to_string())));
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        tool.search_serply_with_client(&client, &format!("{}/v1/search/", server.uri()), "rust")
+            .await
+            .expect("the request must authenticate with the env-override key");
+
+        let recorded = server
+            .received_requests()
+            .await
+            .expect("wiremock should have captured the request");
+        assert_eq!(recorded.len(), 1);
+        let sent = recorded[0]
+            .headers
+            .get("x-api-key")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        assert_eq!(
+            sent, "env-key",
+            "the stored key must not be sent while an override is active"
         );
     }
 
