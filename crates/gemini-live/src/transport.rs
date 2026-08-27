@@ -18,8 +18,8 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::types::{CloseReason, Model};
@@ -244,7 +244,7 @@ impl Transport for WsTransport {
         use futures_util::SinkExt;
         async move {
             self.ws
-                .send(Message::Text(s))
+                .send(Message::Text(s.into()))
                 .await
                 .map_err(|e| TransportError::Send(e.to_string()))
         }

@@ -11,7 +11,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 tokio = { version = "1", features = ["rt", "net", "macros", "time", "sync"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 async-http-proxy = { version = "1.2", features = ["runtime-tokio", "basic-auth"] }
 futures-util = "0.3"
