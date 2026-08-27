@@ -3912,6 +3912,25 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
     s.to_string()
 }
 
+/// Reconstruct the cumulative text expected by MultiMessage finalizers.
+///
+/// Their paragraph offsets are measured against the text supplied to
+/// `update_draft`. Terminal runtime deltas intentionally contain only the new
+/// segment, so a tool-call narration already streamed to the draft can be
+/// absent from `outbound_response`. Preserve that streamed prefix when the
+/// final response is its suffix; otherwise retain the canonical final response
+/// because the two representations no longer describe the same stream.
+fn cumulative_multi_message_final_text(
+    streamed_text: &str,
+    outbound_response: &str,
+    delivered_response: &str,
+) -> String {
+    streamed_text.strip_suffix(outbound_response).map_or_else(
+        || delivered_response.to_string(),
+        |streamed_prefix| format!("{streamed_prefix}{delivered_response}"),
+    )
+}
+
 /// Pump draft deltas to the channel transport, sanitizing every partial on the
 /// way out.
 ///
@@ -3933,6 +3952,7 @@ async fn run_draft_updater(
     reply_target: String,
     draft_id: String,
     known_tool_names: HashSet<String>,
+    streamed_text: Arc<Mutex<String>>,
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_runtime::agent::loop_::DraftEvent>,
 ) {
     use zeroclaw_runtime::agent::loop_::StreamDelta;
@@ -3998,6 +4018,10 @@ async fn run_draft_updater(
             StreamDelta::Text(text) => {
                 accumulated.push_str(&text);
                 let visible = sanitize_streaming_draft_text(&accumulated, &known_tool_names);
+                // Keep the exact visible frame used for MultiMessage offsets;
+                // retaining the raw accumulation here could reintroduce a
+                // protocol payload during finalization.
+                *streamed_text.lock().unwrap_or_else(|e| e.into_inner()) = visible.clone();
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &visible)
                     .await
@@ -6922,6 +6946,10 @@ async fn process_channel_message_body(
     };
 
     // Spawn the appropriate handler for the delta channel.
+    // Multi-message channels use the text accumulated by the draft updater to
+    // finalize the same cumulative stream they used for paragraph offsets.
+    // Other draft modes still finalize the canonical response unchanged.
+    let streamed_draft_text = Arc::new(Mutex::new(String::new()));
     let draft_updater = if use_draft_streaming {
         // Partial: accumulate text and edit a single draft message.
         if let (Some(rx), Some(draft_id_ref), Some(channel_ref)) = (
@@ -6958,8 +6986,17 @@ async fn process_channel_message_body(
                     .iter()
                     .map(|tool| tool.name().to_ascii_lowercase())
                     .collect();
+                let streamed_draft_text = Arc::clone(&streamed_draft_text);
                 Some(zeroclaw_spawn::spawn!(async move {
-                    run_draft_updater(channel, reply_target, draft_id, known_tool_names, rx).await;
+                    run_draft_updater(
+                        channel,
+                        reply_target,
+                        draft_id,
+                        known_tool_names,
+                        streamed_draft_text,
+                        rx,
+                    )
+                    .await;
                 }))
             }
         } else {
@@ -7728,11 +7765,23 @@ async fn process_channel_message_body(
                             .is_ok()
                     } else {
                         let suppress = suppress_voice_override.unwrap_or(false);
+                        let draft_final_response = if channel.supports_multi_message_streaming() {
+                            let streamed_text = streamed_draft_text
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            cumulative_multi_message_final_text(
+                                &streamed_text,
+                                &outbound_response,
+                                &delivered_response,
+                            )
+                        } else {
+                            delivered_response.clone()
+                        };
                         match channel
                             .finalize_draft(
                                 &delivery_recipient,
                                 draft_id,
-                                &delivered_response,
+                                &draft_final_response,
                                 suppress,
                             )
                             .await
@@ -17311,6 +17360,14 @@ api_key = "anthropic-key"
                 channel_name: "matrix",
                 supports_multi_message_streaming: stream_mode
                     == zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+                ..Self::new(false, false)
+            }
+        }
+
+        fn multi_message(channel_name: &'static str) -> Self {
+            Self {
+                channel_name,
+                supports_multi_message_streaming: true,
                 ..Self::new(false, false)
             }
         }
@@ -34904,6 +34961,7 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             no_tools(),
+            Arc::new(Mutex::new(String::new())),
             rx,
         )
         .await;
@@ -34927,6 +34985,112 @@ Done."#;
             progress.as_slice(),
             ["Working on it.".to_string()],
             "status text must reach the transport already stripped of reasoning"
+        );
+    }
+
+    /// Regression at the channel streaming/finalization boundary: malformed
+    /// protocol exhaustion sends only a display-safe terminal fallback after a
+    /// prior tool narration. A MultiMessage finalizer's offset is cumulative,
+    /// so the fallback must remain after the already sent narration exactly
+    /// once.
+    #[tokio::test]
+    async fn multi_message_finalization_keeps_terminal_malformed_fallback_after_narration() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message("discord"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let narration = "Checking the requested records.\n\n";
+        let fallback = "I couldn't complete that response safely.";
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(fallback.to_string()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            rx,
+        )
+        .await;
+
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            fallback,
+            fallback,
+        );
+        assert_eq!(
+            &final_text[narration.len()..],
+            fallback,
+            "the cumulative offset must leave the complete fallback for finalization"
+        );
+        assert_eq!(final_text.matches(fallback).count(), 1);
+        assert_eq!(
+            channel_impl.draft_updates.lock().await.last(),
+            Some(&final_text)
+        );
+    }
+
+    /// Regression at the channel streaming/finalization boundary: the
+    /// max-iteration path sends only its new summary segment after prior tool
+    /// narration. Once MultiMessage has emitted that summary paragraph, the
+    /// stop reason must still be the unsent suffix, not be lost to its
+    /// cumulative offset.
+    #[tokio::test]
+    async fn multi_message_finalization_keeps_max_iteration_stop_reason_after_narration() {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::matrix(
+            zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
+        ));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let narration = "I checked the available sources.\n\n";
+        let summary = "Here is the best partial answer.";
+        let stop_reason = "Stopped after reaching the tool-call limit.";
+        let terminal_segment = format!("{summary}\n\n{stop_reason}");
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(terminal_segment.clone()))
+            .await
+            .unwrap();
+        drop(tx);
+
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            rx,
+        )
+        .await;
+
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &terminal_segment,
+            &terminal_segment,
+        );
+        let sent_so_far = narration.len() + summary.len() + "\n\n".len();
+        assert_eq!(
+            &final_text[sent_so_far..],
+            stop_reason,
+            "the finalizer must flush the stop reason after its cumulative paragraph offset"
+        );
+        assert_eq!(final_text.matches(summary).count(), 1);
+        assert_eq!(final_text.matches(stop_reason).count(), 1);
+        assert_eq!(
+            channel_impl.draft_updates.lock().await.last(),
+            Some(&final_text)
         );
     }
 
@@ -34964,6 +35128,7 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             no_tools(),
+            Arc::new(Mutex::new(String::new())),
             rx,
         )
         .await;
@@ -35026,6 +35191,7 @@ Done."#;
                 "chat-1".to_string(),
                 "draft-1".to_string(),
                 no_tools(),
+                Arc::new(Mutex::new(String::new())),
                 rx,
             )
             .await;
@@ -35093,6 +35259,7 @@ Done."#;
                 "chat-1".to_string(),
                 "draft-1".to_string(),
                 known.clone(),
+                Arc::new(Mutex::new(String::new())),
                 rx,
             )
             .await;
@@ -35134,6 +35301,7 @@ Done."#;
             "chat-1".to_string(),
             "draft-1".to_string(),
             known,
+            Arc::new(Mutex::new(String::new())),
             rx,
         )
         .await;
