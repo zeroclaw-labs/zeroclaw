@@ -862,14 +862,21 @@ fn normalize_telegram_api_base(api_base: &str) -> String {
 
 impl TelegramChannel {
     fn is_safe_model_picker_field(value: &str) -> bool {
-        // Hints are interpolated into `/model <hint>` command syntax, where a
-        // leading `--` token has scope meaning (`--user`, `--agent`) or falls
-        // back to the help ladder. Flag-shaped hints must stay out of the
-        // picker so it can't cross the explicit scope boundary.
-        !value.trim().is_empty()
+        // Hints are interpolated into `/model <hint>` command syntax, which
+        // normalizes whitespace and strips backticks before matching routes,
+        // and treats a leading `--` token as a scope flag (`--user`,
+        // `--agent`) or falls back to the help ladder. Only canonical hints
+        // may enter the picker: already trimmed, single spaces between
+        // tokens, no backticks, and no `--`-prefixed token anywhere. That
+        // keeps every displayed route inside the session-scoped command
+        // domain and guarantees the selection command round-trips back to
+        // the exact configured route instead of a literal model write.
+        !value.is_empty()
             && value.len() <= TELEGRAM_MODEL_PICKER_MAX_FIELD_BYTES
             && !value.chars().any(char::is_control)
-            && !value.starts_with("--")
+            && !value.contains('`')
+            && value.split_whitespace().collect::<Vec<_>>().join(" ") == value
+            && !value.split_whitespace().any(|token| token.starts_with("--"))
     }
 
     fn configured_model_provider(config: &Config, provider_ref: &str) -> bool {
@@ -3452,6 +3459,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         UpdateDisposition::Parsed(Box::new(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
             sender: sender_identity,
+            platform_sender_id: sender_id,
             reply_target,
             content,
             channel: "telegram".into(),
@@ -6969,6 +6977,85 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_excludes_hints_that_do_not_round_trip_the_command_boundary() {
+        // The selection command is `/model <hint>`, whose runtime parser
+        // collapses whitespace, strips backticks, and reads a leading `--`
+        // token as a scope flag. Hints that would change meaning across that
+        // serialization boundary must never become selectable routes.
+        let mut config = model_picker_config();
+        let non_canonical = [
+            " leading",
+            "trailing ",
+            "repeated  space",
+            "`backticked`",
+            "back`tick",
+            " --user fast",
+            "--agent fast",
+            "fast --user",
+        ];
+        for (index, hint) in non_canonical.iter().enumerate() {
+            config.model_routes.push(zeroclaw_config::schema::ModelRouteConfig {
+                hint: (*hint).to_string(),
+                model_provider: "openai.fast".to_string(),
+                model: format!("gpt-non-canonical-{index}"),
+                api_key: None,
+            });
+        }
+
+        let runtime_routes = model_picker_runtime_routes(&config);
+        let context =
+            TelegramChannel::model_picker_context(&config, "main", runtime_routes.as_ref())
+                .expect("valid configured routes should remain available");
+        let options = context
+            .categories
+            .iter()
+            .flat_map(|category| category.options.iter())
+            .collect::<Vec<_>>();
+
+        for hint in non_canonical {
+            assert!(
+                options.iter().all(|option| option.hint != hint),
+                "non-canonical hint {hint:?} must not enter the picker"
+            );
+        }
+    }
+
+    #[test]
+    fn model_picker_selection_commands_stay_in_the_session_scoped_domain() {
+        // Invariant at the callback-to-runtime boundary: for every route the
+        // picker presents, the emitted `/model` command re-normalizes to the
+        // exact hint and its first argument token is never flag-shaped, so a
+        // valid authorized callback can only take the per-sender route path.
+        let config = model_picker_config();
+        let runtime_routes = model_picker_runtime_routes(&config);
+        let context =
+            TelegramChannel::model_picker_context(&config, "main", runtime_routes.as_ref())
+                .expect("configured Telegram owner should produce a picker");
+
+        for option in context
+            .categories
+            .iter()
+            .flat_map(|category| category.options.iter())
+        {
+            let command = TelegramChannel::model_picker_selection_command(option);
+            let mut tokens = command.split_whitespace();
+            assert_eq!(tokens.next(), Some("/model"));
+            let args = tokens.collect::<Vec<_>>();
+            assert!(
+                !args.first().is_some_and(|token| token.starts_with("--")),
+                "hint {:?} must not produce a flag-shaped first token",
+                option.hint
+            );
+            assert_eq!(
+                args.join(" "),
+                option.hint,
+                "hint {:?} must round-trip through the command parser unchanged",
+                option.hint
+            );
+        }
+    }
+
+    #[test]
     fn model_picker_category_keyboard_renders_every_configured_provider() {
         let config = model_picker_config();
         let runtime_routes = model_picker_runtime_routes(&config);
@@ -9768,6 +9855,70 @@ mod tests {
         let parsed = ch.try_parse_voice_message(&update).await;
         assert!(matches!(parsed, UpdateDisposition::SkipPermanent));
         assert!(ch.voice_transcriptions.lock().is_empty());
+    }
+
+    /// The voice path must carry the immutable Telegram user ID into
+    /// `ChannelMessage.platform_sender_id`, matching the text and
+    /// attachment paths, so downstream sender binding works for voice too.
+    #[tokio::test]
+    async fn try_parse_voice_message_sets_platform_sender_id() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": {"file_path": "voice/file.ogg"}
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/voice/file\.ogg$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 100]))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/transcribe$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "hello from voice"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let tc = zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: format!("{}/transcribe", mock_server.uri()),
+            max_duration_secs: 120,
+            ..Default::default()
+        };
+        let mention_only = false;
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        )
+        .with_api_base(mock_server.uri())
+        .with_transcription(tc);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 4,
+                "voice": { "file_id": "voice_file", "duration": 4 },
+                "from": { "id": 123, "username": "alice" },
+                "chat": { "id": 456, "type": "private" }
+            }
+        });
+
+        let parsed = ch.try_parse_voice_message(&update).await;
+        let UpdateDisposition::Parsed(message) = parsed else {
+            panic!("expected Parsed voice message");
+        };
+        assert_eq!(message.platform_sender_id.as_deref(), Some("123"));
+        assert_eq!(message.content, "[Voice] hello from voice");
     }
 
     // ─────────────────────────────────────────────────────────────────────
