@@ -1445,6 +1445,7 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::proxy_test_lock_guard;
 
     #[test]
     fn test_tool_name() {
@@ -1633,6 +1634,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckduckgo_request_reports_forbidden_status() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1656,6 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckduckgo_request_reports_non_block_failure_with_status_tag() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1686,6 +1689,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckduckgo_request_reports_verification_redirect_url() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1717,6 +1721,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckduckgo_request_reports_verification_form_html() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1746,6 +1751,7 @@ mod tests {
         // `anomaly-modal` interstitial (HTTP 200/202, no `/wr.do?` redirect,
         // no verification form), and the old detector slid past it,
         // returning a misleading "No results found" message to the agent.
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1771,6 +1777,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duckduckgo_request_preserves_normal_empty_results() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -3433,6 +3440,7 @@ mod tests {
     /// the pools existing in isolation.
     #[tokio::test]
     async fn duckduckgo_request_sends_browser_shaped_headers() {
+        let _proxy_guard = proxy_test_lock_guard().await;
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
