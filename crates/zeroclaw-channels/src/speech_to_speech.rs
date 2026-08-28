@@ -6,16 +6,18 @@
 //! currently holds only the `Channel` skeleton — the audio seam and session
 //! handle land in a later task.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use tokio::sync::{Notify, mpsc};
 
-use gemini_live::session::{ClientTextSender, Event, Session};
+use gemini_live::session::{ClientTextSender, Event, Session, SessionError};
 use gemini_live::types::{FunctionDecl, Model, SetupConfig};
 use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
+use zeroclaw_config::paths::{normalize_lexical, resolve_under};
 use zeroclaw_config::schema::{ModelKind, SpeechToSpeechConfig};
 
 /// Build the Gemini Live `SetupConfig` for a broker session.
@@ -46,7 +48,10 @@ pub fn build_broker_setup(cfg: &SpeechToSpeechConfig, persona: &str) -> SetupCon
 
     SetupConfig {
         model,
-        voice: cfg.voice.clone().unwrap_or_default(),
+        voice: cfg
+            .voice
+            .clone()
+            .unwrap_or_else(|| default_voice(cfg.model_kind).to_string()),
         language,
         system_instruction: persona.to_string(),
         temperature: cfg.temperature.unwrap_or(0.8),
@@ -81,6 +86,16 @@ pub fn build_broker_setup(cfg: &SpeechToSpeechConfig, persona: &str) -> SetupCon
         // owns the handle across reconnects); a fresh broker setup always
         // starts unresumed.
         resume_handle: None,
+    }
+}
+
+/// The per-`model_kind` default voice used when `cfg.voice` is unset —
+/// spec §3: `Autonoe` for native-audio, a Kore-class voice for
+/// half-cascade.
+fn default_voice(model_kind: ModelKind) -> &'static str {
+    match model_kind {
+        ModelKind::NativeAudio => "Autonoe",
+        ModelKind::HalfCascade => "Kore",
     }
 }
 
@@ -120,16 +135,80 @@ const DEFAULT_BROKER_PERSONA: &str = "You are a helpful voice call broker. Speak
     answer yourself, relay it to the agent via consult_agent and relay its reply back in \
     your own words. When the call is over, end it with end_session.";
 
+/// Resolve `raw_path` — interpreted, per `broker_persona_path`'s documented
+/// contract, as relative to the workspace — against `workspace_dir`, and
+/// reject anything that would escape it: an absolute path outside the
+/// workspace, or `..` traversal. A symlink whose canonical target stays
+/// inside the workspace is accepted (workspace-internal aliases are
+/// legitimate); one that lands outside is rejected. Mirrors
+/// `wechat::WeChatChannel::resolve_local_attachment_path`'s containment
+/// logic (see `canonicalize_within_workspace` there) built from the same
+/// `zeroclaw_config::paths` primitives — reimplemented here rather than
+/// shared because this module has no `WeChatChannel` to borrow it from.
+fn resolve_persona_path_within_workspace(raw_path: &str, workspace_dir: &Path) -> Result<PathBuf> {
+    let candidate = Path::new(raw_path);
+    let normalized = if candidate.is_absolute() {
+        let normalized = normalize_lexical(candidate);
+        let workspace_normalized = normalize_lexical(workspace_dir);
+        if !normalized.starts_with(&workspace_normalized) {
+            anyhow::bail!(
+                "broker_persona_path {raw_path:?} escapes workspace {}",
+                workspace_dir.display()
+            );
+        }
+        normalized
+    } else {
+        resolve_under(workspace_dir, raw_path).map_err(|e| {
+            anyhow::anyhow!(
+                "broker_persona_path {raw_path:?} escapes workspace {}: {e}",
+                workspace_dir.display()
+            )
+        })?
+    };
+
+    // Canonicalize to also catch a symlink whose target lands outside the
+    // workspace. A not-yet-existing path can't be canonicalized; skip the
+    // check there (mirrors wechat's behavior) — `read_to_string` will fail
+    // on it below with a clear "not found" error instead.
+    match std::fs::canonicalize(&normalized) {
+        Ok(canonical) => {
+            let workspace_canonical = std::fs::canonicalize(workspace_dir).with_context(|| {
+                format!(
+                    "workspace_dir {} could not be canonicalized",
+                    workspace_dir.display()
+                )
+            })?;
+            if !canonical.starts_with(&workspace_canonical) {
+                anyhow::bail!(
+                    "broker_persona_path {raw_path:?} canonicalizes to {} which escapes \
+                     workspace {}",
+                    canonical.display(),
+                    workspace_canonical.display()
+                );
+            }
+            Ok(canonical)
+        }
+        Err(_) => Ok(normalized),
+    }
+}
+
 /// Resolve the broker persona system-instruction for a session, standalone
 /// from (and never reading) `AGENTS.md` or any agent-side prompt material.
 /// Precedence: `broker_persona_path` (file contents, read fresh every call)
 /// wins over inline `broker_persona`, which wins over
-/// [`DEFAULT_BROKER_PERSONA`]. A configured path that fails to read is a
-/// real configuration error and propagates as `Err` rather than silently
-/// falling back to the default.
-pub fn resolve_persona(cfg: &SpeechToSpeechConfig) -> Result<String> {
+/// [`DEFAULT_BROKER_PERSONA`]. A configured path that fails to read, or that
+/// resolves outside `workspace_dir`, is a real configuration error and
+/// propagates as `Err` rather than silently falling back to the default.
+///
+/// **Security:** `broker_persona_path` is confined to `workspace_dir` (see
+/// [`resolve_persona_path_within_workspace`]) — an absolute path outside the
+/// workspace or a `..`-escaping relative path is rejected rather than read,
+/// since its contents are shipped to the provider as the session's system
+/// instruction.
+pub fn resolve_persona(cfg: &SpeechToSpeechConfig, workspace_dir: &Path) -> Result<String> {
     if let Some(path) = &cfg.broker_persona_path {
-        return std::fs::read_to_string(path)
+        let resolved = resolve_persona_path_within_workspace(path, workspace_dir)?;
+        return std::fs::read_to_string(&resolved)
             .map_err(|e| anyhow::anyhow!("failed to read broker_persona_path {path:?}: {e}"));
     }
     if let Some(persona) = &cfg.broker_persona {
@@ -148,9 +227,6 @@ pub struct SpeechToSpeechChannel {
     /// registry key (`Channel::name()` returns only the bare type name —
     /// see its doc comment).
     alias: String,
-    /// Reserved for the audio seam added in a later task.
-    #[allow(dead_code)]
-    config: SpeechToSpeechConfig,
     /// The text-send handle for whichever session is currently live on this
     /// alias, if any. Populated by [`Self::attach_session`] (called by
     /// [`Self::run_session`] for the session it drives), consumed by
@@ -179,11 +255,10 @@ pub struct SpeechToSpeechChannel {
 }
 
 impl SpeechToSpeechChannel {
-    pub fn new(alias: impl Into<String>, config: SpeechToSpeechConfig) -> Self {
+    pub fn new(alias: impl Into<String>) -> Self {
         let alias = alias.into();
         Self {
             alias,
-            config,
             active_session: Arc::new(Mutex::new(None)),
             stop: Arc::new(Notify::new()),
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
@@ -271,7 +346,7 @@ impl SpeechToSpeechChannel {
     /// bucket. See [`Self::history_key_for_transcript`] for the transcript
     /// side of that guarantee, proven equal in
     /// `transcript_binds_to_consult_history_key`.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn history_key_for_sender(&self) -> String {
         crate::orchestrator::conversation_history_key(&self.scoped_message("_", ""))
     }
@@ -285,7 +360,7 @@ impl SpeechToSpeechChannel {
     /// PR) — this exists only to prove the derived key is identical to the
     /// consult turn's, so that later wiring is pure plumbing, not a scoping
     /// decision.
-    #[allow(dead_code)]
+    #[cfg(test)]
     fn history_key_for_transcript(&self) -> String {
         crate::orchestrator::conversation_history_key(
             &self.scoped_message(uuid::Uuid::new_v4().to_string(), ""),
@@ -414,19 +489,29 @@ impl Channel for SpeechToSpeechChannel {
     /// whichever session is currently attached on this alias receives it.
     /// If no session is active (call already ended, or none ever started),
     /// this logs and returns `Ok(())` rather than erroring — a reply arriving
-    /// after hangup is a race, not a failure.
+    /// after hangup is a race, not a failure. The same treatment applies if
+    /// a session *was* attached but died between attach and this call
+    /// (`SessionError::Closed`): only genuinely-unexpected relay failures
+    /// surface as `Err`.
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let sender = self.active_session.lock().unwrap().clone();
         match sender {
-            Some(sender) => sender
-                .send_client_text(&message.content)
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(
-                        "speech_to_speech.{}: failed to relay reply into live session: {e}",
-                        self.alias
-                    )
-                }),
+            Some(sender) => match sender.send_client_text(&message.content).await {
+                Ok(()) => Ok(()),
+                Err(SessionError::Closed) => {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"alias": self.alias})),
+                        "speech_to_speech: send() raced session teardown; dropping reply"
+                    );
+                    Ok(())
+                }
+                Err(e) => Err(anyhow::anyhow!(
+                    "speech_to_speech.{}: failed to relay reply into live session: {e}",
+                    self.alias
+                )),
+            },
             None => {
                 ::zeroclaw_log::record!(
                     DEBUG,
@@ -500,7 +585,7 @@ mod tests {
         let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
             .await
             .unwrap();
-        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        let ch = SpeechToSpeechChannel::new("desk".to_string());
         ch.attach_session(&session);
 
         ch.send(&SendMessage::new(
@@ -531,7 +616,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_with_no_active_session_is_a_noop() {
-        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        let ch = SpeechToSpeechChannel::new("desk".to_string());
         ch.send(&SendMessage::new("hello", "voice-broker:desk"))
             .await
             .expect("send() with no active session must not error");
@@ -549,7 +634,7 @@ mod tests {
         let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
             .await
             .unwrap();
-        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        let ch = SpeechToSpeechChannel::new("desk".to_string());
         tokio::spawn(async move {
             let _ = ch.run_session(session, tx).await;
         });
@@ -576,7 +661,7 @@ mod tests {
         let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
             .await
             .unwrap();
-        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        let ch = SpeechToSpeechChannel::new("desk".to_string());
 
         tokio::time::timeout(
             std::time::Duration::from_secs(2),
@@ -620,7 +705,7 @@ mod tests {
         let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
             .await
             .unwrap();
-        let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string(), cfg()));
+        let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string()));
         let driver = {
             let ch = ch.clone();
             tokio::spawn(async move { ch.run_session(session, tx).await })
@@ -652,7 +737,7 @@ mod tests {
         let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
             .await
             .unwrap();
-        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg())
+        let ch = SpeechToSpeechChannel::new("desk".to_string())
             .with_idle_timeout(std::time::Duration::from_millis(50));
 
         tokio::time::timeout(
@@ -671,7 +756,7 @@ mod tests {
 
     #[test]
     fn transcript_binds_to_consult_history_key() {
-        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        let ch = SpeechToSpeechChannel::new("desk".to_string());
         let consult_key = ch.history_key_for_sender(); // used by consult_message
         let transcript_key = ch.history_key_for_transcript();
         assert_eq!(consult_key, transcript_key);
@@ -681,7 +766,7 @@ mod tests {
     fn channel_name_is_bare_type_alias_resolves_composite() {
         use ::zeroclaw_api::attribution::Attributable;
 
-        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        let ch = SpeechToSpeechChannel::new("desk".to_string());
         assert_eq!(ch.name(), "speech_to_speech");
         assert_eq!(ch.alias(), "desk");
         assert_eq!(
@@ -726,10 +811,11 @@ mod tests {
 
     #[test]
     fn persona_inline_used_when_no_path() {
+        let dir = tempfile::tempdir().unwrap();
         let mut c = cfg();
         c.broker_persona = Some("inline persona".into());
         c.broker_persona_path = None;
-        assert_eq!(resolve_persona(&c).unwrap(), "inline persona");
+        assert_eq!(resolve_persona(&c, dir.path()).unwrap(), "inline persona");
     }
 
     #[test]
@@ -739,6 +825,71 @@ mod tests {
         std::fs::write(&p, "file persona").unwrap();
         let mut c = cfg();
         c.broker_persona_path = Some(p.to_string_lossy().into());
-        assert_eq!(resolve_persona(&c).unwrap(), "file persona");
+        assert_eq!(resolve_persona(&c, dir.path()).unwrap(), "file persona");
+    }
+
+    #[test]
+    fn persona_path_relative_within_workspace_read_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("broker.md"), "relative persona").unwrap();
+        let mut c = cfg();
+        c.broker_persona_path = Some("broker.md".into());
+        assert_eq!(resolve_persona(&c, dir.path()).unwrap(), "relative persona");
+    }
+
+    #[test]
+    fn persona_path_absolute_outside_workspace_rejected() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.md");
+        std::fs::write(&secret, "not for Google").unwrap();
+        let mut c = cfg();
+        c.broker_persona_path = Some(secret.to_string_lossy().into());
+        let err = resolve_persona(&c, workspace.path())
+            .expect_err("absolute path outside the workspace must be rejected");
+        assert!(err.to_string().contains("escapes workspace"), "got: {err}");
+    }
+
+    #[test]
+    fn persona_path_dotdot_escape_rejected() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut c = cfg();
+        c.broker_persona_path = Some("../etc/passwd".into());
+        let err = resolve_persona(&c, workspace.path())
+            .expect_err("`..`-escaping broker_persona_path must be rejected");
+        assert!(err.to_string().contains("escapes workspace"), "got: {err}");
+    }
+
+    #[test]
+    fn voice_defaults_per_model_kind_when_unset() {
+        let mut native = cfg();
+        native.model_kind = ModelKind::NativeAudio;
+        native.voice = None;
+        let v = gemini_live::wire::build_setup(&build_broker_setup(&native, "p"));
+        assert_eq!(
+            v["setup"]["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
+            "Autonoe"
+        );
+
+        let mut half = cfg();
+        half.model_kind = ModelKind::HalfCascade;
+        half.voice = None;
+        let v = gemini_live::wire::build_setup(&build_broker_setup(&half, "p"));
+        assert_eq!(
+            v["setup"]["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
+            "Kore"
+        );
+    }
+
+    #[test]
+    fn voice_explicit_override_wins_over_default() {
+        let mut c = cfg();
+        c.model_kind = ModelKind::NativeAudio;
+        c.voice = Some("Puck".into());
+        let v = gemini_live::wire::build_setup(&build_broker_setup(&c, "p"));
+        assert_eq!(
+            v["setup"]["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
+            "Puck"
+        );
     }
 }

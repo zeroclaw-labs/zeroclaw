@@ -17065,6 +17065,11 @@ pub struct SpeechToSpeechConfig {
     pub language: Option<String>,
     /// Path (relative to the workspace) to a broker persona document that
     /// steers how the broker mediates between the caller and the agent.
+    /// Confined to the workspace at resolution time: an absolute path
+    /// outside the workspace, or a `..`-escaping relative path, is rejected
+    /// rather than read (the file's contents are shipped to the provider as
+    /// the session's system instruction). A workspace-internal symlink is
+    /// followed; one that resolves outside the workspace is rejected too.
     #[tab(Behavior)]
     #[serde(default)]
     pub broker_persona_path: Option<String>,

@@ -353,7 +353,8 @@ mod tests {
             setup["generationConfig"]["speechConfig"]["languageCode"],
             "en-US"
         );
-        // Exactly one tool: end_call, parameters == goal_schema.
+        // Exactly one tool: end_call, parameters == the FunctionDecl's own
+        // `parameters` JSON schema (from `functions[0]`).
         let decl = &setup["tools"][0]["functionDeclarations"][0];
         assert_eq!(decl["name"], "end_call");
         assert_eq!(decl["parameters"]["required"][0], "disposition");
