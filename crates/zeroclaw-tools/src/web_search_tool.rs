@@ -53,6 +53,67 @@ fn anysearch_config_parse_error(path: &Path, line: Option<usize>) -> anyhow::Err
 /// rejects requests that carry no User-Agent at all.
 const SERPLY_USER_AGENT: &str = "ZeroClaw/1.0 (https://zeroclaw.ai)";
 
+/// Non-disclosing description of a `config.toml` parse failure.
+///
+/// `toml::de::Error` renders an annotated snippet through `Display`, and that
+/// snippet quotes the offending source line verbatim; `Debug` and `message()`
+/// can carry fragments of it too. None of the three is used as the disclosure
+/// boundary here, because the offending line is very often the credential line
+/// itself: an operator who writes an unquoted key while rotating it would
+/// otherwise put the whole `serply_api_key = ...` line into the model-visible
+/// tool error and into the persisted log attributes, neither of which the
+/// runtime scrubs on that path. Only a stable code and a line number derived
+/// from the error span leave this type.
+struct SerplyConfigParseFailure {
+    code: &'static str,
+    line: Option<usize>,
+}
+
+impl SerplyConfigParseFailure {
+    /// Stable identifier for this failure, safe to log and to show.
+    const CODE: &'static str = "config_toml_parse_failed";
+
+    fn new(contents: &str, error: &toml::de::Error) -> Self {
+        // `span()` is a byte range into `contents`. Counting the newlines
+        // before it yields a 1-based line number and nothing else: no source
+        // text crosses this boundary.
+        let line = error.span().and_then(|span| {
+            contents
+                .get(..span.start)
+                .map(|before| before.matches('\n').count() + 1)
+        });
+        Self {
+            code: Self::CODE,
+            line,
+        }
+    }
+
+    /// Attributes recorded to the log. Constants and numbers only.
+    fn log_attrs(&self, path: &Path) -> ::serde_json::Value {
+        ::serde_json::json!({
+            "path": path.display().to_string(),
+            "search_provider": "serply",
+            "error_code": self.code,
+            "error_line": self.line,
+        })
+    }
+
+    /// Message handed back to the caller, and through it to the model.
+    fn message(&self, path: &Path) -> String {
+        let location = match self.line {
+            Some(line) => format!(" at line {line}"),
+            None => String::new(),
+        };
+        format!(
+            "Failed to parse config file {} for Serply API key: invalid TOML{}. \
+             Fix the syntax there and retry. The parser's own message is withheld \
+             because it quotes the offending line, which may be the credential.",
+            path.display(),
+            location,
+        )
+    }
+}
+
 /// Web search tool for searching the internet.
 /// Supports multiple model_providers: DuckDuckGo (free), Brave (requires API key),
 /// Tavily (requires API key), SearXNG (self-hosted, requires instance URL),
@@ -1153,21 +1214,15 @@ impl WebSearchTool {
         })?;
 
         let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            let failure = SerplyConfigParseFailure::new(&contents, &e);
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({
-                        "path": self.config_path.display().to_string(),
-                        "search_provider": "serply",
-                        "error": format!("{}", e),
-                    })),
+                    .with_attrs(failure.log_attrs(&self.config_path)),
                 "web_search: failed to parse config for Serply API key"
             );
-            anyhow::Error::msg(format!(
-                "Failed to parse config file {} for Serply API key: {e}",
-                self.config_path.display()
-            ))
+            anyhow::Error::msg(failure.message(&self.config_path))
         })?;
 
         let raw_key = config
@@ -3235,6 +3290,105 @@ mod tests {
         );
 
         assert_eq!(tool.resolve_anysearch_api_key().unwrap(), None);
+    }
+
+    /// A credential written without quotes: valid-looking to an operator
+    /// mid-rotation, invalid TOML to the parser, and the exact case where the
+    /// parser's own rendering would quote the credential back.
+    const MALFORMED_SERPLY_KEY_LINE: &str =
+        "[web_search]\nserply_api_key = sk-live-serply-DO-NOT-LEAK-9f3a2b\n";
+    const MALFORMED_SERPLY_SECRET: &str = "sk-live-serply-DO-NOT-LEAK-9f3a2b";
+
+    #[test]
+    fn test_serply_toml_parse_error_display_would_leak_the_credential_line() {
+        // Guards the tests below: if a toml upgrade ever stops quoting the
+        // offending line, this fails and tells us the fixture no longer
+        // reproduces the disclosure the fix exists to prevent.
+        let error = toml::from_str::<zeroclaw_config::schema::Config>(MALFORMED_SERPLY_KEY_LINE)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains(MALFORMED_SERPLY_SECRET),
+            "fixture no longer reproduces the raw-line disclosure: {error}"
+        );
+    }
+
+    #[test]
+    fn test_serply_config_parse_error_is_not_model_visible_credential() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, MALFORMED_SERPLY_KEY_LINE).unwrap();
+        let tool = serply_tool(config_path.clone(), false);
+
+        let err = tool.resolve_serply_api_key().unwrap_err();
+        // `execute` hands this string to the model verbatim, so check the
+        // rendering the runtime uses as well as the bare message.
+        for rendered in [format!("{err}"), format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendered.contains(MALFORMED_SERPLY_SECRET),
+                "model-visible error leaked the credential: {rendered}"
+            );
+        }
+        let message = err.to_string();
+        assert!(message.contains("invalid TOML"), "{message}");
+        assert!(message.contains("at line 2"), "{message}");
+    }
+
+    #[test]
+    fn test_serply_config_parse_failure_log_attrs_carry_no_source_text() {
+        let failure = SerplyConfigParseFailure::new(
+            MALFORMED_SERPLY_KEY_LINE,
+            &toml::from_str::<zeroclaw_config::schema::Config>(MALFORMED_SERPLY_KEY_LINE)
+                .unwrap_err(),
+        );
+        let path = Path::new("/tmp/zeroclaw/config.toml");
+        let attrs = failure.log_attrs(path);
+
+        // This is the value handed to `record!`, so it is exactly what the
+        // writer persists for this event.
+        let serialized = attrs.to_string();
+        assert!(
+            !serialized.contains(MALFORMED_SERPLY_SECRET),
+            "persisted log attributes leaked the credential: {serialized}"
+        );
+        assert_eq!(attrs["error_code"], "config_toml_parse_failed");
+        assert_eq!(attrs["error_line"], 2);
+        assert_eq!(attrs["search_provider"], "serply");
+        assert_eq!(attrs["path"], "/tmp/zeroclaw/config.toml");
+    }
+
+    #[test]
+    fn test_serply_config_parse_failure_without_span_omits_the_line() {
+        // A parse failure the parser cannot place still has to produce a
+        // usable message rather than an empty or misleading location.
+        let failure = SerplyConfigParseFailure {
+            code: SerplyConfigParseFailure::CODE,
+            line: None,
+        };
+        let path = Path::new("/tmp/zeroclaw/config.toml");
+        let message = failure.message(path);
+        assert!(message.contains("invalid TOML."), "{message}");
+        assert!(!message.contains("at line"), "{message}");
+        assert_eq!(
+            failure.log_attrs(path)["error_line"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_serply_with_malformed_config_hides_the_credential() {
+        // End to end through the tool surface the model actually calls.
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, MALFORMED_SERPLY_KEY_LINE).unwrap();
+        let tool = serply_tool(config_path, false);
+
+        let err = tool.execute(json!({"query": "test"})).await.unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(
+            !rendered.contains(MALFORMED_SERPLY_SECRET),
+            "tool history leaked the credential: {rendered}"
+        );
+        assert!(rendered.contains("invalid TOML"), "{rendered}");
     }
 
     #[tokio::test]
