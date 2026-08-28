@@ -10,8 +10,9 @@ use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
+use gemini_live::session::{Event, Session};
 use gemini_live::types::{FunctionDecl, Model, SetupConfig};
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{ModelKind, SpeechToSpeechConfig};
 
 /// Build the Gemini Live `SetupConfig` for a broker session.
@@ -126,6 +127,70 @@ impl SpeechToSpeechChannel {
             config,
         }
     }
+
+    /// Build the inbound `ChannelMessage` for a `consult_agent` tool call:
+    /// the caller's `prompt`, attributed as coming from this broker session,
+    /// scoped so history is isolated per-caller (mirrors how a phone call is
+    /// its own conversation, not shared across every voice-broker session on
+    /// this alias). The caller is talking directly to the broker, which just
+    /// explicitly relayed the request — this always bypasses the
+    /// reply-intent precheck other channels use to guess whether a mention
+    /// was meant for the bot.
+    fn consult_message(&self, prompt: &str) -> ChannelMessage {
+        ChannelMessage {
+            channel_alias: Some(self.alias.clone()),
+            explicitly_addressed: true,
+            conversation_scope: ChannelConversationScope::Sender,
+            ..ChannelMessage::new(
+                uuid::Uuid::new_v4().to_string(),
+                format!("voice-broker:{}", self.alias),
+                self.alias.clone(),
+                prompt,
+                "speech_to_speech",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+        }
+    }
+
+    /// The broker session event loop: drains `session.recv_event()` and, on
+    /// every `consult_agent` tool call, relays the caller's request onto
+    /// `tx` as an ordinary inbound `ChannelMessage` and immediately acks the
+    /// call back to the model (fire-and-forget — the model just needs to
+    /// know the relay was accepted so it can keep the caller company while
+    /// the agent works; the actual reply comes back later via `send()`,
+    /// wired up in a later task). All other events (transcript, audio,
+    /// close, `end_session`) are ignored here; later tasks handle them.
+    /// Returns once the session's event stream ends.
+    pub async fn run_session(
+        &self,
+        mut session: Session,
+        tx: mpsc::Sender<ChannelMessage>,
+    ) -> Result<()> {
+        while let Some(event) = session.recv_event().await {
+            if let Event::ToolCall { name, id, args } = event {
+                if name == "consult_agent" {
+                    let prompt = args
+                        .get("prompt")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    let msg = self.consult_message(prompt);
+                    if tx.send(msg).await.is_err() {
+                        // Orchestrator gone; nothing left to relay into.
+                        break;
+                    }
+                }
+                // Ack unconditionally (including unknown tool names) so the
+                // model's turn is never left hanging; the crate does not
+                // special-case tool names either (mirrors `ToolCall`'s own
+                // contract: "the caller decides its semantics").
+                let _ = session.send_tool_response(&id).await;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ::zeroclaw_api::attribution::Attributable for SpeechToSpeechChannel {
@@ -159,10 +224,69 @@ impl Channel for SpeechToSpeechChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gemini_live::session::{ClientConfig, Reconnector, SessionError};
+    use gemini_live::transport::{FakeTransport, TransportError};
     use zeroclaw_api::channel::Channel;
 
     fn cfg() -> SpeechToSpeechConfig {
         SpeechToSpeechConfig::default()
+    }
+
+    /// Map a `SpeechToSpeechConfig` onto the `gemini-live` `ClientConfig`
+    /// this test drives `Session::connect_with_transport` with. Production
+    /// wiring (real `api_key`/`proxy`, reconnect budget) lands with the
+    /// `listen()` integration in a later task; this is test-only plumbing.
+    fn client_config(cfg: &SpeechToSpeechConfig) -> ClientConfig {
+        let model = match cfg.model_kind {
+            ModelKind::NativeAudio => Model::NativeAudio,
+            ModelKind::HalfCascade => Model::HalfCascade,
+        };
+        ClientConfig {
+            model,
+            api_key: cfg.api_key.clone().unwrap_or_default(),
+            proxy: None,
+            setup: build_broker_setup(cfg, "you are a broker"),
+            max_reconnect_attempts: None,
+        }
+    }
+
+    /// A reconnector that always fails — the tests here never need a real
+    /// reconnect; `FakeTransport::new(true)` keeps the session open past its
+    /// scripted frames instead.
+    fn no_reconnect() -> Reconnector<FakeTransport> {
+        Box::new(|| {
+            Box::pin(async {
+                Err(SessionError::Transport(TransportError::Connect(
+                    "no reconnect".into(),
+                )))
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn consult_agent_toolcall_emits_channel_message() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let mut fake = FakeTransport::new(true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        fake.push_data(
+            br#"{"toolCall":{"functionCalls":[{"name":"consult_agent","id":"c1","args":{"prompt":"what's on my calendar?"}}]}}"#
+                .to_vec(),
+        );
+        let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
+            .await
+            .unwrap();
+        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        tokio::spawn(async move {
+            let _ = ch.run_session(session, tx).await;
+        });
+
+        let msg = rx.recv().await.expect("a channel message");
+        assert_eq!(msg.content, "what's on my calendar?");
+        assert_eq!(msg.channel_alias.as_deref(), Some("desk"));
+        assert!(matches!(
+            msg.conversation_scope,
+            ChannelConversationScope::Sender
+        ));
     }
 
     #[test]
