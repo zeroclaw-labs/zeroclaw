@@ -952,6 +952,13 @@ runtime_profile = "hinted"
     }
 
     async fn run_hinted_call(tools: Vec<Box<dyn Tool>>) -> usize {
+        // Hold the process-global hook lock for the complete
+        // subscribe → turn → sentinel → collection window, so no parallel
+        // test can clear or replace the broadcast hook and detach this
+        // receiver from the sender the turn's events go to — the same
+        // discipline every other broadcast-capture test in the repository
+        // follows.
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
         let mut rx = zeroclaw_log::subscribe_or_install();
 
@@ -992,8 +999,16 @@ runtime_profile = "hinted"
                             );
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    // Any capture loss is a test failure, never something to
+                    // continue past: a lagged or prematurely closed receiver
+                    // could swallow the hinted event or the sentinel, and the
+                    // exactly-once assertions must not pass on lost evidence.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        panic!("broadcast capture lost {n} events — evidence incomplete");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("broadcast closed before the post-turn sentinel");
+                    }
                 }
             }
             seen
