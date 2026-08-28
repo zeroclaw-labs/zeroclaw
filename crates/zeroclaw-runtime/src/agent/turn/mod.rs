@@ -440,6 +440,28 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     turn_state.sync_pending();
 
     let ingress_policy_cfg = IngressPolicy::default();
+
+    // Stamp the initiating internal principal into the turn trace, keyed by
+    // the same trace id every other turn event carries. The principal is
+    // runtime-resolved at the dispatch surface and immutable for the turn;
+    // this record is the trace half of that contract (run records carry it
+    // separately). External turns have none and stay unstamped.
+    if let Some(principal) = &ingress.internal_principal {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_category(::zeroclaw_log::EventCategory::Agent)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "trace_id": turn_id,
+                    "origin": ingress.origin,
+                    "internal_principal": principal,
+                    "executing_agent": agent_alias,
+                })),
+            "turn_internal_principal"
+        );
+    }
+
     let p1_text = turn_state
         .history
         .iter()

@@ -1865,6 +1865,9 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
+                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                        task: "heartbeat:decision".to_string(),
+                    }),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
             ));
@@ -1986,6 +1989,12 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
                 zeroclaw_api::ingress::TurnOrigin::Daemon,
                 crate::agent::loop_::AgentRunOverrides {
                     mcp_registry: shared_mcp_registry.as_ref().map(Arc::clone),
+                    // Heartbeat tasks have no runtime-owned id (their text is
+                    // model-maintained content, which never enters the
+                    // principal), so the stamp names the pipeline phase.
+                    internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                        task: "heartbeat:execute".to_string(),
+                    }),
                     ..crate::agent::loop_::AgentRunOverrides::default()
                 },
             ));

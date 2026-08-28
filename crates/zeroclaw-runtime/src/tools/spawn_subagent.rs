@@ -189,6 +189,9 @@ impl Tool for SpawnSubagentTool {
             // the correct choice. The daemon heartbeat worker is the
             // only `mcp_registry` supplier.
             mcp_registry: None,
+            // Sub-turns are nested inside a parent turn, not internally
+            // initiated; they carry no principal.
+            internal_principal: None,
         };
         let parent_alias = subagent_ctx.parent_alias.clone();
 

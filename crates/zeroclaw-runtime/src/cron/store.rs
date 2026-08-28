@@ -767,12 +767,27 @@ pub fn clear_stale_locks(config: &Config) -> Result<usize> {
     Ok(cleared.unwrap_or(0))
 }
 
+/// The three independent outcomes recorded per run beside the derived
+/// `status` rollup: did the turn itself complete (`ok | error`), what
+/// happened to the configured delivery attempt
+/// (`not_required | delivered | failed | skipped`), and did the
+/// conversation-binding append land (`not_bound | persisted | failed`;
+/// always `not_bound` until conversation binding exists).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunOutcomes<'a> {
+    pub execution: &'a str,
+    pub delivery: &'a str,
+    pub persistence: &'a str,
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn record_run(
     config: &Config,
     job_id: &str,
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     status: &str,
+    outcomes: RunOutcomes<'_>,
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
@@ -790,6 +805,7 @@ pub fn record_run(
             started_at,
             finished_at,
             status,
+            outcomes,
             bounded_output.as_deref(),
             duration_ms,
         )?;
@@ -807,6 +823,7 @@ pub(crate) fn persist_manual_run_result(
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     status: &str,
+    outcomes: RunOutcomes<'_>,
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
@@ -822,6 +839,7 @@ pub(crate) fn persist_manual_run_result(
             started_at,
             finished_at,
             status,
+            outcomes,
             bounded_output.as_deref(),
             duration_ms,
         )?;
@@ -848,6 +866,7 @@ pub(crate) fn persist_run_result(
     finished_at: DateTime<Utc>,
     job_state_at: DateTime<Utc>,
     status: &str,
+    outcomes: RunOutcomes<'_>,
     output: Option<&str>,
     duration_ms: i64,
     action: RunCompletionAction,
@@ -864,6 +883,7 @@ pub(crate) fn persist_run_result(
             started_at,
             finished_at,
             status,
+            outcomes,
             bounded_output.as_deref(),
             duration_ms,
         )?;
@@ -904,12 +924,14 @@ fn insert_run_and_prune(
     started_at: DateTime<Utc>,
     finished_at: DateTime<Utc>,
     status: &str,
+    outcomes: RunOutcomes<'_>,
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
     conn.execute(
-        "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms,
+                                execution, delivery, persistence)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             job_id,
             started_at.to_rfc3339(),
@@ -917,6 +939,9 @@ fn insert_run_and_prune(
             status,
             output,
             duration_ms,
+            outcomes.execution,
+            outcomes.delivery,
+            outcomes.persistence,
         ],
     )
     .context("Failed to insert cron run")?;
@@ -978,7 +1003,8 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
     let Some(runs) = with_read_connection(config, |conn| {
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
         let mut stmt = conn.prepare(
-            "SELECT id, job_id, started_at, finished_at, status, output, duration_ms
+            "SELECT id, job_id, started_at, finished_at, status, output, duration_ms,
+                    execution, delivery, persistence
              FROM cron_runs
              WHERE job_id = ?1
              ORDER BY started_at DESC, id DESC
@@ -996,6 +1022,9 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
                 status: row.get(4)?,
                 output: row.get(5)?,
                 duration_ms: row.get(6)?,
+                execution: row.get(7)?,
+                delivery: row.get(8)?,
+                persistence: row.get(9)?,
             })
         })?;
 
@@ -1476,8 +1505,8 @@ fn convert_delivery_decl(decl: &zeroclaw_config::schema::DeliveryConfigDecl) -> 
     }
 }
 
-fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(cron_jobs)")?;
+fn add_column_if_missing(conn: &Connection, table: &str, name: &str, sql_type: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
         let col_name: String = row.get(1)?;
@@ -1492,7 +1521,7 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
     // Tolerate "duplicate column name" errors to handle the race where
     // another process adds the column between our PRAGMA check and ALTER.
     match conn.execute(
-        &format!("ALTER TABLE cron_jobs ADD COLUMN {name} {sql_type}"),
+        &format!("ALTER TABLE {table} ADD COLUMN {name} {sql_type}"),
         [],
     ) {
         Ok(_) => Ok(()),
@@ -1502,12 +1531,14 @@ fn add_column_if_missing(conn: &Connection, name: &str, sql_type: &str) -> Resul
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", err), "name": name})),
-                "Column cron_jobs. already exists (concurrent migration)"
+                    .with_attrs(
+                        ::serde_json::json!({"error": format!("{}", err), "table": table, "name": name})
+                    ),
+                "Column already exists (concurrent migration)"
             );
             Ok(())
         }
-        Err(e) => Err(e).with_context(|| format!("Failed to add cron_jobs.{name}")),
+        Err(e) => Err(e).with_context(|| format!("Failed to add {table}.{name}")),
     }
 }
 
@@ -1677,6 +1708,9 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             status      TEXT NOT NULL,
             output      TEXT,
             duration_ms INTEGER,
+            execution   TEXT,
+            delivery    TEXT,
+            persistence TEXT,
             FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
@@ -1685,32 +1719,60 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     )
     .context("Failed to initialize cron schema")?;
 
-    add_column_if_missing(conn, "schedule", "TEXT")?;
-    add_column_if_missing(conn, "job_type", "TEXT NOT NULL DEFAULT 'shell'")?;
-    add_column_if_missing(conn, "prompt", "TEXT")?;
-    add_column_if_missing(conn, "name", "TEXT")?;
-    add_column_if_missing(conn, "session_target", "TEXT NOT NULL DEFAULT 'isolated'")?;
-    add_column_if_missing(conn, "model", "TEXT")?;
-    add_column_if_missing(conn, "enabled", "INTEGER NOT NULL DEFAULT 1")?;
-    add_column_if_missing(conn, "delivery", "TEXT")?;
-    add_column_if_missing(conn, "delete_after_run", "INTEGER NOT NULL DEFAULT 0")?;
-    add_column_if_missing(conn, "allowed_tools", "TEXT")?;
-    add_column_if_missing(conn, "source", "TEXT DEFAULT 'imperative'")?;
-    add_column_if_missing(conn, "uses_memory", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "cron_jobs", "schedule", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "job_type",
+        "TEXT NOT NULL DEFAULT 'shell'",
+    )?;
+    add_column_if_missing(conn, "cron_jobs", "prompt", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "name", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "session_target",
+        "TEXT NOT NULL DEFAULT 'isolated'",
+    )?;
+    add_column_if_missing(conn, "cron_jobs", "model", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "enabled", "INTEGER NOT NULL DEFAULT 1")?;
+    add_column_if_missing(conn, "cron_jobs", "delivery", "TEXT")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "delete_after_run",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "cron_jobs", "allowed_tools", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "source", "TEXT DEFAULT 'imperative'")?;
+    add_column_if_missing(
+        conn,
+        "cron_jobs",
+        "uses_memory",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
     // Rows written before the column existed get an empty alias; the
     // scheduler treats those as orphans (skip with warning) rather than
     // coercing them to a magic alias.
-    add_column_if_missing(conn, "agent_alias", "TEXT NOT NULL DEFAULT ''")?;
+    add_column_if_missing(conn, "cron_jobs", "agent_alias", "TEXT NOT NULL DEFAULT ''")?;
     // In-flight execution lock: RFC3339 timestamp of when a run claimed this job,
     // or NULL when idle. `due_jobs`/`all_overdue_jobs` skip locked rows so a job that
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
-    add_column_if_missing(conn, "locked_at", "TEXT")?;
+    add_column_if_missing(conn, "cron_jobs", "locked_at", "TEXT")?;
     add_column_if_missing(
         conn,
+        "cron_jobs",
         "shell_output_format",
         "TEXT NOT NULL DEFAULT 'wrapped'",
     )?;
+
+    // The separated run-outcome triple beside the derived `status` rollup.
+    // Nullable: rows written before these columns existed stay NULL, which
+    // reads as "not recorded" rather than being backfilled with a guess.
+    add_column_if_missing(conn, "cron_runs", "execution", "TEXT")?;
+    add_column_if_missing(conn, "cron_runs", "delivery", "TEXT")?;
+    add_column_if_missing(conn, "cron_runs", "persistence", "TEXT")?;
 
     Ok(())
 }
@@ -2001,6 +2063,99 @@ mod tests {
             .unwrap();
         assert!(columns.iter().any(|name| name == "source"));
         assert!(columns.iter().any(|name| name == "uses_memory"));
+    }
+
+    #[test]
+    fn legacy_cron_runs_schema_gains_outcome_columns() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let cron_dir = cron_dir(&config);
+        std::fs::create_dir_all(&cron_dir).unwrap();
+        let db_path = cron_db(&config);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+             VALUES ('legacy-runs', '*/5 * * * *', 'echo legacy', ?1, ?2)",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+             VALUES ('legacy-runs', ?1, ?2, 'ok', 'done', 5)",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Reading through the public API migrates first; the pre-migration
+        // row reads back with the triple absent, not defaulted.
+        let runs = list_runs(&config, "legacy-runs", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert!(runs[0].execution.is_none());
+        assert!(runs[0].delivery.is_none());
+        assert!(runs[0].persistence.is_none());
+
+        // A run recorded after migration carries all three axes.
+        record_run(
+            &config,
+            "legacy-runs",
+            now + ChronoDuration::seconds(1),
+            now + ChronoDuration::seconds(2),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "delivered",
+                persistence: "not_bound",
+            },
+            Some("done"),
+            1000,
+        )
+        .unwrap();
+        let runs = list_runs(&config, "legacy-runs", 10).unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+        assert_eq!(runs[0].delivery.as_deref(), Some("delivered"));
+        assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
+
+        let conn = Connection::open(&db_path).unwrap();
+        let columns: Vec<String> = conn
+            .prepare("PRAGMA table_info(cron_runs)")
+            .unwrap()
+            .query_map([], |row| row.get(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for name in ["execution", "delivery", "persistence"] {
+            assert!(columns.iter().any(|c| c == name), "missing {name}");
+        }
     }
 
     #[test]
@@ -2813,7 +2968,21 @@ mod tests {
         for idx in 0..3 {
             let start = base + ChronoDuration::seconds(idx);
             let end = start + ChronoDuration::milliseconds(100);
-            record_run(&config, &job.id, start, end, "ok", Some("done"), 100).unwrap();
+            record_run(
+                &config,
+                &job.id,
+                start,
+                end,
+                "ok",
+                RunOutcomes {
+                    execution: "ok",
+                    delivery: "not_required",
+                    persistence: "not_bound",
+                },
+                Some("done"),
+                100,
+            )
+            .unwrap();
         }
 
         let runs = list_runs(&config, &job.id, 10).unwrap();
@@ -2832,6 +3001,11 @@ mod tests {
             start,
             start + ChronoDuration::milliseconds(5),
             "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
             Some("ok"),
             5,
         )
@@ -2855,6 +3029,11 @@ mod tests {
             Utc::now(),
             Utc::now(),
             "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
             Some(&output),
             1,
         )

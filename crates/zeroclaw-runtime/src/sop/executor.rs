@@ -224,7 +224,16 @@ async fn drive_headless_run(
                     Some(session_path),
                     None,
                     zeroclaw_api::ingress::TurnOrigin::Daemon,
-                    crate::agent::loop_::AgentRunOverrides::default(),
+                    crate::agent::loop_::AgentRunOverrides {
+                        // Runtime-owned step identifier, matching the
+                        // engine's nested-SOP turn-id shape.
+                        internal_principal: Some(
+                            zeroclaw_api::ingress::InternalPrincipal::Daemon {
+                                task: format!("sop:{run_id}:step:{}", step.number),
+                            },
+                        ),
+                        ..crate::agent::loop_::AgentRunOverrides::default()
+                    },
                 ))
                 .await;
                 let completed_at = crate::sop::engine::now_iso8601();

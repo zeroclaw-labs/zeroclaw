@@ -207,6 +207,12 @@ impl Tool for SendMessageToPeerTool {
                     &body,
                     None,
                     zeroclaw_api::ingress::TurnOrigin::AgentDirect,
+                    // Initiator only: the recipient turn executes under its
+                    // own alias; the sender's canonical alias travels as
+                    // provenance, resolved before the detached spawn.
+                    Some(zeroclaw_api::ingress::InternalPrincipal::PeerAgent {
+                        sender_alias: sender.clone(),
+                    }),
                 );
                 if let Err(e) = deliver_peer_turn_with_cost_scope(cost_ctx, turn_usage, turn).await
                 {

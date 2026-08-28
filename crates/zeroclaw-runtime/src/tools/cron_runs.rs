@@ -168,6 +168,11 @@ mod tests {
             now,
             now + ChronoDuration::milliseconds(1),
             "ok",
+            cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
             Some(&long_output),
             1,
         )

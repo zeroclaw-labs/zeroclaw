@@ -121,10 +121,41 @@ pub struct ManualCronRunResult {
     pub finished_at: DateTime<Utc>,
 }
 
+/// How the configured delivery attempt for a run resolved — the delivery
+/// axis of the separated run-outcome triple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryDisposition {
+    /// The job configures no delivery; nothing was attempted.
+    NotRequired,
+    /// The announcement was handed to the channel delivery function.
+    Delivered,
+    /// The delivery attempt failed.
+    Failed,
+    /// Delivery was configured but deliberately withheld (NO_REPLY sentinel).
+    Skipped,
+}
+
+impl DeliveryDisposition {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
 pub struct CronDeliveryOutcome {
     pub success: bool,
     pub status: String,
     pub output: String,
+    /// Execution axis of the run-outcome triple: `ok | error`. The turn's
+    /// own result, independent of what delivery then did.
+    pub execution: &'static str,
+    /// Delivery axis of the run-outcome triple.
+    pub delivery: DeliveryDisposition,
 }
 
 pub async fn deliver_and_classify_run_result(
@@ -134,64 +165,73 @@ pub async fn deliver_and_classify_run_result(
     mut output: String,
     context: CronDeliveryContext,
 ) -> CronDeliveryOutcome {
+    // The execution axis is fixed before delivery runs: a later delivery
+    // failure can downgrade the rollup `status`, never the execution fact.
+    let execution = if success { "ok" } else { "error" };
     let mut status = if success { "ok" } else { "error" }.to_string();
 
-    if let Err(e) = deliver_if_configured(config, job, &output).await {
-        // Cron add-time accepts dangling delivery refs (the job's channel
-        // may not be provisioned yet); the loudly-logged warn here is
-        // the scheduler-side half of that contract. Manual trigger paths
-        // share this classifier so status history cannot drift again.
-        let channel = job.delivery.channel.as_deref().unwrap_or("");
-        let target = job.delivery.to.as_deref().unwrap_or("");
-        let delivery_error = e.to_string();
+    let delivery = match deliver_if_configured(config, job, &output).await {
+        Ok(disposition) => disposition,
+        Err(e) => {
+            // Cron add-time accepts dangling delivery refs (the job's channel
+            // may not be provisioned yet); the loudly-logged warn here is
+            // the scheduler-side half of that contract. Manual trigger paths
+            // share this classifier so status history cannot drift again.
+            let channel = job.delivery.channel.as_deref().unwrap_or("");
+            let target = job.delivery.to.as_deref().unwrap_or("");
+            let delivery_error = e.to_string();
 
-        if job.delivery.best_effort {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "job_id": job.id,
-                        "agent_alias": job.agent_alias,
-                        "channel": channel,
-                        "target": target,
-                        "error": delivery_error
-                    })),
-                context.failure_message(true)
-            );
-            if success {
-                status = "degraded".to_string();
+            if job.delivery.best_effort {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "job_id": job.id,
+                            "agent_alias": job.agent_alias,
+                            "channel": channel,
+                            "target": target,
+                            "error": delivery_error
+                        })),
+                    context.failure_message(true)
+                );
+                if success {
+                    status = "degraded".to_string();
+                }
+            } else {
+                success = false;
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "job_id": job.id,
+                            "agent_alias": job.agent_alias,
+                            "channel": channel,
+                            "target": target,
+                            "error": delivery_error
+                        })),
+                    context.failure_message(false)
+                );
+                status = "error".to_string();
             }
-        } else {
-            success = false;
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "job_id": job.id,
-                        "agent_alias": job.agent_alias,
-                        "channel": channel,
-                        "target": target,
-                        "error": delivery_error
-                    })),
-                context.failure_message(false)
-            );
-            status = "error".to_string();
-        }
 
-        if output.trim().is_empty() {
-            output = format!("delivery failed: {delivery_error}");
-        } else {
-            output.push_str("\n\ndelivery failed: ");
-            output.push_str(&delivery_error);
+            if output.trim().is_empty() {
+                output = format!("delivery failed: {delivery_error}");
+            } else {
+                output.push_str("\n\ndelivery failed: ");
+                output.push_str(&delivery_error);
+            }
+            DeliveryDisposition::Failed
         }
-    }
+    };
 
     CronDeliveryOutcome {
         success,
         status,
         output,
+        execution,
+        delivery,
     }
 }
 
@@ -235,6 +275,13 @@ async fn run_manual_job_inner(
         started_at,
         finished_at,
         &outcome.status,
+        crate::cron::store::RunOutcomes {
+            execution: outcome.execution,
+            delivery: outcome.delivery.as_str(),
+            // No conversation binding exists yet; every run records the
+            // explicit absence rather than an empty guess.
+            persistence: "not_bound",
+        },
         Some(&outcome.output),
         duration_ms,
     ) {
@@ -861,6 +908,12 @@ async fn run_agent_job(
         // `agent::run` is the correct choice. The daemon heartbeat
         // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
+        // Initiating principal, resolved from the job's stored config at
+        // dispatch and immutable for the turn's lifetime.
+        internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+            job_id: job.id.clone(),
+            job_name: job.name.clone(),
+        }),
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -953,6 +1006,13 @@ async fn persist_job_result(
         finished_at,
         job_state_at,
         &outcome.status,
+        crate::cron::store::RunOutcomes {
+            execution: outcome.execution,
+            delivery: outcome.delivery.as_str(),
+            // No conversation binding exists yet; every run records the
+            // explicit absence rather than an empty guess.
+            persistence: "not_bound",
+        },
         Some(&outcome.output),
         duration_ms,
         action,
@@ -1046,10 +1106,14 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+async fn deliver_if_configured(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+) -> Result<DeliveryDisposition> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
-        return Ok(());
+        return Ok(DeliveryDisposition::NotRequired);
     }
 
     if !announce_delivery_decision(output).should_deliver() {
@@ -1060,7 +1124,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .with_attrs(::serde_json::json!({"job_id": job.id})),
             "Cron job returned NO_REPLY sentinel — skipping delivery"
         );
-        return Ok(());
+        return Ok(DeliveryDisposition::Skipped);
     }
 
     let channel = delivery.channel.as_deref().ok_or_else(|| {
@@ -1092,6 +1156,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         output,
     )
     .await
+    .map(|()| DeliveryDisposition::Delivered)
 }
 
 /// Delivery function type — takes owned values so the returned future is 'static.
@@ -2855,7 +2920,127 @@ mod tests {
         let job = test_job("echo ok");
 
         // Default delivery mode is not "announce", so should be a no-op.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        assert_eq!(
+            deliver_if_configured(&config, &job, "x").await.unwrap(),
+            DeliveryDisposition::NotRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_triple_separates_execution_from_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        register_recording_delivery_fn();
+
+        // Execution failure with no delivery configured.
+        let job = test_job("echo ok");
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            false,
+            "boom".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert_eq!(outcome.execution, "error");
+        assert_eq!(outcome.delivery, DeliveryDisposition::NotRequired);
+        assert_eq!(outcome.status, "error");
+
+        // Success with no delivery configured.
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "fine".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::NotRequired);
+        assert_eq!(outcome.status, "ok");
+
+        // Best-effort delivery failure downgrades the rollup, never the
+        // execution axis.
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("fail-delivery".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "fine".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(outcome.success);
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::Failed);
+        assert_eq!(outcome.status, "degraded");
+
+        // Required delivery failure downgrades the rollup to error and
+        // flips success, but the execution axis still records the turn's
+        // own completion.
+        job.delivery.best_effort = false;
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "fine".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(!outcome.success);
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::Failed);
+        assert_eq!(outcome.status, "error");
+
+        // A NO_REPLY sentinel withholds a configured delivery: skipped, not
+        // failed and not delivered.
+        job.delivery.best_effort = true;
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "NO_REPLY".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(outcome.success);
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::Skipped);
+        assert_eq!(outcome.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn persisted_runs_carry_the_outcome_triple() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        register_recording_delivery_fn();
+        let mut job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("fail-delivery".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        assert!(success);
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "degraded");
+        assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+        assert_eq!(runs[0].delivery.as_deref(), Some("failed"));
+        assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
