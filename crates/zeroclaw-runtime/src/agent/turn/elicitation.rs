@@ -97,6 +97,55 @@ impl Drop for HintTurnGuard {
     }
 }
 
+/// Caller-owned backstop for the turn's hint record, held by the frame that
+/// owns the turn id and any model-switch retries (the entry points and the
+/// channel orchestrator). The engine's own guard is defused on the
+/// model-switch handoff so the retry still sees the record — but the retry
+/// owner can then fail to re-enter the loop at all (provider resolution or
+/// construction failure), and without this scope the record would outlive
+/// the turn. Dropping the scope removes the record unconditionally; after a
+/// normal turn completion the engine has already removed it and the drop is
+/// a no-op.
+pub struct TurnHintScope {
+    turn_id: String,
+}
+
+impl TurnHintScope {
+    #[must_use]
+    pub fn new(turn_id: &str) -> Self {
+        Self {
+            turn_id: turn_id.to_string(),
+        }
+    }
+}
+
+impl Drop for TurnHintScope {
+    fn drop(&mut self) {
+        hinted_turns_lock().remove(&self.turn_id);
+    }
+}
+
+/// The invocation-correlation telemetry event: the hinted tool was actually
+/// called this turn. Deliberately invocation-only — the outcome stays
+/// [`Unknown`](::zeroclaw_log::EventOutcome::Unknown) regardless of how the
+/// tool's own execution went (that is `tool_call_result`'s job), and the
+/// attributes carry tool name, iteration, and trace id only, never message
+/// text.
+pub(crate) fn hinted_call_event(
+    tool: &str,
+    iteration: usize,
+    turn_id: &str,
+) -> ::zeroclaw_log::Event {
+    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
+        .with_category(::zeroclaw_log::EventCategory::Tool)
+        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+        .with_attrs(::serde_json::json!({
+            "tool": tool,
+            "iteration": iteration,
+            "trace_id": turn_id,
+        }))
+}
+
 /// The ephemeral hint appended to the latest user message's content (the
 /// same rides-the-user-turn idiom as memory context — a separate system
 /// message gets hoisted to context start by provider-side normalization).
@@ -374,6 +423,32 @@ mod tests {
 
         // ...an armed one ends it with the turn.
         drop(HintTurnGuard::new(turn));
+        assert!(hint_record_for(turn).is_none());
+    }
+
+    #[test]
+    fn hinted_call_event_is_invocation_only_by_construction() {
+        let event = hinted_call_event("send_via", 2, "trace-1");
+        assert_eq!(event.outcome, ::zeroclaw_log::EventOutcome::Unknown);
+        let attrs = event.attrs.expect("event carries attributes");
+        assert_eq!(attrs["tool"], "send_via");
+        assert_eq!(attrs["iteration"], 2);
+        assert_eq!(attrs["trace_id"], "trace-1");
+        assert_eq!(
+            attrs.as_object().map(serde_json::Map::len),
+            Some(3),
+            "tool name, iteration, and trace id only — never message text"
+        );
+    }
+
+    #[test]
+    fn turn_hint_scope_backstops_abandoned_records() {
+        let turn = "test-hint-scope-turn";
+        let scope = TurnHintScope::new(turn);
+        record_hint(turn, "send_via");
+        // The engine's defused guard left the record behind (switch
+        // handoff); the owner's scope must reclaim it.
+        drop(scope);
         assert!(hint_record_for(turn).is_none());
     }
 
@@ -712,6 +787,49 @@ runtime_profile = "hinted"
     }
 
     #[tokio::test]
+    async fn abandoned_switch_handoff_does_not_leak_hint_record() {
+        // The engine keeps the record alive across a model-switch handoff,
+        // but the retry owner can fail provider resolution or construction
+        // and exit without ever re-entering the loop. The owner's
+        // TurnHintScope must reclaim the record on that path.
+        let cfg = elicitation_config();
+        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let mut history = vec![ChatMessage::user("please send this to marta")];
+        let turn_id = format!("abandoned-handoff-{}", uuid::Uuid::new_v4());
+        {
+            // What every production retry owner holds for the turn's lifetime.
+            let _scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
+            let provider = PlainProvider;
+            let err = run_spec(
+                RunSpec {
+                    config: Some(&cfg),
+                    ingress: IngressContext::channel(),
+                    tools_registry: &tools,
+                    excluded_tools: &[],
+                    activated_tools: None,
+                    provider: &provider,
+                    turn_id: &turn_id,
+                    model_switch_to: Some(("other", "other-model")),
+                },
+                &mut history,
+            )
+            .await
+            .expect_err("prefilled switch state must exit the loop");
+            assert!(crate::agent::loop_::is_model_switch_requested(&err).is_some());
+            assert!(
+                hint_record_for(&turn_id).is_some(),
+                "handoff must keep the record for a would-be retry"
+            );
+            // The owner now fails to build the new provider and exits
+            // without re-entering the loop: the scope drops here.
+        }
+        assert!(
+            hint_record_for(&turn_id).is_none(),
+            "an abandoned handoff must not leak the turn's hint record"
+        );
+    }
+
+    #[tokio::test]
     async fn activated_deferred_tool_is_hinted_and_excludable() {
         // A deferred tool activated on an earlier turn is advertised and
         // executable on this one; elicitation must scan it too, under the
@@ -833,54 +951,53 @@ runtime_profile = "hinted"
         }
     }
 
-    /// Drain the broadcast stream for `tool_called_after_hint` records with
-    /// this turn's trace id; assert each one is invocation-only (no success
-    /// claim). Returns how many were observed.
-    async fn drain_call_events(
-        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
-        turn_id: &str,
-    ) -> usize {
-        let mut seen = 0;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let step = remaining.min(std::time::Duration::from_millis(50));
-            match tokio::time::timeout(step, rx.recv()).await {
-                Ok(Ok(value)) => {
-                    let is_call_event = value
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .is_some_and(|m| m.contains("tool_called_after_hint"));
-                    let ours = value
-                        .get("attributes")
-                        .and_then(|a| a.get("trace_id"))
-                        .and_then(|v| v.as_str())
-                        == Some(turn_id);
-                    if is_call_event && ours {
-                        seen += 1;
-                        let outcome = value
-                            .get("event")
-                            .and_then(|e| e.get("outcome"))
-                            .and_then(|v| v.as_str());
-                        assert_ne!(
-                            outcome,
-                            Some("success"),
-                            "invocation-only event must not claim tool success: {value}"
-                        );
-                    }
-                }
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
-                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
-                Err(_elapsed) => break,
-            }
-        }
-        seen
-    }
-
     async fn run_hinted_call(tools: Vec<Box<dyn Tool>>) -> usize {
         zeroclaw_log::try_install_capture_subscriber();
         let mut rx = zeroclaw_log::subscribe_or_install();
-        while rx.try_recv().is_ok() {}
+
+        let turn_id = format!("hinted-call-{}", uuid::Uuid::new_v4());
+        let sentinel = format!("elicitation_test_sentinel_{turn_id}");
+
+        // Collector runs CONCURRENTLY with the turn so the shared broadcast
+        // receiver never falls a buffer's length behind under parallel test
+        // load, and stops on a sentinel record emitted after the turn — the
+        // channel is a single ordered stream, so once the sentinel arrives
+        // every event the turn emitted has been observed. No timing guesses.
+        let collector_turn_id = turn_id.clone();
+        let collector_sentinel = sentinel.clone();
+        let collector = zeroclaw_spawn::spawn!(async move {
+            let mut seen = 0usize;
+            loop {
+                match rx.recv().await {
+                    Ok(value) => {
+                        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                        if message.contains(&collector_sentinel) {
+                            break;
+                        }
+                        let ours = value
+                            .get("attributes")
+                            .and_then(|a| a.get("trace_id"))
+                            .and_then(|v| v.as_str())
+                            == Some(collector_turn_id.as_str());
+                        if ours && message.contains("tool_called_after_hint") {
+                            seen += 1;
+                            let outcome = value
+                                .get("event")
+                                .and_then(|e| e.get("outcome"))
+                                .and_then(|v| v.as_str());
+                            assert_ne!(
+                                outcome,
+                                Some("success"),
+                                "invocation-only event must not claim tool success: {value}"
+                            );
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            seen
+        });
 
         let cfg = elicitation_config();
         let provider = CallOnceProvider {
@@ -888,7 +1005,6 @@ runtime_profile = "hinted"
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut history = vec![ChatMessage::user("please send this to marta")];
-        let turn_id = format!("hinted-call-{}", uuid::Uuid::new_v4());
         run_spec(
             RunSpec {
                 config: Some(&cfg),
@@ -904,7 +1020,17 @@ runtime_profile = "hinted"
         )
         .await
         .expect("loop should succeed");
-        drain_call_events(&mut rx, &turn_id).await
+
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            &sentinel
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), collector)
+            .await
+            .expect("collector must observe the post-turn sentinel")
+            .expect("collector task must not panic")
     }
 
     #[tokio::test]

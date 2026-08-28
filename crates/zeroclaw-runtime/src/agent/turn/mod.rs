@@ -1422,14 +1422,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             elicitation::record_hint_call(turn_id);
             ::zeroclaw_log::record!(
                 INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
-                    .with_category(::zeroclaw_log::EventCategory::Tool)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "tool": hinted,
-                        "iteration": iteration + 1,
-                        "trace_id": turn_id,
-                    })),
+                elicitation::hinted_call_event(hinted, iteration + 1, turn_id),
                 "tool_called_after_hint"
             );
         }

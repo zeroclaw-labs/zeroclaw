@@ -2364,6 +2364,9 @@ impl Agent {
         let effective_model = self.classify_model(user_message);
 
         let turn_id = Self::new_turn_id();
+        // This frame owns the turn id and any model-switch rounds, so it
+        // backstops the turn's elicitation hint record on every exit.
+        let _hint_scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
         let turn_observer = Arc::clone(&self.observer);
         let mut guard = crate::observability::AgentTurnGuard::start(
             turn_observer.as_ref(),
@@ -2738,6 +2741,10 @@ impl Agent {
         // `try_apply_model_switch`) can rebind it for later rounds
         let mut effective_model = self.classify_model(user_message);
         let turn_id = Self::new_turn_id();
+        // This frame owns the turn id and the model-switch round loop, so it
+        // backstops the turn's elicitation hint record on every exit — a
+        // switch round that fails to rebuild its provider included.
+        let _hint_scope = crate::agent::loop_::TurnHintScope::new(&turn_id);
         let mut committed_response = String::new();
         // Requested-vs-served divergence for THIS turn. Source of truth is the
         // task-local record inside `zeroclaw_providers::reliable`, consumed
