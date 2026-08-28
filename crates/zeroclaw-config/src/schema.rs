@@ -16065,6 +16065,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub voice_duplex: HashMap<String, VoiceDuplexConfig>,
+    /// Speech-to-speech broker channel instances (`[channels.speech_to_speech.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub speech_to_speech: HashMap<String, SpeechToSpeechConfig>,
     /// MQTT channel instances (`[channels.mqtt.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -16433,6 +16437,7 @@ impl ChannelsConfig {
             || self.voice_call.values().any(|c| c.enabled)
             || self.voice_wake.values().any(|c| c.enabled)
             || self.voice_duplex.values().any(|c| c.enabled)
+            || self.speech_to_speech.values().any(|c| c.enabled)
             || self.mqtt.values().any(|c| c.enabled)
             || self.amqp.values().any(|c| c.enabled)
             || self.filesystem.values().any(|c| c.enabled)
@@ -16447,7 +16452,7 @@ impl ChannelsConfig {
     /// amqp are fan-in listeners; voice_wake is input-only), so a name-addressed
     /// outbound surface such as `heartbeat.target` can refuse them at validation
     /// instead of accepting a target the delivery layer silently drops.
-    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 36] {
+    pub fn channel_presence(&self) -> [(&'static str, bool, bool); 37] {
         [
             ("telegram", !self.telegram.is_empty(), true),
             ("discord", !self.discord.is_empty(), true),
@@ -16481,6 +16486,7 @@ impl ChannelsConfig {
             ("voice_call", !self.voice_call.is_empty(), true),
             ("voice_wake", !self.voice_wake.is_empty(), false),
             ("voice_duplex", !self.voice_duplex.is_empty(), false),
+            ("speech_to_speech", !self.speech_to_speech.is_empty(), true),
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
             ("filesystem", !self.filesystem.is_empty(), false),
@@ -16567,6 +16573,7 @@ impl Default for ChannelsConfig {
             voice_call: HashMap::new(),
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
+            speech_to_speech: HashMap::new(),
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
             filesystem: HashMap::new(),
@@ -16962,6 +16969,144 @@ impl ChannelConfig for TelegramConfig {
     }
     fn desc() -> &'static str {
         "connect your bot"
+    }
+}
+
+/// Speech-to-speech model interaction kind.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    /// Full native-audio duplex model turn (audio in, audio out, single model leg).
+    #[default]
+    NativeAudio,
+    /// Half-cascade pipeline (e.g. staged transcription/synthesis legs).
+    HalfCascade,
+}
+
+/// How a speech-to-speech broker session is triggered.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum Activation {
+    /// Session starts/stops on an explicit hotkey toggle.
+    #[default]
+    HotkeyToggle,
+    /// Session is always listening/active while the channel is enabled.
+    AlwaysOn,
+    /// Session starts on detecting a configured wake word.
+    WakeWord,
+}
+
+/// Speech-to-speech backend provider.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, zeroclaw_macros::ConfigEnum,
+)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SpeechBackend {
+    /// Google Gemini Live API.
+    #[default]
+    GeminiLive,
+}
+
+/// Speech-to-speech broker channel configuration (`[channels.speech_to_speech]`).
+///
+/// Bridges a bidirectional voice model (e.g. Gemini Live) into ZeroClaw as a
+/// broker channel: audio in, transcript/audio out, with a broker persona
+/// steering how the model mediates the call. Distinct from `voice_duplex`
+/// (a direct open-mic gateway channel with no hosted speech-to-speech
+/// backend) -- this channel type always talks to a `backend` provider.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.speech_to_speech"]
+pub struct SpeechToSpeechConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false` so an operator who pastes a partial
+    /// `[channels.<type>.<alias>]` block doesn't accidentally bring a channel
+    /// live before the rest of its config is filled in.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub enabled: bool,
+    /// Speech-to-speech backend provider. Default: `gemini_live`.
+    #[tab(Connection)]
+    #[serde(default)]
+    pub backend: SpeechBackend,
+    /// API key for the speech-to-speech backend. `#[serde(default)]` so a
+    /// config that omits or later has it pruned (e.g. a freshly created
+    /// alias with an empty key, stripped by `prune_empty_leaves` before
+    /// write) still deserializes as `None` instead of failing with
+    /// `missing field 'api_key'`.
+    #[secret]
+    #[tab(Connection)]
+    #[serde(default)]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub api_key: Option<String>,
+    /// Model interaction kind: full native-audio duplex vs. half-cascade
+    /// staged pipeline. Default: `native_audio`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub model_kind: ModelKind,
+    /// Backend model identifier (e.g. `gemini-2.5-flash-native-audio-preview-12-2025`).
+    #[tab(Connection)]
+    #[serde(default)]
+    pub model: String,
+    /// Preferred synthesized voice name, when the backend supports selecting one.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub voice: Option<String>,
+    /// BCP-47 language/locale hint for speech recognition and synthesis.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Path (relative to the workspace) to a broker persona document that
+    /// steers how the broker mediates between the caller and the agent.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub broker_persona_path: Option<String>,
+    /// Inline broker persona text. When both this and `broker_persona_path`
+    /// are set, `broker_persona_path` takes precedence.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub broker_persona: Option<String>,
+    /// How a session with this channel is triggered. Default: `hotkey_toggle`.
+    #[tab(Behavior)]
+    #[serde(default)]
+    pub activation: Activation,
+    /// Model sampling temperature override, when the backend exposes one.
+    #[tab(Advanced)]
+    #[serde(default)]
+    pub temperature: Option<f32>,
+}
+
+impl Default for SpeechToSpeechConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: SpeechBackend::default(),
+            api_key: None,
+            model_kind: ModelKind::default(),
+            model: String::new(),
+            voice: None,
+            language: None,
+            broker_persona_path: None,
+            broker_persona: None,
+            activation: Activation::default(),
+            temperature: None,
+        }
+    }
+}
+
+impl ChannelConfig for SpeechToSpeechConfig {
+    fn name() -> &'static str {
+        "SpeechToSpeech"
+    }
+    fn desc() -> &'static str {
+        "speech-to-speech voice broker"
     }
 }
 
@@ -33835,6 +33980,7 @@ auto_save = true
                 git: HashMap::new(),
                 voice_call: HashMap::new(),
                 voice_duplex: HashMap::new(),
+                speech_to_speech: HashMap::new(),
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
                 amqp: HashMap::new(),
@@ -36259,6 +36405,7 @@ allowed_users = ["@u:matrix.org"]
             git: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
+            speech_to_speech: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
@@ -36878,6 +37025,7 @@ allowed_numbers = ["+1", "+2"]
             git: HashMap::new(),
             voice_call: HashMap::new(),
             voice_duplex: HashMap::new(),
+            speech_to_speech: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
             amqp: HashMap::new(),
@@ -46666,6 +46814,29 @@ model = "gpt-4o"
         assert_eq!(matrix.stream_draft_lines, 10);
         assert_eq!(matrix.message_max_bytes, 48_000);
         assert!(matrix.stream_draft_delete);
+    }
+
+    #[test]
+    async fn speech_to_speech_config_defaults_and_parse() {
+        let toml = r#"
+        [channels.speech_to_speech.desk]
+        enabled = true
+        model_kind = "native_audio"
+        model = "gemini-2.5-flash-native-audio-preview-12-2025"
+        activation = "hotkey_toggle"
+        broker_persona_path = "personas/broker.md"
+    "#;
+        let cfg: Config = toml::from_str(toml).expect("parse");
+        let s = cfg
+            .channels
+            .speech_to_speech
+            .get("desk")
+            .expect("alias present");
+        assert!(s.enabled);
+        assert_eq!(s.model_kind, ModelKind::NativeAudio);
+        assert_eq!(s.activation, Activation::HotkeyToggle);
+        assert_eq!(s.broker_persona_path.as_deref(), Some("personas/broker.md"));
+        assert_eq!(s.backend, SpeechBackend::GeminiLive); // default
     }
 
     #[test]
