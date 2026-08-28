@@ -40,7 +40,7 @@ The agent doesn't send audio anywhere; wake detection is local. Only post-wake s
 A realtime bidirectional voice model (Gemini Live) owns the human-facing call
 audio and speaks with the caller directly; it reaches the ZeroClaw agent
 through exactly one bridge function, `consult_agent`, and relays the agent's
-settled reply back in its own words. The voice model never touches tools —
+settled reply back in its own words. The voice model never touches tools;
 only the agent does, via the normal agent/tool pipeline.
 
 ```toml
@@ -59,7 +59,7 @@ channels = ["speech_to_speech.desk"]
 `voice` defaults per `model_kind` when omitted (`Autonoe` for `native_audio`,
 a Kore-class voice for `half_cascade`), so it's safe to drop from a minimal
 config. `broker_persona_path` is resolved relative to, and confined to, the
-agent's workspace — it never falls back to or reads `AGENTS.md`.
+agent's workspace; it never falls back to or reads `AGENTS.md`.
 
 > **Build flag:** Speech-to-Speech is gated by the `channel-speech-to-speech`
 > cargo feature on `zeroclaw-channels` and is **off by default**. Build with

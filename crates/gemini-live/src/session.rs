@@ -27,7 +27,7 @@
 //!
 //! The reconnect/backoff policy is ported from kutsu's original `gemini_live`:
 //! backoff 0.3s → ×2 → max 5s; the stored resumption handle is dropped as stale
-//! after [`HANDLE_DROP_AFTER`] consecutive failed connects; and the *initial*
+//! after `HANDLE_DROP_AFTER` consecutive failed connects; and the *initial*
 //! connect applies the same bounded backoff+retry so a transient blip during the
 //! SIP ring never kills the call.
 
