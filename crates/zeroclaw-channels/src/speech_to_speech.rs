@@ -143,11 +143,11 @@ pub fn resolve_persona(cfg: &SpeechToSpeechConfig) -> Result<String> {
 /// session logic is filled in by a later task.
 pub struct SpeechToSpeechChannel {
     /// The alias key under `[channels.speech_to_speech.<alias>]` this
-    /// handle is bound to. Used for attribution.
+    /// handle is bound to. Used for attribution, history scoping, and by
+    /// the orchestrator to build the `speech_to_speech.<alias>` composite
+    /// registry key (`Channel::name()` returns only the bare type name —
+    /// see its doc comment).
     alias: String,
-    /// Precomputed `name()` key (`speech_to_speech.<alias>`), joined once at
-    /// construction so `name()` can return a borrowed `&str`.
-    name: String,
     /// Reserved for the audio seam added in a later task.
     #[allow(dead_code)]
     config: SpeechToSpeechConfig,
@@ -181,10 +181,8 @@ pub struct SpeechToSpeechChannel {
 impl SpeechToSpeechChannel {
     pub fn new(alias: impl Into<String>, config: SpeechToSpeechConfig) -> Self {
         let alias = alias.into();
-        let name = format!("speech_to_speech.{alias}");
         Self {
             alias,
-            name,
             config,
             active_session: Arc::new(Mutex::new(None)),
             stop: Arc::new(Notify::new()),
@@ -398,8 +396,14 @@ impl ::zeroclaw_api::attribution::Attributable for SpeechToSpeechChannel {
 
 #[async_trait]
 impl Channel for SpeechToSpeechChannel {
+    /// Bare type name — matches every other `Channel` impl's convention
+    /// (`"telegram"`, `"voice_call"`, ...). The orchestrator's
+    /// `composite_channel_key(name(), alias())` builds the
+    /// `speech_to_speech.<alias>` registry key from this plus [`Self::alias`];
+    /// `name()` itself must stay alias-free, since `append_configured_plugin_channels`
+    /// and other callers rely on `name()` identifying the channel *type*.
     fn name(&self) -> &str {
-        &self.name
+        "speech_to_speech"
     }
 
     /// Relay the agent's settled reply into the live broker session as a
@@ -674,9 +678,16 @@ mod tests {
     }
 
     #[test]
-    fn channel_name_is_alias_scoped() {
+    fn channel_name_is_bare_type_alias_resolves_composite() {
+        use ::zeroclaw_api::attribution::Attributable;
+
         let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
-        assert_eq!(ch.name(), "speech_to_speech.desk");
+        assert_eq!(ch.name(), "speech_to_speech");
+        assert_eq!(ch.alias(), "desk");
+        assert_eq!(
+            crate::orchestrator::composite_channel_key(ch.name(), Some(ch.alias())),
+            "speech_to_speech.desk"
+        );
     }
 
     #[test]
