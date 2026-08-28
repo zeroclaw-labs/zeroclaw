@@ -722,7 +722,7 @@ mod tests {
                 language: Some("en-US".into()),
                 system_instruction: "Be nice.".into(),
                 temperature: 0.8,
-                goal_schema: serde_json::json!({ "type": "object" }),
+                functions: Vec::new(),
                 resume_handle: None,
             },
             // Matches kutsu: unbounded reconnect (backoff caps at 5s). Tests

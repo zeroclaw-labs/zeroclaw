@@ -98,6 +98,22 @@ pub enum ServerEvent {
     GoAway,
 }
 
+/// One `setup.tools[].functionDeclarations[]` entry. The caller owns the
+/// full set of functions exposed to the model for a session — the crate has
+/// no built-in tool (not even `end_call`): kutsu's caller assembles a
+/// single-entry list for that tool; other callers (e.g. the broker channel)
+/// assemble their own set.
+#[derive(Clone, Debug)]
+pub struct FunctionDecl {
+    /// The function name the model will call it by (`toolCall.functionCalls[].name`).
+    pub name: String,
+    /// Human-readable description shown to the model.
+    pub description: String,
+    /// JSON Schema for the function's parameters (`{}`-shaped object schema
+    /// for a no-argument function).
+    pub parameters: serde_json::Value,
+}
+
 /// Everything needed to serialize a Gemini Live `setup` message for one
 /// session, short of the literal wire structure (which lives in
 /// `wire::build_setup`, Task 3). The crate does not assemble prompts or
@@ -105,10 +121,10 @@ pub enum ServerEvent {
 /// arrives here fully built by the caller.
 ///
 /// Every field `wire::build_setup` needs beyond this struct is either a
-/// wire-format constant (`responseModalities`, transcription flags, the
-/// `end_call` tool description) or derived from `model.is_native()`
-/// (activity-detection thresholds, `thinkingConfig`, `proactivity`,
-/// `NON_BLOCKING` tool behavior, whether `languageCode`/`language` applies).
+/// wire-format constant (`responseModalities`, transcription flags) or
+/// derived from `model.is_native()` (activity-detection thresholds,
+/// `thinkingConfig`, `proactivity`, `NON_BLOCKING` tool behavior, whether
+/// `languageCode`/`language` applies).
 #[derive(Clone, Debug)]
 pub struct SetupConfig {
     /// Which model/API-version this session targets.
@@ -124,9 +140,10 @@ pub struct SetupConfig {
     pub system_instruction: String,
     /// `generationConfig.temperature`.
     pub temperature: f32,
-    /// JSON Schema for the `end_call` tool's parameters (the scenario's
-    /// goal schema).
-    pub goal_schema: serde_json::Value,
+    /// The exact set of functions exposed to the model as
+    /// `setup.tools[].functionDeclarations`. The caller controls this list
+    /// completely — no tool is added implicitly.
+    pub functions: Vec<FunctionDecl>,
     /// A prior session's resumption handle to request a warm resume, or
     /// `None` for a fresh session.
     pub resume_handle: Option<String>,
@@ -178,7 +195,7 @@ mod tests {
             language: None,
             system_instruction: "Be nice.".into(),
             temperature: 0.8,
-            goal_schema: serde_json::json!({"type": "object"}),
+            functions: Vec::new(),
             resume_handle: None,
         };
         assert!(cfg.is_native());

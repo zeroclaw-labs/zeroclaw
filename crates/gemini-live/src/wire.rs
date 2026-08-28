@@ -188,15 +188,21 @@ pub fn build_setup(cfg: &SetupConfig) -> Value {
         }
     }
 
-    let mut end_call = json!({
-        "name": "end_call",
-        "description": "Call this exactly once, at the end of the conversation, \
-                        with the collected information and a final disposition.",
-        "parameters": cfg.goal_schema,
-    });
-    if native {
-        end_call["behavior"] = json!("NON_BLOCKING");
-    }
+    let function_decls: Vec<Value> = cfg
+        .functions
+        .iter()
+        .map(|f| {
+            let mut d = json!({
+                "name": f.name,
+                "description": f.description,
+                "parameters": f.parameters,
+            });
+            if native {
+                d["behavior"] = json!("NON_BLOCKING");
+            }
+            d
+        })
+        .collect();
 
     let aad = if native {
         // LOW start-sensitivity: don't let caller-side background noise (a real
@@ -228,7 +234,7 @@ pub fn build_setup(cfg: &SetupConfig) -> Value {
             "speechConfig": speech
         },
         "systemInstruction": { "parts": [ { "text": cfg.system_instruction } ] },
-        "tools": [ { "functionDeclarations": [ end_call ] } ],
+        "tools": [ { "functionDeclarations": function_decls } ],
         "realtimeInputConfig": { "automaticActivityDetection": aad },
         "sessionResumption": { "handle": cfg.resume_handle },
         "inputAudioTranscription": {},
@@ -305,7 +311,7 @@ pub fn build_tool_response(call_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Model;
+    use crate::types::{FunctionDecl, Model};
 
     const TEMPERATURE: f32 = 0.8;
 
@@ -320,7 +326,13 @@ mod tests {
             },
             system_instruction: "Be nice.".into(),
             temperature: TEMPERATURE,
-            goal_schema: serde_json::json!({"type":"object","required":["disposition"]}),
+            functions: vec![FunctionDecl {
+                name: "end_call".into(),
+                description: "Call this exactly once, at the end of the conversation, \
+                              with the collected information and a final disposition."
+                    .into(),
+                parameters: serde_json::json!({"type":"object","required":["disposition"]}),
+            }],
             resume_handle,
         }
     }
