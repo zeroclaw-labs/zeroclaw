@@ -7,10 +7,11 @@
 //! handle land in a later task.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Result;
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 
 use gemini_live::session::{ClientTextSender, Event, Session};
 use gemini_live::types::{FunctionDecl, Model, SetupConfig};
@@ -104,6 +105,11 @@ pub fn broker_tool_names(setup: &SetupConfig) -> Vec<String> {
         .collect()
 }
 
+/// How long [`SpeechToSpeechChannel::run_session`] waits for a new session
+/// event before treating the call as abandoned and closing it. Reset every
+/// time an event is received (see `run_session`'s `select!` loop).
+const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// Speech-to-speech broker channel — bridges a hosted bidirectional voice
 /// model into ZeroClaw. `send`/`listen` are minimal stubs for now; broker
 /// session logic is filled in by a later task.
@@ -130,6 +136,18 @@ pub struct SpeechToSpeechChannel {
     /// sessions. `Mutex` (not `tokio::sync::Mutex`) because the critical
     /// section is a plain pointer swap/clone, never held across an `.await`.
     active_session: Arc<Mutex<Option<ClientTextSender>>>,
+    /// Authoritative manual-close signal for [`Self::run_session`]:
+    /// [`Self::stop`] notifies this, and the loop's `select!` treats it as
+    /// an unconditional break — it wins even mid-model-turn, ahead of
+    /// whatever the model is doing. `Arc<Notify>` (not a `watch`) because
+    /// there is exactly one thing to communicate ("close now") and no state
+    /// to observe after the fact.
+    stop: Arc<Notify>,
+    /// How long `run_session` waits for a new session event before treating
+    /// the call as abandoned and closing it as an idle-timeout backstop.
+    /// Defaults to [`DEFAULT_IDLE_TIMEOUT`]; overridden only by tests via
+    /// [`Self::with_idle_timeout`] so they can force the branch quickly.
+    idle_timeout: Duration,
 }
 
 impl SpeechToSpeechChannel {
@@ -141,7 +159,27 @@ impl SpeechToSpeechChannel {
             name,
             config,
             active_session: Arc::new(Mutex::new(None)),
+            stop: Arc::new(Notify::new()),
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
         }
+    }
+
+    /// Test-only knob: override the idle timeout so a test can force the
+    /// idle-timeout close path quickly instead of waiting out the real
+    /// [`DEFAULT_IDLE_TIMEOUT`]. Production always uses the default set in
+    /// [`Self::new`].
+    #[cfg(test)]
+    fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Authoritatively end whichever session [`Self::run_session`] is
+    /// currently driving on this alias, even mid-model-turn. Takes priority
+    /// over any in-flight event in the `select!` loop — this is a hard
+    /// close, not a request the model can defer.
+    pub async fn stop(&self) {
+        self.stop.notify_one();
     }
 
     /// Record `session` as this alias's active session: `send()` will relay
@@ -150,7 +188,7 @@ impl SpeechToSpeechChannel {
     /// [`ClientTextSender`] — never takes ownership of `session` itself, so
     /// the caller keeps it (typically to drive [`Self::run_session`]
     /// immediately afterward).
-    pub fn attach_session(&self, session: &Session) {
+    pub(crate) fn attach_session(&self, session: &Session) {
         *self.active_session.lock().unwrap() = Some(session.text_sender());
     }
 
@@ -187,39 +225,86 @@ impl SpeechToSpeechChannel {
     /// call back to the model (fire-and-forget — the model just needs to
     /// know the relay was accepted so it can keep the caller company while
     /// the agent works; the actual reply comes back later via `send()`,
-    /// wired up in a later task). All other events (transcript, audio,
-    /// close, `end_session`) are ignored here; later tasks handle them.
-    /// Returns once the session's event stream ends.
+    /// wired up in a later task). Other events (transcript, audio, etc.) are
+    /// otherwise ignored — they only serve to reset the idle timer below.
+    ///
+    /// Three paths close the session, raced via `select!`:
+    ///   1. **Model-initiated:** `Event::ToolCall{name:"end_session"}` — ack
+    ///      it (so the model's turn is never left hanging), then break.
+    ///   2. **Manual stop (authoritative):** [`Self::stop`] notifies
+    ///      `self.stop`; this wins even mid-model-turn, `biased` ahead of
+    ///      the other arms.
+    ///   3. **Idle-timeout backstop:** no session event within
+    ///      `self.idle_timeout`; the sleep is rebuilt (and so reset) every
+    ///      loop iteration, i.e. on every received event.
+    /// The provider ending the stream itself (`Event::SessionClosed`, or
+    /// `recv_event` returning `None` once reconnects are exhausted) also
+    /// ends the loop gracefully. On any break, the active-session handle is
+    /// cleared so a stale `send()` cannot relay into a dead session.
     pub async fn run_session(
         &self,
         mut session: Session,
         tx: mpsc::Sender<ChannelMessage>,
     ) -> Result<()> {
         self.attach_session(&session);
-        while let Some(event) = session.recv_event().await {
-            if let Event::ToolCall { name, id, args } = event {
-                if name == "consult_agent" {
-                    let prompt = args
-                        .get("prompt")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default();
-                    let msg = self.consult_message(prompt);
-                    if tx.send(msg).await.is_err() {
-                        // Orchestrator gone; nothing left to relay into.
-                        break;
+        loop {
+            let idle = tokio::time::sleep(self.idle_timeout);
+            tokio::select! {
+                biased;
+
+                // Manual stop is authoritative: check it first so a
+                // simultaneously-ready event never gets processed ahead of
+                // it.
+                _ = self.stop.notified() => {
+                    break;
+                }
+
+                event = session.recv_event() => {
+                    match event {
+                        Some(Event::ToolCall { name, id, args }) => {
+                            if name == "consult_agent" {
+                                let prompt = args
+                                    .get("prompt")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or_default();
+                                let msg = self.consult_message(prompt);
+                                if tx.send(msg).await.is_err() {
+                                    // Orchestrator gone; nothing left to relay into.
+                                    break;
+                                }
+                            }
+                            // Ack unconditionally (including unknown tool
+                            // names) so the model's turn is never left
+                            // hanging; the crate does not special-case tool
+                            // names either (mirrors `ToolCall`'s own
+                            // contract: "the caller decides its semantics").
+                            let _ = session.send_tool_response(&id).await;
+                            if name == "end_session" {
+                                break;
+                            }
+                        }
+                        Some(Event::SessionClosed { .. }) | None => {
+                            // Provider-initiated close (terminal, or
+                            // reconnects exhausted): nothing left to drive.
+                            break;
+                        }
+                        Some(_other) => {
+                            // Transcript/audio/affect/etc: no action here;
+                            // looping restarts the idle timer above.
+                        }
                     }
                 }
-                // Ack unconditionally (including unknown tool names) so the
-                // model's turn is never left hanging; the crate does not
-                // special-case tool names either (mirrors `ToolCall`'s own
-                // contract: "the caller decides its semantics").
-                let _ = session.send_tool_response(&id).await;
+
+                _ = idle => {
+                    // No session activity within idle_timeout; treat the
+                    // call as abandoned.
+                    break;
+                }
             }
         }
-        // Session's event stream ended (closed/exhausted reconnects); it is
-        // no longer valid to relay into. Per the single-active-session
-        // assumption (see `active_session`'s doc) this alias never has two
-        // sessions attached at once, so an unconditional clear is safe here.
+        // Per the single-active-session assumption (see `active_session`'s
+        // doc) this alias never has two sessions attached at once, so an
+        // unconditional clear is safe on every break path above.
         *self.active_session.lock().unwrap() = None;
         Ok(())
     }
@@ -397,6 +482,112 @@ mod tests {
             msg.conversation_scope,
             ChannelConversationScope::Sender
         ));
+    }
+
+    #[tokio::test]
+    async fn model_end_session_closes() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut fake = FakeTransport::new(true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        fake.push_data(
+            br#"{"toolCall":{"functionCalls":[{"name":"end_session","id":"e1","args":{}}]}}"#
+                .to_vec(),
+        );
+        let sent = fake.sent.clone();
+        let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
+            .await
+            .unwrap();
+        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ch.run_session(session, tx),
+        )
+        .await
+        .expect("run_session must return promptly once the model calls end_session")
+        .unwrap();
+
+        assert!(
+            ch.active_session.lock().unwrap().is_none(),
+            "session must be detached once run_session closes it"
+        );
+
+        // The ack write happens on the driver task, asynchronously from the
+        // enqueue in `run_session` (mirrors `send_relays_reply_into_live_
+        // session_as_text`'s poll below) — the mpsc channel drains already-
+        // queued commands even after `Session` (and so `cmd_tx`) is dropped
+        // at the end of `run_session`, but that drain isn't necessarily
+        // done by the time this assertion runs.
+        let mut acked = false;
+        for _ in 0..1000 {
+            if sent.lock().unwrap().iter().any(|t| t.contains("e1")) {
+                acked = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            acked,
+            "end_session call must still be acked before closing, got {:?}",
+            sent.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_stop_is_authoritative() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut fake = FakeTransport::new(true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
+            .await
+            .unwrap();
+        let ch = Arc::new(SpeechToSpeechChannel::new("desk".to_string(), cfg()));
+        let driver = {
+            let ch = ch.clone();
+            tokio::spawn(async move { ch.run_session(session, tx).await })
+        };
+
+        // Give run_session a moment to attach the session and start waiting
+        // on the select! (mid-turn, no end_session and no idle-timeout in
+        // sight) before we call the authoritative stop.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        ch.stop().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), driver)
+            .await
+            .expect("run_session must return promptly once stop() is called")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            ch.active_session.lock().unwrap().is_none(),
+            "session must be detached once stop() closes it"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_timeout_closes_session() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+        let mut fake = FakeTransport::new(true);
+        fake.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
+            .await
+            .unwrap();
+        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg())
+            .with_idle_timeout(std::time::Duration::from_millis(50));
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ch.run_session(session, tx),
+        )
+        .await
+        .expect("run_session must return once the idle timeout elapses")
+        .unwrap();
+
+        assert!(
+            ch.active_session.lock().unwrap().is_none(),
+            "session must be detached once the idle timeout closes it"
+        );
     }
 
     #[test]
