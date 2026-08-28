@@ -192,6 +192,37 @@ impl SpeechToSpeechChannel {
         *self.active_session.lock().unwrap() = Some(session.text_sender());
     }
 
+    /// Build a `ChannelMessage` carrying this alias's history-scope
+    /// identity fields: `channel` = `"speech_to_speech"`, `channel_alias` =
+    /// this alias, `sender` = `"voice-broker:{alias}"`, `reply_target` =
+    /// this alias, `conversation_scope` = `Sender`, no `thread_ts`. `id` and
+    /// `content` are the only fields callers vary — neither feeds
+    /// `orchestrator::conversation_history_key`, so any two messages built
+    /// here for the same alias resolve to the same history bucket. This is
+    /// the single source of truth for that identity: [`Self::consult_message`]
+    /// and [`Self::history_key_for_transcript`] both build through it,
+    /// which is what guarantees a future transcript handler and the consult
+    /// turn land in the same conversation history (see
+    /// [`Self::history_key_for_sender`]).
+    fn scoped_message(&self, id: impl Into<String>, content: impl Into<String>) -> ChannelMessage {
+        ChannelMessage {
+            channel_alias: Some(self.alias.clone()),
+            explicitly_addressed: true,
+            conversation_scope: ChannelConversationScope::Sender,
+            ..ChannelMessage::new(
+                id,
+                format!("voice-broker:{}", self.alias),
+                self.alias.clone(),
+                content,
+                "speech_to_speech",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            )
+        }
+    }
+
     /// Build the inbound `ChannelMessage` for a `consult_agent` tool call:
     /// the caller's `prompt`, attributed as coming from this broker session,
     /// scoped so history is isolated per-caller (mirrors how a phone call is
@@ -201,22 +232,38 @@ impl SpeechToSpeechChannel {
     /// reply-intent precheck other channels use to guess whether a mention
     /// was meant for the bot.
     fn consult_message(&self, prompt: &str) -> ChannelMessage {
-        ChannelMessage {
-            channel_alias: Some(self.alias.clone()),
-            explicitly_addressed: true,
-            conversation_scope: ChannelConversationScope::Sender,
-            ..ChannelMessage::new(
-                uuid::Uuid::new_v4().to_string(),
-                format!("voice-broker:{}", self.alias),
-                self.alias.clone(),
-                prompt,
-                "speech_to_speech",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            )
-        }
+        self.scoped_message(uuid::Uuid::new_v4().to_string(), prompt)
+    }
+
+    /// The conversation-history key this alias's consult turns resolve to —
+    /// `orchestrator::conversation_history_key` applied to
+    /// [`Self::scoped_message`]'s identity fields, the same fields
+    /// [`Self::consult_message`] builds its `ChannelMessage` from. This is
+    /// the shared-key contract PR1 establishes: whatever routes a message
+    /// through `scoped_message` for this alias — the consult turn today, a
+    /// transcript handler in a later PR — lands in this same history
+    /// bucket. See [`Self::history_key_for_transcript`] for the transcript
+    /// side of that guarantee, proven equal in
+    /// `transcript_binds_to_consult_history_key`.
+    #[allow(dead_code)]
+    fn history_key_for_sender(&self) -> String {
+        crate::orchestrator::conversation_history_key(&self.scoped_message("_", ""))
+    }
+
+    /// The conversation-history key a broker transcript for this alias
+    /// would resolve to, computed the same way
+    /// [`Self::history_key_for_sender`] is: through
+    /// [`Self::scoped_message`]'s shared identity fields. PR1 scope: no
+    /// transcript is actually routed into any history store yet (`Event::
+    /// Transcript` handling and the store itself land with the audio-WS
+    /// PR) — this exists only to prove the derived key is identical to the
+    /// consult turn's, so that later wiring is pure plumbing, not a scoping
+    /// decision.
+    #[allow(dead_code)]
+    fn history_key_for_transcript(&self) -> String {
+        crate::orchestrator::conversation_history_key(
+            &self.scoped_message(uuid::Uuid::new_v4().to_string(), ""),
+        )
     }
 
     /// The broker session event loop: drains `session.recv_event()` and, on
@@ -588,6 +635,14 @@ mod tests {
             ch.active_session.lock().unwrap().is_none(),
             "session must be detached once the idle timeout closes it"
         );
+    }
+
+    #[test]
+    fn transcript_binds_to_consult_history_key() {
+        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        let consult_key = ch.history_key_for_sender(); // used by consult_message
+        let transcript_key = ch.history_key_for_transcript();
+        assert_eq!(consult_key, transcript_key);
     }
 
     #[test]
