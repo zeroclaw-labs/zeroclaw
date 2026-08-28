@@ -68,6 +68,15 @@ agent's workspace; it never falls back to or reads `AGENTS.md`.
 > transport (mic in / speaker out) lands in a follow-up release, so the
 > channel stays inert even when enabled until that lands.
 
+> **Privacy & cost:** A live session streams caller audio, and the
+> transcripts and prompts derived from it, to the speech backend provider
+> (Google Gemini Live). That provider may retain the audio, transcripts, and
+> prompts it receives, and session resumption can extend retention on the
+> order of ~24h beyond a single session. Input and output transcription, when
+> enabled, is billed as text tokens on top of the audio usage. ZeroClaw
+> raises a startup warning (`speech_to_speech_provider_retention`) for each
+> enabled alias so the operator sees this next to the alias they turned on.
+
 {{#config-fields channels.speech_to_speech}}
 
 ## TTS (outbound speech synthesis)

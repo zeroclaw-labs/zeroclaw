@@ -16153,6 +16153,12 @@ impl ChannelsConfig {
                 configured: !self.telegram.is_empty(),
             },
             ChannelInfo {
+                kind: "speech_to_speech",
+                name: "Speech-to-Speech",
+                desc: "Gemini Live voice broker",
+                configured: !self.speech_to_speech.is_empty(),
+            },
+            ChannelInfo {
                 kind: "discord",
                 config_key: "discord",
                 name: "Discord",
@@ -23572,8 +23578,10 @@ impl Config {
     /// Live). That provider may retain the audio, transcripts, and prompts it
     /// receives, and session resumption can extend how long the provider
     /// retains that data (on the order of ~24h beyond a single session).
-    /// Raised once per enabled `[channels.speech_to_speech.<alias>]` so an
-    /// operator sees the notice next to the alias they turned on.
+    /// The notice also states that enabled input/output transcription is
+    /// billed as text tokens on top of the audio usage. Raised once per
+    /// enabled `[channels.speech_to_speech.<alias>]` so an operator sees the
+    /// notice next to the alias they turned on.
     fn collect_speech_to_speech_warnings(
         &self,
         warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
@@ -23588,7 +23596,9 @@ impl Config {
                     "channels.speech_to_speech.{alias} is enabled: a live voice session sends \
                      caller audio, transcripts, and prompts to the speech-to-speech provider. \
                      The provider may retain this audio/transcript/prompt data, and session \
-                     resumption can extend retention (on the order of ~24h beyond a session)."
+                     resumption can extend retention (on the order of ~24h beyond a session). \
+                     Input and output transcription, when enabled, is billed as text tokens on \
+                     top of the audio usage."
                 ),
                 format!("channels.speech_to_speech.{alias}.enabled"),
             ));

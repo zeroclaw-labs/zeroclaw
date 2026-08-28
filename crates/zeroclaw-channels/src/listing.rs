@@ -174,10 +174,7 @@ const CHANNEL_COMPILE_SPECS: &[ChannelCompileSpec] = &[
         compiled: cfg!(feature = "voice-wake"),
     },
     ChannelCompileSpec {
-        // Not in the `channels()` display inventory (like ACP): it registers
-        // as a channel but is surfaced through its own config path, so it has
-        // no display name.
-        schema_name: None,
+        schema_name: Some("Speech-to-Speech"),
         type_keys: &["speech_to_speech", "speech-to-speech"],
         compiled: cfg!(feature = "channel-speech-to-speech"),
     },

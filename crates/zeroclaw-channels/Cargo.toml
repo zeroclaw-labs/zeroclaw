@@ -208,6 +208,7 @@ channels-full = [
   "channel-reddit",
   "channel-signal",
   "channel-slack",
+  "channel-speech-to-speech",
   "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
