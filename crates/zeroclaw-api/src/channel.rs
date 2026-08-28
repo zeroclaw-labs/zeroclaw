@@ -621,26 +621,53 @@ pub struct ForgeApiResponse {
 /// resolution and session scoping keep a single owner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelModelPickerRequest {
+    /// Human-readable display name of the user who sent `/model`, for
+    /// rendering only. Never use this for authorization; that is
+    /// `requesting_user_id`'s role.
     pub requesting_user: String,
+    /// Immutable platform identity of the requesting user, used to authorize
+    /// picker interactions (only this user may drive the picker) and to bind
+    /// the selection back to the sender. Channels may decline to present a
+    /// picker (return `Ok(false)`) when this is empty.
     pub requesting_user_id: String,
+    /// Reply scope inherited from the triggering message. The picker must be
+    /// delivered to this target so it lands in the same chat the command was
+    /// issued in.
     pub reply_target: String,
+    /// Thread/topic scope inherited from the triggering message. When `Some`,
+    /// the picker and any follow-up selection must stay in the same thread or
+    /// topic; when `None`, the channel's default scope applies.
     pub thread_ts: Option<String>,
+    /// Alias of the channel instance that received the command. A channel
+    /// must decline requests whose alias is not its own (return `Ok(false)`).
     pub channel_alias: String,
+    /// Alias of the agent that owns this runtime. Implementations that render
+    /// agent-owned picker state must decline (return `Ok(false)`) on mismatch.
     pub owner_agent_alias: String,
+    /// Provider ref of the currently selected route, shown as the picker's
+    /// starting state.
     pub current_model_provider: String,
+    /// Model of the currently selected route, shown as the picker's starting
+    /// state.
     pub current_model: String,
     /// Restart-scoped route snapshot used by the channel runtime to resolve
-    /// `/model <ref>`. Native pickers must not offer routes outside this set.
+    /// `/model <ref>`. This is an in-memory view of the routes loaded at
+    /// startup, not durable configuration; native pickers must not offer
+    /// routes outside this set.
     pub model_routes: Vec<ChannelModelPickerRoute>,
 }
 
 /// Provider/model route identity exposed to a channel-native model picker.
 ///
-/// API keys stay runtime-owned and are deliberately excluded.
+/// API keys stay runtime-owned and are deliberately excluded; route entries
+/// carry only display and resolution identity, never credentials.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChannelModelPickerRoute {
+    /// Short, user-facing alias accepted by `/model <ref>` (e.g. `fast`).
     pub hint: String,
+    /// Provider ref this route resolves to.
     pub model_provider: String,
+    /// Model identifier this route resolves to.
     pub model: String,
 }
 
@@ -677,9 +704,21 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 
     /// Present a channel-native model picker for a bare `/model` command.
     ///
-    /// Returns `true` when the channel handled the request. The default keeps
-    /// the existing text response for every channel that does not implement a
-    /// native picker.
+    /// The picker is presentation only: a confirmed selection must re-enter
+    /// the runtime through the existing `/model <ref>` command path so model
+    /// resolution and session scoping keep a single owner. `request` carries
+    /// the reply scope (`reply_target`/`thread_ts`) the picker must preserve
+    /// and a restart-scoped route snapshot it must not exceed; see
+    /// [`ChannelModelPickerRequest`] for the per-field contract.
+    ///
+    /// Returns `Ok(true)` when the channel presented a picker and took over
+    /// the interaction, `Ok(false)` when it did not (e.g. a channel without a
+    /// native picker, an alias or owner mismatch, or an empty
+    /// `requesting_user_id`) — the caller then falls back to the ordinary
+    /// text response. Returning `Err` reports a presentation failure; the
+    /// caller logs it and falls back to the text response as well. The
+    /// default implementation returns `Ok(false)` for every channel, keeping
+    /// the existing text behavior.
     async fn present_model_picker(
         &self,
         _request: &ChannelModelPickerRequest,
