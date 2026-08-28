@@ -16274,6 +16274,45 @@ fn collect_configured_channels_with_authority(
         );
     }
 
+    // Unlike every other channel branch here, `alias` stays `None` on the
+    // pushed `ConfiguredChannel`. `SpeechToSpeechChannel::name()` already
+    // returns the full composite key (`speech_to_speech.<alias>`, baked in
+    // at construction) rather than the bare type name every other `Channel`
+    // impl returns. `composite_channel_key` and `spawn_supervised_listener`
+    // both re-append `.{alias}` when `ConfiguredChannel.alias` is `Some`, so
+    // setting it here would double the alias onto the registry key and the
+    // supervised-listener health-component label
+    // (`speech_to_speech.desk.desk`). Leaving it `None` makes both fall back
+    // to `ch.name()` verbatim, which is already correct.
+    #[cfg(feature = "channel-speech-to-speech")]
+    for (alias, s2s) in &config.channels.speech_to_speech {
+        if !active_channel_aliases.contains(&format!("speech_to_speech.{alias}")) {
+            continue;
+        }
+        if !s2s.enabled {
+            continue;
+        }
+        channels.push(ConfiguredChannel {
+            display_name: "Speech-to-Speech",
+            alias: None,
+            channel: Arc::new(crate::speech_to_speech::SpeechToSpeechChannel::new(
+                alias.clone(),
+                s2s.clone(),
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-speech-to-speech"))]
+    if !config.channels.speech_to_speech.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Speech-to-Speech channel is configured but this build was compiled without \
+             `channel-speech-to-speech`; skipping Speech-to-Speech."
+        );
+    }
+
     #[cfg(feature = "channel-webhook")]
     for (alias, wh) in &config.channels.webhook {
         if !active_channel_aliases.contains(&format!("webhook.{alias}")) {
@@ -49740,6 +49779,25 @@ This is an example JSON object for profile settings."#;
                 .iter()
                 .any(|entry| entry.display_name == "Voice Call"),
             "enabled Voice Call with credentials must be collected"
+        );
+    }
+
+    #[cfg(feature = "channel-speech-to-speech")]
+    #[test]
+    fn build_channel_map_includes_enabled_speech_to_speech() {
+        let mut config = Config::default();
+        config.channels.speech_to_speech.insert(
+            "desk".to_string(),
+            zeroclaw_config::schema::SpeechToSpeechConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        let map = build_channel_map(&config);
+        assert!(
+            map.contains_key("speech_to_speech.desk"),
+            "enabled Speech-to-Speech alias must be collected into the channel map"
         );
     }
 
