@@ -159,10 +159,10 @@ fn resolve_persona_path_within_workspace(raw_path: &str, workspace_dir: &Path) -
         normalized
     } else {
         resolve_under(workspace_dir, raw_path).map_err(|e| {
-            anyhow::anyhow!(
+            anyhow::Error::msg(format!(
                 "broker_persona_path {raw_path:?} escapes workspace {}: {e}",
                 workspace_dir.display()
-            )
+            ))
         })?
     };
 
@@ -208,8 +208,9 @@ fn resolve_persona_path_within_workspace(raw_path: &str, workspace_dir: &Path) -
 pub fn resolve_persona(cfg: &SpeechToSpeechConfig, workspace_dir: &Path) -> Result<String> {
     if let Some(path) = &cfg.broker_persona_path {
         let resolved = resolve_persona_path_within_workspace(path, workspace_dir)?;
-        return std::fs::read_to_string(&resolved)
-            .map_err(|e| anyhow::anyhow!("failed to read broker_persona_path {path:?}: {e}"));
+        return std::fs::read_to_string(&resolved).map_err(|e| {
+            anyhow::Error::msg(format!("failed to read broker_persona_path {path:?}: {e}"))
+        });
     }
     if let Some(persona) = &cfg.broker_persona {
         return Ok(persona.clone());
@@ -385,6 +386,7 @@ impl SpeechToSpeechChannel {
     ///   3. **Idle-timeout backstop:** no session event within
     ///      `self.idle_timeout`; the sleep is rebuilt (and so reset) every
     ///      loop iteration, i.e. on every received event.
+    ///
     /// The provider ending the stream itself (`Event::SessionClosed`, or
     /// `recv_event` returning `None` once reconnects are exhausted) also
     /// ends the loop gracefully. On any break, the active-session handle is
@@ -507,10 +509,10 @@ impl Channel for SpeechToSpeechChannel {
                     );
                     Ok(())
                 }
-                Err(e) => Err(anyhow::anyhow!(
+                Err(e) => Err(anyhow::Error::msg(format!(
                     "speech_to_speech.{}: failed to relay reply into live session: {e}",
                     self.alias
-                )),
+                ))),
             },
             None => {
                 ::zeroclaw_log::record!(
@@ -532,6 +534,12 @@ impl Channel for SpeechToSpeechChannel {
 
 #[cfg(test)]
 mod tests {
+    // Tests spawn detached driver tasks directly and do not need the
+    // attribution-span propagation `zeroclaw_spawn::spawn!` provides in
+    // production, so `tokio::spawn` is allowed in this test module
+    // (clippy.toml sanctions a local allow for exempt cases).
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use gemini_live::session::{ClientConfig, Reconnector, SessionError};
     use gemini_live::transport::{FakeTransport, TransportError};
