@@ -16486,7 +16486,7 @@ impl ChannelsConfig {
             ("voice_call", !self.voice_call.is_empty(), true),
             ("voice_wake", !self.voice_wake.is_empty(), false),
             ("voice_duplex", !self.voice_duplex.is_empty(), false),
-            ("speech_to_speech", !self.speech_to_speech.is_empty(), true),
+            ("speech_to_speech", !self.speech_to_speech.is_empty(), false),
             ("mqtt", !self.mqtt.is_empty(), false),
             ("amqp", !self.amqp.is_empty(), false),
             ("filesystem", !self.filesystem.is_empty(), false),
@@ -51733,7 +51733,14 @@ model_provider = \"ollama.default\"
         undeliverable.sort_unstable();
         assert_eq!(
             undeliverable,
-            ["amqp", "filesystem", "mqtt", "voice_duplex", "voice_wake"],
+            [
+                "amqp",
+                "filesystem",
+                "mqtt",
+                "speech_to_speech",
+                "voice_duplex",
+                "voice_wake"
+            ],
             "only input-only transports may be non-deliverable; update channel_presence and is_channel_deliverable together"
         );
     }
