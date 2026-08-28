@@ -6,11 +6,13 @@
 //! currently holds only the `Channel` skeleton — the audio seam and session
 //! handle land in a later task.
 
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use gemini_live::session::{Event, Session};
+use gemini_live::session::{ClientTextSender, Event, Session};
 use gemini_live::types::{FunctionDecl, Model, SetupConfig};
 use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{ModelKind, SpeechToSpeechConfig};
@@ -112,9 +114,22 @@ pub struct SpeechToSpeechChannel {
     /// Precomputed `name()` key (`speech_to_speech.<alias>`), joined once at
     /// construction so `name()` can return a borrowed `&str`.
     name: String,
-    /// Reserved for the audio seam + session handle added in a later task.
+    /// Reserved for the audio seam added in a later task.
     #[allow(dead_code)]
     config: SpeechToSpeechConfig,
+    /// The text-send handle for whichever session is currently live on this
+    /// alias, if any. Populated by [`Self::attach_session`] (called by
+    /// [`Self::run_session`] for the session it drives), consumed by
+    /// [`Channel::send`] to relay the agent's settled reply back in as a
+    /// paraphrase turn.
+    ///
+    /// v1 assumption: **single active session per alias.** A second
+    /// `attach_session` call (e.g. a reconnect, or — not yet possible today —
+    /// a second concurrent call on the same alias) simply overwrites the
+    /// handle; there is no queuing or fan-out across multiple simultaneous
+    /// sessions. `Mutex` (not `tokio::sync::Mutex`) because the critical
+    /// section is a plain pointer swap/clone, never held across an `.await`.
+    active_session: Arc<Mutex<Option<ClientTextSender>>>,
 }
 
 impl SpeechToSpeechChannel {
@@ -125,7 +140,18 @@ impl SpeechToSpeechChannel {
             alias,
             name,
             config,
+            active_session: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Record `session` as this alias's active session: `send()` will relay
+    /// into it until a later `attach_session` call (or `run_session` ending)
+    /// replaces/clears it. Only clones the session's cloneable
+    /// [`ClientTextSender`] — never takes ownership of `session` itself, so
+    /// the caller keeps it (typically to drive [`Self::run_session`]
+    /// immediately afterward).
+    pub fn attach_session(&self, session: &Session) {
+        *self.active_session.lock().unwrap() = Some(session.text_sender());
     }
 
     /// Build the inbound `ChannelMessage` for a `consult_agent` tool call:
@@ -169,6 +195,7 @@ impl SpeechToSpeechChannel {
         mut session: Session,
         tx: mpsc::Sender<ChannelMessage>,
     ) -> Result<()> {
+        self.attach_session(&session);
         while let Some(event) = session.recv_event().await {
             if let Event::ToolCall { name, id, args } = event {
                 if name == "consult_agent" {
@@ -189,6 +216,11 @@ impl SpeechToSpeechChannel {
                 let _ = session.send_tool_response(&id).await;
             }
         }
+        // Session's event stream ended (closed/exhausted reconnects); it is
+        // no longer valid to relay into. Per the single-active-session
+        // assumption (see `active_session`'s doc) this alias never has two
+        // sessions attached at once, so an unconditional clear is safe here.
+        *self.active_session.lock().unwrap() = None;
         Ok(())
     }
 }
@@ -210,9 +242,37 @@ impl Channel for SpeechToSpeechChannel {
         &self.name
     }
 
-    async fn send(&self, _message: &SendMessage) -> Result<()> {
-        // Session/audio delivery lands in a later task.
-        Ok(())
+    /// Relay the agent's settled reply into the live broker session as a
+    /// paraphrase text turn (`send_client_text`) — the caller hears it
+    /// spoken back by the broker persona, not verbatim TTS of raw agent
+    /// output. Per the single-active-session assumption (see
+    /// `active_session`'s doc), there is no correlation to a specific call:
+    /// whichever session is currently attached on this alias receives it.
+    /// If no session is active (call already ended, or none ever started),
+    /// this logs and returns `Ok(())` rather than erroring — a reply arriving
+    /// after hangup is a race, not a failure.
+    async fn send(&self, message: &SendMessage) -> Result<()> {
+        let sender = self.active_session.lock().unwrap().clone();
+        match sender {
+            Some(sender) => sender
+                .send_client_text(&message.content)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "speech_to_speech.{}: failed to relay reply into live session: {e}",
+                        self.alias
+                    )
+                }),
+            None => {
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"alias": self.alias})),
+                    "speech_to_speech: send() with no active session; dropping reply"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -261,6 +321,56 @@ mod tests {
                 )))
             })
         })
+    }
+
+    #[tokio::test]
+    async fn send_relays_reply_into_live_session_as_text() {
+        // `FakeTransport::sent` (an `Arc<Mutex<Vec<String>>>`, already public
+        // on the crate's test double) already records every outbound frame
+        // byte-for-byte — no need for a dedicated recorder: clone the handle
+        // before the transport moves into `connect_with_transport` and
+        // inspect it directly, the same way `gemini_live::session`'s own
+        // tests do (see `send_audio_is_byte_identical_to_kutsu`).
+        let fake = FakeTransport::new(true);
+        let sent = fake.sent.clone();
+        let session = Session::connect_with_transport(client_config(&cfg()), fake, no_reconnect())
+            .await
+            .unwrap();
+        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        ch.attach_session(&session);
+
+        ch.send(&SendMessage::new(
+            "You have a 3pm sync.",
+            "voice-broker:desk",
+        ))
+        .await
+        .unwrap();
+
+        // The driver task performs the transport write asynchronously after
+        // the command is enqueued; poll briefly rather than assuming
+        // immediacy (mirrors `wait_for_sent` in `gemini_live::session`'s own
+        // tests).
+        let mut found = false;
+        for _ in 0..1000 {
+            if sent.lock().unwrap().iter().any(|t| t.contains("3pm sync")) {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        assert!(
+            found,
+            "reply must be relayed via send_client_text, got {:?}",
+            sent.lock().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_with_no_active_session_is_a_noop() {
+        let ch = SpeechToSpeechChannel::new("desk".to_string(), cfg());
+        ch.send(&SendMessage::new("hello", "voice-broker:desk"))
+            .await
+            .expect("send() with no active session must not error");
     }
 
     #[tokio::test]

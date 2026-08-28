@@ -304,6 +304,39 @@ impl Session {
             .await
             .map_err(|_| SessionError::Closed)
     }
+
+    /// A cloneable, `&self`-only handle for enqueuing client-text turns,
+    /// detached from the event-receiving half of this session. `recv_event`
+    /// needs `&mut self` and is normally polled continuously by one owner
+    /// (e.g. a caller's event loop); this handle lets a *different* task push
+    /// text into the same live session concurrently, without contending for
+    /// `&mut Session` — it just clones the outbound command sender, which
+    /// `send_client_text` already only needed `&self` for.
+    pub fn text_sender(&self) -> ClientTextSender {
+        ClientTextSender {
+            cmd_tx: self.cmd_tx.clone(),
+        }
+    }
+}
+
+/// A cloneable handle for sending client-text turns into a live [`Session`],
+/// obtained via [`Session::text_sender`]. See that method's docs for why this
+/// exists (letting a `send()`-style caller reach the session without owning
+/// the `&mut self` used for `recv_event`).
+#[derive(Clone)]
+pub struct ClientTextSender {
+    cmd_tx: mpsc::Sender<Command>,
+}
+
+impl ClientTextSender {
+    /// Send a client text turn. Identical wire effect to
+    /// [`Session::send_client_text`].
+    pub async fn send_client_text(&self, text: &str) -> Result<(), SessionError> {
+        self.cmd_tx
+            .send(Command::ClientText(text.to_string()))
+            .await
+            .map_err(|_| SessionError::Closed)
+    }
 }
 
 /// The reconnect/resumption driver, run inside a spawned task. Owns the
