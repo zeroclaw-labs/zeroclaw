@@ -177,19 +177,16 @@ async fn connect_via_proxy(proxy: &ProxyConfig, url: &str) -> Result<WsStream, T
     Ok(ws)
 }
 
-/// Extract `(host, port)` from a `ws://`/`wss://` URL. Defaults to 443 for
-/// `wss` and 80 for `ws` when no explicit port is present.
+/// Extract `(host, port)` from a `wss://` URL, defaulting to port 443 when no
+/// explicit port is present. Only secure WebSocket URLs are accepted — Gemini
+/// Live is always reached over TLS.
 fn target_host_port(url: &str) -> Result<(String, u16), TransportError> {
-    let (rest, default_port) = if let Some(r) = url.strip_prefix("wss://") {
-        (r, 443u16)
-    } else if let Some(r) = url.strip_prefix("ws://") {
-        (r, 80u16)
-    } else {
-        return Err(TransportError::Connect(format!("not a ws/wss url: {url}")));
-    };
+    let rest = url
+        .strip_prefix("wss://")
+        .ok_or_else(|| TransportError::Connect(format!("not a wss url: {url}")))?;
     // Authority is everything up to the first '/', '?' or '#'.
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-    parse_host_port(authority, default_port)
+    parse_host_port(authority, 443u16)
 }
 
 /// Parse `host` or `host:port`, applying `default_port` when the port is
