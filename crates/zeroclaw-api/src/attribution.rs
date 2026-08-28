@@ -150,13 +150,6 @@ impl ChannelKind {
     pub fn as_wire(self) -> &'static str {
         self.into()
     }
-
-    /// Stable role string used in attribution role fields, single-sourced
-    /// from the same `IntoStaticStr` mapping as [`Self::as_wire`].
-    #[must_use]
-    pub fn role(self) -> &'static str {
-        self.as_wire()
-    }
 }
 
 /// Serde adapter for `Option<ChannelKind>` that routes through the strum
@@ -482,8 +475,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn voice_broker_channel_kind_role() {
-        assert_eq!(ChannelKind::VoiceBroker.role(), "voice_broker");
+    fn voice_broker_channel_kind_as_wire() {
+        assert_eq!(ChannelKind::VoiceBroker.as_wire(), "voice_broker");
     }
 
     #[test]
