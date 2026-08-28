@@ -6,11 +6,96 @@
 //! nudges, it never forces a call, and the prefilter never executes a tool.
 
 use crate::tools::Tool;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
-/// Marker prefix identifying an injected elicitation hint. Doubles as the
-/// idempotence guard: a model-switch retry re-enters the engine with the same
-/// history, and the hint must not stack.
+/// Marker prefix identifying an injected elicitation hint to the model.
+/// Informational only — idempotence is tracked in runtime-owned state (see
+/// [`hinted_tool_for`]), never by scanning content: user text can contain
+/// this literal, and a content guard would let it suppress a real hint and
+/// contaminate the hit-rate telemetry.
 pub(crate) const HINT_PREFIX: &str = "[tool-hint]";
+
+/// Runtime-owned per-turn hint state: which tool was hinted, and whether
+/// the invocation-correlation event has already fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HintRecord {
+    pub tool: String,
+    pub call_recorded: bool,
+}
+
+/// Runtime-owned records of in-flight hinted turns, keyed by turn id. A
+/// model-switch retry re-enters the engine with the same turn id and the
+/// same (already-mutated) history; the record is what tells the re-entry
+/// that the hint is already present and whether its call event already
+/// fired. Entries live exactly as long as their turn: [`HintTurnGuard`]
+/// removes them on every exit except the model-switch handoff.
+fn hinted_turns() -> &'static Mutex<HashMap<String, HintRecord>> {
+    static HINTED_TURNS: OnceLock<Mutex<HashMap<String, HintRecord>>> = OnceLock::new();
+    HINTED_TURNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn hinted_turns_lock() -> std::sync::MutexGuard<'static, HashMap<String, HintRecord>> {
+    match hinted_turns().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// This turn's hint state, if the runtime injected a hint on a prior entry
+/// (model-switch retry path).
+pub(crate) fn hint_record_for(turn_id: &str) -> Option<HintRecord> {
+    hinted_turns_lock().get(turn_id).cloned()
+}
+
+/// Record that the runtime injected a hint for `tool_name` on this turn.
+pub(crate) fn record_hint(turn_id: &str, tool_name: &str) {
+    hinted_turns_lock().insert(
+        turn_id.to_string(),
+        HintRecord {
+            tool: tool_name.to_string(),
+            call_recorded: false,
+        },
+    );
+}
+
+/// Record that this turn's hinted tool was called and the correlation
+/// event fired, so a model-switch retry does not fire it again.
+pub(crate) fn record_hint_call(turn_id: &str) {
+    if let Some(record) = hinted_turns_lock().get_mut(turn_id) {
+        record.call_recorded = true;
+    }
+}
+
+/// Clears a turn's hint record on drop unless defused. Defused only on the
+/// model-switch handoff, where the same turn re-enters the engine and must
+/// still see the record; every other exit (completion, error, panic) ends
+/// the turn and the record with it.
+pub(crate) struct HintTurnGuard {
+    turn_id: String,
+    armed: bool,
+}
+
+impl HintTurnGuard {
+    pub(crate) fn new(turn_id: &str) -> Self {
+        Self {
+            turn_id: turn_id.to_string(),
+            armed: true,
+        }
+    }
+
+    pub(crate) fn defuse(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for HintTurnGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            hinted_turns_lock().remove(&self.turn_id);
+        }
+    }
+}
 
 /// The ephemeral hint appended to the latest user message's content (the
 /// same rides-the-user-turn idiom as memory context — a separate system
@@ -29,16 +114,35 @@ pub(crate) fn hint_message(tool_name: &str) -> String {
 
 /// Scan the lowercased latest user message against every non-excluded tool's
 /// `invocation_triggers()`, using the trait's word-boundary matching contract
-/// ([`zeroclaw_api::tool::invocation_trigger_matches`]). The longest matching
-/// trigger wins so the most specific tool is hinted; ties keep the first tool
-/// in registry order. Returns the winning tool's name.
+/// ([`zeroclaw_api::tool::invocation_trigger_matches`]). Scans every tool
+/// the turn can actually advertise and execute: the static registry plus
+/// the activated deferred set — a deferred tool activated on an earlier
+/// turn is callable on this one and must be equally eligible for a hint.
+/// The longest matching trigger wins so the most specific tool is hinted;
+/// ties keep the first tool in registry order, then activated tools in
+/// their (name-sorted) snapshot order. An activated tool shadowed by a
+/// registry tool of the same name is skipped, mirroring execution's
+/// static-first resolution. Returns the winning tool's name.
 pub(crate) fn scan_for_trigger_hit(
     message_lower: &str,
     tools: &[Box<dyn Tool>],
+    activated: &[Arc<dyn Tool>],
     excluded_tools: &[String],
 ) -> Option<String> {
     let mut best: Option<(usize, &str)> = None;
-    for tool in tools {
+    let registry_then_activated =
+        tools
+            .iter()
+            .map(|t| t.as_ref() as &dyn Tool)
+            .chain(activated.iter().filter_map(|t| {
+                let tool: &dyn Tool = t.as_ref();
+                if tools.iter().any(|r| r.name() == tool.name()) {
+                    None
+                } else {
+                    Some(tool)
+                }
+            }));
+    for tool in registry_then_activated {
         let name = tool.name();
         if excluded_tools.iter().any(|e| e == name) {
             continue;
@@ -65,6 +169,7 @@ mod tests {
     struct TriggerTool {
         name: &'static str,
         triggers: Vec<String>,
+        fail: bool,
     }
 
     impl Attributable for TriggerTool {
@@ -91,6 +196,13 @@ mod tests {
             self.triggers.clone()
         }
         async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            if self.fail {
+                return Ok(ToolResult {
+                    success: false,
+                    output: "".into(),
+                    error: Some("synthetic tool failure".to_string()),
+                });
+            }
             Ok(ToolResult::ok("ok"))
         }
     }
@@ -99,6 +211,15 @@ mod tests {
         Box::new(TriggerTool {
             name,
             triggers: triggers.iter().map(|t| (*t).to_string()).collect(),
+            fail: false,
+        })
+    }
+
+    pub(super) fn failing_tool(name: &'static str, triggers: &[&str]) -> Box<dyn Tool> {
+        Box::new(TriggerTool {
+            name,
+            triggers: triggers.iter().map(|t| (*t).to_string()).collect(),
+            fail: true,
         })
     }
 
@@ -106,7 +227,7 @@ mod tests {
     fn no_triggers_no_hit() {
         let tools = vec![tool("plain", &[])];
         assert_eq!(
-            scan_for_trigger_hit("send this to my email", &tools, &[]),
+            scan_for_trigger_hit("send this to my email", &tools, &[], &[]),
             None
         );
     }
@@ -115,11 +236,11 @@ mod tests {
     fn substring_match_hits() {
         let tools = vec![tool("send_via", &["send this to", "via voice"])];
         assert_eq!(
-            scan_for_trigger_hit("please send this to marta", &tools, &[]),
+            scan_for_trigger_hit("please send this to marta", &tools, &[], &[]),
             Some("send_via".to_string())
         );
         assert_eq!(
-            scan_for_trigger_hit("what's the weather", &tools, &[]),
+            scan_for_trigger_hit("what's the weather", &tools, &[], &[]),
             None
         );
     }
@@ -131,7 +252,7 @@ mod tests {
             tool("send_via", &["send this to my email"]),
         ];
         assert_eq!(
-            scan_for_trigger_hit("send this to my email please", &tools, &[]),
+            scan_for_trigger_hit("send this to my email please", &tools, &[], &[]),
             Some("send_via".to_string())
         );
     }
@@ -140,7 +261,7 @@ mod tests {
     fn excluded_tools_are_skipped() {
         let tools = vec![tool("send_via", &["via voice"])];
         assert_eq!(
-            scan_for_trigger_hit("reply via voice", &tools, &["send_via".to_string()]),
+            scan_for_trigger_hit("reply via voice", &tools, &[], &["send_via".to_string()]),
             None
         );
     }
@@ -150,13 +271,110 @@ mod tests {
         // A short dynamic-style trigger must not fire inside a longer word.
         let tools = vec![tool("send_via", &["dev"])];
         assert_eq!(
-            scan_for_trigger_hit("check the device status", &tools, &[]),
+            scan_for_trigger_hit("check the device status", &tools, &[], &[]),
             None
         );
         assert_eq!(
-            scan_for_trigger_hit("route this to dev", &tools, &[]),
+            scan_for_trigger_hit("route this to dev", &tools, &[], &[]),
             Some("send_via".to_string())
         );
+    }
+
+    pub(super) fn activated_tool(name: &'static str, triggers: &[&str]) -> Arc<dyn Tool> {
+        Arc::new(TriggerTool {
+            name,
+            triggers: triggers.iter().map(|t| (*t).to_string()).collect(),
+            fail: false,
+        })
+    }
+
+    #[test]
+    fn activated_tools_are_scanned() {
+        let tools = vec![tool("plain", &[])];
+        let activated = vec![activated_tool("mcp__mail__send", &["send this to"])];
+        assert_eq!(
+            scan_for_trigger_hit("please send this to marta", &tools, &activated, &[]),
+            Some("mcp__mail__send".to_string())
+        );
+    }
+
+    #[test]
+    fn longest_trigger_wins_across_registry_and_activated() {
+        let tools = vec![tool("send_via", &["send"])];
+        let activated = vec![activated_tool(
+            "mcp__mail__send",
+            &["send this to my email"],
+        )];
+        assert_eq!(
+            scan_for_trigger_hit("send this to my email please", &tools, &activated, &[]),
+            Some("mcp__mail__send".to_string())
+        );
+        // And the registry side wins when its trigger is the longer one.
+        let tools = vec![tool("send_via", &["send this to my email"])];
+        let activated = vec![activated_tool("mcp__mail__send", &["send"])];
+        assert_eq!(
+            scan_for_trigger_hit("send this to my email please", &tools, &activated, &[]),
+            Some("send_via".to_string())
+        );
+    }
+
+    #[test]
+    fn excluded_activated_tools_are_skipped() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let activated = vec![activated_tool("mcp__mail__send", &["via voice"])];
+        assert_eq!(
+            scan_for_trigger_hit(
+                "reply via voice",
+                &tools,
+                &activated,
+                &["mcp__mail__send".to_string()]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn activated_tool_shadowed_by_registry_name_is_skipped() {
+        // Execution resolves static-first; a same-named activated tool must
+        // not add triggers the registry tool does not advertise.
+        let tools = vec![tool("send_via", &["send this to"])];
+        let activated = vec![activated_tool("send_via", &["totally different trigger"])];
+        assert_eq!(
+            scan_for_trigger_hit("totally different trigger", &tools, &activated, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn hint_record_round_trip_and_guard() {
+        let turn = "test-hint-record-turn";
+        assert!(hint_record_for(turn).is_none());
+        record_hint(turn, "send_via");
+        assert_eq!(
+            hint_record_for(turn),
+            Some(HintRecord {
+                tool: "send_via".to_string(),
+                call_recorded: false,
+            })
+        );
+        record_hint_call(turn);
+        assert_eq!(
+            hint_record_for(turn),
+            Some(HintRecord {
+                tool: "send_via".to_string(),
+                call_recorded: true,
+            })
+        );
+
+        // A defused guard keeps the record (model-switch handoff)...
+        let mut guard = HintTurnGuard::new(turn);
+        guard.defuse();
+        drop(guard);
+        assert!(hint_record_for(turn).is_some());
+
+        // ...an armed one ends it with the turn.
+        drop(HintTurnGuard::new(turn));
+        assert!(hint_record_for(turn).is_none());
     }
 
     #[test]
@@ -171,7 +389,7 @@ mod tests {
 /// `run_tool_call_loop` — the engine block this module backs.
 #[cfg(test)]
 mod loop_gate_tests {
-    use super::tests::tool;
+    use super::tests::{failing_tool, tool};
     use super::*;
     use crate::observability;
     use zeroclaw_api::ingress::IngressContext;
@@ -232,36 +450,49 @@ runtime_profile = "hinted"
         .expect("test config parses")
     }
 
-    async fn run_once(
-        config: Option<&zeroclaw_config::schema::Config>,
+    struct RunSpec<'a> {
+        config: Option<&'a zeroclaw_config::schema::Config>,
         ingress: IngressContext,
-        history: &mut Vec<ChatMessage>,
-        tools_registry: &[Box<dyn Tool>],
-    ) {
-        let provider = PlainProvider;
-        let turn_id = uuid::Uuid::new_v4().to_string();
+        tools_registry: &'a [Box<dyn Tool>],
+        excluded_tools: &'a [String],
+        activated_tools: Option<&'a Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+        provider: &'a dyn zeroclaw_providers::ModelProvider,
+        turn_id: &'a str,
+        /// Prefilled model-switch state: makes the loop exit with
+        /// `ModelSwitchRequested` on its first iteration, emulating the
+        /// switch half of a retry.
+        model_switch_to: Option<(&'a str, &'a str)>,
+    }
+
+    async fn run_spec(spec: RunSpec<'_>, history: &mut Vec<ChatMessage>) -> anyhow::Result<String> {
+        let model_switch_callback = spec.model_switch_to.map(|(provider, model)| {
+            Arc::new(std::sync::Mutex::new(Some((
+                provider.to_string(),
+                model.to_string(),
+            ))))
+        });
         crate::agent::loop_::run_tool_call_loop(crate::agent::loop_::ToolLoop {
             parent_agent_alias: None,
             sop_reassembly: None,
             exec: crate::agent::loop_::ResolvedAgentExecution {
                 model_access: crate::agent::loop_::ResolvedModelAccess {
-                    model_provider: &provider,
+                    model_provider: spec.provider,
                     provider_name: "mock",
                     model: "mock-model",
                     temperature: None,
                 },
-                tools_registry,
+                tools_registry: spec.tools_registry,
                 observer: &observability::NoopObserver {},
                 silent: true,
                 approval: None,
                 multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
-                config,
+                config: spec.config,
                 max_tool_iterations: 3,
                 hooks: None,
-                excluded_tools: &[],
+                excluded_tools: spec.excluded_tools,
                 dedup_exempt_tools: &[],
-                activated_tools: None,
-                model_switch_callback: None,
+                activated_tools: spec.activated_tools,
+                model_switch_callback,
                 pacing: &zeroclaw_config::schema::PacingConfig::default(),
                 strict_tool_parsing: false,
                 parallel_tools: false,
@@ -283,10 +514,34 @@ runtime_profile = "hinted"
             new_messages_out: None,
             image_cache: None,
             memory: None,
-            ingress,
+            ingress: spec.ingress,
             agent_alias: Some("default"),
-            turn_id: &turn_id,
+            turn_id: spec.turn_id,
         })
+        .await
+    }
+
+    async fn run_once(
+        config: Option<&zeroclaw_config::schema::Config>,
+        ingress: IngressContext,
+        history: &mut Vec<ChatMessage>,
+        tools_registry: &[Box<dyn Tool>],
+    ) {
+        let provider = PlainProvider;
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        run_spec(
+            RunSpec {
+                config,
+                ingress,
+                tools_registry,
+                excluded_tools: &[],
+                activated_tools: None,
+                provider: &provider,
+                turn_id: &turn_id,
+                model_switch_to: None,
+            },
+            history,
+        )
         .await
         .expect("loop should succeed");
     }
@@ -370,9 +625,11 @@ runtime_profile = "hinted"
     }
 
     #[tokio::test]
-    async fn existing_hint_does_not_stack() {
-        // A model-switch retry re-enters the engine with the already-hinted
-        // history; the note must not duplicate.
+    async fn user_authored_marker_does_not_suppress_the_hint() {
+        // Idempotence is runtime-owned, not content-derived: a user message
+        // that already contains the hint marker (even a verbatim hint) must
+        // still receive the real injection, so untrusted content can neither
+        // suppress the feature nor arm the call telemetry without one.
         let cfg = elicitation_config();
         let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
         let mut history = vec![ChatMessage::user(format!(
@@ -380,6 +637,285 @@ runtime_profile = "hinted"
             hint_message("send_via")
         ))];
         run_once(Some(&cfg), IngressContext::channel(), &mut history, &tools).await;
+        // Forged marker + the real injected hint.
+        assert_eq!(hint_count(&history), 2);
+        let user = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .expect("user message survives the turn");
+        assert!(
+            user.content.ends_with(&hint_message("send_via")),
+            "the runtime's own hint must still be appended"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_switch_retry_does_not_stack_hint_or_events() {
+        // A model-switch retry re-enters the engine with the same turn id
+        // and the already-hinted history; the note must not duplicate. The
+        // guard is the runtime-owned per-turn record, defused across the
+        // switch handoff and cleared when the turn completes.
+        let cfg = elicitation_config();
+        let tools: Vec<Box<dyn Tool>> = vec![tool("send_via", &["send this to"])];
+        let mut history = vec![ChatMessage::user("please send this to marta")];
+        let turn_id = format!("switch-retry-{}", uuid::Uuid::new_v4());
+        let provider = PlainProvider;
+
+        // First entry: hint injected, then the loop hands off for a switch.
+        let err = run_spec(
+            RunSpec {
+                config: Some(&cfg),
+                ingress: IngressContext::channel(),
+                tools_registry: &tools,
+                excluded_tools: &[],
+                activated_tools: None,
+                provider: &provider,
+                turn_id: &turn_id,
+                model_switch_to: Some(("other", "other-model")),
+            },
+            &mut history,
+        )
+        .await
+        .expect_err("prefilled switch state must exit the loop");
+        assert!(
+            crate::agent::loop_::is_model_switch_requested(&err).is_some(),
+            "loop must exit via ModelSwitchRequested, got: {err:?}"
+        );
         assert_eq!(hint_count(&history), 1);
+        assert!(
+            hint_record_for(&turn_id).is_some(),
+            "switch handoff must keep the turn's hint record"
+        );
+
+        // Retry: same turn id, same mutated history — no second hint.
+        run_spec(
+            RunSpec {
+                config: Some(&cfg),
+                ingress: IngressContext::channel(),
+                tools_registry: &tools,
+                excluded_tools: &[],
+                activated_tools: None,
+                provider: &provider,
+                turn_id: &turn_id,
+                model_switch_to: None,
+            },
+            &mut history,
+        )
+        .await
+        .expect("retry completes");
+        assert_eq!(hint_count(&history), 1);
+        assert!(
+            hint_record_for(&turn_id).is_none(),
+            "completing the turn must clear its hint record"
+        );
+    }
+
+    #[tokio::test]
+    async fn activated_deferred_tool_is_hinted_and_excludable() {
+        // A deferred tool activated on an earlier turn is advertised and
+        // executable on this one; elicitation must scan it too, under the
+        // same exclusion rules.
+        let cfg = elicitation_config();
+        let tools: Vec<Box<dyn Tool>> = vec![tool("plain", &[])];
+        let mut set = crate::tools::ActivatedToolSet::new();
+        set.activate(
+            "mcp__mail__send".to_string(),
+            super::tests::activated_tool("mcp__mail__send", &["send this to"]),
+        );
+        let activated = Arc::new(std::sync::Mutex::new(set));
+        let provider = PlainProvider;
+
+        let mut history = vec![ChatMessage::user("please send this to marta")];
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        run_spec(
+            RunSpec {
+                config: Some(&cfg),
+                ingress: IngressContext::channel(),
+                tools_registry: &tools,
+                excluded_tools: &[],
+                activated_tools: Some(&activated),
+                provider: &provider,
+                turn_id: &turn_id,
+                model_switch_to: None,
+            },
+            &mut history,
+        )
+        .await
+        .expect("loop should succeed");
+        assert_eq!(hint_count(&history), 1);
+        assert!(
+            history
+                .iter()
+                .rev()
+                .find(|m| m.role == "user")
+                .expect("user message survives")
+                .content
+                .contains("`mcp__mail__send`"),
+            "the activated tool must be hinted"
+        );
+
+        // The same exclusion list that gates advertisement and execution
+        // gates elicitation.
+        let mut history = vec![ChatMessage::user("please send this to marta")];
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        run_spec(
+            RunSpec {
+                config: Some(&cfg),
+                ingress: IngressContext::channel(),
+                tools_registry: &tools,
+                excluded_tools: &["mcp__mail__send".to_string()],
+                activated_tools: Some(&activated),
+                provider: &provider,
+                turn_id: &turn_id,
+                model_switch_to: None,
+            },
+            &mut history,
+        )
+        .await
+        .expect("loop should succeed");
+        assert_eq!(hint_count(&history), 0);
+    }
+
+    /// Provider that requests one call of `tool` on its first iteration,
+    /// then answers with plain text.
+    struct CallOnceProvider {
+        tool: &'static str,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CallOnceProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("done".to_string())
+        }
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            let first = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Ok(ChatResponse {
+                text: (!first).then(|| "done".to_string()),
+                tool_calls: if first {
+                    vec![zeroclaw_api::model_provider::ToolCall {
+                        id: "call-1".to_string(),
+                        name: self.tool.to_string(),
+                        arguments: "{}".to_string(),
+                        extra_content: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for CallOnceProvider {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "call-once-provider"
+        }
+    }
+
+    /// Drain the broadcast stream for `tool_called_after_hint` records with
+    /// this turn's trace id; assert each one is invocation-only (no success
+    /// claim). Returns how many were observed.
+    async fn drain_call_events(
+        rx: &mut tokio::sync::broadcast::Receiver<serde_json::Value>,
+        turn_id: &str,
+    ) -> usize {
+        let mut seen = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let step = remaining.min(std::time::Duration::from_millis(50));
+            match tokio::time::timeout(step, rx.recv()).await {
+                Ok(Ok(value)) => {
+                    let is_call_event = value
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|m| m.contains("tool_called_after_hint"));
+                    let ours = value
+                        .get("attributes")
+                        .and_then(|a| a.get("trace_id"))
+                        .and_then(|v| v.as_str())
+                        == Some(turn_id);
+                    if is_call_event && ours {
+                        seen += 1;
+                        let outcome = value
+                            .get("event")
+                            .and_then(|e| e.get("outcome"))
+                            .and_then(|v| v.as_str());
+                        assert_ne!(
+                            outcome,
+                            Some("success"),
+                            "invocation-only event must not claim tool success: {value}"
+                        );
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => break,
+                Err(_elapsed) => break,
+            }
+        }
+        seen
+    }
+
+    async fn run_hinted_call(tools: Vec<Box<dyn Tool>>) -> usize {
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let cfg = elicitation_config();
+        let provider = CallOnceProvider {
+            tool: "send_via",
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let mut history = vec![ChatMessage::user("please send this to marta")];
+        let turn_id = format!("hinted-call-{}", uuid::Uuid::new_v4());
+        run_spec(
+            RunSpec {
+                config: Some(&cfg),
+                ingress: IngressContext::channel(),
+                tools_registry: &tools,
+                excluded_tools: &[],
+                activated_tools: None,
+                provider: &provider,
+                turn_id: &turn_id,
+                model_switch_to: None,
+            },
+            &mut history,
+        )
+        .await
+        .expect("loop should succeed");
+        drain_call_events(&mut rx, &turn_id).await
+    }
+
+    #[tokio::test]
+    async fn hinted_call_event_is_invocation_only_for_success_and_failure() {
+        // The correlation event fires once whether the hinted tool's own
+        // execution succeeds or fails, and never claims tool success —
+        // execution results belong to `tool_call_result`.
+        let succeeded = run_hinted_call(vec![tool("send_via", &["send this to"])]).await;
+        assert_eq!(succeeded, 1, "successful hinted call must emit one event");
+
+        let failed = run_hinted_call(vec![failing_tool("send_via", &["send this to"])]).await;
+        assert_eq!(failed, 1, "failed hinted call must still emit one event");
     }
 }
