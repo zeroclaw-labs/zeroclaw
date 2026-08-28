@@ -17021,7 +17021,7 @@ pub enum SpeechBackend {
 /// steering how the model mediates the call. Distinct from `voice_duplex`
 /// (a direct open-mic gateway channel with no hosted speech-to-speech
 /// backend) -- this channel type always talks to a `backend` provider.
-#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "channels.speech_to_speech"]
 pub struct SpeechToSpeechConfig {
@@ -17086,24 +17086,6 @@ pub struct SpeechToSpeechConfig {
     #[tab(Advanced)]
     #[serde(default)]
     pub temperature: Option<f32>,
-}
-
-impl Default for SpeechToSpeechConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            backend: SpeechBackend::default(),
-            api_key: None,
-            model_kind: ModelKind::default(),
-            model: String::new(),
-            voice: None,
-            language: None,
-            broker_persona_path: None,
-            broker_persona: None,
-            activation: Activation::default(),
-            temperature: None,
-        }
-    }
 }
 
 impl ChannelConfig for SpeechToSpeechConfig {
