@@ -48,6 +48,18 @@ fn is_direct_child_path(path: &str, prefix: &str) -> bool {
         .is_some_and(|relative| !relative.is_empty() && !relative.contains('.'))
 }
 
+fn model_field_catalog_reference(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split('.').collect();
+    match segments.as_slice() {
+        ["providers", "models", family, alias, "model", ..]
+            if !family.is_empty() && !alias.is_empty() =>
+        {
+            Some(format!("{family}.{alias}"))
+        }
+        _ => None,
+    }
+}
+
 fn retain_direct_children(fields: &mut Vec<ConfigFieldEntry>, prefix: &str) {
     fields.retain(|field| is_direct_child_path(&field.path, prefix));
 }
@@ -2921,36 +2933,34 @@ impl App {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        if field_path.ends_with(".model") && field_path.starts_with("providers.models.") {
-            // providers.models.<family>.<alias>.model → segment at index 2
-            let segments: Vec<&str> = field_path.split('.').collect();
-            if segments.len() >= 4 {
-                let family = segments[2].to_string();
+        if let Some(provider_ref) = model_field_catalog_reference(&field_path) {
+            let family = provider_ref
+                .split_once('.')
+                .map_or(provider_ref.as_str(), |(family, _)| family)
+                .to_string();
 
-                // Show loading indicator before the blocking RPC call.
-                self.status_msg = Some(crate::i18n::t_args(
-                    "zc-config-status-fetching-models",
-                    &[("family", &family)],
-                ));
-                let _ = self.draw(term);
+            // Show loading indicator before the blocking RPC call.
+            self.status_msg = Some(crate::i18n::t_args(
+                "zc-config-status-fetching-models",
+                &[("family", &family)],
+            ));
+            let _ = self.draw(term);
 
-                match self.rpc.catalog_models(&family).await {
-                    Ok(res) if !res.models.is_empty() => {
-                        self.select_cursor = res
-                            .models
-                            .iter()
-                            .position(|m| m == &field_current)
-                            .unwrap_or(0);
-                        self.select_items = res.models;
-                        self.status_msg = None;
-                    }
-                    Ok(_) => {
-                        self.status_msg = Some(crate::i18n::t("zc-config-status-no-models"));
-                    }
-                    Err(_) => {
-                        self.status_msg =
-                            Some(crate::i18n::t("zc-config-status-model-fetch-failed"));
-                    }
+            match self.rpc.catalog_models(&provider_ref).await {
+                Ok(res) if !res.models.is_empty() => {
+                    self.select_cursor = res
+                        .models
+                        .iter()
+                        .position(|m| m == &field_current)
+                        .unwrap_or(0);
+                    self.select_items = res.models;
+                    self.status_msg = None;
+                }
+                Ok(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-no-models"));
+                }
+                Err(_) => {
+                    self.status_msg = Some(crate::i18n::t("zc-config-status-model-fetch-failed"));
                 }
             }
         }
@@ -4831,6 +4841,22 @@ fn edit_in_external_editor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_field_catalog_reference_preserves_typed_alias() {
+        assert_eq!(
+            model_field_catalog_reference("providers.models.hailo_ollama.edge.model"),
+            Some("hailo_ollama.edge".to_string())
+        );
+        assert_eq!(
+            model_field_catalog_reference("providers.models.openai.default.model"),
+            Some("openai.default".to_string())
+        );
+        assert_eq!(
+            model_field_catalog_reference("providers.models.ollama.default"),
+            None
+        );
+    }
 
     #[test]
     fn config_scalar_validation_rejects_invalid_integer() {

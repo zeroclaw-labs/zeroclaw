@@ -373,6 +373,7 @@ zc-model-switch-provider-ok = model_provider changé pour { $provider } (modèle
 zc-model-switch-failed = Échec du changement de modèle : { $error }
 zc-model-catalog-no-provider = Impossible de résoudre le model_provider de cet agent à partir de la configuration.
 zc-model-catalog-empty = Aucun modèle disponible pour le model_provider actif.
+zc-model-catalog-failed = Impossible de charger les modèles du model_provider actif : { $error }
 zc-model-catalog-loading = Chargement des modèles…
 zc-model-provider-catalog-failed = Impossible de charger les model_providers : { $error }
 zc-chat-label-you = Vous :

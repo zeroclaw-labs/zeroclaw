@@ -1782,7 +1782,7 @@ function FieldRow({
       setModelsFetchFailed(!cached.live && cached.models.length === 0);
       return;
     }
-    void getCatalogModels(provider)
+    void getCatalogModels(provider, alias)
       .then((r) => {
         modelsCache[cacheKey] = { models: r.models, live: r.live, local: r.local };
         setProviderModels(r.models);

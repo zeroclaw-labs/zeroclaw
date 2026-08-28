@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex as ParkingMutex;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -439,8 +439,21 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
     None
 }
 
+/// Provider-declared terminal failures override retry/message heuristics.
+fn has_typed_non_retryable_marker(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|source| source.is::<crate::traits::NonRetryableProviderError>())
+}
+
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // A provider's typed classification is definitive. Check the full chain
+    // before text or status heuristics so recoverable-looking wording cannot
+    // override an explicit provider safety decision.
+    if has_typed_non_retryable_marker(err) {
+        return true;
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -1637,6 +1650,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
+        let mut terminal_provider_keys = HashSet::new();
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -1644,6 +1658,9 @@ impl ModelProvider for ReliableModelProvider {
         // retryable error, sleep with exponential backoff and retry.
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
                 let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
@@ -1762,7 +1779,7 @@ impl ModelProvider for ReliableModelProvider {
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: no history to truncate
                             // in chat_with_system, bail immediately.
-                            if is_context_window_exceeded(&e) {
+                            if is_context_window_exceeded(&e) && !is_non_retryable(&e) {
                                 let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
@@ -1830,6 +1847,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 break;
                             }
@@ -1908,11 +1928,15 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
+                if terminal_provider_keys.contains(&entry.cooldown_key) {
+                    continue;
+                }
                 let provider_name = entry.display_name.as_str();
                 let served_model = entry.served_model(current_model);
                 if self.provider_should_skip_for_cooldown(entry) {
@@ -2031,7 +2055,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e) && !context_truncated {
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
                                 let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
@@ -2112,6 +2139,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 break;
                             }
@@ -2267,6 +2297,7 @@ impl ModelProvider for ReliableModelProvider {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
@@ -2274,7 +2305,9 @@ impl ModelProvider for ReliableModelProvider {
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
-                if is_stream_recovery_skip(model_slot, entry_index) {
+                if is_stream_recovery_skip(model_slot, entry_index)
+                    || terminal_provider_keys.contains(&entry.cooldown_key)
+                {
                     continue;
                 }
                 let provider_name = entry.display_name.as_str();
@@ -2405,7 +2438,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e) && !context_truncated {
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
                                 let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
@@ -2486,6 +2522,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 break;
                             }
@@ -2559,6 +2598,7 @@ impl ModelProvider for ReliableModelProvider {
         let models = self.model_chain(model);
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
+        let mut terminal_provider_keys = HashSet::new();
         let mut effective_messages = request.messages.to_vec();
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
@@ -2566,7 +2606,9 @@ impl ModelProvider for ReliableModelProvider {
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
-                if is_stream_recovery_skip(model_slot, entry_index) {
+                if is_stream_recovery_skip(model_slot, entry_index)
+                    || terminal_provider_keys.contains(&entry.cooldown_key)
+                {
                     continue;
                 }
                 let provider_name = entry.display_name.as_str();
@@ -2701,7 +2743,10 @@ impl ModelProvider for ReliableModelProvider {
                             }
                             final_cause_is_semantic_empty = false;
                             // Context window exceeded: truncate history and retry
-                            if is_context_window_exceeded(&e) && !context_truncated {
+                            if is_context_window_exceeded(&e)
+                                && !is_non_retryable(&e)
+                                && !context_truncated
+                            {
                                 let diagnostic = provider_error_diagnostic(&e);
                                 push_failure(
                                     &mut failures,
@@ -2782,6 +2827,9 @@ impl ModelProvider for ReliableModelProvider {
                                     ),
                                     "Non-retryable error, moving on"
                                 );
+                                if has_typed_non_retryable_marker(&e) {
+                                    terminal_provider_keys.insert(entry.cooldown_key.clone());
+                                }
                                 final_cause = Some(e);
                                 break;
                             }
@@ -3240,6 +3288,54 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "MockModelProvider"
+        }
+    }
+
+    struct MarkerErrorProvider {
+        calls: Arc<AtomicUsize>,
+        error: &'static str,
+    }
+
+    impl MarkerErrorProvider {
+        fn failure(&self) -> anyhow::Error {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::Error::new(crate::traits::NonRetryableProviderError::new(self.error))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for MarkerErrorProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Err(self.failure())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Err(self.failure())
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for MarkerErrorProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "MarkerErrorProvider"
         }
     }
 
@@ -5889,6 +5985,83 @@ mod tests {
         assert!(!is_non_retryable(&anyhow::Error::msg(
             "OpenAI Codex stream error: Your input exceeds the context window of this model."
         )));
+    }
+
+    #[test]
+    fn typed_non_retryable_marker_takes_precedence_over_retryable_heuristics() {
+        let error = anyhow::Error::new(crate::traits::NonRetryableProviderError::new(
+            "provider explicitly rejected retry",
+        ))
+        .context("429 Too Many Requests");
+        assert!(is_non_retryable(&error));
+    }
+
+    #[tokio::test]
+    async fn reliable_provider_does_not_retry_a_typed_marker_with_retryable_text() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableModelProvider::new(
+            "test",
+            vec![(
+                "primary".into(),
+                Box::new(MarkerErrorProvider {
+                    calls: Arc::clone(&calls),
+                    error: "429 Too Many Requests",
+                }),
+            )],
+            3,
+            1,
+        );
+
+        provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("typed provider failure should be terminal");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn typed_context_marker_skips_other_pins_on_the_same_provider() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let primary: Arc<dyn ModelProvider> = Arc::new(MarkerErrorProvider {
+            calls: Arc::clone(&primary_calls),
+            error: "Your input exceeds the context window of this model",
+        });
+        let entries = vec![
+            ReliableModelProviderEntry::new_pinned(
+                "primary",
+                "primary.physical",
+                "primary",
+                "primary-model",
+                Box::new(Arc::clone(&primary)),
+            ),
+            ReliableModelProviderEntry::new_pinned(
+                "primary",
+                "primary.physical",
+                "primary",
+                "fallback-model-on-primary",
+                Box::new(Arc::clone(&primary)),
+            ),
+            ReliableModelProviderEntry::new(
+                "fallback",
+                "fallback.physical",
+                Box::new(MockModelProvider {
+                    calls: Arc::clone(&fallback_calls),
+                    fail_until_attempt: 0,
+                    response: "fallback success",
+                    error: "unused",
+                }),
+            ),
+        ];
+        let provider = ReliableModelProvider::new_with_entries("test", entries, 3, 1);
+
+        let response = provider
+            .simple_chat("hello", "requested-model", Some(0.0))
+            .await
+            .expect("typed rejection should skip sibling pins and reach a distinct provider");
+        assert_eq!(response, "fallback success");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

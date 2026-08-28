@@ -1167,6 +1167,20 @@ impl OpenAiResponsesModelProvider {
         builder.build().unwrap_or_else(|_| Client::new())
     }
 
+    /// Sibling `/models` endpoint next to the configured `/responses` URL,
+    /// following the same OpenAI-compatible convention used elsewhere in
+    /// this crate (base URL with the wire-specific suffix stripped, plus
+    /// `/models`).
+    fn models_url(&self) -> String {
+        let base = self
+            .responses_url
+            .trim_end_matches('/')
+            .strip_suffix("/responses")
+            .unwrap_or(&self.responses_url)
+            .trim_end_matches('/');
+        format!("{base}/models")
+    }
+
     fn streaming_client(&self) -> Client {
         let default_headers = self.build_default_headers();
         let mut builder = Client::builder()
@@ -1211,6 +1225,41 @@ impl ModelProvider for OpenAiResponsesModelProvider {
 
     fn supports_streaming_tool_events(&self) -> bool {
         true
+    }
+
+    /// Configured Responses-wire aliases (custom/self-hosted endpoints using
+    /// `wire_api = "responses"`) have no default public fallback the way the
+    /// OpenAI family does, so an unimplemented listing method here silently
+    /// drops the configured endpoint in favor of a generic catalog. Probe
+    /// the sibling `/models` endpoint next to the configured `/responses`
+    /// URL, the same OpenAI-compatible convention `OpenAiCompatibleModelProvider`
+    /// uses, so a credentialed or header-authenticated alias returns its own
+    /// live models instead of an unrelated public list.
+    async fn list_models(&self) -> anyhow::Result<Vec<String>> {
+        let url = self.models_url();
+        let response = self
+            .http_client()
+            .get(&url)
+            .header(
+                "Authorization",
+                self.credential
+                    .as_deref()
+                    .map(|credential| format!("Bearer {credential}"))
+                    .unwrap_or_default(),
+            )
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow::Error::msg(format!(
+                    "OpenAI Responses model list request failed: {url}: {error}"
+                ))
+            })?;
+        if !response.status().is_success() {
+            let status = response.status();
+            anyhow::bail!("OpenAI Responses model list failed at {url}: HTTP {status}");
+        }
+        let bytes = response.bytes().await?;
+        crate::compatible::parse_model_ids_from_bytes(&bytes)
     }
 
     async fn chat_with_system(
@@ -1566,6 +1615,102 @@ mod tests {
             p.extra_headers.is_empty(),
             "fresh provider must default extra_headers to an empty HashMap"
         );
+    }
+
+    #[test]
+    fn models_url_strips_responses_suffix_from_custom_base() {
+        let p = OpenAiResponsesModelProvider::builder("custom")
+            .api_url("https://custom.example.com/v1")
+            .credential(Some("key"))
+            .build();
+        assert_eq!(p.responses_url, "https://custom.example.com/v1/responses");
+        assert_eq!(p.models_url(), "https://custom.example.com/v1/models");
+    }
+
+    #[tokio::test]
+    async fn list_models_probes_configured_endpoint_for_responses_wire_alias() {
+        // A credentialed custom Responses-wire alias (`wire_api = "responses"`)
+        // must list from its own configured `/models` endpoint rather than
+        // silently falling back to a generic public catalog when the trait
+        // default is used.
+        use axum::Router;
+        use axum::routing::get;
+        use std::sync::{Arc, Mutex};
+        use tokio::net::TcpListener;
+
+        let captured_auth: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_for_route = captured_auth.clone();
+        let app = Router::new().route(
+            "/v1/models",
+            get(move |headers: axum::http::HeaderMap| {
+                let captured = captured_for_route.clone();
+                async move {
+                    *captured.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    axum::Json(serde_json::json!({
+                        "data": [{"id": "custom-endpoint-only-model"}]
+                    }))
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("custom")
+            .api_url(&format!("http://{addr}/v1"))
+            .credential(Some("secret-key"))
+            .build();
+
+        let models = provider
+            .list_models()
+            .await
+            .expect("configured Responses-wire alias must list from its own endpoint");
+        assert_eq!(models, vec!["custom-endpoint-only-model".to_string()]);
+        assert_eq!(
+            captured_auth.lock().unwrap().as_deref(),
+            Some("Bearer secret-key"),
+            "the configured credential must reach the catalog probe"
+        );
+
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn list_models_surfaces_a_genuine_responses_endpoint_failure() {
+        use axum::Router;
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        let app = Router::new().route(
+            "/v1/models",
+            get(|| async { axum::http::StatusCode::UNAUTHORIZED }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_handle = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let provider = OpenAiResponsesModelProvider::builder("custom")
+            .api_url(&format!("http://{addr}/v1"))
+            .credential(Some("bad-key"))
+            .build();
+
+        let error = provider
+            .list_models()
+            .await
+            .expect_err("a genuine native listing failure must remain actionable");
+        assert!(
+            error.to_string().contains("HTTP 401"),
+            "expected the real endpoint failure, got: {error}"
+        );
+
+        server_handle.abort();
     }
 
     #[test]

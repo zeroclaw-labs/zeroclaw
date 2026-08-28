@@ -17,6 +17,22 @@ type ModelCatalogResolver = std::sync::Arc<
         + Sync,
 >;
 
+async fn fallback_if_model_listing_unsupported<F, Fut>(
+    live_result: anyhow::Result<Vec<String>>,
+    family_catalog: F,
+) -> anyhow::Result<Vec<String>>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<Vec<String>>>,
+{
+    match live_result {
+        Err(error) if crate::quickstart::model_listing_is_unsupported(&error) => {
+            family_catalog().await
+        }
+        result => result,
+    }
+}
+
 fn configured_model_provider_profiles(config: &Config) -> Vec<String> {
     let mut profiles = config
         .providers
@@ -257,12 +273,22 @@ impl ModelSwitchTool {
         })
     }
 
-    async fn resolve_catalog(&self, family: &str) -> anyhow::Result<Vec<String>> {
+    async fn resolve_catalog(&self, provider_ref: &str) -> anyhow::Result<Vec<String>> {
         #[cfg(test)]
         if let Some(resolver) = &self.catalog_resolver {
-            return resolver(family.to_string()).await;
+            return resolver(provider_ref.to_string()).await;
         }
-        zeroclaw_providers::catalog::list_models_for_family(family).await
+
+        let family = provider_ref
+            .split_once('.')
+            .map_or(provider_ref, |(family, _)| family);
+        let provider =
+            zeroclaw_providers::create_model_provider_from_ref(&self.config, provider_ref)?;
+        let live_result = provider.list_models().await;
+        fallback_if_model_listing_unsupported(live_result, || {
+            zeroclaw_providers::catalog::list_models_for_family(family)
+        })
+        .await
     }
 
     async fn handle_list_models(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -301,10 +327,10 @@ impl ModelSwitchTool {
             .unwrap_or(model_provider.as_str());
         let provider_family = provider_family.to_lowercase();
 
-        let models: Vec<String> = match self.resolve_catalog(&provider_family).await {
-            Ok(live) if !live.is_empty() => live,
-            Ok(_) => hardcoded_models_for(&provider_family),
+        let models: Vec<String> = match self.resolve_catalog(&model_provider).await {
+            Ok(live) => live,
             Err(error) => {
+                let error = zeroclaw_providers::sanitize_api_error(&error.to_string());
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -314,9 +340,23 @@ impl ModelSwitchTool {
                             "provider_family": provider_family,
                             "error": error.to_string(),
                         })),
-                    "model_switch list_models: live catalog unavailable, using hardcoded fallback"
+                    "model_switch list_models: configured profile catalog failed"
                 );
-                hardcoded_models_for(&provider_family)
+                return Ok(ToolResult {
+                    success: false,
+                    output: serde_json::to_string_pretty(&json!({
+                        "model_provider": model_provider,
+                        "configured_provider_profiles": configured_model_provider_profiles(&self.config),
+                    }))?
+                    .into(),
+                    error: Some(crate::i18n::get_required_cli_string_with_args(
+                        "model-switch-catalog-failed",
+                        &[
+                            ("provider", &model_provider),
+                            ("error", &error),
+                        ],
+                    )),
+                });
             }
         };
 
@@ -355,51 +395,6 @@ impl ModelSwitchTool {
         self.catalog_resolver = Some(std::sync::Arc::new(move |fam| Box::pin(f(fam))));
         self
     }
-}
-
-/// Offline fallback catalog for known provider families. Used only when the
-/// live `list_models_for_family` catalog is unreachable or empty. Kept in
-/// sync with the families in `list_model_providers`; intentionally minimal —
-/// the live catalog is authoritative when reachable
-fn hardcoded_models_for(provider_family: &str) -> Vec<String> {
-    let models: Vec<&'static str> = match provider_family {
-        "openai" => vec![
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4-turbo",
-            "gpt-4",
-            "gpt-3.5-turbo",
-        ],
-        "anthropic" => vec![
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-5",
-            "claude-3-5-sonnet",
-            "claude-3-opus",
-            "claude-3-haiku",
-        ],
-        "openrouter" => vec![
-            "anthropic/claude-sonnet-4-6",
-            "openai/gpt-4o",
-            "google/gemini-pro",
-            "meta-llama/llama-3-70b-instruct",
-        ],
-        "groq" => vec![
-            "llama-3.3-70b-versatile",
-            "mixtral-8x7b-32768",
-            "llama-3.1-70b-speculative",
-        ],
-        "ollama" => vec!["llama3", "llama3.1", "mistral", "codellama", "phi3"],
-        "deepseek" => vec!["deepseek-chat", "deepseek-coder"],
-        "mistral" => vec![
-            "mistral-large-latest",
-            "mistral-small-latest",
-            "mistral-nemo",
-        ],
-        "gemini" => vec!["gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
-        "xai" => vec!["grok-2", "grok-2-vision", "grok-beta"],
-        _ => vec![],
-    };
-    models.into_iter().map(String::from).collect()
 }
 
 #[cfg(test)]
@@ -575,8 +570,177 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_models_preserves_hailo_configured_alias_for_catalog_resolution() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("hailo_ollama", "edge")
+            .unwrap();
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
+            .with_catalog_resolver(|provider_ref| async move {
+                assert_eq!(provider_ref, "hailo_ollama.edge");
+                Ok(vec!["edge-model".to_string()])
+            });
+
+        let result = tool
+            .handle_list_models(&json!({ "model_provider": "hailo_ollama.edge" }))
+            .await
+            .expect("list_models should return a tool result");
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: serde_json::Value =
+            serde_json::from_str(&result.output).expect("output should be json");
+        assert_eq!(output["models"], json!(["edge-model"]));
+    }
+
+    #[tokio::test]
+    async fn list_models_queries_configured_hailo_alias_catalog() {
+        use axum::{Json, Router, extract::State, http::HeaderMap, routing::get};
+        use parking_lot::Mutex;
+        use std::collections::HashMap;
+        use zeroclaw_config::schema::{HailoOllamaModelProviderConfig, ModelProviderConfig};
+
+        #[derive(Clone)]
+        struct CatalogCapture(Arc<Mutex<Option<String>>>);
+
+        async fn tags(
+            State(capture): State<CatalogCapture>,
+            headers: HeaderMap,
+        ) -> Json<serde_json::Value> {
+            *capture.0.lock() = headers
+                .get("x-route")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            Json(json!({"models": [{"name": "edge-model"}]}))
+        }
+
+        let seen_route = Arc::new(Mutex::new(None));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Hailo endpoint");
+        let address = listener.local_addr().expect("fake endpoint address");
+        let seen_route_for_server = Arc::clone(&seen_route);
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/api/tags", get(tags))
+                    .with_state(CatalogCapture(seen_route_for_server)),
+            )
+            .await
+            .expect("serve fake Hailo endpoint");
+        });
+
+        let mut config = Config::default();
+        config.providers.models.hailo_ollama.insert(
+            "edge".to_string(),
+            HailoOllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(format!("http://{address}")),
+                    model: Some("edge-model".to_string()),
+                    extra_headers: HashMap::from([("X-Route".to_string(), "edge".to_string())]),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+
+        let result = tool
+            .handle_list_models(&json!({ "model_provider": "hailo_ollama.edge" }))
+            .await
+            .expect("list_models should return a tool result");
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: serde_json::Value =
+            serde_json::from_str(&result.output).expect("output should be json");
+        assert_eq!(output["models"], json!(["edge-model"]));
+        assert_eq!(seen_route.lock().as_deref(), Some("edge"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn list_models_queries_configured_ollama_alias_catalog() {
+        use axum::{Json, Router, routing::get};
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        async fn models() -> Json<serde_json::Value> {
+            Json(json!({"data": [{"id": "llama-local"}]}))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Ollama endpoint");
+        let address = listener.local_addr().expect("fake endpoint address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, Router::new().route("/v1/models", get(models)))
+                .await
+                .expect("serve fake Ollama endpoint");
+        });
+        let mut config = Config::default();
+        config.providers.models.ollama.insert(
+            "local".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    uri: Some(format!("http://{address}")),
+                    model: Some("llama-local".to_string()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
+
+        let result = tool
+            .handle_list_models(&json!({ "model_provider": "ollama.local" }))
+            .await
+            .expect("list_models should return a tool result");
+        assert!(result.success, "unexpected error: {:?}", result.error);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["models"], json!(["llama-local"]));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn configured_profile_catalog_error_remains_actionable() {
+        let mut config = Config::default();
+        config
+            .providers
+            .models
+            .ensure("hailo_ollama", "edge")
+            .unwrap();
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
+            .with_catalog_resolver(|_provider_ref| async {
+                anyhow::bail!("configured catalog denied request")
+            });
+
+        let result = tool
+            .handle_list_models(&json!({ "model_provider": "hailo_ollama.edge" }))
+            .await
+            .expect("list_models should return a tool result");
+        assert!(
+            !result.success,
+            "configured profile errors must not become empty success"
+        );
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("configured catalog denied request")),
+            "unexpected error: {:?}",
+            result.error
+        );
+    }
+
+    #[tokio::test]
     async fn list_models_accepts_dotted_provider_profile_ref() {
-        let result = tool()
+        let tool = tool().with_catalog_resolver(|provider_ref| async move {
+            assert_eq!(provider_ref, "openai.default");
+            Ok(vec!["gpt-test".to_string()])
+        });
+        let result = tool
             .handle_list_models(&json!({
                 "model_provider": "openai.default"
             }))
@@ -587,145 +751,73 @@ mod tests {
         let output: serde_json::Value =
             serde_json::from_str(&result.output).expect("output should be json");
         assert_eq!(output["model_provider"], "openai.default");
-        // Whether the live models.dev catalog is reachable or we fell back to
-        // the offline list, a configured OpenAI profile must yield a non-empty
-        // model list.
-        assert!(
-            !output["models"]
-                .as_array()
-                .expect("models should be an array")
-                .is_empty(),
-            "expected a non-empty model list, got: {}",
-            result.output
-        );
-    }
-
-    #[test]
-    fn hardcoded_fallback_covers_known_families() {
-        // The nine families that have hardcoded fallback arms.
-        for family in [
-            "openai",
-            "anthropic",
-            "openrouter",
-            "groq",
-            "ollama",
-            "deepseek",
-            "mistral",
-            "gemini",
-            "xai",
-        ] {
-            assert!(
-                !hardcoded_models_for(family).is_empty(),
-                "expected a non-empty offline fallback for family `{family}`"
-            );
-        }
-        // OpenAI's stale fallback set still contains gpt-4o.
-        assert!(hardcoded_models_for("openai").iter().any(|m| m == "gpt-4o"));
-        // Unknown families have no fallback.
-        assert!(hardcoded_models_for("not_a_real_family").is_empty());
+        assert_eq!(output["models"], json!(["gpt-test"]));
     }
 
     #[tokio::test]
-    async fn list_models_prefers_live_catalog_when_reachable() {
-        let live = match zeroclaw_providers::catalog::list_models_for_family("openai").await {
-            Ok(live) if !live.is_empty() => live,
-            _ => {
-                eprintln!("skipping: models.dev catalog unreachable (offline)");
-                return;
-            }
-        };
+    async fn static_catalog_fallback_only_handles_typed_listing_unsupported() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let result = tool()
-            .handle_list_models(&json!({ "model_provider": "openai.default" }))
-            .await
-            .expect("list_models should return a tool result");
-        assert!(result.success, "unexpected error: {:?}", result.error);
-        let output: serde_json::Value =
-            serde_json::from_str(&result.output).expect("output should be json");
-        let models: Vec<String> = output["models"]
-            .as_array()
-            .expect("models should be an array")
-            .iter()
-            .map(|m| m.as_str().unwrap_or_default().to_string())
-            .collect();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = calls.clone();
+        let models = fallback_if_model_listing_unsupported(
+            Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::ModelListingUnsupportedError,
+            )),
+            move || async move {
+                fallback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["static-model".to_string()])
+            },
+        )
+        .await
+        .expect("typed unsupported listing should use the family catalog");
+        assert_eq!(models, vec!["static-model"]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
 
-        // The returned set must be the live catalog, not the stale hardcoded
-        // five-element list.
-        assert_eq!(
-            models, live,
-            "list_models should return the live catalog when reachable"
-        );
-        assert_ne!(
-            models,
-            hardcoded_models_for("openai"),
-            "live catalog should differ from the stale hardcoded fallback"
-        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = calls.clone();
+        let error = fallback_if_model_listing_unsupported(
+            Err(anyhow::Error::msg("HTTP 401 Unauthorized")),
+            move || async move {
+                fallback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec!["must-not-be-used".to_string()])
+            },
+        )
+        .await
+        .expect_err("actionable live-catalog errors must remain fail-closed");
+        assert!(error.to_string().contains("401"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = calls.clone();
+        let models = fallback_if_model_listing_unsupported(Ok(Vec::new()), move || async move {
+            fallback_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec!["must-not-be-used".to_string()])
+        })
+        .await
+        .expect("reachable empty live catalog is authoritative");
+        assert!(models.is_empty());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn list_models_falls_back_to_hardcoded_on_real_offline_err() {
-        let mut config = Config::default();
-        config.providers.models.ensure("ollama", "local").unwrap();
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
-        let result = tool
-            .handle_list_models(&json!({ "model_provider": "ollama.local" }))
-            .await
-            .expect("list_models should return a tool result");
-        assert!(result.success, "unexpected error: {:?}", result.error);
-        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(out["model_provider"], "ollama.local");
-        let models: Vec<String> = out["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m.as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(models, hardcoded_models_for("ollama")); // real offline Err served the hardcoded list
-    }
-
-    #[tokio::test]
-    async fn list_models_falls_back_to_hardcoded_on_empty_ok() {
-        let tool = tool().with_catalog_resolver(|_fam| async { Ok(vec![]) }); // empty-Ok arm (292)
+    async fn configured_empty_catalog_is_authoritative() {
+        let tool = tool().with_catalog_resolver(|_provider_ref| async { Ok(vec![]) });
         let result = tool
             .handle_list_models(&json!({ "model_provider": "openai.default" }))
             .await
             .expect("list_models should return a tool result");
         assert!(result.success, "unexpected error: {:?}", result.error);
-        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-        let models: Vec<String> = out["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|m| m.as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(models, hardcoded_models_for("openai"));
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert!(output["models"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn list_models_returns_empty_when_no_hardcoded_fallback() {
-        let result = tool()
-            .handle_list_models(&json!({ "model_provider": "custom.local" }))
-            .await
-            .expect("list_models should return a tool result");
-        assert!(result.success, "unexpected error: {:?}", result.error);
-        assert!(
-            result.error.is_none(),
-            "expected no error, got: {:?}",
-            result.error
-        );
-        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(out["model_provider"], "custom.local");
-        assert!(out["models"].as_array().unwrap().is_empty());
-        assert!(
-            out["note"]
-                .as_str()
-                .unwrap()
-                .contains("No common models listed")
-        );
-    }
+    async fn list_models_redacts_catalog_error_in_tool_result_and_log() {
+        const USER: &str = "catalog-user";
+        const PASSWORD: &str = "s3cr3t-password";
+        const SIGNATURE: &str = "signed-query-value";
 
-    #[tokio::test]
-    async fn list_models_logs_warn_on_catalog_err() {
         let _writer_guard = zeroclaw_log::__private_test_writer_lock();
         let _hook_guard = zeroclaw_log::__private_test_hook_lock();
         zeroclaw_log::try_install_capture_subscriber();
@@ -733,12 +825,47 @@ mod tests {
         while rx.try_recv().is_ok() {} // drain prior events
 
         let mut config = Config::default();
-        config.providers.models.ensure("ollama", "local").unwrap();
-        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config));
-        let _ = tool
-            .handle_list_models(&json!({ "model_provider": "ollama.local" }))
+        config
+            .providers
+            .models
+            .ensure("hailo_ollama", "log_error")
+            .unwrap();
+        let tool = ModelSwitchTool::new(Arc::new(SecurityPolicy::default()), Arc::new(config))
+            .with_catalog_resolver(|_provider_ref| async {
+                anyhow::bail!(
+                    "GET https://{USER}:{PASSWORD}@api.example.com/v1/models?signature={SIGNATURE} failed"
+                )
+            });
+        let result = tool
+            .handle_list_models(&json!({ "model_provider": "hailo_ollama.log_error" }))
             .await
             .expect("list_models should return a tool result");
+        assert!(!result.success);
+        let tool_error = result
+            .error
+            .as_deref()
+            .expect("tool error should be present");
+        let sanitized_diagnostic = zeroclaw_providers::sanitize_api_error(&format!(
+            "GET https://{USER}:{PASSWORD}@api.example.com/v1/models?signature={SIGNATURE} failed"
+        ));
+        let expected_error = crate::i18n::get_required_cli_string_with_args(
+            "model-switch-catalog-failed",
+            &[
+                ("provider", "hailo_ollama.log_error"),
+                ("error", &sanitized_diagnostic),
+            ],
+        );
+        assert_eq!(tool_error, expected_error);
+        for secret in [USER, PASSWORD, SIGNATURE] {
+            assert!(
+                !tool_error.contains(secret),
+                "tool error leaked {secret}: {tool_error}"
+            );
+        }
+        assert!(
+            tool_error.contains("https://[REDACTED]@api.example.com/v1/models"),
+            "tool error should retain a safe endpoint diagnostic: {tool_error}"
+        );
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut found = false;
@@ -747,25 +874,39 @@ mod tests {
             let step = remaining.min(std::time::Duration::from_millis(50));
             match tokio::time::timeout(step, rx.recv()).await {
                 Ok(Ok(value)) => {
-                    let is_fallback_warn = value
+                    let is_catalog_failure = value
                         .get("message")
                         .and_then(|v| v.as_str())
-                        .map(|s| s.contains("live catalog unavailable, using hardcoded fallback"))
+                        .map(|s| s.contains("configured profile catalog failed"))
                         .unwrap_or(false);
-                    let is_ollama = value
+                    let is_hailo = value
                         .get("attributes")
                         .and_then(|a| a.get("provider_family"))
                         .and_then(|v| v.as_str())
-                        == Some("ollama");
-                    if is_fallback_warn && is_ollama {
+                        == Some("hailo_ollama");
+                    if is_catalog_failure && is_hailo {
                         let attrs = value.get("attributes").expect("attributes present");
                         assert_eq!(
                             attrs.get("provider_family").and_then(|v| v.as_str()),
-                            Some("ollama")
+                            Some("hailo_ollama")
                         );
                         assert_eq!(
                             attrs.get("model_provider").and_then(|v| v.as_str()),
-                            Some("ollama.local")
+                            Some("hailo_ollama.log_error")
+                        );
+                        let logged_error = attrs
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .expect("logged error attribute");
+                        for secret in [USER, PASSWORD, SIGNATURE] {
+                            assert!(
+                                !logged_error.contains(secret),
+                                "log attribute leaked {secret}: {logged_error}"
+                            );
+                        }
+                        assert!(
+                            logged_error.contains("https://[REDACTED]@api.example.com/v1/models"),
+                            "log should retain a safe endpoint diagnostic: {logged_error}"
                         );
                         assert_eq!(
                             value.get("severity_text").and_then(|v| v.as_str()),
@@ -781,7 +922,7 @@ mod tests {
         }
         assert!(
             found,
-            "did not capture the model_switch WARN fallback event"
+            "did not capture the configured-profile catalog failure WARN event"
         );
         zeroclaw_log::clear_broadcast_hook();
     }
