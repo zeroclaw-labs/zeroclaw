@@ -76,6 +76,7 @@ pub fn discord_slash_specs_from_skills(
             .collect();
         specs.push(DiscordSlashCommandSpec {
             skill_name,
+            skill_name_canonical: skill.name.clone(),
             slug,
             description: description.chars().take(100).collect(),
             description_localizations: valid_discord_localizations(
@@ -742,6 +743,7 @@ mod typed_option_tests {
     fn spec_with(options: Vec<OptionSpec>) -> DiscordSlashCommandSpec {
         DiscordSlashCommandSpec {
             skill_name: "s".to_string(),
+            skill_name_canonical: "s".to_string(),
             slug: "s".to_string(),
             description: "d".to_string(),
             description_localizations: Default::default(),

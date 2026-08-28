@@ -99,7 +99,17 @@ impl DiscordOutgoing {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DiscordSlashCommandSpec {
+    /// Display value, sanitized for safe inclusion in generated prose:
+    /// newlines, carriage returns, and apostrophes are replaced with spaces.
+    /// Use this for anything the model or user reads, never as an identity.
     pub skill_name: String,
+    /// The raw, unsanitized `Skill.name` this command resolves to. This is the
+    /// identity carried as `ChannelMessage::invoked_skill` so the runtime
+    /// activation matcher compares it against the loaded skill name on equal
+    /// (canonical) terms. A skill name containing an apostrophe or newline —
+    /// which the repository accepts — would otherwise differ from the sanitized
+    /// display value and silently skip its provider and image-block policy.
+    pub skill_name_canonical: String,
     pub slug: String,
     pub description: String,
     /// Discord-locale-keyed translations of `description` (from the skill

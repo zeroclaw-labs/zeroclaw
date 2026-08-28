@@ -2505,8 +2505,12 @@ impl Channel for DiscordChannel {
                                                     // rendering: the prose below names the skill
                                                     // but is not in a form a text matcher
                                                     // recognizes, and a registered command must
-                                                    // still apply its skill's policy.
-                                                    invoked_skill = Some(spec.skill_name.clone());
+                                                    // still apply its skill's policy. Use the
+                                                    // canonical (unsanitized) name so the runtime
+                                                    // matcher compares it against the loaded skill
+                                                    // name on equal terms; the display value drops
+                                                    // apostrophes/newlines and would miss.
+                                                    invoked_skill = Some(spec.skill_name_canonical.clone());
                                                     skill_command_prompt(&spec, &input, &submitted)
                                                 }
                                                 None => None, // stale or foreign command
@@ -4788,10 +4792,71 @@ mod tests {
         assert!(!specs[0].skill_name.contains('\n'));
     }
 
+    /// Boundary regression across the channel→runtime seam: a skill whose name
+    /// contains an apostrophe or newline (which the repo accepts) must still
+    /// activate its policy when invoked as a native Discord command. The spec's
+    /// display `skill_name` is sanitized for prose, but `skill_name_canonical`
+    /// carries the raw identity, and that is the value the interaction handler
+    /// stores as `invoked_skill`. Feeding the sanitized display value instead
+    /// normalizes differently from the loaded skill name and silently skips the
+    /// skill's provider and image-block policy.
+    #[test]
+    fn native_command_identity_survives_name_sanitization() {
+        let raw_name = "evil'\nname";
+        let mut s = skill(raw_name, "d", &["slash"]);
+        s.provider = Some("openai-codex-evil".to_string());
+        s.blocked_tools_with_image = vec!["sparky__sparky_analyze_food_image".to_string()];
+        let loaded = vec![s];
+
+        let specs = discord_slash_specs_from_skills(&loaded);
+        assert_eq!(
+            specs[0].skill_name_canonical, raw_name,
+            "canonical identity must preserve the raw skill name"
+        );
+        assert!(
+            !specs[0].skill_name.contains('\'') && !specs[0].skill_name.contains('\n'),
+            "display name must stay sanitized for prose"
+        );
+
+        // The canonical identity the interaction handler stores must resolve
+        // the loaded skill and carry its policy.
+        let hit = zeroclaw_runtime::skills::match_skill_activation(
+            &loaded,
+            &zeroclaw_runtime::skills::ActivationContext {
+                invoked_skill: Some(&specs[0].skill_name_canonical),
+                sender_text: "",
+                has_image: true,
+            },
+        );
+        let (matched, _) = hit.expect("canonical native identity must activate its skill");
+        assert_eq!(matched.name, raw_name);
+        assert_eq!(matched.provider.as_deref(), Some("openai-codex-evil"));
+        assert_eq!(
+            matched.blocked_tools_with_image,
+            vec!["sparky__sparky_analyze_food_image".to_string()]
+        );
+
+        // Teeth: the sanitized display value must NOT resolve the identity —
+        // exactly the mismatch the canonical field fixes.
+        assert!(
+            zeroclaw_runtime::skills::match_skill_activation(
+                &loaded,
+                &zeroclaw_runtime::skills::ActivationContext {
+                    invoked_skill: Some(&specs[0].skill_name),
+                    sender_text: "",
+                    has_image: true,
+                },
+            )
+            .is_none(),
+            "the sanitized display name must not resolve the identity"
+        );
+    }
+
     #[test]
     fn registration_body_contains_ask_plus_skill_commands() {
         let specs = vec![DiscordSlashCommandSpec {
             skill_name: "deploy status".to_string(),
+            skill_name_canonical: "deploy status".to_string(),
             slug: "deploy-status".to_string(),
             description: "Check deploy state".to_string(),
             description_localizations: Default::default(),
@@ -8254,6 +8319,7 @@ mod tests {
             .collect();
         DiscordSlashCommandSpec {
             skill_name: "deploy".to_string(),
+            skill_name_canonical: "deploy".to_string(),
             slug: slug.to_string(),
             description: "d".to_string(),
             description_localizations: Default::default(),

@@ -614,7 +614,7 @@ pub struct ActivationContext<'a> {
 /// Match a turn against skill auto-activation rules and return the first
 /// matching skill.
 ///
-/// Match priority per skill, scanning skills in order:
+/// Match priority, highest first:
 /// 1. A native command identity resolved by the channel
 ///    ([`ActivationContext::invoked_skill`]), which activates unconditionally.
 /// 2. Slash command typed by the sender: `/skill_name`
@@ -625,9 +625,17 @@ pub struct ActivationContext<'a> {
 /// 4. The `__image__` sentinel trigger, which matches any turn that carries an
 ///    image attachment.
 ///
-/// Skills are scanned in the order the caller provides; discovery sorts
-/// directory entries lexically, so overlapping triggers resolve to the
-/// lexically-first skill deterministically.
+/// Explicit identity (1 and 2) is resolved in a first pass across *all* skills
+/// before any inferred trigger is scanned. This gives an explicit invocation
+/// global precedence: the skill the sender actually named wins even when an
+/// earlier-loaded skill would match the turn's image or a phrase in the rest
+/// of the message. Without this, an earlier `__image__` or phrase candidate
+/// could preempt the resolved native command, handing the sender the wrong
+/// provider route and the wrong image-turn denylist.
+///
+/// Inferred triggers (3 and 4) are then scanned in the order the caller
+/// provides; discovery sorts directory entries lexically, so overlapping
+/// triggers resolve to the lexically-first skill deterministically.
 pub fn match_skill_activation<'a>(
     skills: &'a [Skill],
     ctx: &ActivationContext<'_>,
@@ -636,36 +644,54 @@ pub fn match_skill_activation<'a>(
     let lower = trimmed.to_ascii_lowercase();
     let invoked = ctx.invoked_skill.map(normalize_skill_name);
 
-    for skill in skills {
-        let norm_skill = normalize_skill_name(&skill.name);
+    // First pass: explicit identity, resolved across all skills so it takes
+    // global precedence over any inferred trigger below.
 
-        // 1. The channel already resolved which skill this is.
-        if invoked.as_deref() == Some(norm_skill.as_str()) {
-            return Some((skill, ActivationMatch::NativeCommand));
+    // 1. The channel already resolved which skill this is.
+    if let Some(invoked) = invoked.as_deref() {
+        for skill in skills {
+            if normalize_skill_name(&skill.name) == invoked {
+                return Some((skill, ActivationMatch::NativeCommand));
+            }
         }
+    }
 
-        // 2. Slash command match: /food_logger or /food-logger.
-        if trimmed.starts_with('/') {
-            let cmd = trimmed
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .strip_prefix('/')
-                .unwrap_or("")
-                .split('@')
-                .next()
-                .unwrap_or("");
-            if normalize_skill_name(cmd) == norm_skill {
+    // 2. Slash command typed by the sender: /food_logger or /food-logger.
+    if trimmed.starts_with('/') {
+        let cmd = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .strip_prefix('/')
+            .unwrap_or("")
+            .split('@')
+            .next()
+            .unwrap_or("");
+        let norm_cmd = normalize_skill_name(cmd);
+        for skill in skills {
+            if normalize_skill_name(&skill.name) == norm_cmd {
                 return Some((skill, ActivationMatch::SlashCommand));
             }
         }
+    }
 
+    // Second pass: inferred triggers, scanned in discovery order so overlapping
+    // triggers resolve to the lexically-first skill deterministically. These
+    // never override the explicit identity resolved above.
+    for skill in skills {
         // 3. Trigger phrases, word-boundary matched. 4. `__image__` sentinel.
         for trigger in &skill.triggers {
             if trigger == "__image__" {
                 if ctx.has_image {
                     return Some((skill, ActivationMatch::ImageSentinel));
                 }
+                continue;
+            }
+            // An empty or whitespace-only trigger would compile to `\b\b`,
+            // which matches a word boundary in essentially every non-empty
+            // message and would auto-switch this skill's provider on every
+            // turn. Ignore it rather than let a malformed manifest do that.
+            if trigger.trim().is_empty() {
                 continue;
             }
             let pat = format!(r"\b{}\b", regex::escape(&trigger.to_ascii_lowercase()));
@@ -4119,6 +4145,24 @@ blocked_tools_with_image = ["sparky__sparky_manage_food"]
         );
     }
 
+    /// Regression: an empty or whitespace-only trigger must never activate.
+    /// It would otherwise compile to `\b\b` and match nearly every message,
+    /// silently switching the skill's provider on unrelated turns.
+    #[test]
+    fn activation_ignores_empty_and_whitespace_triggers() {
+        let skills = vec![activation_skill("greedy", &["", "   ", "\t"])];
+        assert!(
+            match_skill_activation(&skills, &sender_turn("an ordinary message", false)).is_none(),
+            "empty/whitespace triggers must not match ordinary text"
+        );
+        // A real trigger alongside the empty ones still works.
+        let mixed = vec![activation_skill("mixed", &["", "log food"])];
+        assert!(
+            match_skill_activation(&mixed, &sender_turn("please log food", false)).is_some(),
+            "a valid trigger next to empty ones must still activate"
+        );
+    }
+
     fn activation_skill(name: &str, triggers: &[&str]) -> Skill {
         Skill {
             name: name.to_string(),
@@ -4191,6 +4235,82 @@ blocked_tools_with_image = ["sparky__sparky_manage_food"]
         ];
         let hit = match_skill_activation(&skills, &sender_turn("please log food now", false));
         assert_eq!(hit.map(|(skill, _)| skill.name.as_str()), Some("first"));
+    }
+
+    /// Regression: an explicit native command must win over an earlier-loaded
+    /// skill that merely matches the turn's image. Before explicit identity was
+    /// resolved in a global first pass, `alpha`'s `__image__` sentinel returned
+    /// first and the sender received `alpha`'s provider route and image-turn
+    /// denylist instead of the skill the channel actually resolved. The policy
+    /// asserts — not just the name — are the point: a wrong winner here hands
+    /// the turn the wrong capability restriction.
+    #[test]
+    fn explicit_native_command_beats_earlier_image_candidate() {
+        let mut alpha = activation_skill("alpha", &["__image__"]);
+        alpha.provider = Some("anthropic-alpha".to_string());
+        alpha.blocked_tools_with_image = vec!["alpha__unrelated_tool".to_string()];
+
+        let mut food = activation_skill("food-logger", &["__image__"]);
+        food.provider = Some("openai-codex-food".to_string());
+        food.blocked_tools_with_image = vec!["sparky__sparky_analyze_food_image".to_string()];
+
+        // alpha is loaded first, so its `__image__` sentinel is scanned before
+        // food-logger's identity would be reached by a single ordered loop.
+        let skills = vec![alpha, food];
+
+        let ctx = ActivationContext {
+            invoked_skill: Some("food-logger"),
+            sender_text: "log this now",
+            has_image: true,
+        };
+        let (skill, m) =
+            match_skill_activation(&skills, &ctx).expect("explicitly invoked skill must activate");
+        assert_eq!(
+            skill.name, "food-logger",
+            "resolved native identity must win"
+        );
+        assert_eq!(m, ActivationMatch::NativeCommand);
+        assert_eq!(
+            skill.provider.as_deref(),
+            Some("openai-codex-food"),
+            "the winning skill's provider route must be its own"
+        );
+        assert_eq!(
+            skill.blocked_tools_with_image,
+            vec!["sparky__sparky_analyze_food_image".to_string()],
+            "the image-turn denylist must be the invoked skill's policy"
+        );
+    }
+
+    /// Regression: a sender-typed `/food-logger` must win even when an
+    /// earlier-loaded skill's phrase trigger matches the rest of the message.
+    /// Same collision class as the native case, via the slash path.
+    #[test]
+    fn explicit_slash_command_beats_earlier_phrase_candidate() {
+        let mut alpha = activation_skill("alpha", &["log this"]);
+        alpha.provider = Some("anthropic-alpha".to_string());
+
+        let mut food = activation_skill("food-logger", &["__image__"]);
+        food.provider = Some("openai-codex-food".to_string());
+        food.blocked_tools_with_image = vec!["sparky__sparky_analyze_food_image".to_string()];
+
+        let skills = vec![alpha, food];
+
+        // Rest of the message ("log this now") matches alpha's phrase trigger,
+        // but the sender explicitly named food-logger with a slash command.
+        let (skill, m) =
+            match_skill_activation(&skills, &sender_turn("/food-logger log this now", false))
+                .expect("explicit slash command must activate");
+        assert_eq!(
+            skill.name, "food-logger",
+            "explicit slash identity must win"
+        );
+        assert_eq!(m, ActivationMatch::SlashCommand);
+        assert_eq!(skill.provider.as_deref(), Some("openai-codex-food"));
+        assert_eq!(
+            skill.blocked_tools_with_image,
+            vec!["sparky__sparky_analyze_food_image".to_string()]
+        );
     }
 
     /// Deterministic regression for the discovery ordering seam: a
