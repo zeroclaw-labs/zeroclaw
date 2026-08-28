@@ -48,6 +48,14 @@ pub fn build_broker_setup(cfg: &SpeechToSpeechConfig, persona: &str) -> SetupCon
 
     SetupConfig {
         model,
+        // Operator-pinned model id when set; otherwise `model`'s default for
+        // the kind. The api-version stays derived from `model`, so an id that
+        // does not match the kind is the provider's to reject (Gemini returns
+        // a setup error), not this crate's to guess.
+        model_id_override: {
+            let id = cfg.model.trim();
+            (!id.is_empty()).then(|| id.to_string())
+        },
         voice: cfg
             .voice
             .clone()
@@ -527,7 +535,12 @@ impl Channel for SpeechToSpeechChannel {
     }
 
     async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
-        // Broker session loop lands in a later task.
+        // Inert until the audio-frame transport lands (a later PR): there is no
+        // inbound source to drive yet. Park until the listener supervisor
+        // cancels this task (config reload / shutdown). Returning `Ok(())` here
+        // would make the supervisor treat the channel as an unexpected exit and
+        // restart it in a backoff loop, churning an enabled-but-staged channel.
+        std::future::pending::<()>().await;
         Ok(())
     }
 }
@@ -815,6 +828,36 @@ mod tests {
         assert!(v["setup"]["sessionResumption"].is_object());
         assert!(v["setup"]["inputAudioTranscription"].is_object());
         assert!(v["setup"]["outputAudioTranscription"].is_object());
+    }
+
+    #[test]
+    fn build_broker_setup_threads_configured_model_id() {
+        let mut c = cfg();
+        c.model = "gemini-2.5-flash-native-audio-preview-12-2025".into();
+        assert_eq!(
+            build_broker_setup(&c, "p").model_id_override.as_deref(),
+            Some("gemini-2.5-flash-native-audio-preview-12-2025")
+        );
+        // An empty configured model falls back to the kind default (no override).
+        let mut c2 = cfg();
+        c2.model = String::new();
+        assert_eq!(build_broker_setup(&c2, "p").model_id_override, None);
+    }
+
+    #[tokio::test]
+    async fn listen_parks_until_cancelled_not_immediate_ok() {
+        let ch = SpeechToSpeechChannel::new("desk");
+        let (tx, _rx) = mpsc::channel(1);
+        // An immediate `Ok(())` would make the listener supervisor treat the
+        // channel as a crashed listener and restart it in a loop. `listen()`
+        // must instead stay parked (here: still pending after a short wait)
+        // until the supervisor cancels it.
+        let parked =
+            tokio::time::timeout(std::time::Duration::from_millis(50), ch.listen(tx)).await;
+        assert!(
+            parked.is_err(),
+            "listen() should stay parked until cancelled, not return on its own"
+        );
     }
 
     #[test]
