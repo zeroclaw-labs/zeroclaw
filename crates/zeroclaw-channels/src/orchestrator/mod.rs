@@ -3162,6 +3162,23 @@ async fn handle_runtime_command_if_needed(
             if model.is_empty() {
                 channel_runtime_cli_string("channel-runtime-model-empty")
             } else {
+                // Authoritative picker-revocation check at the mutation
+                // point. The early dispatch gate in
+                // `process_channel_message_body` can pass while the
+                // selection is still registered; the callback's bounded ack
+                // wait may then elapse while the message works through the
+                // media/link pipeline, revoking the registration before this
+                // handler runs. Only Telegram picker selections register a
+                // delivery ack (always as `/model <hint>`), so `take_revoked`
+                // is a no-op for ordinary traffic; it consumes the marker
+                // atomically, so the early gate cannot double-fire. No
+                // `.await` sits between this check and the route write.
+                // A revoked selection returns early as handled-but-inert: no
+                // route mutation, no response, no provider turn.
+                #[cfg(feature = "channel-telegram")]
+                if crate::model_picker_delivery::take_revoked(&msg.id) {
+                    return true;
+                }
                 apply_model_ref(&mut current, &ctx.model_routes, &model);
                 set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
@@ -26375,6 +26392,73 @@ BTC is currently around $65,000 based on latest tool output."#
         );
         // The dispatch gate consumed the revoked marker exactly once.
         assert!(!crate::model_picker_delivery::take_revoked(&selection.id));
+    }
+
+    /// Regression for the late-revocation race *past* the early dispatch
+    /// gate: the selection passes the `take_revoked` gate in
+    /// `process_channel_message_body` still registered, then the callback's
+    /// bounded ack wait elapses (revoking the registration) while the
+    /// message works through the media/link pipeline — before
+    /// `handle_runtime_command_if_needed` runs. The authoritative check at
+    /// the mutation point must leave the route untouched and the selection
+    /// inert: no route override, no switch response, marker consumed once.
+    /// Exercises `handle_runtime_command_if_needed` directly, i.e. already
+    /// past the early gate, so the gate cannot mask a missing late check.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn runtime_command_late_revoked_model_picker_selection_does_not_mutate_route() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "agentX",
+            "openrouter.default",
+            "config-model",
+        );
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "anthropic.work".into(),
+            model: "claude-sonnet-4-5".into(),
+            api_key: None,
+        }]);
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "telegram_model_picker_selection_revoked_past_gate".into(),
+            sender: "test_user".into(),
+            reply_target: "chat-42".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            content: "/model fast".into(),
+            ..Default::default()
+        };
+        let channel_impl = Arc::new(ModelPickerRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        // Past the early gate still registered (the gate leaves
+        // non-revoked entries in place); the ack timeout then fires before
+        // the command handler runs.
+        let _delivery_ack = crate::model_picker_delivery::register(&msg.id);
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
+        crate::model_picker_delivery::revoke(&msg.id);
+
+        let handled = handle_runtime_command_if_needed(&ctx, &msg, Some(&channel)).await;
+
+        assert!(
+            handled,
+            "revoked selection must be reported handled so it is not re-dispatched to the agent"
+        );
+        assert!(
+            ctx.route_overrides.lock().unwrap().is_empty(),
+            "late-revoked selection must not write a route override"
+        );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "late-revoked selection must not produce a switch response"
+        );
+        assert!(
+            channel_impl.requests.lock().await.is_empty(),
+            "late-revoked selection must not re-open the picker"
+        );
+        // The authoritative check consumed the revoked marker exactly once.
+        assert!(!crate::model_picker_delivery::take_revoked(&msg.id));
     }
 
     #[cfg(feature = "channel-telegram")]

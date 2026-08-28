@@ -21,13 +21,27 @@
 //! - The callback task can be aborted while waiting. Registration returns a
 //!   [`DeliveryAck`] guard whose `Drop` removes a still-pending entry, so an
 //!   aborted wait cannot leak the sender in the static map.
+//! - A revoked entry whose queued selection is dropped before dispatch
+//!   (runtime receiver shutdown) would otherwise sit in the map forever.
+//!   Entries carry their insertion time and any registry op lazily purges
+//!   entries older than [`DELIVERY_ACK_ENTRY_TTL`] — no background task.
 
 use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::time::Duration;
+
+/// Upper bound on how long a registration may stay in the map. The bounded
+/// ack wait is 5s (`TELEGRAM_MODEL_PICKER_DELIVERY_ACK_TIMEOUT`), after which
+/// the callback either confirms, revokes, or drops the guard — so by 60s any
+/// leftover entry belongs to a selection that was discarded before dispatch
+/// and can never be observed again. Uses `tokio::time::Instant` so tests can
+/// age entries under a paused clock.
+const DELIVERY_ACK_ENTRY_TTL: Duration = Duration::from_secs(60);
 
 struct PendingDeliveryAck {
     sender: tokio::sync::oneshot::Sender<()>,
     revoked: bool,
+    inserted_at: tokio::time::Instant,
 }
 
 static PENDING_DELIVERY_ACKS: LazyLock<Mutex<HashMap<String, PendingDeliveryAck>>> =
@@ -37,6 +51,15 @@ fn pending() -> MutexGuard<'static, HashMap<String, PendingDeliveryAck>> {
     PENDING_DELIVERY_ACKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Lazily reclaim entries older than [`DELIVERY_ACK_ENTRY_TTL`]. A revoked
+/// entry is normally consumed by the late dispatch via [`take_revoked`]; if
+/// the runtime receiver shut down first, the queued selection is dropped
+/// without ever reaching that check, and only this sweep removes the entry.
+/// Called from every registry op so no background task is needed.
+fn purge_expired(pending: &mut HashMap<String, PendingDeliveryAck>) {
+    pending.retain(|_, entry| entry.inserted_at.elapsed() < DELIVERY_ACK_ENTRY_TTL);
 }
 
 /// Receiver side of a registered selection acknowledgement. Dropping the
@@ -75,11 +98,14 @@ impl Drop for DeliveryAck {
 /// immediately cannot confirm into a not-yet-registered id.
 pub(crate) fn register(message_id: &str) -> DeliveryAck {
     let (sender, receiver) = tokio::sync::oneshot::channel();
-    pending().insert(
+    let mut pending = pending();
+    purge_expired(&mut pending);
+    pending.insert(
         message_id.to_string(),
         PendingDeliveryAck {
             sender,
             revoked: false,
+            inserted_at: tokio::time::Instant::now(),
         },
     );
     DeliveryAck {
@@ -92,7 +118,9 @@ pub(crate) fn register(message_id: &str) -> DeliveryAck {
 /// that did not originate from the picker have no registration, so this is
 /// a no-op for ordinary traffic.
 pub(crate) fn confirm(message_id: &str) {
-    let entry = pending().remove(message_id);
+    let mut pending = pending();
+    purge_expired(&mut pending);
+    let entry = pending.remove(message_id);
     if let Some(entry) = entry {
         // A send error only means the callback already stopped waiting and
         // dropped the receiver; nothing left to propagate.
@@ -111,7 +139,9 @@ pub(crate) fn cancel(message_id: &str) {
 /// must observe the revocation via [`take_revoked`] instead of applying the
 /// route change after the picker UI already reported failure.
 pub(crate) fn revoke(message_id: &str) {
-    if let Some(entry) = pending().get_mut(message_id) {
+    let mut pending = pending();
+    purge_expired(&mut pending);
+    if let Some(entry) = pending.get_mut(message_id) {
         entry.revoked = true;
     }
 }
@@ -122,6 +152,7 @@ pub(crate) fn revoke(message_id: &str) {
 /// selection was already removed by [`confirm`], so both return `false`.
 pub(crate) fn take_revoked(message_id: &str) -> bool {
     let mut pending = pending();
+    purge_expired(&mut pending);
     if pending.get(message_id).is_some_and(|entry| entry.revoked) {
         pending.remove(message_id);
         return true;
@@ -131,8 +162,28 @@ pub(crate) fn take_revoked(message_id: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     fn is_registered(message_id: &str) -> bool {
         super::pending().contains_key(message_id)
+    }
+
+    /// Insert an entry with a backdated timestamp. TTL tests cannot advance
+    /// a paused clock instead: the map is process-global, so entries created
+    /// under another test's frozen clock would be measured against this
+    /// runtime's real clock (and vice versa) by any concurrent purge.
+    fn insert_entry_for_test(message_id: &str, revoked: bool, age: Duration) {
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        super::pending().insert(
+            message_id.to_string(),
+            super::PendingDeliveryAck {
+                sender,
+                revoked,
+                inserted_at: tokio::time::Instant::now()
+                    .checked_sub(age)
+                    .unwrap_or_else(tokio::time::Instant::now),
+            },
+        );
     }
 
     #[tokio::test]
@@ -201,5 +252,44 @@ mod tests {
     #[tokio::test]
     async fn ordinary_message_is_never_revoked() {
         assert!(!super::take_revoked("ordinary-never-registered"));
+    }
+
+    #[tokio::test]
+    async fn revoked_entry_older_than_ttl_is_purged_without_consumption() {
+        // The queued selection was dropped before dispatch (runtime
+        // receiver shutdown), so nothing ever calls `take_revoked` for it:
+        // only the lazy TTL sweep can reclaim the revoked entry. Backdated
+        // to 2× the TTL so every runtime clock measures it as expired.
+        insert_entry_for_test(
+            "selection-stale-revoked",
+            true,
+            super::DELIVERY_ACK_ENTRY_TTL * 2,
+        );
+        assert!(is_registered("selection-stale-revoked"));
+        // Any registry op performs the lazy sweep; confirming an id that
+        // was never registered keeps ordinary traffic a no-op.
+        super::confirm("ordinary-message");
+        assert!(
+            !is_registered("selection-stale-revoked"),
+            "expired revoked entry must be reclaimed without consumption"
+        );
+        // The purged marker is gone for good: no late take can observe it.
+        assert!(!super::take_revoked("selection-stale-revoked"));
+    }
+
+    #[tokio::test]
+    async fn revoked_entry_younger_than_ttl_survives_lazy_sweep() {
+        // Half the TTL: comfortably inside the bound even if a concurrent
+        // paused-clock test measures this entry with a slightly advanced
+        // clock (the ack-timeout tests advance ~5s).
+        insert_entry_for_test(
+            "selection-fresh-revoked",
+            true,
+            super::DELIVERY_ACK_ENTRY_TTL / 2,
+        );
+        // The sweep runs on every registry op but must not touch entries
+        // still inside the TTL: the late dispatch can still observe them.
+        let _other = super::register("selection-unrelated");
+        assert!(super::take_revoked("selection-fresh-revoked"));
     }
 }
