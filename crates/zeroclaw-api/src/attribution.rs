@@ -117,6 +117,7 @@ pub enum ChannelKind {
     Telegram,
     Twitch,
     Twitter,
+    VoiceBroker,
     VoiceCall,
     VoiceWake,
     /// Retained after the WATI channel was removed so historical
@@ -148,6 +149,13 @@ impl ChannelKind {
     #[must_use]
     pub fn as_wire(self) -> &'static str {
         self.into()
+    }
+
+    /// Stable role string used in attribution role fields, single-sourced
+    /// from the same `IntoStaticStr` mapping as [`Self::as_wire`].
+    #[must_use]
+    pub fn role(self) -> &'static str {
+        self.as_wire()
     }
 }
 
@@ -472,6 +480,11 @@ impl Role {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_broker_channel_kind_role() {
+        assert_eq!(ChannelKind::VoiceBroker.role(), "voice_broker");
+    }
 
     #[test]
     fn channel_kind_snake_case() {
