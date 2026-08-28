@@ -8,6 +8,14 @@
 //!
 //! The layers are populated task-by-task per the kutsu implementation plan.
 
+// Vendored MIT crate (see PROVENANCE.md): it uses standard `tracing` macros and
+// `tokio::spawn` rather than ZeroClaw's `zeroclaw_log::record!` /
+// `zeroclaw_spawn::spawn!` attribution wrappers, to preserve parity with its
+// upstream (dual-published) source. The workspace `clippy.toml` disallows those
+// in first-party code and explicitly sanctions a local `#![allow(...)]` for
+// exempt files; this crate is the exempt case.
+#![allow(clippy::disallowed_macros, clippy::disallowed_methods)]
+
 pub mod session;
 pub mod transport;
 pub mod types;
