@@ -633,9 +633,20 @@ pub struct ActivationContext<'a> {
 /// could preempt the resolved native command, handing the sender the wrong
 /// provider route and the wrong image-turn denylist.
 ///
+/// The caller must pass the *complete* loaded skill set, not a policy-filtered
+/// subset. A native or slash command can name a skill that declares neither a
+/// provider nor an image-turn denylist; if that skill were filtered out before
+/// this matcher, the explicit identity would miss and the scan would fall
+/// through to some *other* skill's inferred trigger, activating an unrelated
+/// skill's policy. Resolving explicit identity against every loaded skill makes
+/// a policy-free explicit target resolve to itself (activating nothing) instead
+/// of leaking another skill's route or denylist.
+///
 /// Inferred triggers (3 and 4) are then scanned in the order the caller
 /// provides; discovery sorts directory entries lexically, so overlapping
-/// triggers resolve to the lexically-first skill deterministically.
+/// triggers resolve to the lexically-first skill deterministically. Only skills
+/// carrying an activation policy participate in this pass, since an inferred
+/// match on a policy-free skill would do nothing.
 pub fn match_skill_activation<'a>(
     skills: &'a [Skill],
     ctx: &ActivationContext<'_>,
@@ -678,7 +689,18 @@ pub fn match_skill_activation<'a>(
     // Second pass: inferred triggers, scanned in discovery order so overlapping
     // triggers resolve to the lexically-first skill deterministically. These
     // never override the explicit identity resolved above.
+    //
+    // Only skills that carry an activation policy (a provider to switch to or
+    // an image-turn denylist) can be reached by an inferred trigger. Explicit
+    // identity above is matched against every loaded skill so a native or slash
+    // command for a policy-free skill still resolves to that skill and cannot
+    // fall through to a different skill's trigger; but an *inferred* match on a
+    // policy-free skill would activate nothing, so it is skipped here to keep
+    // the deterministic winner among the skills that can actually act.
     for skill in skills {
+        if skill.provider.is_none() && skill.blocked_tools_with_image.is_empty() {
+            continue;
+        }
         // 3. Trigger phrases, word-boundary matched. 4. `__image__` sentinel.
         for trigger in &skill.triggers {
             if trigger == "__image__" {
@@ -4160,6 +4182,48 @@ blocked_tools_with_image = ["sparky__sparky_manage_food"]
         assert!(
             match_skill_activation(&mixed, &sender_turn("please log food", false)).is_some(),
             "a valid trigger next to empty ones must still activate"
+        );
+    }
+
+    /// Regression: an explicit native command whose target skill carries no
+    /// activation policy (no provider, no image denylist) must resolve to that
+    /// skill, not fall through to another skill whose trigger the rendered
+    /// input happens to match. Before explicit identity was resolved against
+    /// the full loaded set, the policy-free target was filtered out upstream,
+    /// the identity lookup missed, and the scan reached `other`'s `log food`
+    /// trigger, wrongly applying `other`'s policy.
+    #[test]
+    fn explicit_native_command_to_policy_free_skill_does_not_fall_through() {
+        // `plain` has no provider and no image denylist.
+        let plain = Skill {
+            provider: None,
+            ..activation_skill("plain", &[])
+        };
+        let mut other = activation_skill("other", &["log food"]);
+        other.provider = Some("anthropic-other".to_string());
+
+        // The full loaded set, as the orchestrator now passes it.
+        let skills = vec![plain, other];
+
+        // Native command for `plain`; its rendered input matches `other`'s
+        // trigger.
+        let ctx = ActivationContext {
+            invoked_skill: Some("plain"),
+            sender_text: "log food",
+            has_image: false,
+        };
+        let (skill, m) = match_skill_activation(&skills, &ctx)
+            .expect("explicit native identity must resolve to its own skill");
+        assert_eq!(skill.name, "plain", "must not fall through to `other`");
+        assert_eq!(m, ActivationMatch::NativeCommand);
+
+        // Sanity: without the explicit identity, the same text does activate
+        // `other` through its trigger, proving the collision was real.
+        let inferred = match_skill_activation(&skills, &sender_turn("log food", false));
+        assert_eq!(
+            inferred.map(|(s, _)| s.name.as_str()),
+            Some("other"),
+            "the trigger collision is genuine when no explicit identity is given"
         );
     }
 

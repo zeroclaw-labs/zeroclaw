@@ -6266,12 +6266,20 @@ async fn process_channel_message_body(
     // out-of-process and leave the declared tool callable on the exact image
     // turn it is meant to block. The loader's content-digest cache
     // keeps the repeat cost to a directory digest rather than a re-audit.
-    let activation_candidates = zeroclaw_runtime::skills::load_activation_candidates(
+    // The complete loaded skill set, not a policy-filtered subset: an explicit
+    // native/slash identity must resolve against every skill (see
+    // `match_skill_activation`), so a command for a policy-free skill cannot
+    // fall through to another skill's inferred trigger. The matcher itself
+    // restricts inferred triggers to skills that carry a policy.
+    let all_activation_skills = zeroclaw_runtime::skills::load_skills_for_agent(
         ctx.workspace_dir.as_ref(),
         ctx.prompt_config.as_ref(),
         ctx.agent_alias.as_ref(),
     );
-    if !activation_candidates.is_empty() {
+    let any_activation_policy = all_activation_skills
+        .iter()
+        .any(|s| s.provider.is_some() || !s.blocked_tools_with_image.is_empty());
+    if any_activation_policy {
         // Image presence comes from the typed attachment envelope captured
         // before media enrichment, never from message-text matching.
         let has_image = msg_has_image_attachment;
@@ -6281,7 +6289,7 @@ async fn process_channel_message_body(
             has_image,
         };
         if let Some((skill, activation_match)) = zeroclaw_runtime::skills::match_skill_activation(
-            &activation_candidates,
+            &all_activation_skills,
             &activation_ctx,
         ) {
             // 1. Switch the session provider if the skill declares one.

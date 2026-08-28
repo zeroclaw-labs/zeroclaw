@@ -125,7 +125,13 @@ triggers = ["__image__", "log food", "i ate"]
 blocked_tools_with_image = ["sparky__sparky_manage_food"]
 ```
 
-Matching runs once per inbound message in the channel orchestrator, before the routing decision. The first skill whose rules match wins, scanning in load order. Skills that declare neither `provider` nor `blocked_tools_with_image` are never scanned.
+Matching runs once per inbound message in the channel orchestrator, before the routing decision.
+
+**Explicit identity wins globally.** A native command the channel resolved to a skill, or a sender-typed `/skill_name`, is matched against *every* loaded skill before any inferred trigger is considered. The skill you explicitly invoke therefore always activates, even when another skill's phrase or `"__image__"` trigger would also match the same message. An explicit command whose target declares neither `provider` nor `blocked_tools_with_image` simply activates nothing; it never falls through to a different skill's trigger.
+
+**Inferred triggers** (phrases and `"__image__"`) are then scanned in load order, and the first match wins. Only skills that declare a `provider` or `blocked_tools_with_image` take part in this pass, since a skill with neither has nothing to apply.
+
+**Image-only activation is asymmetric.** A `provider` switch earned by an `"__image__"` match is held to a stricter image test than the tool block. The block removes a capability and fires on any image signal, so a spoofed MIME or a stripped extension cannot dodge it; a provider route, by contrast, is persisted only when the image clears the stricter loadable-image bar, so that same permissive signal cannot buy a lasting provider change that outlives the turn.
 
 ## Manage installed skills
 

@@ -13,6 +13,8 @@ use crate::tool_search::ToolAccessPolicy;
 pub enum PipelineError {
     #[error("Unknown tool '{0}' is not on the allowed list")]
     UnknownTool(String),
+    #[error("Tool '{0}' is excluded on this turn and cannot run in a pipeline")]
+    ExcludedByTurnCeiling(String),
     #[error("Pipeline exceeds maximum of {0} steps")]
     TooManySteps(usize),
     #[error("Invalid template reference: {0}")]
@@ -65,12 +67,21 @@ pub struct StepResult {
     pub output: String,
 }
 
+/// Reads the current per-turn tool capability ceiling: the set of tool names
+/// excluded for this turn (for example a skill's `blocked_tools_with_image`
+/// denylist on an image turn). The runtime injects this because this crate
+/// cannot see the runtime's task-local ceiling; the closure is invoked inside
+/// `PipelineTool::validate`, which runs on the turn's task where the ceiling
+/// is in scope, so the returned set is captured before any step is dispatched.
+pub type TurnCeilingProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync>;
+
 /// The execute_pipeline tool that runs multi-step tool chains.
 pub struct PipelineTool {
     config: PipelineConfig,
     tools: Vec<Arc<dyn Tool>>,
     allowed_set: HashSet<String>,
     access_policy: Option<ToolAccessPolicy>,
+    turn_ceiling: Option<TurnCeilingProvider>,
 }
 
 impl PipelineTool {
@@ -91,7 +102,18 @@ impl PipelineTool {
             tools,
             allowed_set,
             access_policy,
+            turn_ceiling: None,
         }
+    }
+
+    /// Inject the per-turn capability ceiling reader. Without it the pipeline
+    /// enforces only its static allow/deny policy; with it, a step naming a tool
+    /// the current turn excludes (e.g. an image-turn denylist entry) is rejected
+    /// before any step runs, so the pipeline cannot be used to reach a tool the
+    /// turn removed from the model's surface.
+    pub fn with_turn_ceiling(mut self, provider: TurnCeilingProvider) -> Self {
+        self.turn_ceiling = Some(provider);
+        self
     }
 
     /// Find a tool by name in the registry.
@@ -127,8 +149,23 @@ impl PipelineTool {
             return Err(PipelineError::TooManySteps(self.config.max_steps));
         }
 
+        // The per-turn capability ceiling, captured once here on the turn's
+        // task (where the task-local is in scope) so it applies uniformly to
+        // both the sequential and the parallel dispatch that follow. Reading it
+        // now, before any step runs, also means a spawned parallel task cannot
+        // observe an empty ceiling after the task-local fails to cross the
+        // spawn boundary.
+        let turn_excluded = self
+            .turn_ceiling
+            .as_ref()
+            .map(|provider| provider())
+            .unwrap_or_default();
+
         // Validate the full request before any sequential or parallel step starts.
         for step in &request.steps {
+            if turn_excluded.iter().any(|ex| ex == &step.tool) {
+                return Err(PipelineError::ExcludedByTurnCeiling(step.tool.clone()));
+            }
             let globally_allowed = self.allowed_set.contains(&step.tool);
             let caller_allowed = self.policy_allows_exact_name(&step.tool);
             let child_exists = self.find_tool(&step.tool).is_some();
@@ -908,5 +945,125 @@ mod tests {
         assert!(res.success);
         assert!(res.output.contains("FIRST_BIG_BLOB"));
         assert!(res.output.contains("final answer"));
+    }
+
+    // ── Turn capability ceiling ────────────────────────────
+
+    struct CountingTool {
+        name: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(CountingTool);
+
+    #[async_trait::async_trait]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "counting"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(&self, _args: serde_json::Value) -> Result<ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult {
+                success: true,
+                output: "ran".into(),
+                error: None,
+            })
+        }
+    }
+
+    fn counting_pipeline(
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        ceiling: TurnCeilingProvider,
+    ) -> PipelineTool {
+        let config = PipelineConfig {
+            enabled: true,
+            max_steps: 4,
+            allowed_tools: vec!["shell".to_string()],
+        };
+        PipelineTool::with_access_policy(
+            config,
+            vec![Arc::new(CountingTool {
+                name: "shell".to_string(),
+                calls,
+            })],
+            None,
+        )
+        .with_turn_ceiling(ceiling)
+    }
+
+    /// Regression: a pipeline step naming a tool the turn ceiling excludes must
+    /// not run, in the sequential dispatch. The unrestricted control (empty
+    /// ceiling) proves the step is otherwise reachable, so the block is not
+    /// vacuously passing.
+    #[tokio::test]
+    async fn pipeline_sequential_rejects_a_tool_excluded_by_the_turn_ceiling() {
+        use std::sync::atomic::Ordering;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let req =
+            serde_json::json!({ "steps": [{ "tool": "shell", "args": {} }], "parallel": false });
+
+        let blocked = counting_pipeline(Arc::clone(&calls), Arc::new(|| vec!["shell".to_string()]));
+        let res = blocked.execute(req.clone()).await.unwrap();
+        assert!(!res.success, "excluded step must fail the pipeline");
+        assert!(
+            res.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("excluded"),
+            "error must explain the exclusion; got {:?}",
+            res.error
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "excluded tool must not run"
+        );
+
+        let allowed = counting_pipeline(Arc::clone(&calls), Arc::new(Vec::<String>::new));
+        let res = allowed.execute(req).await.unwrap();
+        assert!(res.success, "control must run the allowed step");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "control proves reachability"
+        );
+    }
+
+    /// Regression: the same enforcement for the parallel dispatch, which spawns
+    /// each step on a fresh task. Capturing the ceiling before dispatch is what
+    /// keeps the parallel path from observing an empty task-local ceiling.
+    #[tokio::test]
+    async fn pipeline_parallel_rejects_a_tool_excluded_by_the_turn_ceiling() {
+        use std::sync::atomic::Ordering;
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let req =
+            serde_json::json!({ "steps": [{ "tool": "shell", "args": {} }], "parallel": true });
+
+        let blocked = counting_pipeline(Arc::clone(&calls), Arc::new(|| vec!["shell".to_string()]));
+        let res = blocked.execute(req.clone()).await.unwrap();
+        assert!(
+            !res.success,
+            "excluded step must fail the parallel pipeline"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "excluded tool must not run"
+        );
+
+        let allowed = counting_pipeline(Arc::clone(&calls), Arc::new(Vec::<String>::new));
+        let res = allowed.execute(req).await.unwrap();
+        assert!(res.success, "control must run the allowed step");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "control proves reachability"
+        );
     }
 }
