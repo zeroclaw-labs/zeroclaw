@@ -110,6 +110,34 @@ pub fn broker_tool_names(setup: &SetupConfig) -> Vec<String> {
 /// time an event is received (see `run_session`'s `select!` loop).
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Fallback broker system-instruction used when neither
+/// `broker_persona_path` nor `broker_persona` is configured. Deliberately
+/// generic and standalone: this is the voice-facing broker's persona, not
+/// the agent's own instructions, so it must never fall back to (or even
+/// mention) `AGENTS.md`.
+const DEFAULT_BROKER_PERSONA: &str = "You are a helpful voice call broker. Speak naturally \
+    and concisely, as if on a phone call. When the caller asks for something you cannot \
+    answer yourself, relay it to the agent via consult_agent and relay its reply back in \
+    your own words. When the call is over, end it with end_session.";
+
+/// Resolve the broker persona system-instruction for a session, standalone
+/// from (and never reading) `AGENTS.md` or any agent-side prompt material.
+/// Precedence: `broker_persona_path` (file contents, read fresh every call)
+/// wins over inline `broker_persona`, which wins over
+/// [`DEFAULT_BROKER_PERSONA`]. A configured path that fails to read is a
+/// real configuration error and propagates as `Err` rather than silently
+/// falling back to the default.
+pub fn resolve_persona(cfg: &SpeechToSpeechConfig) -> Result<String> {
+    if let Some(path) = &cfg.broker_persona_path {
+        return std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("failed to read broker_persona_path {path:?}: {e}"));
+    }
+    if let Some(persona) = &cfg.broker_persona {
+        return Ok(persona.clone());
+    }
+    Ok(DEFAULT_BROKER_PERSONA.to_string())
+}
+
 /// Speech-to-speech broker channel — bridges a hosted bidirectional voice
 /// model into ZeroClaw. `send`/`listen` are minimal stubs for now; broker
 /// session logic is filled in by a later task.
@@ -683,5 +711,23 @@ mod tests {
         assert!(v["setup"]["sessionResumption"].is_object());
         assert!(v["setup"]["inputAudioTranscription"].is_object());
         assert!(v["setup"]["outputAudioTranscription"].is_object());
+    }
+
+    #[test]
+    fn persona_inline_used_when_no_path() {
+        let mut c = cfg();
+        c.broker_persona = Some("inline persona".into());
+        c.broker_persona_path = None;
+        assert_eq!(resolve_persona(&c).unwrap(), "inline persona");
+    }
+
+    #[test]
+    fn persona_path_read_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("b.md");
+        std::fs::write(&p, "file persona").unwrap();
+        let mut c = cfg();
+        c.broker_persona_path = Some(p.to_string_lossy().into());
+        assert_eq!(resolve_persona(&c).unwrap(), "file persona");
     }
 }
