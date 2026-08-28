@@ -150,11 +150,23 @@ pub fn parse_server_message(bytes: &[u8]) -> Result<Vec<ServerEvent>, WireError>
         }
     }
 
-    if let Some(h) = v
-        .pointer("/sessionResumptionUpdate/newHandle")
-        .and_then(|h| h.as_str())
-    {
-        out.push(ServerEvent::ResumptionHandle(h.to_string()));
+    if let Some(ru) = v.get("sessionResumptionUpdate") {
+        let new_handle = ru
+            .get("newHandle")
+            .and_then(|h| h.as_str())
+            .map(|s| s.to_string());
+        // `resumable` is absent from some older/minimal payloads (e.g. this
+        // crate's own earlier fixture messages that only ever carried
+        // `newHandle`); default to `true` so those keep behaving as they did
+        // before this field was modeled explicitly.
+        let resumable = ru
+            .get("resumable")
+            .and_then(|r| r.as_bool())
+            .unwrap_or(true);
+        out.push(ServerEvent::ResumptionUpdate {
+            new_handle,
+            resumable,
+        });
     }
 
     if v.get("goAway").is_some() {
@@ -227,7 +239,12 @@ pub fn build_setup(cfg: &SetupConfig) -> Value {
     };
 
     let mut setup = json!({
-        "model": format!("models/{}", cfg.model.model_id()),
+        "model": format!(
+            "models/{}",
+            cfg.model_id_override
+                .as_deref()
+                .unwrap_or_else(|| cfg.model.model_id())
+        ),
         "generationConfig": {
             "responseModalities": ["AUDIO"],
             "temperature": cfg.temperature,
@@ -318,6 +335,7 @@ mod tests {
     fn cfg(model: Model, resume_handle: Option<String>) -> SetupConfig {
         SetupConfig {
             model,
+            model_id_override: None,
             voice: "Autonoe".into(),
             language: if model.is_native() {
                 None
@@ -335,6 +353,15 @@ mod tests {
             }],
             resume_handle,
         }
+    }
+
+    #[test]
+    fn build_setup_model_id_override_wins_over_kind_default() {
+        let mut c = cfg(Model::HalfCascade, None);
+        c.model_id_override = Some("gemini-custom-live-preview".into());
+        let s = build_setup(&c);
+        // The wire model id is the operator's override, not the kind default.
+        assert_eq!(s["setup"]["model"], "models/gemini-custom-live-preview");
     }
 
     #[test]
@@ -553,7 +580,10 @@ mod parse_tests {
         assert_eq!(
             parse_server_message(br#"{"sessionResumptionUpdate":{"newHandle":"HANDLE-123"}}"#)
                 .unwrap(),
-            vec![ServerEvent::ResumptionHandle("HANDLE-123".into())]
+            vec![ServerEvent::ResumptionUpdate {
+                new_handle: Some("HANDLE-123".into()),
+                resumable: true,
+            }]
         );
         assert_eq!(
             parse_server_message(br#"{"serverContent":{"turnComplete":true}}"#).unwrap(),
@@ -570,6 +600,36 @@ mod parse_tests {
         assert_eq!(
             parse_server_message(br#"{"goAway":{}}"#).unwrap(),
             vec![ServerEvent::GoAway]
+        );
+    }
+
+    #[test]
+    fn resumable_false_is_represented_with_no_new_handle() {
+        // Defect A regression: `resumable: false` (with no `newHandle`) must
+        // itself surface as an event, so the session driver can clear a
+        // stored handle. Previously the wire parser only ever emitted
+        // anything when `newHandle` was present, so `resumable: false` was
+        // silently dropped.
+        assert_eq!(
+            parse_server_message(br#"{"sessionResumptionUpdate":{"resumable":false}}"#).unwrap(),
+            vec![ServerEvent::ResumptionUpdate {
+                new_handle: None,
+                resumable: false,
+            }]
+        );
+    }
+
+    #[test]
+    fn resumable_true_with_new_handle_carries_both_fields() {
+        assert_eq!(
+            parse_server_message(
+                br#"{"sessionResumptionUpdate":{"newHandle":"H1","resumable":true}}"#
+            )
+            .unwrap(),
+            vec![ServerEvent::ResumptionUpdate {
+                new_handle: Some("H1".into()),
+                resumable: true,
+            }]
         );
     }
 

@@ -520,8 +520,21 @@ fn absorb(se: ServerEvent, handle: &mut Option<String>, progressed: &mut bool) -
         ServerEvent::ToolCall { name, id, args } => {
             Absorbed::Emit(Event::ToolCall { name, id, args })
         }
-        ServerEvent::ResumptionHandle(h) => {
-            *handle = Some(h);
+        ServerEvent::ResumptionUpdate {
+            new_handle,
+            resumable,
+        } => {
+            // Per Google's session-management guidance, handle retention is
+            // conditioned on BOTH fields: `resumable: false` means the stored
+            // handle is stale and must be cleared (a reconnect must never
+            // replay it), regardless of whether a `newHandle` accompanies it.
+            // Only when the session is still resumable does a fresh handle
+            // (when present) replace the stored one.
+            if !resumable {
+                *handle = None;
+            } else if let Some(h) = new_handle {
+                *handle = Some(h);
+            }
             *progressed = true;
             Absorbed::Ignore
         }
@@ -589,6 +602,14 @@ fn note_failure(
 /// keeps the caller's bounded command channel from blocking — this is what
 /// prevents caller audio traffic from starving the reconnect. The backoff sleep
 /// itself runs to completion regardless of how many commands arrive.
+///
+/// Recovery of any control message (a settled agent reply, a provider ack) that
+/// the caller enqueues during the outage is deliberately NOT done here: the
+/// crate does not own call semantics. `SessionOpened { is_reconnect: true, .. }`
+/// is the caller's signal to react (drain stale uplink, send a resume cue) —
+/// mirroring kutsu, which keeps this decision in the caller rather than blindly
+/// replaying queued commands (a replay would race the server's own turn-resume
+/// on a warm reconnect).
 #[allow(clippy::too_many_arguments)] // internal driver: params are the lifecycle wiring
 async fn reconnect_loop<T: Transport>(
     reconnect: &mut Reconnector<T>,
@@ -751,6 +772,7 @@ mod tests {
             proxy: None,
             setup: SetupConfig {
                 model: Model::HalfCascade,
+                model_id_override: None,
                 voice: "Autonoe".into(),
                 language: Some("en-US".into()),
                 system_instruction: "Be nice.".into(),
@@ -926,6 +948,103 @@ mod tests {
             setup.contains("H1"),
             "reopened setup must carry the stored handle: {setup}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resumable_false_clears_stored_handle_before_reconnect() {
+        // Defect A regression: a `sessionResumptionUpdate` with
+        // `resumable:false` (no `newHandle`) must clear a previously-stored
+        // handle, so the next reconnect does NOT replay a stale handle.
+        let mut first = FakeTransport::new(false);
+        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        first.push_data(
+            br#"{"sessionResumptionUpdate":{"newHandle":"H1","resumable":true}}"#.to_vec(),
+        );
+        first.push_data(br#"{"sessionResumptionUpdate":{"resumable":false}}"#.to_vec());
+        first.push_close(1011, "server restart");
+
+        let second = FakeTransport::new(true);
+        let second_sent = second.sent.clone();
+
+        let mut s = Session::connect_with_transport(cfg(), first, once(second))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+        // The handle was stored then cleared before the close, so the reopen
+        // is fresh (no stored handle to resume with).
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: true,
+                resumed: false
+            })
+        ));
+
+        let setup = &second_sent.lock().unwrap()[0];
+        assert!(setup.contains("\"setup\""));
+        assert!(
+            !setup.contains("H1"),
+            "stale handle must be dropped after resumable:false, got: {setup}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_commands_queued_during_backoff_are_dropped_signal_is_observable() {
+        // Deliberate design (mirrors kutsu): the crate does NOT replay commands
+        // queued during an outage. Control messages (ClientText/ToolResponse)
+        // are dropped along with stale audio; recovery is the caller's job,
+        // driven by the observable `SessionOpened { is_reconnect: true }`
+        // signal. This guards against a regression back to in-crate replay,
+        // which would race the server's own turn-resume on a warm reconnect and
+        // duplicate a reply the caller already heard.
+        let mut first = FakeTransport::new(false);
+        first.push_data(br#"{"setupComplete":{}}"#.to_vec());
+        first.push_close(1011, "server restart");
+
+        let second = FakeTransport::new(true);
+        let second_sent = second.sent.clone();
+
+        let mut s = Session::connect_with_transport(cfg(), first, once(second))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: false,
+                resumed: false
+            })
+        ));
+
+        // Enqueued while the transport is down (backoff).
+        s.send_client_text("settled reply").await.unwrap();
+        s.send_tool_response("call-1").await.unwrap();
+
+        // The reconnect is observable — this is the caller's recovery hook.
+        assert!(matches!(
+            s.recv_event().await,
+            Some(Event::SessionOpened {
+                is_reconnect: true,
+                ..
+            })
+        ));
+
+        // Only the re-sent setup reached the reopened transport; the queued
+        // control commands were dropped, NOT replayed.
+        let sent = second_sent.lock().unwrap();
+        assert_eq!(
+            sent.len(),
+            1,
+            "only setup replayed on reopen; control commands dropped: {sent:?}"
+        );
+        assert!(sent[0].contains("\"setup\""));
     }
 
     #[tokio::test]

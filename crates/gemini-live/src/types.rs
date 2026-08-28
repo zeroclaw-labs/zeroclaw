@@ -91,8 +91,17 @@ pub enum ServerEvent {
         id: String,
         args: serde_json::Value,
     },
-    /// A fresh session-resumption handle to remember for reconnect.
-    ResumptionHandle(String),
+    /// A `sessionResumptionUpdate` from the server. Per Google's
+    /// session-management guidance, handle retention is conditioned on BOTH
+    /// fields: `resumable: false` means the stored handle is no longer valid
+    /// and must be dropped (`new_handle` is absent in that case); `resumable:
+    /// true` with `new_handle: Some(_)` means a fresh handle should replace
+    /// the stored one. `resumable: true` with `new_handle: None` changes
+    /// nothing (keep whatever handle is already stored).
+    ResumptionUpdate {
+        new_handle: Option<String>,
+        resumable: bool,
+    },
     /// The server is about to close the connection (session limit, etc);
     /// reconnect using the latest resumption handle.
     GoAway,
@@ -127,8 +136,15 @@ pub struct FunctionDecl {
 /// `languageCode`/`language` applies).
 #[derive(Clone, Debug)]
 pub struct SetupConfig {
-    /// Which model/API-version this session targets.
+    /// Which model/API-version this session targets. Selects the endpoint
+    /// api-version and, unless `model_id_override` is set, the wire model id.
     pub model: Model,
+    /// Explicit `models/<id>` to send on the wire, pinning a specific Gemini
+    /// model without changing the api-version (which stays derived from
+    /// `model`). `None` falls back to `model`'s default id. An id incompatible
+    /// with the selected api-version is the provider's to reject — Gemini
+    /// returns a setup error rather than this crate guessing compatibility.
+    pub model_id_override: Option<String>,
     /// Prebuilt voice name (`generationConfig.speechConfig.voiceConfig`).
     pub voice: String,
     /// BCP-47 language tag for `speechConfig.languageCode`. Only meaningful
@@ -191,6 +207,7 @@ mod tests {
     fn setup_config_is_native_follows_model() {
         let cfg = SetupConfig {
             model: Model::NativeAudio,
+            model_id_override: None,
             voice: "Autonoe".into(),
             language: None,
             system_instruction: "Be nice.".into(),
