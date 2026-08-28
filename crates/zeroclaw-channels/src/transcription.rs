@@ -233,6 +233,7 @@ pub struct OpenAiWhisperProvider {
     alias: String,
     api_key: String,
     model: String,
+    language: Option<String>,
 }
 
 impl OpenAiWhisperProvider {
@@ -252,6 +253,7 @@ impl OpenAiWhisperProvider {
             alias: alias.to_string(),
             api_key,
             model: config.model.clone(),
+            language: None,
         })
     }
 
@@ -280,6 +282,7 @@ impl OpenAiWhisperProvider {
                 .clone()
                 .filter(|model| !model.trim().is_empty())
                 .unwrap_or_else(|| "whisper-1".to_string()),
+            language: cfg.base.language.clone(),
         })
     }
 }
@@ -299,10 +302,13 @@ impl TranscriptionProvider for OpenAiWhisperProvider {
             .file_name(normalized_name)
             .mime_str(mime)?;
 
-        let form = Form::new()
+        let mut form = Form::new()
             .part("file", file_part)
             .text("model", self.model.clone())
             .text("response_format", "json");
+        if let Some(language) = &self.language {
+            form = form.text("language", language.clone());
+        }
 
         let resp = client
             .post("https://api.openai.com/v1/audio/transcriptions")
@@ -324,6 +330,7 @@ pub struct DeepgramProvider {
     alias: String,
     api_key: String,
     model: String,
+    language: Option<String>,
 }
 
 impl DeepgramProvider {
@@ -343,6 +350,7 @@ impl DeepgramProvider {
             alias: alias.to_string(),
             api_key,
             model: config.model.clone(),
+            language: None,
         })
     }
 
@@ -371,7 +379,14 @@ impl DeepgramProvider {
                 .clone()
                 .filter(|model| !model.trim().is_empty())
                 .unwrap_or_else(|| "nova-2".to_string()),
+            language: cfg.base.language.clone(),
         })
+    }
+
+    fn language_query(&self) -> (&str, &str) {
+        self.language
+            .as_deref()
+            .map_or(("detect_language", "true"), |value| ("language", value))
     }
 }
 
@@ -386,13 +401,18 @@ impl TranscriptionProvider for DeepgramProvider {
 
         let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.deepgram");
 
-        let url = format!(
-            "https://api.deepgram.com/v1/listen?model={}&punctuate=true",
-            self.model
-        );
+        let url = reqwest::Url::parse_with_params(
+            "https://api.deepgram.com/v1/listen",
+            [
+                ("model", self.model.as_str()),
+                ("punctuate", "true"),
+                self.language_query(),
+            ],
+        )
+        .context("Invalid Deepgram transcription endpoint")?;
 
         let resp = client
-            .post(&url)
+            .post(url)
             .header("Authorization", format!("Token {}", self.api_key))
             .header("Content-Type", mime)
             .body(audio_data.to_vec())
@@ -1681,9 +1701,10 @@ mod tests {
     }
 
     #[test]
-    fn typed_registration_defaults_blank_optional_values() {
+    fn typed_registration_defaults_and_language_hints() {
         let base = zeroclaw_config::schema::TranscriptionProviderConfig {
             api_key: Some("test-key".to_string()),
+            language: Some("it-IT".to_string()),
             ..zeroclaw_config::schema::TranscriptionProviderConfig::default()
         };
 
@@ -1706,8 +1727,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(openai.model, "whisper-1");
+        assert_eq!(openai.language.as_deref(), Some("it-IT"));
 
-        let deepgram = DeepgramProvider::from_typed_config(
+        let mut deepgram = DeepgramProvider::from_typed_config(
             "default",
             &zeroclaw_config::schema::DeepgramTranscriptionProviderConfig {
                 base: base.clone(),
@@ -1716,6 +1738,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(deepgram.model, "nova-2");
+        assert_eq!(deepgram.language_query(), ("language", "it-IT"));
+        deepgram.language = None;
+        assert_eq!(deepgram.language_query(), ("detect_language", "true"));
 
         let google = GoogleSttProvider::from_typed_config(
             "default",
