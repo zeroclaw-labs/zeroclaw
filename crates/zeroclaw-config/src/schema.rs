@@ -23579,6 +23579,35 @@ impl Config {
         ));
     }
 
+    /// Privacy disclosure for the speech-to-speech broker channel: a live
+    /// session streams caller audio, and the transcripts/prompts derived from
+    /// it, to the configured speech backend provider (e.g. Google Gemini
+    /// Live). That provider may retain the audio, transcripts, and prompts it
+    /// receives, and session resumption can extend how long the provider
+    /// retains that data (on the order of ~24h beyond a single session).
+    /// Raised once per enabled `[channels.speech_to_speech.<alias>]` so an
+    /// operator sees the notice next to the alias they turned on.
+    fn collect_speech_to_speech_warnings(
+        &self,
+        warnings: &mut Vec<crate::validation_warnings::ValidationWarning>,
+    ) {
+        for (alias, cfg) in &self.channels.speech_to_speech {
+            if !cfg.enabled {
+                continue;
+            }
+            warnings.push(crate::validation_warnings::ValidationWarning::new(
+                "speech_to_speech_provider_retention",
+                format!(
+                    "channels.speech_to_speech.{alias} is enabled: a live voice session sends \
+                     caller audio, transcripts, and prompts to the speech-to-speech provider. \
+                     The provider may retain this audio/transcript/prompt data, and session \
+                     resumption can extend retention (on the order of ~24h beyond a session)."
+                ),
+                format!("channels.speech_to_speech.{alias}.enabled"),
+            ));
+        }
+    }
+
     /// Collect non-fatal validation warnings — config that loads and
     /// validates successfully (`validate()` returns `Ok(())`) but will fail
     /// at runtime because of a logical inconsistency the schema cannot
@@ -23609,6 +23638,7 @@ impl Config {
         self.collect_verifiable_intent_warnings(&mut warnings);
         self.collect_cron_claim_warnings(&mut warnings);
         self.collect_compiled_out_tool_warnings(&mut warnings);
+        self.collect_speech_to_speech_warnings(&mut warnings);
         warnings.extend(validate_memory_semantics(&self.memory));
         for (alias, wa) in &self.channels.whatsapp {
             warnings.extend(validate_whatsapp_semantics(alias, wa));
@@ -42414,6 +42444,56 @@ enabled = false
             withheld[0].message.contains("vi_verify"),
             "the message must name the withheld tool: {}",
             withheld[0].message
+        );
+    }
+
+    /// The speech-to-speech broker channel streams live audio and derived
+    /// transcripts/prompts to a hosted provider (e.g. Google Gemini Live).
+    /// Enabling any alias must surface a privacy disclosure naming the
+    /// provider and its retention behavior, since that is not obvious from
+    /// the config surface alone.
+    #[test]
+    async fn enabling_speech_to_speech_emits_retention_warning() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.channels.speech_to_speech.insert(
+            "desk".into(),
+            SpeechToSpeechConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.message.to_lowercase().contains("retain")
+                    && w.message.to_lowercase().contains("provider")),
+            "expected a provider-retention warning, got {warnings:?}"
+        );
+    }
+
+    /// The channel is opt-in per alias, so a configured-but-disabled alias
+    /// must not trigger the disclosure.
+    #[test]
+    async fn disabled_speech_to_speech_alias_does_not_warn() {
+        let mut config = Config::default();
+        suppress_semantic_memory_warning(&mut config);
+        config.channels.speech_to_speech.insert(
+            "desk".into(),
+            SpeechToSpeechConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+
+        let warnings = config.collect_warnings();
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.code == "speech_to_speech_provider_retention"),
+            "a disabled alias must not warn, got {warnings:?}"
         );
     }
 

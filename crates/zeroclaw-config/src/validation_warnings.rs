@@ -98,6 +98,13 @@ pub const TOOL_COMPILED_OUT: &str = "tool_compiled_out";
 /// - `tool_compiled_out`: a `[<tool>]` section is enabled, but this build was
 ///   compiled without the tool's `tool-*` feature, so the section has no
 ///   effect and its settings are not validated.
+/// - `speech_to_speech_provider_retention`: a `[channels.speech_to_speech.<alias>]`
+///   is `enabled = true`. A live session sends caller audio, and the
+///   transcripts/prompts derived from it, to the configured speech backend
+///   provider (e.g. Google Gemini Live), which may retain that data; session
+///   resumption can extend retention (on the order of ~24h beyond a single
+///   session). Raised once per enabled alias (see
+///   `Config::collect_speech_to_speech_warnings` in `schema.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {
