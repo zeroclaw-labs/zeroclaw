@@ -284,8 +284,17 @@ pub fn resolve_job_id_or_name(
 
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
-            .context("Failed to delete cron job")
+        let tx = conn.unchecked_transaction()?;
+        // Operator-initiated removal deletes the job AND its history —
+        // explicitly, now that run rows no longer cascade (they must
+        // survive the completion-time auto-delete of one-shots).
+        tx.execute("DELETE FROM cron_runs WHERE job_id = ?1", params![id])
+            .context("Failed to delete cron job run history")?;
+        let changed = tx
+            .execute("DELETE FROM cron_jobs WHERE id = ?1", params![id])
+            .context("Failed to delete cron job")?;
+        tx.commit().context("Failed to commit cron job removal")?;
+        Ok(changed)
     })?;
 
     if changed == 0 {
@@ -328,16 +337,27 @@ pub fn list_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<Vec<Cron
     Ok(jobs)
 }
 
-/// Delete every cron job owned by `agent_alias`, returning the row count
-/// (`cron_runs` cascade via their `job_id` FK). A job whose owning agent is gone
-/// can never run, so the agent-deletion cascade removes it
+/// Delete every cron job owned by `agent_alias` and its run history,
+/// returning the job row count. A job whose owning agent is gone can never
+/// run, so the agent deletion removes it.
 pub fn remove_jobs_by_agent(config: &Config, agent_alias: &str) -> Result<usize> {
     let changed = with_initialized_connection(config, |conn| {
-        conn.execute(
-            "DELETE FROM cron_jobs WHERE agent_alias = ?1",
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM cron_runs WHERE job_id IN
+                 (SELECT id FROM cron_jobs WHERE agent_alias = ?1)",
             params![agent_alias],
         )
-        .context("Failed to delete cron jobs for agent")
+        .context("Failed to delete run history for agent's cron jobs")?;
+        let changed = tx
+            .execute(
+                "DELETE FROM cron_jobs WHERE agent_alias = ?1",
+                params![agent_alias],
+            )
+            .context("Failed to delete cron jobs for agent")?;
+        tx.commit()
+            .context("Failed to commit agent cron job removal")?;
+        Ok(changed)
     })?;
     Ok(changed)
 }
@@ -1242,6 +1262,12 @@ pub fn sync_declarative_jobs(
         // declarative jobs only when cron storage already exists. A fresh
         // workspace with nothing to sync should stay DB-free on daemon start.
         let _ = with_existing_initialized_connection(config, |conn| {
+            conn.execute(
+                "DELETE FROM cron_runs WHERE job_id IN
+                     (SELECT id FROM cron_jobs WHERE source = 'declarative')",
+                [],
+            )
+            .context("Failed to remove stale declarative cron run history")?;
             let deleted = conn
                 .execute("DELETE FROM cron_jobs WHERE source = 'declarative'", [])
                 .context("Failed to remove stale declarative cron jobs")?;
@@ -1280,6 +1306,12 @@ pub fn sync_declarative_jobs(
 
             for db_id in &db_ids {
                 if !config_ids.contains(db_id.as_str()) {
+                    conn.execute("DELETE FROM cron_runs WHERE job_id = ?1", params![db_id])
+                        .with_context(|| {
+                            format!(
+                                "Failed to remove run history of stale declarative cron job '{db_id}'"
+                            )
+                        })?;
                     conn.execute("DELETE FROM cron_jobs WHERE id = ?1", params![db_id])
                         .with_context(|| {
                             format!("Failed to remove stale declarative cron job '{db_id}'")
@@ -1692,6 +1724,9 @@ fn apply_run_completion_state(
             }
         }
         RunCompletionAction::Delete => {
+            // Deletes the JOB only: the run row inserted moments earlier in
+            // this same transaction survives as the one-shot's durable
+            // record (status, outcome triple, provenance).
             let changed = conn
                 .execute("DELETE FROM cron_jobs WHERE id = ?1", params![job.id])
                 .context("Failed to delete completed one-shot cron job")?;
@@ -1741,8 +1776,7 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             delivery    TEXT,
             persistence TEXT,
             principal   TEXT,
-            executing_agent TEXT,
-            FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+            executing_agent TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
@@ -1810,6 +1844,57 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "cron_runs", "principal", "TEXT")?;
     add_column_if_missing(conn, "cron_runs", "executing_agent", "TEXT")?;
 
+    drop_cron_runs_job_fk(conn)?;
+
+    Ok(())
+}
+
+/// One-time rebuild for legacy databases whose `cron_runs` still declares
+/// `FOREIGN KEY (job_id) ... ON DELETE CASCADE`: the cascade silently erased
+/// a one-shot's just-written run record when its successful completion
+/// auto-deleted the job, defeating the immutable run-record contract. Run
+/// history must outlive completion-time job deletion; operator-initiated
+/// removals delete it explicitly instead. Idempotent: a table without the
+/// foreign key is left untouched.
+fn drop_cron_runs_job_fk(conn: &Connection) -> Result<()> {
+    let has_fk = {
+        let mut stmt = conn.prepare("PRAGMA foreign_key_list(cron_runs)")?;
+        let mut rows = stmt.query([])?;
+        rows.next()?.is_some()
+    };
+    if !has_fk {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE cron_runs_no_fk (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id      TEXT NOT NULL,
+            started_at  TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            status      TEXT NOT NULL,
+            output      TEXT,
+            duration_ms INTEGER,
+            execution   TEXT,
+            delivery    TEXT,
+            persistence TEXT,
+            principal   TEXT,
+            executing_agent TEXT
+        );
+        INSERT INTO cron_runs_no_fk (id, job_id, started_at, finished_at, status, output,
+                                     duration_ms, execution, delivery, persistence,
+                                     principal, executing_agent)
+            SELECT id, job_id, started_at, finished_at, status, output,
+                   duration_ms, execution, delivery, persistence,
+                   principal, executing_agent
+            FROM cron_runs;
+        DROP TABLE cron_runs;
+        ALTER TABLE cron_runs_no_fk RENAME TO cron_runs;
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
+        CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);",
+    )
+    .context("Failed to rebuild cron_runs without the job foreign key")?;
     Ok(())
 }
 
@@ -2196,6 +2281,77 @@ mod tests {
         for name in ["execution", "delivery", "persistence"] {
             assert!(columns.iter().any(|c| c == name), "missing {name}");
         }
+    }
+
+    #[test]
+    fn legacy_fk_cron_runs_rebuild_preserves_rows_and_drops_cascade() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let cron_dir = cron_dir(&config);
+        std::fs::create_dir_all(&cron_dir).unwrap();
+        let db_path = cron_db(&config);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE cron_jobs (
+                id               TEXT PRIMARY KEY,
+                expression       TEXT NOT NULL,
+                command          TEXT NOT NULL,
+                created_at       TEXT NOT NULL,
+                next_run         TEXT NOT NULL
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+            );",
+        )
+        .unwrap();
+        let now = Utc::now();
+        conn.execute(
+            "INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+             VALUES ('legacy-fk', '*/5 * * * *', 'echo legacy', ?1, ?2)",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::minutes(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+             VALUES ('legacy-fk', ?1, ?2, 'ok', 'done', 5)",
+            params![
+                now.to_rfc3339(),
+                (now + ChronoDuration::milliseconds(5)).to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        // Opening through the public API rebuilds the table: the row
+        // survives the rebuild and the cascade is gone.
+        let runs = list_runs(&config, "legacy-fk", 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let fk_count: i64 = conn
+            .prepare("SELECT count(*) FROM pragma_foreign_key_list('cron_runs')")
+            .unwrap()
+            .query_row([], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fk_count, 0, "rebuild must drop the job foreign key");
+        // Deleting the job no longer erases the history.
+        conn.execute("PRAGMA foreign_keys = ON", []).unwrap();
+        conn.execute("DELETE FROM cron_jobs WHERE id = 'legacy-fk'", [])
+            .unwrap();
+        drop(conn);
+        let runs = list_runs(&config, "legacy-fk", 10).unwrap();
+        assert_eq!(runs.len(), 1, "run history must outlive the job row");
     }
 
     #[test]

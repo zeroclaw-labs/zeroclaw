@@ -275,6 +275,10 @@ async fn run_manual_job_inner(
     approved: bool,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
+    // Resolve the executing identity exactly as execution will (a migrated
+    // row's empty `agent_alias` falls back to config ownership); the record
+    // must report that identity, or honest absence when none resolves.
+    let executing_agent = resolve_owning_agent(config, job).map(str::to_string);
     let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
@@ -301,7 +305,7 @@ async fn run_manual_job_inner(
         // dispatched with: what a later rename can no longer rewrite.
         crate::cron::store::RunProvenance {
             principal: Some(&run_principal),
-            executing_agent: Some(&job.agent_alias),
+            executing_agent: executing_agent.as_deref(),
         },
         Some(&outcome.output),
         duration_ms,
@@ -836,6 +840,7 @@ async fn execute_and_persist_job(
     let success = Box::pin(persist_job_result(
         config,
         job,
+        agent_alias,
         success,
         &output,
         started_at,
@@ -996,6 +1001,7 @@ async fn run_agent_job(
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
+    executing_agent: &str,
     success: bool,
     output: &str,
     started_at: DateTime<Utc>,
@@ -1042,7 +1048,10 @@ async fn persist_job_result(
         // dispatched with: what a later rename can no longer rewrite.
         crate::cron::store::RunProvenance {
             principal: Some(&run_principal),
-            executing_agent: Some(&job.agent_alias),
+            // The RESOLVED alias the run executed under — a migrated row's
+            // empty `agent_alias` falls back to config ownership at
+            // execution, and the record must report that same identity.
+            executing_agent: Some(executing_agent),
         },
         Some(&outcome.output),
         duration_ms,
@@ -2505,7 +2514,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -2523,7 +2541,16 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
 
         assert!(success);
         assert_eq!(
@@ -2545,7 +2572,16 @@ mod tests {
             let finished = started + ChronoDuration::milliseconds(10);
             let output = format!("run-{idx}");
 
-            let success = persist_job_result(&config, &job, true, &output, started, finished).await;
+            let success = persist_job_result(
+                &config,
+                &job,
+                &job.agent_alias,
+                true,
+                &output,
+                started,
+                finished,
+            )
+            .await;
             assert!(success);
         }
 
@@ -2581,7 +2617,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
 
         assert!(success);
         assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
@@ -2615,10 +2660,69 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
+
+        // The one-shot's durable record survives the job deletion: status,
+        // outcome triple, and provenance stay queryable after the job row
+        // is gone.
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+        assert_eq!(runs[0].delivery.as_deref(), Some("not_required"));
+        assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
+        assert_eq!(
+            runs[0].principal,
+            Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+                job_id: job.id.clone(),
+                job_name: Some("one-shot".to_string()),
+            })
+        );
+        assert_eq!(
+            runs[0].executing_agent.as_deref(),
+            Some(job.agent_alias.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_stamps_resolved_executor_for_migrated_alias() {
+        // A migrated row carries an empty `agent_alias`; execution resolves
+        // the owner through config membership, and the run record must
+        // report that resolved identity, never the empty column value.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        job.agent_alias = String::new();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(
+            &config,
+            &job,
+            "resolved-owner",
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
+        assert!(success);
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].executing_agent.as_deref(), Some("resolved-owner"));
     }
 
     #[tokio::test]
@@ -2643,7 +2747,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            false,
+            "boom",
+            started,
+            finished,
+        )
+        .await;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -2673,7 +2786,16 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            false,
+            "boom",
+            started,
+            finished,
+        )
+        .await;
 
         assert!(!success);
         assert_eq!(
@@ -2719,7 +2841,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -2756,7 +2887,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2777,7 +2917,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
@@ -2794,7 +2943,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            false,
+            "boom",
+            started,
+            finished,
+        )
+        .await;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -2833,7 +2991,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2861,7 +3028,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2931,7 +3107,16 @@ mod tests {
 
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         // After reschedule_after_run, At schedule jobs should be disabled
@@ -3063,7 +3248,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
