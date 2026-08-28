@@ -51,6 +51,10 @@ const TELEGRAM_COMMAND_NAME_MAX_LEN: usize = 32;
 const TELEGRAM_COMMAND_DESCRIPTION_MAX_LEN: usize = 100;
 const TELEGRAM_MODEL_PICKER_PREFIX: &str = "zcmodel:";
 const TELEGRAM_MODEL_PICKER_TTL: Duration = Duration::from_secs(5 * 60);
+/// Bounded wait for the runtime to confirm it consumed a picker selection
+/// before the callback reports it as queued. Keeps a stuck or stopped
+/// consumer from pinning the callback answer forever.
+const TELEGRAM_MODEL_PICKER_DELIVERY_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 // Leave one Telegram keyboard button for Cancel even if every route belongs
 // to a distinct provider alias.
 const TELEGRAM_MODEL_PICKER_MAX_OPTIONS: usize = 99;
@@ -1856,8 +1860,9 @@ impl TelegramChannel {
     /// (`TrySendError::Full`/`Closed`), so a failed handoff hands the
     /// message back and the caller can restore the picker cohort instead
     /// of silently dropping the one-shot selection. A receiver that closes
-    /// *after* a successful enqueue is a shutdown-drain concern outside
-    /// this callback's control.
+    /// *after* a successful enqueue silently discards the queued item; the
+    /// caller covers that boundary with the delivery acknowledgement in
+    /// `crate::model_picker_delivery`.
     fn deliver_model_picker_selection(
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
         message: ChannelMessage,
@@ -1918,7 +1923,14 @@ impl TelegramChannel {
                 // enqueues or returns the message, so a closed/full queue
                 // restores the picker instead of dropping the selection.
                 drop(permit);
-                if Self::deliver_model_picker_selection(tx, *message).is_err() {
+                let message = *message;
+                let message_id = message.id.clone();
+                // Register the delivery acknowledgement before the handoff
+                // so a runtime that consumes the selection immediately
+                // cannot confirm into a not-yet-registered id.
+                let delivery_ack = crate::model_picker_delivery::register(&message_id);
+                if Self::deliver_model_picker_selection(tx, message).is_err() {
+                    crate::model_picker_delivery::cancel(&message_id);
                     self.restore_model_picker_keyboard(previous_keyboard).await;
                     self.answer_model_picker_callback(
                         callback_id,
@@ -1927,13 +1939,32 @@ impl TelegramChannel {
                     .await;
                     return;
                 }
-                tokio::join!(
-                    self.disable_model_picker_keyboard(callback),
+                // `try_send` only proved the queue accepted the selection;
+                // a receiver dropped before consumption silently discards
+                // it. Report `queued` only once the runtime confirms the
+                // selection reached runtime command handling, bounded so a
+                // stuck consumer cannot pin the callback answer. No picker
+                // lock is held across this wait.
+                let confirmed =
+                    tokio::time::timeout(TELEGRAM_MODEL_PICKER_DELIVERY_ACK_TIMEOUT, delivery_ack)
+                        .await;
+                if matches!(confirmed, Ok(Ok(()))) {
+                    tokio::join!(
+                        self.disable_model_picker_keyboard(callback),
+                        self.answer_model_picker_callback(
+                            callback_id,
+                            i18n::get_required_cli_string("channel-telegram-model-picker-queued"),
+                        ),
+                    );
+                } else {
+                    crate::model_picker_delivery::cancel(&message_id);
+                    self.restore_model_picker_keyboard(previous_keyboard).await;
                     self.answer_model_picker_callback(
                         callback_id,
-                        i18n::get_required_cli_string("channel-telegram-model-picker-queued"),
-                    ),
-                );
+                        i18n::get_required_cli_string("channel-telegram-model-picker-unavailable"),
+                    )
+                    .await;
+                }
             }
             ModelPickerCallbackOutcome::Rendered { text, reply_markup } => {
                 drop(permit);
@@ -8511,16 +8542,22 @@ mod tests {
             .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
 
-        channel
-            .handle_model_picker_callback(
-                &model_picker_callback(&token, "test_user", -10042, 9, 77),
-                &tx,
-            )
-            .await;
-
-        let message = rx
-            .try_recv()
-            .expect("selection must enter the runtime queue");
+        // The callback only reports `queued` after the runtime confirms
+        // delivery, so drive both sides concurrently: receive the
+        // selection, then fire the same acknowledgement the orchestrator
+        // sends once the command reaches runtime handling.
+        let callback = model_picker_callback(&token, "test_user", -10042, 9, 77);
+        let ((), message) = tokio::join!(
+            channel.handle_model_picker_callback(&callback, &tx),
+            async {
+                let message = rx
+                    .recv()
+                    .await
+                    .expect("selection must enter the runtime queue");
+                crate::model_picker_delivery::confirm(&message.id);
+                message
+            }
+        );
         assert_eq!(message.content, "/model fast");
         assert_eq!(message.sender, "test_user");
         assert_eq!(message.channel_alias.as_deref(), Some("main"));
@@ -8538,7 +8575,118 @@ mod tests {
                 .await
                 .contains_key(&token)
         );
-        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 3);
+        let queued_answer = requests
+            .iter()
+            .find(|request| request.url.path().ends_with("answerCallbackQuery"))
+            .expect("callback answer request");
+        let queued_body: serde_json::Value = serde_json::from_slice(&queued_answer.body).unwrap();
+        assert_eq!(
+            queued_body["text"],
+            i18n::get_required_cli_string("channel-telegram-model-picker-queued")
+        );
+    }
+
+    /// The post-enqueue shutdown boundary: the queue accepts the `try_send`
+    /// (capacity reserved), but the receiver is dropped before consuming
+    /// the item, so the selection never reaches runtime command handling.
+    /// The bounded acknowledgement wait must elapse, the picker cohort must
+    /// be restored, and the callback must answer `unavailable` — never
+    /// `queued` for a selection that was silently discarded.
+    #[tokio::test(start_paused = true)]
+    async fn model_picker_post_enqueue_shutdown_restores_picker_and_reports_unavailable() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "main",
+            Arc::new(|| vec!["test_user".into()]),
+            false,
+        )
+        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_api_base(server.uri());
+        let token = uuid::Uuid::new_v4().to_string();
+        channel
+            .insert_pending_model_picker_batch(vec![(
+                token.clone(),
+                PendingModelPicker {
+                    created_at: Instant::now(),
+                    expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
+                    requesting_user_id: "123".into(),
+                    reply_target: "-10042:9".into(),
+                    thread_ts: Some("9".into()),
+                    channel_alias: "main".into(),
+                    picker_message_id: 77,
+                    owner_agent_alias: "assistant".into(),
+                    current: ModelPickerSelection {
+                        model_provider: "openai.primary".into(),
+                        model: "gpt-current".into(),
+                    },
+                    runtime_routes: model_picker_runtime_routes(&model_picker_config()),
+                    action: ModelPickerAction::Select(ModelPickerOption {
+                        hint: "fast".into(),
+                        model_provider: "openai.fast".into(),
+                        model: "gpt-fast".into(),
+                    }),
+                },
+            )])
+            .await;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let tx_probe = tx.clone();
+
+        let started = tokio::time::Instant::now();
+        let callback = model_picker_callback(&token, "test_user", -10042, 9, 77);
+        tokio::join!(
+            channel.handle_model_picker_callback(&callback, &tx),
+            async {
+                // Wait until the selection is actually buffered (the queue
+                // slot is taken), then drop the receiver before
+                // consumption: the shutdown boundary after a successful
+                // enqueue.
+                while tx_probe.capacity() == 1 {
+                    tokio::task::yield_now().await;
+                }
+                drop(rx);
+            }
+        );
+
+        // Paused time proves the callback waited the full bounded
+        // acknowledgement timeout instead of answering `queued` at the
+        // `try_send` boundary.
+        let waited = started.elapsed();
+        assert!(
+            waited >= TELEGRAM_MODEL_PICKER_DELIVERY_ACK_TIMEOUT,
+            "callback returned after {waited:?}, short of the ack timeout"
+        );
+        assert!(
+            waited < TELEGRAM_MODEL_PICKER_DELIVERY_ACK_TIMEOUT + Duration::from_secs(1),
+            "callback waited {waited:?}, past the ack timeout bound"
+        );
+        assert!(
+            channel
+                .pending_model_pickers
+                .lock()
+                .await
+                .contains_key(&token)
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let answer: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            answer["text"],
+            i18n::get_required_cli_string("channel-telegram-model-picker-unavailable")
+        );
     }
 
     #[test]

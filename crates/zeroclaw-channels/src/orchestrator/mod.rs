@@ -6291,6 +6291,12 @@ async fn process_channel_message_body(
         );
     }
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+        // Confirm picker-selection delivery only now that the command was
+        // actually handled: the Telegram callback waits on this
+        // acknowledgement before reporting the selection as queued, so a
+        // message dropped anywhere earlier (receiver shutdown, routing
+        // miss) never looks applied. No-op for ordinary messages.
+        crate::model_picker_delivery::confirm(&msg.id);
         reconcile_early_ack(
             ctx.as_ref(),
             &msg,
@@ -26554,6 +26560,10 @@ BTC is currently around $65,000 based on latest tool output."#
             .await
             .expect("Telegram selection callback must reach the runtime queue")
             .expect("runtime queue must remain open");
+        // Mirror the orchestrator's dispatch-side confirmation: the
+        // callback only disables the keyboard and answers `queued` once the
+        // runtime acknowledges the selection reached command handling.
+        crate::model_picker_delivery::confirm(&queued.id);
         wait_for_request(&server, "editMessageReplyMarkup").await;
         wait_for_request(&server, "answerCallbackQuery").await;
         selection_listener.abort();
