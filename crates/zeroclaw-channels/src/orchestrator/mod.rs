@@ -8591,8 +8591,16 @@ async fn run_message_dispatch_loop(
         }
 
         // ── Debounce: accumulate rapid messages per sender ──────────
-        // CLI messages bypass debouncing so the interactive loop stays responsive.
-        let msg = if msg.channel != "cli" {
+        // CLI messages bypass debouncing so the interactive loop stays
+        // responsive. Runtime-control commands bypass too: newline-joining a
+        // `/model`-style command onto pending ordinary text would hide it
+        // from `parse_runtime_command` (the combined content starts with the
+        // ordinary text) and silently drop the control action after the
+        // channel already confirmed it. Ordinary messages keep their
+        // existing debounce semantics, including any already pending.
+        let msg = if msg.channel != "cli"
+            && parse_runtime_command(&msg.channel, &msg.content).is_none()
+        {
             let debounce_key = conversation_history_key(&msg);
 
             // Resolve effective debounce window: per-channel override wins,
@@ -26182,6 +26190,102 @@ BTC is currently around $65,000 based on latest tool output."#
             .expect("selection remains a per-sender session override");
         assert_eq!(route.model_provider, "anthropic.work");
         assert_eq!(route.model, "claude-sonnet-4-5");
+    }
+
+    /// Regression: with a nonzero debounce window, a picker selection
+    /// (`/model <hint>` synthesized by the Telegram callback path as an
+    /// ordinary `ChannelMessage`) must not be newline-joined onto a pending
+    /// ordinary message from the same sender — the combined content no
+    /// longer parses as a runtime command, so the switch would be lost
+    /// while the channel UI already reported success. The control command
+    /// must bypass debounce while the ordinary message keeps its window.
+    #[tokio::test]
+    async fn message_dispatch_debounce_preserves_model_picker_selection_command() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut ctx = channel_runtime_context_for_defaults_test(
+            tmp.path(),
+            "assistant",
+            "openrouter.default",
+            "config-model",
+        );
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.channels.debounce_ms = 300;
+        ctx.prompt_config = Arc::new(prompt_config);
+        ctx.model_routes = Arc::new(vec![zeroclaw_config::schema::ModelRouteConfig {
+            hint: "fast".into(),
+            model_provider: "openrouter.default".into(),
+            model: "fast-model".into(),
+            api_key: None,
+        }]);
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        ctx.model_provider = provider_impl.clone();
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert("telegram.main".to_string(), channel);
+        ctx.channels_by_name = Arc::new(channels_by_name);
+        let runtime_ctx = Arc::new(ctx);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(4);
+        let ordinary = zeroclaw_api::channel::ChannelMessage {
+            id: "ordinary-1".into(),
+            sender: "test_user".into(),
+            platform_sender_id: Some("123".into()),
+            reply_target: "chat-42".into(),
+            content: "hello".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("main".into()),
+            timestamp: 1,
+            ..Default::default()
+        };
+        // Mirror `TelegramChannel::model_picker_selection_message`: an
+        // ordinary ChannelMessage whose content is the `/model <hint>`
+        // control command, arriving while `ordinary` is still pending.
+        let selection = zeroclaw_api::channel::ChannelMessage {
+            id: "telegram_model_picker_selection".into(),
+            content: "/model fast".into(),
+            timestamp: 2,
+            ..ordinary.clone()
+        };
+        let sender_key = conversation_history_key(&selection);
+        tx.send(ordinary).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tx.send(selection).await.unwrap();
+        drop(tx);
+
+        run_message_dispatch_loop(rx, AgentRouter::single(runtime_ctx.clone()), 4).await;
+
+        let route = runtime_ctx
+            .route_overrides
+            .lock()
+            .unwrap()
+            .get(&sender_key)
+            .cloned()
+            .expect("picker selection must still apply the per-sender model switch");
+        assert_eq!(route.model_provider, "openrouter.default");
+        assert_eq!(route.model, "fast-model");
+
+        let calls = provider_impl.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "the ordinary message dispatches exactly one provider turn"
+        );
+        let user_inputs = calls[0]
+            .iter()
+            .filter(|(role, _)| role == "user")
+            .map(|(_, content)| content.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            user_inputs.iter().any(|content| content.contains("hello")),
+            "ordinary content must reach the provider, got {user_inputs:?}"
+        );
+        assert!(
+            user_inputs
+                .iter()
+                .all(|content| !content.contains("/model")),
+            "control command must not leak into the provider turn: {user_inputs:?}"
+        );
     }
 
     #[cfg(feature = "channel-telegram")]

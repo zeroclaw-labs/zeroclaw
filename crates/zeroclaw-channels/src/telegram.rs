@@ -1851,18 +1851,21 @@ impl TelegramChannel {
         }
     }
 
-    /// `Permit::send` reports no delivery result: if the receiver closed
-    /// after the reservation, the queued selection is dropped silently.
-    /// A channel that is closed after the send can never deliver the
-    /// message, so the caller must treat that handoff as failed and
-    /// restore the picker instead of confirming the switch.
+    /// `try_send` is the atomic accept/reject boundary for the queue
+    /// handoff: it either enqueues the selection or returns it
+    /// (`TrySendError::Full`/`Closed`), so a failed handoff hands the
+    /// message back and the caller can restore the picker cohort instead
+    /// of silently dropping the one-shot selection. A receiver that closes
+    /// *after* a successful enqueue is a shutdown-drain concern outside
+    /// this callback's control.
     fn deliver_model_picker_selection(
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-        permit: tokio::sync::mpsc::Permit<'_, ChannelMessage>,
         message: ChannelMessage,
-    ) -> bool {
-        permit.send(message);
-        !tx.is_closed()
+    ) -> Result<(), Box<ChannelMessage>> {
+        tx.try_send(message).map_err(|error| match error {
+            tokio::sync::mpsc::error::TrySendError::Full(message)
+            | tokio::sync::mpsc::error::TrySendError::Closed(message) => Box::new(message),
+        })
     }
 
     async fn handle_model_picker_callback(
@@ -1909,7 +1912,13 @@ impl TelegramChannel {
                     .await;
                     return;
                 };
-                if !Self::deliver_model_picker_selection(tx, permit, *message) {
+                // The early `try_reserve` only proved capacity existed before
+                // the one-shot selection token was consumed. Release the
+                // reservation and hand off atomically: `try_send` either
+                // enqueues or returns the message, so a closed/full queue
+                // restores the picker instead of dropping the selection.
+                drop(permit);
+                if Self::deliver_model_picker_selection(tx, *message).is_err() {
                     self.restore_model_picker_keyboard(previous_keyboard).await;
                     self.answer_model_picker_callback(
                         callback_id,
@@ -7442,6 +7451,75 @@ mod tests {
         }));
     }
 
+    /// Production assembles Telegram as `PacedChannel::wrap(TelegramChannel)`
+    /// whenever `reply_min_interval_secs > 0`. The picker is a control
+    /// surface, not paced outbound traffic: the wrapper must forward
+    /// `present_model_picker` to the inner channel instead of falling
+    /// through to the trait default's `Ok(false)`.
+    #[tokio::test]
+    async fn telegram_model_picker_survives_reply_pacing_wrapper() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 77 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "message_id": 77 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = Arc::new(
+            TelegramChannel::new(
+                "token".into(),
+                "main",
+                Arc::new(|| vec!["test_user".into()]),
+                false,
+            )
+            .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+            .with_api_base(server.uri()),
+        );
+        let pacing = zeroclaw_config::schema::TelegramConfig {
+            reply_min_interval_secs: 3600,
+            ..Default::default()
+        };
+        let paced = crate::paced_channel::PacedChannel::wrap(channel.clone(), &pacing);
+        let request = ChannelModelPickerRequest {
+            requesting_user: "test_user".into(),
+            requesting_user_id: "123".into(),
+            reply_target: "-10042:9".into(),
+            thread_ts: Some("9".into()),
+            channel_alias: "main".into(),
+            owner_agent_alias: "assistant".into(),
+            current_model_provider: "anthropic.team".into(),
+            current_model: "claude-sonnet".into(),
+            model_routes: model_picker_request_routes(&model_picker_config()),
+        };
+
+        assert!(paced.present_model_picker(&request).await.unwrap());
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let pending = channel.pending_model_pickers.lock().await;
+        assert_eq!(pending.len(), 4);
+        assert!(pending.values().all(|state| {
+            state.requesting_user_id == "123"
+                && state.reply_target == "-10042:9"
+                && state.picker_message_id == 77
+        }));
+    }
+
     #[tokio::test]
     async fn telegram_model_picker_never_exposes_keyboard_without_registered_tokens() {
         use wiremock::matchers::{method, path_regex};
@@ -8241,27 +8319,138 @@ mod tests {
     }
 
     #[test]
-    fn deliver_model_picker_selection_reports_receiver_close() {
-        // A receiver that closes after the reservation turns Permit::send
-        // into a silent drop; the handoff must report that as failure.
+    fn deliver_model_picker_selection_hands_message_back_on_closed_queue() {
+        // A receiver that closes after the capacity reservation must turn
+        // the atomic handoff into a rejection that returns the selection
+        // message, so the caller can restore the picker cohort instead of
+        // dropping the one-shot selection.
         let (tx, rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
         let permit = tx.try_reserve().expect("capacity reservation");
         drop(rx);
-        assert!(!TelegramChannel::deliver_model_picker_selection(
+        drop(permit);
+        let returned = TelegramChannel::deliver_model_picker_selection(
             &tx,
-            permit,
-            ChannelMessage::default()
-        ));
+            ChannelMessage {
+                id: "selection-closed".into(),
+                ..Default::default()
+            },
+        )
+        .expect_err("closed queue must reject the handoff");
+        assert_eq!(returned.id, "selection-closed");
+    }
 
-        // An open channel confirms the handoff and delivers the message.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
+    #[test]
+    fn deliver_model_picker_selection_hands_message_back_on_full_queue() {
+        // A competing sender that takes the reserved slot before the
+        // handoff is a `Full` rejection; the message must come back.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
         let permit = tx.try_reserve().expect("capacity reservation");
-        assert!(TelegramChannel::deliver_model_picker_selection(
+        let competing = tx.clone();
+        drop(permit);
+        competing.try_send(ChannelMessage::default()).unwrap();
+        let returned = TelegramChannel::deliver_model_picker_selection(
             &tx,
-            permit,
-            ChannelMessage::default()
-        ));
-        assert!(rx.try_recv().is_ok());
+            ChannelMessage {
+                id: "selection-full".into(),
+                ..Default::default()
+            },
+        )
+        .expect_err("full queue must reject the handoff");
+        assert_eq!(returned.id, "selection-full");
+    }
+
+    #[test]
+    fn deliver_model_picker_selection_delivers_on_open_queue() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChannelMessage>(1);
+        TelegramChannel::deliver_model_picker_selection(
+            &tx,
+            ChannelMessage {
+                id: "selection-open".into(),
+                ..Default::default()
+            },
+        )
+        .expect("open queue must accept the handoff");
+        assert_eq!(
+            rx.try_recv().expect("selection delivered").id,
+            "selection-open"
+        );
+    }
+
+    /// A closed runtime queue rejects the capacity reservation up front:
+    /// the one-shot selection token must survive and the callback answers
+    /// with the "unavailable" string instead of confirming the switch.
+    #[tokio::test]
+    async fn model_picker_closed_control_queue_does_not_consume_selection_token() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "main",
+            Arc::new(|| vec!["test_user".into()]),
+            false,
+        )
+        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_api_base(server.uri());
+        let token = uuid::Uuid::new_v4().to_string();
+        channel
+            .insert_pending_model_picker_batch(vec![(
+                token.clone(),
+                PendingModelPicker {
+                    created_at: Instant::now(),
+                    expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
+                    requesting_user_id: "123".into(),
+                    reply_target: "-10042:9".into(),
+                    thread_ts: Some("9".into()),
+                    channel_alias: "main".into(),
+                    picker_message_id: 77,
+                    owner_agent_alias: "assistant".into(),
+                    current: ModelPickerSelection {
+                        model_provider: "openai.primary".into(),
+                        model: "gpt-current".into(),
+                    },
+                    runtime_routes: model_picker_runtime_routes(&model_picker_config()),
+                    action: ModelPickerAction::Select(ModelPickerOption {
+                        hint: "fast".into(),
+                        model_provider: "openai.fast".into(),
+                        model: "gpt-fast".into(),
+                    }),
+                },
+            )])
+            .await;
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        channel
+            .handle_model_picker_callback(
+                &model_picker_callback(&token, "test_user", -10042, 9, 77),
+                &tx,
+            )
+            .await;
+
+        assert!(
+            channel
+                .pending_model_pickers
+                .lock()
+                .await
+                .contains_key(&token)
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let answer: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            answer["text"],
+            i18n::get_required_cli_string("channel-telegram-model-picker-unavailable")
+        );
     }
 
     #[tokio::test]
