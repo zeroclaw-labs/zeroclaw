@@ -780,6 +780,16 @@ pub struct RunOutcomes<'a> {
     pub persistence: &'a str,
 }
 
+/// The immutable provenance stamped on a run record, side by side, as
+/// at-time-of-action facts: the initiating principal (serialized verbatim)
+/// and the executing agent's canonical alias. Later job renames or owner
+/// changes never rewrite what a historical row reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunProvenance<'a> {
+    pub principal: Option<&'a zeroclaw_api::ingress::InternalPrincipal>,
+    pub executing_agent: Option<&'a str>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn record_run(
     config: &Config,
@@ -788,6 +798,7 @@ pub fn record_run(
     finished_at: DateTime<Utc>,
     status: &str,
     outcomes: RunOutcomes<'_>,
+    provenance: RunProvenance<'_>,
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
@@ -806,6 +817,7 @@ pub fn record_run(
             finished_at,
             status,
             outcomes,
+            provenance,
             bounded_output.as_deref(),
             duration_ms,
         )?;
@@ -824,6 +836,7 @@ pub(crate) fn persist_manual_run_result(
     finished_at: DateTime<Utc>,
     status: &str,
     outcomes: RunOutcomes<'_>,
+    provenance: RunProvenance<'_>,
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
@@ -840,6 +853,7 @@ pub(crate) fn persist_manual_run_result(
             finished_at,
             status,
             outcomes,
+            provenance,
             bounded_output.as_deref(),
             duration_ms,
         )?;
@@ -867,6 +881,7 @@ pub(crate) fn persist_run_result(
     job_state_at: DateTime<Utc>,
     status: &str,
     outcomes: RunOutcomes<'_>,
+    provenance: RunProvenance<'_>,
     output: Option<&str>,
     duration_ms: i64,
     action: RunCompletionAction,
@@ -884,6 +899,7 @@ pub(crate) fn persist_run_result(
             finished_at,
             status,
             outcomes,
+            provenance,
             bounded_output.as_deref(),
             duration_ms,
         )?;
@@ -925,13 +941,19 @@ fn insert_run_and_prune(
     finished_at: DateTime<Utc>,
     status: &str,
     outcomes: RunOutcomes<'_>,
+    provenance: RunProvenance<'_>,
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
+    let principal_json = provenance
+        .principal
+        .map(serde_json::to_string)
+        .transpose()
+        .context("Failed to serialize run principal")?;
     conn.execute(
         "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms,
-                                execution, delivery, persistence)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                execution, delivery, persistence, principal, executing_agent)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             job_id,
             started_at.to_rfc3339(),
@@ -942,6 +964,8 @@ fn insert_run_and_prune(
             outcomes.execution,
             outcomes.delivery,
             outcomes.persistence,
+            principal_json,
+            provenance.executing_agent,
         ],
     )
     .context("Failed to insert cron run")?;
@@ -1004,7 +1028,7 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
         let mut stmt = conn.prepare(
             "SELECT id, job_id, started_at, finished_at, status, output, duration_ms,
-                    execution, delivery, persistence
+                    execution, delivery, persistence, principal, executing_agent
              FROM cron_runs
              WHERE job_id = ?1
              ORDER BY started_at DESC, id DESC
@@ -1025,6 +1049,11 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
                 execution: row.get(7)?,
                 delivery: row.get(8)?,
                 persistence: row.get(9)?,
+                principal: row
+                    .get::<_, Option<String>>(10)?
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str(raw).ok()),
+                executing_agent: row.get(11)?,
             })
         })?;
 
@@ -1711,6 +1740,8 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
             execution   TEXT,
             delivery    TEXT,
             persistence TEXT,
+            principal   TEXT,
+            executing_agent TEXT,
             FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
         );
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
@@ -1773,6 +1804,11 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     add_column_if_missing(conn, "cron_runs", "execution", "TEXT")?;
     add_column_if_missing(conn, "cron_runs", "delivery", "TEXT")?;
     add_column_if_missing(conn, "cron_runs", "persistence", "TEXT")?;
+    // Immutable run provenance: the stamped initiating principal (verbatim
+    // JSON) and the executing agent's alias at time of action. Nullable:
+    // pre-existing rows read back as absent, never backfilled.
+    add_column_if_missing(conn, "cron_runs", "principal", "TEXT")?;
+    add_column_if_missing(conn, "cron_runs", "executing_agent", "TEXT")?;
 
     Ok(())
 }
@@ -2135,6 +2171,10 @@ mod tests {
                 delivery: "delivered",
                 persistence: "not_bound",
             },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
+            },
             Some("done"),
             1000,
         )
@@ -2156,6 +2196,83 @@ mod tests {
         for name in ["execution", "delivery", "persistence"] {
             assert!(columns.iter().any(|c| c == name), "missing {name}");
         }
+    }
+
+    #[test]
+    fn run_provenance_survives_job_and_owner_renames() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            "original-agent",
+            Some("nightly".to_string()),
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "do the thing",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let stamped = zeroclaw_api::ingress::InternalPrincipal::Cron {
+            job_id: job.id.clone(),
+            job_name: job.name.clone(),
+        };
+        let now = Utc::now();
+        record_run(
+            &config,
+            &job.id,
+            now,
+            now + ChronoDuration::milliseconds(5),
+            "ok",
+            RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: Some(&stamped),
+                executing_agent: Some("original-agent"),
+            },
+            Some("done"),
+            5,
+        )
+        .unwrap();
+
+        // Rename the job and its owning agent AFTER the run persisted.
+        update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                name: Some("renamed".to_string()),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            rename_jobs_by_agent(&config, "original-agent", "renamed-agent").unwrap(),
+            1
+        );
+
+        // The historical row still reports the values stamped at dispatch,
+        // not the current metadata.
+        let runs = list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].principal.as_ref(), Some(&stamped));
+        assert_eq!(
+            runs[0].principal,
+            Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+                job_id: job.id.clone(),
+                job_name: Some("nightly".to_string()),
+            })
+        );
+        assert_eq!(runs[0].executing_agent.as_deref(), Some("original-agent"));
     }
 
     #[test]
@@ -2979,6 +3096,10 @@ mod tests {
                     delivery: "not_required",
                     persistence: "not_bound",
                 },
+                RunProvenance {
+                    principal: None,
+                    executing_agent: None,
+                },
                 Some("done"),
                 100,
             )
@@ -3005,6 +3126,10 @@ mod tests {
                 execution: "ok",
                 delivery: "not_required",
                 persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
             },
             Some("ok"),
             5,
@@ -3033,6 +3158,10 @@ mod tests {
                 execution: "ok",
                 delivery: "not_required",
                 persistence: "not_bound",
+            },
+            RunProvenance {
+                principal: None,
+                executing_agent: None,
             },
             Some(&output),
             1,

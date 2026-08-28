@@ -209,6 +209,15 @@ pub struct CronRun {
     /// recorded before the triple existed.
     #[serde(default)]
     pub persistence: Option<String>,
+    /// The initiating principal stamped at dispatch, verbatim — immune to
+    /// later job renames or owner changes. `None` on rows recorded before
+    /// provenance existed.
+    #[serde(default)]
+    pub principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+    /// The executing agent's canonical alias at time of action. `None` on
+    /// rows recorded before provenance existed.
+    #[serde(default)]
+    pub executing_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

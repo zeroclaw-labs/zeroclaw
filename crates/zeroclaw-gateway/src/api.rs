@@ -578,6 +578,11 @@ pub async fn handle_api_cron_runs(
                         "status": r.status,
                         "output": r.output,
                         "duration_ms": r.duration_ms,
+                        "execution": r.execution,
+                        "delivery": r.delivery,
+                        "persistence": r.persistence,
+                        "principal": r.principal,
+                        "executing_agent": r.executing_agent,
                     })
                 })
                 .collect();

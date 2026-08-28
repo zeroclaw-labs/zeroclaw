@@ -449,15 +449,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
     if let Some(principal) = &ingress.internal_principal {
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_category(::zeroclaw_log::EventCategory::Agent)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({
-                    "trace_id": turn_id,
-                    "origin": ingress.origin,
-                    "internal_principal": principal,
-                    "executing_agent": agent_alias,
-                })),
+            internal_principal_event(turn_id, ingress.origin, principal, agent_alias),
             "turn_internal_principal"
         );
     }
@@ -2616,6 +2608,26 @@ mod shared_iteration_budget_tests {
     }
 }
 
+/// The trace stamp for an internally initiated turn: initiating principal
+/// and executing agent side by side, correlated by the turn's trace id.
+/// Attributes carry runtime-resolved identity only, never message text.
+pub(crate) fn internal_principal_event(
+    turn_id: &str,
+    origin: zeroclaw_api::ingress::TurnOrigin,
+    principal: &zeroclaw_api::ingress::InternalPrincipal,
+    executing_agent: Option<&str>,
+) -> ::zeroclaw_log::Event {
+    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+        .with_category(::zeroclaw_log::EventCategory::Agent)
+        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+        .with_attrs(::serde_json::json!({
+            "trace_id": turn_id,
+            "origin": origin,
+            "internal_principal": principal,
+            "executing_agent": executing_agent,
+        }))
+}
+
 /// Live SOP nested-step re-assembly gate, isolation, and fail-closed regressions.
 ///
 /// Privilege-scope properties of the live driver:
@@ -2635,6 +2647,39 @@ mod shared_iteration_budget_tests {
 /// - **Fail-closed.** A cross-agent step with no re-assembly handle, or whose
 ///   agent context cannot be assembled, FAILS rather than running with the
 ///   parent agent's broader context.
+#[cfg(test)]
+mod internal_principal_event_tests {
+    use super::*;
+
+    #[test]
+    fn trace_stamp_carries_both_identities_keyed_by_trace_id() {
+        let principal = zeroclaw_api::ingress::InternalPrincipal::Cron {
+            job_id: "job-1".to_string(),
+            job_name: Some("nightly".to_string()),
+        };
+        let event = internal_principal_event(
+            "trace-1",
+            zeroclaw_api::ingress::TurnOrigin::Cron,
+            &principal,
+            Some("assistant"),
+        );
+        assert_eq!(event.outcome, ::zeroclaw_log::EventOutcome::Unknown);
+        let attrs = event.attrs.expect("event carries attributes");
+        assert_eq!(attrs["trace_id"], "trace-1");
+        assert_eq!(attrs["origin"], "cron");
+        assert_eq!(
+            attrs["internal_principal"],
+            serde_json::json!({"cron": {"job_id": "job-1", "job_name": "nightly"}})
+        );
+        assert_eq!(attrs["executing_agent"], "assistant");
+        assert_eq!(
+            attrs.as_object().map(serde_json::Map::len),
+            Some(4),
+            "identity attributes only — never message text"
+        );
+    }
+}
+
 #[cfg(test)]
 mod sop_step_reassembly_tests {
     use super::*;

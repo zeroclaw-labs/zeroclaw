@@ -158,17 +158,43 @@ pub struct CronDeliveryOutcome {
     pub delivery: DeliveryDisposition,
 }
 
+/// The single derivation boundary for the rollup `status`: computed from
+/// the outcome triple's execution and delivery axes plus the job's
+/// best-effort delivery policy, never written independently. Vocabulary is
+/// unchanged: `ok | degraded | error` (`skipped` is written only by the
+/// missed-run path, which records no outcome triple).
+pub(crate) fn rollup_status(
+    execution: &str,
+    delivery: DeliveryDisposition,
+    best_effort: bool,
+) -> &'static str {
+    if execution != "ok" {
+        return "error";
+    }
+    match delivery {
+        DeliveryDisposition::Failed => {
+            if best_effort {
+                "degraded"
+            } else {
+                "error"
+            }
+        }
+        DeliveryDisposition::NotRequired
+        | DeliveryDisposition::Delivered
+        | DeliveryDisposition::Skipped => "ok",
+    }
+}
+
 pub async fn deliver_and_classify_run_result(
     config: &Config,
     job: &CronJob,
-    mut success: bool,
+    success: bool,
     mut output: String,
     context: CronDeliveryContext,
 ) -> CronDeliveryOutcome {
     // The execution axis is fixed before delivery runs: a later delivery
     // failure can downgrade the rollup `status`, never the execution fact.
     let execution = if success { "ok" } else { "error" };
-    let mut status = if success { "ok" } else { "error" }.to_string();
 
     let delivery = match deliver_if_configured(config, job, &output).await {
         Ok(disposition) => disposition,
@@ -181,40 +207,19 @@ pub async fn deliver_and_classify_run_result(
             let target = job.delivery.to.as_deref().unwrap_or("");
             let delivery_error = e.to_string();
 
-            if job.delivery.best_effort {
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "job_id": job.id,
-                            "agent_alias": job.agent_alias,
-                            "channel": channel,
-                            "target": target,
-                            "error": delivery_error
-                        })),
-                    context.failure_message(true)
-                );
-                if success {
-                    status = "degraded".to_string();
-                }
-            } else {
-                success = false;
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({
-                            "job_id": job.id,
-                            "agent_alias": job.agent_alias,
-                            "channel": channel,
-                            "target": target,
-                            "error": delivery_error
-                        })),
-                    context.failure_message(false)
-                );
-                status = "error".to_string();
-            }
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "agent_alias": job.agent_alias,
+                        "channel": channel,
+                        "target": target,
+                        "error": delivery_error
+                    })),
+                context.failure_message(job.delivery.best_effort)
+            );
 
             if output.trim().is_empty() {
                 output = format!("delivery failed: {delivery_error}");
@@ -225,6 +230,12 @@ pub async fn deliver_and_classify_run_result(
             DeliveryDisposition::Failed
         }
     };
+
+    // Both the rollup and the merged success flag are DERIVED from the
+    // triple plus the delivery policy — nothing writes them independently.
+    let status = rollup_status(execution, delivery, job.delivery.best_effort).to_string();
+    let success =
+        execution == "ok" && (delivery != DeliveryDisposition::Failed || job.delivery.best_effort);
 
     CronDeliveryOutcome {
         success,
@@ -269,6 +280,10 @@ async fn run_manual_job_inner(
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
 
+    let run_principal = zeroclaw_api::ingress::InternalPrincipal::Cron {
+        job_id: job.id.clone(),
+        job_name: job.name.clone(),
+    };
     if let Err(e) = persist_manual_run_result(
         config,
         job,
@@ -281,6 +296,12 @@ async fn run_manual_job_inner(
             // No conversation binding exists yet; every run records the
             // explicit absence rather than an empty guess.
             persistence: "not_bound",
+        },
+        // Immutable provenance from the same job snapshot the run was
+        // dispatched with: what a later rename can no longer rewrite.
+        crate::cron::store::RunProvenance {
+            principal: Some(&run_principal),
+            executing_agent: Some(&job.agent_alias),
         },
         Some(&outcome.output),
         duration_ms,
@@ -999,6 +1020,10 @@ async fn persist_job_result(
     };
 
     let job_state_at = Utc::now();
+    let run_principal = zeroclaw_api::ingress::InternalPrincipal::Cron {
+        job_id: job.id.clone(),
+        job_name: job.name.clone(),
+    };
     if let Err(e) = persist_run_result(
         config,
         job,
@@ -1012,6 +1037,12 @@ async fn persist_job_result(
             // No conversation binding exists yet; every run records the
             // explicit absence rather than an empty guess.
             persistence: "not_bound",
+        },
+        // Immutable provenance from the same job snapshot the run was
+        // dispatched with: what a later rename can no longer rewrite.
+        crate::cron::store::RunProvenance {
+            principal: Some(&run_principal),
+            executing_agent: Some(&job.agent_alias),
         },
         Some(&outcome.output),
         duration_ms,
@@ -3041,6 +3072,43 @@ mod tests {
         assert_eq!(runs[0].execution.as_deref(), Some("ok"));
         assert_eq!(runs[0].delivery.as_deref(), Some("failed"));
         assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
+        assert_eq!(
+            runs[0].principal,
+            Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+                job_id: job.id.clone(),
+                job_name: job.name.clone(),
+            })
+        );
+        assert_eq!(
+            runs[0].executing_agent.as_deref(),
+            Some(job.agent_alias.as_str())
+        );
+    }
+
+    #[test]
+    fn rollup_status_is_the_single_derivation_of_the_triple() {
+        // The full matrix: status is a pure function of execution, delivery,
+        // and the best-effort policy — matching the classifier's behavior
+        // exactly (verified end-to-end by the outcome-triple test above).
+        use DeliveryDisposition as D;
+        for (execution, delivery, best_effort, expected) in [
+            ("ok", D::NotRequired, false, "ok"),
+            ("ok", D::NotRequired, true, "ok"),
+            ("ok", D::Delivered, false, "ok"),
+            ("ok", D::Skipped, true, "ok"),
+            ("ok", D::Failed, true, "degraded"),
+            ("ok", D::Failed, false, "error"),
+            ("error", D::NotRequired, false, "error"),
+            ("error", D::Failed, true, "error"),
+            ("error", D::Failed, false, "error"),
+            ("error", D::Delivered, true, "error"),
+        ] {
+            assert_eq!(
+                rollup_status(execution, delivery, best_effort),
+                expected,
+                "({execution}, {delivery:?}, best_effort={best_effort})"
+            );
+        }
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
