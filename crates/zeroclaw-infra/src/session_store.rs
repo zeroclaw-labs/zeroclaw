@@ -61,6 +61,35 @@ impl SessionStore {
             .join(format!("{}.jsonl", sanitize_session_key(session_key)))
     }
 
+    /// Sidecar file recording whether `session_key`'s transcript currently
+    /// starts with the synthetic trim breadcrumb. Kept as a canonical fact
+    /// next to the transcript so restore never has to infer provenance from
+    /// message text.
+    fn trim_breadcrumb_path(&self, session_key: &str) -> PathBuf {
+        self.sessions_dir.join(format!(
+            "{}.trim_breadcrumb",
+            sanitize_session_key(session_key)
+        ))
+    }
+
+    /// Persist whether the session's transcript starts with the synthetic
+    /// trim breadcrumb.
+    pub fn set_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        std::fs::write(
+            self.trim_breadcrumb_path(session_key),
+            if present { b"1" as &[u8] } else { b"0" },
+        )
+    }
+
+    /// Read the persisted breadcrumb flag. `None` if never recorded.
+    pub fn get_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
+        match std::fs::read(self.trim_breadcrumb_path(session_key)) {
+            Ok(bytes) => Ok(Some(bytes.first() == Some(&b'1'))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Load all messages for a session from its JSONL file.
     /// Returns an empty vec if the path is not a regular JSONL session file or
     /// the file is unreadable.
@@ -219,6 +248,7 @@ impl SessionStore {
             return Ok(false);
         }
         std::fs::remove_file(&path)?;
+        let _ = std::fs::remove_file(self.trim_breadcrumb_path(session_key));
         Ok(true)
     }
 
@@ -356,6 +386,14 @@ impl SessionBackend for SessionStore {
         self.rewrite(session_key, messages)
     }
 
+    fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        self.set_trim_breadcrumb(session_key, present)
+    }
+
+    fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
+        self.get_trim_breadcrumb(session_key)
+    }
+
     fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
         self.update_last(session_key, message)
     }
@@ -472,6 +510,41 @@ mod tests {
         assert_eq!(messages[0].content, "hello");
         assert_eq!(messages[1].role, "assistant");
         assert_eq!(messages[1].content, "hi there");
+    }
+
+    #[test]
+    fn trim_breadcrumb_round_trips_and_survives_reopen() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        assert_eq!(store.get_trim_breadcrumb("chan_user").unwrap(), None);
+
+        store.set_trim_breadcrumb("chan_user", true).unwrap();
+        assert_eq!(store.get_trim_breadcrumb("chan_user").unwrap(), Some(true));
+
+        // A fresh store instance simulates a process restart: the flag must
+        // be a durable fact, not held only in an in-process cache.
+        let reopened = SessionStore::new(tmp.path()).unwrap();
+        assert_eq!(
+            reopened.get_trim_breadcrumb("chan_user").unwrap(),
+            Some(true)
+        );
+
+        store.set_trim_breadcrumb("chan_user", false).unwrap();
+        assert_eq!(store.get_trim_breadcrumb("chan_user").unwrap(), Some(false));
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_breadcrumb_flag() {
+        let tmp = TempDir::new().unwrap();
+        let store = SessionStore::new(tmp.path()).unwrap();
+
+        store.append("chan_user", &ChatMessage::user("hi")).unwrap();
+        store.set_trim_breadcrumb("chan_user", true).unwrap();
+
+        store.delete_session("chan_user").unwrap();
+
+        assert_eq!(store.get_trim_breadcrumb("chan_user").unwrap(), None);
     }
 
     #[test]

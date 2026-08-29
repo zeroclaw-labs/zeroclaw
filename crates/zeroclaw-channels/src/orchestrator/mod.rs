@@ -2409,33 +2409,67 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     }
 }
 
+/// Return `retained_turns` with its last message's content replaced by
+/// `raw_current_turn_content`, if set. `retained_turns` ends with the
+/// current turn's working-buffer user message, which the caller has
+/// prepended with the volatile turn-context preamble (reply_target,
+/// sender, message_id, recalled memory) for the LLM call only; the durable
+/// transcript must store the clean raw content instead, so a restart or
+/// reload never surfaces per-message routing metadata or recalled memory
+/// to a later turn.
+fn strip_volatile_preamble_before_persist(
+    retained_turns: &[ChatMessage],
+    raw_current_turn_content: Option<&str>,
+) -> Vec<ChatMessage> {
+    let mut cleaned = retained_turns.to_vec();
+    if let Some(raw) = raw_current_turn_content
+        && let Some(last) = cleaned.last_mut()
+    {
+        last.content = raw.to_string();
+    }
+    cleaned
+}
+
 /// Replace the cached and durable transcript for `sender_key` with
 /// `trimmed_turns` (the loop-owned history, still including the current
 /// user turn and any synthetic breadcrumb, minus the leading system
-/// prompt). The tool-call loop may have dropped older whole turns and/or
-/// inserted a breadcrumb directly on its working buffer; without this, the
-/// cache and JSONL store keep the pre-trim transcript and the next message
-/// resurrects context the prior `HistoryTrimmed` event said was removed.
-/// Callers append this turn's own new tool/assistant messages afterward, so
-/// this only resyncs the base the loop actually trimmed.
+/// prompt), and record `breadcrumb_present` as the same durable fact. The
+/// tool-call loop may have dropped older whole turns and/or inserted a
+/// breadcrumb directly on its working buffer; without this, the cache and
+/// JSONL store keep the pre-trim transcript and the wrong breadcrumb
+/// provenance, so a restart resurrects context the prior `HistoryTrimmed`
+/// event said was removed. Both writes happen under the same per-sender
+/// persist lock so the transcript and its provenance cannot observably
+/// diverge. Callers append this turn's own new tool/assistant messages
+/// afterward, so this only resyncs the base the loop actually trimmed.
 fn resync_sender_history_after_trim(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
     trimmed_turns: &[ChatMessage],
+    breadcrumb_present: bool,
 ) {
     let persist_lock = acquire_persist_lock(ctx, sender_key);
     let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
 
-    if let Some(ref store) = ctx.session_store
-        && let Err(e) = store.rewrite_messages(sender_key, trimmed_turns)
-    {
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-            "Failed to persist trimmed session history"
-        );
+    if let Some(ref store) = ctx.session_store {
+        if let Err(e) = store.rewrite_messages(sender_key, trimmed_turns) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to persist trimmed session history"
+            );
+        }
+        if let Err(e) = store.set_session_trim_breadcrumb(sender_key, breadcrumb_present) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Failed to persist trim breadcrumb provenance"
+            );
+        }
     }
 
     let mut histories = ctx
@@ -6661,38 +6695,57 @@ async fn process_channel_message_body(
     history.extend(prior_turns);
     // Breadcrumb provenance is carried alongside the transcript so a synthetic
     // crumb is not re-inferred from user-controlled text. The per-sender
-    // `history_crumb_flags` map stores the owner flag for each history_key;
-    // a missing entry is treated as legacy (infer from text), while an
-    // explicit `false` preserves a fresh v2 user-text collision.
-    let mut history_has_trim_breadcrumb = ctx
+    // `history_crumb_flags` in-memory map is checked first; on a cold cache
+    // (e.g. after a restart) the durable session store's canonical column is
+    // consulted next, since it survives process restarts. Only when neither
+    // has ever recorded a flag for this sender do we fall back to inferring
+    // from the restored transcript — legacy sessions predating this column.
+    let mut history_has_trim_breadcrumb = match ctx
         .history_crumb_flags
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&history_key)
         .copied()
-        .unwrap_or_else(|| {
-            // Legacy fallback: no flag stored for this sender — infer from
-            // the restored transcript only for old histories. A fresh v2
-            // session that happens to start with the breadcrumb text will
-            // have an explicit `false` entry after its first turn, so it
-            // will not be misclassified here.
-            let leading_system = history.iter().take_while(|m| m.role == "system").count();
-            if let Some(first) = history.get(leading_system) {
-                let crumb =
-                    zeroclaw_runtime::i18n::get_required_cli_string("history-trim-breadcrumb");
-                first.role == "user" && first.content == crumb
-            } else {
-                false
-            }
-        });
+    {
+        Some(flag) => flag,
+        None => ctx
+            .session_store
+            .as_ref()
+            .and_then(|store| {
+                store
+                    .get_session_trim_breadcrumb(&history_key)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_else(|| {
+                // Legacy fallback: no flag stored anywhere for this sender —
+                // infer from the restored transcript only for old histories.
+                // A fresh v2 session that happens to start with the
+                // breadcrumb text will have an explicit `false` entry after
+                // its first turn, so it will not be misclassified here.
+                let leading_system = history.iter().take_while(|m| m.role == "system").count();
+                if let Some(first) = history.get(leading_system) {
+                    let crumb =
+                        zeroclaw_runtime::i18n::get_required_cli_string("history-trim-breadcrumb");
+                    first.role == "user" && first.content == crumb
+                } else {
+                    false
+                }
+            }),
+    };
     let crumb_present_before_loop = history_has_trim_breadcrumb;
 
+    // Kept so a post-loop trim resync can restore the current turn to this
+    // clean content before persisting; the durable transcript must never
+    // carry the volatile preamble (see the resync call below).
+    let mut outgoing_user_turn_raw_content: Option<String> = None;
     let preamble = build_channel_turn_context_preamble(&msg, target_channel.as_ref());
     if let Some(last_turn) = history.last_mut()
         && last_turn.role == "user"
     {
         let raw_content = last_turn.content.clone();
         last_turn.content = compose_outgoing_user_turn_with_context(&preamble, &raw_content);
+        outgoing_user_turn_raw_content = Some(raw_content);
     }
 
     let matrix_single_message_streaming =
@@ -7473,7 +7526,16 @@ async fn process_channel_message_body(
     if history_has_trim_breadcrumb != crumb_present_before_loop
         || retained_prior_turns.len() != prior_turns_len_before_loop
     {
-        resync_sender_history_after_trim(ctx.as_ref(), &history_key, retained_prior_turns);
+        let clean_retained_turns = strip_volatile_preamble_before_persist(
+            retained_prior_turns,
+            outgoing_user_turn_raw_content.as_deref(),
+        );
+        resync_sender_history_after_trim(
+            ctx.as_ref(),
+            &history_key,
+            &clean_retained_turns,
+            history_has_trim_breadcrumb,
+        );
     }
 
     let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {
@@ -13717,6 +13779,41 @@ fn concurrent_persist_lock_serialization() {
     );
 }
 
+#[cfg(test)]
+#[test]
+fn strip_volatile_preamble_before_persist_restores_clean_content() {
+    use zeroclaw_providers::ChatMessage;
+
+    let old_turn = ChatMessage::user("older turn that survives the trim");
+    let enriched_current_turn = ChatMessage::user(
+        "[turn-context] reply_target=#general sender=@alice message_id=42\n\
+         [memory] the user prefers concise answers\n\n\
+         what's the weather like?",
+    );
+    let retained = vec![old_turn.clone(), enriched_current_turn];
+
+    let cleaned =
+        strip_volatile_preamble_before_persist(&retained, Some("what's the weather like?"));
+
+    assert_eq!(cleaned[0].content, old_turn.content);
+    assert_eq!(
+        cleaned[1].content, "what's the weather like?",
+        "the durable transcript must store the raw user turn, not the \
+         preamble-enriched working copy with routing metadata and recalled memory"
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn strip_volatile_preamble_before_persist_is_a_no_op_without_raw_content() {
+    use zeroclaw_providers::ChatMessage;
+
+    let retained = vec![ChatMessage::user("no preamble was injected this turn")];
+    let cleaned = strip_volatile_preamble_before_persist(&retained, None);
+
+    assert_eq!(cleaned[0].content, retained[0].content);
+}
+
 // ── Channel trim resync test ─────────────────────────────
 // Lives outside `mod tests` so it has direct access to `resync_sender_history_after_trim`.
 
@@ -13737,6 +13834,7 @@ fn channel_trim_resync_survives_restart() {
     #[derive(Default)]
     struct RewritableBackend {
         messages: StdMutex<Vec<ChatMessage>>,
+        breadcrumb: StdMutex<Option<bool>>,
     }
     impl SessionBackend for RewritableBackend {
         fn load(&self, _key: &str) -> Vec<ChatMessage> {
@@ -13766,6 +13864,13 @@ fn channel_trim_resync_survives_restart() {
         fn rewrite_messages(&self, _key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
             *self.messages.lock().unwrap_or_else(|e| e.into_inner()) = messages.to_vec();
             Ok(())
+        }
+        fn set_session_trim_breadcrumb(&self, _key: &str, present: bool) -> std::io::Result<()> {
+            *self.breadcrumb.lock().unwrap_or_else(|e| e.into_inner()) = Some(present);
+            Ok(())
+        }
+        fn get_session_trim_breadcrumb(&self, _key: &str) -> std::io::Result<Option<bool>> {
+            Ok(*self.breadcrumb.lock().unwrap_or_else(|e| e.into_inner()))
         }
     }
 
@@ -13894,7 +13999,7 @@ fn channel_trim_resync_survives_restart() {
     // The tool-call loop trimmed its own working buffer: the two old turns
     // are gone and a breadcrumb was inserted ahead of the retained turn.
     let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
-    resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns);
+    resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns, true);
 
     // The in-memory cache must reflect the trim immediately.
     let cached = ctx
@@ -13926,6 +14031,13 @@ fn channel_trim_resync_survives_restart() {
         reloaded.iter().filter(|m| same(m, &breadcrumb)).count(),
         1,
         "the breadcrumb must be present exactly once, not duplicated across trims"
+    );
+    assert_eq!(
+        backend
+            .get_session_trim_breadcrumb(&sender)
+            .expect("breadcrumb flag read"),
+        Some(true),
+        "the durable breadcrumb flag must survive a restart, not just the in-memory cache"
     );
 
     // A second message that only forwards new turns (the ordinary
