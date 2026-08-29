@@ -13717,6 +13717,238 @@ fn concurrent_persist_lock_serialization() {
     );
 }
 
+// ── Channel trim resync test ─────────────────────────────
+// Lives outside `mod tests` so it has direct access to `resync_sender_history_after_trim`.
+
+#[cfg(test)]
+#[test]
+fn channel_trim_resync_survives_restart() {
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_infra::session_backend::SessionBackend;
+    use zeroclaw_providers::ChatMessage;
+    use zeroclaw_runtime::approval::ApprovalManager;
+    use zeroclaw_runtime::observability::NoopObserver;
+
+    // A durable backend that supports `rewrite_messages`, mirroring the
+    // JSONL/SQLite backends this fix targets (the default trait impl is a
+    // no-op, which is exactly the pre-fix bug: a trim would vanish on
+    // reload). Standing in for "restart", `load` always re-reads from this
+    // same store rather than any process-local cache.
+    #[derive(Default)]
+    struct RewritableBackend {
+        messages: StdMutex<Vec<ChatMessage>>,
+    }
+    impl SessionBackend for RewritableBackend {
+        fn load(&self, _key: &str) -> Vec<ChatMessage> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+        fn append(&self, _key: &str, msg: &ChatMessage) -> std::io::Result<()> {
+            self.messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(msg.clone());
+            Ok(())
+        }
+        fn remove_last(&self, _key: &str) -> std::io::Result<bool> {
+            Ok(self
+                .messages
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pop()
+                .is_some())
+        }
+        fn list_sessions(&self) -> Vec<String> {
+            vec![]
+        }
+        fn rewrite_messages(&self, _key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+            *self.messages.lock().unwrap_or_else(|e| e.into_inner()) = messages.to_vec();
+            Ok(())
+        }
+    }
+
+    let sender = "trim_resync_test_key".to_string();
+    let backend = Arc::new(RewritableBackend::default());
+
+    // Simulate the pre-trim sender transcript: two old turns that a token
+    // trim is about to drop, plus a synthetic breadcrumb and the retained
+    // recent turn.
+    let dropped_turn = ChatMessage::user("first old turn that gets trimmed away");
+    let dropped_reply = ChatMessage::assistant("first old reply that gets trimmed away");
+    let breadcrumb = ChatMessage::system("(earlier history was trimmed)");
+    let retained_turn = ChatMessage::user("most recent turn that survives the trim");
+    backend.append(&sender, &dropped_turn).expect("seed append");
+    backend
+        .append(&sender, &dropped_reply)
+        .expect("seed append");
+    backend
+        .append(&sender, &retained_turn)
+        .expect("seed append");
+
+    let ctx = Arc::new(ChannelRuntimeContext {
+        channels_by_name: Arc::new(HashMap::new()),
+        model_provider: Arc::new(tests::DummyModelProvider),
+        model_provider_ref: Arc::new("test".into()),
+        agent_alias: Arc::new("test".into()),
+        agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+        memory: Arc::new(tests::NoopMemory),
+        memory_strategy: Arc::new(
+            zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                Arc::new(tests::NoopMemory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            ),
+        ),
+        tools_registry: Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+        ),
+        observer: Arc::new(NoopObserver),
+        system_prompt: Arc::new(String::new()),
+        model: Arc::new("test".into()),
+        temperature: Some(0.0),
+        auto_save_memory: false,
+        max_tool_iterations: 5,
+        min_relevance_score: 0.0,
+        conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+        ))),
+        pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+        history_crumb_flags: Arc::new(Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                .expect("MAX_CONVERSATION_SENDERS must be positive"),
+        ))),
+        provider_cache: Arc::new(Mutex::new(HashMap::new())),
+        route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        thinking_overrides: Arc::new(Mutex::new(HashMap::new())),
+        scope_overrides: Arc::new(Mutex::new(HashMap::new())),
+        reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+        interrupt_on_new_message: InterruptOnNewMessageConfig {
+            telegram: false,
+            slack: false,
+            discord: false,
+            mattermost: false,
+            matrix: false,
+            whatsapp: false,
+        },
+        multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+        media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+        transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+        agent_transcription_provider: String::new(),
+        hooks: None,
+        provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+        workspace_dir: Arc::new(std::env::temp_dir()),
+        prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
+        message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+        non_cli_excluded_tools: Arc::new(Vec::new()),
+        autonomy_level: AutonomyLevel::default(),
+        tool_call_dedup_exempt: Arc::new(Vec::new()),
+        model_routes: Arc::new(Vec::new()),
+        query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+        ack_reactions: true,
+        show_tool_calls: true,
+        session_store: Some(backend.clone() as Arc<dyn SessionBackend>),
+        approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+        )),
+        activated_tools: None,
+        cost_tracking: None,
+        pacing: zeroclaw_config::schema::PacingConfig::default(),
+        max_tool_result_chars: 0,
+        context_token_budget: 0,
+        debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+            std::time::Duration::ZERO,
+        )),
+        receipt_generator: None,
+        show_receipts_in_response: false,
+        last_applied_config_stamp: Arc::new(Mutex::new(None)),
+        runtime_defaults_override: Arc::new(Mutex::new(None)),
+        persist_locks: Arc::new(Mutex::new(HashMap::new())),
+        sop_engine: None,
+        sop_audit: None,
+    });
+
+    // Pre-trim cache mirrors the pre-trim durable transcript.
+    ctx.conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .push(
+            sender.clone(),
+            vec![
+                dropped_turn.clone(),
+                dropped_reply.clone(),
+                retained_turn.clone(),
+            ],
+        );
+
+    // `ChatMessage` doesn't implement `PartialEq`, so compare on
+    // (role, content) instead.
+    fn same(a: &ChatMessage, b: &ChatMessage) -> bool {
+        a.role == b.role && a.content == b.content
+    }
+    fn same_as_any(msgs: &[ChatMessage], target: &ChatMessage) -> bool {
+        msgs.iter().any(|m| same(m, target))
+    }
+
+    // The tool-call loop trimmed its own working buffer: the two old turns
+    // are gone and a breadcrumb was inserted ahead of the retained turn.
+    let trimmed_turns = vec![breadcrumb.clone(), retained_turn.clone()];
+    resync_sender_history_after_trim(ctx.as_ref(), &sender, &trimmed_turns);
+
+    // The in-memory cache must reflect the trim immediately.
+    let cached = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .peek(&sender)
+        .expect("history must exist for sender")
+        .clone();
+    assert!(
+        cached.len() == trimmed_turns.len()
+            && cached.iter().zip(&trimmed_turns).all(|(a, b)| same(a, b)),
+        "cache must be resynced to the loop's trimmed history"
+    );
+
+    // Simulate a daemon restart: reload straight from the durable backend,
+    // bypassing any in-process cache.
+    let reloaded = backend.load(&sender);
+    assert!(
+        reloaded.len() == trimmed_turns.len()
+            && reloaded.iter().zip(&trimmed_turns).all(|(a, b)| same(a, b)),
+        "durable store must be resynced so a restart cannot resurrect dropped turns"
+    );
+    assert!(
+        !same_as_any(&reloaded, &dropped_turn) && !same_as_any(&reloaded, &dropped_reply),
+        "dropped turns must stay absent from the durable transcript after a restart"
+    );
+    assert_eq!(
+        reloaded.iter().filter(|m| same(m, &breadcrumb)).count(),
+        1,
+        "the breadcrumb must be present exactly once, not duplicated across trims"
+    );
+
+    // A second message that only forwards new turns (the ordinary
+    // `append_sender_turn` path) must build on the resynced, trimmed base —
+    // not resurrect the pre-trim transcript.
+    backend
+        .append(&sender, &ChatMessage::user("second message after the trim"))
+        .expect("append after resync");
+    let after_second_message = backend.load(&sender);
+    assert!(
+        !same_as_any(&after_second_message, &dropped_turn),
+        "the dropped turn must stay absent after a later message"
+    );
+    assert_eq!(
+        after_second_message
+            .iter()
+            .filter(|m| same(m, &breadcrumb))
+            .count(),
+        1,
+        "the breadcrumb must still appear exactly once after a later message"
+    );
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

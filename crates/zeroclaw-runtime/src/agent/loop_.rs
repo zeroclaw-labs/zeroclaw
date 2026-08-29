@@ -18134,6 +18134,203 @@ Let me check the result."#;
     }
 
     #[tokio::test]
+    async fn dropping_an_old_multimodal_turn_does_not_report_a_false_floor() {
+        // The pre-dispatch gate's internal trim loop measures a raw
+        // marker-based estimate for durable history but reserves a "growth"
+        // delta computed against the ACTUAL post-preparation population
+        // (which expands `[IMAGE:...]` markers into real base64 payloads).
+        // When the image-bearing turn is the one dropped, that delta is
+        // stale: the image is gone, but the heuristic still reserves its
+        // size and can internally conclude the request is an unsatisfiable
+        // floor. The caller must re-measure the actually-rebuilt request
+        // (which no longer contains the dropped image) and must NOT surface
+        // a floor that the real, smaller request does not hit.
+
+        #[derive(Default)]
+        struct CapturingVisionProvider {
+            requests: Arc<Mutex<Vec<Vec<String>>>>,
+        }
+
+        #[async_trait]
+        impl ModelProvider for CapturingVisionProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                anyhow::bail!("chat_with_system should not be used in this test");
+            }
+
+            async fn chat(
+                &self,
+                request: ChatRequest<'_>,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<ChatResponse> {
+                self.requests
+                    .lock()
+                    .expect("requests lock should be valid")
+                    .push(request.messages.iter().map(|m| m.content.clone()).collect());
+                Ok(ChatResponse {
+                    text: Some("done".to_string()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_vision(&self) -> bool {
+                // A vision-capable provider: the image marker is expanded in
+                // place rather than routed to a separate vision provider or
+                // stripped, matching the common case this bug affects.
+                true
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for CapturingVisionProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "CapturingVisionProvider"
+            }
+        }
+
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("shot.png");
+        // PNG signature plus filler bytes so the base64-expanded payload is
+        // large enough to dwarf the raw `[IMAGE:...]` marker text — the
+        // exact mismatch the gate's heuristic must not misattribute after
+        // the carrying turn is dropped.
+        let mut image_bytes = vec![0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'];
+        image_bytes.extend(std::iter::repeat_n(0u8, 3_000));
+        std::fs::write(&image_path, &image_bytes).unwrap();
+        let marker = format!("[IMAGE:{}]", image_path.display());
+
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user(format!("old turn with an attachment {marker}")),
+            ChatMessage::assistant("ok".to_string()),
+            ChatMessage::user("run once, no attachment this time".to_string()),
+        ];
+        let mut crumb_present = false;
+        let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+
+        let provider = CapturingVisionProvider::default();
+        let requests = Arc::clone(&provider.requests);
+        let observer = NoopObserver;
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    // Between the image-expanded population (well over
+                    // 1,000 estimated tokens for a ~3KB attachment) and the
+                    // real rebuilt population once that turn is dropped
+                    // (well under 100 tokens for two short text messages).
+                    context_token_budget: 500,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: Some(&mut image_cache),
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+            }),
+        )
+        .await
+        .expect("tool loop should succeed");
+
+        let captured = requests.lock().unwrap().clone();
+        assert_eq!(captured.len(), 1, "one iteration must dispatch one request");
+        assert!(
+            !captured[0]
+                .iter()
+                .any(|content| content.contains("old turn with an attachment")),
+            "the dispatched request must not contain the dropped old turn"
+        );
+
+        let mut saw_trim = false;
+        let mut saw_false_floor = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                unsatisfiable_floor,
+                dropped_messages,
+                ..
+            } = event
+            {
+                if dropped_messages > 0 {
+                    saw_trim = true;
+                }
+                if unsatisfiable_floor == Some(true) {
+                    saw_false_floor = true;
+                }
+            }
+        }
+        assert!(
+            saw_trim,
+            "the old image-bearing turn must actually be dropped"
+        );
+        assert!(
+            !saw_false_floor,
+            "the rebuilt request no longer carries the dropped image and fits \
+             the budget, so it must not be reported as an unsatisfiable floor"
+        );
+    }
+
+    #[tokio::test]
     async fn agent_turn_propagates_resolved_agent_alias_to_observer_events() {
         // Regression guard: process_message resolves agent_alias but
         // agent_turn hardcoded `agent_alias: None` in the ToolLoop it built,

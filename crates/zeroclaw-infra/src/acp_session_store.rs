@@ -1667,4 +1667,92 @@ mod tests {
         // unknown source → 0
         assert_eq!(store.rename_sessions_by_agent("ghost", "x").unwrap(), 0);
     }
+
+    #[test]
+    fn trim_breadcrumb_provenance_is_a_canonical_column_not_inferred_from_text() {
+        // Regression: restore call sites used to infer breadcrumb ownership by
+        // comparing the first stored message's text against the localized
+        // breadcrumb string. A genuine user turn that happens to contain that
+        // exact text must NOT be misclassified as a synthetic breadcrumb, and
+        // a session that never trimmed must restore with `trim_breadcrumb ==
+        // false` regardless of message content.
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-genuine-text", "alpha", "/tmp/proj")
+            .unwrap();
+        // A real user message that happens to equal a breadcrumb-shaped string.
+        store
+            .append_turn(
+                "sess-genuine-text",
+                &[ConversationMessage::Chat(ChatMessage::user(
+                    "(earlier history was trimmed)",
+                ))],
+            )
+            .unwrap();
+
+        let restored = match store.load_session_for_restore("sess-genuine-text").unwrap() {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            !restored.trim_breadcrumb,
+            "a genuine user message with breadcrumb-shaped text must not be \
+             classified as a synthetic breadcrumb absent an explicit flag"
+        );
+    }
+
+    #[test]
+    fn trim_breadcrumb_survives_restore_and_a_second_trim() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-trimmed", "alpha", "/tmp/proj")
+            .unwrap();
+        store
+            .append_turn(
+                "sess-trimmed",
+                &[ConversationMessage::Chat(ChatMessage::user(
+                    "most recent turn",
+                ))],
+            )
+            .unwrap();
+
+        // First trim: mark the session as carrying a synthetic breadcrumb.
+        store.set_trim_breadcrumb("sess-trimmed", true).unwrap();
+        let restored = match store.load_session_for_restore("sess-trimmed").unwrap() {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            restored.trim_breadcrumb,
+            "the flag must be readable immediately after being set, as a \
+             restart would read it"
+        );
+
+        // A second trim on the same session (e.g. the next turn overflows
+        // again) must leave the flag true, not toggle or duplicate it.
+        store.set_trim_breadcrumb("sess-trimmed", true).unwrap();
+        let restored_again = match store.load_session_for_restore("sess-trimmed").unwrap() {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            restored_again.trim_breadcrumb,
+            "the breadcrumb flag must remain true across a second trim"
+        );
+
+        // Clearing it (e.g. `clear_history`) must be independently observable.
+        store.set_trim_breadcrumb("sess-trimmed", false).unwrap();
+        let restored_cleared = match store.load_session_for_restore("sess-trimmed").unwrap() {
+            AcpSessionRestore::Restorable(data) => data,
+            AcpSessionRestore::Missing => panic!("expected a restorable session, got Missing"),
+            AcpSessionRestore::Killed => panic!("expected a restorable session, got Killed"),
+        };
+        assert!(
+            !restored_cleared.trim_breadcrumb,
+            "the flag must be explicitly clearable and not re-inferred from history text"
+        );
+    }
 }
