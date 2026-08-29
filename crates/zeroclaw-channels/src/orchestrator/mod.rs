@@ -77,7 +77,7 @@ pub use crate::wecom_ws::WeComWsChannel;
 use crate::wecom_ws::WeComWsRuntimePolicy;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
-pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+pub use zeroclaw_api::channel::{Channel, ChannelMessage, ListenerHealth, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
 pub use crate::link_enricher;
@@ -4730,11 +4730,21 @@ fn spawn_supervised_listener(
 ///
 /// A channel with no signal to give (`None`, the default) is recorded exactly as
 /// it was before this existed.
+///
+/// `Pending` records *nothing*. Stamping `ok` for a listener that has not yet
+/// completed an exchange is the original bug in slower form: the component
+/// would read healthy before the channel had ever reached the service. Leaving
+/// it alone keeps it at whatever it already was — `starting`, with no `last_ok`,
+/// for a listener that has just come up.
 fn mark_listener_health(ch: &dyn Channel, component: &str) {
-    if ch.listener_health() == Some(false) {
-        zeroclaw_runtime::health::mark_component_error(component, "channel reported unhealthy");
-    } else {
-        zeroclaw_runtime::health::mark_component_ok(component);
+    match ch.listener_health() {
+        None | Some(ListenerHealth::Healthy) => {
+            zeroclaw_runtime::health::mark_component_ok(component);
+        }
+        Some(ListenerHealth::Unhealthy) => {
+            zeroclaw_runtime::health::mark_component_error(component, "channel reported unhealthy");
+        }
+        Some(ListenerHealth::Pending) => {}
     }
 }
 
@@ -29589,21 +29599,28 @@ This is an example JSON object for profile settings."#;
     /// — the ones that, on real channels, post a message or open a connection.
     struct ObservedChannel {
         name: String,
-        report: Option<bool>,
+        /// Mutable so a test can model a channel whose answer *changes* — a
+        /// constant report cannot express "succeeded once, then stopped
+        /// completing exchanges", which is the staleness case that matters.
+        report: parking_lot::Mutex<Option<ListenerHealth>>,
         observations: Arc<AtomicUsize>,
         probes: Arc<AtomicUsize>,
         calls: Arc<AtomicUsize>,
     }
 
     impl ObservedChannel {
-        fn reporting(name: String, report: Option<bool>) -> Self {
+        fn reporting(name: String, report: Option<ListenerHealth>) -> Self {
             Self {
                 name,
-                report,
+                report: parking_lot::Mutex::new(report),
                 observations: Arc::new(AtomicUsize::new(0)),
                 probes: Arc::new(AtomicUsize::new(0)),
                 calls: Arc::new(AtomicUsize::new(0)),
             }
+        }
+
+        fn set_report(&self, report: Option<ListenerHealth>) {
+            *self.report.lock() = report;
         }
     }
 
@@ -29637,9 +29654,9 @@ This is an example JSON object for profile settings."#;
             Ok(())
         }
 
-        fn listener_health(&self) -> Option<bool> {
+        fn listener_health(&self) -> Option<ListenerHealth> {
             self.observations.fetch_add(1, Ordering::SeqCst);
-            self.report
+            *self.report.lock()
         }
 
         async fn health_check(&self) -> bool {
@@ -29916,7 +29933,10 @@ This is an example JSON object for profile settings."#;
         // the supervisor used to keep stamping `ok` on every heartbeat.
         let channel_name = format!("test-never-connects-{}", uuid::Uuid::new_v4());
         let component_name = format!("channel:{channel_name}");
-        let inner = Arc::new(ObservedChannel::reporting(channel_name, Some(false)));
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Unhealthy),
+        ));
         let calls = Arc::clone(&inner.calls);
         let probes = Arc::clone(&inner.probes);
         let channel: Arc<dyn Channel> = inner;
@@ -29967,7 +29987,10 @@ This is an example JSON object for profile settings."#;
         // supervisor must never reach it.
         let channel_name = format!("test-passive-observation-{}", uuid::Uuid::new_v4());
         let component_name = format!("channel:{channel_name}");
-        let inner = Arc::new(ObservedChannel::reporting(channel_name, Some(true)));
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Healthy),
+        ));
         let probes = Arc::clone(&inner.probes);
         let observations = Arc::clone(&inner.observations);
         let channel: Arc<dyn Channel> = inner;
@@ -30017,7 +30040,10 @@ This is an example JSON object for profile settings."#;
         // double up on the pre-listen observation. The heartbeat's first tick
         // belongs one interval out.
         let channel_name = format!("test-observation-cadence-{}", uuid::Uuid::new_v4());
-        let inner = Arc::new(ObservedChannel::reporting(channel_name, Some(true)));
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Healthy),
+        ));
         let observations = Arc::clone(&inner.observations);
         let channel: Arc<dyn Channel> = inner;
 
@@ -30038,6 +30064,109 @@ This is an example JSON object for profile settings."#;
             observations.load(Ordering::SeqCst),
             1,
             "only the pre-listen observation should have run inside one interval"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_does_not_report_ok_before_the_first_exchange() {
+        // A listener that has only just started has not reached the service
+        // yet. Recording `ok` for it is the original "never connected" bug in
+        // slower form: if the first request never completes, `/health` reports
+        // a healthy channel forever.
+        let channel_name = format!("test-pending-observation-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Pending),
+        ));
+        let channel: Arc<dyn Channel> = inner;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(120)).await;
+
+        let snapshot = zeroclaw_runtime::health::snapshot_json();
+        let component = &snapshot["components"][&component_name];
+        assert_ne!(
+            component["status"], "ok",
+            "a channel that has not completed an exchange must not read ok; got {component}"
+        );
+        assert!(
+            component["last_ok"].is_null(),
+            "nothing has succeeded, so last_ok must be unset; got {component}"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_stops_refreshing_ok_once_a_success_goes_stale() {
+        // One successful exchange, then the next one never completes. The old
+        // success must stop counting: otherwise every heartbeat re-stamps a
+        // current `last_ok` for a channel that has not talked to the service
+        // since, which reads as freshly healthy indefinitely.
+        let channel_name = format!("test-stale-observation-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Healthy),
+        ));
+        let reporter = Arc::clone(&inner);
+        let channel: Arc<dyn Channel> = inner;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let healthy = zeroclaw_runtime::health::snapshot_json();
+        let healthy = &healthy["components"][&component_name];
+        assert_eq!(
+            healthy["status"], "ok",
+            "a fresh success is recorded as ok; got {healthy}"
+        );
+        let stamped_while_healthy = healthy["last_ok"].clone();
+        assert!(!stamped_while_healthy.is_null(), "expected a last_ok stamp");
+
+        // The channel's own freshness rule has now expired its last success.
+        reporter.set_report(Some(ListenerHealth::Unhealthy));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let stale = zeroclaw_runtime::health::snapshot_json();
+        let stale = &stale["components"][&component_name];
+        assert_eq!(
+            stale["status"], "error",
+            "a stale success must not keep reading healthy; got {stale}"
+        );
+        assert_eq!(
+            stale["last_ok"], stamped_while_healthy,
+            "last_ok must stop advancing once the success went stale; got {stale}"
         );
 
         cancel.cancel();

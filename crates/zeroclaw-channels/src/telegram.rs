@@ -6,12 +6,22 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
-use zeroclaw_api::channel::{Channel, ChannelMessage, ProgressEvent, SendMessage};
+use zeroclaw_api::channel::{Channel, ChannelMessage, ListenerHealth, ProgressEvent, SendMessage};
 use zeroclaw_config::schema::{Config, StreamMode, TELEGRAM_OFFICIAL_API_BASE_URL};
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::security::pairing::PairingGuard;
 
 /// Telegram's maximum message length for text messages
+/// How long a successful `getUpdates` exchange stays evidence that the listener
+/// is working.
+///
+/// `getUpdates` long-polls with `timeout: 30`, so even an idle-but-healthy
+/// channel completes an exchange about every 30 seconds. Three times that
+/// leaves room for a slow round trip without letting a blackholed request —
+/// which the default runtime client has no timeout to cut short — keep
+/// reporting the last success indefinitely.
+const POLL_HEALTH_STALE_AFTER: Duration = Duration::from_secs(90);
+
 const TELEGRAM_MAX_MESSAGE_LENGTH: usize = 4096;
 const TELEGRAM_CONTINUED_PREFIX: &str = "(continued)\n\n";
 const TELEGRAM_CONTINUES_SUFFIX: &str = "\n\n(continues...)";
@@ -609,11 +619,15 @@ pub struct TelegramChannel {
     mention_only: bool,
     bot_username: Mutex<Option<String>>,
     bot_id: Mutex<Option<i64>>,
-    /// Outcome of the most recent `getUpdates` exchange, or `None` before the
-    /// first one. Read by `listener_health` so a supervisor can tell a
-    /// connected channel from one that is long-polling a rejecting endpoint,
-    /// without issuing a probe of its own.
-    poll_health: Mutex<Option<bool>>,
+    /// Outcome of the most recent `getUpdates` exchange and when it completed,
+    /// or `None` before the first one. Read by `listener_health` so a
+    /// supervisor can tell a connected channel from one that is long-polling a
+    /// rejecting endpoint, without issuing a probe of its own.
+    ///
+    /// The timestamp is load-bearing: a success is only evidence for as long as
+    /// [`POLL_HEALTH_STALE_AFTER`], because a request that blackholes leaves the
+    /// previous success sitting here forever.
+    poll_health: Mutex<Option<(bool, tokio::time::Instant)>>,
     /// Base URL for the Telegram Bot API. Defaults to `https://api.telegram.org`.
     /// Override for local Bot API servers or testing.
     api_base: String,
@@ -1669,7 +1683,7 @@ impl TelegramChannel {
     /// never returns and liveness alone says nothing. Keeping the last outcome
     /// here lets `listener_health` answer that question without a second call.
     fn record_poll_health(&self, ok: bool) {
-        *self.poll_health.lock() = Some(ok);
+        *self.poll_health.lock() = Some((ok, tokio::time::Instant::now()));
     }
 
     fn is_telegram_username_char(ch: char) -> bool {
@@ -4662,8 +4676,16 @@ Ensure only one `zeroclaw` process is using this bot token."
         }
     }
 
-    fn listener_health(&self) -> Option<bool> {
-        *self.poll_health.lock()
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        Some(match *self.poll_health.lock() {
+            None => ListenerHealth::Pending,
+            Some((false, _)) => ListenerHealth::Unhealthy,
+            Some((true, at)) if at.elapsed() < POLL_HEALTH_STALE_AFTER => ListenerHealth::Healthy,
+            // The last exchange succeeded, but nothing has completed since.
+            // A blackholed request keeps `listen()` alive with no timeout to
+            // end it, so the stale success must stop counting as evidence.
+            Some((true, _)) => ListenerHealth::Unhealthy,
+        })
     }
 
     async fn health_check(&self) -> bool {
@@ -5534,8 +5556,8 @@ mod tests {
 
         assert_eq!(
             channel.listener_health(),
-            None,
-            "nothing observed yet, so the channel has no signal to give"
+            Some(ListenerHealth::Pending),
+            "nothing observed yet, so the channel has nothing to report"
         );
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -5543,7 +5565,7 @@ mod tests {
 
         assert_eq!(
             channel.listener_health(),
-            Some(false),
+            Some(ListenerHealth::Unhealthy),
             "a rejected poll must be visible without a second API call"
         );
     }
@@ -5585,8 +5607,53 @@ mod tests {
 
         assert_eq!(
             channel.listener_health(),
-            Some(true),
+            Some(ListenerHealth::Healthy),
             "a channel whose polls are accepted reports itself connected"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn listener_health_expires_a_success_that_stops_being_evidence() {
+        // `getUpdates` long-polls with `timeout: 30`, so a working listener
+        // completes an exchange every ~30s even when idle. The default runtime
+        // client has no request timeout, so a blackholed poll leaves the last
+        // success sitting in the channel with nothing to end it. After
+        // POLL_HEALTH_STALE_AFTER that success stops being evidence.
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+
+        channel.record_poll_health(true);
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Healthy),
+            "a just-recorded success is evidence"
+        );
+
+        // Still inside the window: one missed long-poll cycle is not a fault.
+        tokio::time::advance(POLL_HEALTH_STALE_AFTER - Duration::from_secs(1)).await;
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Healthy),
+            "a success within the window is still evidence"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Unhealthy),
+            "past the window the channel stops vouching for a stale success"
+        );
+
+        // A completed exchange makes it evidence again.
+        channel.record_poll_health(true);
+        assert_eq!(
+            channel.listener_health(),
+            Some(ListenerHealth::Healthy),
+            "a fresh exchange restores the signal"
         );
     }
 
