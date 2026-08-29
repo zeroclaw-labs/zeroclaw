@@ -26,12 +26,27 @@ pub enum ToolProtocolEnvelopeKind {
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     let initial = match raw {
-        Some(serde_json::Value::String(s)) => serde_json::from_str::<serde_json::Value>(s)
-            .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new())),
+        Some(serde_json::Value::String(s)) => parse_arguments_string(s),
         Some(value) => value.clone(),
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     unwrap_nested_json_strings(initial)
+}
+
+/// String-encoded arguments can carry the same python-style `\'` escapes as
+/// the envelope around them; the outer repair does not reach this inner
+/// string, so a failed parse gets one repair retry before degrading to empty
+/// arguments (an empty call would "succeed" into a tool error downstream).
+fn parse_arguments_string(s: &str) -> serde_json::Value {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(s) {
+        return value;
+    }
+    if let Some((repaired, _)) = repair_python_escaped_quotes(s)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&repaired)
+    {
+        return value;
+    }
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 /// Canonical vocabulary of terminal markers emitted by providers that must be
@@ -525,7 +540,15 @@ pub fn looks_like_tool_protocol_example(text: &str) -> bool {
 }
 
 fn has_example_context(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
+    let mut lower = text.to_ascii_lowercase();
+    // RFC 2606 documentation domains are placeholder DATA, not example
+    // narration: models reach for `https://example.com/...` links inside real
+    // leaked commands, and one such URL must not reclassify a genuine leak as
+    // documentation (observed in the field: a leaked `--zoom-link
+    // https://example.com/...` suppressed the whole salvage pass).
+    for domain in ["example.com", "example.org", "example.net"] {
+        lower = lower.replace(domain, "");
+    }
     lower.contains("example")
         || lower.contains("sample")
         || lower.contains("示例")
@@ -3283,6 +3306,41 @@ mod embedded_envelope_salvage_tests {
     fn embedded_envelope_with_example_context_is_an_example() {
         let text = "For example, the internal protocol looks like this: {\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"id\":\"call_1\",\"name\":\"shell\"}]} and the runtime parses it.";
         assert!(looks_like_tool_protocol_example(text));
+    }
+
+    /// SECOND field payload (2026-08-29, the "continue" turn): prose plan,
+    /// then TWO valid envelopes each echoed by a python stub, where (a) a
+    /// leaked command contains an `https://example.com/...` placeholder link
+    /// -- placeholder DATA must not classify the leak as documentation and
+    /// suppress the salvage -- and (b) the second envelope's string-encoded
+    /// arguments carry a python-style `\'` that only the INNER parse sees,
+    /// which previously degraded that call to empty arguments. A trailing
+    /// stub with a literal newline inside a string (unparseable by design)
+    /// must not stop the two good envelopes from salvaging.
+    #[test]
+    fn prose_led_envelopes_with_placeholder_link_and_inner_escape_salvage() {
+        let plan = "Here's the plan to get this webinar draft created correctly.\n";
+        let env1 = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"python3 docx_to_html.py --extract-images assets\"}","id":"call_1","name":"shell"}]}"#;
+        let stub1 = r#"{"content":"Extracting now.","tool_code":"print(shell(\"python3 docx_to_html.py --extract-images assets\"))","tool_name":"shell"}"#;
+        let env2 = r#"{"content":null,"tool_calls":[{"arguments":"{\"command\":\"wp.py webinar-create --caption 'We\\'ll deliver' --zoom-link 'https://example.com/z'\"}","id":"call_2","name":"shell"}]}"#;
+        let bad_stub = "{\"content\":\"I've created it!\nSee the page.\",\"tool_code\":\"print(1)\",\"tool_name\":\"shell\"}";
+        let payload =
+            format!("{plan}{env1}{stub1}Extracting now.\n{env2}{bad_stub}All done for review.");
+
+        assert!(
+            !looks_like_tool_protocol_example(&payload),
+            "a placeholder example.com link inside a leaked command is data, not documentation"
+        );
+
+        let (visible, calls) = parse_tool_calls(&payload);
+        assert_eq!(calls.len(), 2, "both envelopes salvage: {calls:?}");
+        assert!(calls.iter().all(|c| c.name == "shell"));
+        let second = calls[1].arguments["command"].as_str().unwrap_or_default();
+        assert!(
+            second.contains("webinar-create") && second.contains("We'll deliver"),
+            "inner \\' repair must recover the second command, got: {second}"
+        );
+        assert!(visible.contains("Here's the plan"), "narration is kept");
     }
 
     #[test]
