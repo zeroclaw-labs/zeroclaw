@@ -17366,7 +17366,9 @@ Let me check the result."#;
                     model: "mock-model",
                     temperature: Some(0.0),
                 },
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ),
                 observer: &observer,
                 silent: true,
                 approval: None,
@@ -17552,10 +17554,10 @@ Let me check the result."#;
             ChatMessage::user("run the tool once"),
         ];
         let tool_calls = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&tool_calls),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&tool_calls)),
+            )]);
         let (event_tx, _event_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -17672,7 +17674,9 @@ Let me check the result."#;
                     model: "mock-model",
                     temperature: Some(0.0),
                 },
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    Vec::new(),
+                ),
                 observer: &observer,
                 silent: true,
                 approval: None,
@@ -17826,10 +17830,10 @@ Let me check the result."#;
         ];
         let mut test_crumb_present = false;
         let tool_calls = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&tool_calls),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&tool_calls)),
+            )]);
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -18028,10 +18032,10 @@ Let me check the result."#;
         ];
         let mut crumb_present = false;
         let tool_calls = Arc::new(AtomicUsize::new(0));
-        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
-            "count_tool",
-            Arc::clone(&tool_calls),
-        ))];
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                CountingTool::new("count_tool", Arc::clone(&tool_calls)),
+            )]);
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
         let turn_id = uuid::Uuid::new_v4().to_string();
