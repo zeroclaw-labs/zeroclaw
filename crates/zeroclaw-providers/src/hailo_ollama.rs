@@ -133,8 +133,18 @@ fn canonical_endpoint(endpoint: &str) -> String {
         host.eq_ignore_ascii_case("localhost")
             || host
                 .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
-            || host == "0.0.0.0"
+                .is_ok_and(|address| match address {
+                    std::net::IpAddr::V4(address) => {
+                        address.is_loopback() || address.is_unspecified()
+                    }
+                    std::net::IpAddr::V6(address) => {
+                        address.is_loopback()
+                            || address.is_unspecified()
+                            || address.to_ipv4().is_some_and(|mapped| {
+                                mapped.is_loopback() || mapped.is_unspecified()
+                            })
+                    }
+                })
     });
     if is_loopback_alias {
         let _ = url.set_host(Some("localhost"));
@@ -1689,6 +1699,14 @@ mod tests {
         assert_eq!(
             canonical_endpoint("http://localhost.:8000"),
             canonical_endpoint("http://127.0.0.2:8000")
+        );
+        assert_eq!(
+            canonical_endpoint("http://localhost:8000"),
+            canonical_endpoint("http://[::ffff:127.0.0.1]:8000")
+        );
+        assert_eq!(
+            canonical_endpoint("http://localhost:8000"),
+            canonical_endpoint("http://[::]:8000")
         );
     }
 
