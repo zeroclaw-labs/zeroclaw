@@ -1181,6 +1181,65 @@ mod tests {
     }
 
     #[test]
+    fn repeated_interactive_recovery_keeps_one_breadcrumb_and_real_turn_counts() {
+        // Mirrors the interactive overflow-recovery sequence in
+        // `agent::loop_`: on each provider context-overflow error it must
+        // call the crumb-aware trim with the owner's current flag, then
+        // insert the breadcrumb only if it isn't already present. A
+        // crumb-blind call (the pre-fix bug) would treat an existing
+        // synthetic breadcrumb as the oldest real user turn and drop it as
+        // though real history had been removed.
+        let big = "x".repeat(400);
+        let mut history = vec![sys("system")];
+        for i in 0..6 {
+            history.push(user(&format!("turn {i} {big}")));
+            history.push(asst(&format!("reply {i} {big}")));
+        }
+        let mut crumb_present = false;
+
+        // First overflow: trims some real turns and inserts the crumb.
+        let budget_after_first_trim = estimate_history_tokens(&history) / 2;
+        let result = trim_to_recent_turns_with_crumb(
+            std::mem::take(&mut history),
+            budget_after_first_trim,
+            crumb_present,
+        );
+        assert!(result.trimmed, "fixture must overflow the first budget");
+        history = result.history;
+        crumb_present = insert_breadcrumb_deduped(&mut history, crumb_present);
+        assert!(crumb_present);
+        let real_turns_after_first = history.iter().filter(|m| is_turn_boundary(m)).count() - /* crumb counts as a user turn boundary */ 1;
+
+        // Second overflow on the already-recovered history: the crumb must
+        // not be miscounted as a droppable real turn, and inserting again
+        // must not stack a second marker.
+        let budget_after_second_trim = estimate_history_tokens(&history) / 2;
+        let result = trim_to_recent_turns_with_crumb(
+            std::mem::take(&mut history),
+            budget_after_second_trim,
+            crumb_present,
+        );
+        history = result.history;
+        crumb_present = insert_breadcrumb_deduped(&mut history, crumb_present);
+        assert!(crumb_present);
+
+        let crumbs = history
+            .iter()
+            .filter(|m| m.role == breadcrumb().role && m.content == breadcrumb().content)
+            .count();
+        assert_eq!(
+            crumbs, 1,
+            "repeated recovery must never stack a second synthetic breadcrumb"
+        );
+        assert!(
+            result.kept_turns <= real_turns_after_first,
+            "the second recovery must not report more kept real turns than existed \
+             before it (kept_turns {}, real turns before {real_turns_after_first})",
+            result.kept_turns
+        );
+    }
+
+    #[test]
     fn insert_breadcrumb_deduped_sits_after_leading_system() {
         let mut h = vec![sys("s1"), sys("s2"), user("turn1"), asst("a1")];
         insert_breadcrumb_deduped(&mut h, false);

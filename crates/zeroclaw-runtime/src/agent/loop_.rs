@@ -2656,20 +2656,25 @@ pub async fn run(
                                 );
                                 let taken = std::mem::take(&mut history);
                                 let recovery_budget = eff_model_context_window * 9 / 10;
-                                let result = crate::agent::history_trim::trim_to_recent_turns(
-                                    taken,
-                                    recovery_budget,
-                                );
+                                let crumb_present_before_recovery = history_has_trim_breadcrumb;
+                                let result =
+                                    crate::agent::history_trim::trim_to_recent_turns_with_crumb(
+                                        taken,
+                                        recovery_budget,
+                                        crumb_present_before_recovery,
+                                    );
                                 if result.trimmed {
                                     let mut trimmed = result.history;
-                                    let system_count =
-                                        trimmed.iter().take_while(|m| m.role == "system").count();
-                                    trimmed.insert(
-                                        system_count,
-                                        crate::agent::history_trim::breadcrumb(),
-                                    );
+                                    // Owner-aware insertion: does not stack a
+                                    // second marker when the existing
+                                    // breadcrumb (protected from drop above)
+                                    // is still present.
+                                    history_has_trim_breadcrumb =
+                                        crate::agent::history_trim::insert_breadcrumb_deduped(
+                                            &mut trimmed,
+                                            crumb_present_before_recovery,
+                                        );
                                     history = trimmed;
-                                    history_has_trim_breadcrumb = true;
                                     {
                                         let __zc_trim_span = ::zeroclaw_log::info_span!(
                                             target: "zeroclaw_log_internal_scope",
