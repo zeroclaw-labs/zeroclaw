@@ -611,6 +611,131 @@ mod cost_usd_regression_tests {
         zeroclaw_log::clear_broadcast_hook();
     }
 
+    fn embedded_envelope_ctx<'a>(
+        pacing: &'a zeroclaw_config::schema::PacingConfig,
+        dedup_exempt_tools: &'a [String],
+        turn_id: &'a str,
+    ) -> TurnCtx<'a> {
+        TurnCtx {
+            parent_agent_alias: None,
+            observer: &crate::observability::NoopObserver,
+            provider_name: "openai.codex",
+            model: "gpt-5.6",
+            temperature: None,
+            approval: None,
+            channel_name: "",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            event_tx: None,
+            hooks: None,
+            dedup_exempt_tools,
+            pacing,
+            strict_tool_parsing: false,
+            channel: None,
+            agent_alias: None,
+            draft_reasoning: zeroclaw_config::schema::StreamReasoningMode::Status,
+            turn_id,
+        }
+    }
+
+    fn shell_specs() -> IterationToolSpecs {
+        IterationToolSpecs {
+            tool_specs: vec![crate::tools::ToolSpec::new(
+                "shell",
+                "run a command",
+                serde_json::json!({"type": "object"}),
+            )],
+            known_tool_names: HashSet::from(["shell".to_string()]),
+            use_native_tools: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn envelope_leaked_into_prose_is_salvaged_into_a_call() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let ctx = embedded_envelope_ctx(&pacing, &dedup_exempt_tools, "embedded-envelope-salvage");
+        let leaked = concat!(
+            "Okay! I can create that webinar page for you.\n",
+            "{\"content\":null,\"tool_calls\":[{\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\",\"id\":\"call_1\",\"name\":\"shell\"}]}",
+            "{\"content\":\"Preparing the command now.\",\"tool_code\":\"print(shell(\\\"ls\\\"))\",\"tool_name\":\"shell\"}",
+            "Done in a moment.",
+        );
+
+        let interpreted = interpret_chat_response(
+            &ctx,
+            "openai.codex",
+            "gpt-5.6",
+            ChatResponse {
+                text: Some(leaked.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            &[],
+            &shell_specs(),
+            false,
+            0,
+            false,
+        )
+        .await;
+
+        assert!(
+            !interpreted.parse_issue_detected,
+            "a salvaged call is not a parse issue"
+        );
+        assert_eq!(interpreted.tool_calls.len(), 1);
+        assert_eq!(interpreted.tool_calls[0].name, "shell");
+        assert_eq!(interpreted.tool_calls[0].arguments["command"], "ls");
+        assert!(
+            !interpreted.parsed_text.contains("tool_calls")
+                && !interpreted.parsed_text.contains("tool_code"),
+            "envelope bytes must not reach display text: {}",
+            interpreted.parsed_text
+        );
+        assert!(
+            interpreted
+                .parsed_text
+                .contains("Okay! I can create that webinar page for you.")
+        );
+    }
+
+    #[tokio::test]
+    async fn unsalvageable_python_stub_leak_is_rejected() {
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let dedup_exempt_tools = Vec::new();
+        let ctx = embedded_envelope_ctx(&pacing, &dedup_exempt_tools, "embedded-stub-reject");
+        let leaked = concat!(
+            "Creating the draft now.\n",
+            "{\"content\":\"One moment.\",\"tool_code\":\"print(shell(\\\"ls\\\"))\",\"tool_name\":\"shell\"}",
+        );
+
+        let interpreted = interpret_chat_response(
+            &ctx,
+            "openai.codex",
+            "gpt-5.6",
+            ChatResponse {
+                text: Some(leaked.to_string()),
+                tool_calls: vec![],
+                usage: None,
+                reasoning_content: None,
+            },
+            &[],
+            &shell_specs(),
+            false,
+            0,
+            false,
+        )
+        .await;
+
+        assert!(interpreted.tool_calls.is_empty());
+        assert!(
+            interpreted.parse_issue_detected,
+            "a stub leak that cannot be executed must be rejected, not rendered"
+        );
+    }
+
     #[tokio::test]
     async fn malformed_protocol_retains_usage_without_accepted_usage_event() {
         let (tx, mut rx) = tokio::sync::mpsc::channel::<TurnEvent>(1);

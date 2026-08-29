@@ -3,7 +3,8 @@
 use std::collections::HashSet;
 use zeroclaw_tool_call_parser::{
     ParsedToolCall, ToolProtocolEnvelopeKind, classify_tool_protocol_envelope,
-    contains_tool_protocol_tag_call, looks_like_malformed_tool_protocol_envelope,
+    contains_tool_protocol_tag_call, embedded_tool_protocol_envelope_mentions_known_tool,
+    looks_like_malformed_tool_protocol_envelope,
     looks_like_malformed_tool_protocol_envelope_for_known_tools, looks_like_tool_protocol_envelope,
     looks_like_tool_protocol_example, tool_protocol_envelope_mentions_known_tool,
 };
@@ -175,7 +176,13 @@ pub(crate) fn detect_tool_call_parse_issue_for_known_tools(
         .then(|| message.into());
     }
 
-    looks_like_tool_protocol_envelope(trimmed).then(|| message.into())
+    // Envelope glued into prose that salvage could not turn into a call
+    // (python tool stubs, malformed members): reject rather than render.
+    // Reaching here with an executable embedded envelope for a known tool is
+    // impossible -- the salvage pass would have produced `parsed_calls`.
+    (looks_like_tool_protocol_envelope(trimmed)
+        || embedded_tool_protocol_envelope_mentions_known_tool(trimmed, known_tool_names))
+    .then(|| message.into())
 }
 
 pub(crate) fn json_fence_body(trimmed: &str) -> Option<&str> {
