@@ -15,7 +15,7 @@ Notable submodules:
 - `sop/`: Standard Operating Procedure engine (see [SOP → Overview](../sop/index.md))
 - `subagent/`: SubAgent spawning and lifecycle (see [Delegation & SubAgents](../agents/delegation.md))
 - `cron/`, `daemon/`, `heartbeat/`: scheduling and long-running process management
-- `skillforge/`, `skills/`: skill compilation and execution
+- `skills/`: skill compilation and execution
 - `service/`: systemd / launchctl / Windows Service integration
 - `rpc/`: the RPC layer for zerocode
 
@@ -145,10 +145,6 @@ Derive macros for config schema, tool registration, and channel registration. Sa
 ### `zerocode`
 
 Terminal UI, built as a separate app under `apps/zerocode/`. It is its own workspace member with no `zeroclaw-*` crate dependency (see [Docs & Translations → zerocode strings](../maintainers/docs-and-translations.md) for its independent i18n catalogue).
-
-### `aardvark-sys`, `robot-kit`
-
-Specialised hardware support used by the `hardware` submodule. Out-of-scope unless you're bringing up specific peripherals.
 
 ## Feature flags
 

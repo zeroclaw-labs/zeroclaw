@@ -867,8 +867,8 @@ Examples:
     Update {
         /// Task ID
         id: String,
-        /// Configured agent alias whose risk profile gates the new
-        /// shell command (when --command is provided). Required.
+        /// Configured agent alias. Required. The alias risk profile
+        /// gates shell commands for shell jobs.
         #[arg(short = 'a', long = "agent")]
         agent_alias: String,
         /// New cron expression
@@ -877,7 +877,7 @@ Examples:
         /// New IANA timezone
         #[arg(long)]
         tz: Option<String>,
-        /// New command to run
+        /// New shell command, or new agent prompt when the job is an agent job
         #[arg(long)]
         command: Option<String>,
         /// New job name

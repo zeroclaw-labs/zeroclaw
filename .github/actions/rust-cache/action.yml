@@ -21,6 +21,10 @@ inputs:
     description: Only write the cache when this evaluates truthy (e.g. default branch only).
     required: false
     default: "true"
+  shared-key:
+    description: Shared cache key to reuse a cache across jobs (Swatinem/useblacksmith shared-key). Empty = per-job cache.
+    required: false
+    default: ""
 
 outputs:
   cache-hit:
@@ -36,9 +40,11 @@ runs:
       with:
         cache-on-failure: ${{ inputs.cache-on-failure }}
         save-if: ${{ inputs.save-if }}
+        shared-key: ${{ inputs.shared-key }}
     - id: gh
       if: ${{ inputs.use-blacksmith != 'true' }}
       uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       with:
         cache-on-failure: ${{ inputs.cache-on-failure }}
         save-if: ${{ inputs.save-if }}
+        shared-key: ${{ inputs.shared-key }}

@@ -2,14 +2,17 @@
 //! These functions were originally in `channels/mod.rs` but live here to
 //! break a circular dependency between the channels and agent modules.
 
+use crate::agent::prompt::{TIMESTAMP_ORIENTATION, append_timestamp_orientation};
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
+use zeroclaw_api::runtime_traits::{POSIX_DELETION_GUIDANCE, ShellProfile};
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
+const TRUNCATION_MARKER: &str = "\n\n[System prompt truncated to fit context budget]\n";
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -41,6 +44,11 @@ fn load_openclaw_bootstrap_files(
     }
 }
 
+/// Build the default system prompt.
+///
+/// Reports no shell: callers that know their runtime adapter should use
+/// [`build_system_prompt_with_mode_and_autonomy`] and pass its
+/// `shell_profile` so the model is told which dialect to write.
 pub fn build_system_prompt(
     workspace_dir: &std::path::Path,
     model_name: &str,
@@ -87,6 +95,7 @@ pub fn build_system_prompt_with_tool_calls(
         0,
         true,
         show_tool_calls,
+        None,
     )
 }
 
@@ -119,6 +128,7 @@ pub fn build_system_prompt_with_mode(
         0,
         true,
         false,
+        None,
     )
 }
 
@@ -142,6 +152,11 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // response. When `false` (default), the system prompt instructs
     // the model to treat tool calls as invisible infrastructure.
     show_tool_calls: bool,
+    // The shell the runtime adapter will actually spawn, or `None` for a
+    // shell-less runtime (which omits the `Shell:` field and the dialect
+    // guidance entirely). Resolved from `RuntimeAdapter::shell_profile` so the
+    // reported shell cannot drift from the executed one.
+    shell_profile: Option<&ShellProfile>,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -285,7 +300,14 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              - Do not bypass oversight or approval mechanisms.\n",
         );
     }
-    prompt.push_str("- Prefer `trash` over `rm` (recoverable beats gone forever).\n");
+    // Deletion advice follows the dialect: `trash` exists only on POSIX, so
+    // recommending it to a PowerShell or `cmd.exe` session would name a
+    // command that is not there. Shell-less runtimes keep the POSIX default,
+    // which is what they rendered before this was dialect-aware.
+    prompt.push_str(shell_profile.map_or(
+        POSIX_DELETION_GUIDANCE,
+        ShellProfile::safe_deletion_guidance,
+    ));
     prompt.push_str(match autonomy_config.map(|cfg| cfg.level) {
         Some(crate::security::AutonomyLevel::Full) => {
             "- Respect the runtime autonomy policy: if a tool or action is allowed, execute it directly instead of asking the user for extra approval.\n\
@@ -302,6 +324,21 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     });
     prompt.push('\n');
+
+    // ── 2b. Shell dialect ───────────────────────────────────────
+    // Only when a registered tool takes a model-authored command: the syntax
+    // list is dead weight otherwise. Skipped in compact_context for the same
+    // reason the tool catalog is trimmed there. The `## Runtime` line still
+    // names the shell in both cases.
+    if !compact_context
+        && zeroclaw_api::runtime_traits::needs_shell_dialect_guidance(
+            tools.iter().map(|(name, _)| *name),
+        )
+        && let Some(profile) = shell_profile
+    {
+        prompt.push_str(&profile.prompt_section());
+        prompt.push('\n');
+    }
 
     // ── 3. Skills (full or compact, based on config) ─────────────
     if !skills.is_empty() {
@@ -383,13 +420,30 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     // ── 7. Runtime ──────────────────────────────────────────────
     let host =
         hostname::get().map_or_else(|_| "unknown".into(), |h| h.to_string_lossy().to_string());
-    let _ = writeln!(
-        prompt,
-        "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
-        std::env::consts::OS,
-    );
+    // The shell is reported next to the OS because the OS alone does not
+    // determine it: on Windows `cmd.exe` and PowerShell are both reachable.
+    // Omitted entirely for shell-less runtimes, which read no worse than
+    // before. See `RuntimeAdapter::shell_profile`.
+    match shell_profile {
+        Some(profile) => {
+            let _ = writeln!(
+                prompt,
+                "## Runtime\n\nHost: {host} | OS: {} | Shell: {} | Model: {model_name}\n",
+                std::env::consts::OS,
+                profile.name,
+            );
+        }
+        None => {
+            let _ = writeln!(
+                prompt,
+                "## Runtime\n\nHost: {host} | OS: {} | Model: {model_name}\n",
+                std::env::consts::OS,
+            );
+        }
+    }
 
-    // ── 8. Channel Capabilities (skipped in compact_context mode) ──
+    // ── 8. Channel Capabilities (full copy skipped in compact_context
+    //       mode; the timestamp orientation below emits in both modes) ──
     if !compact_context {
         prompt.push_str("## Channel Capabilities\n\n");
         prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
@@ -416,18 +470,49 @@ pub fn build_system_prompt_with_mode_and_autonomy(
             prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
         }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
-    } // end if !compact_context (Channel Capabilities)
+    } // end if !compact_context (full Channel Capabilities copy)
+
+    // Emitted unconditionally: small local models mistake the enrichment
+    // prefix for log/API data without this orientation. The prefix format
+    // is canonical in agent.rs `Agent::enrich_user_message` — keep in sync.
+    //
+    // This orientation is runtime-owned and must survive the compact/finite
+    // `max_system_prompt_chars` budget: it is what stops small local models
+    // from reading the timestamp prefix as a log/API payload.
+    // Because truncation below keeps only the *top* portion of the prompt,
+    // the orientation is re-emitted inside the retained budget after any
+    // truncation rather than left in the truncatable tail.
+    append_timestamp_orientation(&mut prompt);
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────
     if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
-        // Truncate on a char boundary, keeping the top portion (identity + safety).
-        let mut end = max_system_prompt_chars;
-        // Ensure we don't split a multi-byte UTF-8 character.
-        while !prompt.is_char_boundary(end) && end > 0 {
-            end -= 1;
+        // The orientation is runtime-critical, so it must land inside the
+        // budget. Reserve room for the orientation (and the truncation
+        // marker) at the head-retained portion, then re-append it so it
+        // always survives even when the assembled prompt overflows.
+        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
+        if max_system_prompt_chars >= reserved {
+            // Keep the top portion (identity + safety) minus the reserved tail.
+            let mut end = max_system_prompt_chars - reserved;
+            // Ensure we don't split a multi-byte UTF-8 character.
+            while end > 0 && !prompt.is_char_boundary(end) {
+                end -= 1;
+            }
+            prompt.truncate(end);
+            prompt.push_str(TRUNCATION_MARKER);
+            append_timestamp_orientation(&mut prompt);
+        } else {
+            // When the budget cannot hold both retained content and the
+            // critical tail, prioritize as much of the orientation as fits.
+            // This preserves the full orientation whenever possible without
+            // violating the configured prompt ceiling for very small budgets.
+            let mut end = max_system_prompt_chars.min(TIMESTAMP_ORIENTATION.len());
+            while end > 0 && !TIMESTAMP_ORIENTATION.is_char_boundary(end) {
+                end -= 1;
+            }
+            prompt.clear();
+            prompt.push_str(&TIMESTAMP_ORIENTATION[..end]);
         }
-        prompt.truncate(end);
-        prompt.push_str("\n\n[System prompt truncated to fit context budget]\n");
     }
 
     if prompt.is_empty() {
@@ -488,6 +573,320 @@ mod tests {
     use super::*;
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
 
+    fn prompt_with_compact_context(compact_context: bool) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            compact_context,
+            0,
+            true,
+            false,
+            None,
+        )
+    }
+
+    /// Build a prompt with a finite `max_system_prompt_chars` budget and
+    /// enough registered tools to overflow it, forcing the truncation path.
+    fn prompt_with_finite_budget(
+        compact_context: bool,
+        max_system_prompt_chars: usize,
+        tools: &[(&str, &str)],
+    ) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            tools,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            compact_context,
+            max_system_prompt_chars,
+            true,
+            false,
+            None,
+        )
+    }
+
+    /// Helper: build the prompt with a given shell profile and one registered
+    /// tool, named by `tool_name` so a caller can pick which command-taking
+    /// tool the surface holds.
+    fn build_with_shell(
+        shell_profile: Option<&zeroclaw_api::runtime_traits::ShellProfile>,
+        tool_name: &str,
+    ) -> String {
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            &[(tool_name, "a registered tool")],
+            &[],
+            None,
+            Some(512),
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            shell_profile,
+        )
+    }
+
+    // ── Acceptance criteria from issue 9788 ────────────────────────────
+    //
+    // AC-1: ## Runtime includes `Shell: <name>` derived from shell_profile,
+    //       and omits the field cleanly for None.
+    // AC-2: POSIX runtimes report the configured shell name (`bash`, `zsh`…).
+    // AC-3: Windows reports `cmd` or `powershell`/`pwsh`.
+    // AC-4: Tests cover each dialect variant including the omitted case.
+
+    #[test]
+    fn ac1_runtime_line_includes_shell_field_when_profile_is_present() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "bash".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        let runtime_line = prompt
+            .lines()
+            .find(|l| l.starts_with("Host:"))
+            .expect("Runtime line present");
+        assert!(
+            runtime_line.contains("Shell: bash"),
+            "expected Shell field: {runtime_line}"
+        );
+    }
+
+    #[test]
+    fn ac1_runtime_line_omits_shell_field_when_profile_is_none() {
+        let prompt = build_with_shell(None, "shell");
+        let runtime_line = prompt
+            .lines()
+            .find(|l| l.starts_with("Host:"))
+            .expect("Runtime line present");
+        assert!(
+            !runtime_line.contains("Shell:"),
+            "unexpected Shell field in shell-less prompt: {runtime_line}"
+        );
+    }
+
+    #[test]
+    fn ac2_posix_reports_configured_shell_name() {
+        for (configured, expected) in [("bash", "bash"), ("zsh", "zsh"), ("sh", "sh")] {
+            let profile = zeroclaw_api::runtime_traits::ShellProfile {
+                name: configured.to_string(),
+                dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+            };
+            let prompt = build_with_shell(Some(&profile), "shell");
+            let runtime_line = prompt
+                .lines()
+                .find(|l| l.starts_with("Host:"))
+                .expect("Runtime line present");
+            assert!(
+                runtime_line.contains(&format!("Shell: {expected}")),
+                "configured {configured}: {runtime_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn ac3_windows_reports_cmd_or_powershell_variant() {
+        for (name, dialect) in [
+            (
+                "cmd",
+                zeroclaw_api::runtime_traits::ShellDialect::WindowsCmd,
+            ),
+            (
+                "powershell",
+                zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            ),
+            (
+                "pwsh",
+                zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            ),
+        ] {
+            let profile = zeroclaw_api::runtime_traits::ShellProfile {
+                name: name.to_string(),
+                dialect,
+            };
+            let prompt = build_with_shell(Some(&profile), "shell");
+            let runtime_line = prompt
+                .lines()
+                .find(|l| l.starts_with("Host:"))
+                .expect("Runtime line present");
+            assert!(
+                runtime_line.contains(&format!("Shell: {name}")),
+                "configured {name}: {runtime_line}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_section_present_for_a_cron_only_tool_surface() {
+        // `cron_add`/`cron_update`/`schedule` take a model-authored `command`
+        // that runs through the same interpreter as `shell`, so an agent
+        // holding only those is exactly as exposed to a dialect mismatch.
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "pwsh".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        for tool in ["cron_add", "cron_update", "schedule"] {
+            let prompt = build_with_shell(Some(&profile), tool);
+            assert!(
+                prompt.contains("## Shell"),
+                "{tool} writes commands and needs the dialect: {prompt}"
+            );
+            assert!(prompt.contains("Get-ChildItem"), "{tool}: {prompt}");
+        }
+    }
+
+    #[test]
+    fn shell_section_absent_without_shell_tool() {
+        // The dialect guidance is dead weight when no registered tool takes a
+        // model-authored command.
+        let workspace = tempfile::TempDir::new().expect("tempdir");
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "powershell".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        let prompt = build_system_prompt_with_mode_and_autonomy(
+            workspace.path(),
+            "test-model",
+            &[("file_read", "read a file")],
+            &[],
+            None,
+            Some(512),
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            false,
+            0,
+            true,
+            false,
+            Some(&profile),
+        );
+        assert!(
+            !prompt.contains("## Shell"),
+            "Shell section must be absent when shell tool is not registered"
+        );
+        // Runtime line still reports the shell name.
+        let runtime_line = prompt.lines().find(|l| l.starts_with("Host:")).unwrap();
+        assert!(runtime_line.contains("Shell: powershell"), "{runtime_line}");
+    }
+
+    #[test]
+    fn shell_section_present_and_correct_for_powershell() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "powershell".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        assert!(prompt.contains("## Shell"), "Shell section missing");
+        assert!(
+            prompt.contains("Get-ChildItem"),
+            "PowerShell syntax table missing"
+        );
+        // POSIX tool names must be ruled out as a class.
+        assert!(
+            prompt.contains("POSIX tools"),
+            "POSIX steer missing: {prompt}"
+        );
+    }
+
+    #[test]
+    fn shell_section_present_and_correct_for_pwsh() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "pwsh".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        assert!(
+            prompt.contains("PowerShell 7+"),
+            "pwsh must note PS 7+: {prompt}"
+        );
+    }
+
+    #[test]
+    fn shell_section_present_and_correct_for_cmd() {
+        let profile = zeroclaw_api::runtime_traits::ShellProfile::from_dialect(
+            zeroclaw_api::runtime_traits::ShellDialect::WindowsCmd,
+        )
+        .unwrap();
+        let prompt = build_with_shell(Some(&profile), "shell");
+        assert!(prompt.contains("## Shell"), "Shell section missing");
+        assert!(
+            prompt.contains("dir /a"),
+            "cmd syntax table missing: {prompt}"
+        );
+        assert!(prompt.contains("findstr"), "{prompt}");
+    }
+
+    #[test]
+    fn posix_shell_section_has_no_syntax_table() {
+        // POSIX tool names don't need correction; emitting a table wastes tokens.
+        let profile = zeroclaw_api::runtime_traits::ShellProfile {
+            name: "bash".to_string(),
+            dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+        };
+        let prompt = build_with_shell(Some(&profile), "shell");
+        // The ## Shell section heading is still emitted (name is useful).
+        assert!(prompt.contains("## Shell"), "{prompt}");
+        assert!(
+            !prompt.contains("Get-ChildItem"),
+            "no PS table in POSIX prompt"
+        );
+        assert!(!prompt.contains("dir /a"), "no cmd table in POSIX prompt");
+    }
+
+    #[test]
+    fn deletion_guidance_follows_dialect_not_hardcoded() {
+        // `trash` is only POSIX. PowerShell and cmd must get their own advice.
+        let posix_prompt = build_with_shell(
+            Some(&zeroclaw_api::runtime_traits::ShellProfile {
+                name: "bash".to_string(),
+                dialect: zeroclaw_api::runtime_traits::ShellDialect::Posix,
+            }),
+            "shell",
+        );
+        assert!(posix_prompt.contains("trash"), "POSIX must mention trash");
+
+        let ps_prompt = build_with_shell(
+            Some(&zeroclaw_api::runtime_traits::ShellProfile {
+                name: "powershell".to_string(),
+                dialect: zeroclaw_api::runtime_traits::ShellDialect::PowerShell,
+            }),
+            "shell",
+        );
+        assert!(!ps_prompt.contains("trash"), "PS must not mention trash");
+        assert!(ps_prompt.contains("-WhatIf"), "PS must mention -WhatIf");
+
+        let cmd_prompt = build_with_shell(
+            Some(
+                &zeroclaw_api::runtime_traits::ShellProfile::from_dialect(
+                    zeroclaw_api::runtime_traits::ShellDialect::WindowsCmd,
+                )
+                .unwrap(),
+            ),
+            "shell",
+        );
+        assert!(!cmd_prompt.contains("trash"), "cmd must not mention trash");
+        assert!(
+            cmd_prompt.contains("rmdir /s"),
+            "cmd must name the destructive tool"
+        );
+    }
+
     fn build_with_autonomy(tools: &[(&str, &str)], level: AutonomyLevel) -> String {
         let workspace = tempfile::TempDir::new().expect("tempdir");
         let autonomy = zeroclaw_config::schema::RiskProfileConfig {
@@ -508,7 +907,17 @@ mod tests {
             0,
             true,
             false,
+            None,
         )
+    }
+
+    #[test]
+    fn compact_context_carries_timestamp_orientation() {
+        let prompt = prompt_with_compact_context(true);
+        assert!(
+            prompt.contains("timestamp metadata added by the runtime"),
+            "compact system prompt must orient the model on the date/time-prefix convention: {prompt}"
+        );
     }
 
     #[test]
@@ -568,6 +977,134 @@ mod tests {
                 && !auth.contains("not blocked by any security policy"),
             "block must not claim the tools are exempt from all security policy"
         );
+    }
+
+    #[test]
+    fn non_compact_context_keeps_full_channel_capabilities_section() {
+        let prompt = prompt_with_compact_context(false);
+        assert!(
+            prompt.contains("You are running as a messaging bot"),
+            "full system prompt must retain the existing Channel Capabilities copy: {prompt}"
+        );
+        assert!(
+            prompt.contains("timestamp metadata added by the runtime"),
+            "full system prompt must carry the timestamp orientation too: {prompt}"
+        );
+    }
+
+    #[test]
+    fn timestamp_orientation_survives_finite_budget_truncation() {
+        // Regression guard: finite `max_system_prompt_chars` is a supported production config,
+        // and the runtime-owned timestamp orientation must survive it rather
+        // than being chopped off in the truncatable tail. Register enough
+        // tools and pick a budget small enough to force the truncation path.
+        let tools: [(&str, &str); 12] = [
+            (
+                "shell",
+                "Run a shell command with a long description to add bulk",
+            ),
+            (
+                "file_read",
+                "Read a file with a long description to add bulk",
+            ),
+            (
+                "file_write",
+                "Write a file with a long description to add bulk",
+            ),
+            (
+                "file_edit",
+                "Edit a file with a long description to add bulk",
+            ),
+            (
+                "http_request",
+                "Make an HTTP request with a long description to add bulk",
+            ),
+            (
+                "web_search",
+                "Search the web with a long description to add bulk",
+            ),
+            (
+                "web_fetch",
+                "Fetch a page with a long description to add bulk",
+            ),
+            ("calculator", "Do math with a long description to add bulk"),
+            ("weather", "Get weather with a long description to add bulk"),
+            (
+                "memory_store",
+                "Store memory with a long description to add bulk",
+            ),
+            (
+                "memory_recall",
+                "Recall memory with a long description to add bulk",
+            ),
+            (
+                "canvas",
+                "Render to a canvas with a long description to add bulk",
+            ),
+        ];
+
+        for compact in [false, true] {
+            // A budget well below the assembled prompt length so truncation
+            // definitely runs, but large enough to hold the retained head plus
+            // the reserved orientation.
+            let budget = 600;
+            let prompt = prompt_with_finite_budget(compact, budget, &tools);
+
+            // Truncation must actually have fired (otherwise the test proves
+            // nothing about the retained-budget guarantee).
+            assert!(
+                prompt.contains("[System prompt truncated to fit context budget]"),
+                "compact={compact}: expected truncation to fire at budget {budget}; prompt was:\n{prompt}"
+            );
+            // The runtime-owned orientation must survive inside the budget.
+            assert!(
+                prompt.contains("timestamp metadata added by the runtime"),
+                "compact={compact}: timestamp orientation must survive finite-budget truncation; prompt was:\n{prompt}"
+            );
+            assert!(
+                prompt.len() <= budget,
+                "compact={compact}: prompt length {} exceeded budget {budget}",
+                prompt.len()
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_orientation_respects_budgets_at_and_below_reserved_tail() {
+        let tools = [(
+            "shell",
+            "Run a shell command with enough description to overflow",
+        )];
+        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
+
+        for compact in [false, true] {
+            for budget in [
+                1,
+                TIMESTAMP_ORIENTATION.len() - 1,
+                TIMESTAMP_ORIENTATION.len(),
+                reserved - 1,
+                reserved,
+            ] {
+                let prompt = prompt_with_finite_budget(compact, budget, &tools);
+                assert!(
+                    prompt.len() <= budget,
+                    "compact={compact}: prompt length {} exceeded budget {budget}",
+                    prompt.len()
+                );
+
+                if budget >= TIMESTAMP_ORIENTATION.len() {
+                    assert!(
+                        prompt.ends_with(TIMESTAMP_ORIENTATION),
+                        "compact={compact}: full orientation must survive budget {budget}: {prompt}"
+                    );
+                } else {
+                    assert!(
+                        TIMESTAMP_ORIENTATION.starts_with(&prompt),
+                        "compact={compact}: tiny budget {budget} must retain a bounded orientation prefix: {prompt}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

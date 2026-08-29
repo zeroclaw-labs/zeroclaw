@@ -1108,6 +1108,7 @@ impl SlackChannel {
             file_name,
             data,
             mime_type,
+            marker: None,
         })
     }
 
@@ -5031,8 +5032,7 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
                 chunks.push(remaining.to_string());
             } else {
                 // Truncate with indicator.
-                let avail = crate::util::floor_char_boundary(
-                    remaining,
+                let avail = remaining.floor_char_boundary(
                     max_chars.saturating_sub(SLACK_TRUNCATION_INDICATOR.len()),
                 );
                 let break_at = remaining[..avail]
@@ -5048,7 +5048,7 @@ fn split_text_into_chunks(text: &str, max_chars: usize, max_chunks: usize) -> Ve
         }
 
         // Normal chunk: find a good break point.
-        let limit = crate::util::floor_char_boundary(remaining, max_chars);
+        let limit = remaining.floor_char_boundary(max_chars);
         let break_at = remaining[..limit]
             .rfind('\n')
             .map(|i| i + 1)

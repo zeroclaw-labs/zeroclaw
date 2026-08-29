@@ -2,9 +2,8 @@
 // It speaks JSON-RPC to whatever ZeroClaw daemon is at the configured
 // address; the daemon owns attribution, the TUI owns its session id.
 // Bare `tokio::spawn` is the right primitive here — the workspace-wide
-// `zeroclaw_spawn::spawn!` rule is daemon-path only (see
-// `clippy.toml`'s commentary; this matches the `robot-kit/src/safety.rs`
-// exemption pattern).
+// `zeroclaw_spawn::spawn!` rule is daemon-path only (see `clippy.toml`'s
+// commentary, which records this crate as the sole exemption).
 #![allow(clippy::disallowed_methods)]
 
 use std::path::PathBuf;
@@ -42,6 +41,8 @@ mod mouse;
 mod quickstart_pane;
 mod sop_pane;
 mod terminal_backend;
+#[cfg(test)]
+mod test_support;
 mod text_navigation;
 mod theme;
 mod todo_tracker;
@@ -750,6 +751,7 @@ fn reconcile_spawned_daemon_identity(
     Ok(false)
 }
 
+#[cfg(unix)]
 fn cleanup_spawned_daemon_after_signal(daemon: &mut SpawnedDaemon) -> anyhow::Result<()> {
     daemon
         .terminate_and_wait()
@@ -1018,6 +1020,7 @@ mod connection_tests {
         assert!(daemon.try_wait().expect("poll helper").is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn spawned_daemon_startup_signal_cleanup_terminates_and_reaps_child() {
         let mut daemon =
@@ -1052,6 +1055,8 @@ mod connection_tests {
             std::thread::sleep(Duration::from_millis(10));
         };
 
+        // SAFETY: `owner.id()` is the live child PID returned by `spawn`; this
+        // test sends a standard signal and does not pass pointers across FFI.
         let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, libc::SIGTERM) };
         assert_eq!(
             signal_result,
@@ -1061,6 +1066,8 @@ mod connection_tests {
         );
         assert!(owner.wait().expect("wait signal owner").success());
 
+        // SAFETY: signal 0 performs a process-existence probe only; `daemon_pid`
+        // was parsed from the child helper's PID file and no pointers are used.
         let child_probe = unsafe { libc::kill(daemon_pid as libc::pid_t, 0) };
         assert_eq!(child_probe, -1, "spawned daemon pid {daemon_pid} survived");
         assert_eq!(

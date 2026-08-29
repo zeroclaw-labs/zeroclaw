@@ -261,10 +261,17 @@ impl ApprovalManager {
 /// terminal when available, falling back to stdin otherwise.
 fn prompt_cli_interactive(request: &ApprovalRequest) -> ApprovalResponse {
     let summary = summarize_args(&request.arguments);
+    let tool_args = [("tool", request.tool_name.as_str())];
     eprintln!();
-    eprintln!("🔧 Agent wants to execute: {}", request.tool_name);
+    eprintln!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args("cli-approval-request", &tool_args)
+    );
     eprintln!("   {summary}");
-    eprint!("   [Y]es / [N]o / [A]lways for {}: ", request.tool_name);
+    eprint!(
+        "{}",
+        crate::i18n::get_required_cli_string_with_args("cli-approval-prompt", &tool_args)
+    );
     let _ = io::stderr().flush();
 
     let Ok(line) = read_cli_approval_line() else {
@@ -374,7 +381,9 @@ pub fn summarize_args(args: &serde_json::Value) -> String {
 /// human-readable summaries. Matches anywhere in the (lowercased) key:
 /// covers `api_key`, `api-key`, `apiKey`, `oauth_token`, `secret`,
 /// `password`, `auth_token`, `bearer`, `client_secret`, `private_key`, etc.
-fn looks_like_secret_key(key: &str) -> bool {
+/// Shared conservative heuristic for summary surfaces. A caller must still
+/// avoid rendering untrusted composite values by default.
+pub fn looks_like_secret_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     [
         "secret",

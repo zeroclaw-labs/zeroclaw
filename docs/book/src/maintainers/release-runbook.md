@@ -124,7 +124,7 @@ If the PR also changes `[workspace.package] rust-version` or pinned Rust toolcha
 
 Open a PR. Label it `type:ci`, `size:XS`, and any path labels the PR labeler
 adds. If the PR raises a toolchain floor, also apply `risk:high` and route it
-through lane D. Get one maintainer review. Merge when CI is green. The **Installer Drift**
+through lane D. Get two independent Core Team approvals. Merge only when CI is green. The **Installer Drift**
 gate in CI fails the PR if a generated surface is out of sync with the spec, so
 a missed regeneration cannot land. The
 **Validate Translations Pin** gate resolves the submodule at the pinned commit

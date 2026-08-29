@@ -83,7 +83,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
@@ -115,7 +115,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
@@ -165,7 +165,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
@@ -218,7 +218,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
@@ -248,7 +248,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
@@ -305,7 +305,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
@@ -343,7 +343,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
@@ -416,7 +416,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
@@ -472,7 +472,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
@@ -546,7 +546,7 @@ impl Microsoft365Tool {
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
                     "microsoft365: tool operation denied by policy"
                 );
                 anyhow::Error::msg(e.to_string())
