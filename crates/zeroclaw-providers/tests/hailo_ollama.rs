@@ -2689,6 +2689,85 @@ async fn native_hailo_rejects_unloadable_image_markers_before_http() {
     server.abort();
 }
 
+#[tokio::test]
+async fn native_hailo_rejects_parser_preserved_image_marker_residue_before_http() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(count_chat_requests))
+        .with_state(requests.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let error = hailo_provider(&format!("http://{addr}"))
+        .simple_chat(
+            "Describe this [IMAGE:missing-image.invalid]",
+            "qwen3:1.7b",
+            Some(0.2),
+        )
+        .await
+        .expect_err("parser-preserved image marker residue must fail before HTTP");
+    assert!(error.to_string().contains("does not support image inputs"));
+    assert!(
+        error
+            .chain()
+            .any(|source| source.is::<NonRetryableProviderError>())
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn native_hailo_rejects_image_marker_residue_in_tool_result_history_before_http() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(count_chat_requests))
+        .with_state(requests.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    let history = vec![
+        ChatMessage::user("Inspect the generated image"),
+        ChatMessage::assistant(
+            r#"{"content":null,"tool_calls":[{"id":"call_1","name":"image_gen","arguments":"{}"}]}"#,
+        ),
+        ChatMessage::tool(
+            json!({
+                "tool_call_id": "call_1",
+                "content": "generated [IMAGE:missing-image.invalid]"
+            })
+            .to_string(),
+        ),
+    ];
+    let error = hailo_provider(&format!("http://{addr}"))
+        .chat_with_history(&history, "qwen3:1.7b", Some(0.2))
+        .await
+        .expect_err("tool-result image marker residue must fail before HTTP");
+    assert!(error.to_string().contains("does not support image inputs"));
+    assert!(
+        error
+            .chain()
+            .any(|source| source.is::<NonRetryableProviderError>())
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+    server.abort();
+}
+
 #[derive(Clone)]
 struct CancellationState {
     active: Arc<AtomicUsize>,

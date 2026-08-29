@@ -859,6 +859,10 @@ impl HailoOllamaModelProvider {
                 .images
                 .as_ref()
                 .is_some_and(|images| !images.is_empty())
+                || message
+                    .content
+                    .as_deref()
+                    .is_some_and(multimodal::carries_image_marker)
             {
                 return Err(anyhow::Error::new(NonRetryableProviderError::new(
                     "Hailo-Ollama does not support image inputs",
