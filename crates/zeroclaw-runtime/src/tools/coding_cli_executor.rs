@@ -136,16 +136,14 @@ fn shell_escape(value: &std::ffi::OsStr) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::SecurityPolicy;
-    use crate::security::traits::Sandbox;
-    use serde_json::json;
     use std::path::PathBuf;
-    use std::sync::Mutex;
-    use zeroclaw_api::runtime_traits::RuntimeAdapter;
-    use zeroclaw_api::tool::Tool;
-    use zeroclaw_config::autonomy::AutonomyLevel;
-    use zeroclaw_config::schema::CodexCliConfig;
-    use zeroclaw_tools::codex_cli::CodexCliTool;
+    #[cfg(not(target_os = "windows"))]
+    use {
+        crate::security::SecurityPolicy, crate::security::traits::Sandbox, serde_json::json,
+        std::sync::Mutex, zeroclaw_api::runtime_traits::RuntimeAdapter, zeroclaw_api::tool::Tool,
+        zeroclaw_config::autonomy::AutonomyLevel, zeroclaw_config::schema::CodexCliConfig,
+        zeroclaw_tools::codex_cli::CodexCliTool,
+    };
 
     #[test]
     fn shell_command_uses_posix_quoting_for_shell_runtimes() {

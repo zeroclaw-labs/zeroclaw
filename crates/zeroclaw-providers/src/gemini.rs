@@ -11,10 +11,12 @@ use crate::traits::{
 use async_trait::async_trait;
 use base64::Engine;
 use directories::UserDirs;
-use reqwest::Client;
+use reqwest::{Client, header::HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
 
 /// Gemini model_provider supporting multiple authentication methods.
 pub struct GeminiModelProvider {
@@ -50,7 +52,7 @@ struct OAuthTokenState {
 /// Resolved credential — the variant determines both the HTTP auth method
 /// and the diagnostic label returned by `auth_source()`.
 enum GeminiAuth {
-    /// Explicit API key from config: sent as `?key=` query parameter.
+    /// Explicit API key from config: sent as `x-goog-api-key`.
     ExplicitKey(String),
     /// OAuth access token from Gemini CLI: sent as `Authorization: Bearer`.
     /// Wrapped in a Mutex to allow runtime token refresh.
@@ -61,22 +63,9 @@ enum GeminiAuth {
 }
 
 impl GeminiAuth {
-    /// Whether this credential is an API key (sent as `?key=` query param).
-    fn is_api_key(&self) -> bool {
-        matches!(self, GeminiAuth::ExplicitKey(_))
-    }
-
     /// Whether this credential is an OAuth token (CLI or managed).
     fn is_oauth(&self) -> bool {
         matches!(self, GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth)
-    }
-
-    /// The raw credential string (for API key variants only).
-    fn api_key_credential(&self) -> &str {
-        match self {
-            GeminiAuth::ExplicitKey(s) => s,
-            GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => "",
-        }
     }
 }
 
@@ -918,13 +907,7 @@ impl GeminiModelProvider {
             }
             _ => {
                 let model_name = Self::format_model_name(model);
-                let base_url = format!("{BASE_URL}/{model_name}:generateContent");
-
-                if auth.is_api_key() {
-                    format!("{base_url}?key={}", auth.api_key_credential())
-                } else {
-                    base_url
-                }
+                format!("{BASE_URL}/{model_name}:generateContent")
             }
         }
     }
@@ -1023,9 +1006,12 @@ impl GeminiModelProvider {
         include_generation_config: bool,
         project: Option<&str>,
         oauth_token: Option<&str>,
-    ) -> reqwest::RequestBuilder {
+    ) -> anyhow::Result<reqwest::RequestBuilder> {
         let req = self.http_client().post(url).json(request);
-        match auth {
+        Ok(match auth {
+            GeminiAuth::ExplicitKey(key) => {
+                req.header(GOOGLE_API_KEY_HEADER, Self::sensitive_api_key_header(key)?)
+            }
             GeminiAuth::OAuthToken(_) | GeminiAuth::ManagedOAuth => {
                 let token = oauth_token.unwrap_or_default();
                 // Internal Code Assist API uses a wrapped payload shape:
@@ -1049,8 +1035,21 @@ impl GeminiModelProvider {
                     .json(&internal_request)
                     .bearer_auth(token)
             }
-            _ => req,
-        }
+        })
+    }
+
+    fn sensitive_api_key_header(key: &str) -> anyhow::Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(key)
+            .map_err(|_| anyhow::Error::msg("Gemini API key contains invalid header characters"))?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    fn build_api_key_probe_request(&self, key: &str) -> anyhow::Result<reqwest::RequestBuilder> {
+        Ok(self
+            .http_client()
+            .get(format!("{BASE_URL}/models"))
+            .header(GOOGLE_API_KEY_HEADER, Self::sensitive_api_key_header(key)?))
     }
 
     fn should_retry_oauth_without_generation_config(
@@ -1224,7 +1223,7 @@ impl GeminiModelProvider {
                 true,
                 project.as_deref(),
                 oauth_token.as_deref(),
-            )
+            )?
             .send()
             .await?;
 
@@ -1256,7 +1255,11 @@ impl GeminiModelProvider {
                             (token, proj)
                         }
                         GeminiAuth::ManagedOAuth => {
-                            let auth_service = self.auth_service.as_ref().unwrap();
+                            let Some(auth_service) = self.auth_service.as_ref() else {
+                                return Err(anyhow::Error::msg(
+                                    "Gemini managed OAuth requires an auth service",
+                                ));
+                            };
                             let token = auth_service
                                 .get_valid_gemini_access_token(
                                     self.auth_profile_override.as_deref(),
@@ -1282,7 +1285,11 @@ impl GeminiModelProvider {
                             let proj = self.resolve_oauth_project(&token).await?;
                             (token, proj)
                         }
-                        _ => unreachable!(),
+                        _ => {
+                            return Err(anyhow::Error::msg(
+                                "Gemini retry reached a non-refreshable authentication mode",
+                            ));
+                        }
                     };
                     oauth_token = Some(new_token);
                     project = Some(new_project);
@@ -1295,7 +1302,7 @@ impl GeminiModelProvider {
                             true,
                             project.as_deref(),
                             oauth_token.as_deref(),
-                        )
+                        )?
                         .send()
                         .await?;
                 } else {
@@ -1319,7 +1326,7 @@ impl GeminiModelProvider {
                         false,
                         project.as_deref(),
                         oauth_token.as_deref(),
-                    )
+                    )?
                     .send()
                     .await?;
             } else {
@@ -1348,7 +1355,7 @@ impl GeminiModelProvider {
                         false,
                         project.as_deref(),
                         oauth_token.as_deref(),
-                    )
+                    )?
                     .send()
                     .await?;
             } else {
@@ -1527,19 +1534,9 @@ impl ModelProvider for GeminiModelProvider {
                     // CLI OAuth — cloudcode-pa does not expose a lightweight model-list probe.
                     // Token will be validated on first real request.
                 }
-                _ => {
+                GeminiAuth::ExplicitKey(key) => {
                     // API key path — verify with public API models endpoint.
-                    let url = if auth.is_api_key() {
-                        format!(
-                            "https://generativelanguage.googleapis.com/v1beta/models?key={}",
-                            auth.api_key_credential()
-                        )
-                    } else {
-                        "https://generativelanguage.googleapis.com/v1beta/models".to_string()
-                    };
-
-                    self.http_client()
-                        .get(&url)
+                    self.build_api_key_probe_request(key)?
                         .send()
                         .await?
                         .error_for_status()?;
@@ -1550,7 +1547,7 @@ impl ModelProvider for GeminiModelProvider {
     }
 
     async fn list_models(&self) -> anyhow::Result<Vec<String>> {
-        // Gemini's /v1beta/models requires ?key=<api_key>. Onboard pulls the
+        // Gemini's /v1beta/models requires authentication. Onboard pulls the
         // catalog from models.dev before the user has entered a key.
         crate::models_dev::list_models_for("google").await
     }
@@ -1824,10 +1821,12 @@ mod tests {
     }
 
     #[test]
-    fn api_key_url_includes_key_query_param() {
+    fn api_key_url_excludes_credential() {
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
         let url = GeminiModelProvider::build_generate_content_url("gemini-2.0-flash", &auth);
-        assert!(url.contains(":generateContent?key=api-key-123"));
+        assert!(url.ends_with(":generateContent"));
+        assert!(!url.contains("api-key-123"));
+        assert!(!url.contains("?key="));
     }
 
     #[test]
@@ -1875,6 +1874,7 @@ mod tests {
                 Some("test-project"),
                 Some("ya29.mock-token"),
             )
+            .unwrap()
             .build()
             .unwrap();
 
@@ -1914,6 +1914,7 @@ mod tests {
                 Some("test-project"),
                 Some("ya29.mock-token"),
             )
+            .unwrap()
             .build()
             .unwrap();
 
@@ -1930,7 +1931,7 @@ mod tests {
     }
 
     #[test]
-    fn api_key_request_does_not_set_bearer_header() {
+    fn api_key_request_uses_header_without_url_credential() {
         let model_provider =
             test_model_provider(Some(GeminiAuth::ExplicitKey("api-key-123".into())));
         let auth = GeminiAuth::ExplicitKey("api-key-123".into());
@@ -1957,10 +1958,69 @@ mod tests {
                 None,
                 None,
             )
+            .unwrap()
             .build()
             .unwrap();
 
         assert!(request.headers().get(AUTHORIZATION).is_none());
+        assert_eq!(
+            request
+                .headers()
+                .get(GOOGLE_API_KEY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("api-key-123")
+        );
+        assert!(
+            request
+                .headers()
+                .get(GOOGLE_API_KEY_HEADER)
+                .expect("API key header")
+                .is_sensitive()
+        );
+        assert!(!request.url().as_str().contains("api-key-123"));
+        assert!(!request.url().query_pairs().any(|(name, _)| name == "key"));
+    }
+
+    #[test]
+    fn api_key_probe_uses_header_without_url_credential() {
+        let model_provider = test_model_provider(None);
+        let request = model_provider
+            .build_api_key_probe_request("api-key-123")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get(GOOGLE_API_KEY_HEADER)
+                .and_then(|value| value.to_str().ok()),
+            Some("api-key-123")
+        );
+        assert!(
+            request
+                .headers()
+                .get(GOOGLE_API_KEY_HEADER)
+                .expect("API key header")
+                .is_sensitive()
+        );
+        assert_eq!(
+            request.url().as_str(),
+            "https://generativelanguage.googleapis.com/v1beta/models"
+        );
+    }
+
+    #[test]
+    fn api_key_header_rejects_control_characters_without_echoing_credential() {
+        let credential = "api-key-123\r\ninjected: value";
+        let error = GeminiModelProvider::sensitive_api_key_header(credential)
+            .expect_err("control characters must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "Gemini API key contains invalid header characters"
+        );
+        assert!(!error.to_string().contains(credential));
     }
 
     #[test]

@@ -27,7 +27,7 @@ fn parse_public_https_url(raw_url: &str) -> anyhow::Result<(reqwest::Url, String
         anyhow::bail!("Generated image URL must be a non-empty URL without whitespace");
     }
 
-    let url = reqwest::Url::parse(raw_url).context("Invalid generated image URL")?;
+    let mut url = reqwest::Url::parse(raw_url).context("Invalid generated image URL")?;
     if url.scheme() != "https" {
         anyhow::bail!("Generated image URL must use HTTPS");
     }
@@ -51,13 +51,28 @@ fn parse_public_https_url(raw_url: &str) -> anyhow::Result<(reqwest::Url, String
         anyhow::bail!("Generated image URL targets a cloud metadata host");
     }
 
+    // Request the host that was validated, not the raw spelling. Normalization
+    // can change the host (a leading dot is stripped), and the DNS pin applied
+    // by `generated_image_client_with_builder` is keyed on the normalized host.
+    // Without this, `resolve_to_addrs` never matches the request host and
+    // reqwest silently falls back to its own unvalidated lookup. IP-literal
+    // hosts are left alone: they carry no DNS pin, and `set_host` rejects the
+    // unbracketed IPv6 form that normalization produces.
+    if ip_literal.is_none() {
+        url.set_host(Some(&host))
+            .map_err(|_| anyhow::Error::msg("Generated image URL host is invalid"))?;
+    }
+
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow::Error::msg("Generated image URL must include a valid port"))?;
     Ok((url, host, port))
 }
 
-async fn validate_image_target(raw_url: &str) -> anyhow::Result<ValidatedImageTarget> {
+async fn validate_image_target(
+    raw_url: &str,
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
+) -> anyhow::Result<ValidatedImageTarget> {
     let (url, host, port) = parse_public_https_url(raw_url)?;
     let resolved_addrs = if let Ok(ip) = host.parse::<IpAddr>() {
         vec![SocketAddr::new(ip, port)]
@@ -71,7 +86,7 @@ async fn validate_image_target(raw_url: &str) -> anyhow::Result<ValidatedImageTa
         .iter()
         .map(|addr| addr.ip())
         .collect::<Vec<_>>();
-    domain_guard::validate_resolved_ips_are_public(&host, &ips)?;
+    domain_guard::validate_resolved_ips_are_public(&host, &ips, nat64_prefixes)?;
 
     Ok(ValidatedImageTarget {
         url,
@@ -105,8 +120,9 @@ fn generated_image_client(target: &ValidatedImageTarget) -> anyhow::Result<reqwe
 
 async fn prepare_generated_image_target(
     raw_url: &str,
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
 ) -> anyhow::Result<(ValidatedImageTarget, reqwest::Client)> {
-    let target = validate_image_target(raw_url).await?;
+    let target = validate_image_target(raw_url, nat64_prefixes).await?;
     let client = generated_image_client(&target)?;
     Ok((target, client))
 }
@@ -180,6 +196,7 @@ pub struct ImageGenTool {
     default_model: String,
     api_key_env: String,
     persistent_writes: bool,
+    nat64_prefixes: Vec<domain_guard::Nat64Prefix>,
 }
 
 impl ImageGenTool {
@@ -188,14 +205,16 @@ impl ImageGenTool {
         workspace_dir: PathBuf,
         default_model: String,
         api_key_env: String,
-    ) -> Self {
-        Self {
+        nat64_prefixes: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_persistence(
             security,
             workspace_dir,
             default_model,
             api_key_env,
-            persistent_writes: true,
-        }
+            true,
+            nat64_prefixes,
+        )
     }
 
     /// Construct with an explicit persistence flag derived from the active
@@ -207,14 +226,19 @@ impl ImageGenTool {
         default_model: String,
         api_key_env: String,
         persistent_writes: bool,
-    ) -> Self {
-        Self {
+        nat64_prefixes: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
             security,
             workspace_dir,
             default_model,
             api_key_env,
             persistent_writes,
-        }
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
+            )?,
+        })
     }
 
     /// Build a reusable HTTP client with reasonable timeouts.
@@ -226,12 +250,16 @@ impl ImageGenTool {
             .context("Failed to build fal.ai HTTP client")
     }
 
-    async fn download_generated_image(image_url: &str) -> anyhow::Result<Vec<u8>> {
+    async fn download_generated_image(
+        image_url: &str,
+        nat64_prefixes: &[domain_guard::Nat64Prefix],
+    ) -> anyhow::Result<Vec<u8>> {
         let mut current_url =
             reqwest::Url::parse(image_url).context("Invalid generated image URL")?;
 
         for redirect_count in 0..=MAX_IMAGE_REDIRECTS {
-            let (target, client) = prepare_generated_image_target(current_url.as_str()).await?;
+            let (target, client) =
+                prepare_generated_image_target(current_url.as_str(), nat64_prefixes).await?;
             let response = client
                 .get(target.url.clone())
                 .send()
@@ -262,7 +290,7 @@ impl ImageGenTool {
             return read_generated_image_body(response).await;
         }
 
-        unreachable!("redirect loop exits through success or redirect limit")
+        anyhow::bail!("Generated image redirect limit exceeded")
     }
 
     /// Read an API key from the environment.
@@ -406,7 +434,7 @@ impl ImageGenTool {
             })?;
 
         // ── Download image ─────────────────────────────────────────
-        let bytes = match Self::download_generated_image(image_url).await {
+        let bytes = match Self::download_generated_image(image_url, &self.nat64_prefixes).await {
             Ok(bytes) => bytes,
             Err(error) => {
                 return Ok(ToolResult {
@@ -504,7 +532,7 @@ impl Tool for ImageGenTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -572,7 +600,9 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY".into(),
+            Vec::new(),
         )
+        .unwrap()
     }
 
     #[test]
@@ -592,7 +622,7 @@ mod tests {
         let redirect = resolve_redirect_url(&current, "https://127.0.0.1/private.png").unwrap();
 
         assert!(
-            prepare_generated_image_target(redirect.as_str())
+            prepare_generated_image_target(redirect.as_str(), &[])
                 .await
                 .is_err()
         );
@@ -609,10 +639,32 @@ mod tests {
         assert!(parse_public_https_url("https://example.com./image.png").is_err());
     }
 
+    /// The returned URL must carry the host that was actually validated, not
+    /// the raw spelling. `normalize_domain` strips a leading dot, so
+    /// `https://.example.com/` validates and pins `example.com` while the raw
+    /// URL still asks for `.example.com`. The pin is keyed on the normalized
+    /// host, so a mismatch means `resolve_to_addrs` never matches and reqwest
+    /// performs its own unvalidated lookup for the request host.
+    #[test]
+    fn generated_image_target_url_host_matches_the_validated_host() {
+        let (url, host, _port) = parse_public_https_url("https://.example.com/img.png")
+            .expect("leading-dot host normalizes to a public host");
+
+        assert_eq!(host, "example.com", "host must normalize");
+        assert_eq!(
+            url.host_str(),
+            Some(host.as_str()),
+            "returned URL must request the validated host, otherwise the DNS \
+             pin keyed on '{host}' never matches and reqwest re-resolves \
+             '{:?}' unvalidated",
+            url.host_str()
+        );
+    }
+
     #[tokio::test]
     async fn generated_image_target_accepts_public_ipv6_literal_without_dns() {
         let (target, _client) =
-            prepare_generated_image_target("https://[2606:4700:4700::1111]/image.png")
+            prepare_generated_image_target("https://[2606:4700:4700::1111]/image.png", &[])
                 .await
                 .unwrap();
         let expected_ip = "2606:4700:4700::1111".parse::<IpAddr>().unwrap();
@@ -746,8 +798,10 @@ mod tests {
     async fn fal_client_does_not_follow_redirects() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        zeroclaw_spawn::spawn!(async move {
+        let server = zeroclaw_spawn::spawn!(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).await.unwrap();
             stream
                 .write_all(
                     b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1/unchecked\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -764,6 +818,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+        server.await.unwrap();
     }
 
     #[test]
@@ -832,7 +887,9 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY_TEST_IMAGE_GEN".into(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let result = tool
             .execute(json!({"prompt": "a sunset over the ocean"}))
             .await
@@ -864,7 +921,9 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY_TEST_SIZE".into(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let result = tool
             .execute(json!({"prompt": "test", "size": "invalid_size"}))
             .await
@@ -888,7 +947,9 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY".into(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let result = tool.execute(json!({"prompt": "test image"})).await.unwrap();
         assert!(!result.success);
         let err = result.error.as_deref().unwrap();
@@ -908,7 +969,9 @@ mod tests {
             std::env::temp_dir(),
             "fal-ai/flux/schnell".into(),
             "FAL_API_KEY_TEST_MODEL".into(),
-        );
+            Vec::new(),
+        )
+        .unwrap();
         let result = tool
             .execute(json!({"prompt": "test", "model": "../../evil-endpoint"}))
             .await

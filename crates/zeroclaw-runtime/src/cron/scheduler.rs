@@ -572,7 +572,7 @@ async fn execute_job_now_with_runtime(
     .await
 }
 
-fn cron_agent_run_security_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
+fn cron_agent_run_policy(base: &SecurityPolicy, job: &CronJob) -> SecurityPolicy {
     let mut policy = base.clone();
     if !matches!(job.job_type, JobType::Agent) || job.allowed_tools.is_some() {
         return policy;
@@ -798,13 +798,6 @@ async fn run_agent_job(
     agent_alias: &str,
     job: &CronJob,
 ) -> (bool, String) {
-    let subagent_ctx = match crate::subagent::SubAgentSpawn::for_agent(config, agent_alias)
-        .and_then(|spawn| spawn.build(crate::subagent::SubAgentOverrides::default()))
-    {
-        Ok(ctx) => ctx,
-        Err(e) => return (false, format!("subagent spawn failed: {e:#}")),
-    };
-
     if !security.can_act() {
         return (
             false,
@@ -850,7 +843,7 @@ async fn run_agent_job(
         spawn_site = "cron",
     );
 
-    let run_security = cron_agent_run_security_policy(subagent_ctx.policy.as_ref(), job);
+    let run_security = cron_agent_run_policy(security, job);
     let run_overrides = crate::agent::loop_::AgentRunOverrides {
         security: Some(Arc::new(run_security)),
         memory: None,
@@ -1444,6 +1437,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cron_agent_run_policy_uses_scheduler_workspace() {
+        let workspace = std::path::PathBuf::from("/tmp/zeroclaw-cron-agent-workspace");
+        let security = SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        };
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+
+        let policy = cron_agent_run_policy(&security, &job);
+
+        assert_eq!(policy.workspace_dir, workspace);
+    }
+
     struct PowerShellProbeRuntime {
         build_calls: std::sync::atomic::AtomicUsize,
     }
@@ -1626,13 +1634,13 @@ mod tests {
     }
 
     #[test]
-    fn cron_agent_run_security_policy_excludes_scheduler_mutation_tools_by_default() {
+    fn cron_agent_run_policy_excludes_scheduler_mutation_tools_by_default() {
         let security = SecurityPolicy::default();
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.allowed_tools = None;
 
-        let policy = cron_agent_run_security_policy(&security, &job);
+        let policy = cron_agent_run_policy(&security, &job);
 
         for tool in [
             "cron_add",
@@ -1653,13 +1661,13 @@ mod tests {
     }
 
     #[test]
-    fn cron_agent_run_security_policy_respects_explicit_allowed_tools() {
+    fn cron_agent_run_policy_respects_explicit_allowed_tools() {
         let security = SecurityPolicy::default();
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.allowed_tools = Some(vec!["cron_add".into()]);
 
-        let policy = cron_agent_run_security_policy(&security, &job);
+        let policy = cron_agent_run_policy(&security, &job);
 
         assert!(
             policy.is_tool_allowed("cron_add"),
@@ -2178,6 +2186,146 @@ mod tests {
             Box::pin(run_agent_job(&config, &security, "test-agent", &job)).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
+    }
+
+    #[tokio::test]
+    async fn agent_cron_run_keeps_workspace_through_shell_on_retry_and_concurrency() {
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::post};
+        use tokio::net::TcpListener;
+        use zeroclaw_config::schema::{ModelProviderConfig, OllamaModelProviderConfig};
+
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let fail_first_request = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let requests_for_handler = Arc::clone(&requests);
+        let fail_first_for_handler = Arc::clone(&fail_first_request);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<serde_json::Value>| {
+                requests_for_handler.lock().unwrap().push(body.clone());
+                let has_tool_result = body["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                    })
+                });
+                let fail_this_request =
+                    fail_first_for_handler.swap(false, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if fail_this_request {
+                        return (StatusCode::OK, "not-json").into_response();
+                    }
+                    if has_tool_result {
+                        return Json(serde_json::json!({
+                            "choices": [{"message": {"content": "done"}}]
+                        }))
+                        .into_response();
+                    }
+                    Json(serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "content": null,
+                                "tool_calls": [{
+                                    "id": "call-shell",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "shell",
+                                        "arguments": "{\"command\":\"pwd\"}"
+                                    }
+                                }]
+                            }
+                        }]
+                    }))
+                    .into_response()
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp).await;
+        config.memory.backend = "none".to_string();
+        config.memory.auto_save = false;
+        config.reliability.scheduler_retries = 1;
+        config.reliability.provider_backoff_ms = 1;
+        config.providers.models.ollama.insert(
+            "default".to_string(),
+            OllamaModelProviderConfig {
+                base: ModelProviderConfig {
+                    model: Some("cron-workspace-test-model".to_string()),
+                    timeout_secs: Some(5),
+                    uri: Some(format!("http://{address}")),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        config.agents.get_mut(TEST_AGENT).unwrap().model_provider = "ollama.default".into();
+        config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
+            crate::security::AutonomyLevel::Full;
+
+        let mut security = test_security(&config);
+        let scheduler_workspace = tmp.path().join("scheduler-owned-workspace");
+        std::fs::create_dir_all(&scheduler_workspace).unwrap();
+        security.workspace_dir = scheduler_workspace.clone();
+        let expected_workspace = security.workspace_dir.clone();
+        assert_ne!(expected_workspace, config.agent_workspace_dir(TEST_AGENT));
+        let mut job = test_job("");
+        job.job_type = JobType::Agent;
+        job.prompt = Some("Print the current workspace directory".into());
+        job.allowed_tools = Some(vec!["shell".into()]);
+        job.uses_memory = false;
+
+        let (success, output) = Box::pin(execute_job_with_retry(
+            &config, &security, TEST_AGENT, &job, None, false,
+        ))
+        .await;
+        assert!(success, "retrying cron agent run failed: {output}");
+        assert_eq!(output, "done");
+
+        let sequential = Box::pin(run_agent_job(&config, &security, TEST_AGENT, &job)).await;
+        assert!(
+            sequential.0,
+            "repeated cron agent run failed: {:?}",
+            sequential.1
+        );
+
+        let (concurrent_a, concurrent_b, concurrent_c) = tokio::join!(
+            run_agent_job(&config, &security, TEST_AGENT, &job),
+            run_agent_job(&config, &security, TEST_AGENT, &job),
+            run_agent_job(&config, &security, TEST_AGENT, &job),
+        );
+        for result in [concurrent_a, concurrent_b, concurrent_c] {
+            assert!(result.0, "concurrent cron agent run failed: {:?}", result.1);
+        }
+
+        let requests = requests.lock().unwrap();
+        let tool_results: Vec<&str> = requests
+            .iter()
+            .filter_map(|request| {
+                request["messages"].as_array()?.iter().find_map(|message| {
+                    (message.get("role").and_then(serde_json::Value::as_str) == Some("tool"))
+                        .then(|| message.get("content")?.as_str())
+                        .flatten()
+                })
+            })
+            .collect();
+        assert_eq!(
+            tool_results.len(),
+            5,
+            "each successful run must execute shell once"
+        );
+        for tool_result in tool_results {
+            assert!(
+                tool_result.contains(expected_workspace.to_string_lossy().as_ref()),
+                "shell output must come from the scheduler workspace {:?}, got {tool_result:?}",
+                expected_workspace
+            );
+        }
+
+        server.abort();
     }
 
     #[tokio::test]
@@ -2854,30 +3002,29 @@ mod tests {
     }
 
     #[tokio::test]
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "android")))]
     async fn build_cron_shell_command_executes_with_custom_native_shell() {
-        use std::os::unix::fs::PermissionsExt;
-
         let tmp = TempDir::new().unwrap();
         let shim = tmp.path().join("cron-shell-shim");
-        std::fs::write(
-            &shim,
-            "#!/bin/sh\nprintf 'CUSTOM_SHELL\\n'\nprintf 'arg:%s\\n' \"$@\"\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Avoid writing an executable after the test process is multithreaded:
+        // a concurrently forked child can inherit the write descriptor and
+        // make the subsequent exec fail with ETXTBSY.
+        let shell = which::which("sh").unwrap();
+        std::os::unix::fs::symlink(shell, &shim).unwrap();
 
         let mut config = Config::default();
         config.runtime.shell = Some(shim.to_string_lossy().into_owned());
-        let mut cmd =
-            build_configured_shell_command(&config, "echo cron-custom", tmp.path()).unwrap();
+        let mut cmd = build_configured_shell_command(
+            &config,
+            "printf 'CUSTOM_SHELL:%s\\n' \"$0\"",
+            tmp.path(),
+        )
+        .unwrap();
         let output = cmd.output().await.unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         assert!(output.status.success());
-        assert!(stdout.contains("CUSTOM_SHELL"), "{stdout}");
-        assert!(stdout.contains("arg:-c"), "{stdout}");
-        assert!(stdout.contains("arg:echo cron-custom"), "{stdout}");
+        assert_eq!(stdout.trim(), format!("CUSTOM_SHELL:{}", shim.display()));
     }
 
     #[test]
@@ -2923,7 +3070,15 @@ mod tests {
     fn cron_powershell_policy_accepts_read_only_and_rejects_expressions() {
         let mut config = Config::default();
         config.runtime.shell = Some("powershell".into());
-        let security = SecurityPolicy::default();
+        // PowerShell-only command names are deliberately absent from the
+        // cross-dialect default allowlist (see
+        // `docs/book/src/security/sandboxing.md`): an operator opts into the
+        // cmdlets they need. Grant both documented spellings so the assertions
+        // below exercise the PowerShell grammar rather than the allowlist.
+        let security = SecurityPolicy {
+            allowed_commands: vec!["Write-Output".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
         let runtime = crate::platform::create_runtime(&config.runtime).unwrap();
 
         crate::cron::validate_shell_command_with_security(

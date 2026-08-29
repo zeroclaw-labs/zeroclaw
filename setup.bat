@@ -218,7 +218,7 @@ set "BUILD_DESC=minimal (core only, no default features)"
 goto :do_build
 
 :build_dist
-set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
+set "FEATURES=--no-default-features --features acp-bridge,agent-runtime,channel-acp-server,channel-discord,channel-email,channel-filesystem,channel-git,channel-lark,channel-matrix,channel-telegram,channel-webhook,gateway,observability-prometheus,schema-export,whatsapp-web"
 set "BUILD_DESC=dist (lean standard distribution (recommended))"
 goto :do_build
 

@@ -60,6 +60,13 @@ impl Chord {
             literal_word_control = cfg!(target_os = "macos") && label == "Ctrl";
             parts.push(label);
         }
+        if self.modifiers.contains(KeyModifiers::SUPER) {
+            parts.push(if cfg!(target_os = "macos") {
+                "⌘"
+            } else {
+                "Super"
+            });
+        }
         if self.modifiers.contains(KeyModifiers::ALT) {
             parts.push(if cfg!(target_os = "macos") {
                 "⌥"
@@ -423,6 +430,24 @@ mod tests {
         assert_eq!(Chord::ctrl('x').display(), "⌘x");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn display_explicit_super_on_darwin() {
+        assert_eq!(
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER).display(),
+            "⌘c"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn display_explicit_super_on_non_darwin() {
+        assert_eq!(
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER).display(),
+            "Super+c"
+        );
+    }
+
     #[test]
     fn display_arrow_keys() {
         assert_eq!(Chord::key(KeyCode::Up).display(), "↑");
@@ -440,6 +465,7 @@ mod tests {
     fn wire_round_trips_modifiers() {
         for c in [
             Chord::ctrl('k'),
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
             Chord::shift(KeyCode::Up),
             Chord::with(
                 KeyCode::Down,

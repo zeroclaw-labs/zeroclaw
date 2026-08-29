@@ -14,14 +14,21 @@ pub(crate) struct IterationToolSpecs {
 }
 
 impl IterationToolSpecs {
-    pub(crate) fn refresh_native_tool_mode(&mut self, model_provider: &dyn ModelProvider) {
-        self.use_native_tools =
-            model_provider.supports_native_tools() && !self.tool_specs.is_empty();
+    pub(crate) fn refresh_native_tool_mode(
+        &mut self,
+        model_provider: &dyn ModelProvider,
+        model: &str,
+    ) {
+        self.use_native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling
+            && !self.tool_specs.is_empty();
     }
 }
 
 pub(crate) fn build_iteration_tool_specs(
     model_provider: &dyn ModelProvider,
+    model: &str,
     tools_registry: &[Box<dyn Tool>],
     excluded_tools: &[String],
     activated_tools: Option<&Arc<Mutex<ActivatedToolSet>>>,
@@ -56,7 +63,10 @@ pub(crate) fn build_iteration_tool_specs(
         .iter()
         .map(|tool| tool.name.to_ascii_lowercase())
         .collect();
-    let use_native_tools = model_provider.supports_native_tools() && !tool_specs.is_empty();
+    let use_native_tools = model_provider
+        .capabilities_for_model(model)
+        .native_tool_calling
+        && !tool_specs.is_empty();
 
     Ok(IterationToolSpecs {
         tool_specs,
@@ -215,8 +225,14 @@ mod tests {
         })
         .join();
 
-        let specs = build_iteration_tool_specs(&NativeToolsProvider, &[], &[], Some(&activated))
-            .expect("poisoned activated-tools lock should recover for read");
+        let specs = build_iteration_tool_specs(
+            &NativeToolsProvider,
+            "test-model",
+            &[],
+            &[],
+            Some(&activated),
+        )
+        .expect("poisoned activated-tools lock should recover for read");
         assert!(
             specs
                 .tool_specs
@@ -230,11 +246,12 @@ mod tests {
     fn iteration_tool_specs_recomputes_native_mode_for_active_provider() {
         let invocations = Arc::new(AtomicUsize::new(0));
         let tool = Box::new(CountingTool::new("read_file", invocations));
-        let mut specs = build_iteration_tool_specs(&NativeToolsProvider, &[tool], &[], None)
-            .expect("native provider with tools should build specs");
+        let mut specs =
+            build_iteration_tool_specs(&NativeToolsProvider, "test-model", &[tool], &[], None)
+                .expect("native provider with tools should build specs");
         assert!(specs.use_native_tools);
 
-        specs.refresh_native_tool_mode(&PromptToolsProvider);
+        specs.refresh_native_tool_mode(&PromptToolsProvider, "test-model");
 
         assert!(
             !specs.use_native_tools,

@@ -21,6 +21,7 @@ pub mod api_sections;
 pub mod api_skills;
 pub mod api_sop;
 pub mod api_sop_author;
+mod api_sop_webhook;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
 #[cfg(any(
@@ -43,6 +44,12 @@ pub mod tls;
 pub mod version;
 #[cfg(feature = "gateway-voice-duplex")]
 pub mod voice_duplex;
+#[cfg(any(
+    feature = "channel-linq",
+    feature = "channel-nextcloud",
+    feature = "channel-whatsapp-cloud"
+))]
+mod webhook_ingress;
 pub mod ws;
 pub mod ws_approval;
 pub mod ws_sop_runs;
@@ -113,7 +120,7 @@ use uuid::Uuid;
     feature = "channel-nextcloud",
     feature = "channel-whatsapp-cloud"
 ))]
-use zeroclaw_api::channel::{Channel, SendMessage};
+use zeroclaw_api::channel::Channel;
 use zeroclaw_api::memory_traits::MemoryStrategy;
 use zeroclaw_api::tool::ToolSpec;
 #[cfg(feature = "channel-email")]
@@ -468,8 +475,6 @@ pub struct AppState {
     pub mem: Arc<dyn Memory>,
     pub memory_strategy: Arc<dyn MemoryStrategy>,
     pub auto_save: bool,
-    /// SHA-256 hash of `X-Webhook-Secret` (hex-encoded), never plaintext.
-    pub webhook_secret_hash: Option<Arc<str>>,
     pub pairing: Arc<PairingGuard>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
@@ -1002,16 +1007,6 @@ pub async fn run_gateway(
         tx
     });
     let event_buffer = Arc::new(sse::EventBuffer::new(500));
-    // Extract webhook secret for authentication
-    let webhook_secret_hash: Option<Arc<str>> =
-        config.channels.webhook.values().next().and_then(|webhook| {
-            webhook.secret.as_ref().and_then(|raw_secret| {
-                let trimmed_secret = raw_secret.trim();
-                (!trimmed_secret.is_empty())
-                    .then(|| Arc::<str>::from(hash_webhook_secret(trimmed_secret)))
-            })
-        });
-
     // WhatsApp channel instances (one per cloud-configured alias), keyed by
     // alias so `/whatsapp/{alias}` webhooks reach the matching instance
     #[cfg(feature = "channel-whatsapp-cloud")]
@@ -1537,7 +1532,6 @@ pub async fn run_gateway(
         mem,
         memory_strategy,
         auto_save: config.memory.auto_save,
-        webhook_secret_hash,
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
@@ -1621,6 +1615,7 @@ pub async fn run_gateway(
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
+        .merge(sop_webhook_routes())
         .merge(optional_channel_routes())
         // ── Claude Code runner hooks ──
         .route("/hooks/claude-code", post(api::handle_claude_code_hook))
@@ -1695,6 +1690,10 @@ pub async fn run_gateway(
         .route(
             "/api/sops/{name}/runs/{run_id}/decide",
             post(api_sop_author::handle_sop_decide),
+        )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/cancel",
+            post(api_sop_author::handle_sop_cancel),
         )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
@@ -2640,6 +2639,10 @@ fn optional_channel_routes() -> Router<AppState> {
     router
 }
 
+fn sop_webhook_routes() -> Router<AppState> {
+    Router::new().route("/sop/{*rest}", post(api_sop_webhook::handle_sop_webhook))
+}
+
 /// Webhook request body
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
@@ -2657,16 +2660,66 @@ pub struct WebhookQuery {
     pub agent: Option<String>,
 }
 
-/// POST /webhook — main webhook endpoint
-async fn handle_webhook(
-    State(state): State<AppState>,
-    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
-    Query(query): Query<WebhookQuery>,
-    headers: HeaderMap,
-    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
-    let rate_key =
-        client_key_from_request(Some(peer_addr), &headers, state.trust_forwarded_headers);
+type WebhookJsonResponse = (StatusCode, Json<serde_json::Value>);
+
+/// Resolve the gateway webhook credential from its canonical live config.
+/// Channel webhook aliases own separate HMAC listeners and never participate
+/// in authorization for the gateway's `/webhook` or `/sop/*` routes.
+fn configured_gateway_webhook_secret_hash(state: &AppState) -> Option<String> {
+    state
+        .config
+        .read()
+        .gateway
+        .webhook_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|secret| !secret.is_empty())
+        .map(hash_webhook_secret)
+}
+
+/// Immutable snapshot of the credential policy applied to ONE request.
+///
+/// `AppState::config` is a live `Arc<RwLock<Config>>` that the config
+/// PUT/PATCH handlers and `POST /admin/reload` legitimately mutate while a
+/// request is in flight. Reading the policy twice therefore lets a single
+/// request straddle two security states: a headerless request can pass an
+/// "unconfigured" read and then satisfy a "configured" read after an operator
+/// inserts a secret, and a request bearing a revoked secret can pass a read
+/// against the old secret and then be admitted merely because a replacement is
+/// present.
+///
+/// This verdict is produced by exactly one policy read inside
+/// [`authorize_webhook_request`] and is then threaded through dispatch. No
+/// downstream code re-reads `state.config` for an authorization decision, so
+/// live rotation takes effect at *next*-request granularity instead of mixing
+/// two security states inside one request.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WebhookAuthVerdict {
+    /// `gateway.require_pairing` was on in this snapshot AND the bearer token verified.
+    pairing_verified: bool,
+    /// `gateway.webhook_secret` was set in this snapshot AND `X-Webhook-Secret` matched it.
+    secret_verified: bool,
+    /// At least one control was configured in this same snapshot.
+    any_control_configured: bool,
+}
+
+impl WebhookAuthVerdict {
+    /// The composition rule the docs state: at least one control must be
+    /// configured, and every configured control must have passed. A verdict is
+    /// only ever constructed after every configured control passed, so both
+    /// facts come from the SAME snapshot and insertion/rotation cannot straddle
+    /// them.
+    fn may_dispatch_sop(self) -> bool {
+        self.any_control_configured && (self.pairing_verified || self.secret_verified)
+    }
+}
+
+fn authorize_webhook_request(
+    state: &AppState,
+    peer_addr: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<WebhookAuthVerdict, WebhookJsonResponse> {
+    let rate_key = client_key_from_request(Some(peer_addr), headers, state.trust_forwarded_headers);
     if !state.rate_limiter.allow_webhook(&rate_key) {
         ::zeroclaw_log::record!(
             WARN,
@@ -2678,11 +2731,20 @@ async fn handle_webhook(
             "error": "Too many webhook requests. Please retry later.",
             "retry_after": RATE_LIMIT_WINDOW_SECS,
         });
-        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        return Err((StatusCode::TOO_MANY_REQUESTS, Json(err)));
     }
 
-    // ── Bearer token auth (pairing) with auth rate limiting ──
-    if state.pairing.require_pairing() {
+    // ── The single authorization policy read for this request ──
+    // Everything below decides from `snapshot_secret_hash` / `require_pairing`
+    // captured here; `state.config` is never consulted again for an
+    // authorization decision on this request.
+    let snapshot_secret_hash = configured_gateway_webhook_secret_hash(state);
+    let require_pairing = state.pairing.require_pairing();
+    let any_control_configured = require_pairing || snapshot_secret_hash.is_some();
+    let mut pairing_verified = false;
+    let mut secret_verified = false;
+
+    if require_pairing {
         if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
             ::zeroclaw_log::record!(
                 WARN,
@@ -2695,7 +2757,7 @@ async fn handle_webhook(
                 "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
                 "retry_after": e.retry_after_secs,
             });
-            return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+            return Err((StatusCode::TOO_MANY_REQUESTS, Json(err)));
         }
         let auth = headers
             .get(header::AUTHORIZATION)
@@ -2713,12 +2775,12 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
             });
-            return (StatusCode::UNAUTHORIZED, Json(err));
+            return Err((StatusCode::UNAUTHORIZED, Json(err)));
         }
+        pairing_verified = true;
     }
 
-    // ── Webhook secret auth (optional, additional layer) ──
-    if let Some(ref secret_hash) = state.webhook_secret_hash {
+    if let Some(secret_hash) = snapshot_secret_hash.as_deref() {
         let header_hash = headers
             .get("X-Webhook-Secret")
             .and_then(|v| v.to_str().ok())
@@ -2726,7 +2788,9 @@ async fn handle_webhook(
             .filter(|value| !value.is_empty())
             .map(hash_webhook_secret);
         match header_hash {
-            Some(val) if constant_time_eq(&val, secret_hash.as_ref()) => {}
+            Some(val) if constant_time_eq(&val, secret_hash) => {
+                secret_verified = true;
+            }
             _ => {
                 ::zeroclaw_log::record!(
                     WARN,
@@ -2735,12 +2799,137 @@ async fn handle_webhook(
                     "webhook: rejected request — invalid or missing X-Webhook-Secret"
                 );
                 let err = serde_json::json!({"error": "Unauthorized — invalid or missing X-Webhook-Secret header"});
-                return (StatusCode::UNAUTHORIZED, Json(err));
+                return Err((StatusCode::UNAUTHORIZED, Json(err)));
             }
         }
     }
 
-    // ── Parse body ──
+    Ok(WebhookAuthVerdict {
+        pairing_verified,
+        secret_verified,
+        any_control_configured,
+    })
+}
+
+/// Build an injective storage key for the replay/idempotency store.
+///
+/// Both the namespace (derived from a caller-controlled SOP path) and the
+/// caller's `X-Idempotency-Key` are attacker-controlled strings, so a bare
+/// `"{namespace}:{key}"` join is ambiguous: `/sop/a` with key `b:c` produced
+/// the same string as `/sop/a:b` with key `c`, and a `/webhook` caller could
+/// forge the key `sop:/sop/deploy:k` to collide with `/sop/deploy` key `k`.
+/// An authenticated caller could therefore suppress a *different* attempt
+/// despite the documented per-path and per-endpoint isolation.
+///
+/// This encoding is injective because every component is length-prefixed:
+/// a reader consumes exactly the declared number of bytes, so no component
+/// boundary can be forged by embedding the separator inside a component. The
+/// endpoint domain tag is carried as its own component, so `/webhook` keys can
+/// never alias `/sop/*` keys.
+fn idempotency_storage_key(namespace: Option<&str>, idempotency_key: &str) -> String {
+    fn push_component(out: &mut String, value: &str) {
+        // `<byte-len>:<value>` — the length prefix makes the split point
+        // unambiguous regardless of what `value` contains.
+        out.push_str(&value.len().to_string());
+        out.push(':');
+        out.push_str(value);
+    }
+
+    let mut key = String::new();
+    match namespace {
+        Some(namespace) => {
+            push_component(&mut key, "ns");
+            push_component(&mut key, namespace);
+        }
+        None => push_component(&mut key, "global"),
+    }
+    push_component(&mut key, idempotency_key);
+    key
+}
+
+/// Emit duplicate telemetry without copying caller-controlled key material
+/// into the log pipeline. The key remains available to the replay store; only
+/// its presence is useful and safe at this observability boundary.
+fn record_duplicate_idempotency_log() {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"idempotency_key_present": true})),
+        "webhook duplicate ignored"
+    );
+}
+
+fn check_webhook_idempotency(
+    state: &AppState,
+    headers: &HeaderMap,
+    namespace: Option<&str>,
+) -> Option<WebhookJsonResponse> {
+    let idempotency_key = headers
+        .get("X-Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let storage_key = idempotency_storage_key(namespace, idempotency_key);
+    if state.idempotency_store.record_if_new(&storage_key) {
+        return None;
+    }
+
+    record_duplicate_idempotency_log();
+    Some((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "duplicate",
+            "idempotent": true,
+            "message": "A prior request already reserved this idempotency key; no new dispatch was started"
+        })),
+    ))
+}
+
+/// Fail closed before a SOP run starts. Starting a SOP run authorizes real
+/// side effects, so — unlike the chat-only `/webhook` fallback, which keeps
+/// its existing default-open policy — dispatch must not proceed when both
+/// `gateway.require_pairing` and the webhook secret are unset (the official
+/// container's default configuration). Repo policy is "new external surfaces
+/// default closed".
+///
+/// This is a PURE function over the request-scoped [`WebhookAuthVerdict`]
+/// produced by the single policy read in [`authorize_webhook_request`]. It
+/// deliberately takes no `&AppState`: re-reading the live config here is what
+/// let a request straddle two security states across a concurrent config
+/// mutation.
+fn require_sop_dispatch_credentials(
+    verdict: WebhookAuthVerdict,
+) -> Result<(), WebhookJsonResponse> {
+    if verdict.may_dispatch_sop() {
+        return Ok(());
+    }
+    ::zeroclaw_log::record!(
+        WARN,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+            .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+        "sop webhook dispatch rejected — no credential configured"
+    );
+    let err = serde_json::json!({
+        "error": "SOP webhook dispatch requires a configured credential: set \
+                  `gateway.require_pairing = true` and authenticate with \
+                  `Authorization: Bearer <paired-token>` (pair first via POST /pair), or set \
+                  `gateway.webhook_secret` and send X-Webhook-Secret."
+    });
+    Err((StatusCode::UNAUTHORIZED, Json(err)))
+}
+
+/// POST /webhook — main webhook endpoint
+async fn handle_webhook(
+    State(state): State<AppState>,
+    ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
+    Query(query): Query<WebhookQuery>,
+    headers: HeaderMap,
+    body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers) {
+        Ok(verdict) => verdict,
+        Err(response) => return response,
+    };
     let Json(webhook_body) = match body {
         Ok(b) => b,
         Err(e) => {
@@ -2758,9 +2947,40 @@ async fn handle_webhook(
         }
     };
 
+    // ── SOP dispatch first ──
+    // A matching `/webhook` SOP trigger takes the request before any
+    // chat-only routing (query params, agent aliases) is even inspected —
+    // the advertised contract is SOP dispatch first, chat fallback second,
+    // so a chat-only param must never block a matching SOP.
+    let sop_payload = serde_json::json!({ "message": &webhook_body.message }).to_string();
+    let has_matching_sop = match api_sop_webhook::has_matching_webhook_sop(&state, "/webhook") {
+        Ok(matches) => matches,
+        Err(response) => return response,
+    };
+
+    if has_matching_sop {
+        if let Err(response) = require_sop_dispatch_credentials(auth_verdict) {
+            return response;
+        }
+        if let Some(response) = check_webhook_idempotency(&state, &headers, None) {
+            return response;
+        }
+        if let api_sop_webhook::SopWebhookOutcome::Handled(response) =
+            api_sop_webhook::dispatch_webhook_sop(&state, "/webhook", Some(&sop_payload)).await
+        {
+            return response;
+        }
+        // The engine reported no match after all (e.g. a trigger was
+        // unloaded between the pre-check above and dispatch); fall through
+        // to chat. The idempotency key above is already consumed for this
+        // attempt.
+    }
+
     // ── Per-request agent dispatch (optional `?agent=` query param) ──
-    // Validate before idempotency / autosave so a typo'd alias doesn't
-    // consume the caller's idempotency key. Mirrors the `/ws/chat`
+    // Chat-only routing: only reached when no SOP trigger matched
+    // `/webhook`, so a bogus `?agent=` can never block a matching SOP
+    // dispatch. Validated before idempotency / autosave so a typo'd alias
+    // doesn't consume the caller's idempotency key. Mirrors the `/ws/chat`
     // unknown-agent rejection.
     let agent_override = query
         .agent
@@ -2786,26 +3006,8 @@ async fn handle_webhook(
         }
     }
 
-    // ── Idempotency (optional) ──
-    if let Some(idempotency_key) = headers
-        .get("X-Idempotency-Key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        && !state.idempotency_store.record_if_new(idempotency_key)
-    {
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"idempotency_key": idempotency_key})),
-            "webhook duplicate ignored"
-        );
-        let body = serde_json::json!({
-            "status": "duplicate",
-            "idempotent": true,
-            "message": "Request already processed for this idempotency key"
-        });
-        return (StatusCode::OK, Json(body));
+    if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
+        return response;
     }
 
     let message = &webhook_body.message;
@@ -3031,7 +3233,8 @@ async fn handle_whatsapp_message_impl(
         return api_webhook::not_found("whatsapp");
     };
     let app_secret = state.whatsapp_app_secret.get(alias_key).cloned();
-    let resp = process_whatsapp_message(&state, wa, app_secret.as_deref(), headers, body).await;
+    let resp =
+        process_whatsapp_message(&state, alias_key, wa, app_secret.as_deref(), headers, body).await;
     api_webhook::tag_deprecation(resp.into_response(), resolved, "whatsapp")
 }
 
@@ -3040,149 +3243,73 @@ async fn handle_whatsapp_message_impl(
 #[cfg(feature = "channel-whatsapp-cloud")]
 async fn process_whatsapp_message(
     state: &AppState,
+    alias: &str,
     wa: &Arc<WhatsAppChannel>,
     app_secret: Option<&str>,
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // ── Security: WhatsApp Cloud webhooks MUST be signature-verified ──
-    // Fail closed: with no configured app secret we cannot verify the signature, so the
-    // request is rejected. Previously an absent secret skipped verification entirely,
-    // which let any caller who knew the webhook URL inject messages into the agent.
-    let Some(app_secret) = app_secret else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "whatsapp: no app_secret configured; refusing to accept an unverified webhook"
-            })),
-        );
-    };
-    {
-        let signature = headers
-            .get("X-Hub-Signature-256")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !verify_whatsapp_signature(app_secret, &body, signature) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"channel": "whatsapp"})),
-                &format!(
-                    "webhook signature verification failed (signature: {})",
-                    if signature.is_empty() {
-                        "missing"
-                    } else {
-                        "invalid"
-                    }
-                )
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
-    }
-
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
+    let verified = match webhook_ingress::authenticate(
+        &webhook_ingress::WHATSAPP_WEBHOOK,
+        alias,
+        app_secret,
+        &headers,
+        body,
+        |secret, headers, body| {
+            let signature = headers
+                .get("X-Hub-Signature-256")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            verify_whatsapp_signature(secret, body, signature)
+        },
+    ) {
+        Ok(verified) => verified,
+        Err(refusal) => return refusal.into_response(&webhook_ingress::WHATSAPP_WEBHOOK),
     };
 
-    // Parse messages from the webhook payload
-    let messages = wa.parse_webhook_payload(&payload);
+    let mut verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(wa.parse_webhook_payload(&payload))
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
 
-    if messages.is_empty() {
-        // Acknowledge the webhook even if no messages (could be status updates)
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
-    }
+    // Route approval replies to pending approval requests before dispatching
+    // to the agent.
+    let mut approvals = wa.pending_approvals().lock().await;
+    verified.retain(|msg| {
+        let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
+        else {
+            return true;
+        };
+        let Some(sender) = approvals.remove(&token) else {
+            return true;
+        };
+        let _ = sender.send(response);
+        false
+    });
+    drop(approvals);
 
-    // Process each message
-    for msg in &messages {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "whatsapp", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
-
-        // Route approval replies to pending approval requests before dispatching to agent
-        if let Some((token, response)) = zeroclaw_channels::util::parse_approval_reply(&msg.content)
-        {
-            let mut map = wa.pending_approvals().lock().await;
-            if let Some(sender) = map.remove(&token) {
-                let _ = sender.send(response);
-                continue;
-            }
-        }
-
-        let session_id = sender_session_id("whatsapp", msg);
-
-        // Auto-save to memory
-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-            let key = whatsapp_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        match Box::pin(run_gateway_chat_with_tools(
-            state,
-            &msg.content,
-            Some(&session_id),
-            None,
-        ))
-        .await
-        {
-            Ok(GatewayChatOutcome { response, .. }) => {
-                // Send reply via WhatsApp
-                if let Err(e) = wa
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Failed to send WhatsApp reply"
-                    );
-                }
-            }
-            Err(e) => {
-                let reply = if is_needs_quickstart_err(&e) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "WhatsApp chat refused: gateway has no model configured; \
-                         visit /quickstart"
-                    );
-                    needs_quickstart_channel_reply()
-                } else {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"channel": "whatsapp", "error": format!("{}", e)})
-                            ),
-                        "LLM error"
-                    );
-                    "Sorry, I couldn't process your message right now.".to_string()
-                };
-                let _ = wa.send(&SendMessage::new(reply, &msg.reply_target)).await;
-            }
-        }
-    }
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    let channel: Arc<dyn Channel> = wa.clone();
+    webhook_ingress::dispatch_verified_webhook(
+        state,
+        verified,
+        webhook_ingress::WebhookDispatchContext {
+            channel,
+            memory_key: whatsapp_memory_key,
+            agent_override: None,
+            mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+            #[cfg(test)]
+            suppress_reply_send: true,
+        },
+    )
+    .await
 }
 
 /// POST /linq — incoming message webhook (bare path, deprecated fallback).
@@ -3241,72 +3368,44 @@ async fn process_linq_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let body_str = String::from_utf8_lossy(&body);
-
-    // ── Security: Linq webhooks MUST be signature-verified ──
-    // Fail closed: with no configured signing secret we cannot verify the signature, so
-    // the request is rejected. Previously an absent secret skipped verification
-    // entirely, which let any caller who knew the webhook URL inject messages into the
-    // agent.
-    let Some(signing_secret) = signing_secret else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "linq: no signing_secret configured; refusing to accept an unverified webhook"
-            })),
-        );
-    };
-    {
-        let timestamp = headers
-            .get("X-Webhook-Timestamp")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let signature = headers
-            .get("X-Webhook-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !zeroclaw_channels::linq::verify_linq_signature(
-            signing_secret,
-            &body_str,
-            timestamp,
-            signature,
-        ) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"channel": "linq", "alias": alias})),
-                &format!(
-                    "Linq webhook signature verification failed for alias '{alias}' (signature: {})",
-                    if signature.is_empty() {
-                        "missing"
-                    } else {
-                        "invalid"
-                    }
-                )
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
-    }
-
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
+    let verified = match webhook_ingress::authenticate(
+        &webhook_ingress::LINQ_WEBHOOK,
+        alias,
+        signing_secret,
+        &headers,
+        body,
+        |secret, headers, body| {
+            let body_str = String::from_utf8_lossy(body);
+            let timestamp = headers
+                .get("X-Webhook-Timestamp")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let signature = headers
+                .get("X-Webhook-Signature")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            zeroclaw_channels::linq::verify_linq_signature(secret, &body_str, timestamp, signature)
+        },
+    ) {
+        Ok(verified) => verified,
+        Err(refusal) => return refusal.into_response(&webhook_ingress::LINQ_WEBHOOK),
     };
 
-    // Parse messages from the webhook payload
-    let messages = linq.parse_webhook_payload(&payload);
+    let verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(linq.parse_webhook_payload(&payload))
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
 
-    if messages.is_empty() {
-        // Acknowledge the webhook even if no messages (could be status/delivery events)
+    if verified.is_empty() {
+        // Acknowledge status/delivery events before ownership resolution.
         return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
     }
 
@@ -3335,85 +3434,20 @@ async fn process_linq_webhook(
         );
     }
 
-    // Process each message
-    for msg in &messages {
-        ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "linq", "alias": alias, "sender": msg.sender, "content": msg.content})), "inbound webhook message");
-        let session_id =
-            zeroclaw_api::session_keys::sanitize_session_key(&sender_session_id(&channel_ref, msg));
-
-        // Auto-save to memory
-        if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-            let key = linq_memory_key(msg);
-            let _ = state
-                .mem
-                .store(
-                    &key,
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        // Call the LLM
-        match Box::pin(run_gateway_chat_with_tools(
-            state,
-            &msg.content,
-            Some(&session_id),
-            agent_override.as_deref(),
-        ))
-        .await
-        {
-            Ok(GatewayChatOutcome { response, .. }) => {
-                #[cfg(test)]
-                {
-                    let _ = response;
-                }
-
-                // Send reply via Linq
-                #[cfg(not(test))]
-                if let Err(e) = linq
-                    .send(&SendMessage::new(response, &msg.reply_target))
-                    .await
-                {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "Failed to send Linq reply"
-                    );
-                }
-            }
-            Err(e) => {
-                let reply = if is_needs_quickstart_err(&e) {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "Linq chat refused: gateway has no model configured; \
-                         visit /quickstart"
-                    );
-                    needs_quickstart_channel_reply()
-                } else {
-                    ::zeroclaw_log::record!(
-                        ERROR,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(
-                                ::serde_json::json!({"channel": "linq", "error": format!("{}", e)})
-                            ),
-                        "LLM error"
-                    );
-                    "Sorry, I couldn't process your message right now.".to_string()
-                };
-                let _ = linq.send(&SendMessage::new(reply, &msg.reply_target)).await;
-            }
-        }
-    }
-
-    // Acknowledge the webhook
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    let channel: Arc<dyn Channel> = linq.clone();
+    webhook_ingress::dispatch_verified_webhook(
+        state,
+        verified,
+        webhook_ingress::WebhookDispatchContext {
+            channel,
+            memory_key: linq_memory_key,
+            agent_override,
+            mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+            #[cfg(test)]
+            suppress_reply_send: true,
+        },
+    )
+    .await
 }
 
 /// POST /nextcloud-talk — incoming message webhook (bare path, deprecated).
@@ -3451,6 +3485,7 @@ async fn handle_nextcloud_talk_webhook_impl(
     let webhook_secret = state.nextcloud_talk_webhook_secret.get(alias_key).cloned();
     let resp = process_nextcloud_talk_webhook(
         &state,
+        alias_key,
         nextcloud_talk,
         webhook_secret.as_deref(),
         headers,
@@ -3465,153 +3500,69 @@ async fn handle_nextcloud_talk_webhook_impl(
 #[cfg(feature = "channel-nextcloud")]
 async fn process_nextcloud_talk_webhook(
     state: &AppState,
+    alias: &str,
     nextcloud_talk: &Arc<NextcloudTalkChannel>,
     webhook_secret: Option<&str>,
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let body_str = String::from_utf8_lossy(&body);
-
-    // ── Security: Nextcloud Talk webhooks MUST be signature-verified ──
-    // Fail closed: with no resolved bot secret we cannot verify the signature, so the
-    // request is rejected. Previously an unresolved secret skipped verification
-    // entirely, which left a bot_token-only configuration accepting unverified inbound
-    // webhooks while still signing outbound replies.
-    let Some(webhook_secret) = webhook_secret else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({
-                "error": "nextcloud_talk: no bot secret configured; refusing to accept an unverified webhook"
-            })),
-        );
-    };
-    {
-        let random = headers
-            .get("X-Nextcloud-Talk-Random")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        let signature = headers
-            .get("X-Nextcloud-Talk-Signature")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-
-        if !zeroclaw_channels::nextcloud_talk::verify_nextcloud_talk_signature(
-            webhook_secret,
-            random,
-            &body_str,
-            signature,
-        ) {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "Nextcloud Talk webhook signature verification failed (signature: {})",
-                    if signature.is_empty() {
-                        "missing"
-                    } else {
-                        "invalid"
-                    }
-                )
-            );
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({"error": "Invalid signature"})),
-            );
-        }
-    }
-
-    // Parse JSON body
-    let Ok(payload) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid JSON payload"})),
-        );
+    let verified = match webhook_ingress::authenticate(
+        &webhook_ingress::NEXTCLOUD_TALK_WEBHOOK,
+        alias,
+        webhook_secret,
+        &headers,
+        body,
+        |secret, headers, body| {
+            let body_str = String::from_utf8_lossy(body);
+            let random = headers
+                .get("X-Nextcloud-Talk-Random")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let signature = headers
+                .get("X-Nextcloud-Talk-Signature")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            zeroclaw_channels::nextcloud_talk::verify_nextcloud_talk_signature(
+                secret, random, &body_str, signature,
+            )
+        },
+    ) {
+        Ok(verified) => verified,
+        Err(refusal) => return refusal.into_response(&webhook_ingress::NEXTCLOUD_TALK_WEBHOOK),
     };
 
-    // Parse messages from webhook payload
-    let messages = nextcloud_talk.parse_webhook_payload(&payload);
-    if messages.is_empty() {
-        // Acknowledge webhook even if payload does not contain actionable user messages.
-        return (StatusCode::OK, Json(serde_json::json!({"status": "ok"})));
-    }
+    let verified = match verified.parse_messages(|body| {
+        let payload = serde_json::from_slice::<serde_json::Value>(body).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid JSON payload"})),
+            )
+        })?;
+        Ok::<_, (StatusCode, Json<serde_json::Value>)>(
+            nextcloud_talk.parse_webhook_payload(&payload),
+        )
+    }) {
+        Ok(verified) => verified,
+        Err(response) => return response,
+    };
 
-    // Spawn per-message processing so the webhook returns 200 quickly.
-    // Nextcloud Talk cancels webhook requests that don't complete within ~5s;
-    // slow local models routinely exceed that. Each message gets
-    // its own task — the LLM call and reply are independent of the ack.
-    for msg in messages {
-        let state = state.clone();
-        let nextcloud_talk = Arc::clone(nextcloud_talk);
-        zeroclaw_spawn::spawn!(async move {
-            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"channel": "nextcloud_talk", "sender": msg.sender, "content": msg.content})), "inbound webhook message");
-            let session_id = sender_session_id("nextcloud_talk", &msg);
-
-            if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(&msg.content) {
-                let key = nextcloud_talk_memory_key(&msg);
-                let _ = state
-                    .mem
-                    .store(
-                        &key,
-                        &msg.content,
-                        MemoryCategory::Conversation,
-                        Some(&session_id),
-                    )
-                    .await;
-            }
-
-            match Box::pin(run_gateway_chat_with_tools(
-                &state,
-                &msg.content,
-                Some(&session_id),
-                None,
-            ))
-            .await
-            {
-                Ok(GatewayChatOutcome { response, .. }) => {
-                    if let Err(e) = nextcloud_talk
-                        .send(&SendMessage::new(response, &msg.reply_target))
-                        .await
-                    {
-                        ::zeroclaw_log::record!(
-                            ERROR,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Fail
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                            "Failed to send Nextcloud Talk reply"
-                        );
-                    }
-                }
-                Err(e) => {
-                    let reply = if is_needs_quickstart_err(&e) {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                            "Nextcloud Talk chat refused: gateway has no model configured; \
-                             visit /quickstart"
-                        );
-                        needs_quickstart_channel_reply()
-                    } else {
-                        ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"channel": "nextcloud_talk", "error": format!("{}", e)})), "LLM error");
-                        "Sorry, I couldn't process your message right now.".to_string()
-                    };
-                    let _ = nextcloud_talk
-                        .send(&SendMessage::new(reply, &msg.reply_target))
-                        .await;
-                }
-            }
-        });
-    }
-
-    (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+    // Fast-ack: Nextcloud Talk cancels webhook requests that don't complete
+    // within ~5s and slow local models routinely exceed that, so processing
+    // happens in background tasks and the 200 returns immediately.
+    let channel: Arc<dyn Channel> = nextcloud_talk.clone();
+    webhook_ingress::dispatch_verified_webhook(
+        state,
+        verified,
+        webhook_ingress::WebhookDispatchContext {
+            channel,
+            memory_key: nextcloud_talk_memory_key,
+            agent_override: None,
+            mode: webhook_ingress::WebhookDispatchMode::FastAck,
+            #[cfg(test)]
+            suppress_reply_send: true,
+        },
+    )
+    .await
 }
 
 /// Maximum request body size for the Gmail webhook endpoint (1 MB).
@@ -4366,7 +4317,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(require_pairing, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -4413,6 +4363,128 @@ mod tests {
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
+    }
+
+    fn webhook_sop_state(
+        tmp: &tempfile::TempDir,
+        trigger_path: &str,
+    ) -> (AppState, Arc<MockModelProvider>) {
+        let mut state = admin_paircode_state(tmp, false, false);
+        let provider = Arc::new(MockModelProvider::default());
+        state.model_provider = provider.clone();
+
+        let sops_dir = tmp.path().join("sops");
+        let sop_dir = sops_dir.join("webhook-test");
+        std::fs::create_dir_all(&sop_dir).unwrap();
+        std::fs::write(
+            sop_dir.join("SOP.toml"),
+            format!(
+                r#"[sop]
+name = "webhook-test"
+description = "Gateway webhook fan-in test"
+execution_mode = "auto"
+
+[[triggers]]
+type = "webhook"
+path = "{trigger_path}"
+"#,
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            sop_dir.join("SOP.md"),
+            "## Steps\n\n1. **Handle webhook** — Process the webhook payload.\n",
+        )
+        .unwrap();
+
+        let mut sop_config = state.config.read().sop.clone();
+        sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        sop_config.persist_runs = false;
+        state.config.write().sop = sop_config.clone();
+        let data_dir = state.config.read().data_dir.clone();
+        let install_root = state.config.read().install_root_dir();
+        let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+            sop_config,
+            &data_dir,
+            &install_root,
+            Arc::clone(&state.mem),
+            Default::default(),
+        );
+        state.sop_engine = Some(engine);
+        state.sop_audit = Some(audit);
+        (state, provider)
+    }
+
+    /// Same as [`webhook_sop_state`] but loads two SOPs, each with its own
+    /// distinct webhook trigger path — used to prove idempotency keys are
+    /// namespaced per SOP path rather than shared across all of `/sop/*`.
+    fn webhook_two_sop_state(
+        tmp: &tempfile::TempDir,
+        path_a: &str,
+        path_b: &str,
+    ) -> (AppState, Arc<MockModelProvider>) {
+        let mut state = admin_paircode_state(tmp, false, false);
+        let provider = Arc::new(MockModelProvider::default());
+        state.model_provider = provider.clone();
+
+        let sops_dir = tmp.path().join("sops");
+        for (name, trigger_path) in [("sop-a", path_a), ("sop-b", path_b)] {
+            let sop_dir = sops_dir.join(name);
+            std::fs::create_dir_all(&sop_dir).unwrap();
+            std::fs::write(
+                sop_dir.join("SOP.toml"),
+                format!(
+                    r#"[sop]
+name = "{name}"
+description = "Gateway webhook fan-in test"
+execution_mode = "auto"
+
+[[triggers]]
+type = "webhook"
+path = "{trigger_path}"
+"#,
+                ),
+            )
+            .unwrap();
+            std::fs::write(
+                sop_dir.join("SOP.md"),
+                "## Steps\n\n1. **Handle webhook** — Process the webhook payload.\n",
+            )
+            .unwrap();
+        }
+
+        let mut sop_config = state.config.read().sop.clone();
+        sop_config.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+        sop_config.persist_runs = false;
+        state.config.write().sop = sop_config.clone();
+        let data_dir = state.config.read().data_dir.clone();
+        let install_root = state.config.read().install_root_dir();
+        let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
+            sop_config,
+            &data_dir,
+            &install_root,
+            Arc::clone(&state.mem),
+            Default::default(),
+        );
+        state.sop_engine = Some(engine);
+        state.sop_audit = Some(audit);
+        (state, provider)
+    }
+
+    /// Attach a webhook-secret credential to `state`; returns the plaintext
+    /// secret to send back as `X-Webhook-Secret`. Item 2's fail-closed SOP
+    /// dispatch policy requires a configured-and-verified credential before
+    /// a SOP run can start.
+    fn with_webhook_secret(state: AppState) -> (AppState, String) {
+        let secret = generate_test_secret();
+        state.config.write().gateway.webhook_secret = Some(secret.clone());
+        (state, secret)
+    }
+
+    fn webhook_secret_header(secret: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Webhook-Secret", HeaderValue::from_str(secret).unwrap());
+        headers
     }
 
     fn spa_fallback_state(tmp: &tempfile::TempDir) -> AppState {
@@ -5154,7 +5226,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -5241,7 +5312,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -5915,7 +5985,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6002,6 +6071,808 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sop_webhook_dispatches_matching_path_without_provider_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(br#"{"revision":"abc123"}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(parsed["path"], "/sop/deploy");
+        assert_eq!(parsed["results"][0]["sop"], "webhook-test");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let run_id = parsed["results"][0]["run_id"].as_str().unwrap();
+        let engine = state.sop_engine.as_ref().unwrap().lock().unwrap();
+        let run = engine.get_run(run_id).unwrap();
+        assert_eq!(
+            run.trigger_event.source,
+            zeroclaw_runtime::sop::SopTriggerSource::Webhook
+        );
+        assert_eq!(run.trigger_event.topic.as_deref(), Some("/sop/deploy"));
+        assert_eq!(
+            run.trigger_event.payload.as_deref(),
+            Some(r#"{"revision":"abc123"}"#)
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_route_reaches_the_shared_dispatch_handler() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let app = sop_webhook_routes().with_state(state);
+        let mut request = axum::http::Request::post("/sop/deploy")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("X-Webhook-Secret", secret)
+            .body(axum::body::Body::from(r#"{"revision":"abc123"}"#))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    async fn post_sop_route_without_credentials(
+        state: AppState,
+        path: &'static str,
+        body: &'static [u8],
+    ) -> (StatusCode, serde_json::Value) {
+        let app = sop_webhook_routes().with_state(state);
+        let mut request = axum::http::Request::post(path)
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(test_connect_info());
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&payload).unwrap())
+    }
+
+    #[tokio::test]
+    async fn sop_route_without_credentials_hides_body_and_engine_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (matching, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let unavailable_tmp = tempfile::tempdir().unwrap();
+        let unavailable = admin_paircode_state(&unavailable_tmp, false, false);
+
+        let cases = [
+            post_sop_route_without_credentials(
+                matching.clone(),
+                "/sop/deploy",
+                br#"{"revision":"abc123"}"#,
+            )
+            .await,
+            post_sop_route_without_credentials(
+                matching.clone(),
+                "/sop/missing",
+                br#"{"revision":"abc123"}"#,
+            )
+            .await,
+            post_sop_route_without_credentials(matching, "/sop/deploy", b"not-json").await,
+            post_sop_route_without_credentials(unavailable, "/sop/deploy", br#"{}"#).await,
+        ];
+
+        let expected_error = cases[0].1["error"].clone();
+        for (status, payload) in cases {
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                payload["error"], expected_error,
+                "credential failure must not reveal JSON validity, trigger matches, or engine availability"
+            );
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_rejects_unmatched_and_invalid_requests_without_chat_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+
+        let unmatched = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("missing".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unmatched.status(), StatusCode::NOT_FOUND);
+
+        let invalid = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(b"not-json"),
+        )
+        .await;
+        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_webhook_requires_shared_engine_and_webhook_auth() {
+        let disabled_tmp = tempfile::tempdir().unwrap();
+        let disabled = admin_paircode_state(&disabled_tmp, false, false);
+        let (disabled, secret) = with_webhook_secret(disabled);
+        let unavailable = api_sop_webhook::handle_sop_webhook(
+            State(disabled),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            webhook_secret_header(&secret),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let protected_tmp = tempfile::tempdir().unwrap();
+        let (protected, provider) = webhook_sop_state(&protected_tmp, "/sop/deploy");
+        let secret = generate_test_secret();
+        protected.config.write().gateway.webhook_secret = Some(secret);
+        let unauthorized = api_sop_webhook::handle_sop_webhook(
+            State(protected),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_dispatches_sop_first_then_falls_back_to_chat_on_no_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+        let (state, secret) = with_webhook_secret(state);
+        let sop_response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            webhook_secret_header(&secret),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(sop_response.status(), StatusCode::OK);
+        let payload = sop_response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        let no_match_tmp = tempfile::tempdir().unwrap();
+        let (no_match_state, fallback_provider) = webhook_sop_state(&no_match_tmp, "/sop/only");
+        let fallback_response = handle_webhook(
+            State(no_match_state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "chat instead".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(fallback_response.status(), StatusCode::OK);
+        assert_eq!(fallback_provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_and_chat_webhook_idempotency_namespaces_do_not_collide() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("same-key"));
+
+        let sop_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(sop_response.status(), StatusCode::OK);
+
+        let chat_response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            Ok(Json(WebhookBody {
+                message: "chat".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(chat_response.status(), StatusCode::OK);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sop_idempotency_namespaced_per_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_two_sop_state(&tmp, "/sop/deploy", "/sop/rollback");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("same-key"));
+
+        // Same key, two different SOP paths: both execute.
+        let deploy_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(deploy_response.status(), StatusCode::OK);
+        let deploy_payload = deploy_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let deploy_parsed: serde_json::Value = serde_json::from_slice(&deploy_payload).unwrap();
+        assert_eq!(deploy_parsed["status"], "accepted");
+
+        let rollback_response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("rollback".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(rollback_response.status(), StatusCode::OK);
+        let rollback_payload = rollback_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let rollback_parsed: serde_json::Value = serde_json::from_slice(&rollback_payload).unwrap();
+        assert_eq!(rollback_parsed["status"], "accepted");
+
+        // Same key, same path again: the second call is suppressed as a duplicate.
+        let repeat_response = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(repeat_response.status(), StatusCode::OK);
+        let repeat_payload = repeat_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        let repeat_parsed: serde_json::Value = serde_json::from_slice(&repeat_payload).unwrap();
+        assert_eq!(repeat_parsed["status"], "duplicate");
+        assert_eq!(repeat_parsed["idempotent"], true);
+        assert!(
+            repeat_parsed["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no new dispatch was started"),
+            "duplicate response must describe reservation, not claim successful processing"
+        );
+
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Count SOP runs the engine has ever started (active + finished), so a
+    /// race test can prove *no run was started*, not merely that the HTTP
+    /// status was 401.
+    fn started_run_count(state: &AppState) -> usize {
+        let engine = state.sop_engine.as_ref().expect("engine").lock().unwrap();
+        engine.active_runs().len() + engine.run_summaries(None).len()
+    }
+
+    /// B1 insertion race: pairing disabled and no secret configured, so a
+    /// headerless request is authorized against an "unconfigured" snapshot.
+    /// An operator then writes `gateway.webhook_secret` into the live config
+    /// *after* authorization but before dispatch. The old two-read design would
+    /// see a configured control on the second read and admit a request that
+    /// presented nothing; the request-scoped verdict must reject it.
+    #[tokio::test]
+    async fn sop_dispatch_uses_authorization_snapshot_when_secret_added_midrequest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        // Read #1: no control configured at all.
+        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+            .expect("no configured control -> authorization itself passes");
+
+        // Concurrent operator action lands between authorization and dispatch.
+        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+
+        // The dispatch decision must come from the snapshot, not the new config.
+        let rejection = require_sop_dispatch_credentials(verdict)
+            .expect_err("a request that presented no credential must not dispatch a SOP");
+        assert_eq!(rejection.0, StatusCode::UNAUTHORIZED);
+
+        // And end-to-end through the route: the headerless caller now fails the
+        // (newly configured) secret check outright and still starts no run.
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            started_run_count(&state),
+            0,
+            "no SOP run may start for a request that presented no credential"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// B1 rotation race: secret A is configured and the caller presents A, so
+    /// read #1 verifies genuinely. The live config then rotates to secret B
+    /// before dispatch. The in-flight request is judged on its own snapshot
+    /// (accepted), while rotation takes effect at *next*-request granularity:
+    /// a subsequent A request is rejected and a B request is accepted.
+    #[tokio::test]
+    async fn sop_dispatch_uses_authorization_snapshot_during_secret_rotation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let secret_a = generate_test_secret();
+        state.config.write().gateway.webhook_secret = Some(secret_a.clone());
+
+        let verdict = authorize_webhook_request(
+            &state,
+            test_connect_info().0,
+            &webhook_secret_header(&secret_a),
+        )
+        .expect("the presented secret matches the live policy at read #1");
+
+        // Rotation lands between authorization and dispatch.
+        let secret_b = generate_test_secret();
+        state.config.write().gateway.webhook_secret = Some(secret_b.clone());
+
+        assert!(
+            require_sop_dispatch_credentials(verdict).is_ok(),
+            "a request that genuinely verified its snapshot's secret keeps that verdict"
+        );
+
+        // Next-request granularity: the retired secret is now rejected...
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&secret_a),
+            )
+            .is_err(),
+            "a subsequent request bearing the retired secret must be rejected"
+        );
+        // ...and the replacement is accepted and may dispatch.
+        let rotated = authorize_webhook_request(
+            &state,
+            test_connect_info().0,
+            &webhook_secret_header(&secret_b),
+        )
+        .expect("the rotated secret authorizes the next request");
+        assert!(require_sop_dispatch_credentials(rotated).is_ok());
+    }
+
+    /// B1 on `/webhook`, where body parsing and trigger matching sit between
+    /// authorization and the dispatch credential check — the widest window.
+    /// A headerless request must not become dispatchable because a secret was
+    /// inserted while the body was being parsed.
+    #[tokio::test]
+    async fn webhook_path_snapshot_survives_body_parse_and_trigger_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+
+        let verdict = authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+            .expect("no configured control -> authorization itself passes");
+
+        // Simulate the parse/match window: config mutates before dispatch.
+        assert!(
+            api_sop_webhook::has_matching_webhook_sop(&state, "/webhook").unwrap(),
+            "fixture must load a matching /webhook trigger"
+        );
+        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+
+        assert!(
+            require_sop_dispatch_credentials(verdict).is_err(),
+            "the /webhook SOP branch must judge the snapshot, not the mutated config"
+        );
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            started_run_count(&state),
+            0,
+            "no SOP run may start on the /webhook path either"
+        );
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            0,
+            "and it must not silently fall back to the chat/model path"
+        );
+    }
+
+    /// B1 purity: the dispatch gate decides only from the request-scoped
+    /// verdict. Two verdict values with identical contents must produce
+    /// identical decisions regardless of what the live config says, which is
+    /// only possible because the function never touches `AppState`.
+    #[tokio::test]
+    async fn require_sop_dispatch_credentials_is_pure_over_verdict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        let unconfigured =
+            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+                .expect("no control configured");
+        let before = require_sop_dispatch_credentials(unconfigured).is_ok();
+
+        // Flip the live config to the opposite policy in every way we can.
+        state.config.write().gateway.webhook_secret = Some(generate_test_secret());
+        let after = require_sop_dispatch_credentials(unconfigured).is_ok();
+
+        assert_eq!(
+            before, after,
+            "the decision must depend only on the verdict, never on live state"
+        );
+        assert!(!before, "an unconfigured snapshot must fail closed");
+    }
+
+    /// B2: the replay-domain encoding must be injective. Every one of these
+    /// pairs collides under the old `format!("{namespace}:{key}")` join, which
+    /// let an authenticated caller suppress a *different* attempt.
+    #[test]
+    fn idempotency_storage_key_encoding_is_injective() {
+        // Adversarial cross-path: `/sop/a` + `b:c` vs `/sop/a:b` + `c`.
+        assert_ne!(
+            idempotency_storage_key(Some("sop:/sop/a"), "b:c"),
+            idempotency_storage_key(Some("sop:/sop/a:b"), "c"),
+            "a caller must not shift bytes across the namespace/key boundary"
+        );
+        // `/webhook` (global domain) vs `/sop/*`: a forged caller key must not
+        // alias a namespaced SOP key.
+        assert_ne!(
+            idempotency_storage_key(None, "sop:/sop/deploy:k"),
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+            "/webhook keys must never collide with /sop/* keys"
+        );
+        // Empty-component edge cases stay distinct too.
+        assert_ne!(
+            idempotency_storage_key(Some(""), "x"),
+            idempotency_storage_key(Some("x"), ""),
+        );
+        // The encoding is still deterministic and path-discriminating.
+        assert_eq!(
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+        );
+        assert_ne!(
+            idempotency_storage_key(Some("sop:/sop/deploy"), "k"),
+            idempotency_storage_key(Some("sop:/sop/rollback"), "k"),
+            "distinct SOP paths must remain distinct",
+        );
+    }
+
+    /// B2 end-to-end: two different SOP paths whose `(path, key)` pairs collide
+    /// under the old join must both dispatch. `/sop/a` with `X-Idempotency-Key:
+    /// b:c` and `/sop/a:b` with key `c` are genuinely different requests.
+    #[tokio::test]
+    async fn sop_idempotency_resists_adversarial_cross_path_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_two_sop_state(&tmp, "/sop/a", "/sop/a:b");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("b:c"));
+        let mut second_headers = webhook_secret_header(&secret);
+        second_headers.insert("X-Idempotency-Key", HeaderValue::from_static("c"));
+
+        let first = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("a".to_string()),
+            headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_parsed: serde_json::Value =
+            serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(first_parsed["status"], "accepted");
+
+        let second = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("a:b".to_string()),
+            second_headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_parsed: serde_json::Value =
+            serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            second_parsed["status"], "accepted",
+            "a colliding-by-concatenation key must not suppress a different SOP path"
+        );
+    }
+
+    /// B2 end-to-end across endpoints: a `/webhook` caller who forges the SOP
+    /// namespace prefix into their own key must not reserve the `/sop/deploy`
+    /// replay slot and suppress the real SOP request.
+    #[tokio::test]
+    async fn webhook_forged_namespace_key_cannot_suppress_sop_dispatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_two_sop_state(&tmp, "/webhook", "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+
+        // `/webhook` caller forges the `/sop/deploy` storage key.
+        let mut forged = webhook_secret_header(&secret);
+        forged.insert(
+            "X-Idempotency-Key",
+            HeaderValue::from_static("sop:/sop/deploy:k"),
+        );
+        let chat = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            forged,
+            Ok(Json(WebhookBody {
+                message: "hello".into(),
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(chat.status(), StatusCode::OK);
+
+        // The genuine `/sop/deploy` request with key `k` must still dispatch.
+        let mut sop_headers = webhook_secret_header(&secret);
+        sop_headers.insert("X-Idempotency-Key", HeaderValue::from_static("k"));
+        let sop = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            sop_headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(sop.status(), StatusCode::OK);
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&sop.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(
+            parsed["status"], "accepted",
+            "a forged /webhook key must not reserve a /sop/* replay slot"
+        );
+    }
+
+    /// B2 property test: `idempotency_storage_key` must be injective over the
+    /// whole `(namespace, caller_key)` space, not just the two collisions the
+    /// reviewers happened to name. Exhaustively cross-products adversarial
+    /// components that are rich in the separator character and asserts distinct
+    /// inputs never share an encoding.
+    #[test]
+    fn idempotency_storage_key_is_injective_over_adversarial_inputs() {
+        let namespaces = [
+            None,
+            Some(""),
+            Some(":"),
+            Some("sop:/sop/a"),
+            Some("sop:/sop/a:b"),
+            Some("sop:/sop/a:b:c"),
+            Some("sop:/sop/deploy"),
+            Some("1:x"),
+            Some("global"),
+            Some("ns"),
+        ];
+        let caller_keys = ["", ":", "b:c", "c", "k", "sop:/sop/deploy:k", "1:x", "ns"];
+
+        let mut seen: std::collections::HashMap<String, (Option<&str>, &str)> =
+            std::collections::HashMap::new();
+        for namespace in namespaces {
+            for caller_key in caller_keys {
+                let encoded = idempotency_storage_key(namespace, caller_key);
+                if let Some(previous) = seen.insert(encoded.clone(), (namespace, caller_key)) {
+                    assert_eq!(
+                        previous,
+                        (namespace, caller_key),
+                        "encoding collision: {previous:?} and {:?} both map to {encoded}",
+                        (namespace, caller_key),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            seen.len(),
+            namespaces.len() * caller_keys.len(),
+            "every distinct (namespace, caller_key) pair must have a distinct encoding"
+        );
+    }
+
+    /// B2 counterpart: injectivity must not have broken the *intended*
+    /// duplicate suppression — the same path with the same key is still a replay.
+    #[tokio::test]
+    async fn sop_idempotency_same_path_same_key_still_suppresses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        let (state, secret) = with_webhook_secret(state);
+        let mut headers = webhook_secret_header(&secret);
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("dup-key"));
+
+        let first = api_sop_webhook::handle_sop_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers.clone(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let first_parsed: serde_json::Value =
+            serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(first_parsed["status"], "accepted");
+
+        let second = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            headers,
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let second_parsed: serde_json::Value =
+            serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(
+            second_parsed["status"], "duplicate",
+            "the intended same-path same-key replay suppression must survive the new encoding"
+        );
+    }
+
+    #[tokio::test]
+    async fn sop_dispatch_rejected_when_no_credentials_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            HeaderMap::new(),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(error.contains("require_pairing"), "error was: {error}");
+        assert!(error.contains("X-Webhook-Secret"), "error was: {error}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_sop_dispatch_rejected_when_no_credentials_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        let error = parsed["error"].as_str().unwrap_or_default();
+        assert!(error.contains("require_pairing"), "error was: {error}");
+        assert!(error.contains("X-Webhook-Secret"), "error was: {error}");
+        // Rejected outright — a matching SOP with no configured credential
+        // must never silently fall back to the chat/model path.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sop_dispatch_succeeds_with_paired_bearer_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut state, provider) = webhook_sop_state(&tmp, "/sop/deploy");
+        // A plaintext (not pre-hashed) token: `PairingGuard::new` treats a
+        // bare 64-hex-char value as an already-hashed token, so a "zc_"
+        // prefix keeps this one unambiguously plaintext.
+        let token = format!("zc_{}", generate_test_secret());
+        state.pairing = Arc::new(PairingGuard::new(true, std::slice::from_ref(&token)));
+
+        let response = api_sop_webhook::handle_sop_webhook(
+            State(state),
+            test_connect_info(),
+            axum::extract::Path("deploy".to_string()),
+            bearer_headers(&token),
+            axum::body::Bytes::from_static(br#"{}"#),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_sop_first_ignores_bogus_chat_agent_query_param() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, provider) = webhook_sop_state(&tmp, "/webhook");
+        let (state, secret) = with_webhook_secret(state);
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            Query(WebhookQuery {
+                agent: Some("missing".into()),
+            }),
+            webhook_secret_header(&secret),
+            Ok(Json(WebhookBody {
+                message: "deploy".into(),
+            })),
+        )
+        .await
+        .into_response();
+
+        // A matching SOP dispatches even though `?agent=missing` has no
+        // `[agents.missing]` entry — the chat-only param is never inspected.
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "accepted");
+        assert_eq!(parsed["source"], "webhook");
+        // The model provider is never touched.
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn webhook_unknown_agent_rejected_before_dispatch() {
         let provider_impl = Arc::new(MockModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
@@ -6020,7 +6891,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6140,7 +7010,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6240,7 +7109,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: true,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6339,15 +7207,102 @@ mod tests {
         assert_eq!(one.len(), 64);
     }
 
+    #[test]
+    fn gateway_webhook_secret_uses_one_live_config_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = admin_paircode_state(&tmp, false, false);
+        {
+            let mut config = state.config.write();
+            config.channels.webhook.insert(
+                "enabled-a".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    secret: Some("channel-secret-a".into()),
+                    ..Default::default()
+                },
+            );
+            config.channels.webhook.insert(
+                "enabled-b".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: true,
+                    secret: Some("channel-secret-b".into()),
+                    ..Default::default()
+                },
+            );
+            config.channels.webhook.insert(
+                "disabled".into(),
+                zeroclaw_config::schema::WebhookConfig {
+                    enabled: false,
+                    secret: Some("disabled-channel-secret".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(
+            configured_gateway_webhook_secret_hash(&state),
+            None,
+            "channel listener aliases must never become gateway credentials"
+        );
+        assert!(
+            authorize_webhook_request(&state, test_connect_info().0, &HeaderMap::new())
+                .map(require_sop_dispatch_credentials)
+                .is_ok_and(|dispatch| dispatch.is_err()),
+            "multiple channel aliases without a gateway credential must fail closed"
+        );
+
+        let startup_secret = "synthetic-startup-gateway-secret".to_string();
+        state.config.write().gateway.webhook_secret = Some(startup_secret.clone());
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header("channel-secret-a"),
+            )
+            .is_err(),
+            "an enabled channel alias secret must not authorize the gateway"
+        );
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&startup_secret),
+            )
+            .is_ok()
+        );
+
+        let rotated_secret = "synthetic-rotated-gateway-secret".to_string();
+        state.config.write().gateway.webhook_secret = Some(rotated_secret.clone());
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&startup_secret),
+            )
+            .is_err(),
+            "authorization must not retain a startup snapshot after config replacement"
+        );
+        assert!(
+            authorize_webhook_request(
+                &state,
+                test_connect_info().0,
+                &webhook_secret_header(&rotated_secret),
+            )
+            .is_ok(),
+            "the live canonical gateway credential must take effect"
+        );
+    }
+
     #[tokio::test]
     async fn webhook_secret_hash_rejects_missing_header() {
         let provider_impl = Arc::new(MockModelProvider::default());
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(secret.clone());
 
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6359,7 +7314,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6430,9 +7384,11 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let valid_secret = generate_test_secret();
         let wrong_secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(valid_secret.clone());
 
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6444,7 +7400,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6520,9 +7475,11 @@ mod tests {
         let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
         let secret = generate_test_secret();
+        let mut config = Config::default();
+        config.gateway.webhook_secret = Some(secret.clone());
 
         let state = AppState {
-            config: Arc::new(RwLock::new(Config::default())),
+            config: Arc::new(RwLock::new(config)),
             config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
             model_provider,
             model: "test-model".into(),
@@ -6534,7 +7491,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6631,7 +7587,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6726,7 +7681,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -6785,6 +7739,96 @@ mod tests {
         let response = Box::pin(handle_nextcloud_talk_webhook(
             State(state),
             headers,
+            Bytes::from(body),
+        ))
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// Fail closed. An alias with no resolved bot secret cannot verify
+    /// anything, so the webhook is refused before parsing or dispatch.
+    #[cfg(feature = "channel-nextcloud")]
+    #[tokio::test]
+    async fn nextcloud_talk_webhook_rejects_when_no_secret_is_configured() {
+        let provider_impl = Arc::new(MockModelProvider::default());
+        let model_provider: Arc<dyn ModelProvider> = provider_impl.clone();
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+
+        let alias = "nextcloud_talk_test_alias";
+        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(Vec::new);
+        let channel = Arc::new(NextcloudTalkChannel::new(
+            "https://cloud.example.com".into(),
+            None,
+            String::new(),
+            alias,
+            peer_resolver,
+        ));
+
+        let body = r#"{"type":"message","object":{"token":"room-token"},"message":{"actorType":"users","actorId":"user_a","message":"hello"}}"#;
+
+        let state = AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            nextcloud_talk: HashMap::from([(alias.to_string(), channel)]),
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        };
+
+        let response = Box::pin(handle_nextcloud_talk_webhook(
+            State(state),
+            HeaderMap::new(),
             Bytes::from(body),
         ))
         .await
@@ -6877,7 +7921,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7204,6 +8247,41 @@ mod tests {
         let store = IdempotencyStore::new(Duration::from_secs(300), 100);
         assert!(store.record_if_new("rapid"));
         assert!(!store.record_if_new("rapid"));
+    }
+
+    #[test]
+    fn duplicate_idempotency_log_omits_caller_key() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let raw_key = "caller-sensitive-id";
+        record_duplicate_idempotency_log();
+
+        let event = loop {
+            match receiver.try_recv() {
+                Ok(value)
+                    if value.get("message").and_then(|message| message.as_str())
+                        == Some("webhook duplicate ignored") =>
+                {
+                    break value;
+                }
+                Ok(_) => continue,
+                Err(error) => panic!("duplicate log event was not broadcast: {error}"),
+            }
+        };
+        zeroclaw_log::clear_broadcast_hook();
+
+        assert_eq!(
+            event["attributes"]["idempotency_key_present"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(event["attributes"].get("idempotency_key").is_none());
+        assert!(
+            !event.to_string().contains(raw_key),
+            "caller-controlled idempotency key must not enter structured logs"
+        );
     }
 
     #[test]
@@ -7730,7 +8808,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7816,7 +8893,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -7880,8 +8956,8 @@ mod tests {
     #[tokio::test]
     async fn linq_webhook_accepts_valid_message_for_known_alias() {
         // This test proves alias routing, not signature handling, but inbound
-        // verification is mandatory, so it has to carry a real secret and a valid
-        // signature to reach the routing it is asserting on.
+        // verification is mandatory, so it has to carry a real secret and a
+        // valid signature to reach the routing it is asserting on.
         let secret = generate_test_secret();
         let state = linq_test_state("default", Some(&secret));
         let body = linq_webhook_body("+15551234567", "hello from test");
@@ -7914,7 +8990,8 @@ mod tests {
     #[tokio::test]
     async fn linq_webhook_rejects_when_no_signing_secret_is_configured() {
         // Fail closed. An alias with no resolved signing secret cannot verify
-        // anything, so the webhook is refused rather than processed unverified.
+        // anything, so the webhook is refused rather than processed
+        // unverified.
         let state = linq_test_state("default", None);
         let body = linq_webhook_body("+15551234567", "hello from test");
 
@@ -7989,6 +9066,295 @@ mod tests {
         .into_response();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // ── Authenticated webhook ingress: shared dispatch lifecycle ────────
+
+    /// Memory double that records every autosave call so lifecycle tests
+    /// can assert on keys and session ids.
+    #[cfg(feature = "channel-linq")]
+    #[derive(Default)]
+    struct CapturingMemory {
+        stores: Mutex<Vec<(String, String, Option<String>)>>,
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[async_trait]
+    impl Memory for CapturingMemory {
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            _category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.stores.lock().push((
+                key.to_string(),
+                content.to_string(),
+                session_id.map(ToString::to_string),
+            ));
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.store(key, content, category, session_id).await
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            _query: &str,
+            _limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[cfg(feature = "channel-linq")]
+    impl ::zeroclaw_api::attribution::Attributable for CapturingMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "CapturingMemory"
+        }
+    }
+
+    /// Channel double that records every outbound send so lifecycle tests
+    /// can assert on reply delivery without network I/O.
+    #[cfg(feature = "channel-linq")]
+    #[derive(Default)]
+    struct CapturingChannel {
+        sends: Mutex<Vec<(String, String)>>,
+    }
+
+    #[cfg(feature = "channel-linq")]
+    #[async_trait]
+    impl Channel for CapturingChannel {
+        fn name(&self) -> &str {
+            "capturing"
+        }
+
+        async fn send(&self, message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            self.sends
+                .lock()
+                .push((message.content.clone(), message.recipient.clone()));
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "channel-linq")]
+    impl ::zeroclaw_api::attribution::Attributable for CapturingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "CapturingChannel"
+        }
+    }
+
+    #[cfg(feature = "channel-linq")]
+    fn test_channel_message(sender: &str, content: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            id: "msg-1".into(),
+            sender: sender.into(),
+            reply_target: sender.into(),
+            content: content.into(),
+            channel: "linq".into(),
+            channel_alias: Some("default".into()),
+            timestamp: 0,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: Vec::new(),
+            subject: None,
+            internal_sop_event: None,
+            passive_context: false,
+            explicitly_addressed: false,
+            conversation_scope: Default::default(),
+            references: Vec::new(),
+        }
+    }
+
+    /// A verified request still flows through the full shared lifecycle:
+    /// autosave with the channel session key, agent dispatch, and reply
+    /// delivery through the channel implementation.
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn verified_webhook_dispatch_runs_the_full_lifecycle() {
+        let mut state = linq_test_state("default", Some("secret"));
+        let memory_impl = Arc::new(CapturingMemory::default());
+        let mem: Arc<dyn Memory> = memory_impl.clone();
+        state.mem = mem;
+        state.auto_save = true;
+
+        let verified = match webhook_ingress::authenticate(
+            &webhook_ingress::LINQ_WEBHOOK,
+            "default",
+            Some("secret"),
+            &HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+            |_, _, _| true,
+        ) {
+            Ok(verified) => verified,
+            Err(refusal) => panic!("stub verification must succeed, got {refusal:?}"),
+        };
+        let verified = verified
+            .parse_messages(|body| {
+                assert_eq!(body, b"{}", "the parser receives the verified request body");
+                Ok::<_, ()>(vec![test_channel_message(
+                    "+15551234567",
+                    "hello lifecycle",
+                )])
+            })
+            .expect("verified request should parse");
+
+        let channel_impl = Arc::new(CapturingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let (status, _body) = webhook_ingress::dispatch_verified_webhook(
+            &state,
+            verified,
+            webhook_ingress::WebhookDispatchContext {
+                channel,
+                memory_key: linq_memory_key,
+                agent_override: None,
+                mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+                suppress_reply_send: false,
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+
+        let stores = memory_impl.stores.lock().clone();
+        assert_eq!(stores.len(), 1, "one autosave per inbound message");
+        assert_eq!(stores[0].0, "linq_+15551234567_msg-1");
+        assert_eq!(stores[0].1, "hello lifecycle");
+        assert_eq!(stores[0].2.as_deref(), Some("linq_default__15551234567"));
+
+        let sends = channel_impl.sends.lock().clone();
+        assert_eq!(sends.len(), 1, "one reply per inbound message");
+        assert_eq!(sends[0].0, "ok", "the model reply is what gets delivered");
+        assert_eq!(sends[0].1, "+15551234567");
+    }
+
+    /// When the gateway has no model configured, a verified request still
+    /// gets the quickstart fallback reply through the channel instead of
+    /// silence.
+    #[cfg(feature = "channel-linq")]
+    #[tokio::test]
+    async fn verified_webhook_dispatch_sends_quickstart_fallback_when_unconfigured() {
+        let mut state = linq_test_state("default", Some("secret"));
+        state.model = String::new();
+
+        let verified = match webhook_ingress::authenticate(
+            &webhook_ingress::LINQ_WEBHOOK,
+            "default",
+            Some("secret"),
+            &HeaderMap::new(),
+            Bytes::from_static(b"{}"),
+            |_, _, _| true,
+        ) {
+            Ok(verified) => verified,
+            Err(refusal) => panic!("stub verification must succeed, got {refusal:?}"),
+        };
+        let verified = verified
+            .parse_messages(|body| {
+                assert_eq!(body, b"{}", "the parser receives the verified request body");
+                Ok::<_, ()>(vec![test_channel_message("+15551234567", "anyone home?")])
+            })
+            .expect("verified request should parse");
+
+        let channel_impl = Arc::new(CapturingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let (status, _body) = webhook_ingress::dispatch_verified_webhook(
+            &state,
+            verified,
+            webhook_ingress::WebhookDispatchContext {
+                channel,
+                memory_key: linq_memory_key,
+                agent_override: None,
+                mode: webhook_ingress::WebhookDispatchMode::Synchronous,
+                suppress_reply_send: false,
+            },
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        let sends = channel_impl.sends.lock().clone();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(
+            sends[0].0,
+            needs_quickstart_channel_reply(),
+            "unconfigured gateway sends the quickstart reply, not silence"
+        );
     }
 
     #[cfg(feature = "channel-linq")]
@@ -8137,7 +9503,6 @@ mod tests {
                 std::path::PathBuf::new(),
             )),
             auto_save: false,
-            webhook_secret_hash: None,
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
@@ -8340,12 +9705,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
+    /// Fail closed. A configured alias with no app secret cannot verify
+    /// `X-Hub-Signature-256`, so the webhook is refused rather than
+    /// dispatched to the agent unverified.
     #[cfg(feature = "channel-whatsapp-cloud")]
     #[tokio::test]
     async fn whatsapp_webhook_rejects_when_no_app_secret_is_configured() {
-        // Fail closed. A configured alias with no app secret cannot verify
-        // X-Hub-Signature-256, so the webhook is refused rather than dispatched
-        // to the agent unverified.
         let mut state = webhook_baseline_state();
         state.whatsapp = HashMap::from([("work".to_string(), whatsapp_instance("work", "tok"))]);
         state.whatsapp_app_secret = HashMap::new();

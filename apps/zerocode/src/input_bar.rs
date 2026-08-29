@@ -273,9 +273,9 @@ enum SlashCommand<'a> {
 // ── Wrap geometry helpers ────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VisualLine {
-    start: usize,
-    end: usize,
+pub(crate) struct VisualLine {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
     width: u16,
 }
 
@@ -286,7 +286,7 @@ fn str_cell_width(text: &str) -> u16 {
 }
 
 fn grapheme_is_whitespace(grapheme: &str) -> bool {
-    grapheme.chars().next().is_some_and(char::is_whitespace)
+    grapheme == "\u{200b}" || (grapheme != "\u{00a0}" && grapheme.chars().all(char::is_whitespace))
 }
 
 fn push_hard_wrapped(
@@ -467,7 +467,7 @@ fn push_wrapped_physical_line(
     }
 }
 
-fn wrap_visual_lines(text: &str, width: u16) -> Vec<VisualLine> {
+pub(crate) fn wrap_visual_lines(text: &str, width: u16) -> Vec<VisualLine> {
     if width == 0 {
         return vec![VisualLine {
             start: 0,
@@ -797,6 +797,19 @@ impl InputBarState {
 
     pub fn has_attachment_manager(&self) -> bool {
         self.attachment_manager.is_some()
+    }
+
+    /// Open an explorer with one selected path for parent-level key-routing
+    /// tests, so the test can exercise a real explorer confirmation result.
+    #[cfg(test)]
+    pub(crate) fn open_file_explorer_for_test(&mut self, path: PathBuf) {
+        let start_dir = path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let mut explorer = FileExplorerState::new(start_dir);
+        explorer.select_path_for_test(path);
+        self.file_explorer = Some(explorer);
     }
 
     /// Whether the input bar is in text-input mode (input non-empty or an
@@ -3245,6 +3258,12 @@ mod tests {
     #[test]
     fn wrapped_line_count_word_wraps_like_paragraph() {
         assert_eq!(wrapped_line_count("hello world", 10), 2);
+    }
+
+    #[test]
+    fn copy_wrapping_whitespace_matches_ratatui_for_nbsp_and_zwsp() {
+        assert!(!grapheme_is_whitespace("\u{00a0}"));
+        assert!(grapheme_is_whitespace("\u{200b}"));
     }
 
     #[test]

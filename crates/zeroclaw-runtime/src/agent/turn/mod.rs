@@ -14,6 +14,7 @@ pub(crate) mod max_iter;
 pub(crate) mod outcome;
 pub(crate) mod parse_response;
 pub(crate) mod post_exec;
+pub(crate) mod progress;
 pub(crate) mod protocol_detect;
 pub(crate) mod provider_call;
 pub(crate) mod redact;
@@ -29,7 +30,11 @@ pub(crate) use context::{TurnCtx, TurnMeta};
 pub(crate) use context_recovery::{record_llm_failure, try_recover_context_overflow};
 #[cfg(test)]
 pub(crate) use delivery_defaults::maybe_inject_channel_delivery_defaults;
-pub use events::{DraftEvent, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, StreamDelta};
+pub use events::{
+    DRAFT_PLACEHOLDER, DraftEvent, PROGRESS_MIN_INTERVAL_MS, ProgressEvent, REASONING_FULL_PREFIX,
+    StreamDelta, THINKING_STATUS_PREFIX, is_thinking_status_text, thinking_status_label_round,
+    thinking_status_round, thinking_status_text,
+};
 pub use execution::{
     ResolvedAgentExecution, ResolvedIo, ResolvedModelAccess, ResolvedRuntimeKnobs,
 };
@@ -49,7 +54,8 @@ pub use outcome::{
 #[cfg(test)]
 pub(crate) use parse_response::build_native_assistant_history;
 pub(crate) use parse_response::{
-    interpret_chat_response, resolve_display_text, unforwarded_narration,
+    interpret_chat_response, record_accepted_chat_response, resolve_display_text,
+    unforwarded_narration,
 };
 pub(crate) use post_exec::record_executed_outcomes;
 pub(crate) use provider_call::{
@@ -89,6 +95,91 @@ pub(crate) const MAX_MALFORMED_TOOL_PROTOCOL_RETRIES: usize = 2;
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 pub(crate) const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+
+/// Complete system-prompt variants for the two tool transports supported by a
+/// turn. The caller owns construction; the loop only selects the variant after
+/// a before-LLM hook has finalized the model that will receive the request.
+#[derive(Clone)]
+pub(crate) struct ToolProtocolPrompts {
+    text_tools_section: String,
+}
+
+impl ToolProtocolPrompts {
+    pub(crate) fn new(_native: String, text: String) -> Self {
+        let text_tools_section = tool_section_bounds(&text)
+            .map(|bounds| text[bounds].to_string())
+            .unwrap_or_default();
+        Self { text_tools_section }
+    }
+}
+
+tokio::task_local! {
+    static TOOL_PROTOCOL_PROMPTS: Arc<ToolProtocolPrompts>;
+}
+
+/// Scope complete prompt variants around an Agent turn. This remains transient
+/// request state: durable history keeps the caller-owned canonical prompt.
+pub(crate) async fn scope_tool_protocol_prompts<F: std::future::Future>(
+    prompts: Arc<ToolProtocolPrompts>,
+    future: F,
+) -> F::Output {
+    TOOL_PROTOCOL_PROMPTS.scope(prompts, future).await
+}
+
+fn refresh_scoped_tool_protocol_prompt(
+    history: &mut [ChatMessage],
+    request_messages: &mut [ChatMessage],
+    use_native_tools: bool,
+) {
+    let _ = TOOL_PROTOCOL_PROMPTS.try_with(|prompts| {
+        if let Some(system) = history.iter_mut().find(|message| message.role == "system") {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+        if let Some(system) = request_messages
+            .iter_mut()
+            .find(|message| message.role == "system")
+        {
+            replace_tool_protocol_section(
+                &mut system.content,
+                &prompts.text_tools_section,
+                use_native_tools,
+            );
+        }
+    });
+}
+
+fn tool_section_bounds(prompt: &str) -> Option<std::ops::Range<usize>> {
+    let start = prompt.find("## Tools\n")?;
+    let following = &prompt[start..];
+    let end = following
+        .find("\n\n## Safety")
+        .map_or(prompt.len(), |offset| start + offset);
+    Some(start..end)
+}
+
+fn replace_tool_protocol_section(
+    prompt: &mut String,
+    text_tools_section: &str,
+    use_native_tools: bool,
+) {
+    if let Some(bounds) = tool_section_bounds(prompt) {
+        if use_native_tools {
+            prompt.replace_range(bounds, "");
+        } else {
+            prompt.replace_range(bounds, text_tools_section);
+        }
+        return;
+    }
+
+    if !use_native_tools && !text_tools_section.is_empty() {
+        let insertion = prompt.find("## Safety").unwrap_or(prompt.len());
+        prompt.insert_str(insertion, &format!("{text_tools_section}\n\n"));
+    }
+}
 
 fn try_reserve_shared_iteration(budget: &std::sync::atomic::AtomicUsize) -> bool {
     budget
@@ -462,6 +553,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         pacing,
         strict_tool_parsing,
         channel,
+        draft_reasoning: knobs.draft_reasoning,
         turn_id,
         agent_alias,
         parent_agent_alias,
@@ -632,6 +724,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut iteration_tool_specs = build_iteration_tool_specs(
             model_provider,
+            model,
             tools_registry,
             excluded_tools,
             activated_tools,
@@ -659,15 +752,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         } else {
             (model_provider, provider_name, model)
         };
-        iteration_tool_specs.refresh_native_tool_mode(active_model_provider);
-        let IterationToolSpecs {
-            ref tool_specs,
-            use_native_tools,
-            ..
-        } = iteration_tool_specs;
-
-        refresh_prompt_anchor(turn_state.history, use_native_tools);
-
         let prepared_messages = prepare_messages_for_iteration(
             turn_state.history,
             multimodal_config,
@@ -693,6 +777,34 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             }
         }
         let provider_request_model = hook_selected_model.as_deref().unwrap_or(active_model);
+        // Only direct Agent turns scope the complete prompt variants. Preserve
+        // the channel loop's existing hook/protocol behavior rather than
+        // silently widening this delegation-focused repair into channel prompt
+        // reconciliation.
+        let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
+        let protocol_model = if uses_scoped_tool_protocol {
+            provider_request_model
+        } else {
+            active_model
+        };
+        iteration_tool_specs.refresh_native_tool_mode(active_model_provider, protocol_model);
+        let IterationToolSpecs {
+            ref tool_specs,
+            use_native_tools,
+            ..
+        } = iteration_tool_specs;
+
+        // For scoped direct Agent turns, the hook can choose a different routed
+        // model. Every protocol-bearing surface follows that dispatched model.
+        // Unscoped channel turns intentionally retain their pre-existing
+        // protocol behavior; channel prompt reconciliation is separate work.
+        refresh_prompt_anchor(turn_state.history, use_native_tools);
+        refresh_prompt_anchor(&mut provider_request_messages, use_native_tools);
+        refresh_scoped_tool_protocol_prompt(
+            turn_state.history,
+            &mut provider_request_messages,
+            use_native_tools,
+        );
 
         // Fail closed on the local budget BEFORE announcing the request.
         // `announce_llm_request` emits the user-visible `WaitingOnModel`
@@ -700,6 +812,20 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // first would claim the agent is waiting on a model that is never
         // called.
         enforce_tool_loop_budget()?;
+
+        if strict_tool_parsing
+            && !tool_specs.is_empty()
+            && active_model_provider.has_mixed_native_tool_support_for_model(protocol_model)
+        {
+            return Err(zeroclaw_providers::ProviderCapabilityError {
+                model_provider: active_model_provider_name.to_string(),
+                capability: "tool_protocol".to_string(),
+                message: crate::i18n::get_required_cli_string(
+                    "turn-tool-protocol-strict-mixed-error",
+                ),
+            }
+            .into());
+        }
 
         let llm_started_at = announce_llm_request(
             &ctx,
@@ -719,8 +845,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             None
         };
         let request_tool_count = request_tools.map_or(0, <[crate::tools::ToolSpec]>::len);
-        let base_provider_supports_native_tools = model_provider.supports_native_tools();
-        let active_provider_supports_native_tools = active_model_provider.supports_native_tools();
+        let base_provider_supports_native_tools = model_provider
+            .capabilities_for_model(model)
+            .native_tool_calling;
+        let active_provider_supports_native_tools = active_model_provider
+            .capabilities_for_model(provider_request_model)
+            .native_tool_calling;
         let active_provider_supports_streaming = active_model_provider.supports_streaming();
         let active_provider_supports_streaming_tool_events =
             active_model_provider.supports_streaming_tool_events();
@@ -750,7 +880,8 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let ProviderCallOutcome {
             chat_result,
-            rejected_attempt_usage,
+            attempts,
+            accepted_route,
             streamed_live_deltas,
             streamed_protocol_suppressed,
             streamed_visible_text,
@@ -765,13 +896,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         )
         .await?;
 
-        if let Some(usage) = rejected_attempt_usage.as_ref() {
-            crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                ctx.provider_name,
-                ctx.model,
-                usage,
-            );
-        }
+        // Reliable reports its actually served candidate; direct providers
+        // intentionally retain the requested route as the accounting fallback.
+        let (served_provider, served_model) = accepted_route
+            .as_ref()
+            .map(|route| (route.provider_ref(), route.model()))
+            .unwrap_or((ctx.provider_name, provider_request_model));
 
         // Reliable providers classify this before retries and fallback. Keep
         // the turn-level guard for direct/unwrapped providers: a transport
@@ -779,13 +909,6 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // This runs before response-success telemetry and history mutation.
         let chat_result = chat_result.and_then(|response| {
             if response.is_semantically_empty_terminal() {
-                if let Some(usage) = response.usage.as_ref() {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        ctx.provider_name,
-                        ctx.model,
-                        usage,
-                    );
-                }
                 return Err(anyhow::Error::new(
                     zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
                 ));
@@ -803,16 +926,17 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             protocol_suppressed,
             response_streamed_live,
             reported_input_tokens,
+            response_usage,
         ) = match chat_result {
             Ok(resp) => {
                 let interpreted = interpret_chat_response(
                     &ctx,
-                    provider_request_model,
+                    served_provider,
+                    served_model,
                     resp,
                     &provider_request_messages,
                     &iteration_tool_specs,
                     streamed_protocol_suppressed,
-                    llm_started_at,
                     iteration,
                     knobs.detect_protocol_without_tools,
                 )
@@ -827,18 +951,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     streamed_protocol_suppressed,
                     streamed_live_deltas,
                     interpreted.input_tokens,
+                    interpreted.usage,
                 )
             }
             Err(e) => {
-                if let Some(rejected) = e.chain().find_map(|cause| {
-                    cause.downcast_ref::<zeroclaw_providers::ReliableRejectedCompletionUsage>()
-                }) {
-                    crate::agent::cost::record_rejected_tool_loop_cost_usage(
-                        ctx.provider_name,
-                        ctx.model,
-                        &rejected.usage,
-                    );
-                }
+                crate::agent::cost::settle_provider_attempts(&attempts, None);
                 record_llm_failure(&ctx, provider_request_model, llm_started_at, iteration, &e);
                 let recovered = try_recover_context_overflow(
                     turn_state.history,
@@ -890,9 +1007,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             !native_tool_calls.is_empty(),
         );
 
-        // Native provider tool_calls are converted into parsed `tool_calls`
-        // above; if this branch is reached there is no valid native call to run.
-        if tool_calls.is_empty() && parse_issue_detected {
+        // Any parser or stream-protocol guard finding rejects the transport
+        // candidate, including a response that also carries native tool calls.
+        if parse_issue_detected {
+            crate::agent::cost::settle_provider_attempts(&attempts, None);
             malformed_tool_protocol_retries += 1;
             ::zeroclaw_log::record!(
                 WARN,
@@ -948,6 +1066,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             turn_state.push_dual(msg);
             return Ok(accumulated_display_text);
         }
+
+        // Earlier physical leaves are rejected routing/retry work. The final
+        // accepted response remains settled by `record_accepted_chat_response`
+        // so only it updates context-window telemetry.
+        crate::agent::cost::settle_provider_attempts(
+            &attempts[..attempts.len().saturating_sub(1)],
+            None,
+        );
+        record_accepted_chat_response(
+            &ctx,
+            served_provider,
+            served_model,
+            &response_text,
+            &native_tool_calls,
+            tool_calls.len(),
+            response_usage.as_ref(),
+            &provider_request_messages,
+            llm_started_at,
+            iteration,
+        )
+        .await;
+
+        // A provider transport success is only a candidate. Commit (or clear)
+        // presentation state after parsing has accepted the response, so a
+        // malformed fallback completion cannot leak a stale recovery notice.
+        zeroclaw_providers::dispatch::commit_accepted_provider_route(accepted_route);
 
         // ── Progress: LLM responded ─────────────────────────────
         if let Some(ref tx) = on_delta {
@@ -1042,8 +1186,11 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             mut ordered_results,
             executable_indices,
             executable_calls,
+            stream_calls,
         } = prepare_tool_calls(
             &ctx,
+            tools_registry,
+            activated_tools,
             &tool_calls,
             &mut seen_tool_signatures,
             &mut prompt_approval_tool_signatures,
@@ -1106,16 +1253,19 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
 
         let mut executed_completed_indices: Vec<usize> = Vec::new();
         let mut executed_completed_calls = Vec::new();
+        let mut executed_completed_stream_calls = Vec::new();
         let mut executed_completed_outcomes = Vec::new();
-        for (slot, (call_idx, call)) in executed_slots.into_iter().zip(
+        for (slot, ((call_idx, call), stream_call)) in executed_slots.into_iter().zip(
             executable_indices
                 .iter()
                 .copied()
-                .zip(executable_calls.iter()),
+                .zip(executable_calls.iter())
+                .zip(stream_calls),
         ) {
             if let Some(outcome) = slot {
                 executed_completed_indices.push(call_idx);
                 executed_completed_calls.push(call.clone());
+                executed_completed_stream_calls.push(stream_call);
                 executed_completed_outcomes.push(outcome);
             }
         }
@@ -1124,6 +1274,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             &ctx,
             &executed_completed_indices,
             &executed_completed_calls,
+            &executed_completed_stream_calls,
             executed_completed_outcomes,
             &mut ordered_results,
             iteration,
@@ -1291,6 +1442,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         accumulated_display_text,
         turn_id,
         knobs,
+        event_tx.as_ref(),
         turn_state.canonical.as_deref_mut(),
     )
     .await
@@ -1434,7 +1586,10 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's own configured provider temperature — the same source
     /// the headless driver hands `crate::agent::run`.
     temperature: Option<f64>,
-    pub(crate) tools_registry: Vec<Box<dyn crate::tools::Tool>>,
+    /// The step agent's sealed tool set. A [`crate::tools::scoped::ScopedToolRegistry`]
+    /// so the nested loop's `ResolvedIo.tools_registry` can be fed the scoped
+    /// registry directly (coerces to `&[Box<dyn Tool>]` at leaf sites via `Deref`).
+    pub(crate) tools_registry: crate::tools::scoped::ScopedToolRegistry,
     approval: crate::approval::ApprovalManager,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     /// The step agent's fully-resolved config (identity + every runtime-profile
@@ -1452,6 +1607,10 @@ pub(crate) struct OwnedAgentExecution {
     /// The step agent's deferred+pinned MCP prompt section (single-block
     /// shape, same as `run` / `process_message`).
     mcp_prompt_section: String,
+    /// The shell this step's runtime adapter will spawn, carried so the step's
+    /// system prompt reports the same dialect the step will execute under.
+    /// `None` for a shell-less runtime.
+    shell_profile: Option<zeroclaw_api::runtime_traits::ShellProfile>,
 }
 
 /// Re-assemble `alias`'s per-agent execution context the way a fresh agent turn
@@ -1536,6 +1695,8 @@ pub(crate) async fn assemble_owned_execution(
         None,
     );
     let skills = crate::skills::load_skills_for_agent_from_config(config, alias);
+    // Capture before `runtime` is moved into `ScopedAssembly` below.
+    let shell_profile = runtime.shell_profile();
     // The same gated seam run(), process_message, and independent delegation use:
     // step 2 filters with THIS agent's SecurityPolicy, `connect_mcp` grants only
     // this agent's MCP bundles, and its skills register as tools. Peripherals stay
@@ -1570,7 +1731,8 @@ pub(crate) async fn assemble_owned_execution(
         mcp_tool_names,
         ..
     } = assembled;
-    let tools_registry = registry.into_inner();
+    // Stays sealed into `OwnedAgentExecution.tools_registry` (a `ScopedToolRegistry`).
+    let tools_registry = registry;
 
     let provider_ref = config
         .resolved_model_provider_for_agent(alias)
@@ -1609,6 +1771,9 @@ pub(crate) async fn assemble_owned_execution(
         skills,
         mcp_tool_names,
         mcp_prompt_section,
+        // Captured from the same adapter this step's tools were built with, so
+        // the prompt names the shell the step will actually run under.
+        shell_profile,
     })
 }
 
@@ -1655,6 +1820,7 @@ fn build_owned_step_system_prompt(
         true,
         config.channels.show_tool_calls,
         None,
+        owned.shell_profile.as_ref(),
     )
 }
 
@@ -1666,7 +1832,7 @@ async fn drive_live_sop_actions(
     provider_name: &str,
     model: &str,
     temperature: Option<f64>,
-    tools_registry: &[Box<dyn crate::tools::Tool>],
+    tools_registry: &crate::tools::scoped::ScopedToolRegistry,
     observer: &dyn crate::observability::Observer,
     silent: bool,
     approval: Option<&crate::approval::ApprovalManager>,
@@ -1720,6 +1886,11 @@ async fn drive_live_sop_actions(
     let mut pending = std::collections::VecDeque::from(queued_actions);
     while let Some(queued) = pending.pop_front() {
         let mut action = queued.action.clone();
+        // Per-run budget for deterministic capabilities driven inside this
+        // turn, matching `MAX_HEADLESS_DRIVE_STEPS` in the two headless
+        // drivers. Reset per queued action so one run's routing cycle cannot
+        // consume a later run's allowance.
+        let mut deterministic_steps_driven = 0usize;
         loop {
             match action {
                 crate::sop::SopRunAction::ExecuteStep {
@@ -1833,7 +2004,7 @@ async fn drive_live_sop_actions(
                                 o.model_provider.as_ref(),
                                 o.provider_name.as_str(),
                                 o.model.as_str(),
-                                o.tools_registry.as_slice(),
+                                &o.tools_registry,
                                 Some(&o.approval),
                                 o.activated_tools.as_ref(),
                             ),
@@ -2135,17 +2306,33 @@ async fn drive_live_sop_actions(
                     );
                     break;
                 }
-                crate::sop::SopRunAction::DeterministicStep { run_id, step, .. } => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_attrs(::serde_json::json!({
-                                "run_id": run_id,
-                                "step": step.number,
-                            })),
-                        "SOP live executor yielded deterministic step"
-                    );
-                    break;
+                crate::sop::SopRunAction::DeterministicStep { ref run_id, .. } => {
+                    let run_id = run_id.clone();
+                    // Bound this action type exactly as both headless drivers
+                    // do. `StepFailure::Goto` takes an arbitrary step number
+                    // and nothing validates that routes are acyclic, so a
+                    // capability that keeps failing and routes backwards would
+                    // otherwise spin the enclosing loop at full speed, taking
+                    // and releasing the engine mutex on every iteration and
+                    // starving every other SOP surface. `yield_now` keeps the
+                    // async runtime responsive but does not end the loop.
+                    if deterministic_steps_driven >= crate::sop::executor::MAX_HEADLESS_DRIVE_STEPS
+                    {
+                        crate::sop::executor::fail_exhausted_step_budget(&queued.engine, &run_id);
+                        break;
+                    }
+                    deterministic_steps_driven += 1;
+                    let next = {
+                        let mut engine = match queued.engine.lock() {
+                            Ok(engine) => engine,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        engine.advance_headless_deterministic_step(&run_id, action)?
+                    };
+                    action = next;
+                    // Let an operator request acquire the engine before the next
+                    // deterministic capability is dispatched.
+                    tokio::task::yield_now().await;
                 }
                 crate::sop::SopRunAction::CheckpointWait { run_id, step, .. } => {
                     ::zeroclaw_log::record!(
@@ -2186,6 +2373,18 @@ async fn drive_live_sop_actions(
                                 "sop_name": sop_name,
                             })),
                         "SOP live executor completed run"
+                    );
+                    break;
+                }
+                crate::sop::SopRunAction::Cancelled { run_id, sop_name } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "sop_name": sop_name,
+                            })),
+                        "SOP live executor observed cancelled run"
                     );
                     break;
                 }
@@ -2950,7 +3149,7 @@ mod sop_step_reassembly_tests {
             provider_name: "capture".into(),
             model: "capture-model".into(),
             temperature,
-            tools_registry: tools,
+            tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
             approval: crate::approval::ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             ),
@@ -2960,6 +3159,7 @@ mod sop_step_reassembly_tests {
             skills: Vec::new(),
             mcp_tool_names,
             mcp_prompt_section: String::new(),
+            shell_profile: None,
         }
     }
 
@@ -3032,7 +3232,7 @@ mod sop_step_reassembly_tests {
         engine: Arc<std::sync::Mutex<crate::sop::SopEngine>>,
         action: crate::sop::types::SopRunAction,
         parent_provider: &dyn ModelProvider,
-        parent_tools: &[Box<dyn crate::tools::Tool>],
+        parent_tools: &crate::tools::scoped::ScopedToolRegistry,
         observer: &dyn crate::observability::Observer,
         history: &mut Vec<ChatMessage>,
         new_messages_out: Option<&mut Vec<ChatMessage>>,
@@ -3142,7 +3342,7 @@ mod sop_step_reassembly_tests {
         );
 
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![
             ChatMessage::system("parent system prompt"),
             ChatMessage::user(PARENT_MARKER.to_string()),
@@ -3252,9 +3452,12 @@ mod sop_step_reassembly_tests {
         let parent_provider = TextProvider;
         // Parent scope carries a sensitive tool the child must never be offered.
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3330,7 +3533,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3375,7 +3578,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![ChatMessage::system("parent system prompt")];
         let mut exec_cache = std::collections::HashMap::new();
 
@@ -3426,7 +3629,7 @@ mod sop_step_reassembly_tests {
 
         let observer = IdentityCapture::default();
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history = vec![ChatMessage::system("parent system prompt")];
         let mut capture: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3477,9 +3680,12 @@ mod sop_step_reassembly_tests {
         let handle = SopStepReassembly { config: &config };
 
         let shell_calls = Arc::new(AtomicUsize::new(0));
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3522,9 +3728,12 @@ mod sop_step_reassembly_tests {
         let shell_calls = Arc::new(AtomicUsize::new(0));
         // Parent/delegate scope: a sensitive tool the cross-agent step must never
         // reach.
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = vec![Box::new(ShellProbe {
-            calls: Arc::clone(&shell_calls),
-        })];
+        let parent_tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                ShellProbe {
+                    calls: Arc::clone(&shell_calls),
+                },
+            )]);
         let provider = ShellCallingProvider;
         let mut history: Vec<ChatMessage> = Vec::new();
         let mut exec_cache = std::collections::HashMap::new();
@@ -3683,7 +3892,9 @@ mod sop_step_reassembly_tests {
                 provider_name: "child-original-provider".into(),
                 model: "child-original-model".into(),
                 temperature: None,
-                tools_registry: vec![Box::new(ChildModelSwitchTool)],
+                tools_registry: crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(ChildModelSwitchTool),
+                ]),
                 approval: crate::approval::ApprovalManager::for_non_interactive(
                     &stepper_risk_profile,
                 ),
@@ -3693,6 +3904,7 @@ mod sop_step_reassembly_tests {
                 skills: Vec::new(),
                 mcp_tool_names: std::collections::HashSet::new(),
                 mcp_prompt_section: String::new(),
+                shell_profile: None,
             },
         );
 
@@ -3702,7 +3914,7 @@ mod sop_step_reassembly_tests {
         let parent_switch_state: ModelSwitchCallback = Arc::new(std::sync::Mutex::new(None));
 
         let parent_provider = TextProvider;
-        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let parent_tools = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
         let mut history: Vec<ChatMessage> = Vec::new();
 
         drive_step(
@@ -3747,6 +3959,117 @@ mod sop_step_reassembly_tests {
             step.output.contains("child-provider") && step.output.contains("child-model"),
             "the step failure must name the CHILD's own requested switch: {}",
             step.output
+        );
+    }
+
+    /// Regression for the unbounded live-turn deterministic drive: both
+    /// headless drivers cap at `MAX_HEADLESS_DRIVE_STEPS` because
+    /// `StepFailure::Goto`/`routing.next` take arbitrary step numbers and
+    /// nothing validates that routes are acyclic. `drive_live_sop_actions`
+    /// advanced `DeterministicStep` in place and continued its enclosing
+    /// `loop` with no iteration bound, so a cyclic route reached through an
+    /// agent turn spun forever, taking and releasing the engine mutex on
+    /// every iteration. The live path must agree with the other two drivers:
+    /// terminalize the run as `Failed` and release its admission claim.
+    #[tokio::test]
+    async fn cyclic_deterministic_route_exhausts_the_live_turn_step_budget() {
+        use crate::sop::types::{
+            Sop, SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopStep, SopStepKind,
+            SopTrigger, SopTriggerSource,
+        };
+        use zeroclaw_config::schema::SopConfig;
+
+        // 1 -> 2 -> 1 -> ... : a two-node cycle of always-succeeding
+        // capabilities, so nothing but the budget can end the run.
+        let cap_step = |number: u32, next: u32| {
+            let mut step = SopStep {
+                number,
+                title: format!("Capability {number}"),
+                kind: SopStepKind::Capability,
+                capability: Some("noop".into()),
+                ..SopStep::default()
+            };
+            step.routing.next = Some(next);
+            step
+        };
+        let sop = Sop {
+            name: "cyclic".to_string(),
+            description: "cyclic deterministic route".to_string(),
+            version: "1.0.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![cap_step(1, 2), cap_step(2, 1)],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: Default::default(),
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        // A step is revisited every other iteration, so the per-step visit
+        // bound must stay well above the drive budget for this test to prove
+        // the BUDGET is what stops the loop.
+        let mut engine = crate::sop::SopEngine::new(SopConfig {
+            max_step_visits: u32::MAX,
+            ..SopConfig::default()
+        });
+        engine.set_sops_for_test(vec![sop]);
+        let action = engine
+            .start_run(
+                "cyclic",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: "2026-08-22T00:00:00Z".to_string(),
+                },
+            )
+            .expect("run starts");
+        let run_id = match &action {
+            crate::sop::types::SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected a DeterministicStep, got {other:?}"),
+        };
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+
+        let parent_provider = TextProvider;
+        let parent_tools: Vec<Box<dyn crate::tools::Tool>> = Vec::new();
+        let mut history: Vec<ChatMessage> = Vec::new();
+        let mut exec_cache = std::collections::HashMap::new();
+
+        // Without the bound this call never returns.
+        drive_step(
+            Arc::clone(&engine),
+            action,
+            &parent_provider,
+            &parent_tools,
+            &crate::observability::NoopObserver {},
+            &mut history,
+            None,
+            None,
+            None,
+            None,
+            &mut exec_cache,
+        )
+        .await;
+
+        let guard = engine.lock().expect("engine lock");
+        let run = guard.get_run(&run_id).expect("run retained after budget");
+        assert_eq!(
+            run.status,
+            SopRunStatus::Failed,
+            "an exhausted live-turn budget must terminalize the run"
+        );
+        assert!(
+            !guard.active_runs().contains_key(&run_id),
+            "the failed run must leave the active set so its admission claim is released"
+        );
+        assert_eq!(
+            run.step_results.len(),
+            crate::sop::executor::MAX_HEADLESS_DRIVE_STEPS,
+            "the live driver must execute exactly MAX_HEADLESS_DRIVE_STEPS capabilities, \
+             the same bound both headless drivers use"
         );
     }
 }

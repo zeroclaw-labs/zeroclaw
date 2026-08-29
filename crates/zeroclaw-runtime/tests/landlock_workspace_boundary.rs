@@ -33,6 +33,9 @@ fn landlock_abi_version() -> u32 {
     // highest supported ABI version instead of creating a ruleset.
     const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
 
+    // SAFETY: this is the kernel-documented version-query form: a null attrs
+    // pointer with size zero, plus the VERSION flag. No memory is read or
+    // written through the null pointer.
     let ret = unsafe {
         libc::syscall(
             libc::SYS_landlock_create_ruleset,

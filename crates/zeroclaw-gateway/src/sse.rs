@@ -33,7 +33,10 @@ impl EventBuffer {
 
     /// Push an event into the buffer, evicting the oldest if at capacity.
     pub fn push(&self, event: serde_json::Value) {
-        let mut buf = self.inner.lock().unwrap();
+        let mut buf = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         if buf.len() == self.capacity {
             buf.pop_front();
         }
@@ -42,7 +45,11 @@ impl EventBuffer {
 
     /// Return a snapshot of all buffered events (oldest first).
     pub fn snapshot(&self) -> Vec<serde_json::Value> {
-        self.inner.lock().unwrap().iter().cloned().collect()
+        let buf = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        buf.iter().cloned().collect()
     }
 }
 
@@ -374,6 +381,25 @@ mod tests {
     // The broadcast hook is process-wide; serialize hook-touching tests
     // within this test binary so they don't observe each other's state.
     static HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn event_buffer_recovers_after_a_poisoned_writer() {
+        let buffer = Arc::new(EventBuffer::new(4));
+        let poisoned = buffer.clone();
+        let result = std::thread::spawn(move || {
+            let mut guard = poisoned.inner.lock().expect("fresh buffer must lock");
+            guard.push_back(serde_json::json!({"sequence": 1}));
+            panic!("poison event buffer");
+        })
+        .join();
+        assert!(result.is_err());
+
+        buffer.push(serde_json::json!({"sequence": 2}));
+        let snapshot = buffer.snapshot();
+        assert_eq!(snapshot.len(), 2);
+        assert_eq!(snapshot[0]["sequence"], 1);
+        assert_eq!(snapshot[1]["sequence"], 2);
+    }
 
     fn make_broadcast() -> (
         Arc<BroadcastObserver>,

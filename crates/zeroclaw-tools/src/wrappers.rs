@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use zeroclaw_api::attribution::{Attributable, Role};
+use zeroclaw_api::attribution::{Attributable, Role, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -29,6 +29,9 @@ impl<T: Tool> Attributable for RateLimitedTool<T> {
     fn alias(&self) -> &str {
         self.inner.alias()
     }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.inner.tool_provenance()
+    }
 }
 
 #[async_trait]
@@ -53,23 +56,26 @@ impl<T: Tool> Tool for RateLimitedTool<T> {
         self.inner.param_domains()
     }
 
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
+        let reservation = match self.security.reserve_action() {
+            Some(reservation) => reservation,
+            None => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                });
+            }
+        };
 
         let result = self.inner.execute(args).await?;
 
-        if result.success && !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
+        if result.success {
+            reservation.commit();
         }
 
         Ok(result)
@@ -124,6 +130,9 @@ impl<T: Tool> Attributable for PathGuardedTool<T> {
     fn alias(&self) -> &str {
         self.inner.alias()
     }
+    fn tool_provenance(&self) -> ToolProvenance {
+        self.inner.tool_provenance()
+    }
 }
 
 #[async_trait]
@@ -146,6 +155,10 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
 
     fn param_domains(&self) -> Vec<(&'static str, zeroclaw_api::tool::OptionDomain)> {
         self.inner.param_domains()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -183,6 +196,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
@@ -291,6 +305,66 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
+    struct BlockingTool {
+        entered: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    zeroclaw_api::mock_tool_attribution!(BlockingTool);
+
+    #[async_trait]
+    impl Tool for BlockingTool {
+        fn name(&self) -> &str {
+            "blocking"
+        }
+        fn description(&self) -> &str {
+            "waits until released"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                error: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn rate_limited_parallel_calls_cannot_overbook_one_slot() {
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let first = RateLimitedTool::new(
+            BlockingTool {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+            sec.clone(),
+        );
+        let first_call =
+            zeroclaw_spawn::spawn!(async move { first.execute(serde_json::json!({})).await });
+        entered.notified().await;
+
+        let (second_inner, second_calls) = CountingTool::new();
+        let second = RateLimitedTool::new(second_inner, sec);
+        let blocked = second.execute(serde_json::json!({})).await.unwrap();
+        assert!(!blocked.success, "the in-flight call owns the only slot");
+        assert_eq!(second_calls.load(Ordering::SeqCst), 0);
+
+        release.notify_one();
+        assert!(first_call.await.unwrap().unwrap().success);
+    }
+
     // ── PathGuardedTool tests ─────────────────────────────────────────────────
 
     #[tokio::test]
@@ -375,8 +449,7 @@ mod tests {
     #[tokio::test]
     async fn rate_limited_does_not_consume_budget_on_failure() {
         // Inner tool that always reports failure (e.g. validation error).
-        // record_action() must NOT fire, so the budget stays at full and
-        // a subsequent successful call still goes through.
+        // Its reservation must be released so a later successful call can run.
         struct AlwaysFails;
         impl ::zeroclaw_api::attribution::Attributable for AlwaysFails {
             fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -430,6 +503,124 @@ mod tests {
         let r = succeeding.execute(serde_json::json!({})).await.unwrap();
         assert!(r.success);
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_releases_budget_on_inner_error() {
+        struct AlwaysErrors;
+        zeroclaw_api::mock_tool_attribution!(AlwaysErrors);
+
+        #[async_trait]
+        impl Tool for AlwaysErrors {
+            fn name(&self) -> &str {
+                "always_errors"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                anyhow::bail!("inner error")
+            }
+        }
+
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let erroring = RateLimitedTool::new(AlwaysErrors, sec.clone());
+        assert!(erroring.execute(serde_json::json!({})).await.is_err());
+
+        let (inner, calls) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(inner, sec);
+        assert!(
+            succeeding
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_releases_budget_when_call_is_cancelled() {
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let entered = Arc::new(Notify::new());
+        let tool = RateLimitedTool::new(
+            BlockingTool {
+                entered: entered.clone(),
+                release: Arc::new(Notify::new()),
+            },
+            sec.clone(),
+        );
+        let call = zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
+        entered.notified().await;
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+
+        let (inner, calls) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(inner, sec);
+        assert!(
+            succeeding
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_releases_budget_when_inner_panics() {
+        struct PanickingTool;
+        zeroclaw_api::mock_tool_attribution!(PanickingTool);
+
+        #[async_trait]
+        impl Tool for PanickingTool {
+            fn name(&self) -> &str {
+                "panicking"
+            }
+            fn description(&self) -> &str {
+                ""
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                panic!("inner panic")
+            }
+        }
+
+        let sec = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            max_actions_per_hour: 1,
+            ..SecurityPolicy::default()
+        });
+        let tool = RateLimitedTool::new(PanickingTool, sec.clone());
+        let call = zeroclaw_spawn::spawn!(async move { tool.execute(serde_json::json!({})).await });
+        assert!(call.await.unwrap_err().is_panic());
+
+        let (inner, calls) = CountingTool::new();
+        let succeeding = RateLimitedTool::new(inner, sec);
+        assert!(
+            succeeding
+                .execute(serde_json::json!({}))
+                .await
+                .unwrap()
+                .success
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

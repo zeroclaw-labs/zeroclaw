@@ -231,7 +231,6 @@ impl Tool for DeliverFileTool {
         let full_path = match self.resolve_candidate(path) {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -243,7 +242,6 @@ impl Tool for DeliverFileTool {
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
             Err(e) => {
-                let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
@@ -342,7 +340,6 @@ impl Tool for DeliverFileTool {
             "bytes": bytes,
         });
 
-        let _ = self.security.record_action();
         Ok(ToolResult {
             success: true,
             output: ToolOutput::json_with_text(data, summary),
@@ -355,6 +352,7 @@ impl Tool for DeliverFileTool {
 mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
     fn test_tool(workspace: std::path::PathBuf) -> DeliverFileTool {
         let security = Arc::new(SecurityPolicy {
@@ -403,6 +401,40 @@ mod tests {
         assert!(text.contains("Delivered a.pdf"));
         // Metadata is structural now: no machine trailer in the model-facing text.
         assert!(!text.contains("acp.deliver_file"));
+    }
+
+    #[tokio::test]
+    async fn wrapped_delivery_charges_success_once_and_failure_zero_times() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ok.txt"), b"ok").unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: dir.path().to_path_buf(),
+            max_actions_per_hour: 3,
+            ..SecurityPolicy::default()
+        });
+        let tool = RateLimitedTool::new(
+            PathGuardedTool::new(DeliverFileTool::new(security.clone()), security.clone()),
+            security.clone(),
+        );
+
+        let failed = tool.execute(json!({"path": "missing.txt"})).await.unwrap();
+        assert!(!failed.success);
+        let succeeded = tool.execute(json!({"path": "ok.txt"})).await.unwrap();
+        assert!(succeeded.success);
+
+        assert!(
+            security.record_action(),
+            "one of three slots remains after debit two"
+        );
+        assert!(
+            security.record_action(),
+            "one success plus two debits fills budget"
+        );
+        assert!(
+            !security.record_action(),
+            "successful delivery was charged exactly once"
+        );
     }
 
     #[tokio::test]

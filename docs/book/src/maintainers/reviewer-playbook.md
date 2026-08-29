@@ -13,22 +13,24 @@ Use [PR lanes](./pr-workflow.md#pr-lanes) for routing expectations; use this pla
 | Situation | Action | Section |
 |---|---|---|
 | Intake fails in the first 5 minutes | Leave one actionable checklist comment, stop deep review | [Five-minute intake](#five-minute-intake) |
-| Risk is high or unclear | Treat as `risk:high` until proven otherwise | [Review depth matrix](#review-depth-matrix) |
+| Risk or security-boundary classification is unclear | Classify upward and resolve it with a maintainer before merge | [Review depth matrix](#review-depth-matrix) |
 | Diff adds a parallel interpretive surface | Verify it is derived from, or explicitly points to, the canonical source | [Drift-surface review](#drift-surface-review) |
 | Automation output is wrong or noisy | Apply the override protocol | [Automation override](#automation-override) |
 | Need to hand off to another maintainer | Use the handoff template | [Handoff](#handoff) |
 
 ## Review depth matrix
 
-| Risk label | Typical paths | Minimum depth | Required evidence |
+| Trigger | Typical work | Minimum depth | Required evidence |
 |---|---|---|---|
-| `risk:low` | Docs, tests, chore, isolated non-runtime | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
-| `risk:medium` | `crates/zeroclaw-providers/`, `crates/zeroclaw-channels/`, `crates/zeroclaw-memory/`, `crates/zeroclaw-config/` | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
-| `risk:high` | The [canonical high-risk path set](./labels.md#risk-labels) (runtime, gateway, tools, security, `.github/workflows/`) | Fast triage + deep review + rollback readiness | Security and failure-mode checks, rollback clarity |
+| `risk:low` | Documentation, localization, fixtures, generated references, or mechanical metadata with no production, compatibility, build, release, or governance effect | 1 reviewer + CI gate | Coherent validation evidence, no behavior ambiguity |
+| `risk:medium` | Ordinary behavioral runtime, gateway, provider, channel, tool, config, application, and CI work | 1 subsystem-aware reviewer + behavior verification | Focused scenario proof, explicit side effects |
+| `risk:high` or `domain:security` | A concrete trust, credential, compatibility, governance, release-authority, or cross-cutting security boundary | Fast triage + deep review + rollback readiness + two independent Core Team approvals | Security and failure-mode checks, rollback clarity |
 
-When uncertain, treat as higher risk.
+`domain:security` remains independent from `risk:*`: use it for an effective security or trust boundary, not simply because the changed component is security-shaped. Either label triggers the same deep-review and two-independent-Core-approval path. Automated review does not count as a Core Team approval.
 
-Risk labels are currently manual. If future risk automation is restored, follow the [labels automation contract](./labels.md#automation-contract): apply `risk:manual` when a maintainer correction should not be overwritten on the next pushed update.
+When uncertain, classify upward and ask a maintainer to resolve the boundary before merge.
+
+Risk labels are currently manual. #9345 keeps any future risk classifier report-only until maintainers separately enable mutation. Follow the [labels automation contract](./labels.md#automation-contract): `risk:manual` freezes automated risk replacement when a maintainer correction should persist, but it never lowers the review or approval requirement.
 
 Labels are maintainer metadata. If the correct label is obvious and you have permission, fix it yourself before finalizing the review. Ask the author only when the right label choice is ambiguous or nobody with label permissions is available.
 
@@ -43,6 +45,7 @@ For every new PR, before reading any code:
 3. Confirm `CI Required Gate` signal status.
 4. Confirm scope is one concern. Mixed-feature mega-PRs go back for a split unless the mix is explicitly justified.
 5. Confirm privacy / data-hygiene rules. See [Privacy](../contributing/privacy.md) for the full rulebook.
+6. If the PR changes visual presentation, confirm the author exercised the actual supported interface and supplied privacy-safe screenshots at representative dimensions. A statement that the smoke was not performed records the gap but does not satisfy it.
 
 If any intake check fails, leave one actionable checklist comment and stop. Don't deep-review a PR that hasn't passed intake: the back-and-forth is cheaper at this layer than after the diff has been reasoned about.
 
@@ -53,6 +56,7 @@ If any intake check fails, leave one actionable checklist comment and stop. Don'
 - PR-body provenance is true. Cited RFCs, audits, issues, PRs, paths, generated artifacts, or follow-up findings exist and support the claim.
 - Validation evidence names the checks being relied on and why they cover the changed behavior.
 - Directly user-observable claims identify the user boundary and provide the smallest credible evidence that reaches it; use [User-boundary proof](../contributing/user-boundary-proof.md) when unit, mocked, compile, or generic CI evidence stops short.
+- Visual presentation changes include actual-interface evidence from an identifiable revision plus screenshots with enough surrounding layout to assess the result. String assertions, component-only snapshots, and helper-level renderer tests cannot replace this proof. Interaction and transition claims also name the user action and observed result.
 - Duplicate local Cargo is not required when fresh required CI covers the same head, target, and feature set. Ask for extra validation only when it maps to a named gap in the required gate, such as macOS/Windows tests, cross-platform Clippy, desktop coverage, release target builds, stale CI, or unavailable CI.
 - User-facing behavior changes are documented.
 - Author demonstrates understanding of behavior and blast radius (especially for AI-assisted PRs).
@@ -106,7 +110,7 @@ drives downstream coverage.
 
 ### Deep-review checklist (high-risk only)
 
-For `risk:high` PRs, verify a concrete example in each category. One concrete instance beats five generic claims.
+For PRs carrying `risk:high` or `domain:security`, verify a concrete example in each category. One concrete instance beats five generic claims.
 
 - **Security boundaries**: deny-by-default behavior preserved, no accidental scope broadening.
 - **Failure modes**: error handling explicit, degrades safely.
@@ -194,7 +198,7 @@ If the underlying bug or feature is still valid, preserve it in an issue, tracke
 
 Use this when automation output creates review side effects:
 
-1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk:manual`.
+1. **Incorrect risk label**: set the intended `risk:*` label. If future risk automation is active, also follow the [labels automation contract](./labels.md#automation-contract) for `risk:manual`; the override does not bypass the `risk:high OR domain:security` approval rule.
 2. **Incorrect auto-close on issue triage**: reopen, remove the route label, leave one clarifying comment.
 3. **Label spam or noise**: keep one canonical maintainer comment, remove redundant route labels.
 4. **Ambiguous PR scope**: request a split before deep review; don't try to review across two concerns at once.

@@ -1397,6 +1397,7 @@ mod tests {
             "aggregates must expand, not appear as leaves"
         );
         assert!(r.default_features.contains(&"gateway".to_string()));
+        assert!(!r.default_features.contains(&"channel-git".to_string()));
     }
 
     #[test]
@@ -1428,8 +1429,17 @@ mod tests {
     #[test]
     fn dist_matches_lean_release_contract() {
         let features = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        assert!(features.contains(&"channel-git".to_string()));
         let mut expected = resolve_feature_list(&root(), &Selection::Full).unwrap();
-        expected.extend(["channel-matrix", "channel-lark", "whatsapp-web"].map(str::to_owned));
+        expected.extend(
+            [
+                "channel-matrix",
+                "channel-lark",
+                "channel-git",
+                "whatsapp-web",
+            ]
+            .map(str::to_owned),
+        );
         expected.sort();
         expected.dedup();
         assert_eq!(features, expected);
@@ -1511,6 +1521,7 @@ mod tests {
             "distribution extras come from Cargo.toml registry"
         );
         assert!(extras.contains(&"channel-lark".to_string()));
+        assert!(extras.contains(&"channel-git".to_string()));
         assert!(extras.contains(&"whatsapp-web".to_string()));
     }
 
@@ -1617,6 +1628,17 @@ mod tests {
                 .unwrap();
         assert!(release.contains("features --selection dist --target \"${{ matrix.target }}\""));
         assert!(!release.contains("excluded_features"));
+        let cross_install = "- name: Install cross (MUSL targets)\n        if: matrix.use_cross\n        run: bash scripts/ci/install_release_tool.sh cross";
+        assert!(release.contains(cross_install));
+        assert!(!release.contains("cargo install cross"));
+        assert_eq!(
+            release
+                .matches("run: bash scripts/ci/install_release_tool.sh tauri-cli")
+                .count(),
+            3,
+            "all three desktop release jobs must use the pinned installer"
+        );
+        assert!(!release.contains("cargo install tauri-cli"));
 
         let manual = std::fs::read_to_string(
             root().join(".github/workflows/cross-platform-build-manual.yml"),
@@ -1641,9 +1663,8 @@ mod tests {
                 "- os: ubuntu-latest\n            target: {target}\n            use_cross: true"
             )));
         }
-        assert!(manual.contains(
-            "- name: Install cross (MUSL targets)\n        if: matrix.use_cross\n        run: cargo install cross --version 0.2.5 --locked"
-        ));
+        assert!(manual.contains(cross_install));
+        assert!(!manual.contains("cargo install cross"));
         assert!(manual.contains(
             "if [ \"${{ matrix.use_cross || 'false' }}\" = \"true\" ]; then\n              echo \"BUILD_CMD=cross build\""
         ));

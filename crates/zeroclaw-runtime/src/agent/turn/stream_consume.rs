@@ -2,8 +2,9 @@
 
 use super::events::{DraftEvent, StreamDelta};
 use super::outcome::{
-    StreamCancelledAfterOutput, StreamInterruptedAfterOutput,
-    StreamPreExecutedToolsWithoutFinalResponse, StreamSemanticEmptyCompletion, ToolLoopCancelled,
+    StreamCancelledAfterOutput, StreamCancelledWithUsage, StreamErrorWithUsage,
+    StreamInterruptedAfterOutput, StreamPreExecutedToolsWithoutFinalResponse,
+    StreamSemanticEmptyCompletion,
 };
 use super::stream_guard::{StreamTerminalMarkerStripper, StreamTextGuard, StreamThinkTagStripper};
 use anyhow::Result;
@@ -12,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use zeroclaw_api::agent::TurnEvent;
 use zeroclaw_api::model_provider::StreamEvent;
+use zeroclaw_config::schema::StreamReasoningMode;
 use zeroclaw_providers::{ChatMessage, ChatRequest, ModelProvider, ProviderDispatch, ToolCall};
 
 #[derive(Debug, Default)]
@@ -39,6 +41,7 @@ pub(crate) async fn consume_provider_streaming_response(
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
     event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
     strict_tool_parsing: bool,
+    draft_reasoning: StreamReasoningMode,
 ) -> Result<StreamedChatOutcome> {
     let mut provider_stream = ProviderDispatch::from_ref(model_provider).stream_chat(
         ChatRequest {
@@ -117,9 +120,13 @@ pub(crate) async fn consume_provider_streaming_response(
                     // exactly like the pre-consolidation engine's
                     // committed-partial-on-cancel.
                     if forwarded_text.is_empty() {
-                        return Err(ToolLoopCancelled.into());
+                        return Err(StreamCancelledWithUsage::new(outcome.usage).into());
                     }
-                    return Err(StreamCancelledAfterOutput::new(forwarded_text).into());
+                    return Err(StreamCancelledAfterOutput::with_usage(
+                        forwarded_text,
+                        outcome.usage,
+                    )
+                    .into());
                 }
                 chunk = provider_stream.next() => chunk,
             }
@@ -151,10 +158,15 @@ pub(crate) async fn consume_provider_streaming_response(
                     return Err(StreamInterruptedAfterOutput {
                         partial_text: forwarded_text,
                         message,
+                        usage: outcome.usage,
                     }
                     .into());
                 }
-                return Err(anyhow::Error::msg(message));
+                return Err(StreamErrorWithUsage {
+                    message,
+                    usage: outcome.usage,
+                }
+                .into());
             }
         };
         match event {
@@ -209,6 +221,11 @@ pub(crate) async fn consume_provider_streaming_response(
                     && !reasoning.is_empty()
                 {
                     outcome.reasoning_content.push_str(reasoning);
+                    if draft_reasoning == StreamReasoningMode::Full
+                        && let Some(tx) = on_delta
+                    {
+                        let _ = tx.send(StreamDelta::Reasoning(reasoning.to_string())).await;
+                    }
                     // Thinking is surfaced as its own TurnEvent variant; it
                     // must never reach the Chunk/draft text surfaces.
                     if let Some(tx) = event_tx {
@@ -315,12 +332,18 @@ mod tests {
     use zeroclaw_api::model_provider::StreamChunk;
     use zeroclaw_providers::ToolCall;
     use zeroclaw_providers::traits::{
-        ChatResponse, ProviderCapabilities, StreamOptions, StreamResult,
+        ChatResponse, ProviderCapabilities, StreamOptions, StreamResult, TokenUsage,
     };
 
     struct ToolThenTextProvider;
 
     struct EmptyStreamProvider;
+    struct ReasoningProvider;
+
+    struct CancelAfterUsageProvider {
+        cancellation: CancellationToken,
+        cancel_after_visible_output: bool,
+    }
 
     impl ::zeroclaw_api::attribution::Attributable for ToolThenTextProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -345,6 +368,33 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "EmptyStreamProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for ReasoningProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ReasoningProvider"
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CancelAfterUsageProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CancelAfterUsageProvider"
         }
     }
 
@@ -446,6 +496,127 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ModelProvider for ReasoningProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: false,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: true,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamEvent::TextDelta(StreamChunk {
+                    delta: "answer<eom>".to_string(),
+                    reasoning: Some("private <eom>".to_string()),
+                    is_final: false,
+                    token_count: 0,
+                })),
+                Ok(StreamEvent::Final),
+            ]))
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for CancelAfterUsageProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<ChatResponse> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            let cancellation = self.cancellation.clone();
+            let cancel_after_visible_output = self.cancel_after_visible_output;
+            Box::pin(futures_util::stream::unfold(0_u8, move |state| {
+                let cancellation = cancellation.clone();
+                async move {
+                    match state {
+                        0 => Some((
+                            Ok(StreamEvent::Usage(TokenUsage {
+                                input_tokens: Some(10),
+                                output_tokens: Some(5),
+                                cached_input_tokens: None,
+                            })),
+                            1,
+                        )),
+                        1 => {
+                            if cancel_after_visible_output {
+                                return Some((
+                                    Ok(StreamEvent::TextDelta(StreamChunk::delta("visible"))),
+                                    2,
+                                ));
+                            }
+                            cancellation.cancel();
+                            std::future::pending::<()>().await;
+                            None
+                        }
+                        2 => {
+                            std::future::pending::<()>().await;
+                            None
+                        }
+                        _ => None,
+                    }
+                }
+            }))
+        }
+    }
+
     #[tokio::test]
     async fn forwards_text_deltas_emitted_after_a_native_tool_call() {
         let provider = ToolThenTextProvider;
@@ -461,6 +632,7 @@ mod tests {
             None,
             Some(&event_tx),
             false,
+            StreamReasoningMode::Status,
         )
         .await
         .expect("stream consume should succeed");
@@ -492,6 +664,7 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
         )
         .await
         .expect_err("a semantically empty stream must not complete successfully");
@@ -500,6 +673,174 @@ mod tests {
             err.to_string(),
             "provider stream completed without final text or tool calls"
         );
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_reported_usage_preserves_rejected_usage() {
+        let cancellation = CancellationToken::new();
+        let provider = CancelAfterUsageProvider {
+            cancellation: cancellation.clone(),
+            cancel_after_visible_output: false,
+        };
+
+        let error = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            Some(&cancellation),
+            None,
+            None,
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("cancellation must interrupt the stream");
+
+        let cancelled = error
+            .downcast_ref::<StreamCancelledWithUsage>()
+            .expect("pre-output cancellation retains its typed outcome");
+        let usage = cancelled
+            .usage
+            .as_ref()
+            .expect("reported usage must survive cancellation");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_visible_output_preserves_usage_and_partial_text() {
+        let cancellation = CancellationToken::new();
+        let provider = CancelAfterUsageProvider {
+            cancellation: cancellation.clone(),
+            cancel_after_visible_output: true,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
+        let cancel_after_chunk = cancellation.clone();
+        let observed_chunk = zeroclaw_spawn::spawn!(async move {
+            let event = event_rx.recv().await;
+            cancel_after_chunk.cancel();
+            event
+        });
+
+        let error = consume_provider_streaming_response(
+            &provider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            Some(&cancellation),
+            None,
+            Some(&event_tx),
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("cancellation must interrupt the stream");
+
+        let cancelled = error
+            .downcast_ref::<StreamCancelledAfterOutput>()
+            .expect("visible cancellation keeps its typed partial outcome");
+        assert_eq!(cancelled.partial_text, "visible");
+        let usage = cancelled
+            .usage
+            .as_ref()
+            .expect("reported usage must survive visible cancellation");
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(5));
+        match observed_chunk.await.expect("chunk observer task must join") {
+            Some(TurnEvent::Chunk { delta }) => assert_eq!(delta, "visible"),
+            other => panic!("expected one visible text chunk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_status_mode_keeps_reasoning_out_of_draft_deltas() {
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        let outcome = consume_provider_streaming_response(
+            &ReasoningProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            None,
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(delta_tx);
+
+        assert_eq!(outcome.reasoning_content, "private <eom>");
+        while let Some(delta) = delta_rx.recv().await {
+            assert!(
+                !matches!(delta, StreamDelta::Reasoning(_)),
+                "status mode must not expose raw reasoning"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reasoning_full_mode_keeps_raw_reasoning_separate_from_terminal_markers() {
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        let outcome = consume_provider_streaming_response(
+            &ReasoningProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            None,
+            false,
+            StreamReasoningMode::Full,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(delta_tx);
+
+        let deltas: Vec<_> = std::iter::from_fn(|| delta_rx.try_recv().ok()).collect();
+        assert_eq!(outcome.reasoning_content, "private <eom>");
+        assert_eq!(outcome.response_text, "answer");
+        assert!(deltas.iter().any(|delta| matches!(
+            delta,
+            StreamDelta::Reasoning(text) if text == "private <eom>"
+        )));
+        assert!(
+            deltas
+                .iter()
+                .any(|delta| matches!(delta, StreamDelta::Text(text) if text == "answer"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_off_mode_emits_no_reasoning_draft_delta() {
+        let (delta_tx, mut delta_rx) = tokio::sync::mpsc::channel::<DraftEvent>(8);
+        consume_provider_streaming_response(
+            &ReasoningProvider,
+            &[ChatMessage::user("go")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            Some(&delta_tx),
+            None,
+            false,
+            StreamReasoningMode::Off,
+        )
+        .await
+        .expect("stream consume should succeed");
+        drop(delta_tx);
+
+        while let Some(delta) = delta_rx.recv().await {
+            assert!(
+                !matches!(delta, StreamDelta::Reasoning(_)),
+                "off mode must not expose raw reasoning"
+            );
+        }
     }
 
     struct MarkerTestProvider {
@@ -596,6 +937,7 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
         )
         .await
         .expect("stream consume should succeed");
@@ -621,6 +963,7 @@ mod tests {
             None,
             None,
             true, // strict_tool_parsing = true
+            StreamReasoningMode::Status,
         )
         .await
         .expect("stream consume should succeed");
@@ -729,6 +1072,7 @@ mod tests {
             None,      // on_delta (draft sink)
             Some(&tx), // event_tx
             true,      // strict_tool_parsing = true
+            StreamReasoningMode::Status,
         )
         .await;
 
@@ -775,6 +1119,7 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
         )
         .await
         .expect("stream consume should succeed");
@@ -799,6 +1144,7 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
         )
         .await
         .expect("stream consume should succeed");
@@ -823,6 +1169,7 @@ mod tests {
             None,
             None,
             false,
+            StreamReasoningMode::Status,
         )
         .await
         .expect("stream consume should succeed");
@@ -934,6 +1281,7 @@ mod tests {
                 None,
                 Some(&event_tx),
                 false,
+                StreamReasoningMode::Status,
             )
             .await
         });

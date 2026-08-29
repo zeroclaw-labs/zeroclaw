@@ -26,6 +26,10 @@ pub struct OpenRouterModelProvider {
 
 /// OpenRouter's public aggregator endpoint.
 pub(crate) const BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+pub(crate) fn endpoint_url(path: &str) -> String {
+    format!("{BASE_URL}/{}", path.trim_start_matches('/'))
+}
 const OPENROUTER_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Debug, Serialize)]
@@ -559,7 +563,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // This prevents the first real chat request from timing out on cold start.
         if let Some(credential) = self.credential.as_ref() {
             self.http_client()
-                .get("https://openrouter.ai/api/v1/auth/key")
+                .get(endpoint_url("auth/key"))
                 .header("Authorization", format!("Bearer {credential}"))
                 .send()
                 .await?
@@ -573,7 +577,7 @@ impl ModelProvider for OpenRouterModelProvider {
         // Returns ~300 models across every model_provider OpenRouter proxies.
         let response = self
             .http_client()
-            .get("https://openrouter.ai/api/v1/models")
+            .get(endpoint_url("models"))
             .send()
             .await?
             .error_for_status()?;
@@ -628,7 +632,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -701,7 +705,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -772,7 +776,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -886,7 +890,7 @@ impl ModelProvider for OpenRouterModelProvider {
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
             let response = match client
-                .post("https://openrouter.ai/api/v1/chat/completions")
+                .post(endpoint_url("chat/completions"))
                 .header("Authorization", format!("Bearer {credential}"))
                 .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
                 .header("X-Title", "ZeroClaw")
@@ -1003,7 +1007,7 @@ impl ModelProvider for OpenRouterModelProvider {
         let body = self.merge_extra_body(&native_request)?;
         let response = self
             .http_client()
-            .post("https://openrouter.ai/api/v1/chat/completions")
+            .post(endpoint_url("chat/completions"))
             .header("Authorization", format!("Bearer {credential}"))
             .header("HTTP-Referer", "https://github.com/zeroclaw-labs/zeroclaw")
             .header("X-Title", "ZeroClaw")
@@ -1228,6 +1232,20 @@ mod tests {
             .credential(None)
             .build();
         assert!(model_provider.credential.is_none());
+    }
+
+    #[test]
+    fn warmup_and_model_discovery_urls_share_the_provider_base() {
+        assert_eq!(
+            endpoint_url("auth/key"),
+            "https://openrouter.ai/api/v1/auth/key",
+            "warmup must derive its URL from the provider-owned base"
+        );
+        assert_eq!(
+            endpoint_url("models"),
+            "https://openrouter.ai/api/v1/models",
+            "model discovery must derive its URL from the provider-owned base"
+        );
     }
 
     #[test]
