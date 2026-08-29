@@ -11,36 +11,72 @@
 //! consumption silently discards it — so the callback waits for this
 //! confirmation before reporting the selection as queued.
 //!
-//! Two failure boundaries are covered on top of the happy path:
+//! Ownership of the outcome is a per-selection claim state machine
+//! (`Open` → `Applied` | `Revoked`) shared via `Arc<Mutex<ClaimState>>`.
+//! Both the callback side ([`revoke`], [`DeliveryAck`] drop) and the
+//! dispatch side ([`apply_if_not_revoked`]) transition the claim under the
+//! same lock, and the route mutation runs while the dispatch side holds
+//! that lock. Whichever side locks the claim first owns the outcome, so a
+//! callback timeout can never slip between the dispatch-side check and the
+//! route write.
+//!
+//! The failure boundaries covered on top of the happy path:
 //!
 //! - The bounded wait can elapse while the selection is still queued (or
 //!   waiting on the dispatch semaphore). The callback then reports the
-//!   picker as unavailable and [`revoke`]s the registration, so the late
-//!   dispatch observes [`take_revoked`] and leaves the selection inert
-//!   instead of applying the route change after the UI reported failure.
-//! - The callback task can be aborted while waiting. Registration returns a
-//!   [`DeliveryAck`] guard whose `Drop` removes a still-pending entry, so an
-//!   aborted wait cannot leak the sender in the static map.
-//! - A revoked entry whose queued selection is dropped before dispatch
-//!   (runtime receiver shutdown) would otherwise sit in the map forever.
-//!   Entries carry their insertion time and any registry op lazily purges
-//!   entries older than [`DELIVERY_ACK_ENTRY_TTL`] — no background task.
+//!   picker as unavailable and [`revoke`]s the claim, so the late dispatch
+//!   observes the `Revoked` state and leaves the selection inert instead
+//!   of applying the route change after the UI reported failure. If the
+//!   route mutation already ran, [`revoke`] reports
+//!   [`RevokeOutcome::AlreadyApplied`] so the callback answers `queued`
+//!   instead of restoring the picker.
+//! - The callback task can be aborted while waiting. Registration returns
+//!   a [`DeliveryAck`] guard whose `Drop` revokes an enqueued selection
+//!   (the queued message is still live and must not apply without
+//!   confirmation) and removes a never-enqueued one, so an aborted wait
+//!   can neither leak the sender in the static map nor let an
+//!   unacknowledged selection apply.
+//! - Registry entries carry their insertion time and any registry op
+//!   lazily purges stale `Open` entries older than
+//!   [`DELIVERY_ACK_ENTRY_TTL`] — no background task. `Revoked` markers
+//!   are never swept by time: they are consumed by the late dispatch via
+//!   [`take_revoked`]/[`apply_if_not_revoked`], and a time-based sweep
+//!   could otherwise drop the revocation while the selection is still
+//!   queued, letting the route mutate after the UI reported failure. If
+//!   the queued message was dropped at runtime shutdown nothing consumes
+//!   the marker; that residue is bounded by the number of timed-out
+//!   selections and harmless.
 
 use std::collections::HashMap;
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
-/// Upper bound on how long a registration may stay in the map. The bounded
-/// ack wait is 5s (`TELEGRAM_MODEL_PICKER_DELIVERY_ACK_TIMEOUT`), after which
-/// the callback either confirms, revokes, or drops the guard — so by 60s any
-/// leftover entry belongs to a selection that was discarded before dispatch
-/// and can never be observed again. Uses `tokio::time::Instant` so tests can
-/// age entries under a paused clock.
+/// Upper bound on how long an `Open` registration may stay in the map. The
+/// bounded ack wait is 5s (`TELEGRAM_MODEL_PICKER_DELIVERY_ACK_TIMEOUT`),
+/// after which the callback either confirms, revokes, or drops the guard —
+/// so by 60s any leftover `Open` entry is an orphan with no live queued
+/// message. Uses `tokio::time::Instant` so tests can age entries under a
+/// paused clock.
 const DELIVERY_ACK_ENTRY_TTL: Duration = Duration::from_secs(60);
+
+/// Terminal ownership state of a registered selection. Transitions happen
+/// under the claim lock only; the route mutation runs while the dispatch
+/// side holds that lock, so check and write are atomic with respect to a
+/// concurrent revocation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClaimState {
+    /// Registered; neither side has claimed the outcome yet.
+    Open,
+    /// The dispatch applied the route mutation while holding the claim.
+    Applied,
+    /// The callback timed out or was aborted after enqueue; the late
+    /// dispatch must leave the selection inert.
+    Revoked,
+}
 
 struct PendingDeliveryAck {
     sender: tokio::sync::oneshot::Sender<()>,
-    revoked: bool,
+    claim: Arc<Mutex<ClaimState>>,
     inserted_at: tokio::time::Instant,
 }
 
@@ -53,24 +89,39 @@ fn pending() -> MutexGuard<'static, HashMap<String, PendingDeliveryAck>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Lazily reclaim entries older than [`DELIVERY_ACK_ENTRY_TTL`]. A revoked
-/// entry is normally consumed by the late dispatch via [`take_revoked`]; if
-/// the runtime receiver shut down first, the queued selection is dropped
-/// without ever reaching that check, and only this sweep removes the entry.
-/// Called from every registry op so no background task is needed.
+fn claim_lock(claim: &Arc<Mutex<ClaimState>>) -> MutexGuard<'_, ClaimState> {
+    claim
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Lazily reclaim stale `Open` entries older than
+/// [`DELIVERY_ACK_ENTRY_TTL`]. A stale `Open` entry is always an orphan:
+/// the callback's ack wait is bounded at 5s, so no live queued message can
+/// still own it. `Revoked` (and `Applied`) markers are kept regardless of
+/// age — only the late dispatch may consume a revocation. Called from
+/// every registry op so no background task is needed.
 fn purge_expired(pending: &mut HashMap<String, PendingDeliveryAck>) {
-    pending.retain(|_, entry| entry.inserted_at.elapsed() < DELIVERY_ACK_ENTRY_TTL);
+    pending.retain(|_, entry| {
+        if entry.inserted_at.elapsed() < DELIVERY_ACK_ENTRY_TTL {
+            return true;
+        }
+        !matches!(*claim_lock(&entry.claim), ClaimState::Open)
+    });
 }
 
 /// Receiver side of a registered selection acknowledgement. Dropping the
-/// guard removes a still-pending registration (callback aborted, enqueue
-/// failed after [`cancel`], or an answered callback after [`confirm`]), so
-/// the sender cannot outlive the callback task in the static map. A revoked
-/// entry is left in place: the late dispatch still has to observe the
-/// revocation through [`take_revoked`].
+/// guard settles a still-`Open` registration: an enqueued selection is
+/// revoked (callback aborted mid-wait; the queued message must not apply
+/// without confirmation), a never-enqueued one is removed outright, so the
+/// sender cannot outlive the callback task in the static map. Entries in a
+/// terminal state (`Applied`/`Revoked`) are owned by the dispatch/revoke
+/// paths and left alone.
 pub(crate) struct DeliveryAck {
     message_id: String,
     receiver: tokio::sync::oneshot::Receiver<()>,
+    claim: Arc<Mutex<ClaimState>>,
+    enqueued: bool,
 }
 
 impl DeliveryAck {
@@ -79,16 +130,32 @@ impl DeliveryAck {
     pub(crate) async fn wait(&mut self) -> Result<(), tokio::sync::oneshot::error::RecvError> {
         (&mut self.receiver).await
     }
+
+    /// Mark the selection as handed to the runtime queue. Only an enqueued
+    /// selection needs a surviving `Revoked` marker when the guard drops
+    /// without an answer; a selection that never entered the queue is
+    /// simply unregistered on drop.
+    pub(crate) fn mark_enqueued(&mut self) {
+        self.enqueued = true;
+    }
 }
 
 impl Drop for DeliveryAck {
     fn drop(&mut self) {
         let mut pending = pending();
-        if pending
-            .get(&self.message_id)
-            .is_some_and(|entry| !entry.revoked)
-        {
-            pending.remove(&self.message_id);
+        if !pending.contains_key(&self.message_id) {
+            return;
+        }
+        let mut state = claim_lock(&self.claim);
+        match *state {
+            ClaimState::Open if self.enqueued => {
+                *state = ClaimState::Revoked;
+            }
+            ClaimState::Open => {
+                drop(state);
+                pending.remove(&self.message_id);
+            }
+            ClaimState::Applied | ClaimState::Revoked => {}
         }
     }
 }
@@ -98,19 +165,22 @@ impl Drop for DeliveryAck {
 /// immediately cannot confirm into a not-yet-registered id.
 pub(crate) fn register(message_id: &str) -> DeliveryAck {
     let (sender, receiver) = tokio::sync::oneshot::channel();
+    let claim = Arc::new(Mutex::new(ClaimState::Open));
     let mut pending = pending();
     purge_expired(&mut pending);
     pending.insert(
         message_id.to_string(),
         PendingDeliveryAck {
             sender,
-            revoked: false,
+            claim: Arc::clone(&claim),
             inserted_at: tokio::time::Instant::now(),
         },
     );
     DeliveryAck {
         message_id: message_id.to_string(),
         receiver,
+        claim,
+        enqueued: false,
     }
 }
 
@@ -122,6 +192,7 @@ pub(crate) fn confirm(message_id: &str) {
     purge_expired(&mut pending);
     let entry = pending.remove(message_id);
     if let Some(entry) = entry {
+        *claim_lock(&entry.claim) = ClaimState::Applied;
         // A send error only means the callback already stopped waiting and
         // dropped the receiver; nothing left to propagate.
         let _ = entry.sender.send(());
@@ -134,15 +205,40 @@ pub(crate) fn cancel(message_id: &str) {
     pending().remove(message_id);
 }
 
+/// Outcome of a callback-side revocation attempt.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RevokeOutcome {
+    /// The revocation won: the selection had not been applied, so the late
+    /// dispatch will observe the `Revoked` claim and stay inert.
+    Won,
+    /// The route mutation already ran (or the registration was already
+    /// confirmed): the callback must report the selection as queued
+    /// instead of restoring the picker.
+    AlreadyApplied,
+}
+
 /// Mark a registered selection as revoked: the callback's bounded wait
 /// elapsed while the selection was already enqueued, so the late dispatch
-/// must observe the revocation via [`take_revoked`] instead of applying the
-/// route change after the picker UI already reported failure.
-pub(crate) fn revoke(message_id: &str) {
+/// must observe the revocation instead of applying the route change after
+/// the picker UI already reported failure. The claim lock serializes
+/// against a concurrent [`apply_if_not_revoked`]: whichever side locks the
+/// claim first owns the outcome.
+pub(crate) fn revoke(message_id: &str) -> RevokeOutcome {
     let mut pending = pending();
     purge_expired(&mut pending);
-    if let Some(entry) = pending.get_mut(message_id) {
-        entry.revoked = true;
+    let Some(entry) = pending.get(message_id) else {
+        // Only `confirm`/`apply_if_not_revoked` remove an entry the live
+        // callback still owns, so a missing entry means the route already
+        // mutated.
+        return RevokeOutcome::AlreadyApplied;
+    };
+    let mut state = claim_lock(&entry.claim);
+    match *state {
+        ClaimState::Open | ClaimState::Revoked => {
+            *state = ClaimState::Revoked;
+            RevokeOutcome::Won
+        }
+        ClaimState::Applied => RevokeOutcome::AlreadyApplied,
     }
 }
 
@@ -153,16 +249,77 @@ pub(crate) fn revoke(message_id: &str) {
 pub(crate) fn take_revoked(message_id: &str) -> bool {
     let mut pending = pending();
     purge_expired(&mut pending);
-    if pending.get(message_id).is_some_and(|entry| entry.revoked) {
+    let revoked = pending
+        .get(message_id)
+        .is_some_and(|entry| matches!(*claim_lock(&entry.claim), ClaimState::Revoked));
+    if revoked {
         pending.remove(message_id);
         return true;
     }
     false
 }
 
+/// Route-mutation handoff at the authoritative mutation point. Runs `f`
+/// (the route write) while holding the selection's claim lock, so a
+/// callback revocation can never slip between the check and the mutation:
+/// whichever side locks the claim first owns the outcome. Returns `true`
+/// when the mutation ran; a revoked selection consumes its registration
+/// and returns `false` without running `f`. Messages without a
+/// registration (ordinary `/model` traffic) always apply.
+pub(crate) fn apply_if_not_revoked(message_id: &str, f: impl FnOnce()) -> bool {
+    let claim = {
+        let mut pending = pending();
+        purge_expired(&mut pending);
+        pending
+            .get(message_id)
+            .map(|entry| Arc::clone(&entry.claim))
+    };
+    let Some(claim) = claim else {
+        f();
+        return true;
+    };
+    let mut state = claim_lock(&claim);
+    match *state {
+        ClaimState::Open => {
+            *state = ClaimState::Applied;
+            f();
+            drop(state);
+            // Consume the registration and release the callback's ack wait
+            // only now that the route mutation actually ran.
+            let mut pending = pending();
+            if let Some(entry) = pending.remove(message_id) {
+                let _ = entry.sender.send(());
+            }
+            true
+        }
+        ClaimState::Revoked => {
+            drop(state);
+            pending().remove(message_id);
+            false
+        }
+        // Unreachable in practice: an applied selection already consumed
+        // its registration. Fail closed.
+        ClaimState::Applied => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Barrier, Mutex, MutexGuard};
     use std::time::Duration;
+
+    use super::ClaimState;
+
+    /// The registry is process-global, so every test in this module
+    /// serializes on this lock: a concurrently running test must not purge
+    /// or observe another test's entries (the default runner is parallel).
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_lock() -> MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn is_registered(message_id: &str) -> bool {
         super::pending().contains_key(message_id)
@@ -172,13 +329,13 @@ mod tests {
     /// a paused clock instead: the map is process-global, so entries created
     /// under another test's frozen clock would be measured against this
     /// runtime's real clock (and vice versa) by any concurrent purge.
-    fn insert_entry_for_test(message_id: &str, revoked: bool, age: Duration) {
+    fn insert_entry_for_test(message_id: &str, claim: ClaimState, age: Duration) {
         let (sender, _receiver) = tokio::sync::oneshot::channel();
         super::pending().insert(
             message_id.to_string(),
             super::PendingDeliveryAck {
                 sender,
-                revoked,
+                claim: Arc::new(Mutex::new(claim)),
                 inserted_at: tokio::time::Instant::now()
                     .checked_sub(age)
                     .unwrap_or_else(tokio::time::Instant::now),
@@ -186,15 +343,25 @@ mod tests {
         );
     }
 
+    // The test-serialization lock is held across the whole test
+    // (including the ack wait) on purpose: the registry is
+    // process-global and the default runner is parallel.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn registered_selection_confirm_fires() {
+        let _guard = test_lock();
         let mut ack = super::register("selection-confirm");
         super::confirm("selection-confirm");
         assert!(ack.wait().await.is_ok());
     }
 
+    // The test-serialization lock is held across the whole test
+    // (including the ack wait) on purpose: the registry is
+    // process-global and the default runner is parallel.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn confirm_without_registration_is_a_noop() {
+        let _guard = test_lock();
         // Ordinary traffic never registers; confirming its id must not
         // panic or disturb a later registration under the same id.
         super::confirm("ordinary-message");
@@ -203,8 +370,13 @@ mod tests {
         assert!(ack.wait().await.is_ok());
     }
 
+    // The test-serialization lock is held across the whole test
+    // (including the ack wait) on purpose: the registry is
+    // process-global and the default runner is parallel.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn cancelled_registration_never_fires() {
+        let _guard = test_lock();
         let mut ack = super::register("selection-cancelled");
         super::cancel("selection-cancelled");
         assert!(!is_registered("selection-cancelled"));
@@ -214,9 +386,11 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_registration_removes_entry() {
-        // The callback task was aborted while waiting: no confirm and no
-        // cancel ever ran. The guard drop must still remove the entry so
-        // the sender cannot leak in the static map.
+        let _guard = test_lock();
+        // The callback task was aborted before the queue handoff: no
+        // confirm and no cancel ever ran, and the selection never entered
+        // the queue. The guard drop must still remove the entry so the
+        // sender cannot leak in the static map.
         let ack = super::register("selection-aborted");
         assert!(is_registered("selection-aborted"));
         drop(ack);
@@ -227,9 +401,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborted_after_enqueue_leaves_revoked_marker() {
+        let _guard = test_lock();
+        // The callback task was aborted after the queue handoff succeeded
+        // but before the runtime consumed the message: the queued
+        // selection is still live, so the guard drop must revoke it
+        // instead of letting it apply without confirmation.
+        let mut ack = super::register("selection-aborted-enqueued");
+        ack.mark_enqueued();
+        drop(ack);
+        assert!(is_registered("selection-aborted-enqueued"));
+        // The late dispatch observes the revocation and stays inert.
+        let mut applied = false;
+        assert!(!super::apply_if_not_revoked(
+            "selection-aborted-enqueued",
+            || {
+                applied = true;
+            }
+        ));
+        assert!(!applied, "aborted selection must not mutate the route");
+        assert!(!is_registered("selection-aborted-enqueued"));
+    }
+
+    #[tokio::test]
     async fn revoked_selection_survives_guard_drop_and_is_taken_once() {
-        let ack = super::register("selection-revoked");
-        super::revoke("selection-revoked");
+        let _guard = test_lock();
+        let mut ack = super::register("selection-revoked");
+        ack.mark_enqueued();
+        assert!(matches!(
+            super::revoke("selection-revoked"),
+            super::RevokeOutcome::Won
+        ));
         // The revoked marker must outlive the callback task so the late
         // dispatch can observe it.
         drop(ack);
@@ -241,6 +443,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_selection_is_not_revoked() {
+        let _guard = test_lock();
         // The enqueue-failed path cancels outright: the selection never
         // entered the queue, so there is nothing for dispatch to revoke.
         let ack = super::register("selection-enqueue-failed");
@@ -251,40 +454,157 @@ mod tests {
 
     #[tokio::test]
     async fn ordinary_message_is_never_revoked() {
+        let _guard = test_lock();
         assert!(!super::take_revoked("ordinary-never-registered"));
     }
 
     #[tokio::test]
-    async fn revoked_entry_older_than_ttl_is_purged_without_consumption() {
-        // The queued selection was dropped before dispatch (runtime
-        // receiver shutdown), so nothing ever calls `take_revoked` for it:
-        // only the lazy TTL sweep can reclaim the revoked entry. Backdated
-        // to 2× the TTL so every runtime clock measures it as expired.
+    async fn apply_runs_for_unregistered_message() {
+        let _guard = test_lock();
+        // Ordinary `/model` traffic has no claim and always applies.
+        let mut applied = false;
+        assert!(super::apply_if_not_revoked("ordinary-apply", || {
+            applied = true;
+        }));
+        assert!(applied);
+    }
+
+    #[tokio::test]
+    async fn apply_after_revoke_leaves_selection_inert() {
+        let _guard = test_lock();
+        // The callback's ack wait elapsed while the selection was queued:
+        // the late dispatch must not run the route mutation.
+        let _ack = super::register("selection-revoked-apply");
+        assert!(matches!(
+            super::revoke("selection-revoked-apply"),
+            super::RevokeOutcome::Won
+        ));
+        let mut applied = false;
+        assert!(!super::apply_if_not_revoked(
+            "selection-revoked-apply",
+            || {
+                applied = true;
+            }
+        ));
+        assert!(!applied, "revoked selection must not mutate the route");
+        assert!(!is_registered("selection-revoked-apply"));
+    }
+
+    // The test-serialization lock is held across the whole test
+    // (including the ack wait) on purpose: the registry is
+    // process-global and the default runner is parallel.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn apply_holds_claim_through_mutation_so_revoke_reports_already_applied() {
+        let _guard = test_lock();
+        // Deterministic revocation-during-mutation race: the dispatch
+        // holds the claim lock across the route write, so a concurrent
+        // `revoke` blocks until the mutation finished and then observes
+        // `Applied` — the callback reports the selection as queued instead
+        // of restoring the picker over an already-switched route.
+        let mut ack = super::register("selection-apply-revoke-race");
+        ack.mark_enqueued();
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let entered_worker = Arc::clone(&entered);
+        let release_worker = Arc::clone(&release);
+        let applier = std::thread::spawn(move || {
+            super::apply_if_not_revoked("selection-apply-revoke-race", move || {
+                entered_worker.wait();
+                release_worker.wait();
+            })
+        });
+        // The mutation started and holds the claim lock.
+        entered.wait();
+        let (revoke_tx, revoke_rx) = std::sync::mpsc::channel();
+        let revoker = std::thread::spawn(move || {
+            revoke_tx
+                .send(super::revoke("selection-apply-revoke-race"))
+                .unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            revoke_rx.try_recv().is_err(),
+            "revoke must block while the claim is held across the mutation"
+        );
+        release.wait();
+        assert!(
+            applier.join().unwrap(),
+            "unrevoked selection must apply the route mutation"
+        );
+        assert!(matches!(
+            revoke_rx.recv().unwrap(),
+            super::RevokeOutcome::AlreadyApplied
+        ));
+        revoker.join().unwrap();
+        // The applied selection released the callback's ack wait.
+        assert!(ack.wait().await.is_ok());
+        assert!(!super::take_revoked("selection-apply-revoke-race"));
+    }
+
+    #[tokio::test]
+    async fn revoked_entry_older_than_ttl_survives_lazy_sweep() {
+        let _guard = test_lock();
+        // Regression: a stalled runtime queue can delay dispatch past any
+        // elapsed-time bound. The revocation must stay authoritative until
+        // the late dispatch consumes it — a time-based sweep may never
+        // drop a revoked marker, or the route would mutate after the
+        // picker UI already reported the selection as unavailable.
+        // Backdated to 2× the TTL so every runtime clock measures it as
+        // expired.
         insert_entry_for_test(
             "selection-stale-revoked",
-            true,
+            ClaimState::Revoked,
             super::DELIVERY_ACK_ENTRY_TTL * 2,
         );
-        assert!(is_registered("selection-stale-revoked"));
         // Any registry op performs the lazy sweep; confirming an id that
         // was never registered keeps ordinary traffic a no-op.
         super::confirm("ordinary-message");
         assert!(
-            !is_registered("selection-stale-revoked"),
-            "expired revoked entry must be reclaimed without consumption"
+            is_registered("selection-stale-revoked"),
+            "revoked marker must survive the TTL sweep until dispatch consumes it"
         );
-        // The purged marker is gone for good: no late take can observe it.
-        assert!(!super::take_revoked("selection-stale-revoked"));
+        // The late dispatch beyond the TTL still observes the revocation
+        // and stays inert.
+        let mut applied = false;
+        assert!(!super::apply_if_not_revoked(
+            "selection-stale-revoked",
+            || {
+                applied = true;
+            }
+        ));
+        assert!(!applied);
+        assert!(!is_registered("selection-stale-revoked"));
+    }
+
+    #[tokio::test]
+    async fn stale_open_entry_is_purged_without_consumption() {
+        let _guard = test_lock();
+        // A stale `Open` entry is always an orphan: the callback's ack
+        // wait is bounded at 5s, so by 2× the TTL no live queued message
+        // can still own it, and the lazy sweep reclaims it.
+        insert_entry_for_test(
+            "selection-stale-open",
+            ClaimState::Open,
+            super::DELIVERY_ACK_ENTRY_TTL * 2,
+        );
+        assert!(is_registered("selection-stale-open"));
+        super::confirm("ordinary-message");
+        assert!(
+            !is_registered("selection-stale-open"),
+            "stale open entry must be reclaimed without consumption"
+        );
     }
 
     #[tokio::test]
     async fn revoked_entry_younger_than_ttl_survives_lazy_sweep() {
+        let _guard = test_lock();
         // Half the TTL: comfortably inside the bound even if a concurrent
         // paused-clock test measures this entry with a slightly advanced
         // clock (the ack-timeout tests advance ~5s).
         insert_entry_for_test(
             "selection-fresh-revoked",
-            true,
+            ClaimState::Revoked,
             super::DELIVERY_ACK_ENTRY_TTL / 2,
         );
         // The sweep runs on every registry op but must not touch entries

@@ -3162,25 +3162,36 @@ async fn handle_runtime_command_if_needed(
             if model.is_empty() {
                 channel_runtime_cli_string("channel-runtime-model-empty")
             } else {
-                // Authoritative picker-revocation check at the mutation
+                // Authoritative picker-revocation claim at the mutation
                 // point. The early dispatch gate in
                 // `process_channel_message_body` can pass while the
                 // selection is still registered; the callback's bounded ack
                 // wait may then elapse while the message works through the
                 // media/link pipeline, revoking the registration before this
-                // handler runs. Only Telegram picker selections register a
-                // delivery ack (always as `/model <hint>`), so `take_revoked`
-                // is a no-op for ordinary traffic; it consumes the marker
-                // atomically, so the early gate cannot double-fire. No
-                // `.await` sits between this check and the route write.
-                // A revoked selection returns early as handled-but-inert: no
-                // route mutation, no response, no provider turn.
+                // handler runs. `apply_if_not_revoked` runs the route write
+                // while holding the selection's claim lock, so the
+                // callback's `revoke` can never slip between the check and
+                // the mutation — whichever side locks the claim first owns
+                // the outcome. Only Telegram picker selections register a
+                // delivery ack (always as `/model <hint>`), so ordinary
+                // traffic has no claim and always applies. A revoked
+                // selection returns early as handled-but-inert: no route
+                // mutation, no response, no provider turn.
                 #[cfg(feature = "channel-telegram")]
-                if crate::model_picker_delivery::take_revoked(&msg.id) {
+                let picker_applied =
+                    crate::model_picker_delivery::apply_if_not_revoked(&msg.id, || {
+                        apply_model_ref(&mut current, &ctx.model_routes, &model);
+                        set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                    });
+                #[cfg(not(feature = "channel-telegram"))]
+                {
+                    apply_model_ref(&mut current, &ctx.model_routes, &model);
+                    set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
+                }
+                #[cfg(feature = "channel-telegram")]
+                if !picker_applied {
                     return true;
                 }
-                apply_model_ref(&mut current, &ctx.model_routes, &model);
-                set_route_selection(ctx, &sender_key, current.clone(), &defaults_snapshot);
 
                 let mut resp = channel_runtime_cli_string_with_args(
                     "channel-runtime-model-switched",

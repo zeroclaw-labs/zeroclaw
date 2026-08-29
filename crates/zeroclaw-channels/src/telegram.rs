@@ -1939,6 +1939,9 @@ impl TelegramChannel {
                     .await;
                     return;
                 }
+                // Only an enqueued selection needs the abort/timeout
+                // revocation marker; the guard drop distinguishes on it.
+                delivery_ack.mark_enqueued();
                 // `try_send` only proved the queue accepted the selection;
                 // a receiver dropped before consumption silently discards
                 // it. Report `queued` only once the runtime confirms the
@@ -1959,17 +1962,35 @@ impl TelegramChannel {
                         ),
                     );
                 } else {
-                    // The selection was already enqueued, so cancelling is
-                    // not enough: revoke it so the late dispatch observes
-                    // `take_revoked` and leaves the route change inert
-                    // instead of applying it after the UI reported failure.
-                    crate::model_picker_delivery::revoke(&message_id);
-                    self.restore_model_picker_keyboard(previous_keyboard).await;
-                    self.answer_model_picker_callback(
-                        callback_id,
-                        i18n::get_required_cli_string("channel-telegram-model-picker-unavailable"),
-                    )
-                    .await;
+                    // The bounded ack wait elapsed. The claim decides the
+                    // outcome: if the route mutation already ran, the
+                    // selection succeeded and must be reported as queued;
+                    // otherwise revoke it so the late dispatch leaves the
+                    // route change inert instead of applying it after the
+                    // UI reported failure.
+                    match crate::model_picker_delivery::revoke(&message_id) {
+                        crate::model_picker_delivery::RevokeOutcome::Won => {
+                            self.restore_model_picker_keyboard(previous_keyboard).await;
+                            self.answer_model_picker_callback(
+                                callback_id,
+                                i18n::get_required_cli_string(
+                                    "channel-telegram-model-picker-unavailable",
+                                ),
+                            )
+                            .await;
+                        }
+                        crate::model_picker_delivery::RevokeOutcome::AlreadyApplied => {
+                            tokio::join!(
+                                self.disable_model_picker_keyboard(callback),
+                                self.answer_model_picker_callback(
+                                    callback_id,
+                                    i18n::get_required_cli_string(
+                                        "channel-telegram-model-picker-queued",
+                                    ),
+                                ),
+                            );
+                        }
+                    }
                 }
             }
             ModelPickerCallbackOutcome::Rendered { text, reply_markup } => {
