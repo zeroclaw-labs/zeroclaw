@@ -231,6 +231,7 @@ impl TranscriptionProvider for GroqProvider {
 /// OpenAI Whisper API transcription_provider.
 pub struct OpenAiWhisperProvider {
     alias: String,
+    api_url: String,
     api_key: String,
     model: String,
     language: Option<String>,
@@ -251,6 +252,7 @@ impl OpenAiWhisperProvider {
 
         Ok(Self {
             alias: alias.to_string(),
+            api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
             api_key,
             model: config.model.clone(),
             language: None,
@@ -276,6 +278,7 @@ impl OpenAiWhisperProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
+            api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
             api_key,
             model: cfg
                 .model
@@ -311,7 +314,7 @@ impl TranscriptionProvider for OpenAiWhisperProvider {
         }
 
         let resp = client
-            .post("https://api.openai.com/v1/audio/transcriptions")
+            .post(&self.api_url)
             .bearer_auth(&self.api_key)
             .multipart(form)
             .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
@@ -328,6 +331,7 @@ impl TranscriptionProvider for OpenAiWhisperProvider {
 /// Deepgram STT API transcription_provider.
 pub struct DeepgramProvider {
     alias: String,
+    api_url: String,
     api_key: String,
     model: String,
     language: Option<String>,
@@ -348,6 +352,7 @@ impl DeepgramProvider {
 
         Ok(Self {
             alias: alias.to_string(),
+            api_url: "https://api.deepgram.com/v1/listen".to_string(),
             api_key,
             model: config.model.clone(),
             language: None,
@@ -373,6 +378,7 @@ impl DeepgramProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
+            api_url: "https://api.deepgram.com/v1/listen".to_string(),
             api_key,
             model: cfg
                 .model
@@ -402,7 +408,7 @@ impl TranscriptionProvider for DeepgramProvider {
         let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.deepgram");
 
         let url = reqwest::Url::parse_with_params(
-            "https://api.deepgram.com/v1/listen",
+            &self.api_url,
             [
                 ("model", self.model.as_str()),
                 ("punctuate", "true"),
@@ -1700,11 +1706,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn typed_registration_defaults_and_language_hints() {
+    #[tokio::test]
+    async fn typed_registration_defaults_and_language_hints() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
         let base = zeroclaw_config::schema::TranscriptionProviderConfig {
             api_key: Some("test-key".to_string()),
-            language: Some("it-IT".to_string()),
+            language: Some("it".to_string()),
             ..zeroclaw_config::schema::TranscriptionProviderConfig::default()
         };
 
@@ -1718,7 +1727,7 @@ mod tests {
         .unwrap();
         assert_eq!(groq.model, "whisper-large-v3-turbo");
 
-        let openai = OpenAiWhisperProvider::from_typed_config(
+        let mut openai = OpenAiWhisperProvider::from_typed_config(
             "default",
             &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
                 base: base.clone(),
@@ -1727,7 +1736,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(openai.model, "whisper-1");
-        assert_eq!(openai.language.as_deref(), Some("it-IT"));
+        assert_eq!(openai.language.as_deref(), Some("it"));
 
         let mut deepgram = DeepgramProvider::from_typed_config(
             "default",
@@ -1738,9 +1747,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(deepgram.model, "nova-2");
-        assert_eq!(deepgram.language_query(), ("language", "it-IT"));
+        assert_eq!(deepgram.language_query(), ("language", "it"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "ciao",
+                "results": {"channels": [{"alternatives": [{"transcript": "ciao"}]}]}
+            })))
+            .mount(&server)
+            .await;
+        openai.api_url = format!("{}/openai", server.uri());
+        deepgram.api_url = format!("{}/deepgram", server.uri());
+        openai.transcribe(b"audio", "voice.wav").await.unwrap();
+        deepgram.transcribe(b"audio", "voice.wav").await.unwrap();
         deepgram.language = None;
+        deepgram.transcribe(b"audio", "voice.wav").await.unwrap();
         assert_eq!(deepgram.language_query(), ("detect_language", "true"));
+
+        let requests = server.received_requests().await.unwrap();
+        let multipart = String::from_utf8_lossy(&requests[0].body);
+        assert!(multipart.contains("name=\"language\""));
+        assert!(multipart.contains("\r\n\r\nit\r\n"));
+        assert!(
+            requests[1]
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "language" && value == "it")
+        );
+        assert!(
+            requests[2]
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "detect_language" && value == "true")
+        );
 
         let google = GoogleSttProvider::from_typed_config(
             "default",
