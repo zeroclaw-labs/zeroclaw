@@ -149,6 +149,10 @@ impl SqliteSessionBackend {
                 "sender_id",
                 "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
             ),
+            (
+                "trim_breadcrumb",
+                "ALTER TABLE session_metadata ADD COLUMN trim_breadcrumb INTEGER",
+            ),
         ] {
             Self::ensure_metadata_column(&conn, column, ddl)?;
         }
@@ -822,6 +826,27 @@ impl SessionBackend for SqliteSessionBackend {
         Self::append_on(&conn, session_key, message, &now).map_err(std::io::Error::other)
     }
 
+    fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction().map_err(std::io::Error::other)?;
+        tx.execute(
+            "DELETE FROM sessions WHERE session_key = ?1",
+            params![session_key],
+        )
+        .map_err(std::io::Error::other)?;
+        let now = Utc::now().to_rfc3339();
+        for message in messages {
+            Self::append_on(&tx, session_key, message, &now).map_err(std::io::Error::other)?;
+        }
+        tx.execute(
+            "UPDATE session_metadata SET message_count = ?2 WHERE session_key = ?1",
+            params![session_key, messages.len() as i64],
+        )
+        .map_err(std::io::Error::other)?;
+        tx.commit().map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
         let conn = self.conn.lock();
 
@@ -1389,6 +1414,33 @@ impl SessionBackend for SqliteSessionBackend {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
             other => Err(std::io::Error::other(other)),
         })
+    }
+
+    fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, trim_breadcrumb)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET trim_breadcrumb = excluded.trim_breadcrumb",
+            params![session_key, now, now, i64::from(present)],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT trim_breadcrumb FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get::<_, Option<i64>>(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(std::io::Error::other(other)),
+        })
+        .map(|v| v.map(|n| n != 0))
     }
 
     fn set_session_context(

@@ -2409,6 +2409,42 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     }
 }
 
+/// Replace the cached and durable transcript for `sender_key` with
+/// `trimmed_turns` (the loop-owned history, still including the current
+/// user turn and any synthetic breadcrumb, minus the leading system
+/// prompt). The tool-call loop may have dropped older whole turns and/or
+/// inserted a breadcrumb directly on its working buffer; without this, the
+/// cache and JSONL store keep the pre-trim transcript and the next message
+/// resurrects context the prior `HistoryTrimmed` event said was removed.
+/// Callers append this turn's own new tool/assistant messages afterward, so
+/// this only resyncs the base the loop actually trimmed.
+fn resync_sender_history_after_trim(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    trimmed_turns: &[ChatMessage],
+) {
+    let persist_lock = acquire_persist_lock(ctx, sender_key);
+    let _lock = persist_lock.lock().unwrap_or_else(|e| e.into_inner());
+
+    if let Some(ref store) = ctx.session_store
+        && let Err(e) = store.rewrite_messages(sender_key, trimmed_turns)
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+            "Failed to persist trimmed session history"
+        );
+    }
+
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    histories.put(sender_key.to_string(), trimmed_turns.to_vec());
+}
+
 /// Extract tool-call (assistant with tool_call content) and tool-result
 /// messages from the current turn in the LLM history, excluding the final
 /// assistant text response.  "Current turn" = everything after the last
@@ -6618,6 +6654,9 @@ async fn process_channel_message_body(
     if let Some(ref prefix) = thinking.params.system_prompt_prefix {
         system_prompt = format!("{prefix}\n\n{system_prompt}");
     }
+    // Captured before the tool-call loop can drop whole turns, so the
+    // post-loop resync below can detect that a trim happened.
+    let prior_turns_len_before_loop = prior_turns.len();
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
     // Breadcrumb provenance is carried alongside the transcript so a synthetic
@@ -6646,6 +6685,7 @@ async fn process_channel_message_body(
                 false
             }
         });
+    let crumb_present_before_loop = history_has_trim_breadcrumb;
 
     let preamble = build_channel_turn_context_preamble(&msg, target_channel.as_ref());
     if let Some(last_turn) = history.last_mut()
@@ -7415,6 +7455,25 @@ async fn process_channel_message_body(
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         flags.put(history_key.clone(), history_has_trim_breadcrumb);
+    }
+
+    // The tool-call loop may have dropped whole turns and/or inserted a
+    // breadcrumb directly on its `history` working buffer to fit the
+    // configured token budget. When that happened, the cached and durable
+    // transcript must be resynced to the loop's own trimmed prefix before
+    // this turn's new tool/assistant messages are appended below — otherwise
+    // the next message reloads the dropped turns from the stale cache while
+    // `history_crumb_flags` says the transcript already has a breadcrumb.
+    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+    let retained_prior_turns = if last_user_idx >= 1 {
+        &history[1..=last_user_idx]
+    } else {
+        &history[1..1]
+    };
+    if history_has_trim_breadcrumb != crumb_present_before_loop
+        || retained_prior_turns.len() != prior_turns_len_before_loop
+    {
+        resync_sender_history_after_trim(ctx.as_ref(), &history_key, retained_prior_turns);
     }
 
     let turn_tokens_used = cost_tracking_context.as_ref().and_then(|ctx| {

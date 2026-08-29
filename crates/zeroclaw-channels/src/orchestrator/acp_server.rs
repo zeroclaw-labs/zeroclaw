@@ -1084,6 +1084,11 @@ impl AcpServer {
             .collect();
         let restore_trim_event =
             agent.seed_conversation_history_with_event(stored_messages.clone());
+        // Breadcrumb provenance is the store's own canonical record alongside
+        // the transcript, never inferred from message text: a genuine first
+        // user turn that happens to equal the localized breadcrumb string
+        // must keep its turn-boundary role.
+        agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
         let dropped_messages = match &restore_trim_event {
             Some(TurnEvent::HistoryTrimmed {
                 dropped_messages, ..
@@ -1290,6 +1295,11 @@ impl AcpServer {
         };
 
         let restore_trim_event = agent.seed_conversation_history_with_event(data.messages);
+        // Breadcrumb provenance is the store's own canonical record alongside
+        // the transcript, never inferred from message text: a genuine first
+        // user turn that happens to equal the localized breadcrumb string
+        // must keep its turn-boundary role.
+        agent.set_history_has_trim_breadcrumb(data.trim_breadcrumb);
 
         let acp_channel = Arc::new(AcpChannel::new(
             "acp",
@@ -1543,6 +1553,9 @@ impl AcpServer {
         // concurrent stop/reap from touching the agent mid-turn. The outer
         // map entry remains in place.
         let session_id_for_task = session_id.clone();
+        // Kept alive for the post-turn breadcrumb-provenance persistence
+        // below, after `session_arc` itself moves into the spawned task.
+        let session_arc_for_breadcrumb = session_arc.clone();
         let turn_handle = zeroclaw_spawn::spawn!(async move {
             let mut session = session_arc.lock().await;
             let (turn_alias, turn_provider, turn_model) = session.agent.attribution_fields();
@@ -1741,6 +1754,20 @@ impl AcpServer {
                     "Failed to persist turn; session continues in memory"
                 );
             }
+            // Keep the store's breadcrumb provenance flag in sync with the
+            // transcript it describes, alongside the same append: a restore
+            // must never re-infer it from message text.
+            let store = self.store.as_ref().expect("checked Some above").clone();
+            let sid = session_id.clone();
+            let crumb_present = session_arc_for_breadcrumb
+                .lock()
+                .await
+                .agent
+                .history_has_trim_breadcrumb();
+            let _ = tokio::task::spawn_blocking(move || {
+                store.set_trim_breadcrumb(&sid, crumb_present)
+            })
+            .await;
         }
 
         // Durably persist the latest TodoWrite plan for this turn so it

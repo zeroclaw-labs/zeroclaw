@@ -90,6 +90,19 @@ pub trait SessionBackend: Send + Sync {
     /// Remove the last message from a session. Returns `true` if a message was removed.
     fn remove_last(&self, session_key: &str) -> std::io::Result<bool>;
 
+    /// Replace a session's entire durable transcript with `messages`. Used to
+    /// keep the canonical stored history in sync with a caller-owned buffer
+    /// that trimmed or rewrote turns in place (e.g. history-budget
+    /// enforcement), rather than appending on top of a now-stale transcript.
+    /// No-op by default for backends that only support appending.
+    fn rewrite_messages(
+        &self,
+        _session_key: &str,
+        _messages: &[ChatMessage],
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
     fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
         if self.remove_last(session_key)? {
             self.append(session_key, message)?;
@@ -191,6 +204,29 @@ pub trait SessionBackend: Send + Sync {
 
     /// Get the agent alias associated with a session, if recorded.
     fn get_session_agent_alias(&self, _session_key: &str) -> std::io::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Record whether this session's persisted transcript currently starts
+    /// with the synthetic trim breadcrumb, as one canonical fact alongside
+    /// the transcript itself. Callers must not infer this from message text
+    /// on restore: a genuine first user turn that happens to equal the
+    /// localized breadcrumb string must keep its turn-boundary role, and a
+    /// crumb written under another locale must stay classified as synthetic.
+    /// No-op for backends that don't track it (the caller falls back to
+    /// treating the session as having no breadcrumb).
+    fn set_session_trim_breadcrumb(
+        &self,
+        _session_key: &str,
+        _present: bool,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the recorded breadcrumb provenance for a session. `None` means
+    /// the backend doesn't track it or no session-level state exists yet
+    /// (callers should assume `false`, not attempt text inference).
+    fn get_session_trim_breadcrumb(&self, _session_key: &str) -> std::io::Result<Option<bool>> {
         Ok(None)
     }
 

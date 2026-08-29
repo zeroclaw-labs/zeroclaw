@@ -505,6 +505,29 @@ impl SessionStore {
         let _ = self.seed_history_with_event(id, msgs).await;
     }
 
+    /// Whether the session's in-memory agent currently believes its history
+    /// starts with the synthetic trim breadcrumb. `None` if the session is
+    /// unknown. Callers persist this alongside the transcript so a later
+    /// restore never has to infer provenance from message text.
+    pub async fn history_has_trim_breadcrumb(&self, id: &str) -> Option<bool> {
+        if let Some(s) = self.sessions.lock().await.get(id) {
+            Some(s.agent.lock().await.history_has_trim_breadcrumb())
+        } else {
+            None
+        }
+    }
+
+    /// Restore the session's own canonical breadcrumb-provenance record onto
+    /// its in-memory agent. No-op if the session is unknown.
+    pub async fn set_history_has_trim_breadcrumb(&self, id: &str, present: bool) {
+        if let Some(s) = self.sessions.lock().await.get(id) {
+            s.agent
+                .lock()
+                .await
+                .set_history_has_trim_breadcrumb(present);
+        }
+    }
+
     pub async fn seed_history_with_event(
         &self,
         id: &str,

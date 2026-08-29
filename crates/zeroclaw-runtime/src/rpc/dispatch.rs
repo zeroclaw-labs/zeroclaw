@@ -1670,6 +1670,13 @@ impl RpcDispatcher {
                             .seed_conversation_history_with_event(&session_id, data.messages)
                             .await;
                         self.forward_seed_event(&session_id, seed_event).await;
+                        // Breadcrumb provenance is the store's own canonical
+                        // record alongside the transcript, never inferred
+                        // from message text.
+                        self.ctx
+                            .sessions
+                            .set_history_has_trim_breadcrumb(&session_id, data.trim_breadcrumb)
+                            .await;
                         // Restore the durable TodoWrite plan into the fresh
                         // in-memory session and re-emit it so the resuming /
                         // reconnecting client's tracker repopulates without a
@@ -1747,6 +1754,18 @@ impl RpcDispatcher {
                             .seed_history_with_event(&session_id, &stored)
                             .await;
                         self.forward_seed_event(&session_id, seed_event).await;
+                        // Breadcrumb provenance is the backend's own
+                        // canonical record alongside the transcript, never
+                        // inferred from message text.
+                        let stored_crumb = backend
+                            .get_session_trim_breadcrumb(&session_key)
+                            .ok()
+                            .flatten()
+                            .unwrap_or(false);
+                        self.ctx
+                            .sessions
+                            .set_history_has_trim_breadcrumb(&session_id, stored_crumb)
+                            .await;
                         message_count = stored.len();
                     }
                 }
@@ -2069,12 +2088,19 @@ impl RpcDispatcher {
             )
             .await
             .ok()?;
+        let trim_breadcrumb = data.trim_breadcrumb;
         let seed_event = self
             .ctx
             .sessions
             .seed_conversation_history_with_event(sid, data.messages)
             .await;
         self.forward_seed_event(sid, seed_event).await;
+        // Breadcrumb provenance is the store's own canonical record alongside
+        // the transcript, never inferred from message text.
+        self.ctx
+            .sessions
+            .set_history_has_trim_breadcrumb(sid, trim_breadcrumb)
+            .await;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -2397,7 +2423,17 @@ impl RpcDispatcher {
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
                 if let Some(ref store) = self.ctx.acp_session_store
-                    && let Some(detail) = persist_acp_turn(store, sid, &outcome).await
+                    && let Some(detail) = persist_acp_turn(
+                        store,
+                        sid,
+                        &outcome,
+                        self.ctx
+                            .sessions
+                            .history_has_trim_breadcrumb(sid)
+                            .await
+                            .unwrap_or(false),
+                    )
+                    .await
                 {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -2423,6 +2459,17 @@ impl RpcDispatcher {
                         }
                         _ => {}
                     }
+                    // Keep the store's breadcrumb provenance flag in sync
+                    // with the transcript it describes, alongside the same
+                    // append: a restore must never re-infer it from message
+                    // text.
+                    let trim_breadcrumb = self
+                        .ctx
+                        .sessions
+                        .history_has_trim_breadcrumb(sid)
+                        .await
+                        .unwrap_or(false);
+                    let _ = backend.set_session_trim_breadcrumb(&key, trim_breadcrumb);
                 }
             }
         }
@@ -5328,6 +5375,7 @@ async fn persist_acp_turn(
     store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
     session_id: &str,
     outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+    trim_breadcrumb: bool,
 ) -> Option<String> {
     let messages = match outcome {
         Ok(TurnOutcome::Completed { messages, .. })
@@ -5340,7 +5388,15 @@ async fn persist_acp_turn(
     };
     let store = Arc::clone(store);
     let session_id = session_id.to_string();
-    match tokio::task::spawn_blocking(move || store.append_turn(&session_id, &messages)).await {
+    match tokio::task::spawn_blocking(move || {
+        store.append_turn(&session_id, &messages)?;
+        // Keep the store's breadcrumb provenance flag in sync with the
+        // transcript it describes, alongside the same append: a restore
+        // must never re-infer it from message text.
+        store.set_trim_breadcrumb(&session_id, trim_breadcrumb)
+    })
+    .await
+    {
         Ok(Ok(())) => None,
         Ok(Err(error)) => Some(error.to_string()),
         Err(join) => Some(join.to_string()),
@@ -9438,7 +9494,7 @@ mod tests {
             messages: new_messages.clone(),
         });
 
-        assert_eq!(persist_acp_turn(&store, sid, &outcome).await, None);
+        assert_eq!(persist_acp_turn(&store, sid, &outcome, false).await, None);
 
         let restored = store.load_session(sid).unwrap().unwrap();
         assert_eq!(restored.messages.len(), 52);
@@ -9460,10 +9516,10 @@ mod tests {
             partial_text: String::new(),
             messages: Vec::new(),
         });
-        assert_eq!(persist_acp_turn(&store, sid, &empty).await, None);
+        assert_eq!(persist_acp_turn(&store, sid, &empty, false).await, None);
 
         let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
-        assert_eq!(persist_acp_turn(&store, sid, &failed).await, None);
+        assert_eq!(persist_acp_turn(&store, sid, &failed, false).await, None);
         assert!(
             store
                 .load_session(sid)

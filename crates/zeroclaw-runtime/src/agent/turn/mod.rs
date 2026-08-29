@@ -291,6 +291,15 @@ async fn projected_provider_facing_tokens(
 /// authoritative for whether the provider accepts it. `kept_turns` is derived
 /// breadcrumb-aware so a leading synthetic crumb is never counted as a kept
 /// turn.
+///
+/// This gate does NOT emit the client-visible `HistoryTrimmed` event itself:
+/// the caller rebuilds the actual post-hook request from the trimmed durable
+/// history afterward, and only that rebuilt request's re-measured population
+/// is authoritative for whether the outcome is a genuine trim or floor. A
+/// dropped turn can carry a disproportionate share of `hook_growth` (e.g. a
+/// large multimodal attachment), so the estimate produced *during* the trim
+/// loop below is a heuristic for deciding how much durable history to drop,
+/// not proof that the rebuilt request still exceeds the budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreDispatchOutcome {
     Fit,
@@ -298,19 +307,27 @@ enum PreDispatchOutcome {
     Floor,
 }
 
-async fn surface_oversized_dispatch_if_needed(
+struct PreDispatchTrimResult {
+    outcome: PreDispatchOutcome,
+    dropped_messages: usize,
+    kept_turns: usize,
+}
+
+fn surface_oversized_dispatch_if_needed(
     history: &mut Vec<ChatMessage>,
     crumb_present: &mut bool,
     measured_population: u64,
     tool_schema_tokens: usize,
     context_token_budget: usize,
-    event_tx: Option<&tokio::sync::mpsc::Sender<TurnEvent>>,
-    observer: &dyn crate::observability::Observer,
-) -> PreDispatchOutcome {
+) -> PreDispatchTrimResult {
     if context_token_budget == 0 || measured_population <= context_token_budget as u64 {
-        return PreDispatchOutcome::Fit;
+        return PreDispatchTrimResult {
+            outcome: PreDispatchOutcome::Fit,
+            dropped_messages: 0,
+            kept_turns: crate::agent::history_trim::count_turns(history)
+                .saturating_sub(usize::from(*crumb_present)),
+        };
     }
-    let tokens_before = measured_population;
     let had_crumb = *crumb_present;
     let taken_len = history.len();
     // Attempt to make the *next* dispatch fit by dropping durable history.
@@ -329,9 +346,12 @@ async fn surface_oversized_dispatch_if_needed(
         crate::agent::history::estimate_history_tokens(history) + tool_schema_tokens;
     // Hook growth is the transient per-request delta already included in
     // `measured_population` (post-hook) but not in `current_estimate`
-    // (durable estimate). Keep it constant across the trim loop so a
-    // varying-growth hook that adds a large payload on this iteration still
-    // requires durable history to shrink.
+    // (durable estimate). This is only a heuristic for deciding how far to
+    // trim in this loop: a dropped turn can carry a disproportionate share of
+    // it (e.g. a large multimodal attachment), so it is NOT reused to compute
+    // the outcome or `tokens_after` — the caller re-measures the actual
+    // rebuilt post-hook request after this function returns and that
+    // authoritative count is what decides Trimmed vs. Floor.
     let original_estimate = current_estimate;
     let hook_growth = measured_population.saturating_sub(original_estimate as u64);
     let mut current_measured = (current_estimate as u64).saturating_add(hook_growth);
@@ -339,7 +359,12 @@ async fn surface_oversized_dispatch_if_needed(
     // underestimate due to raw vs prepared differences.
     current_measured = std::cmp::max(current_measured, measured_population);
     if current_measured <= context_token_budget as u64 {
-        return PreDispatchOutcome::Fit;
+        return PreDispatchTrimResult {
+            outcome: PreDispatchOutcome::Fit,
+            dropped_messages: 0,
+            kept_turns: crate::agent::history_trim::count_turns(history)
+                .saturating_sub(usize::from(had_crumb)),
+        };
     }
     let mut trimmed_history = std::mem::take(history);
     loop {
@@ -374,160 +399,31 @@ async fn surface_oversized_dispatch_if_needed(
         );
         let kept_turns = crate::agent::history_trim::count_turns(&with_crumb)
             .saturating_sub(usize::from(new_crumb));
-        // Include the measured hook growth so the reported `tokens_after`
-        // describes the actual post-hook dispatch, not just the durable
-        // history. Without this, a hook that appends a large payload could
-        // make the gate claim the trimmed request fits when the real
-        // dispatched population remains over budget.
-        let tokens_after = (crate::agent::history::estimate_history_tokens(&with_crumb)
-            + tool_schema_tokens) as u64
-            + hook_growth;
         *history = with_crumb;
-        if !hit_floor || (tokens_after as u64) <= context_token_budget as u64 {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_category(::zeroclaw_log::EventCategory::Agent)
-                    .with_attrs(::serde_json::json!({
-                        "measured_population": measured_population,
-                        "tokens_after": tokens_after,
-                        "dropped_messages": dropped_messages,
-                        "kept_turns": kept_turns,
-                        "context_token_budget": context_token_budget,
-                    })),
-                "pre-dispatch trim: dropped whole turns to fit the next request"
-            );
-            if let Some(tx) = event_tx {
-                let _ = tx
-                    .send(TurnEvent::HistoryTrimmed {
-                        dropped_messages,
-                        kept_turns,
-                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                        token_budget: Some(context_token_budget as u64),
-                        tokens_before: Some(tokens_before),
-                        tokens_after: Some(tokens_after as u64),
-                        tokens_before_source: Some(
-                            zeroclaw_api::agent::TokenCountSource::Estimated,
-                        ),
-                        tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                        unsatisfiable_floor: None,
-                    })
-                    .await;
-            }
-            observer.record_event(
-                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-                    dropped_messages,
-                    kept_turns,
-                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                    channel: None,
-                    agent_alias: None,
-                    turn_id: None,
-                    token_budget: Some(context_token_budget as u64),
-                    tokens_before: Some(tokens_before),
-                    tokens_after: Some(tokens_after as u64),
-                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                    unsatisfiable_floor: None,
-                },
-            );
-            return PreDispatchOutcome::Trimmed;
-        }
-        // Trimmed but still over budget and at floor — fall through to floor
-        // reporting with the honest dropped count.
-        let floor_tokens_after = tokens_after as u64;
-        ::zeroclaw_log::record!(
-            WARN,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_category(::zeroclaw_log::EventCategory::Agent)
-                .with_attrs(::serde_json::json!({
-                    "measured_population": measured_population,
-                    "floor_tokens_after": floor_tokens_after,
-                    "dropped_messages": dropped_messages,
-                    "kept_turns": kept_turns,
-                    "context_token_budget": context_token_budget,
-                })),
-            "pre-dispatch floor: history at newest-turn floor still exceeds budget"
-        );
-        if let Some(tx) = event_tx {
-            let _ = tx
-                .send(TurnEvent::HistoryTrimmed {
-                    dropped_messages,
-                    kept_turns,
-                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                    token_budget: Some(context_token_budget as u64),
-                    tokens_before: Some(tokens_before),
-                    tokens_after: Some(floor_tokens_after),
-                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                    unsatisfiable_floor: Some(true),
-                })
-                .await;
-        }
-        observer.record_event(
-            &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-                dropped_messages,
-                kept_turns,
-                reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                channel: None,
-                agent_alias: None,
-                turn_id: None,
-                token_budget: Some(context_token_budget as u64),
-                tokens_before: Some(tokens_before),
-                tokens_after: Some(floor_tokens_after),
-                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                unsatisfiable_floor: Some(true),
+        // The outcome (Trimmed vs. Floor) is provisional: the caller rebuilds
+        // the actual post-hook request from this trimmed durable history and
+        // re-measures it, which is authoritative for the client-visible
+        // event. This heuristic outcome only controls whether the caller
+        // treats the population as "still needs rebuilding" internally.
+        return PreDispatchTrimResult {
+            outcome: if hit_floor {
+                PreDispatchOutcome::Floor
+            } else {
+                PreDispatchOutcome::Trimmed
             },
-        );
-        return PreDispatchOutcome::Floor;
+            dropped_messages,
+            kept_turns,
+        };
     }
     // No trim possible — genuine floor with 0 dropped.
     let kept_turns = crate::agent::history_trim::count_turns(&trimmed_history)
         .saturating_sub(usize::from(had_crumb));
     *history = trimmed_history;
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_category(::zeroclaw_log::EventCategory::Agent)
-            .with_attrs(::serde_json::json!({
-                "measured_population": measured_population,
-                "tool_schema_tokens": tool_schema_tokens,
-                "context_token_budget": context_token_budget,
-            })),
-        "next provider request exceeds the configured token budget after durable-history enforcement"
-    );
-    if let Some(tx) = event_tx {
-        let _ = tx
-            .send(TurnEvent::HistoryTrimmed {
-                dropped_messages: 0,
-                kept_turns,
-                reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-                token_budget: Some(context_token_budget as u64),
-                tokens_before: Some(measured_population),
-                tokens_after: Some(measured_population),
-                tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-                unsatisfiable_floor: Some(true),
-            })
-            .await;
+    PreDispatchTrimResult {
+        outcome: PreDispatchOutcome::Floor,
+        dropped_messages: 0,
+        kept_turns,
     }
-    observer.record_event(
-        &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
-            dropped_messages: 0,
-            kept_turns,
-            reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
-            channel: None,
-            agent_alias: None,
-            turn_id: None,
-            token_budget: Some(context_token_budget as u64),
-            tokens_before: Some(measured_population),
-            tokens_after: Some(measured_population),
-            tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-            tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
-            unsatisfiable_floor: Some(true),
-        },
-    );
-    PreDispatchOutcome::Floor
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1509,33 +1405,32 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // append) without re-executing the hook (exactly-once semantics).
         let history_len_before = turn_state.history.len();
         let crumb_before = turn_state.crumb_present;
+        let tokens_before_dispatch = reported_population_estimated as u64;
         // Snapshot the post-hook request so trimming can preserve its
         // mutations to retained messages rather than discarding them.
         let post_hook_snapshot = provider_request_messages.clone();
         let post_hook_had_crumb = crumb_before;
-        // The gate already emits an explicit `HistoryTrimmed` event with
-        // `unsatisfiable_floor: Some(true)` when nothing more can be dropped
-        // (see `surface_oversized_dispatch_if_needed`), which is the
-        // client-visible discriminator the review asked for. Dispatch still
-        // proceeds on `PreDispatchOutcome::Floor`: an oversized request that
-        // still fits the provider's actual window (this estimate is
+        // The gate attempts a whole-turn trim of the durable history but does
+        // not itself decide Trimmed vs. Floor for the client-visible event:
+        // a dropped turn can carry a disproportionate share of the measured
+        // population (e.g. a large multimodal attachment), so only the
+        // rebuilt post-hook request re-measured below is authoritative.
+        // Dispatch still proceeds regardless of outcome: an oversized request
+        // that still fits the provider's actual window (this estimate is
         // conservative) should not be refused client-side, and refusing here
         // would turn every schema/tool-heavy floor into a hard failure
         // instead of a best-effort, explicitly-flagged send.
-        surface_oversized_dispatch_if_needed(
+        let trim_result = surface_oversized_dispatch_if_needed(
             turn_state.history,
             &mut turn_state.crumb_present,
-            reported_population_estimated as u64,
+            tokens_before_dispatch,
             tool_schema_tokens,
             context_token_budget,
-            event_tx.as_ref(),
-            observer,
-        )
-        .await;
+        );
         *history_has_trim_breadcrumb = turn_state.crumb_present;
-        if turn_state.history.len() != history_len_before
-            || turn_state.crumb_present != crumb_before
-        {
+        let history_was_trimmed = turn_state.history.len() != history_len_before
+            || turn_state.crumb_present != crumb_before;
+        if history_was_trimmed {
             // History was trimmed at the dispatch seam — rebuild the request
             // so the provider sees the trimmed population. Preserve the hook's
             // mutations to retained messages by trimming the already-mutated
@@ -1590,6 +1485,83 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
             reported_population_estimated =
                 crate::agent::history::estimate_history_tokens(&provider_request_messages)
                     + tool_schema_tokens;
+            // The rebuilt request's re-measured population is authoritative:
+            // a floor decided from the trim loop's heuristic estimate can
+            // turn out to fit once the actual dropped turn's share of hook
+            // growth (e.g. a large multimodal attachment) leaves with it.
+            let tokens_after_dispatch = reported_population_estimated as u64;
+            let genuine_floor = trim_result.outcome == PreDispatchOutcome::Floor
+                && tokens_after_dispatch > context_token_budget as u64;
+            if let Some(tx) = event_tx.as_ref() {
+                let _ = tx
+                    .send(TurnEvent::HistoryTrimmed {
+                        dropped_messages: trim_result.dropped_messages,
+                        kept_turns: trim_result.kept_turns,
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                        token_budget: Some(context_token_budget as u64),
+                        tokens_before: Some(tokens_before_dispatch),
+                        tokens_after: Some(tokens_after_dispatch),
+                        tokens_before_source: Some(
+                            zeroclaw_api::agent::TokenCountSource::Estimated,
+                        ),
+                        tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                        unsatisfiable_floor: genuine_floor.then_some(true),
+                    })
+                    .await;
+            }
+            observer.record_event(
+                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                    dropped_messages: trim_result.dropped_messages,
+                    kept_turns: trim_result.kept_turns,
+                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
+                    token_budget: Some(context_token_budget as u64),
+                    tokens_before: Some(tokens_before_dispatch),
+                    tokens_after: Some(tokens_after_dispatch),
+                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                    unsatisfiable_floor: genuine_floor.then_some(true),
+                },
+            );
+        } else if trim_result.outcome == PreDispatchOutcome::Floor {
+            // No droppable whole turn remained at all — the durable history
+            // and rebuilt request are identical, so the gate's measured
+            // population is already the authoritative count.
+            if let Some(tx) = event_tx.as_ref() {
+                let _ = tx
+                    .send(TurnEvent::HistoryTrimmed {
+                        dropped_messages: 0,
+                        kept_turns: trim_result.kept_turns,
+                        reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                        token_budget: Some(context_token_budget as u64),
+                        tokens_before: Some(tokens_before_dispatch),
+                        tokens_after: Some(tokens_before_dispatch),
+                        tokens_before_source: Some(
+                            zeroclaw_api::agent::TokenCountSource::Estimated,
+                        ),
+                        tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                        unsatisfiable_floor: Some(true),
+                    })
+                    .await;
+            }
+            observer.record_event(
+                &zeroclaw_api::observability_traits::ObserverEvent::HistoryTrimmed {
+                    dropped_messages: 0,
+                    kept_turns: trim_result.kept_turns,
+                    reason: crate::i18n::get_required_cli_string("history-trim-reason-budget"),
+                    channel: None,
+                    agent_alias: None,
+                    turn_id: None,
+                    token_budget: Some(context_token_budget as u64),
+                    tokens_before: Some(tokens_before_dispatch),
+                    tokens_after: Some(tokens_before_dispatch),
+                    tokens_before_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                    tokens_after_source: Some(zeroclaw_api::agent::TokenCountSource::Estimated),
+                    unsatisfiable_floor: Some(true),
+                },
+            );
         }
 
         // Fail closed on the local budget BEFORE announcing the request.

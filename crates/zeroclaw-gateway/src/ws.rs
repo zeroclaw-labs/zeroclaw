@@ -547,17 +547,25 @@ async fn handle_socket(
         None
     } else {
         let event = agent.seed_history_with_event(&stored_messages);
-        // Restore breadcrumb provenance for legacy sessions. Fresh v2 sessions
-        // where the user legitimately sent the breadcrumb text would be
-        // misclassified here; the next trim would then treat that real turn as
-        // synthetic. This is rare and the proper fix is to store the flag
-        // alongside the transcript (tracked as follow-up).
-        if let Some(first) = stored_messages.first() {
-            let crumb = zeroclaw_runtime::i18n::get_required_cli_string("history-trim-breadcrumb");
-            if first.role == "user" && first.content == crumb {
-                agent.set_history_has_trim_breadcrumb(true);
-            }
-        }
+        // Breadcrumb provenance is the backend's own canonical record
+        // alongside the transcript, never inferred from message text: a
+        // genuine first user turn that happens to equal the localized
+        // breadcrumb string must keep its turn-boundary role, and a crumb
+        // persisted under another locale must stay classified as synthetic.
+        // Sessions from before this was tracked (`None`) restore as `false`,
+        // matching the pre-existing fallback for backends that don't
+        // support it.
+        let stored_crumb = state
+            .session_backend
+            .as_ref()
+            .and_then(|backend| {
+                backend
+                    .get_session_trim_breadcrumb(&session_key)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or(false);
+        agent.set_history_has_trim_breadcrumb(stored_crumb);
         event
     };
 
@@ -1399,6 +1407,10 @@ async fn process_chat_message(
                             session_key,
                             &error.new_messages,
                         );
+                        let _ = backend.set_session_trim_breadcrumb(
+                            session_key,
+                            agent.history_has_trim_breadcrumb(),
+                        );
                         if !has_assistant_chat_message(&error.new_messages) {
                             let marker = zeroclaw_runtime::i18n::get_required_cli_string(
                                 "turn-interrupted-by-user",
@@ -1478,6 +1490,8 @@ async fn process_chat_message(
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
                 persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
+                let _ = backend
+                    .set_session_trim_breadcrumb(session_key, agent.history_has_trim_breadcrumb());
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -1586,6 +1600,8 @@ async fn process_chat_message(
                 && !e.new_messages.is_empty()
             {
                 persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
+                let _ = backend
+                    .set_session_trim_breadcrumb(session_key, agent.history_has_trim_breadcrumb());
             }
 
             // Set session state to error

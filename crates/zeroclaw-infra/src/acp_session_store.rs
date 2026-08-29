@@ -40,6 +40,10 @@ pub struct AcpSessionData {
     pub created_at: DateTime<Utc>,
     pub last_activity: DateTime<Utc>,
     pub messages: Vec<ConversationMessage>,
+    /// Whether `messages`' first non-system entry is the synthetic
+    /// history-trim breadcrumb, as recorded by the owning turn loop —
+    /// never inferred from message text on restore.
+    pub trim_breadcrumb: bool,
 }
 
 pub enum AcpSessionRestore {
@@ -138,6 +142,9 @@ impl AcpSessionStore {
 
         Self::ensure_interaction_surface_column(&conn)
             .context("Failed to migrate ACP session interaction surface")?;
+
+        Self::ensure_trim_breadcrumb_column(&conn)
+            .context("Failed to migrate ACP session trim breadcrumb column")?;
 
         Ok(Self {
             conn: Mutex::new(conn),
@@ -250,6 +257,47 @@ impl AcpSessionStore {
         }
     }
 
+    /// Idempotent migration adding the `trim_breadcrumb` column: whether the
+    /// persisted transcript's first non-system message is the synthetic
+    /// history-trim marker. Stored as one canonical fact alongside the
+    /// transcript so a restore never has to infer provenance from message
+    /// text (a genuine user turn that happens to equal the localized
+    /// breadcrumb string must keep its turn-boundary role).
+    fn ensure_trim_breadcrumb_column(conn: &Connection) -> Result<()> {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(acp_sessions)")
+            .context("Failed to inspect ACP session schema")?;
+        let mut rows = stmt
+            .query([])
+            .context("Failed to read ACP session schema")?;
+        while let Some(row) = rows
+            .next()
+            .context("Failed to read ACP session schema row")?
+        {
+            let column: String = row
+                .get(1)
+                .context("Failed to read ACP session column name")?;
+            if column == "trim_breadcrumb" {
+                return Ok(());
+            }
+        }
+        drop(rows);
+        drop(stmt);
+
+        match conn.execute(
+            "ALTER TABLE acp_sessions ADD COLUMN trim_breadcrumb INTEGER NOT NULL DEFAULT 0",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column name") =>
+            {
+                Ok(())
+            }
+            Err(e) => Err(e).context("Failed to add ACP session trim breadcrumb column"),
+        }
+    }
+
     /// Record a new session. Returns the integer `id` assigned by SQLite.
     pub fn create_session(
         &self,
@@ -316,7 +364,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, trim_breadcrumb
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -328,6 +376,7 @@ impl AcpSessionStore {
                     row.get::<_, i64>(4)?,
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
                 ))
             },
         );
@@ -340,6 +389,7 @@ impl AcpSessionStore {
             token_count,
             created_at_s,
             last_activity_s,
+            trim_breadcrumb,
         ) = match row {
             Ok(r) => r,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
@@ -360,6 +410,7 @@ impl AcpSessionStore {
             created_at,
             last_activity,
             messages,
+            trim_breadcrumb: trim_breadcrumb != 0,
         }))
     }
 
@@ -370,7 +421,7 @@ impl AcpSessionStore {
         let conn = self.conn.lock();
 
         let row = conn.query_row(
-            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at
+            "SELECT id, agent_alias, workspace_dir, interaction_surface, token_count, created_at, last_activity, killed_at, trim_breadcrumb
              FROM acp_sessions WHERE session_uuid = ?1",
             params![session_uuid],
             |row| {
@@ -383,6 +434,7 @@ impl AcpSessionStore {
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
+                    row.get::<_, i64>(8)?,
                 ))
             },
         );
@@ -396,6 +448,7 @@ impl AcpSessionStore {
             created_at_s,
             last_activity_s,
             killed_at,
+            trim_breadcrumb,
         ) = match row {
             Ok(r) => r,
             Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(AcpSessionRestore::Missing),
@@ -419,6 +472,7 @@ impl AcpSessionStore {
             created_at,
             last_activity,
             messages,
+            trim_breadcrumb: trim_breadcrumb != 0,
         }))
     }
 
@@ -746,6 +800,22 @@ impl AcpSessionStore {
                 "set_token_count: no session with uuid {session_uuid}"
             )));
         }
+        Ok(())
+    }
+
+    /// Record whether this session's persisted transcript currently starts
+    /// with the synthetic trim breadcrumb, as one canonical fact alongside
+    /// the transcript. Silently no-ops for an unknown session (matching
+    /// `append_turn`'s tolerance for a session removed mid-turn) rather than
+    /// erroring like `set_token_count`, since this is best-effort bookkeeping
+    /// that must never fail a turn.
+    pub fn set_trim_breadcrumb(&self, session_uuid: &str, present: bool) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE acp_sessions SET trim_breadcrumb = ?1 WHERE session_uuid = ?2",
+            params![i64::from(present), session_uuid],
+        )
+        .context("Failed to set trim_breadcrumb")?;
         Ok(())
     }
 

@@ -352,6 +352,10 @@ impl SessionBackend for SessionStore {
         self.remove_last(session_key)
     }
 
+    fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        self.rewrite(session_key, messages)
+    }
+
     fn update_last(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<bool> {
         self.update_last(session_key, message)
     }
