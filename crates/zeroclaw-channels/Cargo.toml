@@ -148,6 +148,7 @@ qrcode = { version = "0.14", optional = true }
 # whatsapp-web alongside the rest of the WA Web stack.
 bytes = { version = "1", optional = true }
 shellexpand = "3.1"
+terminal_size = { version = "0.3", optional = true }
 
 # WeChat iLink (optional) — AES-128-ECB and MD5 are mandated by the iLink
 # Bot media encryption protocol. The CDN requires ECB-mode ciphertext and
@@ -229,6 +230,7 @@ whatsapp-web = [
   "dep:prost",
   "dep:qrcode",
   "dep:serde-big-array",
+  "dep:terminal_size",
   "dep:wacore",
   "dep:wacore-binary",
   "dep:waproto",
