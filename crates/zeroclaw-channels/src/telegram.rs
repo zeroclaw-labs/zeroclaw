@@ -5602,13 +5602,32 @@ mod tests {
         )
         .with_api_base(mock_server.uri());
 
+        let channel = Arc::new(channel);
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let _ = tokio::time::timeout(Duration::from_millis(600), channel.listen(tx)).await;
+        let listener = tokio::spawn({
+            let channel = Arc::clone(&channel);
+            async move { channel.listen(tx).await }
+        });
 
-        assert_eq!(
-            channel.listener_health(),
-            Some(ListenerHealth::Healthy),
-            "a channel whose polls are accepted reports itself connected"
+        // Wait for the observation the test is about rather than racing a fixed
+        // budget: `listen` completes a probe exchange and then a long poll, and
+        // under a loaded parallel run those two round trips overrun any deadline
+        // short enough to keep the test quick.
+        let observed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if channel.listener_health() == Some(ListenerHealth::Healthy) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+
+        listener.abort();
+        assert!(
+            observed.is_ok(),
+            "a channel whose polls are accepted should report itself connected; got {:?}",
+            channel.listener_health()
         );
     }
 
