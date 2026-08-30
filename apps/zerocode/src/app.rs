@@ -2442,7 +2442,10 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner());
         overrides::set_active(HashMap::from([(
             GlobalAction::TAG.to_string(),
-            HashMap::from([("quit".to_string(), vec![Chord::ctrl('q')])]),
+            HashMap::from([(
+                "quit".to_string(),
+                vec![Chord::with(KeyCode::Char('q'), KeyModifiers::ALT)],
+            )]),
         )]));
 
         let backend = TestBackend::new(80, 12);
@@ -2458,7 +2461,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        let configured = Chord::ctrl('q').display();
+        let configured = Chord::with(KeyCode::Char('q'), KeyModifiers::ALT).display();
         let default = Chord::ctrl('c').display();
         assert!(
             rendered.contains(&format!("{configured} = quit")),
