@@ -4869,13 +4869,22 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 }));
 
-                registry.register_socket(Box::new(|ctx, cancel, client_count, ready_tx| {
+                let local_session_channel_factory: zeroclaw_runtime::rpc::dispatch::LocalRpcSessionChannelFactory =
+                    std::sync::Arc::new(|config, agent_alias| {
+                        zeroclaw_channels::orchestrator::build_local_rpc_session_channels(
+                            config, agent_alias,
+                        )
+                    });
+                registry.register_socket(Box::new(move |ctx, cancel, client_count, ready_tx| {
+                    let local_session_channel_factory =
+                        std::sync::Arc::clone(&local_session_channel_factory);
                     Box::pin(async move {
-                        zeroclaw_runtime::rpc::local::run_local_listener(
+                        zeroclaw_runtime::rpc::local::run_local_listener_with_factory(
                             ctx,
                             cancel,
                             client_count,
                             ready_tx,
+                            Some(local_session_channel_factory),
                         )
                         .await
                     })

@@ -3,7 +3,7 @@
 //! WebSocket connections, enabling remote TUI-to-daemon connectivity.
 
 use super::context::RpcContext;
-use super::dispatch::RpcDispatcher;
+use super::dispatch::{RpcAccessPolicy, RpcDispatcher};
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -275,7 +275,15 @@ pub async fn run_wss_listener(
                     let mut transport = WssTransport::new(ws_stream, remote_addr);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
+                    // WSS has no local channel factory and can address only
+                    // sessions owned by the authenticated remote TUI.
+                    let mut dispatcher = RpcDispatcher::new_with_access_policy(
+                        ctx.clone(),
+                        writer_tx,
+                        peer,
+                        RpcAccessPolicy::RemoteSessionOwner,
+                        None,
+                    );
                     dispatcher.run(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {

@@ -1,7 +1,7 @@
 //! Local IPC transport for the RPC layer.
 
 use super::context::RpcContext;
-use super::dispatch::RpcDispatcher;
+use super::dispatch::{LocalRpcSessionChannelFactory, RpcAccessPolicy, RpcDispatcher};
 use super::transport::RpcTransport;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -127,6 +127,19 @@ pub async fn run_local_listener(
     client_count: Arc<AtomicUsize>,
     readiness: Option<crate::daemon::SocketReadinessReporter>,
 ) -> Result<()> {
+    run_local_listener_with_factory(ctx, cancel, client_count, readiness, None).await
+}
+
+/// Run the local IPC listener with an optional host-provided session-channel
+/// factory. The four-argument wrapper above preserves the existing daemon and
+/// test API for callers that do not need session-local channels.
+pub async fn run_local_listener_with_factory(
+    ctx: Arc<RpcContext>,
+    cancel: CancellationToken,
+    client_count: Arc<AtomicUsize>,
+    readiness: Option<crate::daemon::SocketReadinessReporter>,
+    channel_factory: Option<LocalRpcSessionChannelFactory>,
+) -> Result<()> {
     let path = {
         let config = ctx.config.read();
         socket_path(&config)
@@ -184,6 +197,7 @@ pub async fn run_local_listener(
 
                 let ctx = ctx.clone();
                 let count = client_count.clone();
+                let channel_factory = channel_factory.clone();
 
                 count.fetch_add(1, Ordering::Relaxed);
 
@@ -191,7 +205,13 @@ pub async fn run_local_listener(
                     let mut transport = LocalTransport::new(stream);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
+                    let mut dispatcher = RpcDispatcher::new_with_access_policy(
+                        ctx.clone(),
+                        writer_tx,
+                        peer,
+                        RpcAccessPolicy::TrustedLocal,
+                        channel_factory,
+                    );
                     dispatcher.run(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {

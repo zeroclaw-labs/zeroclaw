@@ -9809,6 +9809,127 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+#[cfg(feature = "channel-git")]
+struct GuardedLocalGitChannel {
+    inner: GitChannel,
+    config: Arc<RwLock<Config>>,
+    agent_alias: String,
+    git_alias: String,
+    binding: String,
+    serialized_config: String,
+}
+
+#[cfg(feature = "channel-git")]
+impl GuardedLocalGitChannel {
+    fn new(
+        inner: GitChannel,
+        config: Arc<RwLock<Config>>,
+        agent_alias: String,
+        git_alias: String,
+        serialized_config: String,
+    ) -> Self {
+        let binding = format!("git.{git_alias}");
+        Self {
+            inner,
+            config,
+            agent_alias,
+            git_alias,
+            binding,
+            serialized_config,
+        }
+    }
+
+    fn check_live_config(&self) -> anyhow::Result<()> {
+        let config = self.config.read();
+        let Some(agent) = config.agents.get(&self.agent_alias) else {
+            anyhow::bail!("local git channel is no longer bound to an enabled agent");
+        };
+        if !agent.enabled
+            || !agent
+                .channels
+                .iter()
+                .any(|binding| binding == &self.binding)
+        {
+            anyhow::bail!("local git channel binding is no longer enabled");
+        }
+        let Some(current) = config.channels.git.get(&self.git_alias) else {
+            anyhow::bail!("local git channel configuration was removed");
+        };
+        if !current.enabled {
+            anyhow::bail!("local git channel is disabled");
+        }
+        let current_serialized = serde_json::to_string(current).map_err(|e| {
+            anyhow::Error::msg(format!("serializing live git channel configuration: {e}"))
+        })?;
+        if current_serialized != self.serialized_config {
+            anyhow::bail!("local git channel configuration changed");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "channel-git")]
+impl zeroclaw_api::attribution::Attributable for GuardedLocalGitChannel {
+    fn role(&self) -> zeroclaw_api::attribution::Role {
+        zeroclaw_api::attribution::Attributable::role(&self.inner)
+    }
+
+    fn alias(&self) -> &str {
+        self.inner.alias()
+    }
+
+    fn tool_provenance(&self) -> zeroclaw_api::attribution::ToolProvenance {
+        zeroclaw_api::attribution::Attributable::tool_provenance(&self.inner)
+    }
+}
+
+#[cfg(feature = "channel-git")]
+#[async_trait::async_trait]
+impl Channel for GuardedLocalGitChannel {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+        self.check_live_config()?;
+        self.inner.send(message).await
+    }
+
+    async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        anyhow::bail!("local session Git channel cannot listen")
+    }
+
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        self.check_live_config()?;
+        self.inner.add_reaction(channel_id, message_id, emoji).await
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        self.check_live_config()?;
+        self.inner
+            .remove_reaction(channel_id, message_id, emoji)
+            .await
+    }
+
+    async fn forge_request(
+        &self,
+        request: zeroclaw_api::channel::ForgeApiRequest,
+    ) -> anyhow::Result<zeroclaw_api::channel::ForgeApiResponse> {
+        self.check_live_config()?;
+        self.inner.forge_request(request).await
+    }
+}
+
 /// Fold constructed channel plugins into the configured-channel set.
 ///
 /// Plugin channels join the ordinary set rather than getting a lifecycle of
@@ -10060,6 +10181,104 @@ pub fn build_channel_map(
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let configured = collect_configured_channels(&config_arc, "", &[], None, None);
     configured_channel_map(&configured)
+}
+
+/// Build the narrow channel map injected into one local RPC session. Only
+/// explicitly declared `git.<alias>` bindings on the selected enabled agent
+/// are admitted; unlike the daemon channel map this has no legacy fallback.
+pub fn build_local_rpc_session_channels(
+    config: Arc<RwLock<Config>>,
+    agent_alias: String,
+) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
+    #[cfg(feature = "channel-git")]
+    {
+        let snapshot = config.read().clone();
+        let Some(agent) = snapshot.agents.get(&agent_alias) else {
+            return HashMap::new();
+        };
+        if !agent.enabled {
+            return HashMap::new();
+        }
+
+        let mut channels = HashMap::new();
+        for binding in &agent.channels {
+            let Some(git_alias) = binding.strip_prefix("git.") else {
+                continue;
+            };
+            if git_alias.is_empty() {
+                continue;
+            }
+            let Some(git_config) = snapshot.channels.git.get(git_alias) else {
+                continue;
+            };
+            if !git_config.enabled {
+                continue;
+            }
+            let serialized_config = match serde_json::to_string(git_config) {
+                Ok(serialized) => serialized,
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "agent_alias": agent_alias.as_str(),
+                                "git_alias": git_alias,
+                                "error": error.to_string(),
+                            })),
+                        "local Git session channel skipped because its configuration could not be serialized"
+                    );
+                    continue;
+                }
+            };
+            let config_for_peers = Arc::clone(&config);
+            let alias_for_peers = git_alias.to_string();
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = Arc::new(move || {
+                config_for_peers
+                    .read()
+                    .channel_external_peers("git", &alias_for_peers)
+            });
+            let channel =
+                match GitChannel::new(git_config.clone(), git_alias.to_string(), peer_resolver) {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "agent_alias": agent_alias.as_str(),
+                                "git_alias": git_alias,
+                                "error": error.to_string(),
+                            })),
+                            "local Git session channel skipped because its configuration is invalid"
+                        );
+                        continue;
+                    }
+                };
+            let guarded = GuardedLocalGitChannel::new(
+                channel,
+                Arc::clone(&config),
+                agent_alias.clone(),
+                git_alias.to_string(),
+                serialized_config,
+            );
+            channels.insert(
+                binding.to_string(),
+                Arc::new(guarded) as Arc<dyn zeroclaw_api::channel::Channel>,
+            );
+        }
+        channels
+    }
+
+    #[cfg(not(feature = "channel-git"))]
+    {
+        let _ = (config, agent_alias);
+        HashMap::new()
+    }
 }
 
 pub fn register_channels_for_tools(
@@ -13416,6 +13635,100 @@ pub(crate) mod tests {
     use tempfile::TempDir;
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::{ChatMessage, ModelProvider};
+
+    #[cfg(all(feature = "channel-git", feature = "provider-gitea"))]
+    #[tokio::test]
+    async fn guarded_local_git_channel_rejects_live_config_changes_before_network_use() {
+        use zeroclaw_config::schema::{AliasedAgentConfig, GitConfig};
+
+        let mut config = Config::default();
+        let mut agent = AliasedAgentConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        agent.channels = vec![zeroclaw_config::providers::ChannelRef::new("git.main")];
+        config.agents.insert("worker".to_string(), agent);
+        let git = GitConfig {
+            enabled: true,
+            provider: "gitea".to_string(),
+            api_base_url: Some("http://127.0.0.1:1/api/v1".to_string()),
+            access_token: "token-before-rotation".to_string(),
+            ..Default::default()
+        };
+        config.channels.git.insert("main".to_string(), git);
+        let config = Arc::new(RwLock::new(config));
+
+        for mutation in ["binding", "agent", "git"] {
+            let channels =
+                build_local_rpc_session_channels(Arc::clone(&config), "worker".to_string());
+            assert_eq!(channels.len(), 1);
+            let channel = channels
+                .get("git.main")
+                .expect("explicit git binding should be constructed")
+                .clone();
+
+            let mut changed = config.read().clone();
+            match mutation {
+                "binding" => changed
+                    .agents
+                    .get_mut("worker")
+                    .expect("test agent")
+                    .channels
+                    .clear(),
+                "agent" => {
+                    changed
+                        .agents
+                        .get_mut("worker")
+                        .expect("test agent")
+                        .enabled = false
+                }
+                "git" => {
+                    changed
+                        .channels
+                        .git
+                        .get_mut("main")
+                        .expect("test git alias")
+                        .access_token = "token-after-rotation".to_string()
+                }
+                _ => unreachable!(),
+            }
+            *config.write() = changed;
+
+            let forge_error = channel
+                .forge_request(zeroclaw_api::channel::ForgeApiRequest {
+                    method: "GET".to_string(),
+                    path: "repos/example/project".to_string(),
+                    body: None,
+                })
+                .await
+                .expect_err("stale local Git client must fail closed");
+            assert!(forge_error.to_string().contains("local git channel"));
+            let reaction_error = channel
+                .add_reaction("example/project#1", "1", "👍")
+                .await
+                .expect_err("stale local Git reactions must fail closed");
+            assert!(reaction_error.to_string().contains("local git channel"));
+
+            let mut restored = config.read().clone();
+            restored
+                .agents
+                .get_mut("worker")
+                .expect("test agent")
+                .enabled = true;
+            restored
+                .agents
+                .get_mut("worker")
+                .expect("test agent")
+                .channels = vec![zeroclaw_config::providers::ChannelRef::new("git.main")];
+            restored
+                .channels
+                .git
+                .get_mut("main")
+                .expect("test git alias")
+                .access_token = "token-before-rotation".to_string();
+            *config.write() = restored;
+        }
+    }
 
     /// Upper bound for "this must not deadlock" waits in the assembly tests.
     ///

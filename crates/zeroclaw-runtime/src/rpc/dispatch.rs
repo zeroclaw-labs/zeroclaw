@@ -14,6 +14,7 @@ use crate::sop::SopGraphExt;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use zeroclaw_config::schema::Config;
@@ -30,6 +31,27 @@ use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
 /// Wire protocol version. Bump on breaking changes.
 pub const RPC_PROTOCOL_VERSION: u64 = 1;
+
+/// Application-provided factory for channels that belong to one local RPC
+/// session. The runtime owns the seam and only knows the API-level `Channel`
+/// trait; channel implementations remain replaceable by the host.
+pub type LocalRpcSessionChannelFactory = Arc<
+    dyn Fn(
+            Arc<parking_lot::RwLock<Config>>,
+            String,
+        ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>
+        + Send
+        + Sync,
+>;
+
+/// Access policy for session methods reached through an RPC transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpcAccessPolicy {
+    /// Local IPC is trusted to address the daemon's session map.
+    TrustedLocal,
+    /// Remote connections may address only sessions owned by this TUI.
+    RemoteSessionOwner,
+}
 
 mod notification {
     pub const SESSION_UPDATE: &str = "session/update";
@@ -489,10 +511,28 @@ pub struct RpcDispatcher {
     /// Transport-level peer label (e.g. `unix:pid=1234,uid=1000`).
     peer_label: String,
     client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities,
+    access_policy: RpcAccessPolicy,
+    local_session_channel_factory: Option<LocalRpcSessionChannelFactory>,
 }
 
 impl RpcDispatcher {
     pub fn new(ctx: Arc<RpcContext>, writer_tx: mpsc::Sender<String>, peer_label: String) -> Self {
+        Self::new_with_access_policy(
+            ctx,
+            writer_tx,
+            peer_label,
+            RpcAccessPolicy::TrustedLocal,
+            None,
+        )
+    }
+
+    pub fn new_with_access_policy(
+        ctx: Arc<RpcContext>,
+        writer_tx: mpsc::Sender<String>,
+        peer_label: String,
+        access_policy: RpcAccessPolicy,
+        local_session_channel_factory: Option<LocalRpcSessionChannelFactory>,
+    ) -> Self {
         Self {
             ctx,
             rpc: Arc::new(RpcOutbound::new(writer_tx)),
@@ -500,6 +540,8 @@ impl RpcDispatcher {
             tui_id: None,
             peer_label,
             client_elicitation_caps: zeroclaw_api::elicitation::ElicitationCapabilities::default(),
+            access_policy,
+            local_session_channel_factory,
         }
     }
 
@@ -529,6 +571,48 @@ impl RpcDispatcher {
             tui_id: self.tui_id.clone(),
             peer_label: self.peer_label.clone(),
             client_elicitation_caps: self.client_elicitation_caps,
+            access_policy: self.access_policy,
+            local_session_channel_factory: self.local_session_channel_factory.clone(),
+        }
+    }
+
+    async fn ensure_session_access(&self, session_id: &str) -> Result<(), JsonRpcError> {
+        if self.access_policy == RpcAccessPolicy::TrustedLocal {
+            return Ok(());
+        }
+        let owner = self.ctx.sessions.session_owner_tui_id(session_id).await;
+        if matches!(
+            owner.as_ref().and_then(|owner| owner.as_deref()),
+            Some(owner) if self.tui_id.as_deref() == Some(owner)
+        ) {
+            return Ok(());
+        }
+        Err(rpc_err(
+            SESSION_NOT_OWNED,
+            "Caller does not own this session",
+        ))
+    }
+
+    fn populate_local_session_channels(
+        &self,
+        agent: &mut crate::agent::agent::Agent,
+        agent_alias: &str,
+    ) {
+        if self.access_policy != RpcAccessPolicy::TrustedLocal {
+            return;
+        }
+        let Some(factory) = self.local_session_channel_factory.as_ref() else {
+            return;
+        };
+        for (name, channel) in factory(Arc::clone(&self.ctx.config), agent_alias.to_string()) {
+            // Local session channels are intentionally available only to the
+            // reaction/forge tool path. The synthetic RPC approval channel is
+            // registered separately below.
+            agent
+                .channel_handles()
+                .reaction
+                .write()
+                .insert(name, channel);
         }
     }
 
@@ -1107,6 +1191,9 @@ impl RpcDispatcher {
 
     async fn handle_session_new(&self, params: &Value) -> RpcResult {
         let req: SessionNewParams = parse_params(params)?;
+        if let Some(session_id) = req.session_id.as_deref() {
+            self.ensure_session_access(session_id).await?;
+        }
         let resuming = req.session_id.is_some();
         let session_id = req
             .session_id
@@ -1201,6 +1288,7 @@ impl RpcDispatcher {
         )
         .await
         .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Failed to create agent: {e}")))?;
+        self.populate_local_session_channels(&mut agent, &req.agent_alias);
 
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
@@ -1667,6 +1755,7 @@ impl RpcDispatcher {
         )
         .await
         .ok()?;
+        self.populate_local_session_channels(&mut agent, &data.agent_alias);
 
         let approval_ch = Arc::new(crate::rpc::approval_channel::RpcApprovalChannel::new(
             "rpc",
@@ -1723,6 +1812,8 @@ impl RpcDispatcher {
         let req: SessionPromptParams = parse_params(params)?;
         let sid = &req.session_id;
 
+        self.ensure_session_access(sid).await?;
+
         if req.prompt.trim().is_empty() && req.attachments.is_empty() {
             return Err(rpc_err(
                 INVALID_PARAMS,
@@ -1753,6 +1844,22 @@ impl RpcDispatcher {
                 }
             },
         };
+
+        if self.access_policy == RpcAccessPolicy::RemoteSessionOwner {
+            let agent_guard = agent.lock().await;
+            let has_local_session_channels = agent_guard
+                .channel_handles()
+                .reaction
+                .read()
+                .keys()
+                .any(|name| name != "rpc");
+            if has_local_session_channels {
+                return Err(rpc_err(
+                    SESSION_NOT_OWNED,
+                    "Remote caller cannot use this session's local capabilities",
+                ));
+            }
+        }
 
         // Process inline attachments: upload each, append markers to prompt.
         let mut prompt = req.prompt.clone();
@@ -4966,6 +5073,168 @@ mod tests {
 
     fn parse(s: &str) -> Value {
         serde_json::from_str(s).unwrap()
+    }
+
+    struct SessionFactoryStubChannel;
+
+    impl zeroclaw_api::attribution::Attributable for SessionFactoryStubChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
+        }
+
+        fn alias(&self) -> &str {
+            "stub"
+        }
+    }
+
+    #[async_trait]
+    impl zeroclaw_api::channel::Channel for SessionFactoryStubChannel {
+        fn name(&self) -> &str {
+            "git"
+        }
+
+        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn session_factory_stub() -> LocalRpcSessionChannelFactory {
+        Arc::new(|_, _| {
+            let mut channels = HashMap::new();
+            channels.insert(
+                "git.main".to_string(),
+                Arc::new(SessionFactoryStubChannel) as Arc<dyn zeroclaw_api::channel::Channel>,
+            );
+            channels
+        })
+    }
+
+    #[tokio::test]
+    async fn local_session_factory_populates_reaction_handle_with_rpc() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new_with_access_policy(
+            ctx,
+            tx,
+            "test-local".into(),
+            RpcAccessPolicy::TrustedLocal,
+            Some(session_factory_stub()),
+        );
+        dispatcher.set_tui_id_for_test(Some("tui-local".into()));
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "local-factory-session",
+            }))
+            .await
+            .expect("session/new should succeed");
+
+        let agent = sessions
+            .get_agent("local-factory-session")
+            .await
+            .expect("session should be live");
+        let agent = agent.lock().await;
+        let reaction = agent.channel_handles().reaction.read();
+        assert_eq!(reaction.len(), 2);
+        assert!(reaction.contains_key("git.main"));
+        assert!(reaction.contains_key("rpc"));
+    }
+
+    #[tokio::test]
+    async fn remote_session_prompt_rejects_a_cross_owner_tui() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (owner_tx, _owner_rx) = tokio::sync::mpsc::channel(64);
+        let (remote_tx, _remote_rx) = tokio::sync::mpsc::channel(64);
+        let mut owner = RpcDispatcher::new(Arc::clone(&ctx), owner_tx, "owner".into());
+        owner.set_tui_id_for_test(Some("tui-owner".into()));
+        owner
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "remote-owner-session",
+            }))
+            .await
+            .expect("owner session/new should succeed");
+
+        let mut remote = RpcDispatcher::new_with_access_policy(
+            ctx,
+            remote_tx,
+            "remote".into(),
+            RpcAccessPolicy::RemoteSessionOwner,
+            None,
+        );
+        remote.set_tui_id_for_test(Some("tui-other".into()));
+        let error = remote
+            .handle_session_prompt(&json!({
+                "session_id": "remote-owner-session",
+                "prompt": "must be rejected",
+            }))
+            .await
+            .expect_err("remote cross-owner prompt must fail closed");
+        assert_eq!(error.code, SESSION_NOT_OWNED);
+    }
+
+    #[tokio::test]
+    async fn remote_session_prompt_rejects_same_owner_local_capability_session() {
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, Arc::clone(&sessions));
+        let (local_tx, _local_rx) = tokio::sync::mpsc::channel(64);
+        let (remote_tx, _remote_rx) = tokio::sync::mpsc::channel(64);
+        let mut local = RpcDispatcher::new_with_access_policy(
+            Arc::clone(&ctx),
+            local_tx,
+            "local".into(),
+            RpcAccessPolicy::TrustedLocal,
+            Some(session_factory_stub()),
+        );
+        local.set_tui_id_for_test(Some("tui-shared".into()));
+        local
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "session_id": "local-capability-session",
+            }))
+            .await
+            .expect("local session/new should succeed");
+
+        let mut remote = RpcDispatcher::new_with_access_policy(
+            ctx,
+            remote_tx,
+            "wss:test".into(),
+            RpcAccessPolicy::RemoteSessionOwner,
+            None,
+        );
+        remote.set_tui_id_for_test(Some("tui-shared".into()));
+        let error = remote
+            .handle_session_prompt(&json!({
+                "session_id": "local-capability-session",
+                "prompt": "must be rejected before tool execution",
+            }))
+            .await
+            .expect_err("remote prompt must not inherit local capabilities");
+        assert_eq!(error.code, SESSION_NOT_OWNED);
     }
 
     #[test]
@@ -8287,6 +8556,64 @@ mod tests {
             "after rehydrate the session must be live in memory again so the \
              next prompt lands on a working session"
         );
+    }
+
+    #[tokio::test]
+    async fn rehydrated_acp_session_factory_populates_reaction_handle_with_rpc() {
+        use std::collections::HashMap;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_acp_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let chat_backend =
+            Arc::new(zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(&data_dir).unwrap());
+        let acp_store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(&data_dir).unwrap());
+        let ctx = RpcContext::for_persistence_tests(
+            config,
+            Arc::clone(&sessions),
+            Some(chat_backend as Arc<dyn zeroclaw_infra::session_backend::SessionBackend>),
+            Some(Arc::clone(&acp_store)),
+        );
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let factory: LocalRpcSessionChannelFactory = Arc::new(|_, _| {
+            let mut channels = HashMap::new();
+            channels.insert(
+                "git.main".to_string(),
+                Arc::new(SessionFactoryStubChannel) as Arc<dyn zeroclaw_api::channel::Channel>,
+            );
+            channels
+        });
+        let dispatcher = RpcDispatcher::new_with_access_policy(
+            ctx,
+            tx,
+            "test-local".into(),
+            RpcAccessPolicy::TrustedLocal,
+            Some(factory),
+        );
+        let sid = "acp-rehydrated-factory";
+        dispatcher
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "chat_mode": "acp",
+                "session_id": sid,
+            }))
+            .await
+            .expect("session/new should create the ACP session");
+        assert!(sessions.remove(sid).await, "reap must remove live state");
+
+        let recovered = dispatcher
+            .rehydrate_reaped_session(sid)
+            .await
+            .expect("restorable ACP session must rehydrate");
+        let agent = recovered.lock().await;
+        let reaction = agent.channel_handles().reaction.read();
+        assert_eq!(reaction.len(), 2);
+        assert!(reaction.contains_key("git.main"));
+        assert!(reaction.contains_key("rpc"));
     }
 
     #[tokio::test]
