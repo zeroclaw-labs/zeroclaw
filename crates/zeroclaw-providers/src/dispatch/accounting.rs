@@ -476,6 +476,26 @@ pub(crate) fn record_stream_semantic_rejection_usage(usage: TokenUsage) {
     });
 }
 
+/// Suppress a terminal stream attempt's observed usage when the provider
+/// explicitly classifies that terminal outcome as informational.
+///
+/// The dispatch layer has already recorded `StreamEvent::Usage` by the time
+/// the runtime receives the terminal policy. Keep the physical attempt (it
+/// still happened), but clear its cost projection so a policy-owned
+/// non-billable refusal cannot be charged merely because usage arrived first.
+pub(crate) fn suppress_informational_terminal_stream_usage() {
+    let _ = ACTIVE_COLLECTOR.try_with(|collector| {
+        let mut state = collector.lock();
+        if state.closed {
+            return;
+        }
+        state.logical_success = false;
+        if let Some(node) = state.nodes.iter_mut().rev().find(|node| !node.composite) {
+            node.outcome = Some(AttemptUsageOutcome::OutcomeUnknown { observed: None });
+        }
+    });
+}
+
 /// Compatibility-only live projection used to retain typed terminal-error
 /// usage while the provider future is still unwinding.  The collector nodes,
 /// not Reliable, remain the sole attempt store.

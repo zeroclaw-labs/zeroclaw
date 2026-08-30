@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use zeroclaw_api::model_provider::{ChatRequest, ChatResponse, SemanticEmptyTerminalCompletion};
 use zeroclaw_config::schema::{MultimodalConfig, PacingConfig};
 use zeroclaw_providers::dispatch::with_exact_dispatch_route;
-use zeroclaw_providers::{ModelProvider, ProviderDispatch, multimodal};
+use zeroclaw_providers::{ChatMessage, ModelProvider, ProviderDispatch, multimodal};
 
 use super::{LoopKnobs, ModelSwitchCallback};
 use crate::agent::tool_receipts::ReceiptGenerator;
@@ -27,6 +27,35 @@ pub struct ResolvedModelAccess<'a> {
 }
 
 impl ResolvedModelAccess<'_> {
+    /// Run a text-only system/user query through the canonical structured
+    /// accounting path. Text-only callers must not bypass `run_model_query`,
+    /// because a Reliable recovery can carry rejected-attempt usage.
+    pub async fn run_text_query(
+        &self,
+        system_prompt: Option<&str>,
+        message: &str,
+    ) -> anyhow::Result<String> {
+        let mut messages = Vec::with_capacity(usize::from(system_prompt.is_some()) + 1);
+        if let Some(system_prompt) = system_prompt {
+            messages.push(ChatMessage::system(system_prompt));
+        }
+        messages.push(ChatMessage::user(message));
+
+        let response = self
+            .run_model_query(ChatRequest {
+                messages: &messages,
+                tools: None,
+                thinking: None,
+            })
+            .await?;
+        if !response.tool_calls.is_empty() {
+            anyhow::bail!("text-only model query returned unexpected tool calls");
+        }
+        response
+            .text
+            .ok_or_else(|| anyhow::Error::new(SemanticEmptyTerminalCompletion))
+    }
+
     pub async fn run_model_query(&self, request: ChatRequest<'_>) -> anyhow::Result<ChatResponse> {
         // Fail closed before spending a provider call when the enclosing turn's
         // cost budget is already exhausted. No-op when unscoped.

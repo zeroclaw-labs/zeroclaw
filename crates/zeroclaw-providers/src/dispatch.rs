@@ -392,6 +392,12 @@ impl AccountedChatScope {
         self.inner.take().with_attempts(attempts, successful_route)
     }
 
+    /// Whether the selected Reliable stream can advance to a distinct
+    /// candidate without replaying the already attempted route.
+    pub fn has_distinct_reliable_stream_recovery_candidate(&self) -> bool {
+        crate::reliable::has_distinct_reliable_stream_recovery_candidate()
+    }
+
     /// Preserve a semantic-empty stream cause across the exact-entry recovery walk.
     pub fn mark_stream_recovery_semantic_empty(&self) {
         crate::reliable::mark_stream_recovery_semantic_empty();
@@ -416,6 +422,12 @@ impl AccountedChatScope {
     /// completeness to an interrupted lower bound.
     pub fn record_stream_semantic_rejection_usage(&self, usage: crate::traits::TokenUsage) {
         accounting::record_stream_semantic_rejection_usage(usage);
+    }
+
+    /// Retain an informational terminal attempt in the physical report while
+    /// suppressing usage that must not enter rejected-attempt cost accounting.
+    pub fn suppress_informational_terminal_stream_usage(&self) {
+        accounting::suppress_informational_terminal_stream_usage();
     }
 }
 
@@ -739,6 +751,31 @@ impl ProviderDispatch {
         .boxed()
     }
 
+    /// Stream chat while preserving provider-owned terminal policy through the
+    /// dispatch boundary without changing the public response schema.
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let inner_stream = self.stream_chat(request, model, temperature, options);
+        drop(scope);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
+        })
+        .boxed()
+    }
+
     pub async fn simple_chat(
         &self,
         message: &str,
@@ -1040,6 +1077,30 @@ impl<'a> ProviderDispatchRef<'a> {
                 }
             }
             result
+        })
+        .boxed()
+    }
+
+    /// Borrowed equivalent of [`ProviderDispatch::stream_chat_terminal_aware`].
+    pub fn stream_chat_terminal_aware(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: Option<f64>,
+        options: StreamOptions,
+    ) -> stream::BoxStream<'static, anyhow::Result<StreamEvent>> {
+        let (slot, scope) = crate::terminal::enter_terminal_policy_scope();
+        let inner_stream = self.stream_chat(request, model, temperature, options);
+        drop(scope);
+        let mut inner_stream = inner_stream;
+        stream::poll_fn(move |cx| {
+            inner_stream.as_mut().poll_next(cx).map(|item| {
+                item.map(|result| {
+                    result.map_err(|error| {
+                        crate::terminal::contextualize_terminal_stream_error(&slot, error)
+                    })
+                })
+            })
         })
         .boxed()
     }

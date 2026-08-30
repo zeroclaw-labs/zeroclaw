@@ -66,6 +66,14 @@ The current provider stream is never paused and resumed mid-read; tool
 execution happens after that stream reaches `Final`, and the next turn is a
 fresh streaming call.
 
+Provider-side tools are different: `PreExecutedToolCall` and
+`PreExecutedToolResult` describe work already performed by the provider, not
+client-executable calls. If a stream that reported either event lacks a
+trustworthy final response, it is an explicit non-replayable failure. The
+runtime must not retry the request because that could repeat provider-side
+work. Provider adapters must preserve this boundary on every interrupted
+stream exit, not only on a clean terminal event.
+
 From the user's perspective: text, then a visible indicator that the agent ran a tool (via channel-specific hints), then more text. For channels without typing indicators, the gap between the tool call and the next text chunk is the only signal.
 
 ## Transport completion and timeouts
@@ -74,6 +82,14 @@ Streaming transports do not rely on connection close as the success signal.
 OpenAI-compatible streams finish on `[DONE]`, OpenAI Responses streams finish
 on their terminal response event, and Anthropic streams finish on
 `message_stop`. Servers may keep the HTTP connection open after those events.
+
+An OpenAI-compatible chat-completions stream whose explicit
+`finish_reason` is `length` is not a completed answer: the provider reached
+its output-token limit. ZeroClaw preserves text already delivered to the
+caller, reports the terminal result as incomplete, and does not replay that
+request. It may advance to the next configured fallback candidate only before
+any output or tool activity was exposed. The same classification applies to
+non-streaming compatible responses.
 
 Streaming clients use byte-idle timeouts: 300 seconds for OpenAI Responses and
 OpenAI-compatible providers, and 90 seconds for Anthropic. Each received body
