@@ -477,6 +477,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-http-proxy"
+version = "1.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29faa5d4d308266048bd7505ba55484315a890102f9345b9ff4b87de64201592"
+dependencies = [
+ "base64 0.13.1",
+ "httparse",
+ "thiserror 1.0.69",
+ "tokio",
+]
+
+[[package]]
 name = "async-imap"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -840,6 +852,12 @@ dependencies = [
  "gloo-timers",
  "tokio",
 ]
+
+[[package]]
+name = "base64"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e1b586273c5702936fe7b7d6896644d8be71e6314cfe09d3167c95f712589e8"
 
 [[package]]
 name = "base64"
@@ -3691,6 +3709,21 @@ dependencies = [
  "libc",
  "system-deps",
  "x11",
+]
+
+[[package]]
+name = "gemini-live"
+version = "0.1.0"
+dependencies = [
+ "async-http-proxy",
+ "base64 0.22.1",
+ "futures-util",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite 0.29.0",
+ "tracing",
 ]
 
 [[package]]
@@ -13623,6 +13656,7 @@ dependencies = [
  "directories",
  "ecb",
  "futures-util",
+ "gemini-live",
  "glob",
  "hex",
  "hmac 0.12.1",

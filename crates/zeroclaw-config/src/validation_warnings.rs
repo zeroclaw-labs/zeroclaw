@@ -65,6 +65,15 @@ pub const VERIFIABLE_INTENT_TOOL_WITHHELD: &str = "verifiable_intent_tool_withhe
 ///   that trace has no sink under `observability.log_persistence = "none"`;
 ///   this warning is the channel that survives, since `zeroclaw doctor` and the
 ///   config API read the structured list rather than the log.
+/// - `speech_to_speech_provider_retention`: a `[channels.speech_to_speech.<alias>]`
+///   is `enabled = true`. A live session sends caller audio, and the
+///   transcripts/prompts derived from it, to the configured speech backend
+///   provider (e.g. Google Gemini Live), which may retain that data; session
+///   resumption can extend retention (on the order of ~24h beyond a single
+///   session). The notice also states that enabled input/output transcription
+///   is billed as text tokens on top of the audio usage. Raised once per
+///   enabled alias (see `Config::collect_speech_to_speech_warnings` in
+///   `schema.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct ValidationWarning {

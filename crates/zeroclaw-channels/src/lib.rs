@@ -78,6 +78,8 @@ pub mod reddit;
 pub mod signal;
 #[cfg(feature = "channel-slack")]
 pub mod slack;
+#[cfg(feature = "channel-speech-to-speech")]
+pub mod speech_to_speech;
 #[cfg(feature = "channel-telegram")]
 pub mod telegram;
 #[cfg(feature = "channel-twitch")]

@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
+members = [".", "crates/gemini-live", "crates/zeroclaw-api", "crates/zeroclaw-infra", "crates/zeroclaw-config", "crates/zeroclaw-log", "crates/zeroclaw-log/tests/fixtures/attribution-macro-support", "crates/zeroclaw-log/tests/fixtures/attribution-macro-consumer", "crates/zeroclaw-spawn", "crates/zeroclaw-commands", "crates/zeroclaw-providers", "crates/zeroclaw-memory", "crates/zeroclaw-channels", "crates/zeroclaw-tools", "crates/zeroclaw-sop-graph", "crates/zeroclaw-runtime", "crates/zeroclaw-eval", "apps/zerocode", "crates/zeroclaw-plugins", "crates/zeroclaw-plugins/tests/fixtures/channel-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-timeout-fixture", "crates/zeroclaw-plugins/tests/fixtures/tool-secret-fixture", "crates/zeroclaw-gateway", "crates/zeroclaw-hardware", "crates/zeroclaw-tool-call-parser", "crates/zeroclaw-macros", "apps/tauri", "tools/fill-translations", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -255,7 +255,7 @@ channels-full = [
     "channel-twitch", "channel-twitter", "channel-reddit", "channel-notion", "channel-mqtt", "channel-amqp",
     "channel-linq", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
-    "channel-whatsapp-cloud", "channel-voice-call",
+    "channel-whatsapp-cloud", "channel-voice-call", "channel-speech-to-speech",
 ]
 
 # Major subsystems — each forwards to exactly ONE crate
@@ -302,6 +302,7 @@ channel-webhook = ["zeroclaw-channels/channel-webhook"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server", "zeroclaw-gateway?/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud", "zeroclaw-gateway?/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
+channel-speech-to-speech = ["zeroclaw-channels/channel-speech-to-speech"]
 channel-line = ["zeroclaw-channels/channel-line"]
 # Feishu uses the same channel implementation as Lark; `use_feishu = true`
 # selects Feishu endpoints at runtime.

@@ -117,6 +117,7 @@ pub enum ChannelKind {
     Telegram,
     Twitch,
     Twitter,
+    VoiceBroker,
     VoiceCall,
     VoiceWake,
     /// Retained after the WATI channel was removed so historical
@@ -469,6 +470,11 @@ impl Role {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_broker_channel_kind_as_wire() {
+        assert_eq!(ChannelKind::VoiceBroker.as_wire(), "voice_broker");
+    }
 
     #[test]
     fn channel_kind_snake_case() {

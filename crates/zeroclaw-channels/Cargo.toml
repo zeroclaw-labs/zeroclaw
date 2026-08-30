@@ -167,6 +167,7 @@ jsonwebtoken = { version = "10", optional = true, default-features = false, feat
   "use_pem",
 ] }
 thiserror = { version = "2.0", optional = true }
+gemini-live = { path = "../gemini-live", optional = true }
 
 [features]
 default = ["default-channels"]
@@ -199,6 +200,7 @@ channels-full = [
   "channel-reddit",
   "channel-signal",
   "channel-slack",
+  "channel-speech-to-speech",
   "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
@@ -270,6 +272,7 @@ channel-clawdtalk = []
 channel-webhook = ["dep:axum"]
 channel-whatsapp-cloud = []
 channel-voice-call = ["dep:axum"]
+channel-speech-to-speech = ["dep:gemini-live"]
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal"]

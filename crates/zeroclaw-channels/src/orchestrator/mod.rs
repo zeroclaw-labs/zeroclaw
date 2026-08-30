@@ -11673,6 +11673,34 @@ fn collect_configured_channels(
         );
     }
 
+    #[cfg(feature = "channel-speech-to-speech")]
+    for (alias, s2s) in &config.channels.speech_to_speech {
+        if !active_channel_aliases.contains(&format!("speech_to_speech.{alias}")) {
+            continue;
+        }
+        if !s2s.enabled {
+            continue;
+        }
+        channels.push(ConfiguredChannel {
+            display_name: "Speech-to-Speech",
+            alias: Some(alias.clone()),
+            channel: Arc::new(crate::speech_to_speech::SpeechToSpeechChannel::new(
+                alias.clone(),
+            )),
+        });
+    }
+
+    #[cfg(not(feature = "channel-speech-to-speech"))]
+    if !config.channels.speech_to_speech.is_empty() {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Speech-to-Speech channel is configured but this build was compiled without \
+             `channel-speech-to-speech`; skipping Speech-to-Speech."
+        );
+    }
+
     #[cfg(feature = "channel-webhook")]
     for (alias, wh) in &config.channels.webhook {
         if !active_channel_aliases.contains(&format!("webhook.{alias}")) {
@@ -29762,6 +29790,25 @@ This is an example JSON object for profile settings."#;
                 .iter()
                 .any(|entry| entry.display_name == "Voice Call"),
             "enabled Voice Call with credentials must be collected"
+        );
+    }
+
+    #[cfg(feature = "channel-speech-to-speech")]
+    #[test]
+    fn build_channel_map_includes_enabled_speech_to_speech() {
+        let mut config = Config::default();
+        config.channels.speech_to_speech.insert(
+            "desk".to_string(),
+            zeroclaw_config::schema::SpeechToSpeechConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+
+        let map = build_channel_map(&config);
+        assert!(
+            map.contains_key("speech_to_speech.desk"),
+            "enabled Speech-to-Speech alias must be collected into the channel map"
         );
     }
 
