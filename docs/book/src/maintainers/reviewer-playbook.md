@@ -179,6 +179,14 @@ If Discussions are not being reviewed on the documented cadence, do not present 
 
 ### PR backlog pruning
 
+Use the report-only queue snapshot when selecting the next review pass:
+
+```bash
+python3 scripts/github/pr_review_queue.py --queue all --older-than-days 7 --format table
+```
+
+The command is an on-demand view of live GitHub state, not a durable queue or a source of merge authority. This `all` snapshot runs the shared lanes independently, so one PR can appear in more than one lane; add `--author LOGIN` to include `mine`. Use `--queue near-ready` to start with maintainer-routed PRs whose GitHub search status is successful; this prioritizes candidates that may be closer to merge without claiming that they are mergeable or sufficiently approved. Use `--format json` for inspection or downstream reporting and `--format links` for GitHub search links. GitHub search supplies the candidate lists; the script reads timelines only for author-action age and reviews only for current-head second-Core routing. Missing or ambiguous detail remains unknown. Confirm mergeability, checks, and approval applicability during the actual review. Prioritize and review `Depends on #...` parents before children; when a parent is not reviewable, defer deep child review unless a bounded independent slice benefits from early review, then refresh and revalidate the child after the parent lands. Stacked PRs remain a separate report lane and do not become review-ready merely because they are old.
+
 When review demand exceeds capacity:
 
 1. Keep active bug and security PRs (`size:XS` or `size:S`) at the top of the queue.
