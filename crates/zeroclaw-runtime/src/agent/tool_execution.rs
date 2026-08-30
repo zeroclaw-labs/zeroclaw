@@ -683,7 +683,9 @@ mod tests {
             serde_json::json!({}),
             None,
             ToolDispatchContext {
-                tools_registry: &[], // no static tools - force activated-tools path
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ), // no static tools - force activated-tools path
                 activated_tools: Some(&activated),
                 excluded_tools: &[],
                 model_switch_callback: None,
@@ -739,7 +741,9 @@ mod tests {
             serde_json::json!({}),
             Some("call-1"),
             ToolDispatchContext {
-                tools_registry: &[],
+                tools_registry: &crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                    vec![],
+                ),
                 activated_tools: Some(&activated),
                 excluded_tools: &excluded,
                 model_switch_callback: None,

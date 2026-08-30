@@ -102,7 +102,7 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | Label | Matches |
 |---|---|
 | `docs` | `docs/**`, `**/*.md`, `**/*.mdx`, `LICENSE`, `.markdownlint-cli2.yaml` |
-| `dependencies` | `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
+| `dependencies` | `Cargo.toml`, `**/Cargo.toml`, `Cargo.lock`, `**/Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
 | `ci` | `.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**` |
 | `core` | `src/*.rs` |
 | `cli` | `src/main.rs`, `src/lib.rs`, `src/commands/**`, `src/alias_cli/**`, `src/cli_input.rs`, `crates/zeroclaw-commands/**`, `crates/zeroclaw-runtime/src/cli_input.rs` |
@@ -126,7 +126,6 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `zerocode` | `apps/zerocode/**` |
 | `provider` | `src/providers/**`, `crates/zeroclaw-providers/src/**` |
 | `service` | `src/service/**`, `crates/zeroclaw-runtime/src/service/**` |
-| `skillforge` | `src/skillforge/**`, `crates/zeroclaw-runtime/src/skillforge/**` |
 | `skills` | `src/skills/**`, `crates/zeroclaw-runtime/src/skills/**` |
 | `tool` | `src/tools/**`, `crates/zeroclaw-tools/src/**` |
 | `tunnel` | `src/tunnel/**`, `crates/zeroclaw-runtime/src/tunnel/**` |

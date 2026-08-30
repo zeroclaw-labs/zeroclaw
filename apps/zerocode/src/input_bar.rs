@@ -799,6 +799,19 @@ impl InputBarState {
         self.attachment_manager.is_some()
     }
 
+    /// Open an explorer with one selected path for parent-level key-routing
+    /// tests, so the test can exercise a real explorer confirmation result.
+    #[cfg(test)]
+    pub(crate) fn open_file_explorer_for_test(&mut self, path: PathBuf) {
+        let start_dir = path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let mut explorer = FileExplorerState::new(start_dir);
+        explorer.select_path_for_test(path);
+        self.file_explorer = Some(explorer);
+    }
+
     /// Whether the input bar is in text-input mode (input non-empty or an
     /// input-owned modal open). Used to suppress single-char keybindings.
     pub fn wants_text_input(&self) -> bool {

@@ -1410,13 +1410,10 @@ impl Chat {
             return false;
         }
 
-        // The attachment manager is modal within the input surface. Higher
-        // overlays above have already had first refusal; handle it before queue,
-        // browse, and other pane-level shortcuts.
-        if state.pending_approval().is_none() && state.input_bar.has_attachment_manager() {
-            state.clear_mouse_highlight();
-            let _ = state.input_bar.handle_key(key);
-            state.mark_dirty_full();
+        // Input-bar overlays are modal within the input surface. Higher
+        // overlays above have already had first refusal; handle them before
+        // queue, browse, and other pane-level shortcuts.
+        if state.handle_input_bar_overlay_key(key) {
             return false;
         }
 
@@ -1529,7 +1526,7 @@ impl Chat {
 
         // Enter (slash commands + submit), text input, cursor, backspace.
         // It does NOT handle approval, selection, session management, etc.
-        if state.pending_approval().is_none() && !state.in_browse_mode() {
+        if state.composer_owns_text_input() {
             let action = state.input_bar.handle_key(key);
             match action {
                 InputBarAction::Submit { text, attachments } => {
@@ -2685,10 +2682,11 @@ impl Chat {
         let ChatPhase::Active(state) = &mut self.phase else {
             return;
         };
-        // Approval overlays own input while an agent turn is paused for a
-        // decision. Keep paste aligned with the keyboard-input guard so it
-        // cannot mutate the hidden composer beneath the modal.
-        if state.pending_approval().is_some() {
+        // Bracketed paste bypasses the keyboard handlers that give modal and
+        // browse surfaces first refusal. Consult the same composer-ownership
+        // decision before routing it into the input bar so neither text nor a
+        // path-like attachment can mutate hidden state.
+        if !state.composer_owns_text_input() {
             return;
         }
         let action = state.input_bar.handle_paste(text);
@@ -5844,6 +5842,40 @@ impl ChatState {
             self.dirty = LinesDirty::Appended;
         }
         // Full is sticky — don't downgrade.
+    }
+
+    /// Whether text input currently belongs to the composer rather than a
+    /// modal, picker, explorer, or transcript-browse surface.
+    fn composer_owns_text_input(&self) -> bool {
+        !self.model_picker.is_open()
+            && self.pending_elicitation().is_none()
+            && self.pending_approval().is_none()
+            && matches!(self.session_overlay, SessionOverlay::None)
+            && self.context_menu.is_none()
+            && !self.input_bar.has_file_explorer()
+            && !self.input_bar.has_attachment_manager()
+            && !self.in_browse_mode()
+    }
+
+    /// Route a key to an input-bar-owned overlay and retain its user feedback.
+    /// Returns true only when that overlay consumed the key before pane-level
+    /// shortcuts get a chance to process it.
+    fn handle_input_bar_overlay_key(&mut self, key: KeyEvent) -> bool {
+        if self.pending_approval().is_some()
+            || (!self.input_bar.has_file_explorer() && !self.input_bar.has_attachment_manager())
+        {
+            return false;
+        }
+
+        self.clear_mouse_highlight();
+        let action = self.input_bar.handle_key(key);
+        // Explorer confirmation can reject an attachment (for example a file
+        // over the size limit). Preserve that feedback instead of swallowing it.
+        if let InputBarAction::StatusMessage(message) = action {
+            self.set_info_notice(message);
+        }
+        self.mark_dirty_full();
+        true
     }
 
     fn mark_dirty_full(&mut self) {
@@ -13080,6 +13112,122 @@ mod tests {
         chat.handle_paste(" must not reach the composer");
 
         assert_eq!(active_state(&mut chat).input_bar.input(), "alpha beta");
+    }
+
+    #[tokio::test]
+    async fn paste_does_not_mutate_hidden_composer_when_another_surface_owns_input() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let mut cases = Vec::new();
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).model_picker = ModelPickerOverlay::Loading;
+        cases.push(("model picker", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.turn_in_flight = true;
+        state.pending_elicitation = Some(single_elicitation());
+        cases.push(("elicitation", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).session_overlay = SessionOverlay::List {
+            sessions: Vec::new(),
+            list_state: ListState::default(),
+        };
+        cases.push(("session picker", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).context_menu = Some(ChatContextMenu {
+            rect: Rect::new(0, 0, 20, 5),
+            target: ChatContextMenuTarget::Queue(1),
+            selected: 0,
+        });
+        cases.push(("context menu", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        let state = active_state(&mut chat);
+        state.input_bar.add_attachment(PendingAttachment {
+            path: std::path::PathBuf::from("already-attached.png"),
+            mime_type: "image/png".into(),
+            filename: "already-attached.png".into(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::File,
+        });
+        state.input_bar.clear_input();
+        state.input_bar.insert_text("/attachments");
+        assert!(matches!(
+            state
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            InputBarAction::Consumed
+        ));
+        cases.push(("attachment manager", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        assert!(matches!(
+            active_state(&mut chat)
+                .input_bar
+                .handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            InputBarAction::Consumed
+        ));
+        cases.push(("file explorer", chat));
+
+        let mut chat = chat_with_active_input(PaneKind::Chat);
+        active_state(&mut chat).browse_cursor = Some(0);
+        cases.push(("browse mode", chat));
+
+        let attachment_path = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        for (surface, mut chat) in cases {
+            let state = active_state(&mut chat);
+            let original_input = state.input_bar.input().to_string();
+            let original_attachment_count = state.input_bar.pending_attachments().len();
+
+            chat.handle_paste(" hidden text");
+            chat.handle_paste(&attachment_path);
+
+            let state = active_state(&mut chat);
+            assert_eq!(
+                state.input_bar.input(),
+                original_input,
+                "{surface} must keep pasted text out of the hidden composer"
+            );
+            assert_eq!(
+                state.input_bar.pending_attachments().len(),
+                original_attachment_count,
+                "{surface} must not create hidden attachments from pasted paths"
+            );
+        }
+    }
+
+    #[test]
+    fn file_explorer_attachment_error_reaches_info_notice() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        // Keep the explorer listing deterministic and let the guard clean up
+        // the oversized fixture even when an assertion fails.
+        let temp_dir = tempfile::tempdir().expect("create attachment fixture directory");
+        let oversized_path = temp_dir.path().join("oversized.bin");
+        let file = std::fs::File::create(&oversized_path).expect("create oversized attachment");
+        file.set_len(10 * 1024 * 1024 + 1)
+            .expect("make attachment exceed the 10 MiB limit");
+
+        let mut state = state();
+        state
+            .input_bar
+            .open_file_explorer_for_test(oversized_path.clone());
+
+        assert!(
+            state.handle_input_bar_overlay_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE,))
+        );
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|notice| !notice.text.is_empty()),
+            "a rejected file-explorer attachment must produce visible feedback regardless of locale"
+        );
+        assert!(!state.input_bar.has_file_explorer());
     }
 
     #[tokio::test]

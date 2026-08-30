@@ -283,6 +283,43 @@ fn streaming_api_error(status: reqwest::StatusCode, body: &str) -> StreamError {
     StreamError::ModelProvider(format!("{status}: {sanitized}"))
 }
 
+/// Upper bound on a `/models` catalog response buffered before parsing. Real
+/// catalogs run to at most a few hundred KB (hundreds of models with pricing),
+/// so this leaves generous headroom while stopping a misbehaving or compromised
+/// router from making the client buffer an unbounded body — a boundary that
+/// matters most on the public, credential-free listing path a `PUBLIC_MODEL_LISTING`
+/// family (ZeroRouter, Kilo, AtlasCloud) exposes.
+const MAX_MODELS_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Read a response body into memory, refusing anything past `max_bytes`: a
+/// declared `Content-Length` over the cap fails fast, and a stream that grows
+/// past it fails as the bytes arrive (so a lying or absent `Content-Length`
+/// cannot get around the bound). Mirrors the bounded reader in `zeroclaw-channels`
+/// so both behave identically, without taking a cross-crate dependency for it.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    max_bytes: u64,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(content_length) = response.content_length()
+        && content_length > max_bytes
+    {
+        anyhow::bail!(
+            "response body content length {content_length} exceeds {max_bytes}-byte limit"
+        );
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        let next_len = u64::try_from(body.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
+        if next_len > max_bytes {
+            anyhow::bail!("response body exceeds {max_bytes}-byte limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 #[derive(Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelEntry>,
@@ -2713,7 +2750,26 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 let status = response.status();
                 anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
             }
-            let body: ModelsResponse = response.json().await.map_err(|e| {
+            let raw = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES)
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": &self.name,
+                                "phase": "model_list_read",
+                                "error": format!("{e:#}"),
+                            })),
+                        "compatible: model list body was too large or could not be read"
+                    );
+                    anyhow::Error::msg(format!(
+                        "{} model list body was not readable: {e}",
+                        self.name
+                    ))
+                })?;
+            let body: ModelsResponse = serde_json::from_slice(&raw).map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -2785,7 +2841,26 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 let status = response.status();
                 anyhow::bail!("{} model list failed at {url}: HTTP {status}", self.name);
             }
-            let body: ModelsResponse = response.json().await.map_err(|e| {
+            let raw = read_body_capped(response, MAX_MODELS_RESPONSE_BYTES)
+                .await
+                .map_err(|e| {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "model_provider": &self.name,
+                                "phase": "model_list_read",
+                                "error": format!("{e:#}"),
+                            })),
+                        "compatible: model list body was too large or could not be read"
+                    );
+                    anyhow::Error::msg(format!(
+                        "{} model list body was not readable: {e}",
+                        self.name
+                    ))
+                })?;
+            let body: ModelsResponse = serde_json::from_slice(&raw).map_err(|e| {
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -3773,6 +3848,84 @@ mod tests {
     fn sanitize_tool_arguments_empty_or_whitespace_becomes_empty_object() {
         assert_eq!(sanitize_tool_arguments("f", ""), "{}");
         assert_eq!(sanitize_tool_arguments("f", "   \n\t  "), "{}");
+    }
+
+    /// The `/models` success path buffers the whole body before parsing, so a
+    /// misbehaving or compromised router could otherwise make the client hold
+    /// an unbounded response — most exposed on the credential-free
+    /// `PUBLIC_MODEL_LISTING` path. `read_body_capped` must refuse an oversized
+    /// success body two ways: a declared `Content-Length` over the cap fails
+    /// fast, and a chunked body with NO `Content-Length` fails as it grows.
+    #[tokio::test]
+    async fn read_body_capped_bounds_oversized_success_bodies() {
+        use axum::Router;
+        use axum::body::{Body, Bytes};
+        use axum::routing::get;
+        use tokio::net::TcpListener;
+
+        const CAP: u64 = 1024;
+        let under = vec![b'x'; 512];
+
+        let under_route = under.clone();
+        let app = Router::new()
+            .route(
+                "/under",
+                get(move || {
+                    let body = under_route.clone();
+                    async move { body }
+                }),
+            )
+            .route(
+                // Honest Content-Length over the cap.
+                "/declared_over",
+                get(|| async { vec![b'x'; (CAP as usize) + 4096] }),
+            )
+            .route(
+                // Eight 512-byte chunks (4096 > CAP) streamed with no
+                // Content-Length, so only the running accumulator can catch it.
+                "/streamed_over",
+                get(|| async {
+                    let chunks =
+                        (0..8).map(|_| Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 512])));
+                    Body::from_stream(futures_util::stream::iter(chunks))
+                }),
+            );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = ::zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = reqwest::Client::new();
+        let fetch = |path: &str| {
+            let url = format!("http://{addr}{path}");
+            let client = client.clone();
+            async move { client.get(url).send().await.expect("fixture request") }
+        };
+
+        // Under the cap: accepted, bytes preserved exactly.
+        assert_eq!(
+            read_body_capped(fetch("/under").await, CAP)
+                .await
+                .expect("a body under the cap is accepted"),
+            under
+        );
+        // Declared oversize: refused before buffering.
+        assert!(
+            read_body_capped(fetch("/declared_over").await, CAP)
+                .await
+                .is_err(),
+            "a declared-oversize body must be refused"
+        );
+        // Streamed oversize, no Content-Length: refused as it grows.
+        assert!(
+            read_body_capped(fetch("/streamed_over").await, CAP)
+                .await
+                .is_err(),
+            "a streamed body past the cap must be refused"
+        );
+
+        server.abort();
     }
 
     /// Well-formed JSON object returns untouched — only object-shaped arguments

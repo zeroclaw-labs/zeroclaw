@@ -89,10 +89,23 @@ pub struct SopEngine {
     /// renews the retained claim during maintenance; it must not release the
     /// claim until the operator retries to a durable outcome.
     claims_retained_after_terminal_rollback: std::collections::HashSet<String>,
+    /// Process-local proof that the driver reached a supported cancellation
+    /// boundary. The durable `CancelRequested` status remains the lifecycle
+    /// source of truth; this set only distinguishes a still-running step from
+    /// one whose driver exited at a safe boundary, so maintenance may retry a
+    /// failed terminal write without cancelling work mid-step.
+    cancellation_finalization_ready: std::collections::HashSet<String>,
+    /// Process-local proof that a headless driver exhausted its bounded action
+    /// budget and exited. The durable run remains `Running` with its claim held
+    /// until maintenance can persist the terminal `Failed` transition. This set
+    /// creates the safe-boundary fact; it does not duplicate durable run state.
+    step_budget_finalization_ready: std::collections::HashSet<String>,
 }
 
 /// Cap on the in-memory per-message dispatch-dedup window (`SopEngine::dispatch_dedup`).
 const DISPATCH_DEDUP_CAP: usize = 512;
+/// Terminal writes retried while the driver is already at a safe cancellation boundary.
+const CANCELLATION_FINALIZE_ATTEMPTS: usize = 3;
 
 /// Composite dedup key: `sop_name` and the transport delivery key joined by a NUL, which
 /// cannot appear in a SOP name, so distinct pairs never collide.
@@ -110,6 +123,11 @@ pub struct MaintenanceSummary {
     pub reaped_claims: usize,
     /// Terminal runs pruned past the retention policy.
     pub pruned_runs: usize,
+    /// Requested cancellations terminalized after an earlier boundary write
+    /// failed and the store recovered.
+    pub finalized_cancellations: usize,
+    /// Step-budget failures terminalized after an earlier store failure.
+    pub finalized_step_budget_failures: usize,
     /// Timeout actions produced. Mostly self-applied (`Escalate` re-stamps,
     /// `Cancel` finalizes); an opt-in `AutoApprove` yields a resumed `ExecuteStep`
     /// the caller logs until EPIC A2's live executor exists.
@@ -119,7 +137,11 @@ pub struct MaintenanceSummary {
 impl MaintenanceSummary {
     /// True when the pass did nothing (no timeouts, reaps, or prunes).
     pub fn is_empty(&self) -> bool {
-        self.timed_out == 0 && self.reaped_claims == 0 && self.pruned_runs == 0
+        self.timed_out == 0
+            && self.reaped_claims == 0
+            && self.pruned_runs == 0
+            && self.finalized_cancellations == 0
+            && self.finalized_step_budget_failures == 0
     }
 }
 
@@ -143,6 +165,45 @@ impl std::error::Error for TerminalPersistenceRetained {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.source)
     }
+}
+
+/// True when `err` is the typed `TerminalPersistenceRetained` marker (a
+/// terminal write failed and the run stayed active with its claim intact), as
+/// opposed to any other fault. Lets a caller in another module or crate (e.g.
+/// the gateway cancel endpoint) render it as retryable backpressure rather
+/// than reporting the run as cancelled, without depending on the private
+/// struct.
+pub fn err_is_terminal_persistence_retained(err: &anyhow::Error) -> bool {
+    err.is::<TerminalPersistenceRetained>()
+}
+
+#[derive(Debug)]
+struct CancellationRequestPersistenceRetained {
+    run_id: String,
+    source: anyhow::Error,
+}
+
+impl std::fmt::Display for CancellationRequestPersistenceRetained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "cancellation request for run {} was not durably persisted; the run remains active: {}",
+            self.run_id, self.source
+        )
+    }
+}
+
+impl std::error::Error for CancellationRequestPersistenceRetained {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+/// True when cancellation could not be durably persisted and the run remains
+/// active with its admission claim intact. Covers both the initial
+/// `CancelRequested` snapshot and the terminal `Cancelled` transition.
+pub fn err_is_cancellation_persistence_retained(err: &anyhow::Error) -> bool {
+    err.is::<TerminalPersistenceRetained>() || err.is::<CancellationRequestPersistenceRetained>()
 }
 
 /// Typed marker: a resume could not re-acquire an exec slot because the SOP's
@@ -236,6 +297,26 @@ impl StartReservation {
     }
 }
 
+/// What an idempotent operator cancellation did. Returned by
+/// `cancel_run_idempotent` so a caller (the gateway cancel endpoint) can
+/// report success on both a fresh cancellation and a repeat request without
+/// re-deriving the run's active/terminal state itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelOutcome {
+    /// The run was parked with no work in flight and is now durably
+    /// `Cancelled`.
+    Cancelled,
+    /// Cancellation was durably requested while a step was in flight. The run
+    /// remains active and claimed until the driver reaches the next boundary.
+    Requested,
+    /// A prior request already left the run in `CancelRequested`.
+    AlreadyRequested,
+    /// The run had already reached a terminal state - previously cancelled,
+    /// or it raced to normal completion/failure first. Reported as-is; no
+    /// second cancellation or audit event was recorded.
+    AlreadyTerminal(SopRunStatus),
+}
+
 impl SopEngine {
     /// Create a new engine with the given config. Call `reload()` to load SOPs.
     pub fn new(config: SopConfig) -> Self {
@@ -254,6 +335,8 @@ impl SopEngine {
             approval_broker: Arc::new(super::approval::ApprovalBroker::disabled()),
             dispatch_dedup: std::collections::VecDeque::new(),
             claims_retained_after_terminal_rollback: std::collections::HashSet::new(),
+            cancellation_finalization_ready: std::collections::HashSet::new(),
+            step_budget_finalization_ready: std::collections::HashSet::new(),
         }
     }
 
@@ -323,11 +406,60 @@ impl SopEngine {
     /// `resolve_gate` for a `WaitingApproval` run or the historical checkpoint
     /// resolver for a `PausedCheckpoint` run. The broker is cloned out first so it
     /// does not borrow `self` while `self` is mutated by the chokepoint.
+    ///
+    /// This shared entry point does **not** consume a resumed deterministic
+    /// capability tail inline: the caller receives the resumed action and hands it
+    /// to the shared async executor, which reacquires the engine lock once per
+    /// capability. That is what lets an operator cancellation persist
+    /// `CancelRequested` *between* post-checkpoint capabilities instead of blocking
+    /// on the engine mutex until the whole tail has already run.
+    ///
+    /// A caller that genuinely owns an exclusive engine handle and must observe the
+    /// fully-driven tail before returning wants [`Self::resolve_via_broker_inline`]
+    /// instead — but note that no shared transport qualifies.
     pub fn resolve_via_broker(
         &mut self,
         run_id: &str,
         decision: super::approval::ApprovalDecision,
         principal: super::approval::ApprovalPrincipal,
+    ) -> Result<super::approval::BrokerOutcome> {
+        self.resolve_via_broker_inner(run_id, decision, principal, false)
+    }
+
+    /// Resolve through the broker and synchronously drive the resumed
+    /// deterministic capability tail while the engine mutex is still held.
+    ///
+    /// ⚠️ Cancellation cannot interleave with a tail driven this way. Reserved for
+    /// genuinely exclusive callers (single-owner engine handles and tests that
+    /// assert on the fully-driven tail). Shared transports — admin HTTP,
+    /// WebSocket, RPC, channels, and the `sop_approve` tool — must use
+    /// [`Self::resolve_via_broker`], which defers the tail.
+    pub fn resolve_via_broker_inline(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<super::approval::BrokerOutcome> {
+        self.resolve_via_broker_inner(run_id, decision, principal, true)
+    }
+
+    /// Explicit alias for [`Self::resolve_via_broker`], kept for call sites that
+    /// want the deferral to be obvious at the point of use.
+    pub fn resolve_via_broker_deferred(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+    ) -> Result<super::approval::BrokerOutcome> {
+        self.resolve_via_broker_inner(run_id, decision, principal, false)
+    }
+
+    fn resolve_via_broker_inner(
+        &mut self,
+        run_id: &str,
+        decision: super::approval::ApprovalDecision,
+        principal: super::approval::ApprovalPrincipal,
+        drive_inline_capability_tail: bool,
     ) -> Result<super::approval::BrokerOutcome> {
         let broker = Arc::clone(&self.approval_broker);
         if let Some(step) = self.active_runs.get(run_id).and_then(|run| {
@@ -349,7 +481,12 @@ impl SopEngine {
                     super::approval::ResolveOutcome::Revised,
                 ));
             }
-            let action = self.decide_checkpoint_with_principal(run_id, decision, principal)?;
+            let action = self.decide_checkpoint_with_principal(
+                run_id,
+                decision,
+                principal,
+                drive_inline_capability_tail,
+            )?;
             return Ok(super::approval::BrokerOutcome::Resolved(
                 super::approval::ResolveOutcome::Resumed(Box::new(action)),
             ));
@@ -369,6 +506,7 @@ impl SopEngine {
                 // intentionally at-least-once and keeps the canonical gate
                 // reference, allowing adapters to de-duplicate it if needed.
                 let mut replay_parked_requests = Vec::new();
+                let mut finalize_cancel_requests = Vec::new();
                 for pr in runs {
                     // A1: a run persisted while parked at a HITL approval / paused at
                     // a deterministic checkpoint normally holds NO exec claim - it
@@ -482,11 +620,34 @@ impl SopEngine {
                         continue;
                     }
                     let run_id = pr.run.run_id.clone();
+                    let cancel_requested = pr.run.status == SopRunStatus::CancelRequested;
                     if self.active_runs.insert(run_id.clone(), pr.run).is_none() {
                         restored += 1;
                         if parked {
                             replay_parked_requests.push(run_id);
+                        } else if cancel_requested {
+                            finalize_cancel_requests.push(run_id);
                         }
+                    }
+                }
+                // A restored cancellation request has no process-local work
+                // left in flight, so startup itself is a safe execution
+                // boundary. Finalize before any restored work can resume.
+                for run_id in finalize_cancel_requests {
+                    if let Err(e) = self.finish_requested_cancellation(&run_id) {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
+                            "SOP engine: failed to finalize restored cancellation request"
+                        );
                     }
                 }
                 // Reuse the same policy resolution and request construction used
@@ -1207,7 +1368,10 @@ impl SopEngine {
                         ),
                     "SOP engine: terminal gate resolution persistence failed; run and ledger remain uncommitted"
                 );
-                anyhow::Error::new(e)
+                anyhow::Error::new(TerminalPersistenceRetained {
+                    run_id: run.run_id.clone(),
+                    source: e,
+                })
             })?;
         self.notify_run(run, false);
         Ok(())
@@ -2069,6 +2233,9 @@ impl SopEngine {
         retry_input: Option<Value>,
         routed_input: Option<Value>,
     ) -> Result<SopRunAction> {
+        if let Some(action) = self.finish_requested_cancellation(run_id)? {
+            return Ok(action);
+        }
         let decision =
             self.route_decision_after_recorded_step(run_id, sop, current_step, last_status)?;
         self.apply_route_decision(
@@ -2638,19 +2805,177 @@ impl SopEngine {
         Ok(action)
     }
 
-    /// Cancel an active run.
+    /// Cancel an active run immediately without an operator-supplied reason.
+    ///
+    /// Internal callers use this only when no step is executing concurrently.
+    /// Remotely initiated cancellation must use `cancel_run_idempotent`, which
+    /// requests cancellation for a running step and preserves its claim until
+    /// the driver reaches a boundary.
     pub fn cancel_run(&mut self, run_id: &str) -> Result<()> {
-        if !self.active_runs.contains_key(run_id) {
-            bail!("Active run not found: {run_id}");
-        }
-        self.finish_run(run_id, SopRunStatus::Cancelled, None)?;
+        self.cancel_run_with_reason_and_actor(run_id, None, None)
+    }
+
+    fn cancel_run_with_reason_and_actor(
+        &mut self,
+        run_id: &str,
+        reason: Option<String>,
+        actor: Option<String>,
+    ) -> Result<()> {
+        let current_step = self
+            .active_runs
+            .get(run_id)
+            .map(|run| run.current_step)
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "run_cancelled".to_string(),
+            actor,
+            reason: reason.clone(),
+            payload: ::serde_json::json!({ "step": current_step }),
+        };
+        self.finish_run_with_gate_event(run_id, SopRunStatus::Cancelled, reason, &event)?;
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_attrs(::serde_json::json!({"run_id": run_id})),
-            "SOP run  cancelled"
+            "SOP run cancelled"
         );
         Ok(())
+    }
+
+    fn request_run_cancellation(
+        &mut self,
+        run_id: &str,
+        reason: Option<String>,
+        actor: Option<String>,
+    ) -> Result<()> {
+        let prior_run = self
+            .active_runs
+            .get(run_id)
+            .cloned()
+            .ok_or_else(|| anyhow::Error::msg(format!("Active run not found: {run_id}")))?;
+        let current_step = prior_run.current_step;
+        let event = SopEventRecord {
+            run_id: run_id.to_string(),
+            seq: 0,
+            ts: now_iso8601(),
+            kind: "run_cancel_requested".to_string(),
+            actor,
+            reason,
+            payload: ::serde_json::json!({ "step": current_step }),
+        };
+        if let Some(run) = self.active_runs.get_mut(run_id) {
+            run.status = SopRunStatus::CancelRequested;
+        }
+        if let Err(source) = self.persist_active_with_gate_event(run_id, &event) {
+            self.active_runs.insert(run_id.to_string(), prior_run);
+            return Err(anyhow::Error::new(CancellationRequestPersistenceRetained {
+                run_id: run_id.to_string(),
+                source,
+            }));
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_attrs(::serde_json::json!({"run_id": run_id})),
+            "SOP run cancellation requested"
+        );
+        Ok(())
+    }
+
+    /// Finish a previously requested cancellation at a driver-owned execution
+    /// boundary. Actor and reason are resolved from the durable request event,
+    /// avoiding a second in-memory source of truth.
+    pub fn finish_requested_cancellation(&mut self, run_id: &str) -> Result<Option<SopRunAction>> {
+        if self
+            .active_runs
+            .get(run_id)
+            .is_none_or(|run| run.status != SopRunStatus::CancelRequested)
+        {
+            self.cancellation_finalization_ready.remove(run_id);
+            return Ok(None);
+        }
+        self.cancellation_finalization_ready
+            .insert(run_id.to_string());
+        let request = self
+            .run_events(run_id)?
+            .into_iter()
+            .rev()
+            .find(|event| event.kind == "run_cancel_requested")
+            .ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "run {run_id} is cancel_requested but has no durable request event"
+                ))
+            })?;
+        let mut last_error = None;
+        for _ in 0..CANCELLATION_FINALIZE_ATTEMPTS {
+            match self.cancel_run_with_reason_and_actor(
+                run_id,
+                request.reason.clone(),
+                request.actor.clone(),
+            ) {
+                Ok(()) => {
+                    last_error = None;
+                    break;
+                }
+                Err(e) => last_error = Some(e),
+            }
+        }
+        if let Some(e) = last_error {
+            return Err(e);
+        }
+        Ok(Some(
+            self.get_run(run_id)
+                .map(|run| SopRunAction::Cancelled {
+                    run_id: run.run_id.clone(),
+                    sop_name: run.sop_name.clone(),
+                })
+                .ok_or_else(|| {
+                    anyhow::Error::msg(format!("Run {run_id} not found after cancel"))
+                })?,
+        ))
+    }
+
+    /// Cancel a run by id, idempotently. Classifies the run under a single
+    /// borrow of engine state (no intervening lookup that a concurrent
+    /// completion could race) and reports:
+    /// - `Ok(Some(Cancelled))` - the run was active and is now `Cancelled`.
+    /// - `Ok(Some(AlreadyTerminal(status)))` - the run had already reached a
+    ///   terminal status (a repeat cancel, or it finished normally first);
+    ///   no second cancellation or audit event is recorded.
+    /// - `Ok(None)` - no run with this id is known to the engine.
+    /// - `Err(_)` - the terminal persist failed; see
+    ///   `err_is_terminal_persistence_retained` to tell a retryable store
+    ///   fault (the run stays active and claimed) from any other error.
+    pub fn cancel_run_idempotent(
+        &mut self,
+        run_id: &str,
+        reason: Option<String>,
+        actor: Option<String>,
+    ) -> Result<Option<CancelOutcome>> {
+        let Some(status) = self.active_runs.get(run_id).map(|run| run.status) else {
+            return Ok(self
+                .get_run(run_id)
+                .map(|run| CancelOutcome::AlreadyTerminal(run.status)));
+        };
+        match status {
+            SopRunStatus::CancelRequested => Ok(Some(CancelOutcome::AlreadyRequested)),
+            SopRunStatus::Running => {
+                self.request_run_cancellation(run_id, reason, actor)?;
+                Ok(Some(CancelOutcome::Requested))
+            }
+            SopRunStatus::Pending
+            | SopRunStatus::WaitingApproval
+            | SopRunStatus::PausedCheckpoint => {
+                self.cancel_run_with_reason_and_actor(run_id, reason, actor)?;
+                Ok(Some(CancelOutcome::Cancelled))
+            }
+            SopRunStatus::Completed | SopRunStatus::Failed | SopRunStatus::Cancelled => {
+                Ok(Some(CancelOutcome::AlreadyTerminal(status)))
+            }
+        }
     }
 
     pub fn approve_step(&mut self, run_id: &str) -> Result<SopRunAction> {
@@ -2756,7 +3081,7 @@ impl SopEngine {
         run.status = SopRunStatus::Running;
         run.waiting_since = None;
         match self.advance_deterministic_step(run_id, piped, None) {
-            Ok(action) => Ok(action),
+            Ok(action) => self.drive_inline_capability_tail(run_id, action),
             Err(e) => {
                 // Defensive: the pre-flight above validated the same lookups under
                 // this lock, so this is unreachable in practice. If the advance
@@ -3102,6 +3427,7 @@ impl SopEngine {
         run_id: &str,
         decision: super::approval::ApprovalDecision,
         principal: super::approval::ApprovalPrincipal,
+        drive_inline_capability_tail: bool,
     ) -> Result<SopRunAction> {
         let prior_run = self
             .active_runs
@@ -3310,7 +3636,7 @@ impl SopEngine {
                     self.release_claim_on_park(run_id);
                     return Err(e);
                 }
-                self.apply_route_decision(
+                let action = self.apply_route_decision(
                     run_id,
                     &sop,
                     current_step.number,
@@ -3318,7 +3644,17 @@ impl SopEngine {
                     true,
                     Some(retry_input_value(&prior_run, current_step.number)),
                     Some(routed_output),
-                )
+                )?;
+                // Checkpoint decisions are an established synchronous engine API:
+                // callers and durable-effect tests expect an authorized capability
+                // tail to finish before the broker outcome is returned. Shared
+                // dashboard/manual execution instead uses the async executor, which
+                // advances one action per lock acquisition.
+                if drive_inline_capability_tail {
+                    self.drive_inline_capability_tail(run_id, action)
+                } else {
+                    Ok(action)
+                }
             }
         }
     }
@@ -3702,40 +4038,85 @@ impl SopEngine {
     ) -> Result<SopRunAction> {
         let mut action = first_action;
         loop {
-            match action {
-                SopRunAction::DeterministicStep {
-                    ref step,
-                    ref input,
-                    ..
-                } if step.kind == SopStepKind::Capability => {
-                    let (sop_name, sop) = self.resolve_active_run_sop(run_id)?;
-                    action = self.execute_capability_step(&sop, run_id, step, input.clone())?;
-                    if self.active_runs.contains_key(run_id) {
-                        let run_sop_name = self
-                            .active_runs
-                            .get(run_id)
-                            .map(|run| run.sop_name.as_str())
-                            .unwrap_or(sop_name.as_str());
-                        if run_sop_name != sop.name {
-                            return Ok(action);
-                        }
-                    }
-                }
-                SopRunAction::DeterministicStep {
-                    ref step,
-                    ref run_id,
-                    ..
-                } => {
-                    let sop_name = self
-                        .active_runs
-                        .get(run_id)
-                        .map(|run| run.sop_name.clone())
-                        .unwrap_or_default();
-                    return self.fail_headless_driverless_step(run_id, &sop_name, step);
-                }
-                terminal => return Ok(terminal),
+            action = self.advance_headless_deterministic_step(run_id, action)?;
+            if !matches!(action, SopRunAction::DeterministicStep { .. }) {
+                return Ok(action);
             }
         }
+    }
+
+    /// Preserve the synchronous checkpoint contract for built-in capability
+    /// tails without consuming an `Execute` action that belongs to an external
+    /// agent driver.
+    fn drive_inline_capability_tail(
+        &mut self,
+        run_id: &str,
+        action: SopRunAction,
+    ) -> Result<SopRunAction> {
+        if matches!(
+            action,
+            SopRunAction::DeterministicStep {
+                ref step,
+                ..
+            } if step.kind == SopStepKind::Capability
+        ) {
+            self.drive_headless_deterministic(run_id, action)
+        } else {
+            Ok(action)
+        }
+    }
+
+    /// Execute at most one deterministic capability step. Async drivers call
+    /// this once per engine-lock acquisition so an operator cancellation can
+    /// acquire the lock and become visible before the next step dispatches.
+    pub fn advance_headless_deterministic_step(
+        &mut self,
+        run_id: &str,
+        action: SopRunAction,
+    ) -> Result<SopRunAction> {
+        if let Some(cancelled) = self.finish_requested_cancellation(run_id)? {
+            return Ok(cancelled);
+        }
+        match action {
+            SopRunAction::DeterministicStep {
+                ref step,
+                ref input,
+                ..
+            } if step.kind == SopStepKind::Capability => {
+                let (_, sop) = self.resolve_active_run_sop(run_id)?;
+                self.execute_capability_step(&sop, run_id, step, input.clone())
+            }
+            SopRunAction::DeterministicStep {
+                ref step,
+                ref run_id,
+                ..
+            } => {
+                let sop_name = self
+                    .active_runs
+                    .get(run_id)
+                    .map(|run| run.sop_name.clone())
+                    .unwrap_or_default();
+                self.fail_headless_driverless_step(run_id, &sop_name, step)
+            }
+            terminal => Ok(terminal),
+        }
+    }
+
+    /// Fail a run whose headless driver consumed its bounded step budget.
+    /// The engine owns the durable terminal transition so the active run and
+    /// its concurrency claim are released together.
+    pub(crate) fn fail_headless_step_budget(&mut self, run_id: &str) -> Result<SopRunAction> {
+        self.step_budget_finalization_ready
+            .insert(run_id.to_string());
+        let result = self.finish_run(
+            run_id,
+            SopRunStatus::Failed,
+            Some("SOP headless driver step budget exhausted".to_string()),
+        );
+        if result.is_ok() {
+            self.step_budget_finalization_ready.remove(run_id);
+        }
+        result
     }
 
     /// Advance a deterministic run with the output of the current step.
@@ -4555,11 +4936,15 @@ impl SopEngine {
                     state_file,
                 })
             }
-            SopStepKind::Capability => self.execute_capability_step(sop, run_id, step, input),
-            SopStepKind::Execute => {
+            SopStepKind::Capability | SopStepKind::Execute => {
                 // Persist the active (Running) deterministic run so a restart mid-run
                 // leaves a non-terminal row for restore_runs() to rehydrate. This is
                 // the single sink for start / advance / resume deterministic steps.
+                //
+                // Capability execution is deliberately returned as an action instead
+                // of running inline. Shared-engine drivers can then drop the lock
+                // between capabilities, allowing cancellation to become visible at
+                // the next safe step boundary.
                 self.persist_active(run_id);
 
                 Ok(SopRunAction::DeterministicStep {
@@ -4698,6 +5083,8 @@ impl SopEngine {
         let timeout_actions = self.check_approval_timeouts();
         self.retry_pending_park_persists();
         self.retry_capacity_blocked_gated_pends();
+        let finalized_step_budget_failures = self.retry_ready_step_budget_finalizations();
+        let finalized_cancellations = self.retry_ready_cancellation_finalizations();
         self.heartbeat_active_claims();
         let reaped_claims = self.reap_expired_claims();
         let pruned_runs = self.prune_terminal_runs();
@@ -4705,8 +5092,82 @@ impl SopEngine {
             timed_out,
             reaped_claims,
             pruned_runs,
+            finalized_cancellations,
+            finalized_step_budget_failures,
             timeout_actions,
         }
+    }
+
+    fn retry_ready_step_budget_finalizations(&mut self) -> usize {
+        let ready: Vec<String> = self
+            .step_budget_finalization_ready
+            .iter()
+            .cloned()
+            .collect();
+        let mut finalized = 0;
+        for run_id in ready {
+            match self.active_runs.get(&run_id).map(|run| run.status) {
+                Some(SopRunStatus::Running) => match self.fail_headless_step_budget(&run_id) {
+                    Ok(_) => finalized += 1,
+                    Err(error) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": error.to_string(),
+                            })),
+                            "SOP maintenance: step-budget finalization retry failed"
+                        );
+                    }
+                },
+                Some(SopRunStatus::CancelRequested) => {
+                    // A durable operator request supersedes the pending failure.
+                    // The same driver-exited proof now makes cancellation safe
+                    // to finalize during this maintenance pass.
+                    self.step_budget_finalization_ready.remove(&run_id);
+                    self.cancellation_finalization_ready.insert(run_id);
+                }
+                Some(_) | None => {
+                    self.step_budget_finalization_ready.remove(&run_id);
+                }
+            }
+        }
+        finalized
+    }
+
+    fn retry_ready_cancellation_finalizations(&mut self) -> usize {
+        let ready: Vec<String> = self
+            .cancellation_finalization_ready
+            .iter()
+            .cloned()
+            .collect();
+        let mut finalized = 0;
+        for run_id in ready {
+            match self.finish_requested_cancellation(&run_id) {
+                Ok(Some(_)) => finalized += 1,
+                Ok(None) => {
+                    self.cancellation_finalization_ready.remove(&run_id);
+                }
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": error.to_string(),
+                            })),
+                        "SOP maintenance: cancellation finalization retry failed"
+                    );
+                }
+            }
+        }
+        finalized
     }
 
     /// Reclaim concurrency-claim leases past their expiry (the holder died without
@@ -4875,6 +5336,8 @@ impl SopEngine {
         self.record_run_failed_event(run_id, status, reason.as_deref());
         self.claims_pending_persist.remove(run_id);
         self.claims_retained_after_terminal_rollback.remove(run_id);
+        self.cancellation_finalization_ready.remove(run_id);
+        self.step_budget_finalization_ready.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         // The park snapshot is purely a rehydration artifact: a terminal run must
@@ -4895,6 +5358,10 @@ impl SopEngine {
                 run_id: run_id_owned,
                 sop_name,
                 reason: reason.unwrap_or_default(),
+            },
+            SopRunStatus::Cancelled => SopRunAction::Cancelled {
+                run_id: run_id_owned,
+                sop_name,
             },
             _ => SopRunAction::Completed {
                 run_id: run_id_owned,
@@ -4924,6 +5391,8 @@ impl SopEngine {
         self.record_run_failed_event(run_id, status, reason.as_deref());
         self.claims_pending_persist.remove(run_id);
         self.claims_retained_after_terminal_rollback.remove(run_id);
+        self.cancellation_finalization_ready.remove(run_id);
+        self.step_budget_finalization_ready.remove(run_id);
         self.active_runs.remove(run_id);
         self.metrics.record_run_complete(&run);
         self.remove_deterministic_state_file(&run);
@@ -5905,6 +6374,7 @@ mod tests {
             | SopRunAction::CheckpointWait { run_id, .. }
             | SopRunAction::Pending { run_id, .. }
             | SopRunAction::Completed { run_id, .. }
+            | SopRunAction::Cancelled { run_id, .. }
             | SopRunAction::Failed { run_id, .. } => run_id,
         }
     }
@@ -7294,6 +7764,480 @@ mod tests {
     fn cancel_unknown_run_fails() {
         let mut engine = engine_with_sops(vec![]);
         assert!(engine.cancel_run("nonexistent").is_err());
+    }
+
+    #[test]
+    fn cancel_run_idempotent_unknown_run_returns_none() {
+        let mut engine = engine_with_sops(vec![]);
+        assert_eq!(
+            engine
+                .cancel_run_idempotent("nonexistent", None, None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn running_cancel_is_idempotent_and_keeps_claim_until_boundary() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        assert_eq!(
+            engine
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::CancelRequested
+        );
+        assert!(engine.active_runs().contains_key(&run_id));
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (1, 1),
+            "the in-flight run must keep occupying the sole admission slot"
+        );
+        assert_eq!(
+            engine
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::AlreadyRequested)
+        );
+
+        engine
+            .finish_requested_cancellation(&run_id)
+            .unwrap()
+            .expect("the driver boundary must finalize cancellation");
+        assert_eq!(
+            engine.cancel_run_idempotent(&run_id, None, None).unwrap(),
+            Some(CancelOutcome::AlreadyTerminal(SopRunStatus::Cancelled))
+        );
+        assert_eq!(
+            engine.finished_runs(None)[0].status,
+            SopRunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancel_run_idempotent_race_with_normal_completion_is_not_a_hard_error() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        // The run finishes normally before the cancel request lands.
+        engine
+            .finish_run(&run_id, SopRunStatus::Completed, None)
+            .unwrap();
+
+        assert_eq!(
+            engine.cancel_run_idempotent(&run_id, None, None).unwrap(),
+            Some(CancelOutcome::AlreadyTerminal(SopRunStatus::Completed)),
+            "a cancel that loses the race to normal completion must be treated as terminal, not an error"
+        );
+        assert_eq!(
+            engine.finished_runs(None)[0].status,
+            SopRunStatus::Completed,
+            "the run's actual completion status must survive the losing cancel attempt"
+        );
+    }
+
+    #[test]
+    fn cancel_run_records_durable_transition_event() {
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )]);
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        engine
+            .cancel_run_idempotent(
+                &run_id,
+                Some("operator requested stop".to_string()),
+                Some("gateway:operator".to_string()),
+            )
+            .unwrap();
+
+        let events = engine.run_events(&run_id).unwrap();
+        let requested = events
+            .iter()
+            .find(|e| e.kind == "run_cancel_requested")
+            .expect("cancel must append a durable run_cancel_requested event");
+        assert_eq!(requested.reason.as_deref(), Some("operator requested stop"));
+        assert_eq!(requested.actor.as_deref(), Some("gateway:operator"));
+
+        engine
+            .finish_requested_cancellation(&run_id)
+            .unwrap()
+            .expect("the next boundary must finish cancellation");
+        let events = engine.run_events(&run_id).unwrap();
+        let cancelled = events
+            .iter()
+            .find(|e| e.kind == "run_cancelled")
+            .expect("cancel must append a durable run_cancelled event");
+        assert_eq!(cancelled.reason.as_deref(), Some("operator requested stop"));
+        assert_eq!(cancelled.actor.as_deref(), Some("gateway:operator"));
+
+        // The idempotent no-op on an already-terminal run must not append a
+        // second event.
+        engine.cancel_run_idempotent(&run_id, None, None).unwrap();
+        let events_after = engine.run_events(&run_id).unwrap();
+        assert_eq!(
+            events_after
+                .iter()
+                .filter(|e| e.kind == "run_cancelled")
+                .count(),
+            1,
+            "an idempotent repeat cancel must not append a second run_cancelled event"
+        );
+    }
+
+    #[test]
+    fn requested_cancel_terminal_persist_failure_retains_run_and_claim() {
+        let store = std::sync::Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        assert_eq!(
+            engine
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        // Only the terminal write at the safe boundary is made to fail.
+        store
+            .fail_finish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = engine
+            .finish_requested_cancellation(&run_id)
+            .expect_err("a failed terminal persist must reject boundary completion");
+
+        assert!(
+            err_is_terminal_persistence_retained(&err),
+            "the failure must be the typed retryable marker, not an unclassified error: {err}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::CancelRequested,
+            "a failed terminal persist must leave the run requested and active"
+        );
+        assert!(
+            engine.active_runs().contains_key(&run_id),
+            "the run must stay in the engine's active set"
+        );
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (1, 1),
+            "a failed terminal persist must keep the admission claim"
+        );
+
+        store
+            .fail_finish
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(
+            summary.finalized_cancellations, 1,
+            "maintenance owns eventual finalization after the boundary retry budget is exhausted"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (0, 0),
+            "eventual finalization must release the retained admission claim"
+        );
+    }
+
+    #[test]
+    fn step_budget_terminal_persist_failure_retries_in_maintenance() {
+        let store = std::sync::Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Deterministic,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+
+        store
+            .fail_finish
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let error = engine
+            .fail_headless_step_budget(&run_id)
+            .expect_err("the exhausted driver must retain a failed terminal write");
+        assert!(err_is_terminal_persistence_retained(&error));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Running,
+            "the durable active state remains authoritative until terminal persistence succeeds"
+        );
+        assert_eq!(store.claim_counts("s1").unwrap(), (1, 1));
+
+        store
+            .fail_finish
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let summary = engine.run_maintenance_tick();
+        assert_eq!(summary.finalized_step_budget_failures, 1);
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Failed
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
+        assert_eq!(store.claim_counts("s1").unwrap(), (0, 0));
+        assert!(engine.run_maintenance_tick().is_empty());
+    }
+
+    #[test]
+    fn cancellation_boundary_retries_transient_terminal_failure() {
+        let store = std::sync::Arc::new(FailFirstFinishStore::new());
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        engine
+            .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+            .unwrap();
+
+        let terminal = engine
+            .finish_requested_cancellation(&run_id)
+            .expect("the safe boundary should retry a transient terminal failure")
+            .expect("the requested cancellation should become terminal");
+
+        assert!(matches!(terminal, SopRunAction::Cancelled { .. }));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (0, 0),
+            "the successful boundary retry must release the retained claim"
+        );
+        assert_eq!(
+            engine
+                .run_events(&run_id)
+                .unwrap()
+                .iter()
+                .filter(|event| event.kind == "run_cancelled")
+                .count(),
+            1,
+            "the retry must produce exactly one durable cancellation event"
+        );
+    }
+
+    #[test]
+    fn cancellation_request_persist_failure_rolls_back_state_and_keeps_claim() {
+        let store = std::sync::Arc::new(FailingAppendStore {
+            inner: InMemoryRunStore::new(),
+            fail: std::sync::atomic::AtomicBool::new(false),
+            fail_save: std::sync::atomic::AtomicBool::new(false),
+            fail_finish: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut engine = engine_with_sops(vec![test_sop(
+            "s1",
+            SopExecutionMode::Auto,
+            SopPriority::Normal,
+        )])
+        .with_store(store.clone());
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        store
+            .fail_save
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let err = engine
+            .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+            .expect_err("an undurable cancellation request must be rejected");
+        assert!(err_is_cancellation_persistence_retained(&err));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Running,
+            "the in-memory requested state must roll back with the failed write"
+        );
+        assert_eq!(store.claim_counts("s1").unwrap(), (1, 1));
+        assert!(
+            engine
+                .run_events(&run_id)
+                .unwrap()
+                .iter()
+                .all(|event| event.kind != "run_cancel_requested"),
+            "the request event and state snapshot must commit atomically"
+        );
+    }
+
+    #[test]
+    fn restore_finalizes_durable_cancellation_request_before_work_can_resume() {
+        let store = std::sync::Arc::new(InMemoryRunStore::new());
+        let sop = test_sop("s1", SopExecutionMode::Auto, SopPriority::Normal);
+        let mut original = engine_with_sops(vec![sop.clone()]).with_store(store.clone());
+        let action = original.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        original
+            .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+            .unwrap();
+        assert_eq!(store.claim_counts("s1").unwrap(), (1, 1));
+
+        let mut restored = engine_with_sops(vec![sop]).with_store(store.clone());
+        restored.restore_runs();
+
+        assert_eq!(
+            restored.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled
+        );
+        assert!(!restored.active_runs().contains_key(&run_id));
+        assert_eq!(
+            store.claim_counts("s1").unwrap(),
+            (0, 0),
+            "startup is a safe boundary and must release the cancelled run's claim"
+        );
+    }
+
+    #[test]
+    fn cancel_run_idempotent_frees_a_gated_run_and_its_pending_pool_slot() {
+        let mut sop = test_sop("s1", SopExecutionMode::Supervised, SopPriority::Normal);
+        sop.max_concurrent = 5;
+        sop.max_pending_approvals = 1;
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine.start_run("s1", manual_event()).unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::WaitingApproval
+        );
+        assert!(
+            matches!(engine.evaluate_admission("s1"), SopAdmission::Defer { .. }),
+            "the pending-approval pool is full while the gated run waits"
+        );
+
+        assert_eq!(
+            engine.cancel_run_idempotent(&run_id, None, None).unwrap(),
+            Some(CancelOutcome::Cancelled)
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
+
+        assert!(
+            matches!(engine.evaluate_admission("s1"), SopAdmission::Admit),
+            "cancelling the gated run must free its pending-pool slot"
+        );
+        let second = engine
+            .start_run("s1", manual_event())
+            .expect("the freed slot must admit a fresh trigger");
+        assert!(matches!(second, SopRunAction::WaitApproval { .. }));
+
+        // A late resolution attempt on the now-cancelled gate must be a safe
+        // no-op: no error, no panic, and the cancelled run is left untouched.
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .expect("a late resolve on a cancelled run must not error");
+        assert!(
+            matches!(
+                outcome,
+                super::super::approval::BrokerOutcome::Resolved(ResolveOutcome::AlreadyResolved)
+            ),
+            "a cancelled run reads as already-resolved (idempotent, no ledger row): {outcome:?}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled,
+            "the late resolve must not mutate the cancelled run"
+        );
+    }
+
+    #[test]
+    fn cancel_run_idempotent_cancels_a_paused_checkpoint_run_and_late_resolve_is_a_safe_noop() {
+        let sop = deterministic_sop("det-cancel-checkpoint");
+        let mut engine = engine_with_sops(vec![sop]);
+
+        let action = engine
+            .start_run("det-cancel-checkpoint", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action).to_string();
+        let checkpoint = engine
+            .advance_deterministic_step(&run_id, serde_json::json!("s1-out"), None)
+            .unwrap();
+        assert!(matches!(checkpoint, SopRunAction::CheckpointWait { .. }));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::PausedCheckpoint
+        );
+
+        assert_eq!(
+            engine.cancel_run_idempotent(&run_id, None, None).unwrap(),
+            Some(CancelOutcome::Cancelled)
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled
+        );
+        assert!(!engine.active_runs().contains_key(&run_id));
+
+        let outcome = engine
+            .resolve_via_broker(
+                &run_id,
+                ApprovalDecision::Approve,
+                ApprovalPrincipal::cli(None),
+            )
+            .expect("a late resolve on a cancelled checkpoint must not error");
+        assert!(
+            matches!(
+                outcome,
+                super::super::approval::BrokerOutcome::Resolved(ResolveOutcome::AlreadyResolved)
+            ),
+            "a cancelled checkpoint reads as already-resolved (idempotent, no ledger row): {outcome:?}"
+        );
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            SopRunStatus::Cancelled,
+            "the late resolve must not mutate the cancelled run"
+        );
     }
 
     #[test]
@@ -12664,6 +13608,48 @@ type = "manual"
         }
     }
 
+    #[test]
+    fn deterministic_driver_observes_cancel_before_dispatching_next_capability() {
+        let mut sop = deterministic_sop_all_execute("det-cancel-boundary");
+        for step in &mut sop.steps {
+            step.kind = SopStepKind::Capability;
+            step.capability = Some("noop".into());
+        }
+        let mut engine = engine_with_sops(vec![sop]);
+        let first = engine
+            .start_run("det-cancel-boundary", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&first).to_string();
+
+        let second = engine
+            .advance_headless_deterministic_step(&run_id, first)
+            .unwrap();
+        assert!(
+            matches!(second, SopRunAction::DeterministicStep { ref step, .. } if step.number == 2),
+            "first capability should yield the second action: {second:?}; run: {:?}",
+            engine.get_run(&run_id)
+        );
+        assert_eq!(engine.get_run(&run_id).unwrap().step_results.len(), 1);
+
+        assert_eq!(
+            engine
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        let terminal = engine
+            .advance_headless_deterministic_step(&run_id, second)
+            .unwrap();
+        assert!(matches!(terminal, SopRunAction::Cancelled { .. }));
+        let finished = engine.get_run(&run_id).unwrap();
+        assert_eq!(finished.status, SopRunStatus::Cancelled);
+        assert_eq!(
+            finished.step_results.len(),
+            1,
+            "the second capability must not dispatch after cancellation was requested"
+        );
+    }
+
     struct CountingForgeCommentAdapter {
         calls: Arc<std::sync::atomic::AtomicUsize>,
     }
@@ -13002,6 +13988,14 @@ type = "manual"
             terminal: &PersistedRun,
             event: &SopEventRecord,
         ) -> Result<u64, StoreError> {
+            if self
+                .fail_next_finish
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(StoreError::Backend(
+                    "injected first terminal persistence failure".into(),
+                ));
+            }
             self.inner.finish_run_with_event(run_id, terminal, event)
         }
 
@@ -13143,7 +14137,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13230,7 +14224,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13287,7 +14281,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let first_error = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13417,7 +14411,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::agent("triage-agent"),
@@ -13479,7 +14473,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13537,7 +14531,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13593,7 +14587,7 @@ type = "manual"
         let run_id = extract_run_id(&first).to_string();
 
         let first_outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13675,7 +14669,7 @@ type = "manual"
         );
 
         let first_outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13772,7 +14766,7 @@ type = "manual"
         );
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -13802,6 +14796,56 @@ type = "manual"
         assert!(
             events.iter().any(|ev| ev.kind == "gate_resolved"),
             "checkpoint resolution must append a gate_resolved ledger row: {events:?}"
+        );
+    }
+
+    #[test]
+    fn deferred_checkpoint_resume_allows_cancel_before_next_capability() {
+        let mut engine = engine_with_sops(vec![capability_checkpoint_sop("cp-deferred")]);
+        let first = engine.start_run("cp-deferred", manual_event()).unwrap();
+        let run_id = extract_run_id(&first).to_string();
+        let parked = engine
+            .drive_headless_deterministic(&run_id, first)
+            .expect("drive to checkpoint");
+        assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
+
+        let outcome = engine
+            .resolve_via_broker_deferred(
+                &run_id,
+                super::super::approval::ApprovalDecision::Approve,
+                super::super::approval::ApprovalPrincipal::cli(None),
+            )
+            .expect("deferred checkpoint approve resolves");
+        let super::super::approval::BrokerOutcome::Resolved(
+            super::super::approval::ResolveOutcome::Resumed(action),
+        ) = outcome
+        else {
+            panic!("expected Resolved(Resumed), got {outcome:?}");
+        };
+        assert!(
+            matches!(*action, SopRunAction::DeterministicStep { ref step, .. } if step.number == 3),
+            "the gateway path must return the next capability without executing it: {action:?}"
+        );
+
+        assert_eq!(
+            engine
+                .cancel_run_idempotent(&run_id, None, Some("gateway:operator".into()))
+                .unwrap(),
+            Some(CancelOutcome::Requested)
+        );
+        let terminal = engine
+            .advance_headless_deterministic_step(&run_id, *action)
+            .expect("the shared executor should observe cancellation first");
+        assert!(matches!(terminal, SopRunAction::Cancelled { .. }));
+        let run = engine
+            .last_finished_run("cp-deferred")
+            .expect("cancelled run retained");
+        assert_eq!(run.status, SopRunStatus::Cancelled);
+        assert!(
+            run.step_results
+                .iter()
+                .all(|result| result.step_number != 3),
+            "the post-checkpoint capability must not dispatch after cancellation"
         );
     }
 
@@ -13926,7 +14970,7 @@ type = "manual"
         assert!(matches!(parked, SopRunAction::CheckpointWait { .. }));
 
         let outcome = engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Amend {
                     text: "the operator rewrite".into(),
@@ -14323,7 +15367,7 @@ type = "manual"
         }
         // One revise at gate 1: revision 1.
         engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Revise {
                     guidance: "shorter".into(),
@@ -14335,7 +15379,7 @@ type = "manual"
         // Approve gate 1 -> the tail drives to gate 2, whose presentation must
         // be revision 2 (unique vs gate 1's 0 and 1) with a FRESH revise budget.
         engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -14354,7 +15398,7 @@ type = "manual"
         // Gate 2 has its FULL budget despite gate 1's spend.
         for i in 1..=MAX_GATE_REVISIONS {
             engine
-                .resolve_via_broker(
+                .resolve_via_broker_inline(
                     &run_id,
                     super::super::approval::ApprovalDecision::Revise {
                         guidance: format!("gate2 round {i}"),
@@ -14365,7 +15409,7 @@ type = "manual"
         }
         assert!(
             engine
-                .resolve_via_broker(
+                .resolve_via_broker_inline(
                     &run_id,
                     super::super::approval::ApprovalDecision::Revise {
                         guidance: "over budget".into(),
@@ -14395,7 +15439,7 @@ type = "manual"
         let state_file = dir.join(format!("{run_id}.state.json"));
         assert!(state_file.exists(), "the park must write the snapshot");
         engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Deny { reason: None },
                 super::super::approval::ApprovalPrincipal::cli(None),
@@ -14413,7 +15457,7 @@ type = "manual"
         let state_file = dir.join(format!("{run_id}.state.json"));
         assert!(state_file.exists());
         engine
-            .resolve_via_broker(
+            .resolve_via_broker_inline(
                 &run_id,
                 super::super::approval::ApprovalDecision::Approve,
                 super::super::approval::ApprovalPrincipal::cli(None),

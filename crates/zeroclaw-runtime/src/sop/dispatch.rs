@@ -252,6 +252,7 @@ fn extract_run_id_from_action(action: &SopRunAction) -> &str {
         | SopRunAction::CheckpointWait { run_id, .. }
         | SopRunAction::Pending { run_id, .. }
         | SopRunAction::Completed { run_id, .. }
+        | SopRunAction::Cancelled { run_id, .. }
         | SopRunAction::Failed { run_id, .. } => run_id,
     }
 }
@@ -265,46 +266,73 @@ fn action_label(action: &SopRunAction) -> &'static str {
         SopRunAction::CheckpointWait { .. } => "CheckpointWait",
         SopRunAction::Pending { .. } => "Pending",
         SopRunAction::Completed { .. } => "Completed",
+        SopRunAction::Cancelled { .. } => "Cancelled",
         SopRunAction::Failed { .. } => "Failed",
     }
 }
 
-/// Post-start bookkeeping shared by the single-SOP loop and the AMQP batch path:
-/// drive a headless deterministic run to a terminal state (its slot would otherwise
-/// never free), snapshot the run for audit under the lock, and build the `Started`
-/// result. `action` is the first action returned by activation.
+/// Project a deterministic-driver error from the canonical run state.
+///
+/// A driver error does not prove that the run durably failed. In particular,
+/// cancellation or step-budget terminal persistence can fail after the engine
+/// deliberately retains the active run and its claim for maintenance retry.
+/// Treating every error as `Failed` would publish a terminal outcome that the
+/// run store does not contain.
+fn project_driver_error(
+    eng: &SopEngine,
+    run_id: &str,
+    sop_name: &str,
+    error: &anyhow::Error,
+) -> SopRunAction {
+    let Some(run) = eng.get_run(run_id) else {
+        return SopRunAction::Failed {
+            run_id: run_id.to_string(),
+            sop_name: sop_name.to_string(),
+            reason: error.to_string(),
+        };
+    };
+
+    match run.status {
+        super::types::SopRunStatus::Completed => SopRunAction::Completed {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+        },
+        super::types::SopRunStatus::Cancelled => SopRunAction::Cancelled {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+        },
+        super::types::SopRunStatus::Failed => SopRunAction::Failed {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            reason: error.to_string(),
+        },
+        status => SopRunAction::Pending {
+            run_id: run.run_id.clone(),
+            sop_name: run.sop_name.clone(),
+            step: run.current_step,
+            reason: format!(
+                "deterministic driver exited with run retained as {status}; maintenance or the lifecycle owner will reconcile it: {error}"
+            ),
+        },
+    }
+}
+
+/// Post-start bookkeeping shared by the single-SOP loop and the AMQP batch path.
+/// Deterministic actions are queued for the shared driver after the engine lock
+/// is released; `action` is the first action returned by activation.
 fn record_started_run(
-    eng: &mut SopEngine,
+    eng: &SopEngine,
     sop_name: &str,
     action: SopRunAction,
-    started_runs: &mut Vec<SopRun>,
+    pending_deterministic: &mut Vec<(String, String, SopRunAction)>,
 ) -> DispatchResult {
     let run_id = extract_run_id_from_action(&action).to_string();
 
-    // Headless deterministic runs have no agent loop to execute steps. Left as-is,
-    // the run sits in active_runs as Running forever and its max_concurrent slot
-    // never frees, so every later event from the same SOP is skipped. Drive it to a
-    // terminal state here so the slot frees and the SOP can fire again.
     let is_deterministic = eng
         .get_sop(sop_name)
         .is_some_and(|s| s.execution_mode == SopExecutionMode::Deterministic);
-    let action = if is_deterministic {
-        match eng.drive_headless_deterministic(&run_id, action) {
-            Ok(terminal) => terminal,
-            Err(e) => SopRunAction::Failed {
-                run_id: run_id.clone(),
-                sop_name: sop_name.to_string(),
-                reason: e.to_string(),
-            },
-        }
-    } else {
-        action
-    };
-
-    // Snapshot the run for audit (must be done under lock). get_run resolves both
-    // active and finished runs, so a terminal headless deterministic run is captured.
-    if let Some(run) = eng.get_run(&run_id).cloned() {
-        started_runs.push(run);
+    if is_deterministic {
+        pending_deterministic.push((run_id.clone(), sop_name.to_string(), action.clone()));
     }
     ::zeroclaw_log::record!(
         INFO,
@@ -539,7 +567,7 @@ async fn dispatch_sop_event_filtered(
 
     // Phase 2: start runs
     let mut results = Vec::new();
-    let mut started_runs: Vec<SopRun> = Vec::new();
+    let mut pending_deterministic = Vec::new();
 
     {
         let mut eng = match engine.lock() {
@@ -808,9 +836,9 @@ async fn dispatch_sop_event_filtered(
             // the already-activated siblings back (remove their runs + release their claims),
             // release the reservations not yet activated, and defer the whole set for requeue
             // — never leaving one sibling Started while another is dropped. Only once EVERY
-            // sibling has activated do we `record_started_run` (which drives headless
-            // deterministic runs to terminal); a failure there is that run's own terminal
-            // outcome (Started-then-Failed), not a lost trigger.
+            // sibling has activated do we record the starts. Headless deterministic
+            // execution runs after this lock is released; a driver failure is that
+            // run's own Started-then-Failed outcome, not a lost trigger.
             let mut activated: Vec<(String, SopRunAction)> = Vec::new();
             let mut activation_failure: Option<(String, String)> = None;
             let mut remaining = reservations.into_iter();
@@ -853,7 +881,8 @@ async fn dispatch_sop_event_filtered(
                 return results;
             }
             for (sop_name, action) in activated {
-                let result = record_started_run(&mut eng, &sop_name, action, &mut started_runs);
+                let result =
+                    record_started_run(&eng, &sop_name, action, &mut pending_deterministic);
                 remember_dispatch_start(&mut eng, &sop_name, dedup, &result);
                 results.push(result);
             }
@@ -926,7 +955,7 @@ async fn dispatch_sop_event_filtered(
                 match eng.start_run(sop_name, event.clone()) {
                     Ok(action) => {
                         let result =
-                            record_started_run(&mut eng, sop_name, action, &mut started_runs);
+                            record_started_run(&eng, sop_name, action, &mut pending_deterministic);
                         remember_dispatch_start(&mut eng, sop_name, dedup, &result);
                         results.push(result);
                     }
@@ -937,6 +966,45 @@ async fn dispatch_sop_event_filtered(
             }
         }
     } // lock dropped
+
+    for (run_id, sop_name, first_action) in pending_deterministic {
+        let final_action =
+            match super::executor::drive_shared_deterministic_run(engine, first_action).await {
+                Ok(action) => action,
+                Err(e) => {
+                    let eng = match engine.lock() {
+                        Ok(eng) => eng,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    project_driver_error(&eng, &run_id, &sop_name, &e)
+                }
+            };
+        if let Some(DispatchResult::Started { action, .. }) = results.iter_mut().find(|result| {
+            matches!(
+                result,
+                DispatchResult::Started {
+                    run_id: candidate,
+                    ..
+                } if candidate == &run_id
+            )
+        }) {
+            **action = final_action;
+        }
+    }
+
+    let started_runs: Vec<SopRun> = {
+        let eng = match engine.lock() {
+            Ok(eng) => eng,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        results
+            .iter()
+            .filter_map(|result| match result {
+                DispatchResult::Started { run_id, .. } => eng.get_run(run_id).cloned(),
+                _ => None,
+            })
+            .collect()
+    };
 
     // Phase 3: audit (async, no lock)
     use zeroclaw_log::Instrument;
@@ -1043,6 +1111,16 @@ pub fn process_headless_results(results: &[DispatchResult]) {
                         &format!(
                             "SOP headless dispatch: run {run_id} ('{sop_name}') completed immediately"
                         )
+                    );
+                }
+                SopRunAction::Cancelled { .. } => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                            .with_attrs(
+                                ::serde_json::json!({"run_id": run_id, "sop_name": sop_name})
+                            ),
+                        &format!("SOP headless dispatch: run {run_id} ('{sop_name}') cancelled")
                     );
                 }
                 SopRunAction::Failed { reason, .. } => {
@@ -1405,6 +1483,76 @@ mod tests {
 
     fn test_audit() -> SopAuditLogger {
         SopAuditLogger::new(Arc::new(TestMemory::default()))
+    }
+
+    #[test]
+    fn driver_error_projection_preserves_requested_cancellation() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop("cancel-projection", vec![])]);
+        let first = engine
+            .start_run(
+                "cancel-projection",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = extract_run_id_from_action(&first).to_string();
+        let outcome = engine
+            .cancel_run_idempotent(&run_id, Some("stop".to_string()), None)
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            Some(crate::sop::engine::CancelOutcome::Requested)
+        ));
+
+        let driver_error = anyhow::Error::msg("terminal write unavailable");
+        let projected = project_driver_error(&engine, &run_id, "cancel-projection", &driver_error);
+
+        assert!(matches!(
+            projected,
+            SopRunAction::Pending {
+                run_id: ref projected_run_id,
+                ref reason,
+                ..
+            } if projected_run_id == &run_id
+                && reason.contains("retained as cancel_requested")
+        ));
+        assert_eq!(
+            engine.get_run(&run_id).unwrap().status,
+            crate::sop::types::SopRunStatus::CancelRequested,
+            "the dispatch projection must not replace the canonical retained state"
+        );
+    }
+
+    #[test]
+    fn driver_error_projection_uses_reconciled_terminal_state() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop("cancel-projection", vec![])]);
+        let first = engine
+            .start_run(
+                "cancel-projection",
+                SopEvent {
+                    source: SopTriggerSource::Manual,
+                    topic: None,
+                    payload: None,
+                    timestamp: now_iso8601(),
+                },
+            )
+            .unwrap();
+        let run_id = extract_run_id_from_action(&first).to_string();
+        engine
+            .cancel_run_idempotent(&run_id, Some("stop".to_string()), None)
+            .unwrap();
+        engine.finish_requested_cancellation(&run_id).unwrap();
+
+        let driver_error = anyhow::Error::msg("stale driver error");
+        let projected = project_driver_error(&engine, &run_id, "cancel-projection", &driver_error);
+
+        assert!(matches!(projected, SopRunAction::Cancelled { .. }));
     }
 
     #[derive(Default)]

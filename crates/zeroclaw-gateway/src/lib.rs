@@ -1691,6 +1691,10 @@ pub async fn run_gateway(
             "/api/sops/{name}/runs/{run_id}/decide",
             post(api_sop_author::handle_sop_decide),
         )
+        .route(
+            "/api/sops/{name}/runs/{run_id}/cancel",
+            post(api_sop_author::handle_sop_cancel),
+        )
         .route("/api/config/drift", get(api_config::handle_drift))
         .route(
             "/api/config/reload-status",
@@ -2843,6 +2847,18 @@ fn idempotency_storage_key(namespace: Option<&str>, idempotency_key: &str) -> St
     key
 }
 
+/// Emit duplicate telemetry without copying caller-controlled key material
+/// into the log pipeline. The key remains available to the replay store; only
+/// its presence is useful and safe at this observability boundary.
+fn record_duplicate_idempotency_log() {
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({"idempotency_key_present": true})),
+        "webhook duplicate ignored"
+    );
+}
+
 fn check_webhook_idempotency(
     state: &AppState,
     headers: &HeaderMap,
@@ -2858,12 +2874,7 @@ fn check_webhook_idempotency(
         return None;
     }
 
-    ::zeroclaw_log::record!(
-        INFO,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_attrs(::serde_json::json!({"idempotency_key": idempotency_key})),
-        "webhook duplicate ignored"
-    );
+    record_duplicate_idempotency_log();
     Some((
         StatusCode::OK,
         Json(serde_json::json!({
@@ -8236,6 +8247,41 @@ path = "{trigger_path}"
         let store = IdempotencyStore::new(Duration::from_secs(300), 100);
         assert!(store.record_if_new("rapid"));
         assert!(!store.record_if_new("rapid"));
+    }
+
+    #[test]
+    fn duplicate_idempotency_log_omits_caller_key() {
+        let _hook_guard = zeroclaw_log::__private_test_hook_lock();
+        zeroclaw_log::try_install_capture_subscriber();
+        let mut receiver = zeroclaw_log::subscribe_or_install();
+        while receiver.try_recv().is_ok() {}
+
+        let raw_key = "caller-sensitive-id";
+        record_duplicate_idempotency_log();
+
+        let event = loop {
+            match receiver.try_recv() {
+                Ok(value)
+                    if value.get("message").and_then(|message| message.as_str())
+                        == Some("webhook duplicate ignored") =>
+                {
+                    break value;
+                }
+                Ok(_) => continue,
+                Err(error) => panic!("duplicate log event was not broadcast: {error}"),
+            }
+        };
+        zeroclaw_log::clear_broadcast_hook();
+
+        assert_eq!(
+            event["attributes"]["idempotency_key_present"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(event["attributes"].get("idempotency_key").is_none());
+        assert!(
+            !event.to_string().contains(raw_key),
+            "caller-controlled idempotency key must not enter structured logs"
+        );
     }
 
     #[test]

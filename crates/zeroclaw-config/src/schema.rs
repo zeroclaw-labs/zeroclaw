@@ -15,6 +15,7 @@ use serde::de::{self, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, RwLock};
 #[cfg(unix)]
 use tokio::fs::File;
@@ -69,8 +70,14 @@ const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
 ];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
-static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
+static RUNTIME_PROXY_CONFIG_GENERATION: AtomicU64 = AtomicU64::new(0);
+static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, RuntimeProxyCachedClient>>> =
     OnceLock::new();
+
+struct RuntimeProxyCachedClient {
+    generation: u64,
+    client: reqwest::Client,
+}
 
 // ── Top-level config ──────────────────────────────────────────────
 
@@ -5114,6 +5121,17 @@ pub struct McpServerConfig {
     /// Optional per-call timeout in seconds (hard capped in validation).
     #[serde(default)]
     pub tool_timeout_secs: Option<u64>,
+    /// Maximum bytes accepted for a single HTTP/SSE JSON-RPC response body,
+    /// enforced at read time before the body is parsed or any embedded resource
+    /// is materialized. A compromised or misbehaving server cannot force an
+    /// unbounded response-body allocation. This is the *encoded wire* cap, not
+    /// the decoded materialization budget: `None`/`0` uses the built-in default
+    /// of 16,078,168 bytes, sized so a full 10 MiB decoded embedded-resource blob
+    /// (its base64 expansion plus JSON-RPC envelope headroom) still fits. The
+    /// separate 10 MiB figure is the decoded aggregate blob budget applied after
+    /// parsing, not this wire cap.
+    #[serde(default)]
+    pub max_response_bytes: Option<u64>,
     /// Resource URIs to read once at agent startup and inject into the system
     /// prompt as untrusted, server-origin context. Each is read via
     /// `resources/read` on this server; pins on a server that does not advertise
@@ -10507,7 +10525,25 @@ fn runtime_proxy_state() -> &'static RwLock<ProxyConfig> {
     RUNTIME_PROXY_CONFIG.get_or_init(|| RwLock::new(ProxyConfig::default()))
 }
 
-fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, reqwest::Client>> {
+fn runtime_proxy_config_generation() -> u64 {
+    RUNTIME_PROXY_CONFIG_GENERATION.load(Ordering::Acquire)
+}
+
+fn bump_runtime_proxy_config_generation() {
+    let _ = RUNTIME_PROXY_CONFIG_GENERATION.fetch_add(1, Ordering::AcqRel);
+}
+
+fn runtime_proxy_current_generation() -> u64 {
+    match runtime_proxy_state().read() {
+        Ok(_guard) => runtime_proxy_config_generation(),
+        Err(poisoned) => {
+            let _guard = poisoned.into_inner();
+            runtime_proxy_config_generation()
+        }
+    }
+}
+
+fn runtime_proxy_client_cache() -> &'static RwLock<HashMap<String, RuntimeProxyCachedClient>> {
     RUNTIME_PROXY_CLIENT_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
@@ -10540,19 +10576,36 @@ fn runtime_proxy_cache_key(
 }
 
 fn runtime_proxy_cached_client(cache_key: &str) -> Option<reqwest::Client> {
+    let generation = runtime_proxy_current_generation();
     match runtime_proxy_client_cache().read() {
-        Ok(guard) => guard.get(cache_key).cloned(),
-        Err(poisoned) => poisoned.into_inner().get(cache_key).cloned(),
+        Ok(guard) => guard
+            .get(cache_key)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.client.clone()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .get(cache_key)
+            .filter(|entry| entry.generation == generation)
+            .map(|entry| entry.client.clone()),
     }
 }
 
-fn set_runtime_proxy_cached_client(cache_key: String, client: reqwest::Client) {
+fn set_runtime_proxy_cached_client(cache_key: String, generation: u64, client: reqwest::Client) {
+    if generation != runtime_proxy_current_generation() {
+        return;
+    }
+
     match runtime_proxy_client_cache().write() {
         Ok(mut guard) => {
-            guard.insert(cache_key, client);
+            if generation == runtime_proxy_config_generation() {
+                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+            }
         }
         Err(poisoned) => {
-            poisoned.into_inner().insert(cache_key, client);
+            let mut guard = poisoned.into_inner();
+            if generation == runtime_proxy_config_generation() {
+                guard.insert(cache_key, RuntimeProxyCachedClient { generation, client });
+            }
         }
     }
 }
@@ -10561,20 +10614,30 @@ pub fn set_runtime_proxy_config(config: ProxyConfig) {
     match runtime_proxy_state().write() {
         Ok(mut guard) => {
             *guard = config;
+            bump_runtime_proxy_config_generation();
         }
         Err(poisoned) => {
-            *poisoned.into_inner() = config;
+            let mut guard = poisoned.into_inner();
+            *guard = config;
+            bump_runtime_proxy_config_generation();
         }
     }
 
     clear_runtime_proxy_client_cache();
 }
 
-pub fn runtime_proxy_config() -> ProxyConfig {
+fn runtime_proxy_config_snapshot() -> (u64, ProxyConfig) {
     match runtime_proxy_state().read() {
-        Ok(guard) => guard.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
+        Ok(guard) => (runtime_proxy_config_generation(), guard.clone()),
+        Err(poisoned) => {
+            let guard = poisoned.into_inner();
+            (runtime_proxy_config_generation(), guard.clone())
+        }
     }
+}
+
+pub fn runtime_proxy_config() -> ProxyConfig {
+    runtime_proxy_config_snapshot().1
 }
 
 pub fn apply_runtime_proxy_to_builder(
@@ -10590,7 +10653,8 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
         return client;
     }
 
-    let builder = apply_runtime_proxy_to_builder(reqwest::Client::builder(), service_key);
+    let (generation, config) = runtime_proxy_config_snapshot();
+    let builder = config.apply_to_reqwest_builder(reqwest::Client::builder(), service_key);
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
             WARN,
@@ -10603,7 +10667,7 @@ pub fn build_runtime_proxy_client(service_key: &str) -> reqwest::Client {
         );
         reqwest::Client::new()
     });
-    set_runtime_proxy_cached_client(cache_key, client.clone());
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
     client
 }
 
@@ -10618,10 +10682,11 @@ pub fn build_runtime_proxy_client_with_timeouts(
         return client;
     }
 
+    let (generation, config) = runtime_proxy_config_snapshot();
     let builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs));
-    let builder = apply_runtime_proxy_to_builder(builder, service_key);
+    let builder = config.apply_to_reqwest_builder(builder, service_key);
     let client = builder.build().unwrap_or_else(|error| {
         ::zeroclaw_log::record!(
             WARN,
@@ -10634,7 +10699,43 @@ pub fn build_runtime_proxy_client_with_timeouts(
         );
         reqwest::Client::new()
     });
-    set_runtime_proxy_cached_client(cache_key, client.clone());
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
+    client
+}
+
+pub fn build_runtime_proxy_client_with_read_timeout(
+    service_key: &str,
+    read_timeout_secs: u64,
+    connect_timeout_secs: u64,
+) -> reqwest::Client {
+    let cache_key = format!(
+        "{}|timeout=none|connect_timeout={}|read_timeout={}",
+        service_key.trim().to_ascii_lowercase(),
+        connect_timeout_secs,
+        read_timeout_secs,
+    );
+    if let Some(client) = runtime_proxy_cached_client(&cache_key) {
+        return client;
+    }
+
+    let (generation, config) = runtime_proxy_config_snapshot();
+    let builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+        .read_timeout(std::time::Duration::from_secs(read_timeout_secs));
+    let builder = config.apply_to_reqwest_builder(builder, service_key);
+    let client = builder.build().unwrap_or_else(|error| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(
+                    ::serde_json::json!({"service_key": service_key, "error": format!("{}", error)})
+                ),
+            "Failed to build proxied read-timeout client: "
+        );
+        reqwest::Client::new()
+    });
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
     client
 }
 
@@ -10707,6 +10808,7 @@ fn build_explicit_proxy_client(
         return client;
     }
 
+    let generation = runtime_proxy_current_generation();
     let mut builder = reqwest::Client::builder();
     if let Some(t) = timeout_secs {
         builder = builder.timeout(std::time::Duration::from_secs(t));
@@ -10719,7 +10821,7 @@ fn build_explicit_proxy_client(
         ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"service_key": service_key, "proxy_url": proxy_url, "error": format!("{}", error)})), "Failed to build channel proxy client: ");
         reqwest::Client::new()
     });
-    set_runtime_proxy_cached_client(cache_key, client.clone());
+    set_runtime_proxy_cached_client(cache_key, generation, client.clone());
     client
 }
 
@@ -12412,7 +12514,10 @@ pub struct WebhookAuditConfig {
     pub tool_patterns: Vec<String>,
     /// Include tool call arguments in the audit payload. Default: `false`.
     ///
-    /// Be mindful of sensitive data — arguments may contain secrets or PII.
+    /// Arguments are scrubbed for common credentials and recognised inline
+    /// image markers before export, but may still contain unrecognised secrets
+    /// or personal data.
+    /// The destination controls retention of exported payloads.
     #[serde(default)]
     pub include_args: bool,
     /// Maximum size (in bytes) of serialised arguments included in a single
@@ -32534,10 +32639,7 @@ api_token = "tok"
     }
 
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
-        match runtime_proxy_client_cache().read() {
-            Ok(guard) => guard.contains_key(cache_key),
-            Err(poisoned) => poisoned.into_inner().contains_key(cache_key),
-        }
+        runtime_proxy_cached_client(cache_key).is_some()
     }
 
     #[test]
@@ -32592,6 +32694,98 @@ api_token = "tok"
 
         let _ = build_runtime_proxy_client(&service_key);
         assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn runtime_proxy_client_cache_reuses_read_timeout_profile_key() {
+        let _env_guard = env_override_lock().await;
+        let service_key = format!(
+            "model_provider.cache_read_timeout_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = format!(
+            "{}|timeout=none|connect_timeout=10|read_timeout=300",
+            service_key.trim().to_ascii_lowercase(),
+        );
+
+        clear_runtime_proxy_client_cache();
+        assert!(!runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_client_with_read_timeout(&service_key, 300, 10);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+
+        let _ = build_runtime_proxy_client_with_read_timeout(&service_key, 300, 10);
+        assert!(runtime_proxy_cache_contains(&cache_key));
+    }
+
+    #[test]
+    async fn runtime_proxy_client_cache_rejects_stale_generation_insert() {
+        let _env_guard = env_override_lock().await;
+        let service_key = format!(
+            "model_provider.cache_generation_test.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock should be after unix epoch")
+                .as_nanos()
+        );
+        let cache_key = runtime_proxy_cache_key(&service_key, Some(30), Some(5));
+
+        clear_runtime_proxy_client_cache();
+        let stale_generation = runtime_proxy_config_generation();
+        set_runtime_proxy_config(ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://reload.example:8080".to_string()),
+            ..Default::default()
+        });
+
+        match runtime_proxy_client_cache().write() {
+            Ok(mut guard) => {
+                guard.insert(
+                    cache_key.clone(),
+                    RuntimeProxyCachedClient {
+                        generation: stale_generation,
+                        client: reqwest::Client::new(),
+                    },
+                );
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                guard.insert(
+                    cache_key.clone(),
+                    RuntimeProxyCachedClient {
+                        generation: stale_generation,
+                        client: reqwest::Client::new(),
+                    },
+                );
+            }
+        }
+        assert!(
+            !runtime_proxy_cache_contains(&cache_key),
+            "old-generation cache entries must not be visible after reload"
+        );
+        clear_runtime_proxy_client_cache();
+
+        set_runtime_proxy_cached_client(
+            cache_key.clone(),
+            stale_generation,
+            reqwest::Client::new(),
+        );
+        assert!(
+            !runtime_proxy_cache_contains(&cache_key),
+            "old-policy client builds must not repopulate the cache after reload"
+        );
+
+        set_runtime_proxy_cached_client(
+            cache_key.clone(),
+            runtime_proxy_config_generation(),
+            reqwest::Client::new(),
+        );
+        assert!(runtime_proxy_cache_contains(&cache_key));
+
+        set_runtime_proxy_config(ProxyConfig::default());
     }
 
     #[test]

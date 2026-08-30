@@ -3965,53 +3965,6 @@ licence = true
     }
 
     #[test]
-    fn integrate_round_trip_emits_top_level_forge() {
-        use crate::skillforge::scout::{ScoutResult, ScoutSource};
-        use chrono::Utc;
-        let candidate = ScoutResult {
-            name: "round-trip".into(),
-            url: "https://github.com/user/round-trip".into(),
-            description: "round-trip test".into(),
-            stars: 7,
-            language: Some("Rust".into()),
-            updated_at: Some(Utc::now()),
-            source: ScoutSource::GitHub,
-            owner: "user".into(),
-            has_license: true,
-        };
-
-        // Generate the TOML the integrator would write and parse it back.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let integrator = crate::skillforge::integrate::Integrator::new(
-            tmp.path().to_string_lossy().into_owned(),
-        );
-        let skill_dir = integrator.integrate(&candidate).unwrap();
-        let toml_str = std::fs::read_to_string(skill_dir.join("SKILL.toml")).unwrap();
-
-        let manifest: SkillManifest = toml::from_str(&toml_str).unwrap_or_else(|e| {
-            panic!(
-                "integrator output must parse against SkillManifest with strict SkillMeta + ForgeMetadata; \
-                 got error: {e}\n--- toml ---\n{toml_str}"
-            )
-        });
-        let forge = manifest
-            .forge
-            .expect("integrator must emit a [forge] table");
-        assert_eq!(forge.owner.as_deref(), Some("user"));
-        assert_eq!(forge.stars, Some(7));
-        assert_eq!(forge.license, Some(true));
-        assert!(
-            forge
-                .source
-                .as_deref()
-                .is_some_and(|s| s.contains("round-trip")),
-            "forge.source should carry the upstream URL"
-        );
-        assert_eq!(manifest.skill.name, "round-trip");
-        assert_eq!(manifest.skill.description, "round-trip test");
-    }
-
-    #[test]
     fn workspace_swallow_site_skips_invalid_toml_without_panicking() {
         use tempfile::TempDir;
         let tmp = TempDir::new().unwrap();

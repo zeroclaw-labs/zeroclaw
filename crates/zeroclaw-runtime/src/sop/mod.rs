@@ -31,7 +31,10 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
+pub use engine::{
+    CancelOutcome, MaintenanceSummary, SopEngine, err_is_cancellation_persistence_retained,
+    err_is_resume_at_capacity, err_is_terminal_persistence_retained,
+};
 pub use executor::{drive_resumed_broker_action, spawn_headless_run_driver};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,

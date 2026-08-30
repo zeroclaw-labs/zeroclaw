@@ -814,7 +814,10 @@ jobs:
           emit docs     "\.mdx?$|^docs/|^\.markdownlint-cli2\.yaml$|^scripts/ci/docs_(quality_gate|links_gate)\.sh$|${wf}"
           emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
           emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
-          emit web      "^web/|^\.nvmrc$|${wf}"
+          # The generated dashboard contract includes schemas owned by the
+          # config, runtime, and SOP graph crates and is rendered by the xtask generator.
+          # Keep this trigger aligned with every source that can change it.
+          emit web      "^web/|^crates/zeroclaw-(config|gateway|runtime|sop-graph)/|^xtask/|^Cargo\.(toml|lock)$|^\.nvmrc$|${wf}"
 
   nix-eval:
     name: Nix Module Eval
@@ -961,9 +964,17 @@ jobs:
     needs: [path-changes]
     if: needs.path-changes.outputs.web == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: 1.96.1
+      - uses: ./.github/actions/rust-cache
+        with:
+          use-blacksmith: 'false'
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version-file: '.nvmrc'
@@ -972,6 +983,8 @@ jobs:
       - name: Install web dependencies
         working-directory: web
         run: npm ci
+      - name: Typecheck generated dashboard contract
+        run: cargo web check
       - name: Run permission and catalog regressions
         working-directory: web
         run: npm run test:permissions

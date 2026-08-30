@@ -2,8 +2,10 @@
 //!
 //! Assembly applies peripherals, built-in policy, ACP memory stripping, MCP
 //! scope and policy, capability tools, pinned resources, and skills in that
-//! order. This is the intended construction path; the type boundary remains
-//! temporarily unsealed while legacy callers still accept raw tool vectors.
+//! order. This is the only production construction path: the engine's
+//! turn-entry carriers (`ResolvedIo` / `ResolvedAgentExecution`), `Agent`, and
+//! the channel runtime context all store the sealed type, so an unscoped
+//! registry cannot reach a turn without going through [`ScopedToolRegistry::assemble`].
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,11 +27,12 @@ use crate::tools::{
 
 /// A per-agent tool registry that has been scoped and gated. The inner field is
 /// private and production code can only mint one through
-/// [`ScopedToolRegistry::assemble`]. Today (the unsealed P1 phase) the engine still
-/// takes `&[Box<dyn Tool>]`, so callers dissolve the type via [`std::ops::Deref`] or
-/// [`Self::into_inner`] at the boundary; once every construction site is cut over,
-/// the engine's tools field seals to this type and handing it an unfiltered
-/// registry becomes a compile error instead of a review-checklist item.
+/// [`ScopedToolRegistry::assemble`]. The engine's turn-entry carriers
+/// (`ResolvedIo` / `ResolvedAgentExecution`), `Agent`, and the channel runtime
+/// context store this type directly, so handing the engine an unfiltered
+/// registry is a compile error, not a review-checklist item. Read sites are
+/// unchanged: the registry [`std::ops::Deref`]s to the same `[Box<dyn Tool>]`
+/// slice the raw `Vec` used to expose.
 pub struct ScopedToolRegistry(Vec<Box<dyn Tool>>);
 
 impl std::ops::Deref for ScopedToolRegistry {
@@ -40,13 +43,31 @@ impl std::ops::Deref for ScopedToolRegistry {
 }
 
 impl ScopedToolRegistry {
-    /// Consume the assembled registry into the owned `Vec` (for the few callers that
-    /// still pass `&[Box<dyn Tool>]` into the engine during the P1 cut-over).
+    /// Consume the assembled registry into the owned `Vec` for non-turn
+    /// consumers such as the gateway's listing-only registry. Turn carriers
+    /// accept only the sealed type.
     pub fn into_inner(self) -> Vec<Box<dyn Tool>> {
         self.0
     }
 
-    #[cfg(test)]
+    /// Narrow an ALREADY-sealed registry in place. A passthrough to
+    /// [`Vec::retain`] on the private inner vector. This is a mutator on an
+    /// existing sealed registry (it removes tools, never adds), so it cannot
+    /// mint a scope from raw tools and does not weaken the seal - the only way
+    /// to obtain a `ScopedToolRegistry` to call this on is still
+    /// [`Self::assemble`] (or the test-only constructor).
+    pub(crate) fn retain(&mut self, f: impl FnMut(&Box<dyn Tool>) -> bool) {
+        self.0.retain(f);
+    }
+
+    /// Test-only constructor that mints a registry directly from raw tools,
+    /// bypassing [`Self::assemble`]. Gated to `test` (this crate's own unit
+    /// tests) OR the `test-util` feature (so OTHER crates' test builds -
+    /// notably `zeroclaw-channels`, whose `ChannelRuntimeContext` fixtures need
+    /// a sealed registry - can construct one). The `test-util` feature is never
+    /// enabled by a production dependency edge, so this raw mint does not exist
+    /// in shipped builds and the seal holds where it matters.
+    #[cfg(any(test, feature = "test-util"))]
     pub fn from_raw_for_test(tools: Vec<Box<dyn Tool>>) -> Self {
         Self(tools)
     }
@@ -346,7 +367,8 @@ impl ScopedToolRegistry {
                 // elevation in step 5; skip the collection when no skills are
                 // registered through this assembly.
                 if !skills.is_empty() {
-                    mcp_elevation_arcs = tools::collect_mcp_elevation_arcs(&registry).await;
+                    mcp_elevation_arcs =
+                        tools::collect_mcp_elevation_arcs(&registry, security).await;
                 }
                 let mcp_policy = mcp_tool_access_policy(security.as_ref(), caller_allowed);
                 // Generic MCP resource/prompt capability tools (policy-gated in
@@ -373,8 +395,11 @@ impl ScopedToolRegistry {
                 )
                 .await;
                 if config.mcp.deferred_loading {
-                    let deferred_set =
-                        tools::DeferredMcpToolSet::from_registry(Arc::clone(&registry)).await;
+                    let deferred_set = tools::DeferredMcpToolSet::from_registry(
+                        Arc::clone(&registry),
+                        Arc::clone(security),
+                    )
+                    .await;
                     if emit_assembly_logs {
                         ::zeroclaw_log::record!(
                             INFO,
@@ -395,8 +420,9 @@ impl ScopedToolRegistry {
                             if !eager_mcp_tool_allowed(&stub.prefixed_name, mcp_policy.as_ref()) {
                                 continue;
                             }
-                            let wrapper: Arc<dyn Tool> =
-                                Arc::new(stub.activate(Arc::clone(&registry)));
+                            let wrapper: Arc<dyn Tool> = Arc::new(
+                                stub.activate(Arc::clone(&registry), Arc::clone(security)),
+                            );
                             register_eager_mcp_tool_if_allowed(
                                 wrapper,
                                 &mut tools_registry,
@@ -511,6 +537,7 @@ impl ScopedToolRegistry {
                                 name,
                                 def,
                                 Arc::clone(&registry),
+                                Arc::clone(security),
                             ));
                             if register_eager_mcp_tool_if_allowed(
                                 wrapper,

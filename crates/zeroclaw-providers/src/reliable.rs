@@ -545,7 +545,6 @@ pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
 }
 
 pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
-    let lower = err.to_string().to_lowercase();
     let hints = [
         "exceeds the context window",
         "exceeds the available context size",
@@ -559,7 +558,10 @@ pub fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
         "prompt exceeds max length",
     ];
 
-    hints.iter().any(|hint| lower.contains(hint))
+    err.chain().any(|cause| {
+        let lower = cause.to_string().to_lowercase();
+        hints.iter().any(|hint| lower.contains(hint))
+    })
 }
 
 /// Check if an error is a rate-limit (429) error.
@@ -7412,6 +7414,15 @@ mod tests {
         assert!(is_context_window_exceeded(&anyhow::Error::msg(
             "request (8968 tokens) exceeds the available context size (8448 tokens), try increasing it"
         )));
+    }
+
+    #[test]
+    fn is_context_window_exceeded_detects_nested_provider_cause() {
+        let err = anyhow::Error::msg("maximum context length exceeded")
+            .context("provider request failed after retry recovery");
+
+        assert!(!err.to_string().contains("maximum context length"));
+        assert!(is_context_window_exceeded(&err));
     }
 
     #[test]
