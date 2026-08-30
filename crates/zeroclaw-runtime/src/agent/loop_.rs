@@ -5208,7 +5208,7 @@ mod tests {
     /// The operator-denial result has to carry its own meaning, because the
     /// model will otherwise supply one. Handed the bare three-word form, it
     /// reported the decline correctly on one run and offered three invented
-    /// causes on the next, none of them what happened (#9654).
+    /// causes on the next, none of them what happened.
     ///
     /// Three separate obligations, asserted separately so a regression names
     /// which one broke: the call did not run, the operator is named as the
