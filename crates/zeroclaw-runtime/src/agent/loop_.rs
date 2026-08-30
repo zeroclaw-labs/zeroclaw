@@ -4192,7 +4192,7 @@ mod tests {
     use crate::observability::NoopObserver;
     use tempfile::TempDir;
     use zeroclaw_api::model_provider::{
-        ProviderCapabilities, StreamChunk, StreamEvent, StreamOptions,
+        ProviderCapabilities, StreamChunk, StreamError, StreamEvent, StreamOptions,
     };
     use zeroclaw_memory::{Memory, MemoryCategory, SqliteMemory};
     use zeroclaw_providers::ChatResponse;
@@ -4221,18 +4221,43 @@ mod tests {
         let error =
             anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion);
         let diagnostic = error.to_string();
+        let expected = crate::agent::semantic_empty_terminal_completion_message(None);
 
         let projected = super::project_cli_terminal_completion_error(error);
+        let rendered = projected.to_string();
 
         assert_eq!(
-            projected.to_string(),
-            crate::agent::semantic_empty_terminal_completion_message(None),
-            "both direct CLI boundaries must deliver the Fluent terminal-completion message"
+            rendered, expected,
+            "the CLI boundary must use the canonical localized projection"
         );
         assert_eq!(
             diagnostic, "provider completed without final text or tool calls",
             "the diagnostic supplied to the CLI boundary must remain stable for telemetry"
         );
+    }
+
+    #[test]
+    fn direct_cli_provider_failure_projection_hides_retry_diagnostics() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::RateLimited,
+            None,
+            "All model providers/models failed after 3 failure event(s). Events: \
+             event 1 (retry 1/3): rate_limited"
+                .to_string(),
+        ));
+        let expected = crate::agent::terminal_completion_error_message(&error, None)
+            .expect("provider failures have a canonical localized projection");
+
+        let projected = super::project_cli_terminal_completion_error(error);
+        let rendered = projected.to_string();
+
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("retry 1/3"));
+        assert!(!rendered.contains("All model providers/models failed"));
     }
 
     struct NonVisionModelProvider {
@@ -4584,6 +4609,69 @@ mod tests {
         }
         fn alias(&self) -> &str {
             "StreamingScriptedModelProvider"
+        }
+    }
+
+    struct VisibleThenServerStreamFailureModelProvider {
+        chat_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for VisibleThenServerStreamFailureModelProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in stream failure tests")
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.chat_calls.fetch_add(1, Ordering::SeqCst);
+            anyhow::bail!("non-streaming replay should not be used after visible output")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            zeroclaw_providers::traits::StreamResult<StreamChunk>,
+        > {
+            Box::pin(futures_util::stream::iter(vec![
+                Ok(StreamChunk::delta("visible")),
+                Err(StreamError::ModelProvider(
+                    "503 Service Unavailable".to_string(),
+                )),
+            ]))
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for VisibleThenServerStreamFailureModelProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "VisibleThenServerStreamFailureModelProvider"
         }
     }
 
@@ -8991,6 +9079,103 @@ mod tests {
                 .all(|msg| !msg.content.contains("[Tool call parse error]")),
             "toolcalls reference JSON must not trigger internal parser feedback"
         );
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_preserves_visible_stream_failure_partial_in_both_histories() {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let chat_calls = Arc::new(AtomicUsize::new(0));
+        let model_provider = VisibleThenServerStreamFailureModelProvider {
+            chat_calls: Arc::clone(&chat_calls),
+        };
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("stream an answer"),
+        ];
+        let mut new_messages_out = Vec::new();
+        let observer = NoopObserver;
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let interrupted_marker = crate::i18n::get_required_cli_string("turn-stream-interrupted");
+        let expected_content = format!("visible\n\n{interrupted_marker}");
+
+        let error = run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider: &model_provider,
+                    provider_name: "mock-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 4,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history: &mut history,
+            channel_name: "matrix",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: Some(event_tx),
+            steering: None,
+            new_messages_out: Some(&mut new_messages_out),
+            image_cache: None,
+            memory: None,
+            ingress: IngressContext::sub_turn(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+        .expect_err("visible stream failure must remain an interruption error");
+
+        let interrupted = error
+            .downcast_ref::<crate::agent::turn::outcome::StreamInterruptedAfterOutput>()
+            .expect("visible stream failure must preserve its interruption error");
+        assert_eq!(interrupted.partial_text, "visible");
+        assert_eq!(
+            interrupted.to_string(),
+            "model_provider stream error: ModelProvider error: 503 Service Unavailable"
+        );
+
+        let mut events = Vec::new();
+        while let Some(event) = event_rx.recv().await {
+            events.push(event);
+        }
+        assert_eq!(events.len(), 1, "only the visible delta should be emitted");
+        match &events[0] {
+            zeroclaw_api::agent::TurnEvent::Chunk { delta } => assert_eq!(delta, "visible"),
+            other => panic!("expected visible Chunk event, got {other:?}"),
+        }
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2].role, "assistant");
+        assert_eq!(history[2].content, expected_content);
+        assert_eq!(new_messages_out.len(), 1);
+        assert_eq!(new_messages_out[0].role, "assistant");
+        assert_eq!(new_messages_out[0].content, expected_content);
+        assert_eq!(chat_calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -14135,7 +14320,11 @@ Let me check the result."#;
                 )
             })
             .collect();
-        crate::tools::DeferredMcpToolSet { stubs, registry }
+        crate::tools::DeferredMcpToolSet {
+            stubs,
+            registry,
+            security: Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+        }
     }
 
     fn always_group(patterns: &[&str]) -> Vec<zeroclaw_config::schema::ToolFilterGroup> {

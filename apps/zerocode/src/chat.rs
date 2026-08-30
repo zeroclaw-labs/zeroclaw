@@ -26,6 +26,12 @@ use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::input_bar::{InputBarAction, InputBarState};
 use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
+#[cfg(test)]
+use crate::text_selection::{CellPoint, TextCell as TranscriptCell, row_breaks_for_line};
+use crate::text_selection::{
+    TextRowBreak as TranscriptRowBreak, TextSelection as TranscriptSelection,
+    TextSnapshot as TranscriptSnapshot, borrow_line, row_breaks_for_lines, wrapped_rows,
+};
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
@@ -3886,49 +3892,6 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
-/// Wrapped screen-row count for a single cached line at the given width.
-fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
-    Paragraph::new(vec![borrow_line(line)])
-        .wrap(Wrap { trim: false })
-        .line_count(width) as u16
-}
-
-fn row_breaks_for_line(line: &Line<'static>, width: u16) -> Vec<TranscriptRowBreak> {
-    let text = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    let visual_lines = crate::input_bar::wrap_visual_lines(&text, width);
-    let expected_rows = usize::from(wrapped_rows(line, width));
-    if visual_lines.len() != expected_rows {
-        return vec![TranscriptRowBreak::Hard; expected_rows];
-    }
-
-    visual_lines
-        .iter()
-        .enumerate()
-        .map(|(index, current)| {
-            let Some(previous) = index.checked_sub(1).and_then(|i| visual_lines.get(i)) else {
-                return TranscriptRowBreak::Hard;
-            };
-            let gap = &text[previous.end..current.start];
-            if !gap.is_empty() && !gap.chars().all(|ch| ch == '\u{200b}') {
-                TranscriptRowBreak::SoftSpace
-            } else {
-                TranscriptRowBreak::SoftConcat
-            }
-        })
-        .collect()
-}
-
-fn row_breaks_for_lines(lines: &[Line<'static>], width: u16) -> Vec<TranscriptRowBreak> {
-    lines
-        .iter()
-        .flat_map(|line| row_breaks_for_line(line, width))
-        .collect()
-}
-
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
 fn copy_region(
     global_row: u16,
@@ -4005,19 +3968,6 @@ fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
     let center = anchor.x.saturating_add(anchor.width / 2);
     let x = center.saturating_sub(cells / 2);
     Some(Rect::new(x, anchor.y, cells, 1))
-}
-
-fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
-    let spans: Vec<Span<'a>> = line
-        .spans
-        .iter()
-        .map(|s| Span::styled(s.content.as_ref(), s.style))
-        .collect();
-    let mut out = Line::from(spans).style(line.style);
-    if let Some(a) = line.alignment {
-        out = out.alignment(a);
-    }
-    out
 }
 
 fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
@@ -4213,38 +4163,7 @@ fn capture_transcript_snapshot(
     body: Rect,
     row_breaks: Vec<TranscriptRowBreak>,
 ) {
-    use unicode_width::UnicodeWidthStr;
-
-    let cells = {
-        let buffer = f.buffer_mut();
-        let mut cells = Vec::with_capacity(usize::from(body.width) * usize::from(body.height));
-        for y in body.y..body.y.saturating_add(body.height) {
-            let mut column = 0;
-            while column < body.width {
-                let symbol = buffer[(body.x + column, y)].symbol().to_string();
-                let width = (UnicodeWidthStr::width(symbol.as_str()) as u16)
-                    .max(1)
-                    .min(body.width - column);
-                cells.push(TranscriptCell {
-                    symbol,
-                    span_start: column,
-                });
-                for _ in 1..width {
-                    cells.push(TranscriptCell {
-                        symbol: String::new(),
-                        span_start: column,
-                    });
-                }
-                column += width;
-            }
-        }
-        cells
-    };
-    state.set_transcript_snapshot(TranscriptSnapshot {
-        area: body,
-        cells,
-        row_breaks,
-    });
+    state.set_transcript_snapshot(TranscriptSnapshot::capture(f, body, row_breaks));
 }
 
 fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
@@ -4253,19 +4172,7 @@ fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
     else {
         return;
     };
-    let Some((start, end)) = snapshot.selection_bounds(selection) else {
-        return;
-    };
-
-    let buffer = f.buffer_mut();
-    for row in 0..snapshot.area.height {
-        for column in 0..snapshot.area.width {
-            if TranscriptSnapshot::bounds_contain(start, end, CellPoint { column, row }) {
-                buffer[(snapshot.area.x + column, snapshot.area.y + row)]
-                    .set_style(theme::selected_bg_style());
-            }
-        }
-    }
+    snapshot.render_selection(f, selection, theme::selected_bg_style());
 }
 
 fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
@@ -5404,191 +5311,6 @@ enum CopyFeedbackTarget {
 struct CopyFeedback {
     target: CopyFeedbackTarget,
     shown_at: Instant,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CellPoint {
-    column: u16,
-    row: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TranscriptSelection {
-    anchor: CellPoint,
-    head: CellPoint,
-    dragged: bool,
-}
-
-impl TranscriptSelection {
-    fn normalized(self) -> (CellPoint, CellPoint) {
-        if (self.anchor.row, self.anchor.column) <= (self.head.row, self.head.column) {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptCell {
-    symbol: String,
-    span_start: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TranscriptRowBreak {
-    Hard,
-    SoftSpace,
-    SoftConcat,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptSnapshot {
-    area: Rect,
-    cells: Vec<TranscriptCell>,
-    /// Separator before each visible row, derived from source wrap ranges.
-    row_breaks: Vec<TranscriptRowBreak>,
-}
-
-impl TranscriptSnapshot {
-    fn point_at(&self, column: u16, row: u16) -> Option<CellPoint> {
-        if !mouse::in_rect(column, row, self.area) {
-            return None;
-        }
-        Some(CellPoint {
-            column: column - self.area.x,
-            row: row - self.area.y,
-        })
-    }
-
-    fn cell(&self, point: CellPoint) -> Option<&TranscriptCell> {
-        if point.column >= self.area.width || point.row >= self.area.height {
-            return None;
-        }
-        let index =
-            usize::from(point.row) * usize::from(self.area.width) + usize::from(point.column);
-        self.cells.get(index)
-    }
-
-    fn has_text_at(&self, point: CellPoint) -> bool {
-        let Some(cell) = self.cell(point) else {
-            return false;
-        };
-        self.cell(CellPoint {
-            column: cell.span_start,
-            row: point.row,
-        })
-        .is_some_and(|origin| !origin.symbol.chars().all(char::is_whitespace))
-    }
-
-    fn row_text_bounds(&self, row: u16) -> Option<(u16, u16)> {
-        let first =
-            (0..self.area.width).find(|&column| self.has_text_at(CellPoint { column, row }))?;
-        let last = (0..self.area.width)
-            .rev()
-            .find(|&column| self.has_text_at(CellPoint { column, row }))?;
-        Some((first, last))
-    }
-
-    fn clamp_outer_whitespace(&self, mut point: CellPoint) -> CellPoint {
-        if let Some((first, last)) = self.row_text_bounds(point.row) {
-            point.column = point.column.clamp(first, last);
-        }
-        point
-    }
-
-    fn selection_bounds(&self, selection: TranscriptSelection) -> Option<(CellPoint, CellPoint)> {
-        if !selection.dragged {
-            return None;
-        }
-        let (mut start, mut end) = selection.normalized();
-        start = self.clamp_outer_whitespace(start);
-        end = self.clamp_outer_whitespace(end);
-        start.column = self.cell(start)?.span_start;
-        let end_cell = self.cell(end)?;
-        let origin = self.cell(CellPoint {
-            column: end_cell.span_start,
-            row: end.row,
-        })?;
-        end.column = end_cell
-            .span_start
-            .saturating_add(
-                (unicode_width::UnicodeWidthStr::width(origin.symbol.as_str()) as u16)
-                    .max(1)
-                    .saturating_sub(1),
-            )
-            .min(self.area.width.saturating_sub(1));
-        Some((start, end))
-    }
-
-    fn bounds_contain(start: CellPoint, end: CellPoint, point: CellPoint) -> bool {
-        (point.row, point.column) >= (start.row, start.column)
-            && (point.row, point.column) <= (end.row, end.column)
-    }
-
-    fn selected_text(&self, selection: TranscriptSelection) -> Option<String> {
-        if self.cells.is_empty() {
-            return None;
-        }
-
-        let (start, end) = self.selection_bounds(selection)?;
-        let start_row = usize::from(start.row);
-        let end_row = usize::from(end.row);
-        let mut text = String::new();
-
-        for row_idx in start_row..=end_row {
-            let first_col = if row_idx == start_row {
-                start.column
-            } else {
-                0
-            };
-            let last_col = if row_idx == end_row {
-                end.column
-            } else {
-                self.area.width.saturating_sub(1)
-            };
-
-            let mut row_text = String::new();
-            for column in first_col..=last_col {
-                let point = CellPoint {
-                    column,
-                    row: row_idx as u16,
-                };
-                let Some(cell) = self.cell(point) else {
-                    continue;
-                };
-                if cell.span_start == column {
-                    row_text.push_str(&cell.symbol);
-                }
-            }
-            let row_text = row_text.trim_end_matches(' ');
-            if row_idx > start_row {
-                match self
-                    .row_breaks
-                    .get(row_idx)
-                    .copied()
-                    .unwrap_or(TranscriptRowBreak::Hard)
-                {
-                    TranscriptRowBreak::Hard => text.push('\n'),
-                    TranscriptRowBreak::SoftSpace => text.push(' '),
-                    TranscriptRowBreak::SoftConcat => {}
-                }
-            }
-            text.push_str(row_text);
-        }
-
-        text.chars().any(|ch| !ch.is_whitespace()).then_some(text)
-    }
-
-    fn selection_anchor_rect(&self, selection: TranscriptSelection) -> Option<Rect> {
-        if !selection.dragged {
-            return None;
-        }
-        let (start, end) = selection.normalized();
-        let y = self.area.y.saturating_add(start.row);
-        let height = end.row.saturating_sub(start.row).saturating_add(1);
-        Some(Rect::new(self.area.x, y, self.area.width, height))
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

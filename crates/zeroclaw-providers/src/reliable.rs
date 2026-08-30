@@ -13,6 +13,7 @@ use futures_util::{StreamExt, stream};
 use parking_lot::Mutex as ParkingMutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -70,6 +71,7 @@ pub(crate) struct ReliableCallAccounting {
     accepted_route: Option<AcceptedRoute>,
     stream_resume_after: Option<ReliableEntryId>,
     stream_recovery_semantic_empty: bool,
+    stream_recovery_failure: Option<ProviderErrorDiagnostic>,
 }
 
 impl ReliableCallAccounting {
@@ -188,10 +190,25 @@ pub(crate) fn mark_stream_recovery_semantic_empty() {
     });
 }
 
+/// Preserve the classified stream failure while runtime recovers through the
+/// remaining candidates without replaying the failed stream entry.
+pub(crate) fn record_stream_recovery_failure(error: &anyhow::Error) {
+    let _ = RELIABLE_CALL_ACCOUNTING.try_with(|accounting| {
+        accounting.lock().stream_recovery_failure = Some(provider_error_diagnostic(error));
+    });
+}
+
 fn stream_recovery_was_semantic_empty() -> bool {
     RELIABLE_CALL_ACCOUNTING
         .try_with(|accounting| accounting.lock().stream_recovery_semantic_empty)
         .unwrap_or(false)
+}
+
+fn stream_recovery_failure_diagnostic() -> Option<ProviderErrorDiagnostic> {
+    RELIABLE_CALL_ACCOUNTING
+        .try_with(|accounting| accounting.lock().stream_recovery_failure.clone())
+        .ok()
+        .flatten()
 }
 
 /// Take (consume) the last model_provider fallback info, if any.
@@ -497,12 +514,7 @@ pub fn is_non_retryable(err: &anyhow::Error) -> bool {
         return true;
     }
 
-    msg_lower.contains("model")
-        && (msg_lower.contains("not found")
-            || msg_lower.contains("unknown")
-            || msg_lower.contains("unsupported")
-            || msg_lower.contains("does not exist")
-            || msg_lower.contains("invalid"))
+    has_model_not_found_hint(&msg_lower)
 }
 
 /// Check if an error indicates an authentication/authorization failure.
@@ -531,6 +543,20 @@ pub fn is_auth_error(err: &anyhow::Error) -> bool {
     ];
 
     hints.iter().any(|hint| msg_lower.contains(hint))
+}
+
+fn is_missing_credential_error(err: &anyhow::Error) -> bool {
+    let lower = err.to_string().to_lowercase();
+    [
+        "missing api key",
+        "api key not set",
+        "api key is required",
+        "missing access token",
+        "token not set",
+        "anthropic credentials not set",
+    ]
+    .iter()
+    .any(|hint| lower.contains(hint))
 }
 
 pub fn is_tool_schema_error(err: &anyhow::Error) -> bool {
@@ -677,6 +703,146 @@ struct ProviderErrorDiagnostic {
     endpoint: Option<String>,
 }
 
+/// A terminal Reliable failure that can be rendered safely at a user-facing
+/// delivery boundary without exposing retry-attempt diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReliableProviderTerminalFailureKind {
+    ContextWindow,
+    CredentialsMissing,
+    Authentication,
+    RateLimited,
+    ProviderServer,
+    ModelNotFound,
+    ClientRequest,
+    Connection,
+    Timeout,
+    Other,
+}
+
+impl ReliableProviderTerminalFailureKind {
+    fn from_diagnostic_kind(kind: &str) -> Self {
+        match kind {
+            "context_window" => Self::ContextWindow,
+            "credentials_missing" => Self::CredentialsMissing,
+            "auth" => Self::Authentication,
+            "rate_limited" => Self::RateLimited,
+            "provider_server" => Self::ProviderServer,
+            "model_not_found" => Self::ModelNotFound,
+            "client_error" => Self::ClientRequest,
+            "connect" | "connect_timeout" | "dns" => Self::Connection,
+            "timeout" => Self::Timeout,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// The typed terminal presentation cause for a Reliable provider failure.
+///
+/// `Display` intentionally remains the full diagnostic summary used by logs.
+/// User-facing delivery must select a localized message from [`Self::kind`]
+/// instead of exposing the retry envelope.
+#[derive(Debug)]
+pub struct ReliableProviderTerminalFailure {
+    kind: ReliableProviderTerminalFailureKind,
+    provider: Option<String>,
+    endpoint: Option<String>,
+    diagnostic: String,
+    terminal_cause: Option<anyhow::Error>,
+}
+
+impl ReliableProviderTerminalFailure {
+    pub fn new(
+        kind: ReliableProviderTerminalFailureKind,
+        endpoint: Option<String>,
+        diagnostic: String,
+    ) -> Self {
+        Self {
+            kind,
+            provider: None,
+            endpoint,
+            diagnostic,
+            terminal_cause: None,
+        }
+    }
+
+    /// Classify a provider error into a safe terminal presentation cause.
+    pub fn from_error(error: &anyhow::Error) -> Self {
+        let diagnostic = provider_error_diagnostic(error);
+        Self::new(
+            ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            diagnostic.endpoint,
+            format!(
+                "provider error: kind={}; phase={}; hint={}",
+                diagnostic.kind, diagnostic.phase, diagnostic.hint
+            ),
+        )
+    }
+
+    fn with_cause(
+        provider: Option<&str>,
+        diagnostic: ProviderErrorDiagnostic,
+        failure_aggregate: String,
+        terminal_cause: anyhow::Error,
+    ) -> Self {
+        Self {
+            kind: ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            provider: provider
+                .filter(|provider| !provider.is_empty())
+                .map(str::to_owned),
+            endpoint: diagnostic.endpoint,
+            diagnostic: failure_aggregate,
+            terminal_cause: Some(terminal_cause),
+        }
+    }
+
+    pub fn kind(&self) -> ReliableProviderTerminalFailureKind {
+        self.kind
+    }
+
+    /// Attach the configured provider identity used for safe user-facing text.
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        let provider = provider.into();
+        self.provider = (!provider.is_empty()).then_some(provider);
+        self
+    }
+
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    pub fn endpoint(&self) -> Option<&str> {
+        self.endpoint.as_deref()
+    }
+
+    pub fn endpoint_is_local(&self) -> bool {
+        self.endpoint.as_deref().is_some_and(|endpoint| {
+            reqwest::Url::parse(endpoint)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .is_some_and(|host| {
+                    host.eq_ignore_ascii_case("localhost")
+                        || host
+                            .parse::<IpAddr>()
+                            .is_ok_and(|address| address.is_loopback())
+                })
+        })
+    }
+}
+
+impl std::fmt::Display for ReliableProviderTerminalFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.diagnostic)
+    }
+}
+
+impl std::error::Error for ReliableProviderTerminalFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.terminal_cause
+            .as_ref()
+            .map(|cause| cause.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
+
 fn sanitized_url_endpoint(mut url: reqwest::Url) -> String {
     let _ = url.set_username("");
     let _ = url.set_password(None);
@@ -697,6 +863,110 @@ fn endpoint_from_error_text(text: &str) -> Option<String> {
     Some(sanitized_url_endpoint(url))
 }
 
+fn http_status_from_error_text(text: &str) -> Option<u16> {
+    for prefix in [
+        "model_provider stream error: modelprovider error:",
+        "modelprovider error:",
+    ] {
+        if let Some(after_prefix) = text.strip_prefix(prefix).map(str::trim_start)
+            && let Some(code) = after_prefix
+                .get(..3)
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|code| (400..600).contains(code))
+                .filter(|_| {
+                    after_prefix
+                        .as_bytes()
+                        .get(3)
+                        .is_some_and(u8::is_ascii_whitespace)
+                })
+        {
+            return Some(code);
+        }
+    }
+
+    for marker in ["api error (", "http "] {
+        let mut remainder = text;
+        while let Some(start) = remainder.find(marker) {
+            let after_marker = &remainder[start + marker.len()..];
+            if let Some(code) = after_marker
+                .get(..3)
+                .and_then(|value| value.parse::<u16>().ok())
+                .filter(|code| (400..600).contains(code))
+            {
+                return Some(code);
+            }
+            remainder = after_marker;
+        }
+    }
+    None
+}
+
+fn http_status_diagnostic(code: u16, endpoint: Option<String>) -> ProviderErrorDiagnostic {
+    let (kind, hint) = if matches!(code, 401 | 403) {
+        ("auth", "check provider credentials")
+    } else if code == 429 {
+        ("rate_limited", "wait, change key/quota, or switch provider")
+    } else if (500..600).contains(&code) {
+        (
+            "provider_server",
+            "provider returned a server error; retry or switch provider",
+        )
+    } else if code == 404 {
+        (
+            "model_not_found",
+            "check the configured model id for this provider",
+        )
+    } else if (400..500).contains(&code) {
+        (
+            "client_error",
+            "provider rejected the request; check config, model, or request shape",
+        )
+    } else {
+        ("http_error", "inspect provider response or switch provider")
+    };
+    ProviderErrorDiagnostic {
+        kind,
+        phase: "http_response",
+        hint,
+        endpoint,
+    }
+}
+
+fn http_status_is_authoritative(code: u16) -> bool {
+    matches!(code, 401 | 403 | 404 | 429) || (500..600).contains(&code)
+}
+
+fn has_model_not_found_hint(message: &str) -> bool {
+    message.split(": ").any(|segment| {
+        let segment = segment.trim_start();
+
+        [
+            "model not found",
+            "unknown model",
+            "unsupported model",
+            "invalid model",
+        ]
+        .iter()
+        .any(|hint| segment.starts_with(hint))
+            || ["model ", "requested model ", "the requested model "]
+                .iter()
+                .find_map(|prefix| segment.strip_prefix(prefix))
+                .is_some_and(|model_detail| {
+                    [
+                        " not found",
+                        " does not exist",
+                        " is unknown",
+                        " is unsupported",
+                        " is not supported",
+                        " is invalid",
+                    ]
+                    .iter()
+                    .any(|hint| model_detail.contains(hint))
+                        || model_detail == "unknown"
+                })
+    })
+}
+
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
     let error_detail = compact_error_detail(err);
     let lower = error_detail.to_lowercase();
@@ -704,12 +974,32 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         .downcast_ref::<reqwest::Error>()
         .and_then(|reqwest_err| reqwest_err.url().cloned().map(sanitized_url_endpoint))
         .or_else(|| endpoint_from_error_text(&error_detail));
+    let structured_status = err
+        .downcast_ref::<reqwest::Error>()
+        .and_then(reqwest::Error::status)
+        .map(|status| status.as_u16());
+    let text_status = http_status_from_error_text(&lower);
+
+    let http_status = structured_status.or(text_status);
+
+    if let Some(status) = http_status.filter(|status| http_status_is_authoritative(*status)) {
+        return http_status_diagnostic(status, endpoint);
+    }
 
     if is_context_window_exceeded(err) {
         return ProviderErrorDiagnostic {
             kind: "context_window",
             phase: "request_validation",
             hint: "reduce context or use a larger-context model",
+            endpoint,
+        };
+    }
+
+    if is_missing_credential_error(err) {
+        return ProviderErrorDiagnostic {
+            kind: "credentials_missing",
+            phase: "configuration",
+            hint: "configure provider credentials",
             endpoint,
         };
     }
@@ -732,35 +1022,11 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
-    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
-        if let Some(status) = reqwest_err.status() {
-            let code = status.as_u16();
-            let (kind, hint) = if status.is_server_error() {
-                (
-                    "provider_server",
-                    "provider returned a server error; retry or switch provider",
-                )
-            } else if code == 404 {
-                (
-                    "model_not_found",
-                    "check the configured model id for this provider",
-                )
-            } else if status.is_client_error() {
-                (
-                    "client_error",
-                    "provider rejected the request; check config, model, or request shape",
-                )
-            } else {
-                ("http_error", "inspect provider response or switch provider")
-            };
-            return ProviderErrorDiagnostic {
-                kind,
-                phase: "http_response",
-                hint,
-                endpoint,
-            };
-        }
+    if let Some(status) = http_status {
+        return http_status_diagnostic(status, endpoint);
+    }
 
+    if let Some(reqwest_err) = err.downcast_ref::<reqwest::Error>() {
         if reqwest_err.is_timeout() && reqwest_err.is_connect() {
             return ProviderErrorDiagnostic {
                 kind: "connect_timeout",
@@ -801,6 +1067,15 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
+    if lower.contains("client error (connect)") || lower.contains("connection refused") {
+        return ProviderErrorDiagnostic {
+            kind: "connect",
+            phase: "connect",
+            hint: "could not open provider connection; check network, VPN, or firewall",
+            endpoint,
+        };
+    }
+
     if lower.contains("timed out") || lower.contains("timeout") {
         return ProviderErrorDiagnostic {
             kind: "timeout",
@@ -819,13 +1094,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         };
     }
 
-    if lower.contains("model")
-        && (lower.contains("not found")
-            || lower.contains("unknown")
-            || lower.contains("unsupported")
-            || lower.contains("does not exist")
-            || lower.contains("invalid"))
-    {
+    if has_model_not_found_hint(&lower) {
         return ProviderErrorDiagnostic {
             kind: "model_not_found",
             phase: "http_response",
@@ -1195,6 +1464,7 @@ fn reliable_terminal_error(
 }
 
 fn reliable_terminal_error_with_cause(
+    provider: Option<&str>,
     failures: FailureEvents,
     rejected_attempt_usage: Option<TokenUsage>,
     final_cause_is_semantic_empty: bool,
@@ -1202,12 +1472,39 @@ fn reliable_terminal_error_with_cause(
 ) -> anyhow::Error {
     let rejected_attempt_usage = rejected_attempt_usage.or_else(accounted_rejected_attempt_usage);
     if !final_cause_is_semantic_empty && let Some(cause) = final_cause {
+        let terminal_failure = anyhow::Error::new(ReliableProviderTerminalFailure::with_cause(
+            provider,
+            provider_error_diagnostic(&cause),
+            failure_aggregate(&failures),
+            cause,
+        ));
         if let Some(usage) = rejected_attempt_usage {
             return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
-                usage, failures, cause,
+                usage,
+                failures,
+                terminal_failure,
             ));
         }
-        return cause.context(failure_aggregate(&failures));
+        return terminal_failure;
+    }
+    if !final_cause_is_semantic_empty && let Some(diagnostic) = stream_recovery_failure_diagnostic()
+    {
+        let terminal_failure = anyhow::Error::new(
+            ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+                diagnostic.endpoint,
+                failure_aggregate(&failures),
+            )
+            .with_provider(provider.unwrap_or_default()),
+        );
+        if let Some(usage) = rejected_attempt_usage {
+            return anyhow::Error::new(ReliableRejectedCompletionUsage::with_terminal_cause(
+                usage,
+                failures,
+                terminal_failure,
+            ));
+        }
+        return terminal_failure;
     }
     reliable_terminal_error(
         failures,
@@ -1440,6 +1737,13 @@ impl ReliableModelProvider {
         }
     }
 
+    fn configured_provider_identity(&self) -> Option<&str> {
+        self.model_providers
+            .first()
+            .map(ReliableModelProviderEntry::candidate_name)
+            .filter(|provider| !provider.is_empty())
+    }
+
     /// Default cooldown after a retryable 429 when Retry-After is absent.
     const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(10);
 
@@ -1637,6 +1941,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
+        let mut final_cause_provider = None;
 
         // Outer: model fallback chain. Middle: model_provider priority. Inner: retries.
         // Each iteration: attempt one (model_provider, model) call. On success, return
@@ -1776,6 +2081,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()),
                                     failures,
                                     None,
                                     false,
@@ -1831,12 +2137,14 @@ impl ModelProvider for ReliableModelProvider {
                                     "Non-retryable error, moving on"
                                 );
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -1866,6 +2174,7 @@ impl ModelProvider for ReliableModelProvider {
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                             final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -1890,6 +2199,9 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
             failures,
             None,
             final_cause_is_semantic_empty,
@@ -1908,6 +2220,7 @@ impl ModelProvider for ReliableModelProvider {
         let mut failures = FailureEvents::default();
         let mut final_cause_is_semantic_empty = stream_recovery_was_semantic_empty();
         let mut final_cause = None;
+        let mut final_cause_provider = None;
         let mut effective_messages = messages.to_vec();
         let mut context_truncated = false;
 
@@ -2027,6 +2340,7 @@ impl ModelProvider for ReliableModelProvider {
                                 );
                                 final_cause_is_semantic_empty = true;
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
                             final_cause_is_semantic_empty = false;
@@ -2060,6 +2374,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()),
                                     failures,
                                     None,
                                     false,
@@ -2113,12 +2428,14 @@ impl ModelProvider for ReliableModelProvider {
                                     "Non-retryable error, moving on"
                                 );
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -2148,6 +2465,7 @@ impl ModelProvider for ReliableModelProvider {
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                             final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -2168,6 +2486,9 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
             failures,
             None,
             final_cause_is_semantic_empty,
@@ -2271,10 +2592,12 @@ impl ModelProvider for ReliableModelProvider {
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
         let mut final_cause = None;
+        let mut final_cause_provider = None;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 if is_stream_recovery_skip(model_slot, entry_index) {
+                    final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 }
                 let provider_name = entry.display_name.as_str();
@@ -2434,6 +2757,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()),
                                     failures,
                                     rejected_attempt_usage,
                                     false,
@@ -2487,12 +2811,14 @@ impl ModelProvider for ReliableModelProvider {
                                     "Non-retryable error, moving on"
                                 );
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -2522,6 +2848,7 @@ impl ModelProvider for ReliableModelProvider {
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                             final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -2542,6 +2869,9 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
             failures,
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
@@ -2563,10 +2893,12 @@ impl ModelProvider for ReliableModelProvider {
         let mut context_truncated = false;
         let mut rejected_attempt_usage = None;
         let mut final_cause = None;
+        let mut final_cause_provider = None;
 
         for (model_slot, current_model) in models.iter().enumerate() {
             for (entry_index, entry) in self.model_providers.iter().enumerate() {
                 if is_stream_recovery_skip(model_slot, entry_index) {
+                    final_cause_provider = Some(entry.candidate_name().to_string());
                     continue;
                 }
                 let provider_name = entry.display_name.as_str();
@@ -2730,6 +3062,7 @@ impl ModelProvider for ReliableModelProvider {
                                     &failures,
                                 );
                                 return Err(reliable_terminal_error_with_cause(
+                                    Some(entry.candidate_name()),
                                     failures,
                                     rejected_attempt_usage,
                                     false,
@@ -2783,12 +3116,14 @@ impl ModelProvider for ReliableModelProvider {
                                     "Non-retryable error, moving on"
                                 );
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
                             if rate_limited && self.model_providers.len() > 1 {
                                 self.cool_down_rate_limited_provider(entry, served_model, &e);
                                 final_cause = Some(e);
+                                final_cause_provider = Some(entry.candidate_name().to_string());
                                 break;
                             }
 
@@ -2818,6 +3153,7 @@ impl ModelProvider for ReliableModelProvider {
                                 backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
                             }
                             final_cause = Some(e);
+                            final_cause_provider = Some(entry.candidate_name().to_string());
                         }
                     }
                 }
@@ -2842,6 +3178,9 @@ impl ModelProvider for ReliableModelProvider {
         }
 
         Err(reliable_terminal_error_with_cause(
+            final_cause_provider
+                .as_deref()
+                .or_else(|| self.configured_provider_identity()),
             failures,
             rejected_attempt_usage,
             final_cause_is_semantic_empty,
@@ -3145,6 +3484,7 @@ impl ::zeroclaw_api::attribution::Attributable for ReliableModelProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anthropic::AnthropicModelProvider;
     use crate::router::{Route, RouterModelProvider};
     use futures_util::StreamExt;
     use std::sync::Arc;
@@ -5974,6 +6314,30 @@ mod tests {
                 "larger-context model",
             ),
             (
+                "missing api key for configured provider",
+                "credentials_missing",
+                "configuration",
+                "configure provider credentials",
+            ),
+            (
+                "Anthropic credentials not set. Run `zeroclaw quickstart` or `zeroclaw config set` to configure.",
+                "credentials_missing",
+                "configuration",
+                "configure provider credentials",
+            ),
+            (
+                "API error (401): missing API key",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "API error (403): API key not set",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
                 "401 Unauthorized: invalid api key",
                 "auth",
                 "http_response",
@@ -6005,6 +6369,108 @@ mod tests {
                 "model id",
             ),
             (
+                "compatible API error (503 Service Unavailable): overload",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "compatible API error (400 Bad Request): malformed request",
+                "client_error",
+                "http_response",
+                "request shape",
+            ),
+            (
+                "compatible API error (400 Bad Request): input exceeds the context window of this model",
+                "context_window",
+                "request_validation",
+                "larger-context model",
+            ),
+            (
+                "HTTP 503 Service Unavailable",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "HTTP 404 Not Found",
+                "model_not_found",
+                "http_response",
+                "model id",
+            ),
+            (
+                "HTTP 400 Bad Request",
+                "client_error",
+                "http_response",
+                "request shape",
+            ),
+            (
+                "HTTP request failed: HTTP 503 Service Unavailable",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "compatible API error (401 Unauthorized): invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "compatible API error (403 Forbidden): invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "compatible API error (429 Too Many Requests): retry later",
+                "rate_limited",
+                "http_response",
+                "quota",
+            ),
+            (
+                "ModelProvider error: 401 Unauthorized: invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "ModelProvider error: 403 Forbidden: invalid credentials",
+                "auth",
+                "http_response",
+                "credentials",
+            ),
+            (
+                "ModelProvider error: 404 Not Found: unknown model",
+                "model_not_found",
+                "http_response",
+                "model id",
+            ),
+            (
+                "ModelProvider error: 429 Too Many Requests: retry later",
+                "rate_limited",
+                "http_response",
+                "quota",
+            ),
+            (
+                "ModelProvider error: 503 Service Unavailable: overload",
+                "provider_server",
+                "http_response",
+                "server error",
+            ),
+            (
+                "model_provider stream error: ModelProvider error: 404 Not Found: unknown model",
+                "model_not_found",
+                "http_response",
+                "model id",
+            ),
+            (
+                "model_provider stream error: JSON parse error: invalid type: string \"503 Service Unavailable\", expected a sequence at line 1 column 36",
+                "provider_error",
+                "unknown",
+                "inspect provider error",
+            ),
+            (
                 "provider returned an opaque transport error",
                 "provider_error",
                 "unknown",
@@ -6019,6 +6485,140 @@ mod tests {
             assert_eq!(diagnostic.phase, expected_phase, "{message}");
             assert!(diagnostic.hint.contains(expected_hint), "{message}");
         }
+    }
+
+    #[test]
+    fn provider_error_diagnostic_prioritizes_wrapped_structured_http_status() {
+        for (status, expected_kind) in [
+            (reqwest::StatusCode::UNAUTHORIZED, "auth"),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, "rate_limited"),
+        ] {
+            let response = reqwest::Response::from(
+                axum::http::Response::builder()
+                    .status(status)
+                    .body(reqwest::Body::default())
+                    .expect("test response should build"),
+            );
+            let error = anyhow::Error::new(
+                response
+                    .error_for_status()
+                    .expect_err("error status should produce an error"),
+            )
+            .context("missing API key");
+
+            let diagnostic = provider_error_diagnostic(&error);
+
+            assert_eq!(diagnostic.kind, expected_kind, "{status}");
+            assert_eq!(diagnostic.phase, "http_response", "{status}");
+        }
+
+        let response = reqwest::Response::from(
+            axum::http::Response::builder()
+                .status(reqwest::StatusCode::BAD_REQUEST)
+                .body(reqwest::Body::default())
+                .expect("test response should build"),
+        );
+        let error = anyhow::Error::new(
+            response
+                .error_for_status()
+                .expect_err("error status should produce an error"),
+        )
+        .context("input exceeds the context window of this model");
+
+        let diagnostic = provider_error_diagnostic(&error);
+
+        assert_eq!(diagnostic.kind, "context_window");
+        assert_eq!(diagnostic.phase, "request_validation");
+    }
+
+    #[test]
+    fn terminal_provider_failure_keeps_attempt_diagnostics_out_of_presentation_type() {
+        let mut failures = FailureEvents::default();
+        failures.push("event 1 (retry 1/1): retryable; provider detail".to_string());
+        let error = reliable_terminal_error_with_cause(
+            Some("custom.truefoundry"),
+            failures,
+            None,
+            false,
+            Some(anyhow::Error::msg(
+                "error sending request for url (http://127.0.0.1:11434/v1/chat/completions): \
+                 client error (Connect): connection refused",
+            )),
+        );
+
+        assert!(error.to_string().contains("event 1 (retry 1/1)"));
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("terminal provider failure must retain its typed presentation cause");
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::Connection
+        );
+        assert_eq!(failure.provider(), Some("custom.truefoundry"));
+        assert_eq!(
+            failure.endpoint(),
+            Some("http://127.0.0.1:11434/v1/chat/completions")
+        );
+        assert!(failure.endpoint_is_local());
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("client error (Connect): connection refused")
+        }));
+    }
+
+    #[test]
+    fn terminal_provider_failure_preserves_rejected_usage_accounting() {
+        let mut failures = FailureEvents::default();
+        failures.push("event 1 (retry 1/1): retryable; provider detail".to_string());
+        let error = reliable_terminal_error_with_cause(
+            None,
+            failures,
+            Some(TokenUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                cached_input_tokens: None,
+            }),
+            false,
+            Some(anyhow::Error::msg(
+                "compatible API error (503 Service Unavailable)",
+            )),
+        );
+
+        assert_rejected_usage_survives(&error);
+        assert!(error.chain().any(|cause| {
+            cause
+                .downcast_ref::<ReliableProviderTerminalFailure>()
+                .is_some()
+        }));
+    }
+
+    #[tokio::test]
+    async fn anthropic_missing_credentials_reach_typed_terminal_failure() {
+        let model_provider = ReliableModelProvider::new(
+            "anthropic",
+            vec![(
+                "anthropic".into(),
+                Box::new(AnthropicModelProvider::builder("anthropic").build()),
+            )],
+            0,
+            1,
+        );
+
+        let error = model_provider
+            .simple_chat("hello", "claude-sonnet-4-5", Some(0.0))
+            .await
+            .expect_err("missing Anthropic credentials should fail");
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("Reliable must retain the typed Anthropic failure");
+
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::CredentialsMissing
+        );
     }
 
     #[test]
@@ -7390,6 +7990,50 @@ mod tests {
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
+    #[tokio::test]
+    async fn terminal_provider_failure_names_the_final_fallback_candidate() {
+        let model_provider = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "401 Unauthorized",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockModelProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "401 Unauthorized",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let error = model_provider
+            .simple_chat("hello", "test", Some(0.0))
+            .await
+            .expect_err("all configured candidates should fail");
+        let failure = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ReliableProviderTerminalFailure>())
+            .expect("terminal provider failure must retain its typed cause");
+
+        assert_eq!(failure.provider(), Some("fallback"));
+        assert_eq!(
+            failure.kind(),
+            ReliableProviderTerminalFailureKind::Authentication
+        );
+    }
+
     // ── Context window truncation tests ─────────────────────────
 
     #[test]
@@ -8021,6 +8665,49 @@ mod tests {
         // A regular 400 error (e.g. invalid API key) should still be non-retryable.
         let err = anyhow::Error::msg("400 Bad Request: invalid api key provided");
         assert!(is_non_retryable(&err));
+    }
+
+    #[test]
+    fn malformed_stream_parser_error_is_not_treated_as_a_model_failure() {
+        for payload in [
+            "503 Service Unavailable",
+            "model mystery is unknown",
+            "unknown model",
+        ] {
+            let err = anyhow::Error::msg(format!(
+                "model_provider stream error: JSON parse error: invalid type: string \"{payload}\", expected a sequence at line 1 column 36"
+            ));
+
+            assert!(!is_non_retryable(&err), "{payload}");
+            assert_eq!(
+                provider_error_diagnostic(&err).kind,
+                "provider_error",
+                "{payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn model_first_failure_phrases_remain_non_retryable_and_classified() {
+        for message in [
+            "model \"missing\" not found",
+            "model \"mystery\" is unknown",
+            "model unknown",
+            "the requested model 'mystery' is unknown",
+            "model \"legacy\" is unsupported",
+            "model \"legacy\" is not supported",
+            "model \"bad\" is invalid",
+            "model \"gone\" does not exist",
+        ] {
+            let err = anyhow::Error::msg(message);
+
+            assert!(is_non_retryable(&err), "{message}");
+            assert_eq!(
+                provider_error_diagnostic(&err).kind,
+                "model_not_found",
+                "{message}"
+            );
+        }
     }
 
     struct StreamingToolEventMock {

@@ -212,6 +212,40 @@ impl ElevenLabsTtsProvider {
                 .context("Failed to build HTTP client for ElevenLabs TTS")?,
         })
     }
+
+    fn sensitive_api_key_header(&self) -> Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(&self.api_key).map_err(|_| {
+            anyhow::Error::msg("ElevenLabs TTS API key contains invalid header characters")
+        })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    fn build_synthesize_request(&self, text: &str, voice: &str) -> Result<reqwest::RequestBuilder> {
+        if !voice
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!("ElevenLabs voice ID contains invalid characters: {voice}");
+        }
+
+        let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{voice}");
+        let body = serde_json::json!({
+            "text": text,
+            "model_id": self.model_id,
+            "voice_settings": {
+                "stability": self.stability,
+                "similarity_boost": self.similarity_boost,
+            },
+        });
+        let api_key = self.sensitive_api_key_header()?;
+
+        Ok(self
+            .client
+            .post(&url)
+            .header("xi-api-key", api_key)
+            .json(&body))
+    }
 }
 
 #[async_trait::async_trait]
@@ -226,27 +260,8 @@ impl TtsProvider for ElevenLabsTtsProvider {
     }
 
     async fn synthesize(&self, text: &str, voice: &str) -> Result<Vec<u8>> {
-        if !voice
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        {
-            bail!("ElevenLabs voice ID contains invalid characters: {voice}");
-        }
-        let url = format!("https://api.elevenlabs.io/v1/text-to-speech/{voice}");
-        let body = serde_json::json!({
-            "text": text,
-            "model_id": self.model_id,
-            "voice_settings": {
-                "stability": self.stability,
-                "similarity_boost": self.similarity_boost,
-            },
-        });
-
         let resp = self
-            .client
-            .post(&url)
-            .header("xi-api-key", &self.api_key)
-            .json(&body)
+            .build_synthesize_request(text, voice)?
             .send()
             .await
             .context("Failed to send ElevenLabs TTS request")?;
@@ -1351,6 +1366,75 @@ mod tests {
             },
         );
         cfg
+    }
+
+    fn elevenlabs_tts_provider(api_key: &str) -> ElevenLabsTtsProvider {
+        ElevenLabsTtsProvider::new(
+            "test",
+            &TtsProviderConfig {
+                api_key: Some(api_key.to_string()),
+                ..TtsProviderConfig::default()
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn elevenlabs_synthesize_request_preserves_endpoint_body_and_sensitive_header() {
+        let credential = "synthetic-elevenlabs-key";
+        let provider = elevenlabs_tts_provider(credential);
+        let request = provider
+            .build_synthesize_request("hello world", "voice_123")
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://api.elevenlabs.io/v1/text-to-speech/voice_123"
+        );
+
+        let header = request
+            .headers()
+            .get("xi-api-key")
+            .expect("ElevenLabs TTS API key header");
+        assert_eq!(header.to_str().unwrap(), credential);
+        assert!(header.is_sensitive());
+
+        let payload = request
+            .body()
+            .and_then(|body| body.as_bytes())
+            .expect("ElevenLabs TTS request body should be bytes");
+        let body: serde_json::Value = serde_json::from_slice(payload).unwrap();
+
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "text": "hello world",
+                "model_id": "eleven_monolingual_v1",
+                "voice_settings": {
+                    "stability": 0.5,
+                    "similarity_boost": 0.5,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn elevenlabs_tts_rejects_control_characters_without_echoing_credential() {
+        let credential = "synthetic-elevenlabs-key\r\ninjected: value";
+        let provider = elevenlabs_tts_provider(credential);
+
+        let error = match provider.build_synthesize_request("hello", "voice_123") {
+            Ok(_) => panic!("control characters must be rejected before dispatch"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "ElevenLabs TTS API key contains invalid header characters"
+        );
+        assert!(!error.to_string().contains(credential));
     }
 
     fn google_tts_provider(api_key: &str) -> GoogleTtsProvider {

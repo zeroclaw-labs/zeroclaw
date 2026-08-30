@@ -150,6 +150,7 @@ pub(crate) async fn consume_provider_streaming_response(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
+                let provider_error = anyhow::Error::msg(message.clone());
                 if visible_event_output {
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
@@ -159,6 +160,9 @@ pub(crate) async fn consume_provider_streaming_response(
                         partial_text: forwarded_text,
                         message,
                         usage: outcome.usage,
+                        cause: zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
+                            &provider_error,
+                        ),
                     }
                     .into());
                 }

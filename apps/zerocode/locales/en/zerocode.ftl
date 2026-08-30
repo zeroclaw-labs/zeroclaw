@@ -180,7 +180,9 @@ zc-logs-search-action-apply = apply
 zc-logs-search-action-cancel = cancel
 
 zc-logs-help-mouse-label = Mouse
-zc-logs-help-mouse-desc = Click to select, scroll wheel, double-click detail
+zc-logs-help-mouse-desc = Click rows, drag to select text, scroll wheel, double-click detail
+zc-logs-copy = Copy
+zc-logs-copied = [Copied]
 
 zc-doctor-title = Doctor
 zc-doctor-loading = Loading diagnostics...

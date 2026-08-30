@@ -38,9 +38,21 @@ impl HookRunner {
             runner.register(Box::new(super::builtin::CommandLoggerHook::new()));
         }
         if hooks.builtin.webhook_audit.enabled {
-            runner.register(Box::new(super::builtin::WebhookAuditHook::new(
-                hooks.builtin.webhook_audit.clone(),
-            )));
+            match super::builtin::WebhookAuditHook::new(hooks.builtin.webhook_audit.clone()) {
+                Ok(hook) => runner.register(Box::new(hook)),
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "hook": "webhook-audit",
+                                "error": error,
+                            })),
+                        "webhook-audit hook configuration is invalid; hook disabled"
+                    );
+                }
+            }
         }
         runner
     }
@@ -923,6 +935,26 @@ mod tests {
             names.contains(&"command-logger"),
             "command-logger enabled → must be registered; got {names:?}"
         );
+    }
+
+    #[test]
+    fn from_config_skips_invalid_webhook_and_keeps_valid_builtins() {
+        let config = zeroclaw_config::schema::HooksConfig {
+            enabled: true,
+            builtin: zeroclaw_config::schema::BuiltinHooksConfig {
+                command_logger: true,
+                webhook_audit: zeroclaw_config::schema::WebhookAuditConfig {
+                    enabled: true,
+                    url: "http://example.com/audit".to_string(),
+                    ..Default::default()
+                },
+            },
+        };
+
+        let runner = HookRunner::from_config(&config);
+        let names: Vec<&str> = runner.handlers.iter().map(|h| h.name()).collect();
+
+        assert_eq!(names, vec!["command-logger"]);
     }
 
     #[tokio::test]

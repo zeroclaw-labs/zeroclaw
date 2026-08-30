@@ -38,6 +38,15 @@ fn invalid_semantic_completion_error(agent_name: &str) -> String {
 }
 
 fn delegate_failure_error(agent_name: &str, error: &anyhow::Error) -> String {
+    if error
+        .chain()
+        .any(|source| source.is::<zeroclaw_providers::ReliableProviderTerminalFailure>())
+    {
+        // Reliable's aggregate is the durable retry diagnostic for delegated
+        // task records; other typed terminal failures use the delivery projection.
+        return format!("Agent '{agent_name}' failed: {error}");
+    }
+
     crate::agent::turn::outcome::terminal_completion_error_message(error, Some(agent_name))
         .unwrap_or_else(|| format!("Agent '{agent_name}' failed: {error}"))
 }
@@ -3008,7 +3017,10 @@ mod tests {
         ModelProviderConfig, ModelRouteConfig,
     };
     use zeroclaw_memory::{AgentScopedMemory, SqliteMemory};
-    use zeroclaw_providers::{ChatRequest, ChatResponse, ToolCall};
+    use zeroclaw_providers::{
+        ChatRequest, ChatResponse, ReliableProviderTerminalFailure,
+        ReliableProviderTerminalFailureKind, ToolCall,
+    };
 
     zeroclaw_api::mock_tool_attribution!(EchoTool, FakeMcpTool);
 
@@ -5376,6 +5388,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_agentic_delegate_retains_provider_terminal_diagnostic() {
+        let result = DelegateTool::render_non_agentic_result(
+            "delegate",
+            "custom",
+            "model",
+            Err(anyhow::Error::new(ReliableProviderTerminalFailure::new(
+                ReliableProviderTerminalFailureKind::Connection,
+                None,
+                "All model providers/models failed after 3 failure event(s). Events: retry 1/3"
+                    .to_string(),
+            ))),
+        );
+
+        assert!(!result.success);
+        assert_eq!(
+            result.error.as_deref(),
+            Some(
+                "Agent 'delegate' failed: All model providers/models failed after 3 failure event(s). Events: retry 1/3"
+            )
+        );
+    }
+
+    #[test]
+    fn delegate_failure_projects_provider_tools_terminal_category() {
+        let error = anyhow::Error::new(
+            crate::agent::turn::outcome::StreamPreExecutedToolsWithoutFinalResponse { usage: None },
+        );
+        let expected = crate::agent::turn::outcome::terminal_completion_error_message(
+            &error,
+            Some("delegate"),
+        )
+        .expect("provider-tools terminal category must project");
+
+        assert_eq!(delegate_failure_error("delegate", &error), expected);
+        assert_ne!(
+            expected,
+            "Agent 'delegate' failed: provider stream ended after provider-executed tools without a final response"
+        );
+    }
+
+    #[tokio::test]
     async fn execute_agentic_rejects_empty_terminal_completion() {
         let config = agentic_agent_config();
         let tool = DelegateTool::new(HashMap::new(), None, test_security())
@@ -5433,7 +5486,7 @@ mod tests {
             "failed delegate must not emit output"
         );
         let error = result.error.as_deref().unwrap_or_default();
-        assert!(error.contains("invalid semantic completion"), "{error}");
+        assert_eq!(error, invalid_semantic_completion_error("agentic"));
         assert!(!error.contains("[Empty response]"), "{error}");
     }
 
@@ -6304,6 +6357,7 @@ mod tests {
                     .await
                     .unwrap(),
             ),
+            security: Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
         };
         let handle = Arc::clone(&parent_tools);
         let tool_search = crate::tools::ToolSearchTool::new(deferred, Arc::clone(&activated))
