@@ -43,9 +43,11 @@
 //!   [`take_revoked`]/[`apply_if_not_revoked`], and a time-based sweep
 //!   could otherwise drop the revocation while the selection is still
 //!   queued, letting the route mutate after the UI reported failure. If
-//!   the queued message was dropped at runtime shutdown nothing consumes
-//!   the marker; that residue is bounded by the number of timed-out
-//!   selections and harmless.
+//!   the queued message was dropped because the runtime receiver went away
+//!   before dequeue, nothing consumes the marker; [`clear_abandoned`]
+//!   reclaims that residue once the dispatch pipeline is definitively gone
+//!   (`start_channels` teardown), which is the only point where no live
+//!   queued selection can still hold revocation authority.
 
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -257,6 +259,16 @@ pub(crate) fn take_revoked(message_id: &str) -> bool {
         return true;
     }
     false
+}
+
+/// Reclaim every registration whose owning dispatch pipeline is gone.
+/// Must only run once the runtime queue is definitively dead
+/// (`start_channels` teardown): a revoked marker is authority for a
+/// selection that may still be queued, and clearing it while the message
+/// remains live would let the late dispatch apply a route change the
+/// picker UI already reported as unavailable.
+pub(crate) fn clear_abandoned() {
+    pending().clear();
 }
 
 /// Route-mutation handoff at the authoritative mutation point. Runs `f`
@@ -594,6 +606,26 @@ mod tests {
             !is_registered("selection-stale-open"),
             "stale open entry must be reclaimed without consumption"
         );
+    }
+
+    #[tokio::test]
+    async fn clear_abandoned_reclaims_revoked_entry_after_queue_death() {
+        let _guard = test_lock();
+        // The callback timed out (selection revoked) and the runtime
+        // receiver was then dropped before dequeue: nothing will ever
+        // consume the marker. Once the dispatch pipeline is definitively
+        // gone, `clear_abandoned` reclaims the residue — and never before,
+        // so a still-queued selection cannot lose its revocation.
+        let mut ack = super::register("selection-abandoned");
+        ack.mark_enqueued();
+        assert!(matches!(
+            super::revoke("selection-abandoned"),
+            super::RevokeOutcome::Won
+        ));
+        drop(ack);
+        assert!(is_registered("selection-abandoned"));
+        super::clear_abandoned();
+        assert!(!is_registered("selection-abandoned"));
     }
 
     #[tokio::test]

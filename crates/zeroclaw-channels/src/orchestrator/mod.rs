@@ -8587,6 +8587,23 @@ fn resolve_effective_debounce_window(
     std::time::Duration::from_millis(per_channel_ms.unwrap_or(global_ms))
 }
 
+/// Drop guard reclaiming abandoned model-picker delivery-ack
+/// registrations when the production dispatch pipeline (`start_channels`)
+/// tears down — whether it returns normally or its future is dropped on
+/// shutdown. Only then is the runtime queue definitively dead, so no live
+/// queued selection can lose its revocation authority. Tests drive
+/// `run_message_dispatch_loop` directly and never pass through here, so
+/// their registry entries are untouched.
+#[cfg(feature = "channel-telegram")]
+struct ModelPickerAckCleanupGuard;
+
+#[cfg(feature = "channel-telegram")]
+impl Drop for ModelPickerAckCleanupGuard {
+    fn drop(&mut self) {
+        crate::model_picker_delivery::clear_abandoned();
+    }
+}
+
 async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<zeroclaw_api::channel::ChannelMessage>,
     router: AgentRouter,
@@ -13013,6 +13030,11 @@ pub async fn start_channels(
     let rx = rx_holder.expect("rx initialized by first agent's channel setup");
     let max_in_flight =
         max_in_flight_messages.expect("max_in_flight initialized by first agent's channel setup");
+    // Declared before the dispatch loop so it drops after it: on any
+    // `start_channels` teardown the production queue is gone and abandoned
+    // picker ack registrations are reclaimed.
+    #[cfg(feature = "channel-telegram")]
+    let _picker_ack_cleanup = ModelPickerAckCleanupGuard;
     run_message_dispatch_loop(rx, router, max_in_flight).await;
 
     for h in listener_handles {
