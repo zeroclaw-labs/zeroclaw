@@ -2314,6 +2314,63 @@ mod tests {
     }
 
     #[test]
+    fn alt_backspace_deletes_previous_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn plain_backspace_still_deletes_one_grapheme() {
+        // The word-delete chord differs from Backspace only by ALT, so an
+        // over-permissive match would silently turn every Backspace into a
+        // word delete.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello worl");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn alt_backspace_deletes_the_selection_when_one_is_active() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+        bar.selection = Some((6, 11));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello ");
+        assert!(bar.selection.is_none());
+    }
+
+    #[test]
+    fn alt_backspace_normalizes_cursor_after_joining_emoji_graphemes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("🇺x🇸");
+        bar.move_cursor_left();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
     fn alt_arrows_move_by_word_without_changing_input() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut bar = input_bar_with_shared_commands();

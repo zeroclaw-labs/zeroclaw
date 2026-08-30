@@ -1,7 +1,9 @@
 use anyhow::{Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, Utc};
+use portable_atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
@@ -129,6 +131,37 @@ impl WebhookChannel {
         };
 
         mac.verify_slice(&expected).is_ok()
+    }
+
+    /// Serve inbound webhook requests on an already-bound listener. Split out
+    /// from `listen()` so tests can bind an OS-assigned port and read it back
+    /// before the server starts accepting connections.
+    pub(crate) async fn listen_with_listener(
+        &self,
+        listener: tokio::net::TcpListener,
+        tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    ) -> Result<()> {
+        let state = Arc::new(WebhookState {
+            tx,
+            secret: self.secret.clone(),
+            counter: Arc::new(AtomicU64::new(0)),
+            alias: self.alias.clone(),
+        });
+
+        let app = build_webhook_router(&self.listen_path, state);
+
+        axum::serve(listener, app).await.map_err(|e| {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "Webhook server error"
+            );
+            anyhow::Error::msg(format!("Webhook server error: {e}"))
+        })?;
+
+        Ok(())
     }
 
     async fn attempt_send(
@@ -261,6 +294,118 @@ enum AttemptOutcome {
     Fatal(anyhow::Error),
 }
 
+// ---------------------------------------------------------------------------
+// Webhook state and router (module-level for testability)
+// ---------------------------------------------------------------------------
+
+struct WebhookState {
+    tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+    secret: Option<String>,
+    counter: Arc<AtomicU64>,
+    alias: String,
+}
+
+fn build_webhook_router(listen_path: &str, state: Arc<WebhookState>) -> axum::Router {
+    use axum::{Router, routing::post};
+    Router::new()
+        .route(listen_path, post(handle_webhook))
+        .with_state(state)
+}
+
+async fn handle_webhook(
+    axum::extract::State(state): axum::extract::State<Arc<WebhookState>>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::http::StatusCode {
+    use axum::http::StatusCode;
+
+    // Verify signature if secret is configured
+    if let Some(ref secret) = state.secret {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let signature = headers
+            .get("x-webhook-signature")
+            .and_then(|v| v.to_str().ok());
+
+        let valid = if let Some(sig) = signature {
+            if let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) {
+                mac.update(&body);
+                let expected = hex::decode(sig.trim_start_matches("sha256=")).unwrap_or_default();
+                mac.verify_slice(&expected).is_ok()
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !valid {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "invalid signature, rejecting request"
+            );
+            return StatusCode::UNAUTHORIZED;
+        }
+    }
+
+    let payload: IncomingWebhook = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "invalid JSON payload"
+            );
+            return StatusCode::BAD_REQUEST;
+        }
+    };
+
+    if payload.content.is_empty() {
+        return StatusCode::BAD_REQUEST;
+    }
+
+    let seq = state.counter.fetch_add(1, Ordering::Relaxed);
+
+    #[allow(clippy::cast_possible_truncation)]
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let reply_target = payload
+        .thread_id
+        .clone()
+        .unwrap_or_else(|| payload.sender.clone());
+
+    let msg = ChannelMessage {
+        id: format!("webhook_{seq}"),
+        sender: payload.sender,
+        reply_target,
+        content: payload.content,
+        channel: "webhook".to_string(),
+        channel_alias: Some(state.alias.clone()),
+        timestamp,
+        thread_ts: payload.thread_id,
+        interruption_scope_id: None,
+        attachments: vec![],
+        subject: None,
+
+        ..Default::default()
+    };
+
+    if state.tx.send(msg).await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    StatusCode::OK
+}
+
 #[async_trait]
 impl Channel for WebhookChannel {
     fn name(&self) -> &str {
@@ -354,129 +499,6 @@ impl Channel for WebhookChannel {
             );
         }
 
-        use axum::{
-            Router,
-            body::Bytes,
-            extract::State,
-            http::{HeaderMap, StatusCode},
-            routing::post,
-        };
-        use portable_atomic::{AtomicU64, Ordering};
-        use std::sync::Arc;
-
-        let counter = Arc::new(AtomicU64::new(0));
-
-        struct WebhookState {
-            tx: tokio::sync::mpsc::Sender<ChannelMessage>,
-            secret: Option<String>,
-            counter: Arc<AtomicU64>,
-        }
-
-        let state = Arc::new(WebhookState {
-            tx: tx.clone(),
-            secret: self.secret.clone(),
-            counter: counter.clone(),
-        });
-
-        let listen_path = self.listen_path.clone();
-
-        async fn handle_webhook(
-            State(state): State<Arc<WebhookState>>,
-            headers: HeaderMap,
-            body: Bytes,
-        ) -> StatusCode {
-            // Verify signature if secret is configured
-            if let Some(ref secret) = state.secret {
-                use hmac::{Hmac, Mac};
-                use sha2::Sha256;
-                type HmacSha256 = Hmac<Sha256>;
-
-                let signature = headers
-                    .get("x-webhook-signature")
-                    .and_then(|v| v.to_str().ok());
-
-                let valid = if let Some(sig) = signature {
-                    if let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) {
-                        mac.update(&body);
-                        let expected =
-                            hex::decode(sig.trim_start_matches("sha256=")).unwrap_or_default();
-                        mac.verify_slice(&expected).is_ok()
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                };
-
-                if !valid {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                        "invalid signature, rejecting request"
-                    );
-                    return StatusCode::UNAUTHORIZED;
-                }
-            }
-
-            let payload: IncomingWebhook = match serde_json::from_slice(&body) {
-                Ok(p) => p,
-                Err(e) => {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "invalid JSON payload"
-                    );
-                    return StatusCode::BAD_REQUEST;
-                }
-            };
-
-            if payload.content.is_empty() {
-                return StatusCode::BAD_REQUEST;
-            }
-
-            let seq = state.counter.fetch_add(1, Ordering::Relaxed);
-
-            #[allow(clippy::cast_possible_truncation)]
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-
-            let reply_target = payload
-                .thread_id
-                .clone()
-                .unwrap_or_else(|| payload.sender.clone());
-
-            let msg = ChannelMessage {
-                id: format!("webhook_{seq}"),
-                sender: payload.sender,
-                reply_target,
-                content: payload.content,
-                channel: "webhook".to_string(),
-                channel_alias: None,
-                timestamp,
-                thread_ts: payload.thread_id,
-                interruption_scope_id: None,
-                attachments: vec![],
-                subject: None,
-
-                ..Default::default()
-            };
-
-            if state.tx.send(msg).await.is_err() {
-                return StatusCode::SERVICE_UNAVAILABLE;
-            }
-
-            StatusCode::OK
-        }
-
-        let app = Router::new()
-            .route(&listen_path, post(handle_webhook))
-            .with_state(state);
-
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], self.listen_port));
         ::zeroclaw_log::record!(
             INFO,
@@ -488,18 +510,7 @@ impl Channel for WebhookChannel {
         );
 
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        axum::serve(listener, app).await.map_err(|e| {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                "Webhook server error"
-            );
-            anyhow::Error::msg(format!("Webhook server error: {e}"))
-        })?;
-
-        Ok(())
+        self.listen_with_listener(listener, tx).await
     }
 
     async fn health_check(&self) -> bool {
@@ -816,6 +827,163 @@ mod tests {
             msg.contains("requires a `secret`"),
             "expected error about missing secret, got: {msg}",
         );
+    }
+
+    // ---- Inbound alias routing (gateway handler + downstream lookup) -----
+
+    fn make_channel_with_alias(alias: &str) -> WebhookChannel {
+        WebhookChannel::new(
+            alias.into(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some("mysecret".into()),
+            None,
+            None,
+            None,
+        )
+    }
+
+    fn sign_body(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+        let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
+        mac.update(body);
+        hex::encode(mac.finalize().into_bytes())
+    }
+
+    /// Spawn a webhook server on an OS-assigned port.
+    /// Returns `(port, rx, abort_handle)`; abort the handle to stop the server.
+    async fn spawn_webhook(
+        ch: WebhookChannel,
+    ) -> (
+        u16,
+        tokio::sync::mpsc::Receiver<ChannelMessage>,
+        tokio::task::AbortHandle,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let jh = zeroclaw_spawn::spawn!(async move {
+            ch.listen_with_listener(listener, tx).await.ok();
+        });
+        // Give the server a moment to begin accepting connections.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (port, rx, jh.abort_handle())
+    }
+
+    /// POST a signed inbound payload to a spawned webhook listener and return
+    /// the HTTP status code.
+    async fn post_signed(port: u16, secret: &str, body: &serde_json::Value) -> u16 {
+        let bytes = serde_json::to_vec(body).unwrap();
+        let sig = sign_body(secret, &bytes);
+        reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/webhook"))
+            .header("Content-Type", "application/json")
+            .header("x-webhook-signature", sig)
+            .body(bytes)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16()
+    }
+
+    #[tokio::test]
+    async fn inbound_message_carries_configured_alias() {
+        let ch = make_channel_with_alias("support");
+        let (port, mut rx, _jh) = spawn_webhook(ch).await;
+
+        let status = post_signed(
+            port,
+            "mysecret",
+            &serde_json::json!({"sender": "alice", "content": "hello"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let msg = rx.recv().await.expect("expected a routed message");
+        assert_eq!(msg.channel, "webhook");
+        assert_eq!(msg.channel_alias.as_deref(), Some("support"));
+        assert_eq!(msg.sender, "alice");
+        assert_eq!(msg.content, "hello");
+    }
+
+    #[tokio::test]
+    async fn two_webhook_aliases_route_to_distinct_instances() {
+        let alpha = make_channel_with_alias("alpha");
+        let beta = make_channel_with_alias("beta");
+        let (alpha_port, mut alpha_rx, _alpha_jh) = spawn_webhook(alpha).await;
+        let (beta_port, mut beta_rx, _beta_jh) = spawn_webhook(beta).await;
+
+        let alpha_status = post_signed(
+            alpha_port,
+            "mysecret",
+            &serde_json::json!({"sender": "alice", "content": "from alpha"}),
+        )
+        .await;
+        let beta_status = post_signed(
+            beta_port,
+            "mysecret",
+            &serde_json::json!({"sender": "bob", "content": "from beta"}),
+        )
+        .await;
+        assert_eq!(alpha_status, 200);
+        assert_eq!(beta_status, 200);
+
+        let alpha_msg = alpha_rx.recv().await.expect("alpha message");
+        let beta_msg = beta_rx.recv().await.expect("beta message");
+
+        // Each instance stamps its own configured alias. The bug this guards
+        // against had both collapse onto `channel_alias: None` and rely on
+        // whichever webhook instance registered the bare `webhook` owner key
+        // first, so the two aliases would end up sharing one agent/session.
+        assert_eq!(alpha_msg.channel_alias.as_deref(), Some("alpha"));
+        assert_eq!(beta_msg.channel_alias.as_deref(), Some("beta"));
+
+        // Downstream session/routing scope keys off `channel_alias` — two
+        // aliases must compute distinct keys so they never share a session.
+        let alpha_key = crate::orchestrator::conversation_history_key(&alpha_msg);
+        let beta_key = crate::orchestrator::conversation_history_key(&beta_msg);
+        assert_ne!(alpha_key, beta_key);
+        assert!(
+            alpha_key.starts_with("webhook_alpha_"),
+            "alpha key should be scoped by its own alias: {alpha_key}"
+        );
+        assert!(
+            beta_key.starts_with("webhook_beta_"),
+            "beta key should be scoped by its own alias: {beta_key}"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_webhook_config_still_behaves_as_before() {
+        // A plain single-instance webhook config: one alias, no siblings.
+        // Message parsing, reply-target derivation, and id format must stay
+        // exactly as before — the only change is that `channel_alias` is now
+        // populated with the configured alias instead of `None`.
+        let ch = make_channel_with_alias("primary");
+        let (port, mut rx, _jh) = spawn_webhook(ch).await;
+
+        let status = post_signed(
+            port,
+            "mysecret",
+            &serde_json::json!({"sender": "carol", "content": "hi", "thread_id": "t1"}),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let msg = rx.recv().await.expect("expected a routed message");
+        assert_eq!(msg.channel, "webhook");
+        assert_eq!(msg.sender, "carol");
+        assert_eq!(msg.content, "hi");
+        assert_eq!(msg.reply_target, "t1");
+        assert_eq!(msg.thread_ts.as_deref(), Some("t1"));
+        assert!(msg.id.starts_with("webhook_"));
+        assert_eq!(msg.channel_alias.as_deref(), Some("primary"));
     }
 
     #[test]

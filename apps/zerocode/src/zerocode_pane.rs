@@ -1753,6 +1753,26 @@ impl ZerocodePane {
         }
     }
 
+    /// Why installing `chords` for `action_key` would leave the keymap
+    /// ambiguous, or `None` when it is safe.
+    ///
+    /// Both editor writes go through this. A config file loaded whole is
+    /// already checked by `build_override_table`, but these two install one row
+    /// against a table nobody re-validates, and a chord owned by two explicit
+    /// rows is arbitrated nowhere: dispatch silently follows enum declaration
+    /// order while Help advertises the chord for both actions. Refusing names
+    /// the other action so the operator can rebind it first, which is a worse
+    /// outcome than succeeding but a better one than a binding that does
+    /// something else.
+    fn collision_reason(action_key: &str, chords: &[Chord]) -> Option<String> {
+        let (tag, variant) = action_key.split_once('.')?;
+        let (chord, other) = overrides::conflicting_row(tag, variant, chords)?;
+        Some(format!(
+            "'{}' is already bound to {tag}.{other}; rebind that first",
+            chord.display()
+        ))
+    }
+
     fn reset_row(&mut self) {
         let Some(row) = self.rows.get(self.binding_cursor) else {
             return;
@@ -1761,6 +1781,10 @@ impl ZerocodePane {
         // Reset = restore compile-time default for this single action by
         // persisting its default chords, then re-resolving.
         let defaults = default_chords_for(&action_key);
+        if let Some(reason) = Self::collision_reason(&action_key, &defaults) {
+            self.status = Some(format!("Reset refused: {reason}"));
+            return;
+        }
         if let Err(e) = config::persist_keybind_row(&self.config_dir, &action_key, defaults.clone())
         {
             self.status = Some(format!("Reset failed: {e}"));
@@ -1797,6 +1821,10 @@ impl ZerocodePane {
             return;
         };
         let action_key = self.rows[cap.row].action_key.clone();
+        if let Some(reason) = Self::collision_reason(&action_key, std::slice::from_ref(&chord)) {
+            self.status = Some(format!("Save refused: {reason}"));
+            return;
+        }
         if let Err(e) =
             config::persist_keybind_row(&self.config_dir, &action_key, vec![chord.clone()])
         {
@@ -2155,6 +2183,7 @@ fn defaults_in<A: crate::keymap::RebindableActions>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::keymap::InputBarAction;
     use crossterm::event::{KeyCode, KeyEvent};
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -2168,6 +2197,138 @@ mod tests {
         while pane.focus != target {
             pane.handle_key(key(KeyCode::Down));
         }
+    }
+
+    /// Park the binding cursor on `action_key`, returning its row index.
+    fn focus_binding(pane: &mut ZerocodePane, action_key: &str) -> usize {
+        pane.rebuild_rows();
+        let idx = pane
+            .rows
+            .iter()
+            .position(|r| r.action_key == action_key)
+            .unwrap_or_else(|| panic!("no binding row for {action_key}"));
+        pane.binding_cursor = idx;
+        idx
+    }
+
+    /// Install one explicit override row, the way a config load or an earlier
+    /// editor save would have left it.
+    fn given_explicit_row(action_key: &str, chords: Vec<Chord>) {
+        let (tag, variant) = action_key.split_once('.').expect("dotted action key");
+        overrides::set_row(tag, variant, chords);
+    }
+
+    /// The bot's round-2 finding, at both call sites. An operator already owning
+    /// `alt+backspace` on a *different* input-bar action must not end up with two
+    /// explicit owners of it, because nothing arbitrates that pair: dispatch
+    /// falls to enum declaration order and Help advertises the chord twice.
+    ///
+    /// Reset is the path this PR newly reaches, because `alt+backspace` is now
+    /// one of the chords `default_chords_for("input_bar.delete_previous_word")`
+    /// writes. Capture is reachable without this PR at all.
+    #[test]
+    fn binding_editor_refuses_a_chord_another_explicit_row_owns() {
+        let _g = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let alt_backspace = Chord::with(KeyCode::Backspace, KeyModifiers::ALT);
+
+        for capture in [false, true] {
+            crate::keymap::overrides::reset();
+            given_explicit_row("input_bar.clear_input", vec![alt_backspace.clone()]);
+
+            let dir = tempfile::tempdir().unwrap();
+            let mut pane = ZerocodePane::new(dir.path());
+            let row = focus_binding(&mut pane, "input_bar.delete_previous_word");
+
+            if capture {
+                pane.capture = Some(Capture { row, error: None });
+                pane.handle_capture_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+            } else {
+                pane.reset_row();
+            }
+
+            let status = pane.status().unwrap_or_default().to_string();
+            assert!(
+                status.contains("refused") && status.contains("clear_input"),
+                "the write must be refused and name the other owner, got: {status:?}"
+            );
+
+            // The refusal is only worth anything if it left the keymap alone.
+            let ev = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+            assert_eq!(
+                InputBarAction::from_chord(&ev),
+                Some(InputBarAction::ClearInput),
+                "the operator's existing binding must still own the chord"
+            );
+            assert!(
+                !crate::keymap::action_key_labels(InputBarAction::DeletePreviousWord)
+                    .contains(&alt_backspace.display()),
+                "a refused write must not advertise the chord in Help"
+            );
+        }
+        crate::keymap::overrides::reset();
+    }
+
+    /// The editor half of the darwin normalization case. `ctrl+a` and `super+a`
+    /// are one chord at dispatch there, so capturing `super+a` for an action
+    /// while another explicit row owns `ctrl+a` would install two rows that
+    /// only the dispatcher can tell apart.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn binding_editor_refuses_a_normalized_collision_on_darwin() {
+        let _g = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+        given_explicit_row("input_bar.clear_input", vec![Chord::ctrl('a')]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let row = focus_binding(&mut pane, "input_bar.delete_previous_word");
+        pane.capture = Some(Capture { row, error: None });
+        pane.handle_capture_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+
+        let status = pane.status().unwrap_or_default().to_string();
+        assert!(
+            status.contains("refused") && status.contains("clear_input"),
+            "a chord that only differs on the wire must still collide, got: {status:?}"
+        );
+        assert_eq!(
+            InputBarAction::from_chord(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER)),
+            Some(InputBarAction::ClearInput),
+            "the existing binding must keep the key"
+        );
+        crate::keymap::overrides::reset();
+    }
+
+    /// The inverse, so the guard cannot pass by refusing everything: a chord
+    /// nobody else owns still installs.
+    #[test]
+    fn binding_editor_still_saves_an_unclaimed_chord() {
+        let _g = crate::keymap::overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::keymap::overrides::reset();
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut pane = ZerocodePane::new(dir.path());
+        let row = focus_binding(&mut pane, "input_bar.delete_previous_word");
+        pane.capture = Some(Capture { row, error: None });
+        // alt+d is bound by no default in this repo.
+        pane.handle_capture_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+
+        let status = pane.status().unwrap_or_default().to_string();
+        assert!(
+            !status.contains("refused"),
+            "an unclaimed chord must save, got: {status:?}"
+        );
+        let ev = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT);
+        assert_eq!(
+            InputBarAction::from_chord(&ev),
+            Some(InputBarAction::DeletePreviousWord)
+        );
+        crate::keymap::overrides::reset();
     }
 
     fn edit_tracker_number(pane: &mut ZerocodePane, field: TrackerField, value: &str) {

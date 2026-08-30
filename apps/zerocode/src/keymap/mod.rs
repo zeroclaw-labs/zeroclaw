@@ -79,10 +79,15 @@ pub fn reserved_chords() -> &'static [(Chord, &'static str)] {
 
 /// Whether `chord` is a reserved bare control chord; returns the reason
 /// when it is, so the capture widget can explain the rejection.
+///
+/// Compared with `same_key`: `strip_redundant_shift` drops `SHIFT` from every
+/// character chord on every platform, so `shift+space` is the reserved
+/// selection-toggle key at dispatch and an `Eq` test would have let the capture
+/// widget bind it.
 pub fn reserved_reason(chord: &Chord) -> Option<&'static str> {
     reserved_chords()
         .iter()
-        .find_map(|(c, reason)| (c == chord).then_some(*reason))
+        .find_map(|(c, reason)| c.same_key(chord).then_some(*reason))
 }
 
 pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A> {
@@ -95,7 +100,26 @@ pub fn match_chord<A: Copy>(table: &[(Chord, A)], event: &KeyEvent) -> Option<A>
 /// chords (e.g. `["Tab"]`, `["⌘x"]`). Help surfaces use this so the keys
 /// they advertise track the live keybinding registry instead of literals.
 pub fn action_key_labels<A: RebindableActions>(action: A) -> Vec<String> {
-    action.resolved().iter().map(Chord::display).collect()
+    let action_key = action.key();
+    action
+        .resolved()
+        .iter()
+        .filter(|chord| show_chord_in_help(&action_key, chord))
+        .map(Chord::display)
+        .collect()
+}
+
+fn show_chord_in_help(_action_key: &str, _chord: &Chord) -> bool {
+    #[cfg(target_os = "macos")]
+    if _action_key == "logs.copy_selection"
+        && _chord.code == KeyCode::Char('C')
+        && _chord.modifiers == KeyModifiers::CONTROL.union(KeyModifiers::SHIFT)
+    {
+        // Some macOS terminals collapse Ctrl+Shift+C to Ctrl+C, which
+        // reaches ZeroCode as Quit instead of the advertised Logs action.
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -223,6 +247,25 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn help_hides_unreliable_fallback_only_for_logs_copy() {
+        assert_eq!(action_key_labels(LogsTabAction::CopySelection), vec!["⌘c"]);
+        assert_eq!(
+            action_key_labels(ChatTabAction::CopyAllVisible),
+            vec!["Ctrl+Shift+C"]
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn logs_copy_help_keeps_both_resolved_bindings() {
+        assert_eq!(
+            action_key_labels(LogsTabAction::CopySelection),
+            vec!["Super+c", "Ctrl+Shift+C"]
+        );
+    }
+
     #[test]
     fn labels_are_human_readable() {
         assert_eq!(GlobalAction::Quit.label(), "quit");
@@ -237,6 +280,251 @@ mod tests {
         assert_eq!(json, "\"scroll_up\"");
         let back: ChatTabAction = serde_json::from_str(&json).unwrap();
         assert_eq!(action, back);
+    }
+
+    #[test]
+    fn delete_previous_word_answers_to_both_ctrl_w_and_alt_backspace() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        with_default_bindings(|| {
+            // Both chords resolve to the one action, so the existing
+            // Unicode-aware deletion stays the single behavior owner.
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(
+                    KeyCode::Char('w'),
+                    KeyModifiers::CONTROL
+                )),
+                Some(InputBarAction::DeletePreviousWord)
+            );
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+                Some(InputBarAction::DeletePreviousWord)
+            );
+
+            // Unmodified Backspace keeps its own action rather than falling
+            // through to the word delete.
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                Some(InputBarAction::Backspace)
+            );
+
+            // Help and the rebinding surface read the defaults, so both chords
+            // have to be advertised there, not just accepted at match time.
+            let defaults = InputBarAction::DeletePreviousWord.default_chords();
+            assert!(defaults.contains(&Chord::ctrl('w')));
+            assert!(defaults.contains(&Chord::with(KeyCode::Backspace, KeyModifiers::ALT)));
+            assert_eq!(
+                action_key_labels(InputBarAction::DeletePreviousWord).len(),
+                2
+            );
+        });
+    }
+
+    /// Run `body` with no override table installed, so the assertions see
+    /// compile-time defaults. Needed by any test that reads
+    /// `action_key_labels`, which resolves through the process-wide
+    /// override state and would otherwise race a test that installs one.
+    #[cfg(test)]
+    fn with_default_bindings(body: impl FnOnce()) {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        body();
+    }
+
+    /// Install a sparse `input_bar` override for one variant, run `body`,
+    /// then drop the table again. Serialized against every other test that
+    /// touches the process-wide override state.
+    #[cfg(test)]
+    fn with_input_bar_override(variant: &str, chords: Vec<Chord>, body: impl FnOnce()) {
+        let _g = overrides::TEST_GUARD
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        overrides::reset();
+        let mut table = overrides::OverrideTable::new();
+        let mut rows = std::collections::HashMap::new();
+        rows.insert(variant.to_string(), chords);
+        table.insert(InputBarAction::TAG.to_string(), rows);
+        overrides::set_active(table);
+        body();
+        overrides::reset();
+    }
+
+    /// The capture widget refuses reserved chords, and that refusal has to use
+    /// dispatch semantics too. `strip_redundant_shift` drops `SHIFT` from every
+    /// character chord on every platform, so `shift+space` *is* the reserved
+    /// selection-toggle key once it reaches `match_chord`. An `Eq` test let the
+    /// widget bind it and the binding then did something else.
+    #[test]
+    fn reserved_reason_sees_a_normalized_spelling() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        assert!(reserved_reason(&Chord::char(' ')).is_some());
+        assert!(
+            reserved_reason(&Chord::with(KeyCode::Char(' '), KeyModifiers::SHIFT)).is_some(),
+            "shift+space normalizes to the reserved space chord"
+        );
+        // Still narrow: an unreserved chord stays bindable.
+        assert!(reserved_reason(&Chord::char('x')).is_none());
+        assert!(reserved_reason(&Chord::ctrl('w')).is_none());
+    }
+
+    /// `same_key` has to answer exactly what dispatch would: two chords are one
+    /// chord iff either matches the event the other describes. Asserted on both
+    /// platforms, so the Linux run still pins the contract even though only
+    /// darwin makes the ctrl/super pair equivalent.
+    #[test]
+    fn same_key_agrees_with_dispatch() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let pairs = [
+            (
+                Chord::ctrl('a'),
+                Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER),
+            ),
+            // Host-reserved on darwin, so CONTROL is never rewritten for it.
+            (
+                Chord::ctrl('c'),
+                Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
+            ),
+            (Chord::ctrl('a'), Chord::ctrl('a')),
+            (Chord::ctrl('a'), Chord::ctrl('b')),
+            (
+                Chord::with(KeyCode::Backspace, KeyModifiers::ALT),
+                Chord::with(KeyCode::Backspace, KeyModifiers::ALT),
+            ),
+            (
+                Chord::with(KeyCode::Backspace, KeyModifiers::ALT),
+                Chord::ctrl('w'),
+            ),
+        ];
+        for (a, b) in pairs {
+            let as_event = KeyEvent::new(b.code, b.modifiers);
+            assert_eq!(
+                a.same_key(&b),
+                a.matches(&as_event),
+                "same_key disagreed with matches for {} vs {}",
+                a.wire(),
+                b.wire()
+            );
+            assert_eq!(a.same_key(&b), b.same_key(&a), "same_key must be symmetric");
+        }
+    }
+
+    /// The darwin-only half of the precedence contract. `normalise_mods`
+    /// rewrites CONTROL to SUPER for every chord the host has not reserved, so
+    /// an operator's explicit `super+a` and the earlier-declared
+    /// `OpenFileBrowser`'s retained `ctrl+a` default are one chord at dispatch
+    /// and two on the wire. Comparing raw values left the shadowed default in
+    /// the table, and the operator's own binding lost to it by declaration
+    /// order while Help advertised the chord twice.
+    ///
+    /// Only meaningful on darwin: elsewhere the two chords really are distinct
+    /// and there is nothing to arbitrate. `same_key_agrees_with_dispatch` is
+    /// the part that runs everywhere.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_super_override_outranks_a_normalized_ctrl_default_on_darwin() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let super_a = Chord::with(KeyCode::Char('a'), KeyModifiers::SUPER);
+
+        with_input_bar_override("delete_previous_word", vec![super_a.clone()], || {
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER)),
+                Some(InputBarAction::DeletePreviousWord),
+                "the operator's explicit binding must win over a normalized default"
+            );
+            assert!(
+                !action_key_labels(InputBarAction::OpenFileBrowser).contains(&super_a.display()),
+                "the shadowed ctrl+a default must leave Help too"
+            );
+            assert_eq!(
+                action_key_labels(InputBarAction::DeletePreviousWord),
+                vec![super_a.display()]
+            );
+        });
+    }
+
+    #[test]
+    fn an_explicit_binding_outranks_a_retained_default_on_another_action() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let alt_backspace = Chord::with(KeyCode::Backspace, KeyModifiers::ALT);
+
+        // ClearInput is declared *after* DeletePreviousWord, whose defaults
+        // include the same chord. Dispatch takes the first match, so without
+        // the claim check the operator's binding would never be reached.
+        with_input_bar_override("clear_input", vec![alt_backspace.clone()], || {
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+                Some(InputBarAction::ClearInput),
+                "an explicitly bound chord must reach the action the operator chose"
+            );
+
+            // Help must not advertise the chord for both actions.
+            assert_eq!(
+                action_key_labels(InputBarAction::ClearInput),
+                vec![alt_backspace.display()]
+            );
+            assert!(
+                !action_key_labels(InputBarAction::DeletePreviousWord)
+                    .contains(&alt_backspace.display()),
+                "the shadowed default must disappear from Help, not just from dispatch"
+            );
+
+            // The default that was not claimed is untouched.
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(
+                    KeyCode::Char('w'),
+                    KeyModifiers::CONTROL
+                )),
+                Some(InputBarAction::DeletePreviousWord)
+            );
+        });
+    }
+
+    #[test]
+    fn override_precedence_does_not_depend_on_declaration_order() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // The mirror of the case above: the override is on the *earlier*
+        // declared action and the retained default on the later one. Both
+        // directions must land on the explicit binding, or the contract is
+        // just an artifact of enum ordering.
+        let ctrl_u = Chord::ctrl('u');
+        with_input_bar_override("backspace", vec![ctrl_u.clone()], || {
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(
+                    KeyCode::Char('u'),
+                    KeyModifiers::CONTROL
+                )),
+                Some(InputBarAction::Backspace)
+            );
+            assert!(
+                !action_key_labels(InputBarAction::ClearInput).contains(&ctrl_u.display()),
+                "ClearInput's retained default lost the chord to an explicit binding"
+            );
+        });
+    }
+
+    #[test]
+    fn an_unrelated_override_leaves_other_defaults_alone() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        // Guard against the claim filter being too eager: a sparse override
+        // elsewhere in the enum must not strip defaults it never mentions.
+        with_input_bar_override("clear_input", vec![Chord::ctrl('k')], || {
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)),
+                Some(InputBarAction::DeletePreviousWord)
+            );
+            assert_eq!(
+                InputBarAction::from_chord(&KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                Some(InputBarAction::Backspace)
+            );
+            assert_eq!(
+                action_key_labels(InputBarAction::DeletePreviousWord).len(),
+                2
+            );
+        });
     }
 
     #[test]

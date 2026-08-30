@@ -44,6 +44,7 @@ mod terminal_backend;
 #[cfg(test)]
 mod test_support;
 mod text_navigation;
+mod text_selection;
 mod theme;
 mod todo_tracker;
 mod turn_status;
@@ -58,6 +59,29 @@ const DAEMON_STDERR_LIMIT: usize = 8 * 1024;
 /// Set to `true` once the alternate screen is active so signal/panic
 /// handlers know they need to restore the terminal before exiting.
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn new() -> std::io::Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+            terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -197,8 +221,8 @@ fn install_panic_hook() {
     }));
 }
 
-/// Best-effort terminal restoration used by the panic hook and SIGTERM
-/// handler.  Errors are intentionally ignored — we're already crashing.
+/// Best-effort terminal restoration used by the panic hook and Unix shutdown
+/// handlers. Errors are intentionally ignored — we're already crashing.
 fn force_restore_terminal() {
     if TERMINAL_ACTIVE.load(Ordering::Relaxed) {
         let _ = crossterm::terminal::disable_raw_mode();
@@ -260,6 +284,21 @@ fn confirm_insecure_tls(url: &str) -> anyhow::Result<InsecureTlsChoice> {
     let stdin = std::io::stdin();
     let mut stderr = std::io::stderr();
     confirm_insecure_tls_with(stdin.lock(), &mut stderr, url)
+}
+
+#[cfg(unix)]
+fn prepare_wss_shutdown_signals(
+    requires_confirmation: bool,
+    config_dir: &std::path::Path,
+    url: &str,
+) -> anyhow::Result<ShutdownSignals> {
+    // Keep the default signal disposition while this synchronous prompt waits
+    // for input. Installing Tokio's handler first would consume Ctrl+C without
+    // giving the blocked read a chance to observe it.
+    if requires_confirmation {
+        apply_insecure_tls_choice(confirm_insecure_tls(url)?, config_dir, url)?;
+    }
+    Ok(ShutdownSignals::new()?)
 }
 
 /// Apply the operator's [`InsecureTlsChoice`] for `url`: a no-op for
@@ -347,7 +386,7 @@ async fn run() -> anyhow::Result<()> {
     };
 
     #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut shutdown_signals = None;
 
     // Initial connection (before the terminal is initialized).
     // `owns_ephemeral` records whether THIS process spawned the daemon
@@ -357,9 +396,11 @@ async fn run() -> anyhow::Result<()> {
     let rpc = match &target {
         ConnectTarget::LocalSocket(socket) => {
             #[cfg(unix)]
+            let shutdown_signals = shutdown_signals.insert(ShutdownSignals::new()?);
+            #[cfg(unix)]
             let initial_connection = tokio::select! {
                 result = client::RpcClient::connect(socket, None, None) => result,
-                _ = sigterm.recv() => return Ok(()),
+                _ = shutdown_signals.recv() => return Ok(()),
             };
             #[cfg(not(unix))]
             let initial_connection = client::RpcClient::connect(socket, None, None).await;
@@ -373,7 +414,7 @@ async fn run() -> anyhow::Result<()> {
                     #[cfg(unix)]
                     let readiness = tokio::select! {
                         result = await_spawned_daemon_ready(socket, &mut daemon) => result,
-                        _ = sigterm.recv() => {
+                        _ = shutdown_signals.recv() => {
                             return cleanup_spawned_daemon_after_signal(&mut daemon);
                         }
                     };
@@ -397,14 +438,22 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         ConnectTarget::Wss { url, skip_verify } => {
-            if *skip_verify && !loaded_config.connection.wss.tls.route_acked(url) {
+            let requires_confirmation =
+                *skip_verify && !loaded_config.connection.wss.tls.route_acked(url);
+            #[cfg(not(unix))]
+            if requires_confirmation {
                 apply_insecure_tls_choice(confirm_insecure_tls(url)?, &local_config_dir, url)?;
             }
             #[cfg(unix)]
             {
+                let shutdown_signals = shutdown_signals.insert(prepare_wss_shutdown_signals(
+                    requires_confirmation,
+                    &local_config_dir,
+                    url,
+                )?);
                 tokio::select! {
                     result = client::RpcClient::connect_wss(url, None, None, *skip_verify) => result?,
-                    _ = sigterm.recv() => return Ok(()),
+                    _ = shutdown_signals.recv() => return Ok(()),
                 }
             }
             #[cfg(not(unix))]
@@ -424,7 +473,9 @@ async fn run() -> anyhow::Result<()> {
         &local_config_dir,
         owns_ephemeral,
         #[cfg(unix)]
-        &mut sigterm,
+        shutdown_signals
+            .as_mut()
+            .expect("Unix connection path installs shutdown signal handlers"),
     )
     .await;
 
@@ -433,8 +484,8 @@ async fn run() -> anyhow::Result<()> {
     result
 }
 
-/// Runs the TUI under a SIGTERM handler so the terminal is restored on
-/// signal instead of dying mid-draw. `app::run` owns the full session
+/// Runs the TUI under Unix shutdown handlers so the terminal is restored on
+/// SIGINT or SIGTERM instead of dying mid-draw. `app::run` owns the full session
 /// lifecycle — including in-loop reconnection and recovery — and returns
 /// only when the user quits.
 async fn run_until_exit(
@@ -443,7 +494,7 @@ async fn run_until_exit(
     target: &ConnectTarget,
     config_dir: &std::path::Path,
     owns_ephemeral: bool,
-    #[cfg(unix)] sigterm: &mut tokio::signal::unix::Signal,
+    #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
     // the new agent's alias here so the recovering `app::run` loop drops
@@ -458,7 +509,7 @@ async fn run_until_exit(
     {
         tokio::select! {
             r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral) => r.map(|_| ()),
-            _ = sigterm.recv() => Ok(()),
+            _ = shutdown_signals.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
@@ -758,7 +809,7 @@ fn cleanup_spawned_daemon_after_signal(daemon: &mut SpawnedDaemon) -> anyhow::Re
         .map(|_| ())
         .map_err(|cleanup_error| {
             anyhow::Error::msg(format!(
-                "received SIGTERM while starting daemon; cleanup failed: {cleanup_error:#}"
+                "received shutdown signal while starting daemon; cleanup failed: {cleanup_error:#}"
             ))
         })
 }
@@ -1032,8 +1083,7 @@ mod connection_tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn spawned_daemon_parent_only_sigterm_cleans_up_child() {
+    fn assert_parent_signal_cleans_up_child(signal: libc::c_int) {
         let temp = tempfile::tempdir().expect("create temp dir");
         let pid_path = temp.path().join("daemon.pid");
         let mut owner = spawned_daemon_helper_command("signal-owner");
@@ -1057,11 +1107,11 @@ mod connection_tests {
 
         // SAFETY: `owner.id()` is the live child PID returned by `spawn`; this
         // test sends a standard signal and does not pass pointers across FFI.
-        let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, libc::SIGTERM) };
+        let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, signal) };
         assert_eq!(
             signal_result,
             0,
-            "send SIGTERM: {}",
+            "send parent signal: {}",
             std::io::Error::last_os_error()
         );
         assert!(owner.wait().expect("wait signal owner").success());
@@ -1074,6 +1124,264 @@ mod connection_tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_daemon_parent_only_sigterm_cleans_up_child() {
+        assert_parent_signal_cleans_up_child(libc::SIGTERM);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spawned_daemon_parent_only_sigint_cleans_up_child() {
+        assert_parent_signal_cleans_up_child(libc::SIGINT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn insecure_tls_prompt_preserves_default_sigint() {
+        use std::io::Read;
+        use std::os::unix::process::ExitStatusExt;
+
+        let temp = tempfile::tempdir().expect("create prompt temp dir");
+        let mut owner = spawned_daemon_helper_command("insecure-tls-prompt-owner");
+        owner
+            .env("ZEROCODE_INSECURE_PROMPT_CONFIG_DIR", temp.path())
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut owner = owner.spawn().expect("spawn insecure-TLS prompt owner");
+        let mut stderr = owner.stderr.take().expect("capture prompt stderr");
+        let (prompt_tx, prompt_rx) = std::sync::mpsc::channel();
+        let prompt_reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stderr.read(&mut byte).expect("read prompt stderr") != 0 {
+                output.push(byte[0]);
+                if output.ends_with(b"Continue with verification disabled? [y/a/N] ") {
+                    prompt_tx.send(()).expect("publish prompt readiness");
+                    return;
+                }
+            }
+            panic!("prompt owner exited before writing the confirmation prompt");
+        });
+        if prompt_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            let _ = owner.kill();
+            let _ = owner.wait();
+            prompt_reader.join().expect("join prompt reader");
+            panic!("prompt owner did not block for insecure-TLS confirmation");
+        }
+
+        let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, libc::SIGINT) };
+        assert_eq!(
+            signal_result,
+            0,
+            "send SIGINT to prompt owner: {}",
+            std::io::Error::last_os_error()
+        );
+
+        let exit_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = owner.try_wait().expect("poll signalled prompt owner") {
+                break status;
+            }
+            if std::time::Instant::now() >= exit_deadline {
+                let _ = owner.kill();
+                let _ = owner.wait();
+                panic!("SIGINT was swallowed while the insecure-TLS prompt was blocked");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGINT));
+        prompt_reader.join().expect("join prompt reader");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn duplicate_stdio(fd: libc::c_int) -> std::process::Stdio {
+        use std::os::fd::FromRawFd;
+
+        let duplicate = unsafe { libc::dup(fd) };
+        assert!(
+            duplicate >= 0,
+            "duplicate PTY slave: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { std::process::Stdio::from_raw_fd(duplicate) }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn terminal_attributes(fd: libc::c_int) -> libc::termios {
+        let mut attributes = std::mem::MaybeUninit::<libc::termios>::uninit();
+        let result = unsafe { libc::tcgetattr(fd, attributes.as_mut_ptr()) };
+        assert_eq!(
+            result,
+            0,
+            "read PTY terminal attributes: {}",
+            std::io::Error::last_os_error()
+        );
+        unsafe { attributes.assume_init() }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_terminal_attributes_equal(expected: &libc::termios, actual: &libc::termios) {
+        assert_eq!(actual.c_iflag, expected.c_iflag, "input flags not restored");
+        assert_eq!(
+            actual.c_oflag, expected.c_oflag,
+            "output flags not restored"
+        );
+        assert_eq!(
+            actual.c_cflag, expected.c_cflag,
+            "control flags not restored"
+        );
+        assert_eq!(actual.c_lflag, expected.c_lflag, "local flags not restored");
+        assert_eq!(
+            actual.c_cc, expected.c_cc,
+            "control characters not restored"
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn output_contains(output: &[u8], sequence: &[u8]) -> bool {
+        output
+            .windows(sequence.len())
+            .any(|candidate| candidate == sequence)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn set_nonblocking(fd: libc::c_int) {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(
+            flags >= 0,
+            "read PTY flags: {}",
+            std::io::Error::last_os_error()
+        );
+        let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        assert_eq!(
+            result,
+            0,
+            "set PTY nonblocking: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn drain_pty_output(master: &mut std::fs::File, output: &mut Vec<u8>) {
+        use std::io::Read;
+
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match master.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                // Linux PTY masters report EIO, rather than EOF, after the
+                // final slave descriptor closes.
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("read terminal output: {error}"),
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn assert_signal_restores_terminal(signal: libc::c_int) {
+        use std::os::fd::FromRawFd;
+
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        let openpty_result = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(
+            openpty_result,
+            0,
+            "open PTY: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+        set_nonblocking(master_fd);
+        let original = terminal_attributes(slave_fd);
+
+        let temp = tempfile::tempdir().expect("create terminal-owner temp dir");
+        let ready_path = temp.path().join("ready");
+        let restored_path = temp.path().join("restored");
+        let mut owner_command = spawned_daemon_helper_command("terminal-owner");
+        owner_command
+            .env("ZEROCODE_TERMINAL_OWNER_READY_PATH", &ready_path)
+            .env("ZEROCODE_TERMINAL_OWNER_RESTORED_PATH", &restored_path)
+            .stdin(duplicate_stdio(slave_fd))
+            .stdout(duplicate_stdio(slave_fd))
+            .stderr(duplicate_stdio(slave_fd));
+        let mut owner = owner_command.spawn().expect("spawn terminal owner");
+        drop(owner_command);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() {
+            assert!(
+                owner.try_wait().expect("poll terminal owner").is_none(),
+                "terminal owner exited before activating the terminal"
+            );
+            assert!(
+                std::time::Instant::now() < deadline,
+                "terminal owner did not activate the terminal"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut output = Vec::new();
+        drain_pty_output(&mut master, &mut output);
+
+        let active = terminal_attributes(slave_fd);
+        assert_eq!(
+            active.c_lflag & libc::ICANON,
+            0,
+            "terminal never entered raw mode"
+        );
+        let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, signal) };
+        assert_eq!(
+            signal_result,
+            0,
+            "send signal to terminal owner: {}",
+            std::io::Error::last_os_error()
+        );
+        assert!(owner.wait().expect("wait for terminal owner").success());
+        assert!(
+            restored_path.exists(),
+            "terminal owner exited before restore_terminal returned"
+        );
+
+        let restored = terminal_attributes(slave_fd);
+        assert_terminal_attributes_equal(&original, &restored);
+        drain_pty_output(&mut master, &mut output);
+        unsafe { libc::close(slave_fd) };
+
+        for sequence in [
+            b"\x1b[?2004l".as_slice(),
+            b"\x1b[?1006l".as_slice(),
+            b"\x1b[?1000l".as_slice(),
+            b"\x1b[?1049l".as_slice(),
+        ] {
+            assert!(
+                output_contains(&output, sequence),
+                "terminal teardown omitted {sequence:?}; output: {output:?}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sigterm_restores_terminal_state() {
+        assert_signal_restores_terminal(libc::SIGTERM);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sigint_restores_terminal_state() {
+        assert_signal_restores_terminal(libc::SIGINT);
     }
 
     #[test]
@@ -1138,18 +1446,57 @@ mod connection_tests {
                     .build()
                     .expect("build signal runtime");
                 runtime.block_on(async {
-                    let mut sigterm =
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                            .expect("install SIGTERM handler");
+                    let mut shutdown_signals =
+                        ShutdownSignals::new().expect("install Unix shutdown handlers");
                     let mut daemon = SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep"))
                         .expect("spawn owned daemon helper");
                     let pid_path = std::env::var_os("ZEROCODE_SIGNAL_OWNER_PID_PATH")
                         .expect("signal owner pid path");
                     std::fs::write(pid_path, daemon.id().to_string())
                         .expect("publish owned daemon pid");
-                    sigterm.recv().await;
+                    shutdown_signals.recv().await;
                     cleanup_spawned_daemon_after_signal(&mut daemon)
                         .expect("clean up signalled daemon");
+                });
+            }
+            #[cfg(unix)]
+            Ok("insecure-tls-prompt-owner") => {
+                let config_dir = std::env::var_os("ZEROCODE_INSECURE_PROMPT_CONFIG_DIR")
+                    .expect("insecure prompt config dir");
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build insecure prompt runtime");
+                let _runtime_guard = runtime.enter();
+                prepare_wss_shutdown_signals(
+                    true,
+                    std::path::Path::new(&config_dir),
+                    "wss://insecure.example",
+                )
+                .expect("prepare WSS shutdown signals");
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            Ok("terminal-owner") => {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("build terminal-owner runtime");
+                runtime.block_on(async {
+                    let mut shutdown_signals =
+                        ShutdownSignals::new().expect("install Unix shutdown handlers");
+                    let mut terminal =
+                        config_manager::init_terminal().expect("initialize terminal");
+                    TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
+                    let ready_path = std::env::var_os("ZEROCODE_TERMINAL_OWNER_READY_PATH")
+                        .expect("terminal owner ready path");
+                    std::fs::write(ready_path, b"ready").expect("publish terminal readiness");
+                    shutdown_signals.recv().await;
+                    TERMINAL_ACTIVE.store(false, Ordering::Relaxed);
+                    config_manager::restore_terminal(&mut terminal).expect("restore terminal");
+                    let restored_path = std::env::var_os("ZEROCODE_TERMINAL_OWNER_RESTORED_PATH")
+                        .expect("terminal owner restored path");
+                    std::fs::write(restored_path, b"restored")
+                        .expect("publish terminal restoration");
                 });
             }
             other => panic!("unexpected helper mode: {other:?}"),
