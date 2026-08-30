@@ -2101,6 +2101,45 @@ fn normalize_peer_username(raw: &str) -> String {
     raw.trim_start_matches('@').to_ascii_lowercase()
 }
 
+/// Whether the inbound sender belongs to an `output_modality = "voice"` peer
+/// group on the channel the message arrived on. The answer travels to the
+/// channel as `SendMessage::force_voice`.
+///
+/// The decision lives here because this is the only place that holds both the
+/// sender and the reply target. A channel that inspects its own outbound
+/// recipient instead cannot answer it correctly wherever the two differ: on
+/// Matrix a reply is addressed to a room (`!room:server`) while peer groups
+/// name senders (`@user:server`), so comparing the recipient against
+/// `external_peers` never matches, and `["*"]` fails a literal comparison too.
+///
+/// Matching mirrors [`is_agent_scope_authorized`]: both the configured peers
+/// and the sender are normalized through [`normalize_peer_username`], then
+/// compared with `crate::allowlist::is_user_allowed` so the wildcard and the
+/// leading-`@` / case semantics every inbound path already uses apply here as
+/// well.
+///
+/// Only replies pass through here. Proactive delivery (cron announces) has no
+/// inbound sender to consult and is decided by the channel from the target
+/// room instead.
+fn sender_prefers_voice(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let channel_type = msg.channel.as_str();
+    let channel_alias = msg.channel_alias.as_deref().unwrap_or(channel_type);
+    let voice_peers: Vec<String> = ctx
+        .prompt_config
+        .channel_voice_peers(channel_type, channel_alias)
+        .into_iter()
+        .map(|p| normalize_peer_username(&p))
+        .collect();
+    if voice_peers.is_empty() {
+        return false;
+    }
+    let sender = normalize_peer_username(msg.sender.as_str());
+    crate::allowlist::is_user_allowed(&voice_peers, &sender, crate::allowlist::Match::Sensitive)
+}
+
 fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
     ctx.conversation_histories
         .lock()
@@ -7679,11 +7718,14 @@ async fn process_channel_message_body(
                 );
                 (ch, recipient, suppress, force_voice)
             } else {
+                // No `send_via` override: the peer group the sender belongs to
+                // decides. `suppress_voice` stays `None` so a `text` group is
+                // still the channel default rather than an explicit override.
                 (
                     target_channel.clone(),
                     msg.reply_target.clone(),
                     None,
-                    false,
+                    sender_prefers_voice(&ctx, &msg),
                 )
             };
 
@@ -9291,6 +9333,13 @@ fn build_channel_by_id(
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
                 let transcription_config_arc = Arc::clone(config_arc);
                 let transcription_channel_key = format!("matrix.{alias}");
+                let tts_config_arc = Arc::clone(config_arc);
+                let tts_channel_key = format!("matrix.{alias}");
+                let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                    let cfg_arc = config_arc.clone();
+                    let alias = alias.clone();
+                    Arc::new(move || cfg_arc.read().channel_voice_peers("matrix", &alias))
+                };
                 Ok(Arc::new(
                     MatrixChannel::new(mx.clone(), alias, peer_resolver, state_dir)?
                         .with_transcription_manager_factory(move || {
@@ -9306,6 +9355,18 @@ fn build_channel_by_id(
                                 &config, &provider,
                             ))
                         })
+                        .with_tts_manager_factory(move || {
+                            let config = tts_config_arc.read();
+                            if !config.tts.enabled {
+                                return None;
+                            }
+                            let owner = resolve_agent_tts_owner(&config, &tts_channel_key);
+                            Some(crate::tts::TtsManager::from_config_for_agent(
+                                &config,
+                                owner.as_deref(),
+                            ))
+                        })
+                        .with_voice_peer_resolver(voice_peer_resolver)
                         .with_workspace_dir(workspace_dir)
                         .with_ack_reactions(ack),
                 ))
@@ -10309,6 +10370,25 @@ fn build_configured_discord_channel(
     configure_discord_transcription(channel, config, &channel_key)
 }
 
+/// Resolve the enabled agent that owns `channel_key`, for binding that agent's
+/// `tts_provider`. Shares [`build_owner_by_channel_key`] with message dispatch
+/// and with [`resolve_agent_transcription_provider`], so synthesis can never
+/// select a different owner than the one the router delivers to: with two
+/// enabled agents bound to the same channel, sorted last-writer-wins picks one
+/// answer for both.
+///
+/// Returns `None` when no enabled agent owns the channel, which
+/// [`crate::tts::TtsManager::from_config_for_agent`] treats as "fall back to
+/// the runtime-active agent" — collapsing that to an empty string would
+/// silently drop the fallback.
+#[cfg(feature = "channel-matrix")]
+fn resolve_agent_tts_owner(config: &Config, channel_key: &str) -> Option<String> {
+    let enabled_agents = enabled_agent_aliases(config);
+    build_owner_by_channel_key(config, &enabled_agents, &[channel_key.to_string()])
+        .get(channel_key)
+        .cloned()
+}
+
 /// Per-alias Matrix state directory. Each `[channels.matrix.<alias>]` block
 /// must own its own session/crypto store so two bots under one daemon don't
 /// restore each other's `session.json` and run as the wrong account. The
@@ -10655,6 +10735,13 @@ fn collect_configured_channels(
         let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
         let transcription_config_arc = Arc::clone(config_arc);
         let transcription_channel_key = format!("matrix.{alias}");
+        let tts_config_arc = Arc::clone(config_arc);
+        let tts_channel_key = format!("matrix.{alias}");
+        let voice_peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+            let cfg_arc = config_arc.clone();
+            let alias = alias.clone();
+            Arc::new(move || cfg_arc.read().channel_voice_peers("matrix", &alias))
+        };
         match MatrixChannel::new(mx.clone(), alias.clone(), peer_resolver, state_dir) {
             Ok(channel) => {
                 let channel = channel
@@ -10671,6 +10758,18 @@ fn collect_configured_channels(
                             &config, &provider,
                         ))
                     })
+                    .with_tts_manager_factory(move || {
+                        let config = tts_config_arc.read();
+                        if !config.tts.enabled {
+                            return None;
+                        }
+                        let owner = resolve_agent_tts_owner(&config, &tts_channel_key);
+                        Some(crate::tts::TtsManager::from_config_for_agent(
+                            &config,
+                            owner.as_deref(),
+                        ))
+                    })
+                    .with_voice_peer_resolver(voice_peer_resolver)
                     .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
                     .with_ack_reactions(ack);
                 channels.push(ConfiguredChannel {
@@ -26631,6 +26730,151 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
+    fn voice_peer_group(
+        channel: &str,
+        members: &[&str],
+    ) -> zeroclaw_config::multi_agent::PeerGroupConfig {
+        use zeroclaw_config::multi_agent::OutputModality;
+        zeroclaw_config::multi_agent::PeerGroupConfig {
+            output_modality: OutputModality::Voice,
+            ..peer_group(channel, members, false)
+        }
+    }
+
+    /// A Matrix reply is addressed to `!room:server`, while the peer group
+    /// names `@user:server`. Resolving the modality here — where the inbound
+    /// sender is still in hand — is what makes a user-ID voice group work.
+    fn matrix_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "!room:server".into(),
+            channel: "matrix".into(),
+            channel_alias: Some("default".into()),
+            content: "hello".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Telegram addresses replies by chat id and names peers by username, so
+    /// it has the same recipient-versus-identity mismatch Matrix had. Resolving
+    /// modality in the runtime fixes both at once, which is a behaviour change
+    /// for Telegram: a voice group that was inert now matches, and Telegram's
+    /// `send` treats `force_voice` as voice-*only*, dropping the text reply.
+    /// Matrix instead posts the voice note alongside its text. That divergence
+    /// is Telegram's existing contract, not something this resolution invents.
+    fn telegram_msg(sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "123456789".into(),
+            channel: "telegram".into(),
+            channel_alias: Some("default".into()),
+            content: "hello".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn telegram_voice_group_is_resolved_by_username_not_chat_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            voice_peer_group("telegram.default", &["@alice"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(
+            sender_prefers_voice(&ctx, &telegram_msg("@alice")),
+            "the sender's username decides, and it is what the group names"
+        );
+        assert!(
+            !sender_prefers_voice(&ctx, &telegram_msg("123456789")),
+            "the chat id the reply is addressed to is not a peer identity"
+        );
+        assert!(!sender_prefers_voice(&ctx, &telegram_msg("@mallory")));
+    }
+
+    #[test]
+    fn matrix_voice_group_member_gets_a_voiced_reply_by_user_id() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            voice_peer_group("matrix.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+        assert!(
+            !sender_prefers_voice(&ctx, &matrix_msg("@mallory:server")),
+            "a sender outside the group keeps the text default"
+        );
+        assert!(
+            !sender_prefers_voice(&ctx, &matrix_msg("!room:server")),
+            "the room id is not a peer identity and must never match"
+        );
+    }
+
+    #[test]
+    fn matrix_voice_group_wildcard_voices_every_sender() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert("open".into(), voice_peer_group("matrix.default", &["*"]));
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(sender_prefers_voice(&ctx, &matrix_msg("@anyone:server")));
+    }
+
+    #[test]
+    fn matrix_voice_group_matching_ignores_case_and_a_leading_at() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            voice_peer_group("matrix.default", &["Alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+    }
+
+    #[test]
+    fn a_mirror_peer_group_does_not_voice() {
+        // `mirror` is the default modality and Matrix does not implement it;
+        // only an explicit `voice` group speaks.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "family".into(),
+            peer_group("matrix.default", &["@alice:server"], false),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(!sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+    }
+
+    #[test]
+    fn no_peer_groups_never_voices() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ctx =
+            channel_runtime_context_with_peer_groups(tmp.path(), std::collections::HashMap::new());
+
+        assert!(!sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+    }
+
+    #[test]
+    fn a_voice_group_on_another_channel_does_not_leak() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "telegram_voice".into(),
+            voice_peer_group("telegram.default", &["@alice:server"]),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(!sender_prefers_voice(&ctx, &matrix_msg("@alice:server")));
+    }
+
     #[test]
     fn set_model_scoped_agent_allowed_for_listed_admin() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -30560,6 +30804,100 @@ This is an example JSON object for profile settings."#;
             "local_whisper.office",
             "Voice Wake must select that same fallback owner's provider"
         );
+    }
+
+    /// `Config::agent_for_channel` takes the first match out of a `HashMap`,
+    /// so with two agents bound to one Matrix alias it can name a different
+    /// owner than dispatch does — silencing voice, or speaking through the
+    /// wrong agent's provider. Synthesis must go through the same sorted,
+    /// last-writer-wins decision the router uses.
+    #[cfg(feature = "channel-matrix")]
+    #[test]
+    fn matrix_tts_owner_is_the_same_canonical_co_owner_as_dispatch() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "zeta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["matrix.default".into()],
+                tts_provider: "openai.loud".into(),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["matrix.default".into()],
+                tts_provider: "elevenlabs.quiet".into(),
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        let owners =
+            build_owner_by_channel_key(&config, &enabled_agents, &["matrix.default".to_string()]);
+        let dispatch_owner = owners.get("matrix.default").map(String::as_str);
+
+        assert_eq!(dispatch_owner, Some("zeta"));
+        assert_eq!(
+            resolve_agent_tts_owner(&config, "matrix.default").as_deref(),
+            dispatch_owner,
+            "synthesis must bind the same owning agent the router delivers to"
+        );
+    }
+
+    /// With no agent declaring any binding, the router falls back to a
+    /// deterministic owner. TTS has to land on that same one.
+    #[cfg(feature = "channel-matrix")]
+    #[test]
+    fn matrix_tts_owner_is_the_same_legacy_fallback_owner_as_dispatch() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                tts_provider: "openai.office".into(),
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        let collected_channel_keys = vec!["matrix.default".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+
+        assert_eq!(
+            owners.get("matrix.default").map(String::as_str),
+            Some("legacy")
+        );
+        assert_eq!(
+            resolve_agent_tts_owner(&config, "matrix.default").as_deref(),
+            Some("legacy")
+        );
+    }
+
+    /// An unowned channel yields `None`, not an empty alias:
+    /// `TtsManager::from_config_for_agent` reads `None` as "fall back to the
+    /// runtime-active agent", and collapsing it to `""` would drop that.
+    #[cfg(feature = "channel-matrix")]
+    #[test]
+    fn matrix_tts_owner_is_none_when_no_enabled_agent_owns_the_channel() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "off".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: false,
+                channels: vec!["matrix.default".into()],
+                tts_provider: "openai.loud".into(),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(resolve_agent_tts_owner(&config, "matrix.default"), None);
     }
 
     #[cfg(feature = "voice-wake")]
