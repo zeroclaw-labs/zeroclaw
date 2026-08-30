@@ -1420,7 +1420,7 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // conservative) should not be refused client-side, and refusing here
         // would turn every schema/tool-heavy floor into a hard failure
         // instead of a best-effort, explicitly-flagged send.
-        let trim_result = surface_oversized_dispatch_if_needed(
+        let mut trim_result = surface_oversized_dispatch_if_needed(
             turn_state.history,
             &mut turn_state.crumb_present,
             tokens_before_dispatch,
@@ -1431,67 +1431,114 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         let history_was_trimmed = turn_state.history.len() != history_len_before
             || turn_state.crumb_present != crumb_before;
         if history_was_trimmed {
-            // History was trimmed at the dispatch seam — rebuild the request
-            // so the provider sees the trimmed population. Preserve the hook's
-            // mutations to retained messages by trimming the already-mutated
-            // post-hook snapshot directly, rather than repreparing the trimmed
-            // durable history and losing rewrites of existing messages.
-            let mut trimmed_post_hook = post_hook_snapshot;
-            // Separate any hook-appended suffix (messages beyond the original
-            // prepared length) so turn-dropping targets the durable prefix
-            // without dropping the hook's transient growth.
-            let suffix_len = hook_suffix.len();
-            let mut suffix = Vec::new();
-            if suffix_len > 0 && trimmed_post_hook.len() >= suffix_len {
-                suffix = trimmed_post_hook.split_off(trimmed_post_hook.len() - suffix_len);
-            }
-            // Drop oldest whole turns from the post-hook prefix until its
-            // turn count matches the trimmed durable history's count.
-            let durable_target_turns = crate::agent::history_trim::count_turns(turn_state.history)
-                .saturating_sub(usize::from(turn_state.crumb_present));
-            // The post-hook prefix's turn count still reflects the pre-trim
-            // durable turns plus any hook rewrites; drop until it matches.
-            while crate::agent::history_trim::count_turns(&trimmed_post_hook)
-                .saturating_sub(usize::from(post_hook_had_crumb))
-                > durable_target_turns
-            {
-                let dropped = crate::agent::history_trim::drop_oldest_whole_turn(
+            // Rebuild the post-hook request from the trimmed durable history,
+            // re-measure it, and — if the authoritative rebuilt population is
+            // still over budget — drop another whole turn and rebuild again.
+            // A single rebuild is not enough: the heuristic trim loop above
+            // decides how many turns to drop from a hook-growth estimate that
+            // assumes a dropped turn carries an average share of that growth,
+            // but a turn can carry disproportionately little of it (e.g. the
+            // growth came from a hook-appended suffix, not from history). In
+            // that case the rebuilt request can still exceed budget while an
+            // older turn remains, and the true floor is only reached once no
+            // further whole turn can be dropped. Bound iterations by the turn
+            // count so a persistently-over-budget rebuild cannot loop forever.
+            let mut total_dropped_messages = trim_result.dropped_messages;
+            let mut tokens_after_dispatch = tokens_before_dispatch;
+            let mut genuine_floor = false;
+            let max_iterations = crate::agent::history_trim::count_turns(turn_state.history) + 1;
+            for _ in 0..max_iterations {
+                // Preserve the hook's mutations to retained messages by
+                // trimming the already-mutated post-hook snapshot directly,
+                // rather than repreparing the trimmed durable history and
+                // losing rewrites of existing messages.
+                let mut trimmed_post_hook = post_hook_snapshot.clone();
+                // Separate any hook-appended suffix (messages beyond the
+                // original prepared length) so turn-dropping targets the
+                // durable prefix without dropping the hook's transient growth.
+                let suffix_len = hook_suffix.len();
+                let mut suffix = Vec::new();
+                if suffix_len > 0 && trimmed_post_hook.len() >= suffix_len {
+                    suffix = trimmed_post_hook.split_off(trimmed_post_hook.len() - suffix_len);
+                }
+                // Drop oldest whole turns from the post-hook prefix until its
+                // turn count matches the (possibly further-trimmed) durable
+                // history's count.
+                let durable_target_turns =
+                    crate::agent::history_trim::count_turns(turn_state.history)
+                        .saturating_sub(usize::from(turn_state.crumb_present));
+                while crate::agent::history_trim::count_turns(&trimmed_post_hook)
+                    .saturating_sub(usize::from(post_hook_had_crumb))
+                    > durable_target_turns
+                {
+                    let dropped = crate::agent::history_trim::drop_oldest_whole_turn(
+                        &mut trimmed_post_hook,
+                        post_hook_had_crumb,
+                    );
+                    if dropped == 0 {
+                        break;
+                    }
+                }
+                // If the durable trim inserted a fresh breadcrumb, mirror it
+                // in the post-hook request so the dispatched population
+                // matches the persisted history.
+                if !post_hook_had_crumb && turn_state.crumb_present {
+                    crate::agent::history_trim::insert_breadcrumb_deduped(
+                        &mut trimmed_post_hook,
+                        false,
+                    );
+                }
+                // Re-append the hook's transient suffix and re-apply prompt
+                // framing so the system anchor stays consistent.
+                trimmed_post_hook.extend(suffix);
+                refresh_prompt_anchor(&mut trimmed_post_hook, use_native_tools);
+                refresh_scoped_tool_protocol_prompt(
+                    turn_state.history,
                     &mut trimmed_post_hook,
-                    post_hook_had_crumb,
+                    use_native_tools,
                 );
-                if dropped == 0 {
+                provider_request_messages = trimmed_post_hook;
+                reported_population_estimated =
+                    crate::agent::history::estimate_history_tokens(&provider_request_messages)
+                        + tool_schema_tokens;
+                // The rebuilt request's re-measured population is
+                // authoritative: a floor decided from the trim loop's
+                // heuristic estimate can turn out to fit once the actual
+                // dropped turn's share of hook growth (e.g. a large
+                // multimodal attachment) leaves with it.
+                tokens_after_dispatch = reported_population_estimated as u64;
+                if tokens_after_dispatch <= context_token_budget as u64 {
+                    genuine_floor = false;
+                    break;
+                }
+                if trim_result.outcome == PreDispatchOutcome::Floor {
+                    // The prior call already found no droppable whole turn;
+                    // re-running it would repeat the same no-op decision.
+                    genuine_floor = true;
+                    break;
+                }
+                // Still over budget on the authoritative rebuilt count: try
+                // to drop another whole turn using that count, not the stale
+                // heuristic that decided the previous round stopped early.
+                let before_len = turn_state.history.len();
+                let before_crumb = turn_state.crumb_present;
+                trim_result = surface_oversized_dispatch_if_needed(
+                    turn_state.history,
+                    &mut turn_state.crumb_present,
+                    tokens_after_dispatch,
+                    tool_schema_tokens,
+                    context_token_budget,
+                );
+                *history_has_trim_breadcrumb = turn_state.crumb_present;
+                total_dropped_messages += trim_result.dropped_messages;
+                let dropped_more = turn_state.history.len() != before_len
+                    || turn_state.crumb_present != before_crumb;
+                if !dropped_more {
+                    genuine_floor = true;
                     break;
                 }
             }
-            // If the durable trim inserted a fresh breadcrumb, mirror it in
-            // the post-hook request so the dispatched population matches the
-            // persisted history.
-            if !post_hook_had_crumb && turn_state.crumb_present {
-                crate::agent::history_trim::insert_breadcrumb_deduped(
-                    &mut trimmed_post_hook,
-                    false,
-                );
-            }
-            // Re-append the hook's transient suffix and re-apply prompt
-            // framing so the system anchor stays consistent.
-            trimmed_post_hook.extend(suffix);
-            refresh_prompt_anchor(&mut trimmed_post_hook, use_native_tools);
-            refresh_scoped_tool_protocol_prompt(
-                turn_state.history,
-                &mut trimmed_post_hook,
-                use_native_tools,
-            );
-            provider_request_messages = trimmed_post_hook;
-            reported_population_estimated =
-                crate::agent::history::estimate_history_tokens(&provider_request_messages)
-                    + tool_schema_tokens;
-            // The rebuilt request's re-measured population is authoritative:
-            // a floor decided from the trim loop's heuristic estimate can
-            // turn out to fit once the actual dropped turn's share of hook
-            // growth (e.g. a large multimodal attachment) leaves with it.
-            let tokens_after_dispatch = reported_population_estimated as u64;
-            let genuine_floor = trim_result.outcome == PreDispatchOutcome::Floor
-                && tokens_after_dispatch > context_token_budget as u64;
+            trim_result.dropped_messages = total_dropped_messages;
             if let Some(tx) = event_tx.as_ref() {
                 let _ = tx
                     .send(TurnEvent::HistoryTrimmed {

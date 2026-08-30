@@ -9329,6 +9329,7 @@ mod tests {
             ingress: IngressContext::sub_turn(),
             agent_alias: None,
             turn_id: &turn_id,
+            history_has_trim_breadcrumb: &mut false,
         })
         .await
         .expect_err("visible stream failure must remain an interruption error");
