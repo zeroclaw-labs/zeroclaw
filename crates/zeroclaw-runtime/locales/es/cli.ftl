@@ -26,7 +26,7 @@ cli-config-about = Gestiona la configuración de ZeroClaw
 cli-update-about = Comprueba y aplica las actualizaciones de ZeroClaw
 cli-self-test-about = Ejecuta autopruebas de diagnóstico
 cli-completions-about = Genera scripts de autocompletado del shell
-cli-desktop-about = Inicia la aplicación de escritorio complementaria de ZeroClaw
+cli-desktop-about = Inicia la aplicación de escritorio complementaria, o abre su página de descarga
 cli-config-schema-about = Vuelca el esquema JSON de configuración completo en stdout
 cli-config-list-about = Lista todas las propiedades de configuración con los valores actuales
 cli-config-get-about = Obtiene el valor de una propiedad de configuración
@@ -316,11 +316,11 @@ cli-desktop-long-about =
 
     La aplicación complementaria es una aplicación ligera de barra de menú / bandeja del sistema que se conecta al mismo gateway que la CLI. Proporciona acceso rápido al panel, monitoreo de estado y emparejamiento de dispositivos.
 
-    Usa --install para descargar la aplicación complementaria precompilada para tu plataforma.
+    Usa --install para abrir la página de descarga para tu plataforma. No instala nada por sí mismo.
 
     Ejemplos:
     zeroclaw desktop              # lanzar la aplicación complementaria
-    zeroclaw desktop --install    # descargarla e instalarla
+    zeroclaw desktop --install    # abrir la página de descarga
 channel-needs-quickstart-reply = Este agente aún no está completamente configurado. El operador debe ejecutar Quickstart antes de que pueda responder.
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web está configurado pero la característica 'whatsapp-web' no está compilada.
 channel-whatsapp-web-feature-missing-build = Compila/ejecuta con: cargo build --features whatsapp-web
@@ -372,6 +372,12 @@ channel-whatsapp-web-delivery-failure-note-many = (nota: no pude entregar {$coun
 channel-line-bind-success = ✅ ¡Emparejado! Ya puedes chatear.
 channel-line-bind-invalid-code = ❌ Código no válido. Inténtalo de nuevo.
 channel-line-bind-rate-limited = ⏳ Demasiados intentos. Reintenta en { $secs }s.
+channel-telegram-cmd-new-desc = Iniciar una nueva sesión de conversación
+channel-telegram-cmd-clear-desc = Borrar esta sesión de conversación
+channel-telegram-cmd-stop-desc = Cancelar la tarea en curso
+channel-telegram-cmd-model-desc = Mostrar o cambiar el modelo actual
+channel-telegram-cmd-models-desc = Listar los proveedores de modelos disponibles o cambiar de proveedor
+channel-telegram-cmd-config-desc = Mostrar la configuración actual
 onboard-openai-auth-note =
     Autenticación de OpenAI:
     • Clave de API — acceso estándar a la API mediante platform.openai.com (sk-...)
@@ -425,11 +431,12 @@ cli-sop-none = No se encontraron SOP.
 cli-sop-pending-none = No hay ejecuciones de SOP esperando aprobación.
 cli-sop-pending-header = Ejecuciones de SOP esperando aprobación:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] paso {$step}/{$total}
+cli-sop-status-failure-reason = Motivo del fallo: {$reason}
 cli-sop-ws-invalid-approval = sop approval_response requiere run_id y una decisión approve o deny
 cli-sop-ws-resolve-failed = error al resolver SOP: {$error}
 cli-sop-ws-engine-lock-poisoned = bloqueo del motor SOP envenenado
 cli-sop-ws-subsystem-disabled = el subsistema SOP no está habilitado
-cli-sop-create-hint = {"  "}Cree uno: mkdir -p <workspace>/sops/my-sop
+cli-sop-create-hint = {"  "}Cree uno: mkdir -p <shared>/sops/my-sop
 cli-sop-create-hint-2 = {"              "}luego agregue SOP.toml y SOP.md
 cli-sop-loaded-header = SOP cargados ({$count}):
 cli-sop-none-to-validate = No se encontraron SOP para validar.
@@ -599,6 +606,7 @@ cli-quickstart-error-channel-required = se requieren tipo de canal y alias
 cli-quickstart-error-channel-field-not-advertised = el campo de canal `{$field}` no está disponible en Quickstart
 cli-quickstart-error-channel-token-required = se requiere el token del bot de Telegram
 cli-quickstart-error-webhook-secret-required = se requiere el secreto compartido del webhook
+cli-quickstart-error-webhook-port-conflict = el puerto de webhook {$port} ya está en uso por el webhook habilitado `{$alias}` — cada webhook habilitado necesita su propio puerto
 cli-quickstart-error-peer-group-name-required = se requiere el nombre del grupo de pares
 cli-quickstart-error-peer-group-channel-required = se requiere la referencia de canal del grupo de pares
 cli-quickstart-error-peer-group-unknown-channel = el grupo de pares `{$name}` referencia un canal desconocido `{$channel}`
@@ -659,9 +667,9 @@ cli-status-service-stopped = 🔴 Servicio:       detenido
 cli-status-channels = Canales:
 cli-status-cli-always = {"  "}CLI:      ✅ siempre
 cli-status-peripherals = Periféricos:
-cli-desktop-download = Descarga la aplicación complementaria de ZeroClaw:
+cli-desktop-download = Abriendo la página de descargas de la aplicación complementaria ZeroClaw:
 cli-desktop-homebrew = O instálala con Homebrew (próximamente):
-cli-desktop-linux-pkg = {"  "}Descarga el .deb o .AppImage para tu arquitectura.
+cli-desktop-linux-pkg = {"  "}La página ofrece archivos .deb y .AppImage para tu arquitectura.
 cli-desktop-launching = Iniciando la aplicación complementaria de ZeroClaw...
 cli-status-version = Versión:     {$v}
 cli-status-workspace = Espacio de trabajo:   {$v}
@@ -717,8 +725,8 @@ cli-plugin-install-resolving = Resolviendo '{$source}' desde el registro de comp
 cli-plugin-installed-from = Complemento instalado desde {$source}
 cli-plugin-installed-name-version = Complemento instalado {$name} v{$version}
 cli-plugin-config-entry-seeded = Se creó [[plugins.entries]] para '{$name}'. Establece los valores de configuración del plugin con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
+cli-plugin-config-entry-key = Clave de configuración ({$capability}): {$key}
 cli-plugin-config-entry-seed-skipped = advertencia: se omitió crear la entrada de configuración para '{$name}': la sección [plugins] en disco está mal formada. Repárala, agrega un bloque [[plugins.entries]] con `name = "{$name}"`, y luego establece valores con `zeroclaw config set plugins.entries.{$name}.config.<key>`.
-cli-plugin-config-entry-seed-unaddressable = advertencia: se omitió crear la entrada de configuración para '{$name}': los nombres de plugin que contienen '.' no se pueden direccionar mediante rutas de configuración con puntos (`config set` divide por '.'). Agrega a mano un bloque [[plugins.entries]] con `name = "{$name}"` al archivo de configuración.
 cli-config-section-degraded = advertencia: la sección de configuración `{$section}` en {$path} está mal formada y se restableció a los valores predeterminados para esta ejecución. Los valores de esa sección NO están en efecto. Ejecuta `zeroclaw config migrate` para ver el error de análisis y luego repara el archivo.
 cli-plugin-removed = Complemento '{$name}' eliminado.
 cli-plugin-not-found = No se encontró el complemento '{$name}'.
@@ -966,6 +974,11 @@ sop-rpc-decision-unauthorized = La identidad RPC no está autorizada para resolv
 sop-rpc-policy-missing = La política de aprobación de SOP '{$name}' no está configurada.
 sop-rpc-policy-unavailable = La política del SOP en espera no está disponible: {$reason}.
 
+# ── Aprobación de herramientas en la terminal ──
+# Los atajos ASCII se mantienen alineados con el analizador de respuestas de Rust.
+cli-approval-request = 🔧 El agente quiere ejecutar: {$tool}
+cli-approval-prompt = { "   " }[Y] Sí / [N] No / [A] Siempre para {$tool}:{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply
@@ -984,10 +997,13 @@ channel-approval-btn-always = Siempre
 channel-approval-tap-instruction = Toca un botón a continuación:
 channel-approval-reply-instruction-yesno = Responde: "{ $yes_command }", "{ $no_command }" o "{ $always_command }"
 channel-approval-reply-instruction-approve-deny = Responde con `{ $approve_command }` / `{ $deny_command }` / `{ $always_command }`.
+channel-approval-group-visibility-warning =
+    Este es un chat de grupo, por lo que todos los presentes pueden ver este código y los argumentos de la herramienta mostrados arriba. Solo un par autorizado de este canal puede responder.
 channel-telegram-approval-ack-approved = Aprobado
 channel-telegram-approval-ack-always-approved = Siempre aprobado
 channel-telegram-approval-ack-denied = Denegado
 channel-telegram-approval-ack-unknown = Acción desconocida
+channel-telegram-approval-ack-already-resolved = Aprobación ya resuelta
 channel-discord-approval-btn-allow-once = Permitir una vez
 channel-discord-approval-btn-allow-session = Permitir esta sesión
 channel-discord-approval-btn-allow-always = Permitir siempre
@@ -996,3 +1012,21 @@ channel-approval-opt-allow-once = Permitir una vez
 channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
+cli-agent-error-provider-context-window = La solicitud es demasiado grande para el modelo seleccionado. Reduce la conversación o elige un modelo con una ventana de contexto mayor.
+cli-agent-error-provider-credentials-missing = El proveedor de modelo seleccionado no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.
+cli-agent-error-provider-credentials-missing-named = El proveedor de modelo {$provider} no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.
+cli-agent-error-provider-authentication = El proveedor de modelo seleccionado rechazó sus credenciales. Revisa las credenciales configuradas.
+cli-agent-error-provider-authentication-named = El proveedor de modelo {$provider} rechazó sus credenciales. Revisa las credenciales configuradas.
+cli-agent-error-provider-rate-limited = El proveedor de modelo seleccionado limitó la solicitud. Espera, revisa la cuota o elige otro proveedor.
+cli-agent-error-provider-server = El proveedor de modelo seleccionado devolvió un error de servidor. Inténtalo de nuevo o elige otro proveedor.
+cli-agent-error-provider-model-not-found = El modelo seleccionado no está disponible. Revisa el nombre de modelo configurado.
+cli-agent-error-provider-client-request = El proveedor de modelo seleccionado rechazó la solicitud. Revisa la configuración del proveedor y la solicitud.
+cli-agent-error-provider-connection-local = El servidor de modelo local en {$endpoint} no está disponible. Inícialo o actualiza el endpoint.
+cli-agent-error-provider-connection-remote = No se puede alcanzar el proveedor de modelo en {$endpoint}. Revisa el acceso de red o elige otro proveedor.
+cli-agent-error-provider-connection = No se puede alcanzar el proveedor de modelo seleccionado. Revisa el acceso de red o elige otro proveedor.
+cli-agent-error-provider-timeout = El proveedor de modelo seleccionado agotó el tiempo de espera. Inténtalo de nuevo o elige otro proveedor.
+cli-agent-error-provider-generic = El proveedor de modelo seleccionado falló. Revisa la configuración del proveedor o elige otro proveedor.
+cli-delegate-error-invalid-semantic-completion = El agente '{$agent_name}' falló: el proveedor de modelo devolvió una finalización semántica no válida.
+cli-agent-error-invalid-semantic-completion = El proveedor de modelo devolvió una finalización semántica no válida.
+cli-delegate-error-incomplete-after-provider-tools = El agente '{$agent_name}' falló: el proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.
+cli-agent-error-incomplete-after-provider-tools = El proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.

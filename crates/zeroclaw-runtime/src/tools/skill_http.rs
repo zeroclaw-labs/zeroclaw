@@ -177,6 +177,7 @@ mod tests {
     use super::*;
     use crate::skills::SkillTool;
     use serde_json::json;
+    use zeroclaw_api::attribution::{Attributable, ToolProvenance};
 
     fn sample_http_tool() -> SkillTool {
         let mut args = HashMap::new();
@@ -217,6 +218,13 @@ mod tests {
     fn skill_http_tool_name_is_prefixed() {
         let tool = SkillHttpTool::new("weather_skill", &sample_http_tool());
         assert_eq!(tool.name(), "weather_skill__get_weather");
+    }
+
+    #[test]
+    fn manifest_loaded_skill_http_is_an_extension() {
+        let tool = SkillHttpTool::new("browser", &sample_http_tool());
+
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
     }
 
     #[test]

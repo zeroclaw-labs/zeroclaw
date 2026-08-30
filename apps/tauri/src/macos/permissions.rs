@@ -6,6 +6,9 @@ use std::process::Command;
 
 // ── Accessibility ──────────────────────────────────────────────────────────
 
+// SAFETY: these declarations match the parameter-free Boolean signatures in
+// Apple's ApplicationServices accessibility API. The framework is linked by
+// name on macOS, the only target that compiles this module.
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
@@ -20,6 +23,9 @@ pub fn check_accessibility() -> &'static str {
 
 // ── Screen Recording ───────────────────────────────────────────────────────
 
+// SAFETY: these declarations match the parameter-free Boolean signatures in
+// Apple's CoreGraphics screen-capture permission API. The framework is linked
+// by name on macOS, the only target that compiles this module.
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
@@ -119,6 +125,9 @@ print(result)
     }
 }
 
+// SAFETY: these declarations match the `IOHIDCheckAccess` and
+// `IOHIDRequestAccess` signatures in the macOS IOKit HID API; the request type
+// is the SDK-defined integer enum value passed by value.
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
     fn IOHIDCheckAccess(requestType: u32) -> u32;

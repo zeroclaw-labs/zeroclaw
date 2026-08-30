@@ -1,9 +1,11 @@
 //! Voice Wake Word detection channel.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
+use cpal::Sample;
 use tokio::sync::mpsc;
 
 use crate::transcription::TranscriptionManager;
@@ -11,6 +13,83 @@ use zeroclaw_config::schema::TranscriptionConfig;
 use zeroclaw_config::schema::VoiceWakeConfig;
 
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+
+fn normalize_samples<T>(data: &[T]) -> Vec<f32>
+where
+    T: cpal::SizedSample,
+    f32: cpal::FromSample<T>,
+{
+    data.iter().copied().map(f32::from_sample).collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PcmSampleFormat {
+    F32,
+    F64,
+    I8,
+    I16,
+    I24,
+    I32,
+    I64,
+    U8,
+    U16,
+    U24,
+    U32,
+    U64,
+}
+
+impl TryFrom<cpal::SampleFormat> for PcmSampleFormat {
+    type Error = anyhow::Error;
+
+    fn try_from(format: cpal::SampleFormat) -> Result<Self> {
+        match format {
+            cpal::SampleFormat::F32 => Ok(Self::F32),
+            cpal::SampleFormat::F64 => Ok(Self::F64),
+            cpal::SampleFormat::I8 => Ok(Self::I8),
+            cpal::SampleFormat::I16 => Ok(Self::I16),
+            cpal::SampleFormat::I24 => Ok(Self::I24),
+            cpal::SampleFormat::I32 => Ok(Self::I32),
+            cpal::SampleFormat::I64 => Ok(Self::I64),
+            cpal::SampleFormat::U8 => Ok(Self::U8),
+            cpal::SampleFormat::U16 => Ok(Self::U16),
+            cpal::SampleFormat::U24 => Ok(Self::U24),
+            cpal::SampleFormat::U32 => Ok(Self::U32),
+            cpal::SampleFormat::U64 => Ok(Self::U64),
+            format => bail!("Unsupported input sample format: {format}"),
+        }
+    }
+}
+
+fn build_input_stream<T>(
+    device: &cpal::Device,
+    config: cpal::StreamConfig,
+    audio_tx: mpsc::Sender<Vec<f32>>,
+) -> Result<cpal::Stream, cpal::Error>
+where
+    T: cpal::SizedSample,
+    f32: cpal::FromSample<T>,
+{
+    use cpal::traits::DeviceTrait;
+
+    device.build_input_stream(
+        config,
+        move |data: &[T], _: &cpal::InputCallbackInfo| {
+            let samples = normalize_samples(data);
+            // Non-blocking: try_send and drop if full.
+            let _ = audio_tx.try_send(samples);
+        },
+        move |err| {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "VoiceWake: audio stream error"
+            );
+        },
+        None,
+    )
+}
 
 // ── State machine ──────────────────────────────────────────────
 
@@ -43,10 +122,16 @@ impl std::fmt::Display for WakeState {
 /// Voice wake-word channel that activates on a spoken keyword.
 pub struct VoiceWakeChannel {
     config: VoiceWakeConfig,
-    transcription_config: TranscriptionConfig,
     /// The alias key under `[channels.voice_wake.<alias>]` this handle is
-    /// bound to. Used for attribution.
+    /// bound to. Used for attribution and message routing only — never as
+    /// a transcription-provider key.
     alias: String,
+    /// Materializes transcription state from its canonical source when the
+    /// listener starts. The orchestrator replaces the compatibility factory
+    /// with a resolver over live `Config` so reloadable provider policy is
+    /// not copied into this long-lived channel handle.
+    transcription_manager_factory:
+        Arc<dyn Fn() -> Result<TranscriptionManager> + Send + Sync + 'static>,
 }
 
 impl VoiceWakeChannel {
@@ -56,11 +141,43 @@ impl VoiceWakeChannel {
         config: VoiceWakeConfig,
         transcription_config: TranscriptionConfig,
     ) -> Self {
+        let transcription_manager_factory =
+            Arc::new(move || TranscriptionManager::new(&transcription_config));
         Self {
             config,
-            transcription_config,
             alias: alias.into(),
+            transcription_manager_factory,
         }
+    }
+
+    /// Bind this channel to the resolved `transcription_provider` of the
+    /// agent that owns it. Distinct from `alias`, which only scopes
+    /// `[channels.voice_wake.<alias>]` routing and must never be used to
+    /// select a transcription provider.
+    pub fn with_agent_transcription_provider(mut self, provider: impl Into<String>) -> Self {
+        let provider = provider.into();
+        let base_factory = Arc::clone(&self.transcription_manager_factory);
+        self.transcription_manager_factory = Arc::new(move || {
+            Ok(base_factory()?.with_agent_transcription_provider(provider.clone()))
+        });
+        self
+    }
+
+    /// Replace the compatibility transcription factory with the channel
+    /// runtime's live-config resolver.
+    pub(crate) fn with_transcription_manager_factory(
+        mut self,
+        factory: impl Fn() -> Result<TranscriptionManager> + Send + Sync + 'static,
+    ) -> Self {
+        self.transcription_manager_factory = Arc::new(factory);
+        self
+    }
+
+    /// Build the transcription manager bound to this channel's resolved
+    /// agent transcription provider. Split out of `listen()` so the wiring
+    /// can be exercised without standing up an audio input stream.
+    fn build_transcription_manager(&self) -> Result<TranscriptionManager> {
+        (self.transcription_manager_factory)()
     }
 }
 
@@ -103,8 +220,7 @@ impl Channel for VoiceWakeChannel {
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let self_alias = self.alias.clone();
         let config = self.config.clone();
-        let transcription_manager = TranscriptionManager::new(&self.transcription_config)?
-            .with_agent_transcription_provider(self.alias.clone());
+        let transcription_manager = self.build_transcription_manager()?;
 
         // Run the blocking audio capture loop on a dedicated thread.
         let (audio_tx, mut audio_rx) = mpsc::channel::<Vec<f32>>(4);
@@ -131,31 +247,55 @@ impl Channel for VoiceWakeChannel {
             })?;
 
             let supported = device.default_input_config()?;
-            sample_rate = supported.sample_rate().0;
+            let sample_format = PcmSampleFormat::try_from(supported.sample_format())?;
+            sample_rate = supported.sample_rate();
             channels_count = supported.channels();
+            let device_name = device
+                .description()
+                .map(|description| description.name().to_owned())
+                .unwrap_or_default();
 
-            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"device": device.name().unwrap_or_default(), "sample_rate": sample_rate, "channels": channels_count})), "VoiceWake: opening audio input");
+            ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"device": device_name, "sample_rate": sample_rate, "channels": channels_count})), "VoiceWake: opening audio input");
 
             let stream_config: cpal::StreamConfig = supported.into();
-            let audio_tx_clone = audio_tx.clone();
-
-            let stream = device.build_input_stream(
-                &stream_config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    // Non-blocking: try_send and drop if full.
-                    let _ = audio_tx_clone.try_send(data.to_vec());
-                },
-                move |err| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                        "VoiceWake: audio stream error"
-                    );
-                },
-                None,
-            )?;
+            let stream = match sample_format {
+                PcmSampleFormat::F32 => {
+                    build_input_stream::<f32>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::F64 => {
+                    build_input_stream::<f64>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I8 => {
+                    build_input_stream::<i8>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I16 => {
+                    build_input_stream::<i16>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I24 => {
+                    build_input_stream::<cpal::I24>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I32 => {
+                    build_input_stream::<i32>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::I64 => {
+                    build_input_stream::<i64>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U8 => {
+                    build_input_stream::<u8>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U16 => {
+                    build_input_stream::<u16>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U24 => {
+                    build_input_stream::<cpal::U24>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U32 => {
+                    build_input_stream::<u32>(&device, stream_config, audio_tx.clone())?
+                }
+                PcmSampleFormat::U64 => {
+                    build_input_stream::<u64>(&device, stream_config, audio_tx.clone())?
+                }
+            };
 
             stream.play()?;
 
@@ -465,6 +605,57 @@ mod tests {
     }
 
     #[test]
+    fn all_pcm_formats_are_classified() {
+        let cases = [
+            (cpal::SampleFormat::F32, PcmSampleFormat::F32),
+            (cpal::SampleFormat::F64, PcmSampleFormat::F64),
+            (cpal::SampleFormat::I8, PcmSampleFormat::I8),
+            (cpal::SampleFormat::I16, PcmSampleFormat::I16),
+            (cpal::SampleFormat::I24, PcmSampleFormat::I24),
+            (cpal::SampleFormat::I32, PcmSampleFormat::I32),
+            (cpal::SampleFormat::I64, PcmSampleFormat::I64),
+            (cpal::SampleFormat::U8, PcmSampleFormat::U8),
+            (cpal::SampleFormat::U16, PcmSampleFormat::U16),
+            (cpal::SampleFormat::U24, PcmSampleFormat::U24),
+            (cpal::SampleFormat::U32, PcmSampleFormat::U32),
+            (cpal::SampleFormat::U64, PcmSampleFormat::U64),
+        ];
+
+        for (format, expected) in cases {
+            assert_eq!(PcmSampleFormat::try_from(format).unwrap(), expected);
+        }
+        assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU8).is_err());
+        assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU16).is_err());
+        assert!(PcmSampleFormat::try_from(cpal::SampleFormat::DsdU32).is_err());
+    }
+
+    #[test]
+    fn all_pcm_formats_normalize_nonzero_samples() {
+        fn assert_round_trip<T>()
+        where
+            T: cpal::SizedSample + cpal::FromSample<f32>,
+            f32: cpal::FromSample<T>,
+        {
+            let input = T::from_sample(0.5);
+            let normalized = normalize_samples(&[input]);
+            assert!((normalized[0] - 0.5).abs() < 0.01);
+        }
+
+        assert_round_trip::<f32>();
+        assert_round_trip::<f64>();
+        assert_round_trip::<i8>();
+        assert_round_trip::<i16>();
+        assert_round_trip::<cpal::I24>();
+        assert_round_trip::<i32>();
+        assert_round_trip::<i64>();
+        assert_round_trip::<u8>();
+        assert_round_trip::<u16>();
+        assert_round_trip::<cpal::U24>();
+        assert_round_trip::<u32>();
+        assert_round_trip::<u64>();
+    }
+
+    #[test]
     fn rms_energy_of_constant_signal() {
         // Constant signal at 0.5 → RMS should be 0.5
         let signal = vec![0.5f32; 100];
@@ -647,5 +838,146 @@ mod tests {
             TranscriptionConfig::default(),
         );
         assert!(!channel.supports_outbound_send());
+    }
+
+    // ── Transcription provider binding tests ───────────────────
+
+    #[tokio::test]
+    async fn with_agent_transcription_provider_binds_provider_not_alias() {
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        )
+        .with_agent_transcription_provider("groq.default");
+
+        let manager = channel.build_transcription_manager().unwrap();
+        let err = manager
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("groq.default"), "got: {err}");
+        assert!(!err.contains("'frontdoor'"), "got: {err}");
+        assert_eq!(channel.alias, "frontdoor");
+    }
+
+    #[tokio::test]
+    async fn agent_transcription_provider_defaults_empty_when_unset() {
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        );
+        let err = channel
+            .build_transcription_manager()
+            .unwrap()
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no transcription_provider configured"),
+            "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dotted_typed_provider_dispatches_through_voice_wake_manager() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_config::schema::{Config, LocalWhisperTranscriptionProviderConfig};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/transcribe"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"text": "typed provider selected"})),
+            )
+            .mount(&server)
+            .await;
+
+        let mut runtime_config = Config::default();
+        runtime_config.providers.transcription.local_whisper.insert(
+            "office".to_string(),
+            LocalWhisperTranscriptionProviderConfig {
+                uri: format!("{}/v1/transcribe", server.uri()),
+                ..LocalWhisperTranscriptionProviderConfig::default()
+            },
+        );
+
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            TranscriptionConfig::default(),
+        )
+        .with_transcription_manager_factory(move || {
+            TranscriptionManager::from_config_with_provider(
+                &runtime_config,
+                "local_whisper.office".to_string(),
+            )
+        });
+
+        let result = channel
+            .build_transcription_manager()
+            .unwrap()
+            .transcribe(b"fake-audio", "voice.ogg")
+            .await
+            .unwrap();
+        assert_eq!(result, "typed provider selected");
+    }
+
+    #[tokio::test]
+    async fn unset_agent_transcription_provider_fails_with_useful_error() {
+        let transcription_config = TranscriptionConfig {
+            api_key: Some("test-groq-key".to_string()),
+            ..TranscriptionConfig::default()
+        };
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            transcription_config,
+        );
+
+        let manager = channel.build_transcription_manager().unwrap();
+        let err = manager
+            .transcribe(&[0u8; 16], "clip.wav")
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no transcription_provider configured"),
+            "expected a no-provider-configured error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonexistent_agent_transcription_provider_fails_with_useful_error() {
+        let transcription_config = TranscriptionConfig {
+            api_key: Some("test-groq-key".to_string()),
+            ..TranscriptionConfig::default()
+        };
+        let channel = VoiceWakeChannel::new(
+            "frontdoor",
+            VoiceWakeConfig::default(),
+            transcription_config,
+        )
+        .with_agent_transcription_provider("nonexistent.provider");
+
+        let manager = channel.build_transcription_manager().unwrap();
+        let err = manager
+            .transcribe(&[0u8; 16], "clip.wav")
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not configured"),
+            "expected a not-configured error naming the missing provider, got: {msg}"
+        );
+        assert!(
+            msg.contains("nonexistent.provider"),
+            "error should name the missing provider, got: {msg}"
+        );
     }
 }

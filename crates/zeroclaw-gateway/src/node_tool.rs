@@ -8,12 +8,12 @@ use async_trait::async_trait;
 use tokio::time::Duration;
 
 use crate::nodes::{NodeInvocation, NodeRegistry};
-use zeroclaw_api::attribution::ToolKind;
+use zeroclaw_api::attribution::{ToolKind, ToolProvenance};
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_api::tool_attribution;
 use zeroclaw_tools::node_capabilities::requires_approval;
 
-tool_attribution!(NodeTool, ToolKind::Plugin);
+tool_attribution!(NodeTool, ToolKind::Plugin, ToolProvenance::Extension);
 
 /// Default timeout for node invocations (30 seconds).
 const NODE_INVOKE_TIMEOUT_SECS: u64 = 30;
@@ -169,6 +169,7 @@ impl Tool for NodeTool {
 mod tests {
     use super::*;
     use crate::nodes::{NodeCapability, NodeInfo, NodeRegistry};
+    use zeroclaw_api::attribution::Attributable;
 
     #[test]
     fn node_tool_name_format() {
@@ -192,6 +193,7 @@ mod tests {
         assert_eq!(tool.name(), "node:phone-1:camera.snap");
         assert_eq!(tool.description(), "Take a photo");
         assert_eq!(tool.parameters_schema()["type"], "object");
+        assert_eq!(tool.tool_provenance(), ToolProvenance::Extension);
     }
 
     #[tokio::test]

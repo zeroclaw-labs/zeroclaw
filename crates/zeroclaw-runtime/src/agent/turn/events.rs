@@ -8,14 +8,62 @@ use anyhow::Result;
 use tokio::sync::mpsc::Sender;
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::agent::{ToolArtifact, TurnEvent};
+use zeroclaw_api::attribution::ToolProvenance;
 pub use zeroclaw_api::channel::ProgressEvent;
 use zeroclaw_tool_call_parser::ParsedToolCall;
 
-/// Minimum characters per chunk when relaying LLM text to a streaming draft.
+/// Minimum characters per chunk when relaying live model text to draft surfaces.
 pub(crate) const STREAM_CHUNK_MIN_CHARS: usize = 80;
 
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
+
+/// Placeholder text used for newly opened draft messages.
+pub const DRAFT_PLACEHOLDER: &str = "...";
+/// Prefix for liveness-only thinking/reasoning progress.
+pub const THINKING_STATUS_PREFIX: &str = "\u{1f914} ";
+/// Prefix for opt-in raw reasoning progress.
+pub const REASONING_FULL_PREFIX: &str = THINKING_STATUS_PREFIX;
+const THINKING_STATUS_LABEL: &str = "Thinking...";
+const THINKING_STATUS_ROUND_PREFIX: &str = "Thinking (round ";
+const THINKING_STATUS_ROUND_SUFFIX: &str = ")...";
+
+/// Status-mode reasoning tick that does not expose raw reasoning text.
+pub fn thinking_status_text(iteration: usize) -> String {
+    let round = iteration + 1;
+    if round == 1 {
+        format!("{THINKING_STATUS_PREFIX}{THINKING_STATUS_LABEL}\n")
+    } else {
+        format!(
+            "{THINKING_STATUS_PREFIX}{THINKING_STATUS_ROUND_PREFIX}{round}{THINKING_STATUS_ROUND_SUFFIX}\n"
+        )
+    }
+}
+
+/// Parse the label portion of a generated status-mode reasoning line.
+pub fn thinking_status_label_round(label: &str) -> Option<usize> {
+    if label == THINKING_STATUS_LABEL {
+        return Some(1);
+    }
+    label
+        .strip_prefix(THINKING_STATUS_ROUND_PREFIX)
+        .and_then(|rest| rest.strip_suffix(THINKING_STATUS_ROUND_SUFFIX))
+        .and_then(|round| round.parse::<usize>().ok())
+        .filter(|round| *round > 1)
+}
+
+/// Comparable round number for a generated status-mode reasoning line.
+pub fn thinking_status_round(text: &str) -> Option<usize> {
+    let label = text
+        .strip_prefix(THINKING_STATUS_PREFIX)?
+        .strip_suffix('\n')?;
+    thinking_status_label_round(label)
+}
+
+/// Whether a progress line is one of the liveness-only thinking status lines.
+pub fn is_thinking_status_text(text: &str) -> bool {
+    thinking_status_round(text).is_some()
+}
 
 /// Delta sent from the agent loop to the channel's draft updater.
 /// Append-only — no clear/reset variant exists by design.
@@ -25,8 +73,59 @@ pub enum StreamDelta {
     Text(String),
     /// Ephemeral tool progress (not part of the response body).
     Status(String),
+    /// A pending tool call. Channel draft consumers decide how to render its
+    /// arguments; the runtime keeps this event structured to avoid coupling a
+    /// transport-specific disclosure policy into the agent loop.
+    ToolStart {
+        tool: String,
+        arguments: std::sync::Arc<serde_json::Value>,
+        /// Canonical trust origin carried from the resolved static or activated
+        /// tool. `None` means the name did not resolve in either registry.
+        tool_provenance: Option<ToolProvenance>,
+    },
+    /// A completed tool call paired with its original arguments.
+    ToolComplete {
+        tool: String,
+        arguments: std::sync::Arc<serde_json::Value>,
+        /// The same trust origin observed when the matching start event was
+        /// emitted; consumers must treat `None` as untrusted.
+        tool_provenance: Option<ToolProvenance>,
+        secs: u64,
+        success: bool,
+        error: Option<String>,
+    },
+    /// Provider reasoning text. Channel surfaces must opt in before rendering.
+    Reasoning(String),
     /// Typed, non-sensitive agent lifecycle progress.
     Lifecycle(ProgressEvent),
+}
+
+impl StreamDelta {
+    /// Render structured tool events with the historical conservative policy.
+    /// Non-Matrix consumers must use this instead of serializing arguments.
+    #[must_use]
+    pub fn legacy_status(&self) -> Option<String> {
+        match self {
+            Self::ToolStart {
+                tool, arguments, ..
+            } => Some(super::progress::render_tool_start_progress(tool, arguments)),
+            Self::ToolComplete {
+                tool,
+                arguments,
+                secs,
+                success,
+                error,
+                ..
+            } => Some(super::progress::render_tool_completion_progress(
+                tool,
+                arguments,
+                *secs,
+                *success,
+                error.as_deref(),
+            )),
+            Self::Text(_) | Self::Status(_) | Self::Reasoning(_) | Self::Lifecycle(_) => None,
+        }
+    }
 }
 
 /// Send a typed lifecycle state through the draft stream without exposing tool
@@ -140,18 +239,6 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    #[tokio::test]
-    async fn progress_events_remain_typed_in_the_draft_stream() {
-        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-
-        send_progress(Some(&tx), ProgressEvent::RunningTool).await;
-
-        assert!(matches!(
-            rx.recv().await,
-            Some(StreamDelta::Lifecycle(ProgressEvent::RunningTool))
-        ));
-    }
-
     fn parsed_call(id: Option<&str>) -> ParsedToolCall {
         ParsedToolCall {
             name: "echo".into(),
@@ -169,6 +256,20 @@ mod tests {
             receipt: None,
             output_data: None,
         }
+    }
+
+    #[test]
+    fn thinking_status_parser_requires_exact_generated_status_text() {
+        assert!(is_thinking_status_text(&thinking_status_text(0)));
+        assert_eq!(thinking_status_round(&thinking_status_text(0)), Some(1));
+        assert!(is_thinking_status_text(&thinking_status_text(1)));
+        assert_eq!(thinking_status_round(&thinking_status_text(1)), Some(2));
+        assert!(!is_thinking_status_text(&format!(
+            "{REASONING_FULL_PREFIX}Thinking (round 2) through the next option"
+        )));
+        assert!(!is_thinking_status_text(&format!(
+            "{THINKING_STATUS_PREFIX}Thinking (round 1)...\n"
+        )));
     }
 
     #[tokio::test]

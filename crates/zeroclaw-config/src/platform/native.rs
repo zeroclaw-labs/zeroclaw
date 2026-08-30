@@ -1,10 +1,27 @@
 use std::path::{Path, PathBuf};
 #[cfg(not(target_os = "windows"))]
 use zeroclaw_api::platform::is_android;
-use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect};
+use zeroclaw_api::runtime_traits::{RuntimeAdapter, ShellDialect, ShellProfile};
 
 pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
     format!("\"{command}\"")
+}
+
+/// Return the bare interpreter name of a configured shell: the final path
+/// component, with a trailing `.exe` removed.
+///
+/// Both `/` and `\` are treated as separators regardless of the host OS, so
+/// `/usr/bin/zsh` reduces to `zsh` and
+/// `C:\Program Files\PowerShell\7\pwsh.exe` to `pwsh`. Shared by interpreter
+/// classification and prompt reporting so the two read the same name out of
+/// one configured string. Case is preserved; callers that compare fold it
+/// themselves.
+fn shell_stem(shell: &str) -> &str {
+    let file = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
+    match file.rsplit_once('.') {
+        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") => stem,
+        _ => file,
+    }
 }
 
 /// Return whether `runtime.shell` names a PowerShell interpreter.
@@ -21,12 +38,10 @@ pub fn windows_cmd_shell_raw_arg(command: &str) -> String {
 /// `cmd.exe`, so classifying them as PowerShell would make validation and
 /// execution use different shell languages.
 fn is_powershell_interpreter(shell: &str) -> bool {
-    let file = shell.rsplit(['/', '\\']).next().unwrap_or(shell);
-    let stem = match file.rsplit_once('.') {
-        Some((stem, ext)) if ext.eq_ignore_ascii_case("exe") => stem,
-        _ => file,
-    };
-    matches!(stem.to_ascii_lowercase().as_str(), "powershell" | "pwsh")
+    matches!(
+        shell_stem(shell).to_ascii_lowercase().as_str(),
+        "powershell" | "pwsh"
+    )
 }
 
 #[cfg(target_os = "windows")]
@@ -173,6 +188,35 @@ impl RuntimeAdapter for NativeRuntime {
         }
     }
 
+    fn shell_profile(&self) -> Option<ShellProfile> {
+        // Report the interpreter `build_shell_command` will actually spawn,
+        // named the way the operator configured it. Variants within a dialect
+        // differ enough to be worth naming: `bash` vs `zsh` under POSIX, and
+        // `pwsh` (7+) vs `powershell` (5.1) under PowerShell, which disagree
+        // on ternaries, `&&`/`||` pipeline chains, and several parameters.
+        let dialect = self.shell_dialect();
+        match dialect {
+            // Native execution on Windows always routes through `cmd.exe /C`
+            // regardless of the configured value (the cross-platform default
+            // `sh` lands here), so the configured name would misreport it.
+            ShellDialect::WindowsCmd | ShellDialect::None => ShellProfile::from_dialect(dialect),
+            ShellDialect::Posix | ShellDialect::PowerShell => {
+                // Android pins execution to /system/bin/sh and ignores the
+                // configured value; reporting that value would name a shell
+                // that never runs.
+                #[cfg(not(target_os = "windows"))]
+                if is_android() {
+                    return ShellProfile::from_dialect(ShellDialect::Posix);
+                }
+
+                Some(ShellProfile {
+                    name: shell_stem(&self.shell).to_ascii_lowercase(),
+                    dialect,
+                })
+            }
+        }
+    }
+
     fn build_shell_command(
         &self,
         command: &str,
@@ -259,6 +303,74 @@ mod tests {
     #[test]
     fn native_memory_budget_unlimited() {
         assert_eq!(NativeRuntime::new().memory_budget(), 0);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn posix_shell_profile_reports_the_configured_variant() {
+        // The point of naming the POSIX variant: `[runtime] shell = "bash"`
+        // must be visible to the model, not flattened to a generic `sh`.
+        for (configured, expected) in [
+            ("sh", "sh"),
+            ("bash", "bash"),
+            ("/usr/bin/zsh", "zsh"),
+            ("/usr/bin/fish", "fish"),
+        ] {
+            let profile = NativeRuntime::with_shell(configured.into())
+                .shell_profile()
+                .expect("native runtime has a shell");
+            assert_eq!(profile.name, expected, "configured {configured}");
+            assert_eq!(profile.dialect, ShellDialect::Posix);
+        }
+    }
+
+    #[test]
+    fn powershell_shell_profile_distinguishes_pwsh_from_windows_powershell() {
+        // pwsh (7+) and powershell (5.1) share a dialect but not a syntax
+        // surface, so the prompt must be able to tell them apart.
+        for (configured, expected) in [
+            ("pwsh", "pwsh"),
+            ("powershell", "powershell"),
+            ("PowerShell.exe", "powershell"),
+            ("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "pwsh"),
+        ] {
+            let profile = NativeRuntime::with_shell(configured.into())
+                .shell_profile()
+                .expect("native runtime has a shell");
+            assert_eq!(profile.name, expected, "configured {configured}");
+            assert_eq!(profile.dialect, ShellDialect::PowerShell);
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "windows")]
+    fn windows_cmd_shell_profile_reports_cmd_whatever_was_configured() {
+        // Native Windows execution routes through `cmd.exe /C` regardless of
+        // the configured value, so the cross-platform default `sh` must not
+        // be reported as if a POSIX shell were going to run.
+        for configured in ["sh", "cmd", "cmd.exe", "bash"] {
+            let profile = NativeRuntime::with_shell(configured.into())
+                .shell_profile()
+                .expect("native runtime has a shell");
+            assert_eq!(profile.name, "cmd", "configured {configured}");
+            assert_eq!(profile.dialect, ShellDialect::WindowsCmd);
+        }
+    }
+
+    #[test]
+    fn shell_profile_matches_the_dialect_that_validates_commands() {
+        // The reported profile and the policy dialect come from one adapter;
+        // if they could disagree, the model would be told one language while
+        // policy validated another.
+        for configured in ["sh", "bash", "pwsh", "powershell", "cmd"] {
+            let runtime = NativeRuntime::with_shell(configured.into());
+            let profile = runtime.shell_profile().expect("native runtime has a shell");
+            assert_eq!(
+                profile.dialect,
+                runtime.shell_dialect(),
+                "configured {configured}"
+            );
+        }
     }
 
     #[test]

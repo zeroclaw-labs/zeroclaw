@@ -23,6 +23,10 @@ pub enum TurnOutcome {
 pub enum TurnError {
     Panicked(String),
     AgentError(String),
+    TerminalCompletion {
+        diagnostic: String,
+        user_message: String,
+    },
 }
 
 impl std::fmt::Display for TurnError {
@@ -30,11 +34,25 @@ impl std::fmt::Display for TurnError {
         match self {
             Self::Panicked(msg) => write!(f, "Turn task panicked: {msg}"),
             Self::AgentError(msg) => write!(f, "Agent turn failed: {msg}"),
+            Self::TerminalCompletion { diagnostic, .. } => {
+                write!(f, "Agent turn failed: {diagnostic}")
+            }
         }
     }
 }
 
 impl std::error::Error for TurnError {}
+
+impl TurnError {
+    /// Localized text is carried only for a client-delivery boundary. Display
+    /// remains the stable diagnostic form used by logs and durable audit rows.
+    pub fn user_message(&self) -> Option<&str> {
+        match self {
+            Self::TerminalCompletion { user_message, .. } => Some(user_message),
+            Self::Panicked(_) | Self::AgentError(_) => None,
+        }
+    }
+}
 
 /// Attribution fields attached to the tracing span for the duration of a turn.
 /// All fields appear on every `record!()` emitted inside the turn.
@@ -158,7 +176,17 @@ fn outcome_from_task_result(
             },
             messages: new_messages,
         }),
-        Err(StreamedTurnError { error, .. }) => Err(TurnError::AgentError(format!("{error}"))),
+        Err(StreamedTurnError { error, .. }) => {
+            if let Some(user_message) =
+                crate::agent::terminal_completion_error_message(&error, None)
+            {
+                return Err(TurnError::TerminalCompletion {
+                    diagnostic: error.to_string(),
+                    user_message,
+                });
+            }
+            Err(TurnError::AgentError(error.to_string()))
+        }
     }
 }
 
@@ -363,6 +391,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn terminal_completion_keeps_diagnostic_and_delivery_text_separate() {
+        let expected = crate::agent::semantic_empty_terminal_completion_message(None);
+        let err = StreamedTurnError {
+            error: anyhow::Error::new(
+                zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
+            ),
+            committed_response: String::new(),
+            new_messages: Vec::new(),
+        };
+
+        let outcome = match outcome_from_task_result(Err(err), String::new()) {
+            Err(error) => error,
+            Ok(_) => panic!("semantic-empty terminal completion must fail"),
+        };
+        assert_eq!(
+            outcome.to_string(),
+            "Agent turn failed: provider completed without final text or tool calls"
+        );
+        assert_eq!(outcome.user_message(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn provider_terminal_completion_keeps_retry_diagnostic_out_of_rpc_delivery() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::Connection,
+            Some("http://localhost:11434/v1/chat/completions".to_string()),
+            "All model providers/models failed after 3 failure event(s). Events: \
+                 event 1 (retry 1/3): retryable"
+                .to_string(),
+        ));
+        let expected = crate::agent::terminal_completion_error_message(&error, None)
+            .expect("provider failures have a canonical localized projection");
+        let err = StreamedTurnError {
+            error,
+            committed_response: String::new(),
+            new_messages: Vec::new(),
+        };
+
+        let outcome = match outcome_from_task_result(Err(err), String::new()) {
+            Err(error) => error,
+            Ok(_) => panic!("provider terminal completion must fail"),
+        };
+        let user_message = outcome
+            .user_message()
+            .expect("terminal completion supplies a user message");
+        assert!(
+            outcome
+                .to_string()
+                .contains("All model providers/models failed")
+        );
+        assert_eq!(user_message, expected);
+        assert!(user_message.contains("http://localhost:11434/v1/chat/completions"));
+        assert!(!user_message.contains("retry 1/3"));
+        assert!(!user_message.contains("All model providers/models failed"));
+    }
+
     #[tokio::test]
     async fn execute_turn_scopes_cost_context_so_usage_is_persisted() {
         use crate::agent::agent::Agent;
@@ -453,7 +542,9 @@ mod tests {
 
         let agent = Agent::builder()
             .model_provider(Box::new(UsageProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(mem)
             .observer(Arc::from(NoopObserver {}) as Arc<dyn Observer>)
             .tool_dispatcher(Box::new(NativeToolDispatcher))

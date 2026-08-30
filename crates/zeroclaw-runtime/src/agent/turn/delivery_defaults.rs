@@ -54,6 +54,7 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
     tool_name: &str,
     tool_args: &mut serde_json::Value,
     channel_name: &str,
+    channel_alias: Option<&str>,
     channel_reply_target: Option<&str>,
 ) {
     // Interactive tools first — independent of cron delivery defaults.
@@ -90,10 +91,20 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
         return;
     }
 
+    // Delivery resolves `<type>.<alias>`; the bare type is registered only
+    // while that type has one configured instance (`configured_channel_map`).
+    let delivery_channel = match channel_alias
+        .map(str::trim)
+        .filter(|alias| !alias.is_empty())
+    {
+        Some(alias) => format!("{channel_name}.{alias}"),
+        None => channel_name.to_string(),
+    };
+
     let default_delivery = || {
         serde_json::json!({
             "mode": "announce",
-            "channel": channel_name,
+            "channel": delivery_channel,
             "to": reply_target,
         })
     };
@@ -118,14 +129,19 @@ pub(crate) fn maybe_inject_channel_delivery_defaults(
                 .entry("mode".to_string())
                 .or_insert_with(|| serde_json::Value::String("announce".to_string()));
 
-            let needs_channel = delivery
+            // Unset, or the bare type the turn-context block recommends: both
+            // name this turn's instance. Anything else is a chosen destination.
+            let needs_resolved_channel = delivery
                 .get("channel")
                 .and_then(serde_json::Value::as_str)
-                .is_none_or(|value| value.trim().is_empty());
-            if needs_channel {
+                .is_none_or(|value| {
+                    let value = value.trim();
+                    value.is_empty() || value.eq_ignore_ascii_case(channel_name)
+                });
+            if needs_resolved_channel {
                 delivery.insert(
                     "channel".to_string(),
-                    serde_json::Value::String(channel_name.to_string()),
+                    serde_json::Value::String(delivery_channel.clone()),
                 );
             }
 
@@ -159,6 +175,7 @@ mod tests {
             "cron_add",
             &mut args,
             "discord",
+            None,
             Some("channel-42"),
         );
 
@@ -170,6 +187,132 @@ mod tests {
                 "to": "channel-42",
             })
         );
+    }
+
+    #[test]
+    fn absent_delivery_defaults_to_the_originating_composite_channel() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "check the inbox",
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("work"),
+            Some("chat-42"),
+        );
+
+        assert_eq!(
+            args["delivery"],
+            serde_json::json!({
+                "mode": "announce",
+                "channel": "telegram.work",
+                "to": "chat-42",
+            })
+        );
+    }
+
+    #[test]
+    fn omitted_channel_key_is_filled_with_the_composite_channel() {
+        // Observed shape: the model emits mode and to, and omits channel.
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "delivery": { "mode": "announce", "to": "chat-42" },
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("work"),
+            Some("chat-42"),
+        );
+
+        assert_eq!(args["delivery"]["channel"], "telegram.work");
+    }
+
+    #[test]
+    fn an_explicit_destination_is_never_overridden() {
+        // Includes this turn's own instance, which must not gain a second suffix.
+        for chosen in ["telegram.work", "telegram.other", "discord", "discord.ops"] {
+            let mut args = serde_json::json!({
+                "job_type": "agent",
+                "delivery": { "mode": "announce", "channel": chosen, "to": "chat-42" },
+            });
+
+            maybe_inject_channel_delivery_defaults(
+                "cron_add",
+                &mut args,
+                "telegram",
+                Some("work"),
+                Some("chat-42"),
+            );
+
+            assert_eq!(args["delivery"]["channel"], chosen, "chosen={chosen}");
+        }
+    }
+
+    #[test]
+    fn bare_originating_type_is_upgraded_to_the_composite_channel() {
+        // The turn-context block recommends this spelling to the model.
+        for spelling in ["telegram", "TELEGRAM", "  telegram  "] {
+            let mut args = serde_json::json!({
+                "job_type": "agent",
+                "delivery": { "mode": "announce", "channel": spelling, "to": "chat-42" },
+            });
+
+            maybe_inject_channel_delivery_defaults(
+                "cron_add",
+                &mut args,
+                "telegram",
+                Some("work"),
+                Some("chat-42"),
+            );
+
+            assert_eq!(
+                args["delivery"]["channel"], "telegram.work",
+                "spelling={spelling}"
+            );
+        }
+    }
+
+    #[test]
+    fn mode_none_still_suppresses_every_injection() {
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "delivery": { "mode": "none" },
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("work"),
+            Some("chat-42"),
+        );
+
+        assert_eq!(args["delivery"], serde_json::json!({ "mode": "none" }));
+    }
+
+    #[test]
+    fn unaliased_channel_still_defaults_to_the_bare_type() {
+        // CLI and daemon turns have no instance behind them.
+        let mut args = serde_json::json!({
+            "job_type": "agent",
+            "prompt": "check the inbox",
+        });
+
+        maybe_inject_channel_delivery_defaults(
+            "cron_add",
+            &mut args,
+            "telegram",
+            Some("   "),
+            Some("chat-42"),
+        );
+
+        assert_eq!(args["delivery"]["channel"], "telegram");
     }
 
     #[test]

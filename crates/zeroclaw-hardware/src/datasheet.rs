@@ -1,4 +1,4 @@
-//! Datasheet management for industry devices connected via Aardvark.
+//! Datasheet management for connected industry devices.
 
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -120,8 +120,8 @@ impl Default for DatasheetManager {
 // ── DatasheetTool ─────────────────────────────────────────────────────────────
 
 /// Tool: search for, download, and manage device datasheets.
-/// Invoked by the LLM when a user identifies a new device connected via
-/// Aardvark (e.g. "I have an LM75 temperature sensor on the I2C bus").
+/// Invoked by the LLM when a user identifies a newly connected device
+/// (e.g. "I have an LM75 temperature sensor on the I2C bus").
 pub struct DatasheetTool;
 
 impl DatasheetTool {
@@ -144,7 +144,7 @@ impl Tool for DatasheetTool {
 
     fn description(&self) -> &str {
         "Search for, download, and manage device datasheets. \
-         Use when the user identifies a new device connected via the Aardvark adapter \
+         Use when the user identifies a newly connected device \
          (e.g. 'I have an LM75 sensor'). \
          Actions: 'search' returns a web search query; \
          'download' fetches a PDF from a URL; \
@@ -265,7 +265,7 @@ impl Tool for DatasheetTool {
                             "Datasheet for '{device}' downloaded successfully.\n\
                              Saved to: {}\n\n\
                              Next step: create a device profile at \
-                             ~/.zeroclaw/hardware/devices/aardvark0.md with the key \
+                             ~/.zeroclaw/hardware/devices/<device>.md with the key \
                              registers, I2C address, and protocol notes from this datasheet.",
                             path.display()
                         )

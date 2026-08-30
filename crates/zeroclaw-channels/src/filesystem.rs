@@ -51,10 +51,10 @@ impl FilesystemChannel {
         &self.alias
     }
 
-    async fn watch_and_dispatch(&self) -> anyhow::Result<()> {
+    async fn watch_and_dispatch(&self, tx: &mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         use zeroclaw_log::Instrument;
         let span = zeroclaw_log::attribution_span!(self);
-        self.watch_and_dispatch_inner().instrument(span).await
+        self.watch_and_dispatch_inner(tx).instrument(span).await
     }
 
     fn compile_globs_or_log(
@@ -72,13 +72,21 @@ impl FilesystemChannel {
         })
     }
 
-    async fn watch_and_dispatch_inner(&self) -> anyhow::Result<()> {
+    async fn watch_and_dispatch_inner(
+        &self,
+        tx: &mpsc::Sender<ChannelMessage>,
+    ) -> anyhow::Result<()> {
         let config = &self.config;
         config.validate()?;
         let include = self.compile_globs_or_log(&config.include, "include")?;
         let exclude = self.compile_globs_or_log(&config.exclude, "exclude")?;
 
-        let (raw_tx, raw_rx) = std::sync::mpsc::channel::<Event>();
+        // Bridge watcher callbacks (which run on notify's own thread) into an
+        // async channel so the listener awaits instead of parking a Tokio
+        // worker in a blocking `recv()`. A blocked worker stalled unrelated
+        // daemon work between filesystem events and made an idle listener
+        // impossible to cancel without a synthetic event.
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel::<Event>();
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
             if let Ok(event) = res {
                 let _ = raw_tx.send(event);
@@ -102,6 +110,21 @@ impl FilesystemChannel {
 
         zeroclaw_runtime::health::mark_component_ok("filesystem");
 
+        self.dispatch_loop(raw_rx, tx, &include, &exclude).await
+    }
+
+    /// Core event loop, separated from watcher construction so tests can
+    /// drive it with synthetic events. Returns when the event source ends or
+    /// when every receiver of `tx` is gone (supervisor shutdown) — including
+    /// while completely idle.
+    async fn dispatch_loop(
+        &self,
+        mut raw_rx: tokio::sync::mpsc::UnboundedReceiver<Event>,
+        tx: &mpsc::Sender<ChannelMessage>,
+        include: &[glob::Pattern],
+        exclude: &[glob::Pattern],
+    ) -> anyhow::Result<()> {
+        let config = &self.config;
         let enabled_events = parse_event_kinds(&config.events);
         let debounce = Duration::from_millis(config.debounce_ms);
         let settle = Duration::from_millis(config.settle_ms);
@@ -109,9 +132,12 @@ impl FilesystemChannel {
         let mut pending_from: Option<PathBuf> = None;
 
         loop {
-            let event = match raw_rx.recv() {
-                Ok(e) => e,
-                Err(_) => return Ok(()),
+            let event = tokio::select! {
+                maybe_event = raw_rx.recv() => match maybe_event {
+                    Some(event) => event,
+                    None => return Ok(()),
+                },
+                () = tx.closed() => return Ok(()),
             };
 
             let (kind, path, old_path) = match classify(&event, &mut pending_from) {
@@ -128,7 +154,7 @@ impl FilesystemChannel {
 
             let path_str = path.to_string_lossy().to_string();
 
-            if !matches_globs(&path_str, &include, &exclude) {
+            if !matches_globs(&path_str, include, exclude) {
                 continue;
             }
 
@@ -188,8 +214,8 @@ impl Channel for FilesystemChannel {
         false
     }
 
-    async fn listen(&self, _tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
-        self.watch_and_dispatch().await
+    async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        self.watch_and_dispatch(&tx).await
     }
 
     fn self_handle(&self) -> Option<String> {
@@ -862,6 +888,86 @@ mod tests {
         assert_eq!(payload["content"], "{\"id\":1}");
     }
 
+    fn test_channel(config: FilesystemConfig, alias: &str) -> FilesystemChannel {
+        use std::sync::Arc;
+        use zeroclaw_runtime::sop::engine::SopEngine;
+
+        let memory = Arc::new(zeroclaw_memory::NoneMemory::new(alias));
+        FilesystemChannel::new(FilesystemChannelConfig {
+            config,
+            alias: alias.into(),
+            engine: Arc::new(Mutex::new(SopEngine::new(Default::default()))),
+            audit: Arc::new(SopAuditLogger::new(memory)),
+        })
+    }
+
+    /// Regression for the blocking `std::sync::mpsc::Receiver::recv()` in the
+    /// listener: an idle filesystem channel must exit promptly when the
+    /// supervisor's message channel closes, without needing a synthetic
+    /// filesystem event to unblock it. Before the async bridge, this test
+    /// hangs until its timeout because the listener parks a runtime worker in
+    /// the blocking receive.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn idle_listener_exits_on_shutdown_without_a_filesystem_event() {
+        let watched = tempfile::tempdir().unwrap();
+        let channel = test_channel(
+            FilesystemConfig {
+                paths: vec![watched.path().to_string_lossy().to_string()],
+                ..FilesystemConfig::default()
+            },
+            "fs-idle-cancel",
+        );
+
+        let (tx, rx) = mpsc::channel(1);
+        let listener = ::zeroclaw_spawn::spawn!(async move { channel.listen(tx).await });
+
+        // Close the supervisor side while the watcher is completely idle.
+        drop(rx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), listener)
+            .await
+            .expect("idle listener must exit promptly on shutdown, not wait for an event")
+            .expect("listener task must not panic");
+        result.expect("shutdown is a clean exit");
+    }
+
+    /// The dispatch loop still processes synthetic watcher events and exits
+    /// cleanly when the event source ends.
+    #[tokio::test]
+    async fn dispatch_loop_delivers_events_then_exits_when_source_ends() {
+        use notify::event::{CreateKind, EventKind};
+
+        let watched = tempfile::tempdir().unwrap();
+        let file = watched.path().join("order-1.json");
+        std::fs::write(&file, b"{}").unwrap();
+
+        let channel = test_channel(
+            FilesystemConfig {
+                paths: vec![watched.path().to_string_lossy().to_string()],
+                settle_ms: 0,
+                ..FilesystemConfig::default()
+            },
+            "fs-loop",
+        );
+
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::unbounded_channel();
+        raw_tx
+            .send(Event::new(EventKind::Create(CreateKind::File)).add_path(file))
+            .unwrap();
+        drop(raw_tx);
+
+        let (tx, _rx) = mpsc::channel(1);
+        let include = compile_globs(&[]).unwrap();
+        let exclude = compile_globs(&[]).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            channel.dispatch_loop(raw_rx, &tx, &include, &exclude),
+        )
+        .await
+        .expect("loop must exit once the event source ends")
+        .expect("processing a delivered event is not an error");
+    }
+
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn invalid_glob_rejection_is_span_attributed() {
@@ -888,8 +994,9 @@ mod tests {
             audit: Arc::new(SopAuditLogger::new(memory)),
         });
 
+        let (probe_tx, _probe_rx) = mpsc::channel(1);
         let err = channel
-            .watch_and_dispatch()
+            .watch_and_dispatch(&probe_tx)
             .await
             .expect_err("invalid include glob must fail the listener closed");
         assert!(

@@ -2075,6 +2075,7 @@ impl RpcDispatcher {
                 })
             }
             Err(e) => {
+                let user_message = e.user_message().map(str::to_owned);
                 ::zeroclaw_log::record!(
                     ERROR,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -2093,10 +2094,15 @@ impl RpcDispatcher {
                 self.emit_turn_complete(
                     &req.session_id,
                     crate::rpc::types::TurnCompletionOutcome::Failed,
-                    format!("turn failed: {e}"),
+                    user_message
+                        .clone()
+                        .unwrap_or_else(|| format!("turn failed: {e}")),
                 )
                 .await;
-                Err(rpc_err(INTERNAL_ERROR, e.to_string()))
+                Err(rpc_err(
+                    INTERNAL_ERROR,
+                    user_message.unwrap_or_else(|| e.to_string()),
+                ))
             }
         }
     }
@@ -2126,12 +2132,31 @@ impl RpcDispatcher {
     async fn handle_session_configure(&self, params: &Value) -> RpcResult {
         let req: SessionConfigureParams = parse_params(params)?;
         validate_session_configure_overrides(&req.overrides)?;
+
+        // Capture the session generation /before/ acquiring the per-session
+        // update lock. If the session is replaced while we wait for the lock,
+        // the re-verification below will detect the mismatch and reject the
+        // stale configure.
+        let session_generation = self
+            .ctx
+            .sessions
+            .get_generation(&req.session_id)
+            .await
+            .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Acquire the per-session ordering boundary.
         let _model_provider_update = self
             .ctx
             .sessions
             .lock_model_provider_update(&req.session_id)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
+
+        // Re-verify the session has not been replaced while we waited for
+        // the lock. If replaced, this configure is stale — reject it.
+        if self.ctx.sessions.get_generation(&req.session_id).await != Some(session_generation) {
+            return Err(rpc_err(SESSION_NOT_FOUND, "Session not found"));
+        }
 
         let merged = self
             .ctx
@@ -2176,6 +2201,7 @@ impl RpcDispatcher {
                 let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                     &agent_cfg,
                     model_provider.as_ref(),
+                    &model_name,
                 );
                 (
                     model_provider,
@@ -2192,7 +2218,7 @@ impl RpcDispatcher {
         let merged = self
             .ctx
             .sessions
-            .set_overrides(&req.session_id, req.overrides)
+            .set_overrides_gated(&req.session_id, session_generation, req.overrides)
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
@@ -2203,10 +2229,12 @@ impl RpcDispatcher {
                 .sessions
                 .apply_model_provider(
                     &req.session_id,
+                    session_generation,
                     model_provider,
                     model_provider_name,
                     model_name,
                     tool_dispatcher,
+                    None,
                 )
                 .await
                 .then_some(())
@@ -2802,55 +2830,70 @@ impl RpcDispatcher {
         let req: ConfigSetParams = parse_params(params)?;
         let refresh_model_provider_ref = model_provider_ref_from_provider_profile_prop(&req.prop);
         let config_write_guard = Arc::clone(&self.ctx.config_write_lock).lock_owned().await;
-        {
-            let mut config = self.ctx.config.write();
-            if config.ensure_map_key_for_path(&req.prop) {
-                // Refused to vivify the reserved `default` agent: return a
-                // reserved error rather than a downstream "Unknown property".
-                return Err(rpc_err(
-                    INVALID_PARAMS,
-                    "alias `default` is reserved and cannot be created",
-                ));
-            }
-            let info = config
-                .prop_fields()
-                .into_iter()
-                .find(|f| f.name == req.prop);
-            // Polymorphic value: strings pass through, everything else coerced.
-            let value_str = match &req.value {
-                Value::String(s) => s.clone(),
-                other => zeroclaw_config::typed_value::coerce_for_set_prop(
-                    other,
-                    info.as_ref().map(|i| i.kind),
-                )
-                .map_err(|e| rpc_err(INVALID_PARAMS, e.message))?,
-            };
-            // Reject the masked sentinel for secrets — surfaces echo the
-            // masked display value back when no real edit happened, and
-            // letting that through silently clobbers the live secret with
-            // the literal masked string.
-            let is_secret_prop = info
-                .as_ref()
-                .is_some_and(|i| i.is_secret || i.derived_from_secret)
-                || zeroclaw_config::schema::Config::prop_is_secret(&req.prop);
-            if is_secret_prop
-                && (value_str == zeroclaw_config::traits::MASKED_SECRET
-                    || value_str == "****"
-                    || value_str.is_empty())
-            {
-                return Err(rpc_err(
-                    INVALID_PARAMS,
-                    format!(
-                        "Refusing to overwrite secret `{}` with a masked or empty value",
-                        req.prop
-                    ),
-                ));
-            }
-            config
-                .set_prop_persistent(&req.prop, &value_str)
-                .map_err(|e| rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")))?;
+        // Clone the live config and perform every mutation — alias creation,
+        // field lookup, value coercion, masked-secret validation, and the
+        // persistent write — on the working copy. Any early error simply
+        // returns and drops the clone, so a partially-applied attempt (e.g. a
+        // freshly auto-created alias followed by a coercion failure) is
+        // discarded as one unit and can never leave a phantom entry on the
+        // live config. Only a fully successful mutation is committed, by
+        // swapping the snapshot in under `config_write_guard`. This keeps
+        // alias-creation ownership inside `zeroclaw-config` and commit
+        // orchestration inside the runtime, rather than mirroring config
+        // transaction semantics through a tracked tuple.
+        // `Config` is a large aggregate; box the working clone so it lives on
+        // the heap rather than inflating this async fn's stack frame across the
+        // awaits below.
+        let mut config = Box::new(self.ctx.config.read().clone());
+        if config.ensure_map_key_for_path(&req.prop) {
+            // Refused to vivify the reserved `default` agent: return a
+            // reserved error rather than a downstream "Unknown property".
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                "alias `default` is reserved and cannot be created",
+            ));
         }
-        self.flush_config(&config_write_guard).await?;
+        let info = config
+            .prop_fields()
+            .into_iter()
+            .find(|f| f.name == req.prop);
+        // Polymorphic value: strings pass through, everything else coerced.
+        let value_str = match &req.value {
+            Value::String(s) => s.clone(),
+            other => match zeroclaw_config::typed_value::coerce_for_set_prop(
+                other,
+                info.as_ref().map(|i| i.kind),
+            ) {
+                Ok(coerced) => coerced,
+                Err(e) => return Err(rpc_err(INVALID_PARAMS, e.message)),
+            },
+        };
+        // Reject the masked sentinel for secrets — surfaces echo the
+        // masked display value back when no real edit happened, and
+        // letting that through silently clobbers the live secret with
+        // the literal masked string.
+        let is_secret_prop = info
+            .as_ref()
+            .is_some_and(|i| i.is_secret || i.derived_from_secret)
+            || zeroclaw_config::schema::Config::prop_is_secret(&req.prop);
+        if is_secret_prop
+            && (value_str == zeroclaw_config::traits::MASKED_SECRET
+                || value_str == "****"
+                || value_str.is_empty())
+        {
+            return Err(rpc_err(
+                INVALID_PARAMS,
+                format!(
+                    "Refusing to overwrite secret `{}` with a masked or empty value",
+                    req.prop
+                ),
+            ));
+        }
+        if let Err(e) = config.set_prop_persistent(&req.prop, &value_str) {
+            return Err(rpc_err(INTERNAL_ERROR, format!("Config set failed: {e}")));
+        }
+        self.save_and_swap_config(*config, &config_write_guard)
+            .await?;
         if let Some(model_provider_ref) = refresh_model_provider_ref {
             self.refresh_memory_embedder_for_model_provider(&model_provider_ref);
             self.schedule_live_sessions_refresh_for_model_provider(model_provider_ref);
@@ -2974,17 +3017,41 @@ impl RpcDispatcher {
     {
         let session_ids = ctx.sessions.list_ids().await;
         for session_id in session_ids {
+            // Capture the generation before acquiring the lock so we can
+            // detect same-ID replacement while waiting.
+            let Some(session_generation) = ctx.sessions.get_generation(&session_id).await else {
+                continue;
+            };
+
+            // Acquire the per-session ordering boundary. This serialises
+            // with session/configure so the state we read afterwards
+            // reflects any configure that committed before this point.
             let Some(_model_provider_update) =
                 ctx.sessions.lock_model_provider_update(&session_id).await
             else {
                 continue;
             };
+
+            // Re-verify the session has not been replaced while we waited
+            // for the lock.
+            let Some(current_gen) = ctx.sessions.get_generation(&session_id).await else {
+                continue;
+            };
+            if current_gen != session_generation {
+                continue;
+            };
+
+            // Re-read alias and overrides inside the ordering boundary.
+            // A session/configure may have committed new overrides on the
+            // same generation while we were waiting for the lock; reading
+            // here ensures the refresh acts on the latest state.
             let Some(agent_alias) = ctx.sessions.get_agent_alias(&session_id).await else {
                 continue;
             };
             let Some(overrides) = ctx.sessions.get_overrides(&session_id).await else {
                 continue;
             };
+
             let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
                 let config = ctx.config.read();
                 let Some(model_provider_ref) =
@@ -3027,6 +3094,7 @@ impl RpcDispatcher {
                         let tool_dispatcher = crate::agent::agent::tool_dispatcher_for_provider(
                             &agent_cfg,
                             model_provider.as_ref(),
+                            &model_name,
                         );
                         (
                             model_provider,
@@ -3056,21 +3124,17 @@ impl RpcDispatcher {
                     }
                 }
             };
-            if ctx
-                .sessions
+            ctx.sessions
                 .apply_model_provider(
                     &session_id,
+                    session_generation,
                     model_provider,
                     model_provider_name,
                     model_name,
                     tool_dispatcher,
+                    Some(temperature),
                 )
-                .await
-                && let Some(agent) = ctx.sessions.get_agent(&session_id).await
-            {
-                let mut agent = agent.lock().await;
-                agent.set_temperature(temperature);
-            }
+                .await;
         }
     }
 
@@ -4180,8 +4244,8 @@ impl RpcDispatcher {
 
     fn sops_dir_and_mode(&self) -> (std::path::PathBuf, crate::sop::SopExecutionMode) {
         let config = self.ctx.config.read();
-        let workspace = config.shared_workspace_dir();
-        let dir = crate::sop::resolve_sops_dir(&workspace, config.sop.sops_dir.as_deref());
+        let install_root = config.install_root_dir();
+        let dir = crate::sop::resolve_sops_dir(&install_root, config.sop.sops_dir.as_deref());
         let mode = crate::sop::parse_execution_mode(&config.sop.default_execution_mode);
         (dir, mode)
     }
@@ -4372,7 +4436,7 @@ impl RpcDispatcher {
             use crate::sop::approval::{BrokerOutcome, ResolveOutcome};
             let principal = crate::sop::approval::ApprovalPrincipal::cli(self.tui_id.clone());
             match guard
-                .resolve_via_broker(&req.run_id, decision, principal)
+                .resolve_via_broker_deferred(&req.run_id, decision, principal)
                 .map_err(|e| rpc_err(INTERNAL_ERROR, e.to_string()))?
             {
                 outcome @ BrokerOutcome::Resolved(ResolveOutcome::Resumed(_)) => {
@@ -5720,6 +5784,36 @@ mod tests {
         assert_eq!(err.code, INTERNAL_ERROR);
     }
 
+    // The `sop list` create-hint tells users to author under `<shared>/sops`;
+    // this locks the CLI scan root (sops_dir_and_mode) to that same path when
+    // sops_dir is unset, so the hint can never drift from where we actually
+    // read.
+    #[test]
+    fn sops_list_scan_root_matches_shared_sops_create_hint() {
+        use zeroclaw_config::schema::Config;
+        use zeroclaw_infra::session_queue::SessionActorQueue;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        assert!(
+            config.sop.sops_dir.is_none(),
+            "default config must leave sops_dir unset so the hint path applies",
+        );
+
+        let queue = Arc::new(SessionActorQueue::new(4, 10, 60));
+        let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let d = RpcDispatcher::new(ctx, tx, "test-peer-sopscan:pid=1".into());
+
+        let (dir, _mode) = d.sops_dir_and_mode();
+        assert_eq!(dir, tmp.path().join("shared").join("sops"));
+    }
+
     fn make_checkpoint_rpc_dispatcher(
         quorum: u32,
         members: &[&str],
@@ -6598,7 +6692,9 @@ mod tests {
         let sessions = Arc::new(crate::rpc::session::SessionStore::new(16, queue));
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
@@ -8461,6 +8557,17 @@ mod tests {
         dispatcher
     }
 
+    fn make_shared_sessions_dispatcher(
+        config: zeroclaw_config::schema::Config,
+        sessions: Arc<crate::rpc::session::SessionStore>,
+    ) -> RpcDispatcher {
+        let ctx = RpcContext::minimal(config, sessions);
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut dispatcher = RpcDispatcher::new(ctx, tx, "test-peer".into());
+        dispatcher.authenticated = true;
+        dispatcher
+    }
+
     fn make_secret_test_config(tmp: &tempfile::TempDir) -> zeroclaw_config::schema::Config {
         let mut cfg = zeroclaw_config::schema::Config {
             config_path: tmp.path().join("config.toml"),
@@ -8528,6 +8635,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn config_set_rejects_ambiguous_dotted_resource_path_without_mutation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.cost.rates.providers.models.openai.insert(
+            "gpt-4.1".to_string(),
+            zeroclaw_config::schema::ModelCostRates {
+                input_per_mtok: Some(1.0),
+                ..Default::default()
+            },
+        );
+        cfg.cost.rates.providers.models.openai.insert(
+            "gpt-4.1.input_per_mtok".to_string(),
+            zeroclaw_config::schema::ModelCostRates {
+                input_per_mtok: Some(2.0),
+                ..Default::default()
+            },
+        );
+        cfg.save().await.expect("seed colliding resource keys");
+        let prior_disk = std::fs::read_to_string(&config_path).unwrap();
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "cost.rates.providers.models.openai.gpt-4.1.input_per_mtok",
+                "value": 9.9
+            }))
+            .await;
+        let err = res.expect_err("ambiguous resource path must fail closed");
+        let message = format!("{err:?}");
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\\\"gpt-4.1.input_per_mtok\\\"]"),
+            "RPC error must name the whole-entry interpretation: {message}"
+        );
+        assert!(
+            message.contains("cost.rates.providers.models.openai[\\\"gpt-4.1\\\"].input_per_mtok"),
+            "RPC error must name the field interpretation: {message}"
+        );
+
+        let live = dispatcher.ctx.config.read();
+        assert_eq!(
+            live.cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(1.0),
+            "the field interpretation must remain unchanged"
+        );
+        assert_eq!(
+            live.cost
+                .rates
+                .providers
+                .models
+                .openai
+                .get("gpt-4.1.input_per_mtok")
+                .and_then(|rates| rates.input_per_mtok),
+            Some(2.0),
+            "the exact-key interpretation must remain unchanged"
+        );
+        drop(live);
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            prior_disk,
+            "a rejected config/set must not rewrite the on-disk config"
+        );
+    }
+
+    #[tokio::test]
     async fn config_set_still_materializes_operator_chosen_alias() {
         let tmp = tempfile::TempDir::new().unwrap();
         let dispatcher = make_config_set_test_dispatcher(make_secret_test_config(&tmp));
@@ -8573,6 +8751,160 @@ mod tests {
             stored.as_deref(),
             Some("sk-real-test-key"),
             "real secret must land in memory as plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_persists_dotted_dynamic_secret_keys_for_existing_and_fresh_aliases() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let mut cfg = make_secret_test_config(&tmp);
+        cfg.secrets.encrypt = false;
+        cfg.create_map_key("providers.models.openai", "existing")
+            .expect("create the existing provider alias");
+        cfg.providers
+            .models
+            .openai
+            .get_mut("existing")
+            .expect("existing provider alias must be present")
+            .base
+            .model = Some("gpt-4o".to_string());
+        cfg.save().await.expect("seed the on-disk config");
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+
+        let existing = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.existing.extra_headers.X-Trace.level",
+                "value": "existing-value"
+            }))
+            .await;
+        assert!(
+            existing.is_ok(),
+            "config/set must accept a dotted key on an existing alias: {existing:?}"
+        );
+
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk).unwrap_or_else(|e| {
+            panic!("config must reload after existing-alias write: {e}\n{disk}")
+        });
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("existing")
+                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
+                .map(String::as_str),
+            Some("existing-value"),
+            "RPC success must mean the literal dotted key survived save/reload"
+        );
+
+        let fresh = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.fresh.extra_headers.X-Trace.level",
+                "value": "fresh-value"
+            }))
+            .await;
+        assert!(
+            fresh.is_ok(),
+            "config/set must materialize an alias for a first dotted dynamic-map write: {fresh:?}"
+        );
+        assert_eq!(
+            dispatcher
+                .ctx
+                .config
+                .read()
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
+                .map(String::as_str),
+            Some("fresh-value"),
+            "new alias and dotted key must be published to live config"
+        );
+
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        let reloaded: zeroclaw_config::schema::Config = toml::from_str(&disk)
+            .unwrap_or_else(|e| panic!("config must reload after fresh-alias write: {e}\n{disk}"));
+        assert_eq!(
+            reloaded
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Trace.level"))
+                .map(String::as_str),
+            Some("fresh-value"),
+            "fresh alias dotted key must survive the RPC save/reload boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_post_rename_sync_failure_still_commits_disk_live_and_backup() {
+        // Production-boundary regression for the post-rename durability fault:
+        // the injected failure is driven through `config/set` itself (not the
+        // write helper), proving the RPC reports committed success, disk and
+        // live config agree on the new value, and the prior file is retained
+        // as `.bak`.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let cfg = make_secret_test_config(&tmp);
+        cfg.save().await.expect("seed the on-disk config");
+        let prior_disk = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("seeded config must exist on disk");
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let config_path = tmp.path().join("config.toml");
+        zeroclaw_config::schema::arm_post_replace_sync_failure_for_test(&config_path);
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.anthropic.default.api_key",
+                "value": "sk-post-rename-sync-key"
+            }))
+            .await;
+        assert!(
+            res.is_ok(),
+            "a post-rename sync fault must still report a committed config/set: {res:?}"
+        );
+        assert!(
+            !zeroclaw_config::schema::post_replace_sync_failure_armed(&config_path),
+            "the injected fault must actually fire inside the config/set save path"
+        );
+
+        let live = dispatcher
+            .ctx
+            .config
+            .read()
+            .providers
+            .models
+            .anthropic
+            .get("default")
+            .and_then(|e| e.base.api_key.clone());
+        assert_eq!(
+            live.as_deref(),
+            Some("sk-post-rename-sync-key"),
+            "live config must hold the committed value"
+        );
+
+        let disk = tokio::fs::read_to_string(tmp.path().join("config.toml"))
+            .await
+            .expect("config.toml must survive the injected fault");
+        assert!(
+            disk.contains("api_key"),
+            "disk must contain the replacement config: {disk}"
+        );
+        assert_ne!(
+            disk, prior_disk,
+            "disk must hold the new file, not the pre-fault one"
+        );
+
+        let backup = tokio::fs::read_to_string(tmp.path().join("config.toml.bak"))
+            .await
+            .expect("durability uncertainty must retain the pre-replace backup");
+        assert_eq!(
+            backup, prior_disk,
+            ".bak must contain the prior on-disk config"
         );
     }
 
@@ -8748,7 +9080,9 @@ mod tests {
 
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(scoped)
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
@@ -8837,6 +9171,108 @@ mod tests {
             stored.as_deref(),
             Some("sk-live-secret"),
             "live secret must NOT be clobbered by a masked write"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_unknown_field_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.anthropic.new_bot.not_a_real_field",
+            "value": "anything"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set on an unknown tail field must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.anthropic")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot")),
+            "the alias auto-created to resolve the write must be rolled back, \
+             not left as a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_bad_value_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.openai.new_bot.temperature",
+            "value": "abc"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with an unparsable value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot")),
+            "a set_prop value failure after alias auto-creation must roll the \
+             alias back, not leave a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_coercion_failure_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        // Non-string JSON value so the failure happens in coerce_for_set_prop,
+        // not in the later set_prop parse.
+        let params = json!({
+            "prop": "providers.models.openai.new_bot3.temperature",
+            "value": {"not": "a-float"}
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with an uncoercible value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot3")),
+            "a value coercion failure after alias auto-creation must roll the \
+             alias back, not leave a phantom in the live daemon config"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_set_masked_secret_leaves_no_phantom_alias() {
+        let dispatcher =
+            make_config_set_test_dispatcher(zeroclaw_config::schema::Config::default());
+        let params = json!({
+            "prop": "providers.models.openai.new_bot2.api_key",
+            "value": "****"
+        });
+
+        let res = dispatcher.handle_config_set(&params).await;
+
+        assert!(
+            res.is_err(),
+            "config/set with a masked secret value must fail, got: {res:?}"
+        );
+        let cfg_after = dispatcher.ctx.config.read().clone();
+        assert!(
+            cfg_after
+                .get_map_keys("providers.models.openai")
+                .is_some_and(|keys| !keys.iter().any(|k| k == "new_bot2")),
+            "the masked-secret rejection after alias auto-creation must roll \
+             the alias back, not leave a phantom in the live daemon config"
         );
     }
 
@@ -10047,7 +10483,9 @@ mod tests {
         // dispatcher sees a live session.
         let agent = crate::agent::agent::Agent::builder()
             .model_provider(Box::new(DummyModelProvider))
-            .tools(vec![])
+            .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+                vec![],
+            ))
             .memory(Arc::new(zeroclaw_memory::NoneMemory::new("none")))
             .observer(Arc::new(crate::observability::noop::NoopObserver))
             .tool_dispatcher(Box::new(crate::agent::dispatcher::NativeToolDispatcher))
@@ -10637,6 +11075,389 @@ mod tests {
         assert!(
             !on_disk.contains("[agents.alpha]"),
             "old alias must not survive on disk:\n{on_disk}"
+        );
+    }
+
+    // ── generation-gated stale-refresh in-flight race tests ──
+    //
+    // These tests use a SessionStore test-only gate to pause stale work
+    // after the generation is captured but before the gated method commits,
+    // then replace the session through session/new while the stale work is
+    // paused. After releasing the gate they wait for the gated method to
+    // exit (done notification), then assert the successor is untouched.
+
+    /// Deterministic race: `session/configure` captures the original
+    /// generation, enters the gated method, then the session is replaced
+    /// via `session/new` while the stale configure is paused. The stale
+    /// work must be rejected and the successor must remain untouched.
+    #[tokio::test]
+    async fn session_configure_stale_gen_replaced_during_provider_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let (entered, release, done) = sessions.set_test_gated_op_pause();
+        let sid = session_id.clone();
+        let workspace = tmp.path().join("workspace");
+
+        // Spawn the configure handler — it will capture the generation,
+        // acquire the per-session lock, build the provider, then block at
+        // the gate inside set_overrides_gated.
+        let handle = zeroclaw_spawn::spawn!(async move {
+            dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": sid,
+                    "overrides": {
+                        "model_provider": "openai.test-provider",
+                        "model": "intruder-model",
+                        "temperature": 0.99,
+                    }
+                }))
+                .await
+        });
+
+        // Wait for the handler to enter the gate (generation captured,
+        // commit pending).
+        entered.notified().await;
+
+        // Replace the session via session/new while the stale configure
+        // is paused — this is caller-supplied same-ID replacement.
+        let dispatcher2 = make_shared_sessions_dispatcher(
+            make_model_refresh_test_config(&tmp),
+            Arc::clone(&sessions),
+        );
+        let replace_res = dispatcher2
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": workspace,
+                "session_id": session_id,
+            }))
+            .await;
+        assert!(
+            replace_res.is_ok(),
+            "session/new replacement must succeed: {replace_res:?}"
+        );
+
+        // Release the gate — stale work sees the generation mismatch.
+        release.notify_one();
+
+        // Wait for the gated method to exit.
+        done.notified().await;
+        sessions.clear_test_gated_op_pause();
+
+        let res = handle.await.expect("spawned configure must not panic");
+        assert!(
+            res.is_err(),
+            "stale-generation configure after replacement must fail; got: {res:?}"
+        );
+
+        // Successor must be completely untouched — it was created from
+        // config by session/new and must still have its original values.
+        let overrides = sessions
+            .get_overrides(&session_id)
+            .await
+            .expect("successor still exists");
+        assert_eq!(overrides.model_provider, None);
+        assert_eq!(overrides.model, None);
+        assert_eq!(overrides.temperature, None);
+
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("successor agent exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        // Successor was built from the test config with
+        // model_provider = "openai.test-provider", model = "old-model".
+        // The stale configure tried to change these to "intruder-model";
+        // if the generation gate held, the successor keeps its original
+        // config values.
+        assert_eq!(
+            model_name, "old-model",
+            "successor model must not be overwritten by stale configure"
+        );
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.2),
+            "successor temperature must not be overwritten"
+        );
+    }
+
+    /// Deterministic race: config/set triggers an async refresh. The
+    /// refresh snapshots the session identity, acquires the per-session
+    /// lock, builds the provider, then blocks at `apply_model_provider`.
+    /// The session is replaced via `session/new` while paused. The stale
+    /// refresh must skip the successor.
+    #[tokio::test]
+    async fn config_set_refresh_stale_gen_replaced_during_provider_build() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let dispatcher = make_config_set_test_dispatcher(make_model_refresh_test_config(&tmp));
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        let sessions = Arc::clone(&dispatcher.ctx.sessions);
+        let (entered, release, done) = sessions.set_test_gated_op_pause();
+
+        // Trigger config/set — schedules an async refresh that will
+        // snapshot, lock, build provider, then block at apply_model_provider.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "refreshed-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // Wait for the async refresh to reach the gate (snapshot captured,
+        // provider built, apply pending).
+        entered.notified().await;
+
+        // Replace the session via session/new while the stale refresh is
+        // paused.
+        let dispatcher2 = make_shared_sessions_dispatcher(
+            make_model_refresh_test_config(&tmp),
+            Arc::clone(&sessions),
+        );
+        let workspace = tmp.path().join("workspace");
+        let replace_res = dispatcher2
+            .handle_session_new_for_test(&json!({
+                "agent_alias": "test-agent",
+                "cwd": workspace,
+                "session_id": session_id,
+            }))
+            .await;
+        assert!(
+            replace_res.is_ok(),
+            "session/new replacement must succeed: {replace_res:?}"
+        );
+
+        // Release the gate — stale refresh sees generation mismatch.
+        release.notify_one();
+
+        // Wait for the gated method to exit, then clean up.
+        done.notified().await;
+        sessions.clear_test_gated_op_pause();
+
+        // Successor must be untouched by the stale refresh — it was
+        // created from config with model "old-model". The refresh tried
+        // to change it to "refreshed-model"; gen-gating must prevent that.
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("successor agent exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        assert_eq!(
+            model_name, "old-model",
+            "successor model must not be overwritten by stale config/set refresh"
+        );
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.2),
+            "successor temperature must not be overwritten"
+        );
+    }
+
+    /// Deterministic race: config/set triggers an async refresh that pauses
+    /// at `apply_model_provider` after capturing the old generation. While
+    /// paused, the session is replaced through ACP rehydration
+    /// (`rehydrate_reaped_session`), which installs a same-ID successor via
+    /// `SessionStore::insert`. The stale refresh must skip the rehydrated
+    /// successor.
+    #[tokio::test]
+    async fn config_set_refresh_stale_gen_replaced_by_acp_rehydration() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = make_model_refresh_test_config(&tmp);
+        let data_dir = config.data_dir.clone();
+        let (dispatcher, sessions, _chat_backend, acp_store) =
+            make_persistence_test_dispatcher(config, &data_dir);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+        assert_eq!(
+            model_name_for_session(&dispatcher, &session_id).await,
+            "old-model"
+        );
+
+        // Persist a restorable ACP row for the same session ID so
+        // rehydrate_reaped_session can reinstall it under the same ID.
+        let workspace = tmp.path().join("workspace").to_string_lossy().to_string();
+        acp_store
+            .create_session(&session_id, "test-agent", &workspace)
+            .expect("ACP session row must be created");
+
+        let (entered, release, done) = sessions.set_test_gated_op_pause();
+
+        // Trigger config/set — schedules an async refresh that pauses at
+        // apply_model_provider after capturing the old generation.
+        let res = dispatcher
+            .handle_config_set(&json!({
+                "prop": "providers.models.openai.test-provider.model",
+                "value": "refreshed-model"
+            }))
+            .await;
+        assert!(res.is_ok(), "config/set must succeed: {res:?}");
+
+        // Wait for the async refresh to reach the gate.
+        entered.notified().await;
+
+        // Rewind the provider model so the rehydrated successor is built
+        // from "old-model" while the paused refresh still targets
+        // "refreshed-model". This makes the two distinguishable: if the
+        // stale refresh leaks through, the successor would flip to
+        // "refreshed-model".
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .providers
+            .models
+            .ensure("openai", "test-provider")
+            .expect("openai.test-provider slot exists")
+            .model = Some("old-model".into());
+
+        // Replace the session via ACP rehydration while the stale refresh
+        // is paused. This installs a same-ID successor via SessionStore::insert.
+        let rehydrated = dispatcher.rehydrate_reaped_session(&session_id).await;
+        assert!(
+            rehydrated.is_some(),
+            "ACP rehydration must install the same-ID successor"
+        );
+
+        // Release the gate — the stale refresh sees the generation mismatch.
+        release.notify_one();
+        done.notified().await;
+        sessions.clear_test_gated_op_pause();
+
+        // The rehydrated successor must retain its provider, model, and
+        // temperature — untouched by the stale config/set refresh.
+        let agent = sessions
+            .get_agent(&session_id)
+            .await
+            .expect("rehydrated successor exists");
+        let guard = agent.lock().await;
+        let (_, provider_name, model_name) = guard.attribution_fields();
+        assert_eq!(
+            model_name, "old-model",
+            "rehydrated successor model must not be overwritten by stale config/set refresh"
+        );
+        assert_eq!(provider_name, "openai.test-provider");
+        assert_eq!(
+            guard.temperature_for_test(),
+            Some(0.2),
+            "rehydrated successor temperature must not be overwritten"
+        );
+    }
+
+    /// Reverse-order regression: `session/configure` queues before a provider
+    /// refresh. The configure commits a `model_provider` override, then the
+    /// refresh — which captured its generation before blocking on the
+    /// ordering lock — must re-read the committed override inside the lock
+    /// and skip the session instead of applying a stale pre-lock snapshot.
+    #[tokio::test]
+    async fn model_provider_update_queued_refresh_reads_newer_configure_override() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut cfg = make_model_refresh_test_config(&tmp);
+        let other = cfg
+            .providers
+            .models
+            .ensure("openai", "other-provider")
+            .expect("openai provider slot exists");
+        other.api_key = Some("test-key".into());
+        other.uri = Some("http://127.0.0.1:1".into());
+        other.model = Some("other-model".into());
+
+        let dispatcher = make_config_set_test_dispatcher(cfg);
+        let session_id = create_model_refresh_test_session(&dispatcher, &tmp).await;
+
+        // Hold the per-session ordering lock so both configure and refresh
+        // queue behind it.
+        let update_guard = dispatcher
+            .ctx
+            .sessions
+            .lock_model_provider_update(&session_id)
+            .await
+            .expect("session update lock exists");
+
+        // Point the agent at other-provider so a refresh that does NOT see
+        // the configure override would rebuild the agent to other-model.
+        dispatcher
+            .ctx
+            .config
+            .write()
+            .agents
+            .get_mut("test-agent")
+            .expect("test agent exists")
+            .model_provider = "openai.other-provider".into();
+
+        // Queue configure FIRST — it will commit a model_provider override.
+        let configure_dispatcher = Arc::new(dispatcher);
+        let configure_task_dispatcher = Arc::clone(&configure_dispatcher);
+        let configure_session_id = session_id.clone();
+        let configure_waiting = configure_dispatcher
+            .ctx
+            .sessions
+            .model_provider_update_waiting();
+        let configure_wait = configure_waiting.notified();
+        let configure = zeroclaw_spawn::spawn!(async move {
+            configure_task_dispatcher
+                .handle_session_configure(&json!({
+                    "session_id": configure_session_id,
+                    "overrides": { "model_provider": "openai.test-provider" }
+                }))
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), configure_wait)
+            .await
+            .expect("session/configure must queue first on the provider update boundary");
+
+        // Queue refresh SECOND — it captures its generation then blocks on
+        // the same ordering lock behind configure.
+        let refresh_ctx = Arc::clone(&configure_dispatcher.ctx);
+        let refresh_waiting = configure_dispatcher
+            .ctx
+            .sessions
+            .model_provider_update_waiting();
+        let refresh_wait = refresh_waiting.notified();
+        let refresh = zeroclaw_spawn::spawn!(async move {
+            RpcDispatcher::refresh_live_sessions_for_agent(refresh_ctx, "test-agent").await;
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), refresh_wait)
+            .await
+            .expect("agent refresh must queue behind the configure");
+
+        drop(update_guard);
+
+        configure
+            .await
+            .expect("session/configure task must complete")
+            .expect("session/configure must commit the override");
+        refresh.await.expect("agent refresh task must complete");
+
+        // The refresh must resolve the committed configure override and skip
+        // the session, preserving the newer override instead of applying its
+        // stale pre-lock snapshot.
+        assert_eq!(
+            model_name_for_session(&configure_dispatcher, &session_id).await,
+            "old-model",
+            "a later refresh must not overwrite a configure override that committed first"
+        );
+        assert_eq!(
+            configure_dispatcher
+                .ctx
+                .sessions
+                .get_overrides(&session_id)
+                .await
+                .and_then(|overrides| overrides.model_provider),
+            Some("openai.test-provider".to_string())
         );
     }
 }

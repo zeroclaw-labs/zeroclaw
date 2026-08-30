@@ -198,12 +198,19 @@ impl RecoveryBarrier {
         }
     }
 
+    fn needed_epoch(&self) -> std::sync::MutexGuard<'_, Option<u64>> {
+        match self.needed_epoch.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
     /// Publish that the observed epoch now needs recovery before any further
     /// write. Idempotent for a given epoch; a newer epoch supersedes an older
     /// pending one. This is intentionally synchronous (no `.await`) so it takes
     /// effect the instant an outcome becomes unknown.
     fn arm(&self, epoch: u64) {
-        let mut needed = self.needed_epoch.lock().unwrap();
+        let mut needed = self.needed_epoch();
         match *needed {
             Some(existing) if existing >= epoch => {}
             _ => *needed = Some(epoch),
@@ -214,7 +221,7 @@ impl RecoveryBarrier {
     /// for `recovered_epoch`, then wake any waiting writers.
     fn finish(&self, recovered_epoch: u64) {
         {
-            let mut needed = self.needed_epoch.lock().unwrap();
+            let mut needed = self.needed_epoch();
             if matches!(*needed, Some(pending) if pending <= recovered_epoch) {
                 *needed = None;
             }
@@ -234,7 +241,7 @@ impl RecoveryBarrier {
     }
 
     fn recovery_pending(&self) -> bool {
-        self.needed_epoch.lock().unwrap().is_some()
+        self.needed_epoch().is_some()
     }
 }
 
@@ -951,9 +958,9 @@ impl McpRegistry {
                 _request: &JsonRpcRequest,
                 _lifecycle: &McpRequestLifecycle,
             ) -> Result<JsonRpcResponse> {
-                unreachable!(
-                    "for_test_with_server_count registry is only used for server_count/Arc equality"
-                )
+                Err(anyhow::Error::msg(
+                    "for_test_with_server_count transport does not support requests",
+                ))
             }
 
             async fn close(&self) -> Result<()> {
@@ -1104,10 +1111,9 @@ impl McpRegistry {
                 _request: &JsonRpcRequest,
                 _lifecycle: &McpRequestLifecycle,
             ) -> Result<JsonRpcResponse> {
-                unreachable!(
-                    "for_test_make_stub_server is only used for identity / \
-                     ptr_eq / server_count assertions — never for actual tool calls"
-                )
+                Err(anyhow::Error::msg(
+                    "for_test_make_stub_server transport does not support requests",
+                ))
             }
 
             async fn close(&self) -> Result<()> {
@@ -1154,11 +1160,16 @@ impl McpRegistry {
     }
 
     /// Execute a tool by prefixed name.
+    ///
+    /// Returns the raw JSON-RPC result value. Callers that surface the result
+    /// to the model should run
+    /// `embedded_resource::format_mcp_tool_result_for_model` so `resource`+`blob`
+    /// content is materialized instead of pretty-printed.
     pub async fn call_tool(
         &self,
         prefixed_name: &str,
         arguments: serde_json::Value,
-    ) -> Result<String> {
+    ) -> Result<serde_json::Value> {
         let (server_idx, original_name) = self.tool_index.get(prefixed_name).ok_or_else(|| {
             ::zeroclaw_log::record!(
                 WARN,
@@ -1169,11 +1180,9 @@ impl McpRegistry {
             );
             anyhow::Error::msg(format!("unknown MCP tool `{prefixed_name}`"))
         })?;
-        let result = self.servers[*server_idx]
+        self.servers[*server_idx]
             .call_tool(original_name, arguments)
-            .await?;
-        serde_json::to_string_pretty(&result)
-            .with_context(|| format!("failed to serialize result of MCP tool `{prefixed_name}`"))
+            .await
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1592,6 +1601,8 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            tls_ca_cert_path: None,
+            max_response_bytes: None,
         };
         let result = McpServer::connect(config).await;
         assert!(result.is_err());
@@ -1612,6 +1623,8 @@ mod tests {
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            tls_ca_cert_path: None,
+            max_response_bytes: None,
         }];
         let registry = McpRegistry::connect_all(&configs)
             .await
@@ -2233,6 +2246,115 @@ mod tests {
         }
     }
 
+    /// Like `server_returning`, but the server advertises a single tool so a
+    /// registry built from it routes `call_tool` through the production path.
+    fn server_with_tool_returning(tool: &str, result: serde_json::Value) -> McpServer {
+        let transport: Arc<dyn SharedMcpTransportConn> = Arc::new(FakeTransport { result });
+        let inner = McpServerInner {
+            config: McpServerConfig {
+                name: "fake".into(),
+                ..Default::default()
+            },
+            #[cfg(target_has_atomic = "64")]
+            next_id: AtomicU64::new(3),
+            #[cfg(not(target_has_atomic = "64"))]
+            next_id: AtomicU32::new(3),
+            tools: vec![crate::mcp_protocol::McpToolDef {
+                name: tool.to_string(),
+                description: Some("fake tool".into()),
+                input_schema: serde_json::json!({}),
+            }],
+            capabilities: McpServerCapabilities::default(),
+        };
+        McpServer {
+            inner: Arc::new(Mutex::new(inner)),
+            transport,
+            epoch_gate: Arc::new(RwLock::new(0)),
+            serial_gate: None,
+            recovery: Arc::new(RecoveryBarrier::new()),
+        }
+    }
+
+    /// Production-path fixture: a tool result carrying text + a `resource` blob +
+    /// `structuredContent` + `_meta` flows through `McpToolWrapper::execute`
+    /// (call_tool -> format) exactly as in production. Proves the model output
+    /// keeps every non-binary surface, omits the base64, and materializes the
+    /// blob only inside the workspace.
+    #[tokio::test]
+    async fn mcp_tool_wrapper_execute_materializes_blob_and_preserves_full_result() {
+        use crate::mcp_tool::McpToolWrapper;
+        use base64::Engine as _;
+        use zeroclaw_api::tool::Tool as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let pdf_b64 = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 hello world");
+        let result = serde_json::json!({
+            "content": [
+                { "type": "text", "text": "Here is your report." },
+                { "type": "resource", "resource": {
+                    "uri": "file:///report.pdf",
+                    "mimeType": "application/pdf",
+                    "blob": pdf_b64,
+                }},
+            ],
+            "structuredContent": { "rows": [ { "id": 1, "name": "alpha-row" } ] },
+            "_meta": { "trace": "t-123" },
+            "isError": false,
+        });
+
+        let server = server_with_tool_returning("do_thing", result);
+        let mut tool_index = HashMap::new();
+        tool_index.insert(
+            "fake__do_thing".to_string(),
+            (0usize, "do_thing".to_string()),
+        );
+        let mut server_index = HashMap::new();
+        server_index.insert("fake".to_string(), 0usize);
+        let registry = Arc::new(McpRegistry {
+            servers: vec![server],
+            tool_index,
+            server_index,
+        });
+
+        let security = Arc::new(zeroclaw_config::policy::SecurityPolicy {
+            workspace_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        });
+        let def = crate::mcp_protocol::McpToolDef {
+            name: "do_thing".into(),
+            description: Some("does".into()),
+            input_schema: serde_json::json!({}),
+        };
+        let wrapper = McpToolWrapper::new("fake__do_thing".into(), def, registry, security);
+
+        let out = wrapper
+            .execute(serde_json::json!({}))
+            .await
+            .expect("execute is non-fatal");
+        assert!(out.success, "execute should succeed: {:?}", out.error);
+        let text = out.output.as_str();
+
+        // Every non-binary result surface is preserved.
+        assert!(text.contains("Here is your report."), "text lost: {text}");
+        assert!(text.contains("alpha-row"), "structuredContent lost: {text}");
+        assert!(text.contains("t-123"), "_meta lost: {text}");
+        // The base64 payload never reaches the model output.
+        assert!(
+            !text.contains(&pdf_b64),
+            "raw base64 leaked into model output"
+        );
+        // The blob is materialized only under {workspace}/uploads, with real bytes.
+        let files: Vec<_> = std::fs::read_dir(dir.path().join("uploads"))
+            .expect("uploads dir")
+            .filter_map(|e| e.ok())
+            .collect();
+        assert_eq!(files.len(), 1, "exactly one materialized file");
+        assert_eq!(
+            std::fs::read(files[0].path()).unwrap(),
+            b"%PDF-1.4 hello world"
+        );
+    }
+
     /// Like `server_returning`, but with explicit advertised capabilities.
     fn server_with_caps_returning(
         capabilities: McpServerCapabilities,
@@ -2468,6 +2590,8 @@ done
             transport: McpTransport::Stdio,
             url: None,
             headers: std::collections::HashMap::default(),
+            tls_ca_cert_path: None,
+            max_response_bytes: None,
         };
 
         let registry = McpRegistry::connect_all(&[config])

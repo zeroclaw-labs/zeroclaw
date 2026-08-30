@@ -49,41 +49,10 @@ jobs:
       - name: Clippy
         shell: bash
         run: |
-          set +e
-          cargo_log="${RUNNER_TEMP}/cargo-clippy-${{ matrix.target }}.log"
-          SECONDS=0
-          cargo clippy \
-            --workspace \
-            --exclude zeroclaw-desktop \
-            --all-targets \
-            --features ci-all \
+          bash scripts/ci/run_clippy.sh \
+            --scope workspace \
             --target ${{ matrix.target }} \
-            -- -D warnings 2>&1 | tee "$cargo_log"
-          cargo_status=${PIPESTATUS[0]}
-          duration_seconds=$SECONDS
-          set -e
-
-          workspace_path_compiles="$(grep -E -c 'Compiling.*\([^)]*zeroclaw' "$cargo_log" || true)"
-          total_compiles="$(grep -c 'Compiling' "$cargo_log" || true)"
-          downloaded_crates="$(grep -c 'Downloaded' "$cargo_log" || true)"
-          cache_hit="${RUST_CACHE_HIT:-unknown}"
-          summary_file="${GITHUB_STEP_SUMMARY:-/dev/null}"
-
-          {
-            echo "### Cross-platform Clippy diagnostics: ${{ matrix.target }}"
-            echo ""
-            echo "| Field | Value |"
-            echo "| --- | --- |"
-            echo "| Target | \`${{ matrix.target }}\` |"
-            echo "| Runner OS | \`${{ runner.os }}\` |"
-            echo "| Rust cache exact hit | \`${cache_hit}\` |"
-            echo "| Clippy duration | \`${duration_seconds}s\` |"
-            echo "| Clippy status | \`${cargo_status}\` |"
-            echo "| Workspace path compile lines | \`${workspace_path_compiles}\` |"
-            echo "| Total compile lines | \`${total_compiles}\` |"
-            echo "| Downloaded crate lines | \`${downloaded_crates}\` |"
-          } >> "$summary_file"
-
-          exit "$cargo_status"
+            --summary-title "Cross-platform Clippy diagnostics: ${{ matrix.target }}" \
+            --log-name cargo-clippy-${{ matrix.target }}.log
         env:
           RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}

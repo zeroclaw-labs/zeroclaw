@@ -4,12 +4,18 @@ use serde::{Deserialize, Serialize};
 #[macro_export]
 macro_rules! tool_attribution {
     ($ty:ty, $kind:expr) => {
+        $crate::tool_attribution!($ty, $kind, $crate::attribution::ToolProvenance::Native);
+    };
+    ($ty:ty, $kind:expr, $provenance:expr) => {
         impl $crate::attribution::Attributable for $ty {
             fn role(&self) -> $crate::attribution::Role {
                 $crate::attribution::Role::Tool($kind)
             }
             fn alias(&self) -> &str {
                 <Self as $crate::tool::Tool>::name(self)
+            }
+            fn tool_provenance(&self) -> $crate::attribution::ToolProvenance {
+                $provenance
             }
         }
     };
@@ -315,6 +321,50 @@ impl OptionEntry {
     }
 }
 
+/// Reference implementation of the [`Tool::invocation_triggers`] matching
+/// contract: `true` when `trigger` occurs in `haystack` at a word boundary.
+/// Both are compared case-insensitively; the caller passes an
+/// already-lowercased `haystack` and a lowercased `trigger`. A boundary is
+/// the start/end of the string or any non-alphanumeric *character*
+/// (Unicode-aware), so a trigger matches only as a whole word or phrase
+/// (`dev` misses inside `device`, `send this to` hits inside `please send
+/// this to marta`). Boundaries and retry advancement are character-based, so
+/// multibyte trigger or haystack text is handled without panics or
+/// misclassification. Empty triggers never match.
+#[must_use]
+pub fn invocation_trigger_matches(haystack_lower: &str, trigger_lower: &str) -> bool {
+    if trigger_lower.is_empty() {
+        return false;
+    }
+    // `find` returns a byte offset of a valid substring, so `start` and
+    // `start + trigger.len()` are always char boundaries — the surrounding
+    // slices below are safe to index.
+    let mut search_start = 0;
+    while let Some(rel) = haystack_lower[search_start..].find(trigger_lower) {
+        let start = search_start + rel;
+        let end = start + trigger_lower.len();
+        let left_ok = haystack_lower[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        let right_ok = haystack_lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if left_ok && right_ok {
+            return true;
+        }
+        // Advance one whole character past this occurrence's start so the next
+        // slice index stays on a boundary (byte + 1 could split a multibyte
+        // character and panic).
+        match haystack_lower[start..].chars().next() {
+            Some(c) => search_start = start + c.len_utf8(),
+            None => break,
+        }
+    }
+    false
+}
+
 #[async_trait]
 pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// Tool name (used in LLM function calling)
@@ -339,6 +389,28 @@ pub trait Tool: Send + Sync + crate::attribution::Attributable {
     /// ...). Surfaces resolve these through the runtime to render real
     /// selectable choices. Default: no domain-typed parameters.
     fn param_domains(&self) -> Vec<(&'static str, OptionDomain)> {
+        Vec::new()
+    }
+
+    /// Lowercase phrases that suggest an inbound message wants this tool —
+    /// e.g. routing wording or configured destination names for a delivery
+    /// tool. A pre-turn prefilter may scan the message against these and
+    /// nudge the model to consider the tool; the tool itself is never called
+    /// by the prefilter.
+    ///
+    /// **Matching contract:** case-insensitive, **word-boundary** — a trigger
+    /// matches only where it is bounded by non-alphanumeric characters or the
+    /// message ends (see [`invocation_trigger_matches`]). So `dev` does not
+    /// fire inside `device` and `ops` does not fire inside `stops`; a trigger
+    /// only hits as a whole word or phrase. Entries should still be wording
+    /// that, taken whole, indicates this tool — avoid single common words.
+    /// A config-derived name that happens to equal a common word can still
+    /// over-fire; the hint is advisory (the model, not the prefilter, decides
+    /// to call), so the cost of a false positive is a wasted nudge, never an
+    /// action. Entries derived from runtime config (aliases, group names)
+    /// must be computed live per call, never cached across reloads. Default:
+    /// no triggers; the tool does not participate in prefilter hints.
+    fn invocation_triggers(&self) -> Vec<String> {
         Vec::new()
     }
 
@@ -393,6 +465,79 @@ mod tests {
         let back: ToolSpec = serde_json::from_str(&arc_json).expect("spec deserializes");
         assert_eq!(back.name, spec.name);
         assert_eq!(*back.parameters, *spec.parameters);
+    }
+
+    #[test]
+    fn trigger_matches_are_word_bounded() {
+        // Whole-word / phrase hits.
+        assert!(invocation_trigger_matches(
+            "please send this to marta",
+            "send this to"
+        ));
+        assert!(invocation_trigger_matches(
+            "reply by voice please",
+            "by voice"
+        ));
+        assert!(invocation_trigger_matches("route to dev", "dev"));
+        assert!(invocation_trigger_matches("dev", "dev"));
+        // Substring-inside-word must NOT hit.
+        assert!(!invocation_trigger_matches(
+            "check the device status",
+            "dev"
+        ));
+        assert!(!invocation_trigger_matches("the bus stops here", "ops"));
+        assert!(!invocation_trigger_matches("recall everything", "all"));
+        // Bounded by punctuation counts as a word boundary.
+        assert!(invocation_trigger_matches("send to: dev.", "dev"));
+        // Empty trigger never matches.
+        assert!(!invocation_trigger_matches("anything", ""));
+    }
+
+    #[test]
+    fn trigger_matches_are_utf8_safe() {
+        // A multibyte trigger whose first occurrence is glued to another
+        // ideograph (rejected) and whose second occurrence is space-bounded
+        // (accepted). The byte-offset retry `start + 1` would land inside the
+        // leading multibyte character and panic; the char-based advance must
+        // reject the first, survive, and accept the second.
+        assert!(invocation_trigger_matches("料理番 送信 する", "送信"));
+        // Same trigger with only the glued occurrence must NOT match, and must
+        // not panic while scanning past it.
+        assert!(!invocation_trigger_matches("料理送信番", "送信"));
+        // A single ideograph is alphanumeric under Unicode, so an adjacent
+        // ideograph is not a boundary — no false positive inside CJK text.
+        assert!(!invocation_trigger_matches("東京都", "京"));
+        // But the same single-character trigger is bounded by ASCII spaces.
+        assert!(invocation_trigger_matches("go to 京 now", "京"));
+    }
+
+    #[test]
+    fn invocation_triggers_default_to_empty() {
+        struct Plain;
+        impl crate::attribution::Attributable for Plain {
+            fn role(&self) -> crate::attribution::Role {
+                crate::attribution::Role::Tool(crate::attribution::ToolKind::Plugin)
+            }
+            fn alias(&self) -> &str {
+                "plain"
+            }
+        }
+        #[async_trait]
+        impl Tool for Plain {
+            fn name(&self) -> &str {
+                "plain"
+            }
+            fn description(&self) -> &str {
+                "no triggers"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult::ok("ok"))
+            }
+        }
+        assert!(Plain.invocation_triggers().is_empty());
     }
 
     #[test]

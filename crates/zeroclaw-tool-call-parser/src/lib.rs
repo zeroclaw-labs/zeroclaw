@@ -2,6 +2,7 @@
 
 use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
+pub use zeroclaw_api::model_provider::strip_think_tags;
 
 /// A single parsed tool call extracted from LLM output.
 #[derive(Debug, Clone)]
@@ -858,8 +859,14 @@ fn extract_xml_pairs(input: &str) -> Vec<(&str, &str)> {
     let mut results = Vec::new();
     let mut search_start = 0;
     while let Some(open_cap) = XML_OPEN_TAG_RE.captures(&input[search_start..]) {
-        let full_open = open_cap.get(0).unwrap();
-        let tag_name = open_cap.get(1).unwrap().as_str();
+        let Some(full_open) = open_cap.get(0) else {
+            break;
+        };
+        let Some(tag_name) = open_cap.get(1) else {
+            search_start += full_open.end();
+            continue;
+        };
+        let tag_name = tag_name.as_str();
         let open_end = search_start + full_open.end();
 
         let closing_tag = format!("</{tag_name}>");
@@ -2343,7 +2350,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut last_end = 0;
 
         for cap in MD_TOOL_CALL_RE.captures_iter(response) {
-            let full_match = cap.get(0).unwrap();
+            let Some(full_match) = cap.get(0) else {
+                continue;
+            };
             // Range-aware: a fence that OPENS before a refused span and runs
             // through it must be refused too, not just one that starts inside.
             if range_hits_rejected_span(&rejected_tools_spans, full_match.start(), full_match.end())
@@ -2389,7 +2398,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut last_end = 0;
 
         for cap in MD_TOOL_NAME_RE.captures_iter(response) {
-            let full_match = cap.get(0).unwrap();
+            let Some(full_match) = cap.get(0) else {
+                continue;
+            };
             // Range-aware: a fence that OPENS before a refused span and runs
             // through it must be refused too, not just one that starts inside.
             if range_hits_rejected_span(&rejected_tools_spans, full_match.start(), full_match.end())
@@ -2559,30 +2570,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     (text_parts.join("\n"), calls)
 }
 
-/// Remove `<think>...</think>` blocks from model output.
-/// Qwen and other reasoning models embed chain-of-thought inline in the
-/// response text using `<think>` tags.  These must be removed before parsing
-/// tool-call tags or displaying output.
-pub fn strip_think_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        if let Some(start) = rest.find("<think>") {
-            result.push_str(&rest[..start]);
-            if let Some(end) = rest[start..].find("</think>") {
-                rest = &rest[start + end + "</think>".len()..];
-            } else {
-                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
-                break;
-            }
-        } else {
-            result.push_str(rest);
-            break;
-        }
-    }
-    result.trim().to_string()
-}
-
 /// Strip prompt-guided tool artifacts from visible output while preserving
 /// raw model text in history for future turns.
 pub fn strip_tool_result_blocks(text: &str) -> String {
@@ -2726,8 +2713,10 @@ pub fn build_native_assistant_history_from_parsed_calls(
         "tool_calls": calls_json,
     });
 
-    if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
+    if let Some(rc) = reasoning_content
+        && let Some(obj) = obj.as_object_mut()
+    {
+        obj.insert(
             "reasoning_content".to_string(),
             serde_json::Value::String(rc.to_string()),
         );
@@ -3810,7 +3799,10 @@ Done."#;
                     .get("attributes")
                     .and_then(|attributes| attributes.get("_file"))
                     .and_then(|value| value.as_str())
-                    .is_some_and(|file| file.ends_with("zeroclaw-tool-call-parser/src/lib.rs"));
+                    .is_some_and(|file| {
+                        file.replace('\\', "/")
+                            .ends_with("zeroclaw-tool-call-parser/src/lib.rs")
+                    });
                 if matches_message && matches_source {
                     break 'search event;
                 }

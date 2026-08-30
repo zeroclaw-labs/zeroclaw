@@ -2,7 +2,10 @@ use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
-use reqwest::multipart::{Form, Part};
+use reqwest::{
+    header::HeaderValue,
+    multipart::{Form, Part},
+};
 
 use zeroclaw_config::providers::{TranscriptionProviderEntry, TranscriptionProviders};
 use zeroclaw_config::schema::{Config, TranscriptionConfig};
@@ -12,6 +15,9 @@ const MAX_AUDIO_BYTES: usize = 25 * 1024 * 1024;
 
 /// Request timeout for transcription API calls (seconds).
 const TRANSCRIPTION_TIMEOUT_SECS: u64 = 120;
+
+const GOOGLE_STT_ENDPOINT: &str = "https://speech.googleapis.com/v1/speech:recognize";
+const GOOGLE_API_KEY_HEADER: &str = "x-goog-api-key";
 
 // ── Audio utilities ─────────────────────────────────────────────
 
@@ -225,8 +231,10 @@ impl TranscriptionProvider for GroqProvider {
 /// OpenAI Whisper API transcription_provider.
 pub struct OpenAiWhisperProvider {
     alias: String,
+    api_url: String,
     api_key: String,
     model: String,
+    language: Option<String>,
 }
 
 impl OpenAiWhisperProvider {
@@ -244,8 +252,10 @@ impl OpenAiWhisperProvider {
 
         Ok(Self {
             alias: alias.to_string(),
+            api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
             api_key,
             model: config.model.clone(),
+            language: None,
         })
     }
 
@@ -268,12 +278,14 @@ impl OpenAiWhisperProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
+            api_url: "https://api.openai.com/v1/audio/transcriptions".to_string(),
             api_key,
             model: cfg
                 .model
                 .clone()
                 .filter(|model| !model.trim().is_empty())
                 .unwrap_or_else(|| "whisper-1".to_string()),
+            language: cfg.base.language.clone(),
         })
     }
 }
@@ -293,13 +305,16 @@ impl TranscriptionProvider for OpenAiWhisperProvider {
             .file_name(normalized_name)
             .mime_str(mime)?;
 
-        let form = Form::new()
+        let mut form = Form::new()
             .part("file", file_part)
             .text("model", self.model.clone())
             .text("response_format", "json");
+        if let Some(language) = &self.language {
+            form = form.text("language", language.clone());
+        }
 
         let resp = client
-            .post("https://api.openai.com/v1/audio/transcriptions")
+            .post(&self.api_url)
             .bearer_auth(&self.api_key)
             .multipart(form)
             .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
@@ -316,8 +331,10 @@ impl TranscriptionProvider for OpenAiWhisperProvider {
 /// Deepgram STT API transcription_provider.
 pub struct DeepgramProvider {
     alias: String,
+    api_url: String,
     api_key: String,
     model: String,
+    language: Option<String>,
 }
 
 impl DeepgramProvider {
@@ -335,8 +352,10 @@ impl DeepgramProvider {
 
         Ok(Self {
             alias: alias.to_string(),
+            api_url: "https://api.deepgram.com/v1/listen".to_string(),
             api_key,
             model: config.model.clone(),
+            language: None,
         })
     }
 
@@ -359,13 +378,21 @@ impl DeepgramProvider {
             })?;
         Ok(Self {
             alias: alias.to_string(),
+            api_url: "https://api.deepgram.com/v1/listen".to_string(),
             api_key,
             model: cfg
                 .model
                 .clone()
                 .filter(|model| !model.trim().is_empty())
                 .unwrap_or_else(|| "nova-2".to_string()),
+            language: cfg.base.language.clone(),
         })
+    }
+
+    fn language_query(&self) -> (&str, &str) {
+        self.language
+            .as_deref()
+            .map_or(("detect_language", "true"), |value| ("language", value))
     }
 }
 
@@ -380,13 +407,18 @@ impl TranscriptionProvider for DeepgramProvider {
 
         let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.deepgram");
 
-        let url = format!(
-            "https://api.deepgram.com/v1/listen?model={}&punctuate=true",
-            self.model
-        );
+        let url = reqwest::Url::parse_with_params(
+            &self.api_url,
+            [
+                ("model", self.model.as_str()),
+                ("punctuate", "true"),
+                self.language_query(),
+            ],
+        )
+        .context("Invalid Deepgram transcription endpoint")?;
 
         let resp = client
-            .post(&url)
+            .post(url)
             .header("Authorization", format!("Token {}", self.api_key))
             .header("Content-Type", mime)
             .body(audio_data.to_vec())
@@ -648,6 +680,24 @@ impl GoogleSttProvider {
                 .unwrap_or_else(|| "en-US".to_string()),
         })
     }
+
+    fn sensitive_api_key_header(&self) -> Result<HeaderValue> {
+        let mut value = HeaderValue::from_str(&self.api_key).map_err(|_| {
+            anyhow::Error::msg("Google STT API key contains invalid header characters")
+        })?;
+        value.set_sensitive(true);
+        Ok(value)
+    }
+
+    fn build_request(&self, request_body: &serde_json::Value) -> Result<reqwest::RequestBuilder> {
+        Ok(
+            zeroclaw_config::schema::build_runtime_proxy_client("transcription.google")
+                .post(GOOGLE_STT_ENDPOINT)
+                .header(GOOGLE_API_KEY_HEADER, self.sensitive_api_key_header()?)
+                .json(request_body)
+                .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS)),
+        )
+    }
 }
 
 #[async_trait]
@@ -666,8 +716,6 @@ impl TranscriptionProvider for GoogleSttProvider {
 
     async fn transcribe(&self, audio_data: &[u8], file_name: &str) -> Result<String> {
         let (normalized_name, _) = validate_audio(audio_data, file_name)?;
-
-        let client = zeroclaw_config::schema::build_runtime_proxy_client("transcription.google");
 
         let encoding = match normalized_name
             .rsplit_once('.')
@@ -697,15 +745,8 @@ impl TranscriptionProvider for GoogleSttProvider {
             }
         });
 
-        let url = format!(
-            "https://speech.googleapis.com/v1/speech:recognize?key={}",
-            self.api_key
-        );
-
-        let resp = client
-            .post(&url)
-            .json(&request_body)
-            .timeout(std::time::Duration::from_secs(TRANSCRIPTION_TIMEOUT_SECS))
+        let resp = self
+            .build_request(&request_body)?
             .send()
             .await
             .context("Failed to send transcription request to Google STT")?;
@@ -920,6 +961,14 @@ impl TranscriptionManager {
     /// manager to a specific agent should call
     /// `with_agent_transcription_provider` to set it.
     pub fn new(config: &TranscriptionConfig) -> Result<Self> {
+        Self::from_sections(config, None, String::new())
+    }
+
+    fn from_sections(
+        config: &TranscriptionConfig,
+        typed: Option<&TranscriptionProviders>,
+        agent_transcription_provider: String,
+    ) -> Result<Self> {
         if matches!(config.max_audio_bytes, Some(0)) {
             bail!("transcription.max_audio_bytes must be greater than zero");
         }
@@ -928,6 +977,9 @@ impl TranscriptionManager {
             HashMap::new();
 
         Self::register_legacy_providers(&mut transcription_providers, config);
+        if let Some(typed) = typed {
+            Self::register_typed_providers(&mut transcription_providers, typed);
+        }
 
         if config.enabled && transcription_providers.is_empty() {
             bail!(
@@ -942,45 +994,32 @@ impl TranscriptionManager {
         Ok(Self {
             transcription_providers,
             max_audio_bytes: config.max_audio_bytes,
-            agent_transcription_provider: String::new(),
+            agent_transcription_provider,
         })
     }
 
     pub fn from_config_for_agent(config: &Config, agent_alias: Option<&str>) -> Result<Self> {
-        if matches!(config.transcription.max_audio_bytes, Some(0)) {
-            bail!("transcription.max_audio_bytes must be greater than zero");
-        }
-
-        let mut transcription_providers: HashMap<String, Box<dyn TranscriptionProvider>> =
-            HashMap::new();
-
-        Self::register_legacy_providers(&mut transcription_providers, &config.transcription);
-        Self::register_typed_providers(
-            &mut transcription_providers,
-            &config.providers.transcription,
-        );
-
-        if config.transcription.enabled && transcription_providers.is_empty() {
-            bail!(
-                "Transcription is enabled but no transcription provider registered \
-                 successfully. Configure at least one of: [providers.transcription.<type>.<alias>], \
-                 [transcription] (Groq) with api_key + api_url, [transcription.openai], \
-                 [transcription.deepgram], [transcription.assemblyai], [transcription.google], \
-                 or [transcription.local_whisper]."
-            );
-        }
-
         let agent_transcription_provider = agent_alias
             .or_else(|| config.resolved_runtime_agent_alias())
             .and_then(|alias| config.agents.get(alias))
             .map(|a| a.transcription_provider.as_str().to_string())
             .unwrap_or_default();
 
-        Ok(Self {
-            transcription_providers,
-            max_audio_bytes: config.transcription.max_audio_bytes,
+        Self::from_config_with_provider(config, agent_transcription_provider)
+    }
+
+    /// Build from the canonical runtime config while binding an already
+    /// resolved provider reference. Channel factories use this when routing
+    /// has selected an owner separately from the runtime-default agent.
+    pub(crate) fn from_config_with_provider(
+        config: &Config,
+        agent_transcription_provider: String,
+    ) -> Result<Self> {
+        Self::from_sections(
+            &config.transcription,
+            Some(&config.providers.transcription),
             agent_transcription_provider,
-        })
+        )
     }
 
     fn register_legacy_providers(
@@ -1667,10 +1706,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn typed_registration_defaults_blank_optional_values() {
+    #[tokio::test]
+    async fn typed_registration_defaults_and_language_hints() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
         let base = zeroclaw_config::schema::TranscriptionProviderConfig {
             api_key: Some("test-key".to_string()),
+            language: Some("it".to_string()),
             ..zeroclaw_config::schema::TranscriptionProviderConfig::default()
         };
 
@@ -1684,7 +1727,7 @@ mod tests {
         .unwrap();
         assert_eq!(groq.model, "whisper-large-v3-turbo");
 
-        let openai = OpenAiWhisperProvider::from_typed_config(
+        let mut openai = OpenAiWhisperProvider::from_typed_config(
             "default",
             &zeroclaw_config::schema::OpenAiTranscriptionProviderConfig {
                 base: base.clone(),
@@ -1693,8 +1736,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(openai.model, "whisper-1");
+        assert_eq!(openai.language.as_deref(), Some("it"));
 
-        let deepgram = DeepgramProvider::from_typed_config(
+        let mut deepgram = DeepgramProvider::from_typed_config(
             "default",
             &zeroclaw_config::schema::DeepgramTranscriptionProviderConfig {
                 base: base.clone(),
@@ -1703,6 +1747,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!(deepgram.model, "nova-2");
+        assert_eq!(deepgram.language_query(), ("language", "it"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "text": "ciao",
+                "results": {"channels": [{"alternatives": [{"transcript": "ciao"}]}]}
+            })))
+            .mount(&server)
+            .await;
+        openai.api_url = format!("{}/openai", server.uri());
+        deepgram.api_url = format!("{}/deepgram", server.uri());
+        openai.transcribe(b"audio", "voice.wav").await.unwrap();
+        deepgram.transcribe(b"audio", "voice.wav").await.unwrap();
+        deepgram.language = None;
+        deepgram.transcribe(b"audio", "voice.wav").await.unwrap();
+        assert_eq!(deepgram.language_query(), ("detect_language", "true"));
+
+        let requests = server.received_requests().await.unwrap();
+        let multipart = String::from_utf8_lossy(&requests[0].body);
+        assert!(multipart.contains("name=\"language\""));
+        assert!(multipart.contains("\r\n\r\nit\r\n"));
+        assert!(
+            requests[1]
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "language" && value == "it")
+        );
+        assert!(
+            requests[2]
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "detect_language" && value == "true")
+        );
 
         let google = GoogleSttProvider::from_typed_config(
             "default",
@@ -1715,6 +1793,61 @@ mod tests {
         )
         .unwrap();
         assert_eq!(google.language_code, "en-US");
+    }
+
+    #[test]
+    fn google_stt_request_uses_sensitive_header_without_url_credential() {
+        let provider = GoogleSttProvider {
+            alias: "default".to_string(),
+            api_key: "api-key-123".to_string(),
+            language_code: "en-US".to_string(),
+        };
+        let body = serde_json::json!({
+            "config": { "languageCode": "en-US" },
+            "audio": { "content": "dGVzdA==" },
+        });
+
+        let request = provider.build_request(&body).unwrap().build().unwrap();
+
+        assert_eq!(request.url().as_str(), GOOGLE_STT_ENDPOINT);
+        assert!(!request.url().as_str().contains("api-key-123"));
+        assert!(!request.url().query_pairs().any(|(name, _)| name == "key"));
+
+        let header = request
+            .headers()
+            .get(GOOGLE_API_KEY_HEADER)
+            .expect("Google API key header");
+        assert_eq!(header.to_str().unwrap(), "api-key-123");
+        assert!(header.is_sensitive());
+
+        let payload = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .expect("JSON request body should be buffered");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(payload).unwrap(),
+            body
+        );
+    }
+
+    #[test]
+    fn google_stt_request_rejects_malformed_header_without_echoing_key() {
+        let api_key = "api-key-123\r\nleaked";
+        let provider = GoogleSttProvider {
+            alias: "default".to_string(),
+            api_key: api_key.to_string(),
+            language_code: "en-US".to_string(),
+        };
+
+        let err = match provider.build_request(&serde_json::json!({})) {
+            Ok(_) => panic!("malformed Google STT API key should be rejected"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.to_string(),
+            "Google STT API key contains invalid header characters"
+        );
+        assert!(!err.to_string().contains(api_key));
     }
 
     #[test]

@@ -15,11 +15,12 @@ pub use schedule::{
 };
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, all_overdue_jobs, claim_job, clear_stale_locks, due_jobs, get_job, list_jobs,
-    list_jobs_by_agent, list_runs, record_last_run, record_last_run_with_status, record_run,
-    release_job, remove_job, remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
+    add_agent_job, all_overdue_jobs, claim_job, clear_stale_locks, due_jobs, get_job,
+    get_job_for_agent, list_jobs, list_jobs_by_agent, list_runs, record_last_run,
+    record_last_run_with_status, record_run, release_job, remove_job, remove_job_for_agent,
+    remove_jobs_by_agent, rename_jobs_by_agent, reschedule_after_run,
     reschedule_after_run_with_status, resolve_job_id_or_name, skip_missed_run,
-    sync_declarative_jobs, update_job,
+    sync_declarative_jobs, update_job, update_job_for_agent,
 };
 pub use types::{
     CronJob, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
@@ -44,6 +45,23 @@ pub(crate) const CRON_DELIVERY_SCHEMA_CHANNELS: &[&str] = &[
     "signal",
     "email",
 ];
+
+/// JSON Schema `pattern` for a cron delivery channel.
+///
+/// Accepts either a bare channel type (`telegram`) or a configured instance's
+/// composite key (`telegram.work`). The tool descriptions recommend the
+/// composite form, and a bare-type enum would reject exactly what they
+/// recommend — `cron_update` in particular has no other unambiguous way to
+/// select one instance in a multi-instance setup.
+///
+/// Built from `CRON_DELIVERY_SCHEMA_CHANNELS` so the supported types stay
+/// declared once.
+pub(crate) fn cron_delivery_channel_pattern() -> String {
+    format!(
+        "^({})(\\.[A-Za-z0-9_-]+)?$",
+        CRON_DELIVERY_SCHEMA_CHANNELS.join("|")
+    )
+}
 
 /// Validate a shell command against an agent's security policy
 /// (allowlist + risk gate). `agent_alias` names the agent under whose
@@ -210,9 +228,29 @@ pub fn add_shell_job_with_approval_and_format(
     )
 }
 
-/// Update a shell job's command with security validation.
-/// Validates the new command (if changed) against the named agent's
-/// risk profile before persisting.
+/// Agent jobs execute [`CronJob::prompt`], not [`CronJob::command`]. Callers
+/// that only have a `command` field (CLI `--command`, some tool payloads)
+/// must not persist that text on the unused command column or run shell-policy
+/// validation against a natural-language prompt. Matches `PATCH /api/cron`
+/// (`command.or(prompt)` on agent jobs).
+fn remap_agent_command_patch(
+    config: &Config,
+    job_id: &str,
+    mut patch: CronJobPatch,
+) -> Result<CronJobPatch> {
+    if patch.command.is_none() {
+        return Ok(patch);
+    }
+    let existing = get_job(config, job_id)?;
+    if existing.job_type == JobType::Agent {
+        patch.prompt = patch.command.take().or(patch.prompt);
+    }
+    Ok(patch)
+}
+
+/// Update a job with security validation for shell-command patches.
+/// Validates a new shell command against the named agent's risk profile
+/// before persisting. Agent jobs remap `command` onto `prompt` first.
 pub fn update_shell_job_with_approval(
     config: &Config,
     agent_alias: &str,
@@ -220,27 +258,50 @@ pub fn update_shell_job_with_approval(
     patch: CronJobPatch,
     approved: bool,
 ) -> Result<CronJob> {
+    let patch = remap_agent_command_patch(config, job_id, patch)?;
     if patch.command.is_none() {
         return update_job(config, job_id, patch);
     }
 
     let security = SecurityPolicy::for_agent(config, agent_alias)?;
     let runtime = crate::platform::create_runtime(&config.runtime)?;
-    update_shell_job_with_runtime(config, runtime.as_ref(), &security, job_id, patch, approved)
+    // `owner: None` — this is the OPERATOR entry point, used by the gateway API
+    // and the CLI. Its `agent_alias` names whose risk profile validates the
+    // command, which is not necessarily the job's owner: patching an agent-type
+    // job's prompt is not agent-gated at all and may omit the agent entirely.
+    // Scoping here would stop an operator patching a job.
+    update_shell_job_with_runtime(
+        config,
+        runtime.as_ref(),
+        &security,
+        None,
+        job_id,
+        patch,
+        approved,
+    )
 }
 
 pub(crate) fn update_shell_job_with_runtime(
     config: &Config,
     runtime: &dyn RuntimeAdapter,
     security: &SecurityPolicy,
+    // Some(alias) for an agent-facing call, which carries the ownership test
+    // into the write; None for operator callers, which have no owning agent.
+    owner: Option<&str>,
     job_id: &str,
     patch: CronJobPatch,
     approved: bool,
 ) -> Result<CronJob> {
+    let patch = remap_agent_command_patch(config, job_id, patch)?;
     if let Some(command) = patch.command.as_deref() {
         validate_shell_command_with_security(runtime, security, command, approved)?;
     }
-    update_job(config, job_id, patch)
+    match owner {
+        // Scoped: the ownership test travels with the write rather than being a
+        // separate read the operator's rename cascade can slip between.
+        Some(agent_alias) => update_job_for_agent(config, job_id, agent_alias, patch),
+        None => update_job(config, job_id, patch),
+    }
 }
 
 /// Create a one-shot validated shell job from a delay string (e.g. "30m").
@@ -414,6 +475,33 @@ pub fn resume_job(config: &Config, id: &str) -> Result<CronJob> {
     )
 }
 
+/// Pause a job the calling agent owns. The ownership test travels with the
+/// write; see `store::remove_job_for_agent`.
+pub fn pause_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<CronJob> {
+    update_job_for_agent(
+        config,
+        id,
+        agent_alias,
+        CronJobPatch {
+            enabled: Some(false),
+            ..CronJobPatch::default()
+        },
+    )
+}
+
+/// Resume a job the calling agent owns.
+pub fn resume_job_for_agent(config: &Config, id: &str, agent_alias: &str) -> Result<CronJob> {
+    update_job_for_agent(
+        config,
+        id,
+        agent_alias,
+        CronJobPatch {
+            enabled: Some(true),
+            ..CronJobPatch::default()
+        },
+    )
+}
+
 pub fn parse_delay(input: &str) -> Result<chrono::Duration> {
     let input = input.trim();
     if input.is_empty() {
@@ -526,5 +614,219 @@ mod validate_delivery_tests {
             best_effort: true,
         };
         validate_delivery_config(Some(&delivery)).expect("webhook without thread_id must validate");
+    }
+}
+
+#[cfg(test)]
+mod remap_agent_command_tests {
+    use super::*;
+    use crate::security::AutonomyLevel;
+    use tempfile::TempDir;
+
+    const TEST_AGENT: &str = "test-agent";
+
+    fn test_config(tmp: &TempDir) -> Config {
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default()
+            .allowed_commands = vec!["echo".into()];
+        config
+            .risk_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default()
+            .level = AutonomyLevel::Supervised;
+        config
+            .runtime_profiles
+            .entry(TEST_AGENT.to_string())
+            .or_default();
+        config
+            .providers
+            .models
+            .ensure("openrouter", TEST_AGENT)
+            .expect("known family");
+        config.agents.entry(TEST_AGENT.to_string()).or_insert(
+            zeroclaw_config::schema::AliasedAgentConfig {
+                model_provider: format!("openrouter.{TEST_AGENT}").into(),
+                risk_profile: TEST_AGENT.into(),
+                runtime_profile: TEST_AGENT.into(),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
+    #[test]
+    fn update_maps_command_patch_onto_agent_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "old prompt",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let updated = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                command: Some("summarize the overnight logs".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            updated.prompt.as_deref(),
+            Some("summarize the overnight logs")
+        );
+        assert_eq!(updated.command, "");
+        assert_eq!(updated.job_type, JobType::Agent);
+    }
+
+    #[test]
+    fn update_keeps_shell_command_patches_on_the_command_column() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, TEST_AGENT, "*/5 * * * *", "echo old").unwrap();
+
+        let updated = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                command: Some("echo new".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(updated.command, "echo new");
+        assert_eq!(updated.prompt, None);
+        assert_eq!(updated.job_type, JobType::Shell);
+    }
+
+    #[test]
+    fn update_does_not_run_shell_policy_against_an_agent_prompt() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "old prompt",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let updated = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                command: Some("curl https://example.com".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .expect("agent prompt text must not be validated as a shell command");
+
+        assert_eq!(updated.prompt.as_deref(), Some("curl https://example.com"));
+        assert_eq!(updated.command, "");
+    }
+
+    #[test]
+    fn update_still_blocks_disallowed_shell_command_patches() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, TEST_AGENT, "*/5 * * * *", "echo old").unwrap();
+
+        let err = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                command: Some("curl https://example.com".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .expect_err("shell jobs must still validate --command against policy");
+
+        assert!(
+            err.to_string().contains("blocked by security policy"),
+            "unexpected error: {err}"
+        );
+        let unchanged = get_job(&config, &job.id).unwrap();
+        assert_eq!(unchanged.command, "echo old");
+    }
+
+    #[test]
+    fn update_name_only_leaves_agent_prompt_untouched() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_agent_job(
+            &config,
+            TEST_AGENT,
+            None,
+            Schedule::Cron {
+                expr: "*/5 * * * *".into(),
+                tz: None,
+            },
+            "keep this prompt",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap();
+
+        let updated = update_shell_job_with_approval(
+            &config,
+            TEST_AGENT,
+            &job.id,
+            CronJobPatch {
+                name: Some("morning-digest".into()),
+                ..CronJobPatch::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(updated.name.as_deref(), Some("morning-digest"));
+        assert_eq!(updated.prompt.as_deref(), Some("keep this prompt"));
+        assert_eq!(updated.command, "");
     }
 }

@@ -34,17 +34,7 @@ pub mod pico_flash;
 #[cfg(feature = "hardware")]
 pub mod pico_code;
 
-/// Aardvark USB adapter transport (I2C / SPI / GPIO via aardvark-sys).
-#[cfg(feature = "hardware")]
-pub mod aardvark;
-
-/// Tools backed by the Aardvark transport (i2c_scan, i2c_read, i2c_write,
-/// spi_transfer, gpio_aardvark).
-#[cfg(feature = "hardware")]
-pub mod aardvark_tools;
-
 /// Datasheet management — search, download, and manage device datasheets.
-/// Used by DatasheetTool when an Aardvark is connected.
 #[cfg(feature = "hardware")]
 pub mod datasheet;
 
@@ -64,10 +54,6 @@ pub mod loader;
 pub mod manifest;
 pub mod subprocess;
 pub mod tool_registry;
-
-#[cfg(feature = "hardware")]
-#[allow(unused_imports)]
-pub use aardvark::AardvarkTransport;
 
 use crate::device::DeviceRegistry;
 #[cfg(feature = "hardware")]
@@ -311,52 +297,6 @@ pub async fn boot(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Say \"flash my pico\" to install ZeroClaw firmware automatically"
         );
-    }
-
-    // Aardvark discovery: scan for Total Phase Aardvark USB adapters and
-    // register each one with AardvarkTransport + full I2C/SPI/GPIO capabilities.
-    {
-        use aardvark::AardvarkTransport;
-        use device::DeviceCapabilities;
-
-        let aardvark_ports = aardvark_sys::AardvarkHandle::find_devices();
-        for (i, &port) in aardvark_ports.iter().enumerate() {
-            let alias = registry_inner.register(
-                "aardvark",
-                Some(0x2b76),
-                None,
-                None,
-                Some("Total Phase Aardvark".to_string()),
-            );
-            let transport = std::sync::Arc::new(AardvarkTransport::new(i32::from(port), 100))
-                as std::sync::Arc<dyn transport::Transport>;
-            let caps = DeviceCapabilities {
-                gpio: true,
-                i2c: true,
-                spi: true,
-                ..DeviceCapabilities::default()
-            };
-            registry_inner
-                .attach_transport(&alias, transport, caps)
-                .unwrap_or_else(|e| {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(
-                                ::serde_json::json!({"alias": alias, "err": e.to_string()})
-                            ),
-                        "aardvark attach_transport failed"
-                    )
-                });
-            ::zeroclaw_log::record!(
-                INFO,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_attrs(::serde_json::json!({"alias": alias, "port_index": i})),
-                "aardvark adapter registered"
-            );
-            println!("[registry] {alias} ready \u{2192} Total Phase port {i}");
-        }
     }
 
     let devices = std::sync::Arc::new(tokio::sync::RwLock::new(registry_inner));

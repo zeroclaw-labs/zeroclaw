@@ -1,10 +1,12 @@
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -59,6 +61,234 @@ enum QuickstartChatDrain {
 const TICK: Duration = Duration::from_millis(200);
 const CHROME_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_COALESCED_MOUSE_DRAGS: usize = 64;
+const SGR_MOUSE_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(50);
+const MAX_SGR_MOUSE_SEQUENCE_EVENTS: usize = 32;
+
+/// Reassembles SGR mouse sequences that crossterm exposed as individual key
+/// events after an input read split the sequence at the escape byte.
+///
+/// A complete sequence is converted back into the same `MouseEvent` that
+/// crossterm would have produced. Invalid or incomplete sequences are replayed
+/// in order, so ordinary Escape-prefixed keyboard input is not discarded.
+#[derive(Debug, Default)]
+struct SgrMouseEventDecoder {
+    pending: VecDeque<Event>,
+    candidate: Vec<Event>,
+    candidate_started_at: Option<Instant>,
+}
+
+impl SgrMouseEventDecoder {
+    fn feed(&mut self, event: Event) {
+        let output = if self.candidate.is_empty() {
+            if is_sgr_mouse_start(&event) {
+                self.candidate.push(event);
+                self.candidate_started_at = Some(Instant::now());
+                Vec::new()
+            } else {
+                vec![event]
+            }
+        } else {
+            self.candidate.push(event);
+            self.decode_candidate()
+        };
+        self.pending.extend(output);
+    }
+
+    fn next(&mut self) -> Option<Event> {
+        self.pending.pop_front()
+    }
+
+    fn push_front(&mut self, event: Event) {
+        self.pending.push_front(event);
+    }
+
+    fn poll_timeout(&self) -> Duration {
+        self.candidate_started_at
+            .map(|started| SGR_MOUSE_SEQUENCE_TIMEOUT.saturating_sub(started.elapsed()))
+            .unwrap_or(TICK)
+    }
+
+    fn flush_candidate(&mut self) -> bool {
+        if self.candidate.is_empty() {
+            return false;
+        }
+        self.pending.extend(self.candidate.drain(..));
+        self.candidate_started_at = None;
+        true
+    }
+
+    fn flush_timed_out_candidate(&mut self) -> bool {
+        let timed_out = self
+            .candidate_started_at
+            .is_some_and(|started| started.elapsed() >= SGR_MOUSE_SEQUENCE_TIMEOUT);
+        timed_out && self.flush_candidate()
+    }
+
+    fn read_ready(&mut self) -> Result<Option<Event>> {
+        self.read_ready_with(|| {
+            if event::poll(Duration::ZERO)? {
+                Ok(Some(event::read()?))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn read_ready_with<F>(&mut self, mut read_event: F) -> Result<Option<Event>>
+    where
+        F: FnMut() -> Result<Option<Event>>,
+    {
+        loop {
+            if let Some(event) = self.next() {
+                return Ok(Some(event));
+            }
+            let Some(event) = read_event()? else {
+                return Ok(None);
+            };
+            self.feed(event);
+        }
+    }
+
+    fn decode_candidate(&mut self) -> Vec<Event> {
+        if self.candidate.len() > MAX_SGR_MOUSE_SEQUENCE_EVENTS {
+            return self.replay_candidate();
+        }
+
+        let Some(chars) = self.candidate[1..]
+            .iter()
+            .map(key_event_char)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return self.replay_candidate();
+        };
+
+        let prefix = ['[', '<'];
+        for (index, expected) in prefix.iter().enumerate() {
+            let Some(actual) = chars.get(index) else {
+                return Vec::new();
+            };
+            if actual != expected {
+                return self.replay_candidate();
+            }
+        }
+
+        let Some(final_char) = chars.last().copied() else {
+            return Vec::new();
+        };
+        if !matches!(final_char, 'M' | 'm') {
+            if chars[2..]
+                .iter()
+                .all(|character| character.is_ascii_digit() || *character == ';')
+            {
+                return Vec::new();
+            }
+            return self.replay_candidate();
+        }
+
+        let Some(mouse) = parse_sgr_mouse(&chars) else {
+            return self.replay_candidate();
+        };
+        self.candidate.clear();
+        self.candidate_started_at = None;
+        vec![Event::Mouse(mouse)]
+    }
+
+    fn replay_candidate(&mut self) -> Vec<Event> {
+        self.candidate_started_at = None;
+        self.candidate.drain(..).collect()
+    }
+}
+
+fn is_sgr_mouse_start(event: &Event) -> bool {
+    matches!(
+        event,
+        Event::Key(key)
+            if key.code == KeyCode::Esc // keyguard: recognize terminal protocol escape, not an app chord
+                && key.kind == KeyEventKind::Press
+                && key.modifiers == KeyModifiers::NONE
+    )
+}
+
+fn key_event_char(event: &Event) -> Option<char> {
+    match event {
+        Event::Key(KeyEvent {
+            code: KeyCode::Char(character), // keyguard: extract terminal protocol byte
+            kind: KeyEventKind::Press,
+            ..
+        }) => Some(*character),
+        _ => None,
+    }
+}
+
+fn parse_sgr_mouse(chars: &[char]) -> Option<MouseEvent> {
+    let final_char = *chars.last()?;
+    let payload: String = chars[2..chars.len().checked_sub(1)?].iter().collect();
+    let payload = payload.strip_suffix(';').unwrap_or(payload.as_str());
+    let fields: Vec<_> = payload.split(';').collect();
+    if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
+        return None;
+    }
+    let cb = fields[0].parse::<u8>().ok()?;
+    let column = fields[1].parse::<u16>().ok()?;
+    let row = fields[2].parse::<u16>().ok()?;
+    if column == 0 || row == 0 {
+        return None;
+    }
+
+    let (mut kind, modifiers) = parse_sgr_mouse_button(cb)?;
+    if final_char == 'm'
+        && let MouseEventKind::Down(button) = kind
+    {
+        kind = MouseEventKind::Up(button);
+    }
+
+    Some(MouseEvent {
+        kind,
+        column: column - 1,
+        row: row - 1,
+        modifiers,
+    })
+}
+
+fn parse_sgr_mouse_button(cb: u8) -> Option<(MouseEventKind, KeyModifiers)> {
+    let button_number = (cb & 0b0000_0011) | ((cb & 0b1100_0000) >> 4);
+    let dragging = cb & 0b0010_0000 == 0b0010_0000;
+    let kind = match (button_number, dragging) {
+        (0, false) => MouseEventKind::Down(MouseButton::Left),
+        (1, false) => MouseEventKind::Down(MouseButton::Middle),
+        (2, false) => MouseEventKind::Down(MouseButton::Right),
+        (0, true) => MouseEventKind::Drag(MouseButton::Left),
+        (1, true) => MouseEventKind::Drag(MouseButton::Middle),
+        (2, true) => MouseEventKind::Drag(MouseButton::Right),
+        (3, false) => MouseEventKind::Up(MouseButton::Left),
+        (3, true) | (4, true) | (5, true) => MouseEventKind::Moved,
+        (4, false) => MouseEventKind::ScrollUp,
+        (5, false) => MouseEventKind::ScrollDown,
+        (6, false) => MouseEventKind::ScrollLeft,
+        (7, false) => MouseEventKind::ScrollRight,
+        _ => return None,
+    };
+
+    let mut modifiers = KeyModifiers::NONE;
+    if cb & 0b0000_0100 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if cb & 0b0000_1000 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if cb & 0b0001_0000 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    Some((kind, modifiers))
+}
+
+/// Returns whether an application-level confirmation modal owns an input event.
+///
+/// Confirmation dialogs sit above every pane and intentionally consume paste
+/// events so text or file paths cannot mutate a hidden composer.
+fn confirmation_modal_owns_event(event: &Event, reload_confirm: bool, quit_confirm: bool) -> bool {
+    matches!(event, Event::Paste(_)) && (reload_confirm || quit_confirm)
+}
 
 fn mouse_drag_button(event: &Event) -> Option<crossterm::event::MouseButton> {
     match event {
@@ -136,10 +366,6 @@ impl HelpOverlayState {
 }
 
 /// Mode bar entries. Shared between drawing and click detection.
-/// SOP authoring is not exposed from any build: the web dashboard ships as the
-/// first experimental release while the TUI pane cooks longer. `Mode::Sop` is
-/// deliberately absent here so the pane is unreachable from navigation
-/// regardless of feature selection.
 const MODES: &[Mode] = &[
     Mode::Dashboard,
     Mode::Config,
@@ -148,6 +374,7 @@ const MODES: &[Mode] = &[
     Mode::Logs,
     Mode::Doctor,
     Mode::Quickstart,
+    Mode::Sop,
 ];
 
 // ── Mode enum ────────────────────────────────────────────────────
@@ -161,8 +388,41 @@ enum Mode {
     Chat,
     Logs,
     Quickstart,
-    #[allow(dead_code)]
     Sop,
+}
+
+#[derive(Debug, Clone)]
+struct ModeBarEntry {
+    mode: Mode,
+    title: String,
+    hit_rect: Rect,
+}
+
+/// Exact geometry produced for the most recently rendered mode bar.
+///
+/// Drawing and mouse dispatch both consume this value, so a clipped or hidden
+/// tab can never retain a larger synthetic click target.
+#[derive(Debug, Clone, Default)]
+struct ModeBarLayout {
+    tab_area: Rect,
+    summary_area: Option<Rect>,
+    entries: Vec<ModeBarEntry>,
+}
+
+impl ModeBarLayout {
+    fn mode_at(&self, column: u16, row: u16) -> Option<Mode> {
+        if self
+            .summary_area
+            .is_some_and(|area| mouse::in_rect(column, row, area))
+            || !mouse::in_rect(column, row, self.tab_area)
+        {
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|entry| mouse::in_rect(column, row, entry.hit_rect))
+            .map(|entry| entry.mode)
+    }
 }
 
 #[derive(Default)]
@@ -362,7 +622,7 @@ pub async fn run(
     let mut reload_confirm = false;
     let mut quit_confirm = false;
     let mut reload_status: Option<String> = None;
-    let mut bar_area = Rect::default();
+    let mut mode_bar_layout = ModeBarLayout::default();
     let mut content_area = Rect::default();
     let mut reconnect_last_attempt: Option<std::time::Instant> = None;
     let mut ephemeral_respawn_done = false;
@@ -436,9 +696,9 @@ pub async fn run(
     )?;
     let mut chrome_status = ChromeStatus::default();
     chrome_status.tick(&rpc);
-    let mut pending_event = None;
+    let mut input_decoder = SgrMouseEventDecoder::default();
 
-    loop {
+    'event_loop: loop {
         // Draw
         let conn_state = rpc.connection_state();
         if matches!(conn_state, ConnectionState::Disconnected { .. }) {
@@ -498,8 +758,7 @@ pub async fn run(
                 .constraints(constraints)
                 .split(frame.area());
 
-            bar_area = chunks[0];
-            draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
+            mode_bar_layout = draw_mode_bar(frame, chunks[0], mode, chrome_summary.as_ref());
             content_area = chunks[1];
 
             match mode {
@@ -622,7 +881,8 @@ pub async fn run(
                             acp_pane.current_agent_alias().map(String::from),
                         );
                         match build_panes!(resume_chat, resume_acp) {
-                            Ok(panes) => {
+                            Ok(mut panes) => {
+                                refresh_visible_sop_after_reconnect(mode, &mut panes.7).await;
                                 dashboard_pane = panes.0;
                                 config_app = panes.1;
                                 doctor_pane = panes.2;
@@ -655,13 +915,20 @@ pub async fn run(
             }
         }
 
-        let input_event = if let Some(pending) = pending_event.take() {
-            pending
-        } else {
+        let input_event = loop {
+            if let Some(event) = input_decoder.next() {
+                break event;
+            }
+
             // Poll for input with a timeout so live panes refresh periodically.
-            if !event::poll(TICK)? {
-                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+            // A shorter deadline while an Escape-prefixed sequence is being
+            // assembled keeps an ordinary Escape key responsive.
+            if !event::poll(input_decoder.poll_timeout())? {
+                if input_decoder.flush_timed_out_candidate() {
                     continue;
+                }
+                if matches!(conn_state, ConnectionState::Disconnected { .. }) {
+                    continue 'event_loop;
                 }
                 if mode == Mode::Dashboard {
                     dashboard_pane.tick().await;
@@ -682,18 +949,21 @@ pub async fn run(
                     &mut chat_pane,
                 )
                 .await;
-                continue;
+                continue 'event_loop;
             }
-            event::read()?
+            input_decoder.feed(event::read()?);
         };
-        let (input_event, next_pending) = coalesce_mouse_drag(input_event, || {
-            if event::poll(Duration::ZERO)? {
-                Ok(Some(event::read()?))
-            } else {
-                Ok(None)
-            }
-        })?;
-        pending_event = next_pending;
+        let (input_event, next_pending) =
+            coalesce_mouse_drag(input_event, || input_decoder.read_ready())?;
+        if let Some(next_pending) = next_pending {
+            input_decoder.push_front(next_pending);
+        }
+
+        if confirmation_modal_owns_event(&input_event, reload_confirm, quit_confirm) {
+            // The visible confirmation modal is the authoritative input
+            // owner; discard paste instead of forwarding it underneath.
+            continue;
+        }
 
         match input_event {
             Event::Key(key) => {
@@ -709,7 +979,7 @@ pub async fn run(
                     Mode::Chat => chat_pane.wants_text_input(),
                     Mode::Logs => logs_pane.wants_text_input(),
                     Mode::Quickstart => quickstart.wants_text_input(),
-                    Mode::Sop => false,
+                    Mode::Sop => sop_pane.wants_text_input(),
                 };
                 let global = GlobalAction::from_chord(&key);
 
@@ -803,6 +1073,7 @@ pub async fn run(
                     Mode::Config => config_app.claims_pane_navigation(&key),
                     Mode::Acp => acp_pane.claims_pane_navigation(&key),
                     Mode::Chat => chat_pane.claims_pane_navigation(&key),
+                    Mode::Sop => sop_pane.claims_pane_navigation(&key),
                     _ => false,
                 };
                 // Disconnected panes are skipped below to avoid dead-socket RPCs,
@@ -903,30 +1174,21 @@ pub async fn run(
                     continue;
                 }
                 // Mode bar clicks
-                if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    let labels: Vec<(&str, String)> = MODES
-                        .iter()
-                        .map(|m| ("", format!(" {} ", crate::i18n::t(m.fluent_key()))))
-                        .collect();
-                    let label_refs: Vec<(&str, &str)> =
-                        labels.iter().map(|(k, l)| (*k, l.as_str())).collect();
-                    if let Some(n) =
-                        mouse::mode_bar_click(mouse.column, mouse.row, bar_area, &label_refs)
-                    {
-                        let next = MODES[(n - 1) as usize];
-                        switch_mode(
-                            &mut mode,
-                            next,
-                            &conn_state,
-                            &mut dashboard_pane,
-                            &mut quickstart,
-                            &mut acp_pane,
-                            &mut chat_pane,
-                            &mut sop_pane,
-                        )
-                        .await;
-                        continue;
-                    }
+                if matches!(mouse.kind, MouseEventKind::Down(_))
+                    && let Some(next) = mode_bar_layout.mode_at(mouse.column, mouse.row)
+                {
+                    switch_mode(
+                        &mut mode,
+                        next,
+                        &conn_state,
+                        &mut dashboard_pane,
+                        &mut quickstart,
+                        &mut acp_pane,
+                        &mut chat_pane,
+                        &mut sop_pane,
+                    )
+                    .await;
+                    continue;
                 }
                 // Help-hint click: every pane renders the `?=help` indicator at
                 // the bottom-left of the content area; clicking it opens help,
@@ -991,7 +1253,7 @@ pub async fn run(
                     Mode::Quickstart => quickstart.handle_paste(&text),
                     Mode::Dashboard => dashboard_pane.handle_paste(&text),
                     Mode::Logs => logs_pane.handle_paste(&text),
-                    Mode::Sop => {}
+                    Mode::Sop => sop_pane.handle_paste(&text),
                 }
                 consume_pending_quickstart_chat(
                     &conn_state,
@@ -1006,6 +1268,15 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// A reconnect rebuilds every pane around the new RPC client. The SOP list is
+/// loaded on focus rather than at construction, so an already-visible SOP pane
+/// must run that same canonical refresh before replacing the disconnected pane.
+async fn refresh_visible_sop_after_reconnect(mode: Mode, pane: &mut sop_pane::SopPane) {
+    if mode == Mode::Sop {
+        pane.refresh().await;
+    }
 }
 
 fn global_help_entries() -> Vec<HelpEntry> {
@@ -1069,40 +1340,141 @@ fn draw_mode_bar(
     area: Rect,
     active: Mode,
     chrome_summary: Option<&Line<'static>>,
-) {
+) -> ModeBarLayout {
     use ratatui::widgets::Tabs;
 
     let active_idx = MODES.iter().position(|m| *m == active).unwrap_or(0);
-    let titles: Vec<ratatui::text::Line> = MODES
+    let base_titles: Vec<String> = MODES
         .iter()
-        .map(|m| {
-            let label = crate::i18n::t(m.fluent_key());
+        .map(|mode| format!(" {} ", crate::i18n::t(mode.fluent_key())))
+        .collect();
+
+    // Chrome is informative; the selected navigation target is interactive.
+    // Keep the full summary only when it leaves enough room for the active tab.
+    let active_width = crate::display_width::display_width(&base_titles[active_idx]) as u16;
+    let summary_width = chrome_summary
+        .map(Line::width)
+        .filter(|width| usize::from(area.width) >= width.saturating_add(active_width.into()))
+        .map(|width| width.min(usize::from(u16::MAX)) as u16)
+        .unwrap_or(0);
+    let tab_area = Rect::new(
+        area.x,
+        area.y,
+        area.width.saturating_sub(summary_width),
+        area.height,
+    );
+    let summary_area = (summary_width > 0)
+        .then(|| Rect::new(tab_area.right(), area.y, summary_width, area.height));
+
+    let (start, end, show_overflow_markers) =
+        visible_mode_window(&base_titles, active_idx, usize::from(tab_area.width));
+    let mut visible: Vec<(Mode, String)> = MODES[start..end]
+        .iter()
+        .copied()
+        .zip(base_titles[start..end].iter().cloned())
+        .collect();
+    if show_overflow_markers && start > 0 {
+        visible[0].1.insert(0, '‹');
+    }
+    if show_overflow_markers && end < MODES.len() {
+        visible
+            .last_mut()
+            .expect("active mode is visible")
+            .1
+            .push('›');
+    }
+
+    let mut x = tab_area.x;
+    let mut entries = Vec::with_capacity(visible.len());
+    for (index, (mode, title)) in visible.into_iter().enumerate() {
+        let remaining = tab_area.right().saturating_sub(x);
+        if remaining == 0 {
+            break;
+        }
+        let title_width = crate::display_width::display_width(&title) as u16;
+        let rendered_width = title_width.min(remaining);
+        entries.push(ModeBarEntry {
+            mode,
+            title,
+            hit_rect: Rect::new(x, tab_area.y, rendered_width, tab_area.height),
+        });
+        x = x.saturating_add(rendered_width);
+        if rendered_width < title_width {
+            break;
+        }
+        if index + 1 < end - start && x < tab_area.right() {
+            // Ratatui renders the one-column divider after each non-final title.
+            x = x.saturating_add(1);
+        }
+    }
+
+    let selected = entries.iter().position(|entry| entry.mode == active);
+    let titles: Vec<ratatui::text::Line> = entries
+        .iter()
+        .map(|entry| {
             ratatui::text::Line::from(ratatui::text::Span::styled(
-                format!(" {} ", label),
+                entry.title.clone(),
                 theme::body_style(),
             ))
         })
         .collect();
 
     let tabs = Tabs::new(titles)
-        .select(active_idx)
+        .select(selected)
         .style(theme::bar_style())
         .highlight_style(theme::selected_style().add_modifier(Modifier::BOLD))
         .divider("│")
         .padding("", "");
 
-    if let Some(summary) = chrome_summary {
-        let summary_w = summary.width() as u16;
-        let right_w = summary_w.min(area.width);
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Min(0), Constraint::Length(right_w)])
-            .split(area);
-        frame.render_widget(tabs, chunks[0]);
-        frame.render_widget(Paragraph::new(summary.clone()), chunks[1]);
-    } else {
-        frame.render_widget(tabs, area);
+    frame.render_widget(tabs, tab_area);
+    if let (Some(summary), Some(summary_area)) = (chrome_summary, summary_area) {
+        frame.render_widget(Paragraph::new(summary.clone()), summary_area);
     }
+
+    ModeBarLayout {
+        tab_area,
+        summary_area,
+        entries,
+    }
+}
+
+/// Select a contiguous localized-title window containing `active_idx`.
+/// Hidden neighbors are signaled with edge markers when those markers fit.
+fn visible_mode_window(
+    titles: &[String],
+    active_idx: usize,
+    available_width: usize,
+) -> (usize, usize, bool) {
+    let mut start = active_idx.min(titles.len().saturating_sub(1));
+    let mut end = (start + 1).min(titles.len());
+
+    loop {
+        let mut expanded = false;
+        if start > 0 && mode_window_width(titles, start - 1, end) <= available_width {
+            start -= 1;
+            expanded = true;
+        }
+        if end < titles.len() && mode_window_width(titles, start, end + 1) <= available_width {
+            end += 1;
+            expanded = true;
+        }
+        if !expanded {
+            break;
+        }
+    }
+
+    let markers_fit = mode_window_width(titles, start, end) <= available_width;
+    (start, end, markers_fit)
+}
+
+fn mode_window_width(titles: &[String], start: usize, end: usize) -> usize {
+    let title_width: usize = titles[start..end]
+        .iter()
+        .map(|title| crate::display_width::display_width(title))
+        .sum();
+    let dividers = end.saturating_sub(start + 1);
+    let overflow_markers = usize::from(start > 0) + usize::from(end < titles.len());
+    title_width + dividers + overflow_markers
 }
 
 // ── Status bar ───────────────────────────────────────────────────
@@ -1699,12 +2071,41 @@ mod tests {
     use std::collections::VecDeque;
 
     fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        mouse_event_with_modifiers(kind, column, row, KeyModifiers::NONE)
+    }
+
+    fn mouse_event_with_modifiers(
+        kind: MouseEventKind,
+        column: u16,
+        row: u16,
+        modifiers: KeyModifiers,
+    ) -> Event {
         Event::Mouse(crossterm::event::MouseEvent {
             kind,
             column,
             row,
-            modifiers: KeyModifiers::NONE,
+            modifiers,
         })
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn decode_sgr_sequence(sequence: &str) -> Vec<Event> {
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(key_event(KeyCode::Esc));
+        for character in sequence.chars() {
+            decoder.feed(key_event(KeyCode::Char(character)));
+        }
+        std::iter::from_fn(|| decoder.next()).collect()
+    }
+
+    fn split_sgr_events(sequence: &str) -> VecDeque<Event> {
+        sequence
+            .chars()
+            .map(|character| key_event(KeyCode::Char(character)))
+            .collect()
     }
 
     #[test]
@@ -1846,6 +2247,190 @@ mod tests {
     }
 
     #[test]
+    fn split_sgr_mouse_decoder_decodes_vertical_wheel_events() {
+        for (sequence, kind) in [
+            ("[<64;32;17M", MouseEventKind::ScrollUp),
+            ("[<65;32;17M", MouseEventKind::ScrollDown),
+        ] {
+            assert_eq!(
+                decode_sgr_sequence(sequence),
+                vec![mouse_event(kind, 31, 16)]
+            );
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_click_and_release_events() {
+        for (sequence, kind) in [
+            ("[<0;3;4M", MouseEventKind::Down(MouseButton::Left)),
+            ("[<1;3;4M", MouseEventKind::Down(MouseButton::Middle)),
+            ("[<2;3;4M", MouseEventKind::Down(MouseButton::Right)),
+            ("[<3;3;4M", MouseEventKind::Up(MouseButton::Left)),
+            ("[<0;3;4m", MouseEventKind::Up(MouseButton::Left)),
+        ] {
+            assert_eq!(decode_sgr_sequence(sequence), vec![mouse_event(kind, 2, 3)]);
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_drag_and_movement_events() {
+        for (sequence, kind) in [
+            ("[<32;5;6M", MouseEventKind::Drag(MouseButton::Left)),
+            ("[<33;5;6M", MouseEventKind::Drag(MouseButton::Middle)),
+            ("[<34;5;6M", MouseEventKind::Drag(MouseButton::Right)),
+            ("[<35;5;6M", MouseEventKind::Moved),
+        ] {
+            assert_eq!(decode_sgr_sequence(sequence), vec![mouse_event(kind, 4, 5)]);
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_decodes_horizontal_wheel_events() {
+        for (sequence, kind) in [
+            ("[<66;10;11M", MouseEventKind::ScrollLeft),
+            ("[<67;10;11M", MouseEventKind::ScrollRight),
+        ] {
+            assert_eq!(
+                decode_sgr_sequence(sequence),
+                vec![mouse_event(kind, 9, 10)]
+            );
+        }
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_preserves_modifiers_and_coordinates() {
+        assert_eq!(
+            decode_sgr_sequence("[<93;1;2M"),
+            vec![mouse_event_with_modifiers(
+                MouseEventKind::ScrollDown,
+                0,
+                1,
+                KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
+            )]
+        );
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_accepts_optional_delimiter_and_lowercase_release() {
+        assert_eq!(
+            decode_sgr_sequence("[<64;32;17;M"),
+            vec![mouse_event(MouseEventKind::ScrollUp, 31, 16)]
+        );
+        assert_eq!(
+            decode_sgr_sequence("[<0;32;17;m"),
+            vec![mouse_event(MouseEventKind::Up(MouseButton::Left), 31, 16)]
+        );
+    }
+
+    #[test]
+    fn split_sgr_mouse_decoder_rejects_multiple_empty_trailing_fields() {
+        let sequence = "[<64;32;17;;M";
+        let expected: Vec<Event> = std::iter::once(key_event(KeyCode::Esc))
+            .chain(
+                sequence
+                    .chars()
+                    .map(|character| key_event(KeyCode::Char(character))),
+            )
+            .collect();
+
+        assert_eq!(decode_sgr_sequence(sequence), expected);
+    }
+
+    #[test]
+    fn drag_read_ahead_reassembles_split_sgr_drag_without_leaking_escape() {
+        let first_drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 4, 5);
+        let latest_drag = mouse_event(MouseEventKind::Drag(MouseButton::Left), 7, 8);
+        let following_key = key_event(KeyCode::Char('x'));
+        let mut queued = VecDeque::from([key_event(KeyCode::Esc)]);
+        queued.extend(split_sgr_events("[<32;8;9M"));
+        queued.push_back(following_key.clone());
+        let mut decoder = SgrMouseEventDecoder::default();
+
+        let (current, pending) = coalesce_mouse_drag(first_drag, || {
+            decoder.read_ready_with(|| Ok(queued.pop_front()))
+        })
+        .expect("reassemble SGR drag during read-ahead");
+
+        assert_eq!(current, latest_drag);
+        assert_eq!(pending, Some(following_key.clone()));
+        assert!(decoder.candidate.is_empty());
+        assert!(queued.is_empty());
+
+        decoder.push_front(pending.expect("preserve following input"));
+        assert_eq!(decoder.next(), Some(following_key));
+    }
+
+    #[test]
+    fn invalid_escape_prefix_is_replayed_in_order() {
+        let original = vec![
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+        ];
+        let mut decoder = SgrMouseEventDecoder::default();
+        for event in original.iter().cloned() {
+            decoder.feed(event);
+        }
+
+        let decoded: Vec<Event> = std::iter::from_fn(|| decoder.next()).collect();
+
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn incomplete_escape_flush_preserves_the_escape_key() {
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(escape.clone());
+
+        assert_eq!(decoder.next(), None);
+        assert!(decoder.flush_candidate());
+        assert_eq!(decoder.next(), Some(escape));
+    }
+
+    #[test]
+    fn delayed_input_flushes_an_expired_escape_before_the_next_tick() {
+        let escape = Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut decoder = SgrMouseEventDecoder::default();
+        decoder.feed(escape.clone());
+        decoder.candidate_started_at = Some(Instant::now() - SGR_MOUSE_SEQUENCE_TIMEOUT);
+
+        assert_eq!(decoder.poll_timeout(), Duration::ZERO);
+        assert!(decoder.flush_timed_out_candidate());
+        assert_eq!(decoder.next(), Some(escape));
+    }
+
+    #[test]
+    fn confirmation_modals_consume_text_and_path_paste_before_pane_dispatch() {
+        let paste_payloads = ["hidden composer text", "/tmp/hidden-attachment.txt"];
+        let modal_states = [(true, false), (false, true), (true, true)];
+
+        for (reload_confirm, quit_confirm) in modal_states {
+            for payload in paste_payloads {
+                // Both plain text and path-shaped paste must stop at the
+                // application modal boundary before any pane sees the value.
+                let event = Event::Paste(payload.to_owned());
+                assert!(confirmation_modal_owns_event(
+                    &event,
+                    reload_confirm,
+                    quit_confirm
+                ));
+            }
+        }
+
+        assert!(!confirmation_modal_owns_event(
+            &Event::Paste("visible composer text".to_owned()),
+            false,
+            false
+        ));
+        assert!(!confirmation_modal_owns_event(
+            &Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            true,
+            false
+        ));
+    }
+
+    #[test]
     fn chrome_process_summary_shows_cpu_loading_without_health() {
         let cpu = crate::i18n::t("zc-chrome-summary-cpu");
         let loading = crate::i18n::t("zc-chrome-summary-loading");
@@ -1915,6 +2500,86 @@ mod tests {
             .expect("request channel should stay open");
         let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(request["method"], crate::client::method::STATUS);
+    }
+
+    #[tokio::test]
+    async fn reconnect_refreshes_the_sop_list_when_it_remains_visible() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let mut pane = sop_pane::SopPane::new(rpc);
+
+        let responder = tokio::spawn(async move {
+            let raw = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("visible reconnect should request the SOP list")
+                .expect("RPC request channel should stay open");
+            let request: serde_json::Value =
+                serde_json::from_str(&raw).expect("RPC request should be JSON");
+            assert_eq!(request["method"], crate::client::method::SOPS_LIST);
+            let id = request["id"]
+                .as_str()
+                .expect("RPC request should carry an id");
+            outbound.dispatch_response(id, Some(serde_json::json!([{ "name": "deploy" }])), None);
+        });
+
+        refresh_visible_sop_after_reconnect(Mode::Sop, &mut pane).await;
+        responder.await.expect("RPC responder should complete");
+
+        assert_eq!(pane.selected_name(), Some("deploy"));
+    }
+
+    #[test]
+    fn narrow_mode_bar_keeps_selected_sop_visible_and_summary_non_clickable() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let summary = Line::from(" status");
+        let backend = TestBackend::new(24, 1);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut layout = ModeBarLayout::default();
+
+        terminal
+            .draw(|frame| {
+                layout = draw_mode_bar(frame, frame.area(), Mode::Sop, Some(&summary));
+            })
+            .expect("draw narrow mode bar");
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("SOPs"), "rendered bar: {rendered:?}");
+        assert!(
+            rendered.contains('‹'),
+            "hidden leading modes should be signaled: {rendered:?}"
+        );
+
+        let sop = layout
+            .entries
+            .iter()
+            .find(|entry| entry.mode == Mode::Sop)
+            .expect("selected SOP tab must have rendered geometry");
+        assert_eq!(
+            layout.mode_at(sop.hit_rect.x, sop.hit_rect.y),
+            Some(Mode::Sop)
+        );
+
+        let summary_area = layout.summary_area.expect("full summary should fit");
+        assert_eq!(
+            layout.mode_at(summary_area.x, summary_area.y),
+            None,
+            "chrome summary must not share a tab hit target"
+        );
+        assert!(
+            layout
+                .entries
+                .iter()
+                .all(|entry| entry.hit_rect.right() <= layout.tab_area.right()),
+            "every click target must stay within the rendered tab chunk"
+        );
     }
 
     #[test]
