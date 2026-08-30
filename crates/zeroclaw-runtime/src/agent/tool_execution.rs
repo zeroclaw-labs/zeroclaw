@@ -273,8 +273,11 @@ pub(crate) async fn execute_one_tool(
             .await;
     }
 
-    let tool_future = tool
-        .execute(call_arguments.clone())
+    let tool_future = zeroclaw_api::TOOL_LOOP_TOOL_CALL_ID
+        .scope(
+            Some(event_call_id.clone()),
+            tool.execute(call_arguments.clone()),
+        )
         .instrument(tool_span.clone());
     let execute = async {
         if let Some(token) = cancellation_token {
@@ -601,6 +604,46 @@ mod tests {
         }
     }
 
+    struct ScopedIdTool;
+
+    impl zeroclaw_api::attribution::Attributable for ScopedIdTool {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::System
+        }
+
+        fn alias(&self) -> &str {
+            "test-scoped-id-tool"
+        }
+    }
+
+    #[async_trait]
+    impl Tool for ScopedIdTool {
+        fn name(&self) -> &str {
+            "scoped_id"
+        }
+
+        fn description(&self) -> &str {
+            "Returns the dispatcher-scoped tool-call ID"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _args: serde_json::Value,
+        ) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: zeroclaw_api::elicitation::scoped_tool_call_id()
+                    .unwrap_or_else(|| "missing".to_string())
+                    .into(),
+                error: None,
+            })
+        }
+    }
+
     #[test]
     fn resolved_provenance_uses_activated_mcp_tool() {
         let activated = Arc::new(Mutex::new(ActivatedToolSet::new()));
@@ -646,6 +689,38 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn execute_one_tool_scopes_the_canonical_call_id() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ScopedIdTool)];
+        let meta = crate::agent::turn::TurnMeta {
+            parent_agent_alias: None,
+            agent_alias: None,
+            turn_id: "test-turn-id",
+            channel_name: "test",
+        };
+
+        let outcome = execute_one_tool(
+            "scoped_id",
+            serde_json::json!({}),
+            Some("call-canonical"),
+            ToolDispatchContext {
+                tools_registry: &tools,
+                activated_tools: None,
+                excluded_tools: &[],
+                model_switch_callback: None,
+            },
+            &meta,
+            &NoopObserver,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("scoped-id tool should execute");
+
+        assert_eq!(outcome.output, "call-canonical");
     }
 
     #[tokio::test]

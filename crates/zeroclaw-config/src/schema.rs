@@ -12446,15 +12446,22 @@ fn default_otel_tool_io_max_chars() -> usize {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "hooks"]
 pub struct HooksConfig {
-    /// Enable lifecycle hook execution.
+    /// Enable built-in and external lifecycle hook execution.
     ///
-    /// Hooks run in-process with the same privileges as the main runtime.
-    /// Keep enabled hook handlers narrowly scoped and auditable.
+    /// Built-ins run in-process. Lifecycle commands run as bounded child
+    /// processes under the runtime's OS identity. Keep every handler narrowly
+    /// scoped and auditable.
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
     #[nested]
     pub builtin: BuiltinHooksConfig,
+    /// Explicit external commands that receive content-free lifecycle JSON on
+    /// stdin. An empty list (the default) starts no workers or processes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[nested]
+    #[natural_key = "name"]
+    pub lifecycle_commands: Vec<LifecycleCommandConfig>,
 }
 
 impl Default for HooksConfig {
@@ -12462,7 +12469,163 @@ impl Default for HooksConfig {
         Self {
             enabled: true,
             builtin: BuiltinHooksConfig::default(),
+            lifecycle_commands: Vec::new(),
         }
+    }
+}
+
+use zeroclaw_infra::lifecycle_command::{
+    LIFECYCLE_COMMAND_ARG_BYTES_MAX, LIFECYCLE_COMMAND_ARGV_MAX, LIFECYCLE_COMMAND_CONCURRENCY_MAX,
+    LIFECYCLE_COMMAND_NAME_CHARS_MAX, LIFECYCLE_COMMAND_OUTPUT_BYTES_MAX,
+    LIFECYCLE_COMMAND_QUEUE_MAX, LIFECYCLE_COMMAND_TIMEOUT_MS_MAX,
+};
+
+fn default_lifecycle_command_queue_capacity() -> usize {
+    32
+}
+
+fn default_lifecycle_command_max_concurrency() -> usize {
+    1
+}
+
+fn default_lifecycle_command_timeout_ms() -> u64 {
+    1_000
+}
+
+fn default_lifecycle_command_max_output_bytes() -> usize {
+    4096
+}
+
+/// One bounded external lifecycle command projection.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "hooks.lifecycle_commands"]
+pub struct LifecycleCommandConfig {
+    /// Stable configuration identity.
+    #[serde(default)]
+    pub name: String,
+    /// Whether this entry is active.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Absolute executable followed by literal arguments. No shell parses it.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Explicit lifecycle event allowlist using snake-case event names.
+    #[serde(default)]
+    pub events: Vec<String>,
+    /// Maximum queued non-terminal events.
+    #[serde(default = "default_lifecycle_command_queue_capacity")]
+    pub queue_capacity: usize,
+    /// Maximum concurrently running child processes.
+    #[serde(default = "default_lifecycle_command_max_concurrency")]
+    pub max_concurrency: usize,
+    /// Per-child timeout in milliseconds.
+    #[serde(default = "default_lifecycle_command_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Maximum retained bytes from each of stdout and stderr.
+    #[serde(default = "default_lifecycle_command_max_output_bytes")]
+    pub max_output_bytes: usize,
+}
+
+impl Default for LifecycleCommandConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            argv: Vec::new(),
+            events: Vec::new(),
+            queue_capacity: default_lifecycle_command_queue_capacity(),
+            max_concurrency: default_lifecycle_command_max_concurrency(),
+            timeout_ms: default_lifecycle_command_timeout_ms(),
+            max_output_bytes: default_lifecycle_command_max_output_bytes(),
+        }
+    }
+}
+
+impl HooksConfig {
+    /// Validate enabled lifecycle command entries before runtime construction.
+    pub fn validate(&self) -> Result<()> {
+        let mut names = std::collections::HashSet::new();
+        for (index, command) in self.lifecycle_commands.iter().enumerate() {
+            if !command.enabled {
+                continue;
+            }
+            let base = format!("hooks.lifecycle_commands[{index}]");
+            if command.name.trim().is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("{base}.name"),
+                    "{base}.name must not be empty"
+                );
+            }
+            if command.name.chars().count() > LIFECYCLE_COMMAND_NAME_CHARS_MAX
+                || command.name.chars().any(char::is_control)
+            {
+                anyhow::bail!(
+                    "{base}.name must contain at most {LIFECYCLE_COMMAND_NAME_CHARS_MAX} non-control characters"
+                );
+            }
+            if !names.insert(command.name.as_str()) {
+                anyhow::bail!(
+                    "hooks.lifecycle_commands contains duplicate name {:?}",
+                    command.name
+                );
+            }
+            let Some(executable) = command.argv.first() else {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("{base}.argv"),
+                    "{base}.argv must contain an absolute executable"
+                );
+            };
+            if !Path::new(executable).is_absolute() {
+                anyhow::bail!("{base}.argv[0] must be an absolute executable path");
+            }
+            if command.argv.len() > LIFECYCLE_COMMAND_ARGV_MAX
+                || command
+                    .argv
+                    .iter()
+                    .any(|arg| arg.len() > LIFECYCLE_COMMAND_ARG_BYTES_MAX)
+            {
+                anyhow::bail!(
+                    "{base}.argv exceeds the {LIFECYCLE_COMMAND_ARGV_MAX}-argument or {LIFECYCLE_COMMAND_ARG_BYTES_MAX}-byte-per-argument bound"
+                );
+            }
+            if command.events.is_empty() {
+                validation_bail!(
+                    RequiredFieldEmpty,
+                    format!("{base}.events"),
+                    "{base}.events must explicitly allow at least one lifecycle event"
+                );
+            }
+            for event in &command.events {
+                if zeroclaw_api::lifecycle::LifecycleEventKind::parse(event).is_none() {
+                    anyhow::bail!(
+                        "{base}.events contains unknown event {event:?}; valid events: {}",
+                        zeroclaw_api::lifecycle::LifecycleEventKind::ALL
+                            .map(zeroclaw_api::lifecycle::LifecycleEventKind::as_str)
+                            .join(", ")
+                    );
+                }
+            }
+            if !(1..=LIFECYCLE_COMMAND_QUEUE_MAX).contains(&command.queue_capacity) {
+                anyhow::bail!("{base}.queue_capacity must be 1..={LIFECYCLE_COMMAND_QUEUE_MAX}");
+            }
+            if !(1..=LIFECYCLE_COMMAND_CONCURRENCY_MAX).contains(&command.max_concurrency) {
+                anyhow::bail!(
+                    "{base}.max_concurrency must be 1..={LIFECYCLE_COMMAND_CONCURRENCY_MAX}"
+                );
+            }
+            if !(1..=LIFECYCLE_COMMAND_TIMEOUT_MS_MAX).contains(&command.timeout_ms) {
+                anyhow::bail!("{base}.timeout_ms must be 1..={LIFECYCLE_COMMAND_TIMEOUT_MS_MAX}");
+            }
+            if command.max_output_bytes > LIFECYCLE_COMMAND_OUTPUT_BYTES_MAX {
+                anyhow::bail!(
+                    "{base}.max_output_bytes must be 0..={LIFECYCLE_COMMAND_OUTPUT_BYTES_MAX}"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -21100,6 +21263,7 @@ impl Config {
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
         validate_memory_rerank_config(&self.memory)?;
+        self.hooks.validate()?;
 
         let websocket_ping_interval_secs = self.gateway.websocket_ping_interval_secs;
         if websocket_ping_interval_secs > GATEWAY_WEBSOCKET_PING_INTERVAL_MAX_SECS {
@@ -43048,6 +43212,122 @@ model_provider = \"ollama.default\"
         let from_empty: HooksConfig = toml::from_str("").unwrap();
         let default = HooksConfig::default();
         assert_eq!(from_empty.enabled, default.enabled);
+        assert!(from_empty.lifecycle_commands.is_empty());
+    }
+
+    fn valid_lifecycle_command_config() -> LifecycleCommandConfig {
+        LifecycleCommandConfig {
+            name: "test".into(),
+            enabled: true,
+            argv: vec![absolute_test_executable(), "$(literal)".into()],
+            events: vec!["turn_started".into(), "session_ended".into()],
+            queue_capacity: 2,
+            max_concurrency: 1,
+            timeout_ms: 100,
+            max_output_bytes: 17,
+        }
+    }
+
+    #[cfg(unix)]
+    fn absolute_test_executable() -> String {
+        "/bin/echo".into()
+    }
+
+    #[cfg(windows)]
+    fn absolute_test_executable() -> String {
+        r"C:\Windows\System32\cmd.exe".into()
+    }
+
+    #[test]
+    async fn lifecycle_command_validation_accepts_literal_bounded_config() {
+        let hooks = HooksConfig {
+            lifecycle_commands: vec![valid_lifecycle_command_config()],
+            ..HooksConfig::default()
+        };
+        assert!(hooks.validate().is_ok());
+        assert_eq!(hooks.lifecycle_commands[0].argv[1], "$(literal)");
+    }
+
+    #[test]
+    async fn lifecycle_command_validation_ignores_disabled_entries() {
+        let hooks = HooksConfig {
+            lifecycle_commands: vec![LifecycleCommandConfig {
+                enabled: false,
+                ..LifecycleCommandConfig::default()
+            }],
+            ..HooksConfig::default()
+        };
+        assert!(hooks.validate().is_ok());
+    }
+
+    #[test]
+    async fn lifecycle_command_validation_rejects_unsafe_or_unbounded_config() {
+        let mut invalid = valid_lifecycle_command_config();
+        invalid.name = "invalid\0name".into();
+        assert!(
+            HooksConfig {
+                lifecycle_commands: vec![invalid],
+                ..HooksConfig::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("non-control")
+        );
+
+        let mut invalid = valid_lifecycle_command_config();
+        invalid.argv[0] = "relative-command".into();
+        assert!(
+            HooksConfig {
+                lifecycle_commands: vec![invalid],
+                ..HooksConfig::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("absolute executable")
+        );
+
+        let mut invalid = valid_lifecycle_command_config();
+        invalid.events = vec!["unknown_event".into()];
+        assert!(
+            HooksConfig {
+                lifecycle_commands: vec![invalid],
+                ..HooksConfig::default()
+            }
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown event")
+        );
+
+        for invalid in [
+            LifecycleCommandConfig {
+                queue_capacity: 0,
+                ..valid_lifecycle_command_config()
+            },
+            LifecycleCommandConfig {
+                max_concurrency: LIFECYCLE_COMMAND_CONCURRENCY_MAX + 1,
+                ..valid_lifecycle_command_config()
+            },
+            LifecycleCommandConfig {
+                timeout_ms: LIFECYCLE_COMMAND_TIMEOUT_MS_MAX + 1,
+                ..valid_lifecycle_command_config()
+            },
+            LifecycleCommandConfig {
+                max_output_bytes: LIFECYCLE_COMMAND_OUTPUT_BYTES_MAX + 1,
+                ..valid_lifecycle_command_config()
+            },
+        ] {
+            assert!(
+                HooksConfig {
+                    lifecycle_commands: vec![invalid],
+                    ..HooksConfig::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 
     #[test]

@@ -116,6 +116,42 @@ Standalone `zeroclaw gateway start` has no daemon supervisor. Its reload
 endpoint returns a restart-required response because there is no outer daemon
 loop to signal.
 
+### Lifecycle command projections
+
+`hooks.lifecycle_commands` is an explicit, default-empty list. An empty list,
+or `hooks.enabled = false`, creates no queue, worker thread, or process. Each
+enabled entry owns one bounded queue and concurrency budget for the whole
+runtime generation, not one per agent or message.
+
+```toml
+[[hooks.lifecycle_commands]]
+name = "terminal-multiplexer"
+enabled = true
+argv = ["/absolute/path/to/adapter", "--literal-argument"]
+events = ["turn_started", "approval_requested", "session_ended"]
+queue_capacity = 32
+max_concurrency = 1
+timeout_ms = 1000
+max_output_bytes = 4096
+```
+
+`argv[0]` must be absolute. Arguments are passed literally without a shell,
+and the versioned lifecycle event is written as JSON on standard input. Event
+selection is an allowlist. Queue depth, concurrency, timeout, and retained
+stdout/stderr bytes have validated hard limits.
+
+The executable is a trusted local extension. It runs under ZeroClaw's OS
+identity and inherits the process environment and working directory. The
+delivery bounds protect ZeroClaw from a stalled adapter; they do not sandbox
+the adapter or prevent it from reading resources already available to that OS
+account. Do not configure untrusted executables.
+
+Daemon reload replaces the generation-owned command observer: the old workers
+receive shutdown and drain their reserved terminal events before their hook is
+removed, then the new config installs one replacement. Standalone agent, ACP,
+gateway, and channel commands own one observer for their process lifetime and
+therefore require restart to apply edits.
+
 ## Reload access
 
 Local reload is allowed from loopback. Remote reload requires both:

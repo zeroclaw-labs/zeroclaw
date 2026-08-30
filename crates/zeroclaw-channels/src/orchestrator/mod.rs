@@ -6956,13 +6956,14 @@ async fn process_channel_message_body(
     // A successful switch updates the closing attribution without creating a
     // second lifecycle start for the same logical turn.
     let turn_observer = Arc::clone(&ctx.observer);
-    let mut turn_guard = zeroclaw_runtime::observability::AgentTurnGuard::start(
+    let mut turn_guard = zeroclaw_runtime::observability::AgentTurnGuard::start_with_session_key(
         turn_observer.as_ref(),
         route.model_provider.clone(),
         route.model.clone(),
         Some(msg.channel.to_string()),
         Some(ctx.agent_alias.to_string()),
         Some(turn_id.clone()),
+        Some(history_key.clone()),
     );
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {

@@ -6,6 +6,7 @@ use super::events::StreamDelta;
 use super::redact::scrub_credentials;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::approval::{ApprovalRequest, ApprovalRequirement, ApprovalResponse};
+use crate::observability::ObserverEvent;
 use std::time::Duration;
 
 pub(crate) enum ApprovalGateOutcome {
@@ -31,6 +32,13 @@ pub(crate) async fn gate_tool_approval(
     if let Some(mgr) = ctx.approval
         && approval_requirement == ApprovalRequirement::Prompt
     {
+        ctx.observer
+            .record_event(&ObserverEvent::AuthorizationRequested {
+                tool_name: tool_name.to_string(),
+                channel: Some(ctx.channel_name.to_string()),
+                agent_alias: ctx.agent_alias.map(str::to_string),
+                turn_id: Some(ctx.turn_id.to_string()),
+            });
         let request = ApprovalRequest {
             tool_name: tool_name.to_string(),
             arguments: tool_args.clone(),
@@ -106,6 +114,14 @@ pub(crate) async fn gate_tool_approval(
         };
 
         let decision_channel = decided_by.unwrap_or_else(|| ctx.channel_name.to_string());
+        ctx.observer
+            .record_event(&ObserverEvent::AuthorizationResponded {
+                tool_name: tool_name.to_string(),
+                granted: matches!(&decision, ApprovalResponse::Yes | ApprovalResponse::Always),
+                channel: Some(ctx.channel_name.to_string()),
+                agent_alias: ctx.agent_alias.map(str::to_string),
+                turn_id: Some(ctx.turn_id.to_string()),
+            });
         mgr.record_decision(tool_name, tool_args, &decision, &decision_channel);
 
         if decision == ApprovalResponse::No {

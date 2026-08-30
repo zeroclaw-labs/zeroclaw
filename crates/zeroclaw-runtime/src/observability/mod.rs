@@ -33,7 +33,8 @@ use std::time::Instant;
 
 use parking_lot::RwLock;
 use traits::ObserverMetric;
-use zeroclaw_config::schema::{ObservabilityBackend, ObservabilityConfig};
+use zeroclaw_config::schema::{HooksConfig, ObservabilityBackend, ObservabilityConfig};
+use zeroclaw_infra::lifecycle_command::{LifecycleCommandObserver, LifecycleCommandSpec};
 
 /// Drop-safe lifecycle bracket for one logical agent turn.
 ///
@@ -50,6 +51,7 @@ pub struct AgentTurnGuard<'a> {
     channel: Option<String>,
     agent_alias: Option<String>,
     turn_id: Option<String>,
+    session_key: Option<String>,
     turn_started_at: Instant,
     tokens_used: Option<zeroclaw_api::observability_traits::TurnTokenUsage>,
     cost_usd: Option<f64>,
@@ -66,15 +68,50 @@ impl<'a> AgentTurnGuard<'a> {
         agent_alias: Option<String>,
         turn_id: Option<String>,
     ) -> Self {
+        let session_key = zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        Self::start_with_session_key(
+            observer,
+            model_provider,
+            model,
+            channel,
+            agent_alias,
+            turn_id,
+            session_key,
+        )
+    }
+
+    /// Open a lifecycle bracket with an explicit existing session-key scope.
+    ///
+    /// Use this only when the caller owns the same session key that will scope
+    /// the turn body but must construct the guard before entering that async
+    /// scope. The key remains process-local; observers can derive opaque
+    /// correlation from it without exposing the source value.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_session_key(
+        observer: &'a dyn Observer,
+        model_provider: impl Into<String>,
+        model: impl Into<String>,
+        channel: Option<String>,
+        agent_alias: Option<String>,
+        turn_id: Option<String>,
+        session_key: Option<String>,
+    ) -> Self {
         let model_provider = model_provider.into();
         let model = model.into();
-        observer.record_event(&ObserverEvent::AgentStart {
-            model_provider: model_provider.clone(),
-            model: model.clone(),
-            channel: channel.clone(),
-            agent_alias: agent_alias.clone(),
-            turn_id: turn_id.clone(),
-        });
+        record_event_in_session_scope(
+            observer,
+            session_key.clone(),
+            ObserverEvent::AgentStart {
+                model_provider: model_provider.clone(),
+                model: model.clone(),
+                channel: channel.clone(),
+                agent_alias: agent_alias.clone(),
+                turn_id: turn_id.clone(),
+            },
+        );
         Self {
             observer,
             model_provider,
@@ -82,6 +119,7 @@ impl<'a> AgentTurnGuard<'a> {
             channel,
             agent_alias,
             turn_id,
+            session_key,
             turn_started_at: Instant::now(),
             tokens_used: None,
             cost_usd: None,
@@ -111,17 +149,29 @@ impl<'a> AgentTurnGuard<'a> {
             return;
         }
         self.done = true;
-        self.observer.record_event(&ObserverEvent::AgentEnd {
-            model_provider: self.model_provider.clone(),
-            model: self.model.clone(),
-            duration: self.turn_started_at.elapsed(),
-            tokens_used: self.tokens_used.clone(),
-            cost_usd: self.cost_usd,
-            channel: self.channel.clone(),
-            agent_alias: self.agent_alias.clone(),
-            turn_id: self.turn_id.clone(),
-        });
+        record_event_in_session_scope(
+            self.observer,
+            self.session_key.clone(),
+            ObserverEvent::AgentEnd {
+                model_provider: self.model_provider.clone(),
+                model: self.model.clone(),
+                duration: self.turn_started_at.elapsed(),
+                tokens_used: self.tokens_used.clone(),
+                cost_usd: self.cost_usd,
+                channel: self.channel.clone(),
+                agent_alias: self.agent_alias.clone(),
+                turn_id: self.turn_id.clone(),
+            },
+        );
     }
+}
+
+fn record_event_in_session_scope(
+    observer: &dyn Observer,
+    session_key: Option<String>,
+    event: ObserverEvent,
+) {
+    zeroclaw_api::TOOL_LOOP_SESSION_KEY.sync_scope(session_key, || observer.record_event(&event));
 }
 
 impl Drop for AgentTurnGuard<'_> {
@@ -130,11 +180,15 @@ impl Drop for AgentTurnGuard<'_> {
     }
 }
 
-/// Process-wide broadcast hook installed by long-running subsystems (today: the
-/// gateway) so that events emitted by observers built in *other* subsystems —
-/// notably the agent loop's `process_message` — also fan out to the SSE
-/// broadcast channel. Without this, observers created per call site stay
-/// isolated and `/api/events` only sees the gateway's own direct emissions.
+/// Process-wide broadcast hooks installed by long-running subsystems (today:
+/// the gateway's SSE layer) so that events emitted by observers built in
+/// *other* subsystems — notably the agent loop's `process_message` — also fan
+/// out to them. Without this, observers created per call site stay isolated
+/// and `/api/events` only sees the gateway's own direct emissions.
+///
+/// Every live hook receives every event: concurrently installed hooks fan out
+/// rather than shadowing each other, so a process-level consumer (e.g. a
+/// lifecycle projection worker) can coexist with the gateway's SSE layer.
 ///
 /// Uses `parking_lot::RwLock` so the event-recording path never has to handle
 /// lock poisoning: a panic inside a hook would not silently disable the entire
@@ -150,11 +204,24 @@ struct BroadcastHookEntry {
 struct BroadcastHookState {
     next_scoped_id: u64,
     entries: Vec<BroadcastHookEntry>,
+    /// Precomputed fan-out over `entries`, rebuilt on every install/remove so
+    /// the per-event path stays a single `Arc` clone under the read lock.
+    composite: Option<Arc<dyn Observer>>,
 }
 
 impl BroadcastHookState {
     fn current(&self) -> Option<Arc<dyn Observer>> {
-        self.entries.last().map(|entry| entry.observer.clone())
+        self.composite.clone()
+    }
+
+    fn rebuild_composite(&mut self) {
+        self.composite = match self.entries.as_slice() {
+            [] => None,
+            [single] => Some(single.observer.clone()),
+            many => Some(Arc::new(MultiObserver::from_shared(
+                many.iter().map(|entry| entry.observer.clone()).collect(),
+            ))),
+        };
     }
 }
 
@@ -164,7 +231,8 @@ fn broadcast_hook_slot() -> &'static RwLock<BroadcastHookState> {
 
 /// Install a process-wide observer that will receive every event recorded
 /// through observers built by [`create_observer`]. Calling this again replaces
-/// the previous hook.
+/// every previously installed hook, scoped ones included; prefer
+/// [`set_scoped_broadcast_hook`] when other hooks must keep receiving events.
 pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
     let mut slot = broadcast_hook_slot().write();
     slot.entries.clear();
@@ -172,6 +240,7 @@ pub fn set_broadcast_hook(observer: Arc<dyn Observer>) {
         scoped_id: None,
         observer,
     });
+    slot.rebuild_composite();
 }
 
 #[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
@@ -184,10 +253,14 @@ impl Drop for BroadcastHookGuard {
         let mut slot = broadcast_hook_slot().write();
         slot.entries
             .retain(|entry| entry.scoped_id != Some(self.scoped_id));
+        slot.rebuild_composite();
     }
 }
 
-/// Install a process-wide observer and return a guard that clears it on drop.
+/// Install a process-wide observer and return a guard that removes it on drop.
+/// Multiple scoped hooks may be live at once; every live hook receives every
+/// event, so independent subsystems can install their own without shadowing
+/// each other.
 #[must_use = "hold the guard for as long as the broadcast hook should remain installed"]
 pub fn set_scoped_broadcast_hook(observer: Arc<dyn Observer>) -> BroadcastHookGuard {
     let mut slot = broadcast_hook_slot().write();
@@ -197,12 +270,96 @@ pub fn set_scoped_broadcast_hook(observer: Arc<dyn Observer>) -> BroadcastHookGu
         scoped_id: Some(scoped_id),
         observer,
     });
+    slot.rebuild_composite();
     BroadcastHookGuard { scoped_id }
 }
 
-/// Remove the broadcast hook, if any. Intended for tests and orderly shutdown.
+/// Remove all broadcast hooks, if any. Intended for tests and orderly shutdown.
 pub fn clear_broadcast_hook() {
-    broadcast_hook_slot().write().entries.clear();
+    let mut slot = broadcast_hook_slot().write();
+    slot.entries.clear();
+    slot.rebuild_composite();
+}
+
+/// Generation-scoped owner for configured lifecycle command workers.
+///
+/// Dropping the guard drains the workers before removing their broadcast hook.
+#[must_use = "hold the guard for the lifetime of the runtime generation"]
+pub struct LifecycleCommandHookGuard {
+    observer: Arc<LifecycleCommandObserver>,
+    broadcast_guard: Option<BroadcastHookGuard>,
+}
+
+impl Drop for LifecycleCommandHookGuard {
+    fn drop(&mut self) {
+        self.observer.flush();
+        self.broadcast_guard.take();
+    }
+}
+
+/// Install one process-wide lifecycle command observer for a runtime generation.
+///
+/// Empty or disabled configuration allocates no queue, worker, thread, or
+/// process. Invalid configuration and worker-start failures are logged and
+/// skipped so an optional projection cannot fail an agent turn or runtime boot.
+pub fn install_lifecycle_command_hook(config: &HooksConfig) -> Option<LifecycleCommandHookGuard> {
+    match build_lifecycle_command_observer(config) {
+        Ok(Some(observer)) => {
+            let observer = Arc::new(observer);
+            let hook: Arc<dyn Observer> = observer.clone();
+            let broadcast_guard = set_scoped_broadcast_hook(hook);
+            Some(LifecycleCommandHookGuard {
+                observer,
+                broadcast_guard: Some(broadcast_guard),
+            })
+        }
+        Ok(None) => None,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "Lifecycle command hook disabled after setup failure"
+            );
+            None
+        }
+    }
+}
+
+fn build_lifecycle_command_observer(
+    config: &HooksConfig,
+) -> anyhow::Result<Option<LifecycleCommandObserver>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+    config.validate()?;
+    let specs = config
+        .lifecycle_commands
+        .iter()
+        .filter(|command| command.enabled)
+        .map(|command| {
+            let events = command
+                .events
+                .iter()
+                .map(|event| {
+                    zeroclaw_api::lifecycle::LifecycleEventKind::parse(event).ok_or_else(|| {
+                        anyhow::Error::msg(format!("unknown lifecycle command event {event:?}"))
+                    })
+                })
+                .collect::<anyhow::Result<std::collections::HashSet<_>>>()?;
+            Ok(LifecycleCommandSpec {
+                name: command.name.clone(),
+                argv: command.argv.clone(),
+                events,
+                queue_capacity: command.queue_capacity,
+                max_concurrency: command.max_concurrency,
+                timeout: std::time::Duration::from_millis(command.timeout_ms),
+                max_output_bytes: command.max_output_bytes,
+            })
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    LifecycleCommandObserver::from_specs(specs)
 }
 
 fn current_broadcast_hook() -> Option<Arc<dyn Observer>> {
@@ -258,7 +415,10 @@ impl Drop for FlushGuard {
 }
 
 /// Wrapper that forwards every event to a primary observer plus the
-/// process-wide broadcast hook (when set). Metrics flow only to the primary.
+/// process-wide broadcast hooks (when installed). Metrics flow only to the
+/// primary. Flush reaches the hooks too, so background consumers attached at
+/// the hook get a drain signal from the same [`FlushGuard`]/shutdown paths
+/// that flush the primary.
 struct TeeObserver {
     primary: Box<dyn Observer>,
 }
@@ -277,6 +437,9 @@ impl Observer for TeeObserver {
 
     fn flush(&self) {
         self.primary.flush();
+        if let Some(hook) = current_broadcast_hook() {
+            hook.flush();
+        }
     }
 
     fn name(&self) -> &str {
@@ -578,6 +741,168 @@ mod tests {
     }
 
     #[test]
+    fn empty_lifecycle_command_config_installs_nothing() {
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
+        clear_broadcast_hook();
+
+        assert!(install_lifecycle_command_hook(&HooksConfig::default()).is_none());
+        assert!(current_broadcast_hook().is_none());
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_lifecycle_events(
+        path: &std::path::Path,
+        expected: usize,
+    ) -> Vec<zeroclaw_api::lifecycle::LifecycleEventV1> {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let bytes = std::fs::read(path).unwrap_or_default();
+                let events = serde_json::Deserializer::from_slice(&bytes)
+                    .into_iter::<zeroclaw_api::lifecycle::LifecycleEventV1>()
+                    .filter_map(Result::ok)
+                    .collect::<Vec<_>>();
+                if events.len() >= expected {
+                    return events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn one_lifecycle_authority_receives_canonical_events_from_multiple_surfaces() {
+        let _test_lock = HOOK_TEST_LOCK.lock().await;
+        clear_broadcast_hook();
+        let temporary = tempfile::tempdir().unwrap();
+        let output = temporary.path().join("lifecycle.json-stream");
+        let hooks = HooksConfig {
+            lifecycle_commands: vec![
+                zeroclaw_config::schema::LifecycleCommandConfig {
+                    enabled: false,
+                    ..Default::default()
+                },
+                zeroclaw_config::schema::LifecycleCommandConfig {
+                    name: "capture".into(),
+                    enabled: true,
+                    argv: vec![
+                        "/usr/bin/tee".into(),
+                        "-a".into(),
+                        output.to_string_lossy().into_owned(),
+                    ],
+                    events: zeroclaw_api::lifecycle::LifecycleEventKind::ALL
+                        .into_iter()
+                        .map(|event| event.as_str().to_string())
+                        .collect(),
+                    queue_capacity: 16,
+                    max_concurrency: 1,
+                    timeout_ms: 1_000,
+                    max_output_bytes: 0,
+                },
+            ],
+            ..HooksConfig::default()
+        };
+        let sibling = Arc::new(CountingObserver::default());
+        let sibling_guard = set_scoped_broadcast_hook(sibling.clone());
+        let lifecycle_guard = install_lifecycle_command_hook(&hooks).unwrap();
+        let config = ObservabilityConfig::default();
+        let surface_a = create_observer(&config);
+        let surface_b = create_observer(&config);
+        let raw_session = "channel_private_sender_session";
+        let raw_turn = "turn_private_source";
+        let mut turn_guard = AgentTurnGuard::start_with_session_key(
+            surface_a.as_ref(),
+            "provider",
+            "model",
+            Some("channel".into()),
+            Some("agent".into()),
+            Some(raw_turn.into()),
+            Some(raw_session.into()),
+        );
+        wait_for_lifecycle_events(&output, 2).await;
+
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(raw_session.into()), async {
+                surface_b.record_event(&ObserverEvent::ToolCallStart {
+                    tool: "shell".into(),
+                    tool_call_id: Some("call".into()),
+                    arguments: Some("private arguments".into()),
+                    channel: Some("channel".into()),
+                    agent_alias: Some("agent".into()),
+                    parent_agent_alias: None,
+                    turn_id: Some(raw_turn.into()),
+                });
+            })
+            .await;
+        wait_for_lifecycle_events(&output, 3).await;
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(raw_session.into()), async {
+                surface_a.record_event(&ObserverEvent::ToolCall {
+                    tool: "shell".into(),
+                    tool_call_id: Some("call".into()),
+                    duration: std::time::Duration::from_millis(1),
+                    success: true,
+                    arguments: Some("private arguments".into()),
+                    result: Some("private result".into()),
+                    channel: Some("channel".into()),
+                    agent_alias: Some("agent".into()),
+                    parent_agent_alias: None,
+                    turn_id: Some(raw_turn.into()),
+                });
+            })
+            .await;
+        wait_for_lifecycle_events(&output, 4).await;
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(raw_session.into()), async {
+                surface_b.record_event(&ObserverEvent::AuthorizationRequested {
+                    tool_name: "shell".into(),
+                    channel: Some("channel".into()),
+                    agent_alias: Some("agent".into()),
+                    turn_id: Some(raw_turn.into()),
+                });
+            })
+            .await;
+        wait_for_lifecycle_events(&output, 5).await;
+        zeroclaw_api::TOOL_LOOP_SESSION_KEY
+            .scope(Some(raw_session.into()), async {
+                surface_a.record_event(&ObserverEvent::AuthorizationResponded {
+                    tool_name: "shell".into(),
+                    granted: true,
+                    channel: Some("channel".into()),
+                    agent_alias: Some("agent".into()),
+                    turn_id: Some(raw_turn.into()),
+                });
+            })
+            .await;
+        wait_for_lifecycle_events(&output, 6).await;
+        turn_guard.finish();
+        let events = wait_for_lifecycle_events(&output, 8).await;
+
+        assert_eq!(
+            events.iter().map(|event| event.event).collect::<Vec<_>>(),
+            zeroclaw_api::lifecycle::LifecycleEventKind::ALL
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>()
+        );
+        assert_eq!(sibling.events.load(Ordering::SeqCst), 6);
+        let serialized = std::fs::read_to_string(&output).unwrap();
+        for private in [raw_session, raw_turn, "private arguments", "private result"] {
+            assert!(!serialized.contains(private));
+        }
+
+        drop(lifecycle_guard);
+        drop(sibling_guard);
+        clear_broadcast_hook();
+    }
+
+    #[test]
     fn broadcast_hook_receives_events_from_factory_observer() {
         let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
@@ -690,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn dropping_newer_scoped_broadcast_hook_restores_older_live_hook() {
+    fn concurrent_scoped_broadcast_hooks_all_receive_events() {
         let _guard = HOOK_TEST_LOCK.blocking_lock();
         clear_broadcast_hook();
 
@@ -706,19 +1031,47 @@ mod tests {
         };
         let observer = create_observer(&cfg);
         observer.record_event(&ObserverEvent::HeartbeatTick);
-        assert_eq!(old_hook.events.load(Ordering::SeqCst), 0);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
         assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
 
         drop(new_guard);
         observer.record_event(&ObserverEvent::HeartbeatTick);
-        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 2);
         assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
 
         drop(old_guard);
         observer.record_event(&ObserverEvent::HeartbeatTick);
-        assert_eq!(old_hook.events.load(Ordering::SeqCst), 1);
+        assert_eq!(old_hook.events.load(Ordering::SeqCst), 2);
         assert_eq!(new_hook.events.load(Ordering::SeqCst), 1);
 
+        clear_broadcast_hook();
+    }
+
+    #[test]
+    fn tee_flush_reaches_every_live_broadcast_hook() {
+        let _guard = HOOK_TEST_LOCK.blocking_lock();
+        clear_broadcast_hook();
+
+        let hook_a = Arc::new(CountingObserver::default());
+        let guard_a = set_scoped_broadcast_hook(hook_a.clone());
+        let hook_b = Arc::new(CountingObserver::default());
+        let guard_b = set_scoped_broadcast_hook(hook_b.clone());
+
+        let cfg = ObservabilityConfig {
+            backend: ObservabilityBackend::None,
+            ..ObservabilityConfig::default()
+        };
+        let observer = create_observer(&cfg);
+        observer.flush();
+        assert_eq!(hook_a.flushes.load(Ordering::SeqCst), 1);
+        assert_eq!(hook_b.flushes.load(Ordering::SeqCst), 1);
+
+        drop(guard_b);
+        observer.flush();
+        assert_eq!(hook_a.flushes.load(Ordering::SeqCst), 2);
+        assert_eq!(hook_b.flushes.load(Ordering::SeqCst), 1);
+
+        drop(guard_a);
         clear_broadcast_hook();
     }
 

@@ -38,6 +38,33 @@ events, not native platform text-field events. On macOS, system text
 replacements therefore work only when your terminal expands them before
 zerocode receives the input.
 
+## Terminal status
+
+zerocode automatically publishes the most urgent Chat or Code turn state to
+the terminal using two escape-sequence conventions:
+
+- OSC 2 sets a short, human-readable tab title such as `⏳ my-agent — working`
+  or `⚠ my-agent — awaiting approval`.
+- OSC 9;4 reports cleared, indeterminate, or warning progress without requiring
+  another program to parse the title text.
+
+Both sequences derive idle, working, blocked, and finished semantics from the
+content-free lifecycle contract in `zeroclaw-api`; Zerocode keeps localized
+detail such as thinking, responding, or the current tool only for display.
+
+This is terminal metadata, not a connection to a particular workspace manager.
+Compatible terminals and multiplexers may display, retain, or consume it;
+software that does not support these sequences ignores them. The payload
+includes only the selected agent alias and a bounded status or tool name. It
+never includes the prompt, tool arguments, tool output, or response text.
+
+On normal exit and supported termination signals, zerocode clears progress and
+restores the terminal title when the terminal supports a title stack. It writes
+a neutral `zerocode` fallback for terminals without one. Like all terminal
+programs, it cannot clean up after an uncatchable `SIGKILL` or an abrupt machine
+shutdown. A later terminal or shell title update, or closing the tab, clears
+that stale display.
+
 ## CLI flags
 
 | Flag | Description |

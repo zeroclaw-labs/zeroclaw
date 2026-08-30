@@ -1,8 +1,9 @@
-//! Channel infrastructure: session backends, debouncing, and stall watchdog.
-//! These are cross-cutting utilities used by multiple channel implementations.
+//! Shared runtime infrastructure: session backends, lifecycle command delivery,
+//! debouncing, network guards, and stall detection.
 
 pub mod acp_session_store;
 pub mod debounce;
+pub mod lifecycle_command;
 pub mod net_guard;
 pub mod session_backend;
 pub mod session_queue;

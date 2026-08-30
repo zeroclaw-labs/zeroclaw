@@ -489,6 +489,8 @@ pub async fn run(
     if port != 0 {
         config.gateway.port = port;
     }
+    let _lifecycle_command_hook =
+        crate::observability::install_lifecycle_command_hook(&config.hooks);
 
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config

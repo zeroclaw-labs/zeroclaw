@@ -38,6 +38,7 @@ mod jsonrpc;
 mod keymap;
 mod logs;
 mod mouse;
+mod osc_status;
 mod quickstart_pane;
 mod sop_pane;
 mod terminal_backend;
@@ -58,6 +59,38 @@ const DAEMON_STDERR_LIMIT: usize = 8 * 1024;
 /// Set to `true` once the alternate screen is active so signal/panic
 /// handlers know they need to restore the terminal before exiting.
 static TERMINAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Graceful Unix termination sources whose default action would otherwise
+/// leave raw mode, OSC progress, or the window title behind.
+#[cfg(unix)]
+struct TerminationSignals {
+    terminate: tokio::signal::unix::Signal,
+    interrupt: tokio::signal::unix::Signal,
+    hangup: tokio::signal::unix::Signal,
+    quit: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl TerminationSignals {
+    fn new() -> std::io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+            interrupt: signal(SignalKind::interrupt())?,
+            hangup: signal(SignalKind::hangup())?,
+            quit: signal(SignalKind::quit())?,
+        })
+    }
+
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.terminate.recv() => {}
+            _ = self.interrupt.recv() => {}
+            _ = self.hangup.recv() => {}
+            _ = self.quit.recv() => {}
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -197,10 +230,13 @@ fn install_panic_hook() {
     }));
 }
 
-/// Best-effort terminal restoration used by the panic hook and SIGTERM
-/// handler.  Errors are intentionally ignored — we're already crashing.
+/// Best-effort terminal restoration used by panic and termination handlers.
+/// Errors are intentionally ignored — we're already crashing or exiting.
 fn force_restore_terminal() {
     if TERMINAL_ACTIVE.load(Ordering::Relaxed) {
+        // Terminal status outlives the process, so it has to be handed back
+        // here too — otherwise a crash leaves the tab reading as busy.
+        crate::osc_status::release();
         let _ = crossterm::terminal::disable_raw_mode();
         let _ = crossterm::execute!(
             std::io::stdout(),
@@ -347,7 +383,7 @@ async fn run() -> anyhow::Result<()> {
     };
 
     #[cfg(unix)]
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut termination_signals = TerminationSignals::new()?;
 
     // Initial connection (before the terminal is initialized).
     // `owns_ephemeral` records whether THIS process spawned the daemon
@@ -359,7 +395,7 @@ async fn run() -> anyhow::Result<()> {
             #[cfg(unix)]
             let initial_connection = tokio::select! {
                 result = client::RpcClient::connect(socket, None, None) => result,
-                _ = sigterm.recv() => return Ok(()),
+                _ = termination_signals.recv() => return Ok(()),
             };
             #[cfg(not(unix))]
             let initial_connection = client::RpcClient::connect(socket, None, None).await;
@@ -373,7 +409,7 @@ async fn run() -> anyhow::Result<()> {
                     #[cfg(unix)]
                     let readiness = tokio::select! {
                         result = await_spawned_daemon_ready(socket, &mut daemon) => result,
-                        _ = sigterm.recv() => {
+                        _ = termination_signals.recv() => {
                             return cleanup_spawned_daemon_after_signal(&mut daemon);
                         }
                     };
@@ -404,7 +440,7 @@ async fn run() -> anyhow::Result<()> {
             {
                 tokio::select! {
                     result = client::RpcClient::connect_wss(url, None, None, *skip_verify) => result?,
-                    _ = sigterm.recv() => return Ok(()),
+                    _ = termination_signals.recv() => return Ok(()),
                 }
             }
             #[cfg(not(unix))]
@@ -424,7 +460,7 @@ async fn run() -> anyhow::Result<()> {
         &local_config_dir,
         owns_ephemeral,
         #[cfg(unix)]
-        &mut sigterm,
+        &mut termination_signals,
     )
     .await;
 
@@ -433,8 +469,8 @@ async fn run() -> anyhow::Result<()> {
     result
 }
 
-/// Runs the TUI under a SIGTERM handler so the terminal is restored on
-/// signal instead of dying mid-draw. `app::run` owns the full session
+/// Runs the TUI under Unix termination handlers so the terminal is restored
+/// instead of dying mid-draw. `app::run` owns the full session
 /// lifecycle — including in-loop reconnection and recovery — and returns
 /// only when the user quits.
 async fn run_until_exit(
@@ -443,7 +479,7 @@ async fn run_until_exit(
     target: &ConnectTarget,
     config_dir: &std::path::Path,
     owns_ephemeral: bool,
-    #[cfg(unix)] sigterm: &mut tokio::signal::unix::Signal,
+    #[cfg(unix)] termination_signals: &mut TerminationSignals,
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
     // the new agent's alias here so the recovering `app::run` loop drops
@@ -458,7 +494,7 @@ async fn run_until_exit(
     {
         tokio::select! {
             r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral) => r.map(|_| ()),
-            _ = sigterm.recv() => Ok(()),
+            _ = termination_signals.recv() => Ok(()),
         }
     }
     #[cfg(not(unix))]
@@ -758,7 +794,7 @@ fn cleanup_spawned_daemon_after_signal(daemon: &mut SpawnedDaemon) -> anyhow::Re
         .map(|_| ())
         .map_err(|cleanup_error| {
             anyhow::Error::msg(format!(
-                "received SIGTERM while starting daemon; cleanup failed: {cleanup_error:#}"
+                "received termination signal while starting daemon; cleanup failed: {cleanup_error:#}"
             ))
         })
 }
@@ -1033,47 +1069,59 @@ mod connection_tests {
 
     #[cfg(unix)]
     #[test]
-    fn spawned_daemon_parent_only_sigterm_cleans_up_child() {
-        let temp = tempfile::tempdir().expect("create temp dir");
-        let pid_path = temp.path().join("daemon.pid");
-        let mut owner = spawned_daemon_helper_command("signal-owner");
-        owner.env("ZEROCODE_SIGNAL_OWNER_PID_PATH", &pid_path);
-        let mut owner = owner.spawn().expect("spawn signal owner");
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        let daemon_pid = loop {
-            if let Ok(pid) = std::fs::read_to_string(&pid_path) {
-                break pid.trim().parse::<u32>().expect("parse daemon pid");
-            }
-            assert!(
-                owner.try_wait().expect("poll signal owner").is_none(),
-                "signal owner exited before publishing daemon pid"
-            );
-            assert!(
-                std::time::Instant::now() < deadline,
-                "signal owner did not publish daemon pid"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
+    fn spawned_daemon_parent_termination_signals_clean_up_child() {
+        for (signal_name, signal) in [
+            ("SIGTERM", libc::SIGTERM),
+            ("SIGINT", libc::SIGINT),
+            ("SIGHUP", libc::SIGHUP),
+            ("SIGQUIT", libc::SIGQUIT),
+        ] {
+            let temp = tempfile::tempdir().expect("create temp dir");
+            let pid_path = temp.path().join("daemon.pid");
+            let mut owner = spawned_daemon_helper_command("signal-owner");
+            owner.env("ZEROCODE_SIGNAL_OWNER_PID_PATH", &pid_path);
+            let mut owner = owner.spawn().expect("spawn signal owner");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let daemon_pid = loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+                    break pid.trim().parse::<u32>().expect("parse daemon pid");
+                }
+                assert!(
+                    owner.try_wait().expect("poll signal owner").is_none(),
+                    "signal owner exited before publishing daemon pid"
+                );
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "signal owner did not publish daemon pid"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
 
-        // SAFETY: `owner.id()` is the live child PID returned by `spawn`; this
-        // test sends a standard signal and does not pass pointers across FFI.
-        let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, libc::SIGTERM) };
-        assert_eq!(
-            signal_result,
-            0,
-            "send SIGTERM: {}",
-            std::io::Error::last_os_error()
-        );
-        assert!(owner.wait().expect("wait signal owner").success());
+            // SAFETY: `owner.id()` is the live child PID returned by `spawn`;
+            // this test sends a standard signal and does not pass pointers
+            // across FFI.
+            let signal_result = unsafe { libc::kill(owner.id() as libc::pid_t, signal) };
+            assert_eq!(
+                signal_result,
+                0,
+                "send {signal_name}: {}",
+                std::io::Error::last_os_error()
+            );
+            assert!(owner.wait().expect("wait signal owner").success());
 
-        // SAFETY: signal 0 performs a process-existence probe only; `daemon_pid`
-        // was parsed from the child helper's PID file and no pointers are used.
-        let child_probe = unsafe { libc::kill(daemon_pid as libc::pid_t, 0) };
-        assert_eq!(child_probe, -1, "spawned daemon pid {daemon_pid} survived");
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
+            // SAFETY: signal 0 performs a process-existence probe only;
+            // `daemon_pid` was parsed from the child helper's PID file and no
+            // pointers are used.
+            let child_probe = unsafe { libc::kill(daemon_pid as libc::pid_t, 0) };
+            assert_eq!(
+                child_probe, -1,
+                "spawned daemon pid {daemon_pid} survived {signal_name}"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+        }
     }
 
     #[test]
@@ -1138,16 +1186,15 @@ mod connection_tests {
                     .build()
                     .expect("build signal runtime");
                 runtime.block_on(async {
-                    let mut sigterm =
-                        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                            .expect("install SIGTERM handler");
+                    let mut termination_signals =
+                        TerminationSignals::new().expect("install termination handlers");
                     let mut daemon = SpawnedDaemon::spawn(spawned_daemon_helper_command("sleep"))
                         .expect("spawn owned daemon helper");
                     let pid_path = std::env::var_os("ZEROCODE_SIGNAL_OWNER_PID_PATH")
                         .expect("signal owner pid path");
                     std::fs::write(pid_path, daemon.id().to_string())
                         .expect("publish owned daemon pid");
-                    sigterm.recv().await;
+                    termination_signals.recv().await;
                     cleanup_spawned_daemon_after_signal(&mut daemon)
                         .expect("clean up signalled daemon");
                 });

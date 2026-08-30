@@ -4363,6 +4363,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 move || zeroclaw_channels::orchestrator::build_channel_map(&config_clone)
             }));
 
+            let _lifecycle_command_hook =
+                zeroclaw_runtime::observability::install_lifecycle_command_hook(&config.hooks);
             Box::pin(agent::run(
                 config,
                 &agent_alias,
@@ -4413,6 +4415,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             );
                         })
                         .ok();
+                let _lifecycle_command_hook =
+                    zeroclaw_runtime::observability::install_lifecycle_command_hook(&config.hooks);
                 let server = if let Some(store) = store {
                     std::sync::Arc::new(channels::acp_server::AcpServer::new_with_store(
                         config, acp_config, store,
@@ -5562,6 +5566,8 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     sop_audit.as_ref(),
                     config.sop.maintenance_interval_secs,
                 );
+                let _lifecycle_command_hook =
+                    zeroclaw_runtime::observability::install_lifecycle_command_hook(&config.hooks);
                 let result = Box::pin(channels::start_channels(
                     config, None, cancel, sop_engine, sop_audit,
                 ))
@@ -8651,6 +8657,8 @@ async fn run_gateway_if_enabled(
 ) -> anyhow::Result<()> {
     let default_host = config.gateway.host.clone();
     let default_port = config.gateway.port;
+    let _lifecycle_command_hook =
+        zeroclaw_runtime::observability::install_lifecycle_command_hook(&config.hooks);
     // Capture the launch command before the gateway starts so in-app upgrade
     // can self-respawn after the listener is released. Must mirror the same
     // call in the Daemon branch.

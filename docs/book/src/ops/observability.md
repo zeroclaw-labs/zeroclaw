@@ -18,6 +18,46 @@ works without further configuration.
 
 Persistence is best-effort rather than a transactional audit guarantee. The Observer bridge, when bound, and broadcast delivery happen before the event is offered to a bounded background-writer queue. A full queue or worker write failure can leave an event out of JSONL. Periodic sync covers the current active file; daily rotation before a new UTC day's first append and size rotation after a threshold-crossing append can rename the active file without first syncing it, so the cadence does not bound durability for a just-rotated archive. See [Logging architecture](../architecture/logging.md#delivery-surfaces-have-different-guarantees) for the separate delivery contracts.
 
+## Lifecycle command projection
+
+ZeroClaw can project its content-free agent lifecycle to an operator-configured
+external command under `[[hooks.lifecycle_commands]]`. This is separate from
+log persistence, OTel content capture, and gateway SSE. The same process-wide
+observer fan-out lets gateway SSE and lifecycle commands coexist without
+creating a worker for every agent, message, or observer factory.
+
+Each enabled command receives one JSON object on standard input for each
+allowed event. The schema is versioned and closed: it contains event/state,
+sequence and timestamp, opaque session/turn correlation, configured agent
+alias, optional bounded tool name, optional tool success, and optional approval
+outcome. Session and turn source identifiers are domain-separated hashes; raw
+channel history keys and raw turn IDs do not cross the process boundary.
+
+The payload has no prompt, model response, tool arguments or results,
+credentials, memory, or arbitrary metadata map. The command executable and
+arguments are a literal argv array, never shell text. Standard output and error
+are drained concurrently but retained only up to the configured per-stream
+bound; captured content is never logged.
+
+The configured executable is trusted code. It inherits ZeroClaw's OS identity,
+environment, and working directory; this projection is not a subprocess
+sandbox. The content-free JSON contract limits what ZeroClaw writes to standard
+input, but it cannot restrict resources the executable can access directly.
+
+Delivery is best-effort and nonblocking for the turn. Every command has bounded
+queue depth, concurrency, timeout, and output capture. Repeated working edges
+coalesce, while turn/session completion uses reserved queue capacity and is
+drained during orderly shutdown. Queue overflow, spawn failure, timeout, or a
+nonzero exit is observable in logs but cannot fail or cancel the agent turn.
+
+The built-in daemon, agent, ACP, gateway, and channel entry points hold this
+generation guard automatically. An embedding host that invokes the Agent or
+`process_message` APIs directly must hold the guard returned by
+`install_lifecycle_command_hook` for its runtime generation.
+
+See [Config lifecycle](../architecture/config-lifecycle.md#lifecycle-command-projections)
+for the configuration and reload contract.
+
 ### Archive rotation (`log_persistence = "rotating"`)
 
 `rotating` applies no entry-count trim to events accepted by the background writer, like `full`, but ZeroClaw manages the active file: it is rotated to a timestamped archive on a size and/or daily boundary, and old archives are pruned by count and age. This differs from `rolling`, which trims old entries out of the active file; rotated events are preserved in archive files for later diagnostics.
