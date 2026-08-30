@@ -30130,9 +30130,9 @@ This is an example JSON object for profile settings."#;
         // Telegram is registered through `PacedChannel::wrap`, which returns a
         // wrapper whenever `reply_min_interval_secs > 0`. If the wrapper does
         // not forward `listener_health`, dynamic dispatch hits the trait
-        // default `None`, the supervisor maps that to `ok`, and #9811 survives
-        // for anyone with reply pacing configured. This drives the real
-        // production wrapper rather than the bare channel.
+        // default `None`, the supervisor maps that to `ok`, and the false-health
+        // bug survives for anyone with reply pacing configured. This drives the
+        // real production wrapper rather than the bare channel.
         struct Pacing;
         impl zeroclaw_config::schema::HasReplyPacing for Pacing {
             fn reply_min_interval_secs(&self) -> u64 {
