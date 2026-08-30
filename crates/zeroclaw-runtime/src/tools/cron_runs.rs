@@ -27,6 +27,16 @@ struct RunView {
     status: String,
     output: Option<String>,
     duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    delivery: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persistence: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    principal: Option<zeroclaw_api::ingress::InternalPrincipal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executing_agent: Option<String>,
 }
 
 #[async_trait]
@@ -87,6 +97,11 @@ impl Tool for CronRunsTool {
                         status: run.status,
                         output: run.output.map(|out| truncate(&out, MAX_RUN_OUTPUT_CHARS)),
                         duration_ms: run.duration_ms,
+                        execution: run.execution,
+                        delivery: run.delivery,
+                        persistence: run.persistence,
+                        principal: run.principal,
+                        executing_agent: run.executing_agent,
                     })
                     .collect();
 
@@ -168,6 +183,15 @@ mod tests {
             now,
             now + ChronoDuration::milliseconds(1),
             "ok",
+            cron::RunOutcomes {
+                execution: "ok",
+                delivery: "not_required",
+                persistence: "not_bound",
+            },
+            cron::RunProvenance {
+                principal: None,
+                executing_agent: None,
+            },
             Some(&long_output),
             1,
         )

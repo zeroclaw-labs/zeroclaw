@@ -121,31 +121,92 @@ pub struct ManualCronRunResult {
     pub finished_at: DateTime<Utc>,
 }
 
+/// How the configured delivery attempt for a run resolved — the delivery
+/// axis of the separated run-outcome triple.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryDisposition {
+    /// The job configures no delivery; nothing was attempted.
+    NotRequired,
+    /// The announcement was handed to the channel delivery function.
+    Delivered,
+    /// The delivery attempt failed.
+    Failed,
+    /// Delivery was configured but deliberately withheld (NO_REPLY sentinel).
+    Skipped,
+}
+
+impl DeliveryDisposition {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequired => "not_required",
+            Self::Delivered => "delivered",
+            Self::Failed => "failed",
+            Self::Skipped => "skipped",
+        }
+    }
+}
+
 pub struct CronDeliveryOutcome {
     pub success: bool,
     pub status: String,
     pub output: String,
+    /// Execution axis of the run-outcome triple: `ok | error`. The turn's
+    /// own result, independent of what delivery then did.
+    pub execution: &'static str,
+    /// Delivery axis of the run-outcome triple.
+    pub delivery: DeliveryDisposition,
+}
+
+/// The single derivation boundary for the rollup `status`: computed from
+/// the outcome triple's execution and delivery axes plus the job's
+/// best-effort delivery policy, never written independently. Vocabulary is
+/// unchanged: `ok | degraded | error` (`skipped` is written only by the
+/// missed-run path, which records no outcome triple).
+pub(crate) fn rollup_status(
+    execution: &str,
+    delivery: DeliveryDisposition,
+    best_effort: bool,
+) -> &'static str {
+    if execution != "ok" {
+        return "error";
+    }
+    match delivery {
+        DeliveryDisposition::Failed => {
+            if best_effort {
+                "degraded"
+            } else {
+                "error"
+            }
+        }
+        DeliveryDisposition::NotRequired
+        | DeliveryDisposition::Delivered
+        | DeliveryDisposition::Skipped => "ok",
+    }
 }
 
 pub async fn deliver_and_classify_run_result(
     config: &Config,
     job: &CronJob,
-    mut success: bool,
+    success: bool,
     mut output: String,
     context: CronDeliveryContext,
 ) -> CronDeliveryOutcome {
-    let mut status = if success { "ok" } else { "error" }.to_string();
+    // The execution axis is fixed before delivery runs: a later delivery
+    // failure can downgrade the rollup `status`, never the execution fact.
+    let execution = if success { "ok" } else { "error" };
 
-    if let Err(e) = deliver_if_configured(config, job, &output).await {
-        // Cron add-time accepts dangling delivery refs (the job's channel
-        // may not be provisioned yet); the loudly-logged warn here is
-        // the scheduler-side half of that contract. Manual trigger paths
-        // share this classifier so status history cannot drift again.
-        let channel = job.delivery.channel.as_deref().unwrap_or("");
-        let target = job.delivery.to.as_deref().unwrap_or("");
-        let delivery_error = e.to_string();
+    let delivery = match deliver_if_configured(config, job, &output).await {
+        Ok(disposition) => disposition,
+        Err(e) => {
+            // Cron add-time accepts dangling delivery refs (the job's channel
+            // may not be provisioned yet); the loudly-logged warn here is
+            // the scheduler-side half of that contract. Manual trigger paths
+            // share this classifier so status history cannot drift again.
+            let channel = job.delivery.channel.as_deref().unwrap_or("");
+            let target = job.delivery.to.as_deref().unwrap_or("");
+            let delivery_error = e.to_string();
 
-        if job.delivery.best_effort {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -157,41 +218,31 @@ pub async fn deliver_and_classify_run_result(
                         "target": target,
                         "error": delivery_error
                     })),
-                context.failure_message(true)
+                context.failure_message(job.delivery.best_effort)
             );
-            if success {
-                status = "degraded".to_string();
+
+            if output.trim().is_empty() {
+                output = format!("delivery failed: {delivery_error}");
+            } else {
+                output.push_str("\n\ndelivery failed: ");
+                output.push_str(&delivery_error);
             }
-        } else {
-            success = false;
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({
-                        "job_id": job.id,
-                        "agent_alias": job.agent_alias,
-                        "channel": channel,
-                        "target": target,
-                        "error": delivery_error
-                    })),
-                context.failure_message(false)
-            );
-            status = "error".to_string();
+            DeliveryDisposition::Failed
         }
+    };
 
-        if output.trim().is_empty() {
-            output = format!("delivery failed: {delivery_error}");
-        } else {
-            output.push_str("\n\ndelivery failed: ");
-            output.push_str(&delivery_error);
-        }
-    }
+    // Both the rollup and the merged success flag are DERIVED from the
+    // triple plus the delivery policy — nothing writes them independently.
+    let status = rollup_status(execution, delivery, job.delivery.best_effort).to_string();
+    let success =
+        execution == "ok" && (delivery != DeliveryDisposition::Failed || job.delivery.best_effort);
 
     CronDeliveryOutcome {
         success,
         status,
         output,
+        execution,
+        delivery,
     }
 }
 
@@ -224,17 +275,38 @@ async fn run_manual_job_inner(
     approved: bool,
 ) -> ManualCronRunResult {
     let started_at = Utc::now();
+    // Resolve the executing identity exactly as execution will (a migrated
+    // row's empty `agent_alias` falls back to config ownership); the record
+    // must report that identity, or honest absence when none resolves.
+    let executing_agent = resolve_owning_agent(config, job).map(str::to_string);
     let (success, output) = execute_job_now_with_runtime(config, job, runtime, approved).await;
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
     let outcome = deliver_and_classify_run_result(config, job, success, output, context).await;
 
+    let run_principal = zeroclaw_api::ingress::InternalPrincipal::Cron {
+        job_id: job.id.clone(),
+        job_name: job.name.clone(),
+    };
     if let Err(e) = persist_manual_run_result(
         config,
         job,
         started_at,
         finished_at,
         &outcome.status,
+        crate::cron::store::RunOutcomes {
+            execution: outcome.execution,
+            delivery: outcome.delivery.as_str(),
+            // No conversation binding exists yet; every run records the
+            // explicit absence rather than an empty guess.
+            persistence: "not_bound",
+        },
+        // Immutable provenance from the same job snapshot the run was
+        // dispatched with: what a later rename can no longer rewrite.
+        crate::cron::store::RunProvenance {
+            principal: Some(&run_principal),
+            executing_agent: executing_agent.as_deref(),
+        },
         Some(&outcome.output),
         duration_ms,
     ) {
@@ -768,6 +840,7 @@ async fn execute_and_persist_job(
     let success = Box::pin(persist_job_result(
         config,
         job,
+        agent_alias,
         success,
         &output,
         started_at,
@@ -861,6 +934,12 @@ async fn run_agent_job(
         // `agent::run` is the correct choice. The daemon heartbeat
         // worker is the only `mcp_registry` supplier.
         mcp_registry: None,
+        // Initiating principal, resolved from the job's stored config at
+        // dispatch and immutable for the turn's lifetime.
+        internal_principal: Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+            job_id: job.id.clone(),
+            job_name: job.name.clone(),
+        }),
     };
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
@@ -922,6 +1001,7 @@ async fn run_agent_job(
 async fn persist_job_result(
     config: &Config,
     job: &CronJob,
+    executing_agent: &str,
     success: bool,
     output: &str,
     started_at: DateTime<Utc>,
@@ -946,6 +1026,10 @@ async fn persist_job_result(
     };
 
     let job_state_at = Utc::now();
+    let run_principal = zeroclaw_api::ingress::InternalPrincipal::Cron {
+        job_id: job.id.clone(),
+        job_name: job.name.clone(),
+    };
     if let Err(e) = persist_run_result(
         config,
         job,
@@ -953,6 +1037,22 @@ async fn persist_job_result(
         finished_at,
         job_state_at,
         &outcome.status,
+        crate::cron::store::RunOutcomes {
+            execution: outcome.execution,
+            delivery: outcome.delivery.as_str(),
+            // No conversation binding exists yet; every run records the
+            // explicit absence rather than an empty guess.
+            persistence: "not_bound",
+        },
+        // Immutable provenance from the same job snapshot the run was
+        // dispatched with: what a later rename can no longer rewrite.
+        crate::cron::store::RunProvenance {
+            principal: Some(&run_principal),
+            // The RESOLVED alias the run executed under — a migrated row's
+            // empty `agent_alias` falls back to config ownership at
+            // execution, and the record must report that same identity.
+            executing_agent: Some(executing_agent),
+        },
         Some(&outcome.output),
         duration_ms,
         action,
@@ -1046,10 +1146,14 @@ fn warn_if_high_frequency_agent_job(job: &CronJob) {
     }
 }
 
-async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> Result<()> {
+async fn deliver_if_configured(
+    config: &Config,
+    job: &CronJob,
+    output: &str,
+) -> Result<DeliveryDisposition> {
     let delivery: &DeliveryConfig = &job.delivery;
     if !delivery.mode.eq_ignore_ascii_case("announce") {
-        return Ok(());
+        return Ok(DeliveryDisposition::NotRequired);
     }
 
     if !announce_delivery_decision(output).should_deliver() {
@@ -1060,7 +1164,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
                 .with_attrs(::serde_json::json!({"job_id": job.id})),
             "Cron job returned NO_REPLY sentinel — skipping delivery"
         );
-        return Ok(());
+        return Ok(DeliveryDisposition::Skipped);
     }
 
     let channel = delivery.channel.as_deref().ok_or_else(|| {
@@ -1092,6 +1196,7 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, output: &str) -> 
         output,
     )
     .await
+    .map(|()| DeliveryDisposition::Delivered)
 }
 
 /// Delivery function type — takes owned values so the returned future is 'static.
@@ -2409,7 +2514,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -2427,7 +2541,16 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
 
         assert!(success);
         assert_eq!(
@@ -2449,7 +2572,16 @@ mod tests {
             let finished = started + ChronoDuration::milliseconds(10);
             let output = format!("run-{idx}");
 
-            let success = persist_job_result(&config, &job, true, &output, started, finished).await;
+            let success = persist_job_result(
+                &config,
+                &job,
+                &job.agent_alias,
+                true,
+                &output,
+                started,
+                finished,
+            )
+            .await;
             assert!(success);
         }
 
@@ -2485,7 +2617,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
 
         assert!(success);
         assert!(cron::list_runs(&config, &job.id, 10).unwrap().is_empty());
@@ -2519,10 +2660,69 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
+
+        // The one-shot's durable record survives the job deletion: status,
+        // outcome triple, and provenance stay queryable after the job row
+        // is gone.
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "ok");
+        assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+        assert_eq!(runs[0].delivery.as_deref(), Some("not_required"));
+        assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
+        assert_eq!(
+            runs[0].principal,
+            Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+                job_id: job.id.clone(),
+                job_name: Some("one-shot".to_string()),
+            })
+        );
+        assert_eq!(
+            runs[0].executing_agent.as_deref(),
+            Some(job.agent_alias.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_job_result_stamps_resolved_executor_for_migrated_alias() {
+        // A migrated row carries an empty `agent_alias`; execution resolves
+        // the owner through config membership, and the run record must
+        // report that resolved identity, never the empty column value.
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let mut job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo ok").unwrap();
+        job.agent_alias = String::new();
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(
+            &config,
+            &job,
+            "resolved-owner",
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
+        assert!(success);
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].executing_agent.as_deref(), Some("resolved-owner"));
     }
 
     #[tokio::test]
@@ -2547,7 +2747,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            false,
+            "boom",
+            started,
+            finished,
+        )
+        .await;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -2577,7 +2786,16 @@ mod tests {
         let finished = started + ChronoDuration::milliseconds(10);
 
         crate::cron::store::reset_write_connection_count_for_tests(&config);
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            false,
+            "boom",
+            started,
+            finished,
+        )
+        .await;
 
         assert!(!success);
         assert_eq!(
@@ -2623,7 +2841,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let runs = cron::list_runs(&config, &job.id, 10).unwrap();
@@ -2660,7 +2887,16 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2681,7 +2917,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
         let lookup = cron::get_job(&config, &job.id);
         assert!(lookup.is_err());
@@ -2698,7 +2943,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            false,
+            "boom",
+            started,
+            finished,
+        )
+        .await;
         assert!(!success);
         let updated = cron::get_job(&config, &job.id).unwrap();
         assert!(!updated.enabled);
@@ -2737,7 +2991,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2765,7 +3028,16 @@ mod tests {
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         let updated = cron::get_job(&config, &job.id).unwrap();
@@ -2835,7 +3107,16 @@ mod tests {
 
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
-        let success = persist_job_result(&config, &job, true, "ok", started, finished).await;
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
         assert!(success);
 
         // After reschedule_after_run, At schedule jobs should be disabled
@@ -2855,7 +3136,173 @@ mod tests {
         let job = test_job("echo ok");
 
         // Default delivery mode is not "announce", so should be a no-op.
-        assert!(deliver_if_configured(&config, &job, "x").await.is_ok());
+        assert_eq!(
+            deliver_if_configured(&config, &job, "x").await.unwrap(),
+            DeliveryDisposition::NotRequired
+        );
+    }
+
+    #[tokio::test]
+    async fn outcome_triple_separates_execution_from_delivery() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        register_recording_delivery_fn();
+
+        // Execution failure with no delivery configured.
+        let job = test_job("echo ok");
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            false,
+            "boom".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert_eq!(outcome.execution, "error");
+        assert_eq!(outcome.delivery, DeliveryDisposition::NotRequired);
+        assert_eq!(outcome.status, "error");
+
+        // Success with no delivery configured.
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "fine".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::NotRequired);
+        assert_eq!(outcome.status, "ok");
+
+        // Best-effort delivery failure downgrades the rollup, never the
+        // execution axis.
+        let mut job = test_job("echo ok");
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("fail-delivery".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "fine".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(outcome.success);
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::Failed);
+        assert_eq!(outcome.status, "degraded");
+
+        // Required delivery failure downgrades the rollup to error and
+        // flips success, but the execution axis still records the turn's
+        // own completion.
+        job.delivery.best_effort = false;
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "fine".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(!outcome.success);
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::Failed);
+        assert_eq!(outcome.status, "error");
+
+        // A NO_REPLY sentinel withholds a configured delivery: skipped, not
+        // failed and not delivered.
+        job.delivery.best_effort = true;
+        let outcome = deliver_and_classify_run_result(
+            &config,
+            &job,
+            true,
+            "NO_REPLY".to_string(),
+            CronDeliveryContext::Scheduled,
+        )
+        .await;
+        assert!(outcome.success);
+        assert_eq!(outcome.execution, "ok");
+        assert_eq!(outcome.delivery, DeliveryDisposition::Skipped);
+        assert_eq!(outcome.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn persisted_runs_carry_the_outcome_triple() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        register_recording_delivery_fn();
+        let mut job = cron::add_job(&config, "test-agent", "*/5 * * * *", "echo ok").unwrap();
+        job.delivery = DeliveryConfig {
+            mode: "announce".into(),
+            channel: Some("fail-delivery".into()),
+            to: Some("123456".into()),
+            thread_id: None,
+            best_effort: true,
+        };
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        let success = persist_job_result(
+            &config,
+            &job,
+            &job.agent_alias,
+            true,
+            "ok",
+            started,
+            finished,
+        )
+        .await;
+        assert!(success);
+
+        let runs = cron::list_runs(&config, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "degraded");
+        assert_eq!(runs[0].execution.as_deref(), Some("ok"));
+        assert_eq!(runs[0].delivery.as_deref(), Some("failed"));
+        assert_eq!(runs[0].persistence.as_deref(), Some("not_bound"));
+        assert_eq!(
+            runs[0].principal,
+            Some(zeroclaw_api::ingress::InternalPrincipal::Cron {
+                job_id: job.id.clone(),
+                job_name: job.name.clone(),
+            })
+        );
+        assert_eq!(
+            runs[0].executing_agent.as_deref(),
+            Some(job.agent_alias.as_str())
+        );
+    }
+
+    #[test]
+    fn rollup_status_is_the_single_derivation_of_the_triple() {
+        // The full matrix: status is a pure function of execution, delivery,
+        // and the best-effort policy — matching the classifier's behavior
+        // exactly (verified end-to-end by the outcome-triple test above).
+        use DeliveryDisposition as D;
+        for (execution, delivery, best_effort, expected) in [
+            ("ok", D::NotRequired, false, "ok"),
+            ("ok", D::NotRequired, true, "ok"),
+            ("ok", D::Delivered, false, "ok"),
+            ("ok", D::Skipped, true, "ok"),
+            ("ok", D::Failed, true, "degraded"),
+            ("ok", D::Failed, false, "error"),
+            ("error", D::NotRequired, false, "error"),
+            ("error", D::Failed, true, "error"),
+            ("error", D::Failed, false, "error"),
+            ("error", D::Delivered, true, "error"),
+        ] {
+            assert_eq!(
+                rollup_status(execution, delivery, best_effort),
+                expected,
+                "({execution}, {delivery:?}, best_effort={best_effort})"
+            );
+        }
     }
 
     static DELIVERED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);

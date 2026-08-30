@@ -2582,6 +2582,7 @@ pub(crate) async fn run_gateway_chat_with_tools(
                     message,
                     session_id,
                     zeroclaw_api::ingress::TurnOrigin::Interactive,
+                    None,
                 ),
             ),
         ))
