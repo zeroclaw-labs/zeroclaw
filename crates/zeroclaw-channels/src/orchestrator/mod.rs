@@ -5164,6 +5164,14 @@ impl Channel for ApprovalTypingChannel {
         self.inner.listen(tx).await
     }
 
+    /// Forward the inner channel's passive observation; see the note on
+    /// `PacedChannel::listener_health`. Pausing typing around approvals says
+    /// nothing about listener health, and the trait default would hide the
+    /// inner channel's signal from the supervisor.
+    fn listener_health(&self) -> Option<ListenerHealth> {
+        self.inner.listener_health()
+    }
+
     async fn request_approval(
         &self,
         recipient: &str,
@@ -30109,6 +30117,77 @@ This is an example JSON object for profile settings."#;
         assert!(
             component["last_ok"].is_null(),
             "nothing has succeeded, so last_ok must be unset; got {component}"
+        );
+
+        cancel.cancel();
+        let join = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        assert!(join.is_ok(), "listener should stop on cancel");
+        drop(rx);
+    }
+
+    #[tokio::test]
+    async fn paced_wrapper_preserves_listener_health_through_to_the_registry() {
+        // Telegram is registered through `PacedChannel::wrap`, which returns a
+        // wrapper whenever `reply_min_interval_secs > 0`. If the wrapper does
+        // not forward `listener_health`, dynamic dispatch hits the trait
+        // default `None`, the supervisor maps that to `ok`, and #9811 survives
+        // for anyone with reply pacing configured. This drives the real
+        // production wrapper rather than the bare channel.
+        struct Pacing;
+        impl zeroclaw_config::schema::HasReplyPacing for Pacing {
+            fn reply_min_interval_secs(&self) -> u64 {
+                1
+            }
+            fn reply_queue_depth_max(&self) -> u16 {
+                8
+            }
+        }
+
+        let channel_name = format!("test-paced-health-{}", uuid::Uuid::new_v4());
+        let component_name = format!("channel:{channel_name}");
+        let inner = Arc::new(ObservedChannel::reporting(
+            channel_name,
+            Some(ListenerHealth::Pending),
+        ));
+        let reporter = Arc::clone(&inner);
+        let bare: Arc<dyn Channel> = inner;
+        let paced = crate::paced_channel::PacedChannel::wrap(bare, &Pacing);
+        assert!(
+            !Arc::ptr_eq(&paced, &(Arc::clone(&reporter) as Arc<dyn Channel>)),
+            "non-zero pacing must actually produce the wrapper"
+        );
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let handle = spawn_supervised_listener_with_health_interval(
+            paced,
+            None,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            cancel.clone(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let pending = zeroclaw_runtime::health::snapshot_json();
+        let pending = &pending["components"][&component_name];
+        assert_ne!(
+            pending["status"], "ok",
+            "Pending must survive the wrapper; got {pending}"
+        );
+        assert!(
+            pending["last_ok"].is_null(),
+            "nothing has succeeded, so last_ok must be unset; got {pending}"
+        );
+
+        reporter.set_report(Some(ListenerHealth::Unhealthy));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let unhealthy = zeroclaw_runtime::health::snapshot_json();
+        let unhealthy = &unhealthy["components"][&component_name];
+        assert_eq!(
+            unhealthy["status"], "error",
+            "Unhealthy must survive the wrapper; got {unhealthy}"
         );
 
         cancel.cancel();
