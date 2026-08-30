@@ -1,0 +1,46 @@
+[package]
+name = "zerorelay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ZeroClaw nominated relay: a standalone blind forwarder that tunnels the inner client<->daemon mTLS without decrypting it."
+publish = false
+
+[[bin]]
+name = "zerorelay"
+path = "src/main.rs"
+
+[lib]
+name = "zerorelay"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.50", default-features = false, features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
+serde_json = "1.0"
+# A reloadable relay.toml ([bind]/[tls]/[admission]/[limits]); CLI flags override.
+serde = { version = "1.0", features = ["derive"] }
+toml = "1.0"
+zeroclaw-relay-proto = { workspace = true }
+# Outer transport: the relay terminates an OUTER TLS + WebSocket session with each
+# party and pipes the inner (still-encrypted) mTLS bytes inside DATA frames.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+# Ed25519 admission handshake + nonce RNG + pubkey fingerprinting. ring is already
+# in the tree as rustls' crypto provider, so this adds no new transitive root.
+ring = "0.17"
+base64 = "0.22"
+sha2 = "0.10"
+hex = "0.4"
+# Self-provision the relay's own outer TLS cert (CA + server leaf, SANs, perms) on
+# first run when no --tls-cert is given - the same machinery the daemon uses, so
+# no openssl is ever needed.
+zeroclaw-tls = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3.26"

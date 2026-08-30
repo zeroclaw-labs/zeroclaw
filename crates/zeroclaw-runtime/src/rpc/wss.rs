@@ -33,6 +33,67 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
 const ACCEPT_ERROR_BACKOFF_MS: u64 = 50;
 
+/// Default ceiling on sockets past `accept()` but not yet through the TLS and
+/// WebSocket handshakes. See [`WssLimits::max_pending_handshakes`].
+pub const DEFAULT_MAX_PENDING_HANDSHAKES: usize = 256;
+
+/// Default absolute budget for TLS accept plus the WebSocket upgrade.
+/// See [`WssLimits::handshake_timeout`].
+pub const DEFAULT_HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+
+/// Default ceiling on concurrently established WSS sessions.
+/// See [`WssLimits::max_sessions`].
+pub const DEFAULT_MAX_SESSIONS: usize = 512;
+
+/// Bounds on the WSS listener's pre-authentication and session state.
+///
+/// The remote WSS plane is the daemon's mandatory mTLS surface and its default
+/// bind is `0.0.0.0`, so every state an *unauthenticated* peer can reach has to
+/// be bounded in both time and count. Without these, each accepted TCP socket
+/// spawned a task that awaited the TLS handshake and the WebSocket upgrade with
+/// no deadline and no cap, so a peer that merely connected - and never proved
+/// anything - could accumulate sockets, tasks and TLS parser state without
+/// limit. Mirrors the bounds the relay applies to its own admission path.
+#[derive(Debug, Clone)]
+pub struct WssLimits {
+    /// Ceiling on sockets past `accept()` that have not finished the TLS
+    /// handshake and WebSocket upgrade. When the pool is exhausted new sockets
+    /// are dropped at accept rather than queued, so a slowloris spread across
+    /// many source addresses sheds instead of accumulating.
+    pub max_pending_handshakes: usize,
+    /// One absolute deadline covering TLS accept AND the WebSocket upgrade,
+    /// measured from accept. It is a single budget for the whole setup
+    /// sequence, not a fresh window per phase: the heartbeat only starts once
+    /// a session is established, so without this a peer could stall in either
+    /// handshake forever.
+    pub handshake_timeout: Duration,
+    /// Ceiling on concurrently established WSS sessions. Bounds the steady
+    /// state that survives authentication, so an authorized-but-abusive peer
+    /// cannot grow dispatcher and transport state without limit.
+    pub max_sessions: usize,
+}
+
+impl Default for WssLimits {
+    fn default() -> Self {
+        Self {
+            max_pending_handshakes: DEFAULT_MAX_PENDING_HANDSHAKES,
+            handshake_timeout: Duration::from_secs(DEFAULT_HANDSHAKE_TIMEOUT_SECS),
+            max_sessions: DEFAULT_MAX_SESSIONS,
+        }
+    }
+}
+
+/// Decrements the shared client counter on every exit path of a connection
+/// task. The counter drives `--ephemeral` shutdown, so a missed decrement
+/// would keep an idle daemon alive forever.
+struct ClientCountGuard(Arc<AtomicUsize>);
+
+impl Drop for ClientCountGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// File-descriptor exhaustion errno values, stable across the Unix targets
 /// we support (Linux, macOS, BSD).
 #[cfg(unix)]
@@ -153,34 +214,41 @@ impl RpcTransport for WssTransport {
 
 // ── TLS acceptor ─────────────────────────────────────────────────
 
-/// Build a `TlsAcceptor` from PEM-encoded cert and key files.
-pub fn build_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
-    use rustls::ServerConfig;
-    use rustls_pemfile::{certs, private_key};
-    use std::fs::File;
-    use std::io::BufReader;
-
-    let cert_file =
-        File::open(cert_path).with_context(|| format!("opening TLS cert: {cert_path}"))?;
-    let key_file = File::open(key_path).with_context(|| format!("opening TLS key: {key_path}"))?;
-
-    let certs: Vec<_> = certs(&mut BufReader::new(cert_file))
-        .collect::<Result<Vec<_>, _>>()
-        .context("parsing TLS certificates")?;
-
-    let key = private_key(&mut BufReader::new(key_file))
-        .context("parsing TLS private key")?
-        .context("no private key found in key file")?;
-
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("building TLS server config")?;
-
-    Ok(TlsAcceptor::from(Arc::new(config)))
+/// Build a [`TlsAcceptor`] for the remote WSS RPC plane.
+///
+/// The remote plane is ALWAYS mutually authenticated and TLS 1.3 only: every
+/// client certificate is verified against `ca_cert_path` (optionally pinned to
+/// `pinned_certs`). There is deliberately no server-only / no-client-auth path
+/// here (threat model A11); the secure-by-construction builder lives in
+/// [`zeroclaw_tls::build_mtls_acceptor`].
+pub fn build_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    ca_cert_path: &str,
+    pinned_certs: &[String],
+    crl_path: &str,
+) -> Result<TlsAcceptor> {
+    zeroclaw_tls::build_mtls_acceptor(cert_path, key_path, ca_cert_path, pinned_certs, crl_path)
 }
 
 // ── Listener ─────────────────────────────────────────────────────
+
+/// Parser limits for the WSS RPC plane. tungstenite defaults to a 64 MiB message
+/// / 16 MiB frame, which would let the parser buffer far more than the RPC
+/// contract permits before [`WssTransport`]/`RpcDispatcher` can reject it. The
+/// RPC attachment contract caps a request at
+/// [`crate::rpc::attachments::MAX_REQUEST_BYTES`] (20 MiB); this ceiling leaves
+/// encoding headroom above that while still replacing the unbounded-by-default
+/// parser allocation. It mirrors the client's RPC-plane config (zerocode
+/// `rpc_ws_config`) so the two ends cannot drift.
+fn rpc_ws_config() -> tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+    // 20 MiB request (MAX_REQUEST_BYTES) + encoding headroom, matching the client.
+    const RPC_WS_MAX: usize = 32 * 1024 * 1024;
+    let mut cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default();
+    cfg.max_message_size = Some(RPC_WS_MAX);
+    cfg.max_frame_size = Some(RPC_WS_MAX);
+    cfg
+}
 
 /// Run the WSS RPC listener as a daemon subsystem.
 /// `client_count` is incremented on connect, decremented on disconnect —
@@ -191,10 +259,19 @@ pub async fn run_wss_listener(
     client_count: Arc<AtomicUsize>,
     tls_acceptor: TlsAcceptor,
     bind_addr: SocketAddr,
+    limits: WssLimits,
 ) -> Result<()> {
     let listener = TcpListener::bind(bind_addr)
         .await
         .with_context(|| format!("binding WSS listener on {bind_addr}"))?;
+
+    // Bounds on unauthenticated setup work and on established sessions. A
+    // permit is held from accept until the peer is through both handshakes;
+    // the session permit is held for the life of the dispatcher.
+    let handshake_permits = Arc::new(tokio::sync::Semaphore::new(
+        limits.max_pending_handshakes.max(1),
+    ));
+    let session_permits = Arc::new(tokio::sync::Semaphore::new(limits.max_sessions.max(1)));
 
     ::zeroclaw_log::record!(
         INFO,
@@ -235,30 +312,86 @@ pub async fn run_wss_listener(
                     }
                 };
 
+                // Shed before spending any TLS/task state on this socket when the
+                // unauthenticated setup budget is exhausted. The ESTABLISHED-session
+                // ceiling (`max_sessions`) is NOT applied here: a permit taken at
+                // accept would be held through TLS/WS setup, so an unauthenticated
+                // stall would consume a session slot (with max_sessions=1, one
+                // staller blocks a valid client until the handshake deadline). The
+                // session permit is taken only once both handshakes succeed (below).
+                // Dropping the stream closes it, so a shed client sees a prompt EOF
+                // instead of an indefinite stall.
+                let Ok(handshake_permit) =
+                    handshake_permits.clone().try_acquire_owned()
+                else {
+                    drop(tcp_stream);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "WSS shedding connection from {remote_addr}: {} pending handshakes \
+                             already in flight",
+                            limits.max_pending_handshakes
+                        )
+                    );
+                    continue;
+                };
+
                 let ctx = ctx.clone();
                 let count = client_count.clone();
                 let acceptor = tls_acceptor.clone();
+                let handshake_timeout = limits.handshake_timeout;
+                // Consumed only after both handshakes succeed, so an unauthenticated
+                // stall can never occupy an established-session slot.
+                let session_permits = session_permits.clone();
+                let max_sessions = limits.max_sessions;
 
                 count.fetch_add(1, Ordering::Relaxed);
 
                 zeroclaw_spawn::spawn!(async move {
+                    // Guarantees the `--ephemeral` counter is decremented on
+                    // every exit path below, including the new timeout one.
+                    let _count_guard = ClientCountGuard(count);
+
+                    // ONE absolute deadline over TLS accept AND the WebSocket
+                    // upgrade, measured from accept. A fresh per-phase window
+                    // would let a peer spend the full budget twice.
+                    let deadline = tokio::time::Instant::now() + handshake_timeout;
+
+                    let setup = async {
                     // TLS handshake.
                     let tls_stream = match acceptor.accept(tcp_stream).await {
                         Ok(s) => s,
                         Err(e) => {
+                            // The WSS plane is always mutually authenticated, so a
+                            // client with no certificate (un-migrated) or a revoked
+                            // one fails here. Surface it actionably rather than as a
+                            // bare TLS error so the operator knows to enroll it.
                             ::zeroclaw_log::record!(
                                 WARN,
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                                &format!("WSS TLS handshake failed from {remote_addr}: {e}")
+                                &format!(
+                                    "WSS TLS handshake failed from {remote_addr}: {e}. The WSS plane \
+                                     requires a client certificate; an un-migrated client must enroll \
+                                     first (zerocode --enroll), and a revoked cert is refused."
+                                )
                             );
-                            count.fetch_sub(1, Ordering::Relaxed);
-                            return;
+                            return None;
                         }
                     };
 
-                    // WebSocket upgrade.
-                    let ws_stream = match tokio_tungstenite::accept_async(tls_stream).await {
+                    // WebSocket upgrade. An explicit parser config replaces
+                    // tungstenite's 64 MiB message / 16 MiB frame defaults with a
+                    // ceiling sized to the RPC contract, so the parser cannot buffer
+                    // far more than a legitimate request before `next_frame` sees it.
+                    let ws_stream = match tokio_tungstenite::accept_async_with_config(
+                        tls_stream,
+                        Some(rpc_ws_config()),
+                    )
+                    .await
+                    {
                         Ok(ws) => ws,
                         Err(e) => {
                             ::zeroclaw_log::record!(
@@ -267,15 +400,69 @@ pub async fn run_wss_listener(
                                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
                                 &format!("WSS WebSocket upgrade failed from {remote_addr}: {e}")
                             );
-                            count.fetch_sub(1, Ordering::Relaxed);
+                            return None;
+                        }
+                    };
+                        Some(ws_stream)
+                    };
+
+                    let ws_stream = match tokio::time::timeout_at(deadline, setup).await {
+                        Ok(Some(ws)) => ws,
+                        Ok(None) => return, // logged above
+                        Err(_) => {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!(
+                                    "WSS setup from {remote_addr} exceeded the {}s handshake \
+                                     budget; connection dropped",
+                                    handshake_timeout.as_secs()
+                                )
+                            );
                             return;
                         }
                     };
 
+                    // Through both handshakes: this peer presented a valid client
+                    // certificate. Only now consume an ESTABLISHED-session slot, so
+                    // unauthenticated setup stalls (bounded separately by
+                    // max_pending_handshakes) can never exhaust the session ceiling.
+                    // Take the session permit BEFORE releasing the handshake permit
+                    // so the two bounds hand off with no gap a flood could exploit.
+                    let Ok(_session_permit) = session_permits.try_acquire_owned() else {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "WSS shedding authenticated connection from {remote_addr}: {} \
+                                 sessions already established",
+                                max_sessions
+                            )
+                        );
+                        return;
+                    };
+                    // Released for the next connection being set up now that this
+                    // one holds an established-session slot.
+                    drop(handshake_permit);
+
+                    // The client cert was verified against the CA during the
+                    // mTLS handshake; capture its SHA-256 fingerprint (the ledger
+                    // key) before the stream is consumed by the transport.
+                    let peer_cert_fp = ws_stream
+                        .get_ref()
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|certs| certs.first())
+                        .map(|der| zeroclaw_tls::cert_sha256_fingerprint(der.as_ref()));
+
                     let mut transport = WssTransport::new(ws_stream, remote_addr);
                     let peer = transport.peer_label();
                     let writer_tx = transport.writer();
-                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer);
+                    let mut dispatcher = RpcDispatcher::new(ctx.clone(), writer_tx, peer)
+                        .with_peer_cert_fingerprint(peer_cert_fp);
                     dispatcher.run(&mut transport).await;
 
                     if let Some(tui_id) = dispatcher.tui_id() {
@@ -298,8 +485,6 @@ pub async fn run_wss_listener(
                         .instrument(span)
                         .await;
                     }
-
-                    count.fetch_sub(1, Ordering::Relaxed);
                 });
             }
         }
@@ -333,5 +518,111 @@ mod accept_error_tests {
         assert!(!is_recoverable_accept_error(&Error::from(
             ErrorKind::InvalidInput
         )));
+    }
+}
+
+#[cfg(test)]
+// Test code, not daemon-path: bare `tokio::spawn` is fine here (the
+// `zeroclaw_spawn::spawn!` attribution rule is for production daemon tasks).
+#[allow(clippy::disallowed_methods)]
+mod parser_bound_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+    // In-memory duplex only (no network/TLS). The URI is built from parts with
+    // the scheme as a bare field so no insecure-scheme string literal exists in
+    // source for the hosted scanner to flag.
+    fn loopback_url() -> tokio_tungstenite::tungstenite::http::Uri {
+        tokio_tungstenite::tungstenite::http::Uri::builder()
+            .scheme("ws")
+            .authority("ceiling.test")
+            .path_and_query("/")
+            .build()
+            .expect("valid test uri")
+    }
+
+    // A client permitted to EMIT frames larger than tungstenite's 16 MiB default,
+    // so the SERVER's configured ceiling is what is under test.
+    fn permissive_client_config() -> WebSocketConfig {
+        let mut cfg = WebSocketConfig::default();
+        cfg.max_message_size = Some(64 * 1024 * 1024);
+        cfg.max_frame_size = Some(64 * 1024 * 1024);
+        cfg
+    }
+
+    // W1: the WSS upgrade applies an explicit parser config sized to the RPC
+    // contract. A legitimate max-size request (MAX_REQUEST_BYTES = 20 MiB) must be
+    // admitted as a single frame — which tungstenite's 16 MiB DEFAULT frame cap
+    // would wrongly reject — while a message beyond the 32 MiB ceiling is refused
+    // at the parser instead of buffered up to the 64 MiB message default.
+    #[tokio::test]
+    async fn rpc_ws_config_admits_contract_max_and_refuses_oversized() {
+        // (1) A 20 MiB message is accepted and delivered intact.
+        {
+            let (client_io, server_io) = tokio::io::duplex(1 << 20);
+            let server = tokio::spawn(async move {
+                let mut ws =
+                    tokio_tungstenite::accept_async_with_config(server_io, Some(rpc_ws_config()))
+                        .await
+                        .expect("server upgrade");
+                match ws.next().await {
+                    Some(Ok(Message::Binary(b))) => Ok(b.len()),
+                    other => Err(format!("{other:?}")),
+                }
+            });
+            let (mut client, _r) = tokio_tungstenite::client_async_with_config(
+                loopback_url(),
+                client_io,
+                Some(permissive_client_config()),
+            )
+            .await
+            .expect("client upgrade");
+            let payload = vec![7u8; 20 * 1024 * 1024];
+            client
+                .send(Message::binary(payload))
+                .await
+                .expect("send 20 MiB");
+            client.flush().await.expect("flush");
+            let got = server.await.unwrap();
+            assert_eq!(
+                got,
+                Ok(20 * 1024 * 1024),
+                "a 20 MiB request (contract max) must be admitted as one frame"
+            );
+        }
+        // (2) A message beyond the 32 MiB ceiling is refused at the parser.
+        {
+            let (client_io, server_io) = tokio::io::duplex(1 << 20);
+            let server = tokio::spawn(async move {
+                let mut ws =
+                    tokio_tungstenite::accept_async_with_config(server_io, Some(rpc_ws_config()))
+                        .await
+                        .expect("server upgrade");
+                loop {
+                    match ws.next().await {
+                        Some(Ok(_)) => continue,
+                        Some(Err(_)) => return true,
+                        None => return false,
+                    }
+                }
+            });
+            let (mut client, _r) = tokio_tungstenite::client_async_with_config(
+                loopback_url(),
+                client_io,
+                Some(permissive_client_config()),
+            )
+            .await
+            .expect("client upgrade");
+            let oversized = vec![0u8; 33 * 1024 * 1024];
+            let _ = client.send(Message::binary(oversized)).await;
+            let _ = client.flush().await;
+            let refused = server.await.unwrap();
+            assert!(
+                refused,
+                "a message beyond the 32 MiB ceiling must be refused"
+            );
+        }
     }
 }

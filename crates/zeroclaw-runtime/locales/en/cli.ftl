@@ -1091,6 +1091,31 @@ cli-daemon-started-socket = Socket:   {$path}
 cli-daemon-started-pairing = Pairing:    enabled (see gateway output above for current status)
 cli-daemon-started-stop = Ctrl+C or SIGTERM to stop
 
+# ── daemon mTLS and enrollment operator output ──
+cli-relay-rotation-requested = Requested a relay node-id rotation. A running daemon will rotate within ~{$secs}s; the new id reaches clients in-band on their next certificate renewal.
+cli-mtls-issued-client-cert = Issued client certificate for '{$name}':
+cli-mtls-issued-cert-path = {"  "}cert: {$path}
+cli-mtls-issued-key-path = {"  "}key:  {$path}
+cli-mtls-issued-ca-path = {"  "}CA:   {$path}
+cli-mtls-dropin-line-1 = Drop-in: this directory is a ready client TLS dir (ca.crt / client.crt /
+cli-mtls-dropin-line-2 = {"  "}client.key). Copy it to the client as <config-dir>/tls and zerocode finds
+cli-mtls-dropin-line-3 = {"  "}the material automatically - no --tls-* flags needed.
+cli-mtls-relay-connect-header = Reach this daemon THROUGH its configured relay:
+cli-mtls-relay-ca-note-1 = {"  "}(--relay-ca is the RELAY's CA - copy it from the relay to the client;
+cli-mtls-relay-ca-note-2 = {"   "}--tls-ca-cert is the DAEMON's CA, already in the bundle.)
+cli-mtls-direct-connect-header = Connect with zerocode (direct):
+cli-mtls-revoked-certificate = Revoked certificate {$fingerprint}.
+cli-mtls-revoke-no-active-fingerprint = No active certificate with fingerprint {$fingerprint} (already revoked or never issued).
+cli-mtls-revoked-device-certs = Revoked {$count} active certificate(s) for device '{$device}'.
+cli-mtls-revoked-list-updated = Updated {$path}; the daemon refuses the revoked certificate(s) at the next connection.
+cli-mtls-list-no-active-certs = No active client certificates issued by this daemon's CA.
+cli-mtls-list-active-header = Active client certificates ({$count}):
+cli-enroll-endpoint-ready = Enrollment endpoint ready on {$bind}:{$port}. To enroll a client, give it
+cli-enroll-confirm-sas-line-1 = this one-time pairing code and confirm the short-auth-string (SAS)
+cli-enroll-confirm-sas-line-2 = matches on both ends before trusting the daemon:
+cli-enroll-pairing-code = {"    "}pairing code : {$code}
+cli-enroll-sas = {"    "}SAS          : {$sas}
+
 # ── Context window (doctor update-context-windows, agent interactive) ──
 cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: model provider returned an invalid semantic completion.
 cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
