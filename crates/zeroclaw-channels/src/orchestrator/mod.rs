@@ -9176,9 +9176,23 @@ fn build_channel_by_id(
                 };
                 let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
                 let workspace_dir = one_shot_channel_workspace_dir(&config, "matrix", &alias);
+                let transcription_config_arc = Arc::clone(config_arc);
+                let transcription_channel_key = format!("matrix.{alias}");
                 Ok(Arc::new(
                     MatrixChannel::new(mx.clone(), alias, peer_resolver, state_dir)?
-                        .with_transcription(config.transcription.clone())
+                        .with_transcription_manager_factory(move || {
+                            let config = transcription_config_arc.read();
+                            if !config.transcription.enabled {
+                                return None;
+                            }
+                            let provider = resolve_agent_transcription_provider(
+                                &config,
+                                &transcription_channel_key,
+                            );
+                            Some(crate::matrix::build_transcription_manager(
+                                &config, &provider,
+                            ))
+                        })
                         .with_workspace_dir(workspace_dir)
                         .with_ack_reactions(ack),
                 ))
@@ -10102,7 +10116,11 @@ pub fn register_channels_for_tools(
 /// Gated to match its callers: with both transcribing channels compiled out
 /// this has no call sites, and an ungated definition trips the dead-code lint
 /// under a no-default-features build.
-#[cfg(any(feature = "channel-telegram", feature = "voice-wake"))]
+#[cfg(any(
+    feature = "channel-telegram",
+    feature = "voice-wake",
+    feature = "channel-matrix"
+))]
 fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> String {
     let enabled_agents = enabled_agent_aliases(config);
     build_owner_by_channel_key(config, &enabled_agents, &[channel_key.to_string()])
@@ -10482,10 +10500,24 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_external_peers("matrix", &alias))
         };
         let ack = mx.ack_reactions.unwrap_or(config.channels.ack_reactions);
+        let transcription_config_arc = Arc::clone(config_arc);
+        let transcription_channel_key = format!("matrix.{alias}");
         match MatrixChannel::new(mx.clone(), alias.clone(), peer_resolver, state_dir) {
             Ok(channel) => {
                 let channel = channel
-                    .with_transcription(config.transcription.clone())
+                    .with_transcription_manager_factory(move || {
+                        let config = transcription_config_arc.read();
+                        if !config.transcription.enabled {
+                            return None;
+                        }
+                        let provider = resolve_agent_transcription_provider(
+                            &config,
+                            &transcription_channel_key,
+                        );
+                        Some(crate::matrix::build_transcription_manager(
+                            &config, &provider,
+                        ))
+                    })
                     .with_workspace_dir(config.channel_workspace_dir(&format!("matrix.{alias}")))
                     .with_ack_reactions(ack);
                 channels.push(ConfiguredChannel {
