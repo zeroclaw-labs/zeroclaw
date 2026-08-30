@@ -11634,16 +11634,31 @@ mod tests {
         let requests = mock_server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2, "HTML send then plain-text retry");
 
-        let expected = crate::util::approval_position_line(Some((2, 3)));
-        let expected = expected.trim_end();
-        assert!(!expected.is_empty(), "helper should render a 2-of-3 line");
+        let raw = crate::util::approval_position_line(Some((2, 3)));
+        let raw = raw.trim_end();
+        assert!(!raw.is_empty(), "helper should render a 2-of-3 line");
+        // The two sends escape differently, so the expectations differ. Several
+        // locales put an apostrophe in this line (fr: `Appel d'outil 2 sur 3`),
+        // which the HTML send escapes and the fallback must not; comparing both
+        // against the raw string passes only in locales with nothing to escape.
+        let escaped = TelegramChannel::escape_html(raw);
 
         let html: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(
-            html["text"].as_str().unwrap().contains(expected),
-            "HTML card should carry the position; got {}",
-            html["text"]
+        assert_eq!(
+            html["parse_mode"], "HTML",
+            "the first send is the HTML card"
         );
+        let html_text = html["text"].as_str().unwrap();
+        assert!(
+            html_text.contains(escaped.as_str()),
+            "HTML card should carry the escaped position; want {escaped:?}, got {html_text}"
+        );
+        if escaped != raw {
+            assert!(
+                !html_text.contains(raw),
+                "the HTML position line must be escaped, not raw; got {html_text}"
+            );
+        }
 
         let plain: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert!(
@@ -11652,15 +11667,17 @@ mod tests {
         );
         let plain_text = plain["text"].as_str().unwrap();
         assert!(
-            plain_text.contains(expected),
-            "plain fallback should carry the position; got {plain_text}"
+            plain_text.contains(raw),
+            "plain fallback should carry the raw position; want {raw:?}, got {plain_text}"
         );
-        // Unescaped: with no parse_mode, an HTML-escaped line would show its
-        // entities literally.
-        assert!(
-            !plain_text.contains("&amp;") && !plain_text.contains("&lt;"),
-            "the fallback position line must not be HTML-escaped; got {plain_text}"
-        );
+        // With no parse_mode, an escaped line would show its entities literally.
+        // Only meaningful in a locale where the two forms actually differ.
+        if escaped != raw {
+            assert!(
+                !plain_text.contains(escaped.as_str()),
+                "the fallback position line must not be HTML-escaped; got {plain_text}"
+            );
+        }
     }
 
     #[tokio::test]
