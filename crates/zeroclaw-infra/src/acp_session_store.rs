@@ -669,7 +669,70 @@ impl AcpSessionStore {
         let tx = conn
             .transaction()
             .context("Failed to begin append_turn transaction")?;
+        Self::insert_messages(&tx, session_id, messages, &now)?;
 
+        tx.execute(
+            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
+            params![now, session_id],
+        )
+        .context("Failed to update last_activity")?;
+
+        tx.commit().context("Failed to commit append_turn")?;
+        Ok(())
+    }
+
+    /// Replace a session's entire durable message transcript with the
+    /// agent's own authoritative post-turn history, in one transaction.
+    /// Deleting `acp_messages` cascades to `acp_tool_calls` via their FK
+    /// (`foreign_keys = ON`). Used by callers that own a trimmed in-memory
+    /// history so the store never resurrects turns the live agent already
+    /// dropped by appending on top of a stale transcript.
+    pub fn replace_messages(
+        &self,
+        session_uuid: &str,
+        messages: &[ConversationMessage],
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+
+        let session_id: i64 = conn
+            .query_row(
+                "SELECT id FROM acp_sessions WHERE session_uuid = ?1",
+                params![session_uuid],
+                |row| row.get(0),
+            )
+            .with_context(|| format!("unknown session_uuid: {session_uuid}"))?;
+
+        let tx = conn
+            .transaction()
+            .context("Failed to begin replace_messages transaction")?;
+        tx.execute(
+            "DELETE FROM acp_messages WHERE session_id = ?1",
+            params![session_id],
+        )
+        .context("Failed to clear prior messages")?;
+        Self::insert_messages(&tx, session_id, messages, &now)?;
+
+        tx.execute(
+            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
+            params![now, session_id],
+        )
+        .context("Failed to update last_activity")?;
+
+        tx.commit().context("Failed to commit replace_messages")?;
+        Ok(())
+    }
+
+    /// Insert `messages` into `acp_messages`/`acp_tool_calls`, decomposing
+    /// `AssistantToolCalls`/`ToolResults` variants. Shared by `append_turn`
+    /// (adds to the existing transcript) and `replace_messages` (called
+    /// after clearing it) so both write the same row shapes.
+    fn insert_messages(
+        tx: &rusqlite::Transaction<'_>,
+        session_id: i64,
+        messages: &[ConversationMessage],
+        now: &str,
+    ) -> Result<()> {
         // Track the most recent assistant message_id so a following
         // ToolResults variant can attach its 'out' rows back to it.
         let mut last_assistant_msg_id: Option<i64> = None;
@@ -737,7 +800,7 @@ impl AcpSessionStore {
                                 )
                                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                 .with_attrs(::serde_json::json!({
-                                    "session_uuid": session_uuid,
+                                    "session_id": session_id,
                                 })),
                                 "ToolResults without preceding AssistantToolCalls"
                             );
@@ -777,13 +840,6 @@ impl AcpSessionStore {
             }
         }
 
-        tx.execute(
-            "UPDATE acp_sessions SET last_activity = ?1 WHERE id = ?2",
-            params![now, session_id],
-        )
-        .context("Failed to update last_activity")?;
-
-        tx.commit().context("Failed to commit append_turn")?;
         Ok(())
     }
 
@@ -1242,6 +1298,104 @@ mod tests {
             &data.messages[1],
             ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi"
         ));
+    }
+
+    #[test]
+    fn replace_messages_drops_prior_rows_and_cascades_to_tool_calls() {
+        let (_tmp, store) = open_store();
+        store
+            .create_session("sess-replace", "alpha", "/tmp/proj")
+            .unwrap();
+
+        // An existing turn with a tool call, to prove the old row (and its
+        // cascaded acp_tool_calls row) is fully gone after replace, not left
+        // behind alongside the new transcript.
+        let old = vec![
+            ConversationMessage::AssistantToolCalls {
+                text: Some(String::new()),
+                tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                    id: "call-1".into(),
+                    name: "old_tool".into(),
+                    arguments: "{}".into(),
+                    extra_content: None,
+                }],
+                reasoning_content: None,
+            },
+            ConversationMessage::ToolResults(vec![
+                zeroclaw_api::model_provider::ToolResultMessage {
+                    tool_call_id: "call-1".into(),
+                    content: "old result".into(),
+                    tool_name: "old_tool".into(),
+                },
+            ]),
+        ];
+        store.append_turn("sess-replace", &old).unwrap();
+        assert_eq!(
+            store
+                .load_session("sess-replace")
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            2
+        );
+
+        let new = vec![
+            ConversationMessage::Chat(ChatMessage::user("hello")),
+            ConversationMessage::Chat(ChatMessage::assistant("hi")),
+        ];
+        store.replace_messages("sess-replace", &new).unwrap();
+
+        let data = store.load_session("sess-replace").unwrap().unwrap();
+        assert_eq!(
+            data.messages.len(),
+            2,
+            "replace must not leave the prior turn's rows behind"
+        );
+        assert!(matches!(
+            &data.messages[0],
+            ConversationMessage::Chat(m) if m.role == "user" && m.content == "hello"
+        ));
+        assert!(matches!(
+            &data.messages[1],
+            ConversationMessage::Chat(m) if m.role == "assistant" && m.content == "hi"
+        ));
+
+        // A fresh call, unrelated to the replaced-away "call-1", must not
+        // resolve tool_name off the deleted (cascaded) tool_calls row.
+        store
+            .append_turn(
+                "sess-replace",
+                &[
+                    ConversationMessage::AssistantToolCalls {
+                        text: Some(String::new()),
+                        tool_calls: vec![zeroclaw_api::model_provider::ToolCall {
+                            id: "call-2".into(),
+                            name: "new_tool".into(),
+                            arguments: "{}".into(),
+                            extra_content: None,
+                        }],
+                        reasoning_content: None,
+                    },
+                    ConversationMessage::ToolResults(vec![
+                        zeroclaw_api::model_provider::ToolResultMessage {
+                            tool_call_id: "call-2".into(),
+                            content: "new result".into(),
+                            tool_name: "new_tool".into(),
+                        },
+                    ]),
+                ],
+            )
+            .unwrap();
+        let data = store.load_session("sess-replace").unwrap().unwrap();
+        assert_eq!(data.messages.len(), 4);
+    }
+
+    #[test]
+    fn replace_messages_unknown_session_errors() {
+        let (_tmp, store) = open_store();
+        let msgs = vec![ConversationMessage::Chat(ChatMessage::user("hi"))];
+        assert!(store.replace_messages("no-such-session", &msgs).is_err());
     }
 
     #[test]

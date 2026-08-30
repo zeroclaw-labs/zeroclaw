@@ -546,7 +546,6 @@ async fn handle_socket(
     let restore_trim_event = if stored_messages.is_empty() {
         None
     } else {
-        let event = agent.seed_history_with_event(&stored_messages);
         // Breadcrumb provenance is the backend's own canonical record
         // alongside the transcript, never inferred from message text: a
         // genuine first user turn that happens to equal the localized
@@ -554,7 +553,11 @@ async fn handle_socket(
         // persisted under another locale must stay classified as synthetic.
         // Sessions from before this was tracked (`None`) restore as `false`,
         // matching the pre-existing fallback for backends that don't
-        // support it.
+        // support it. Ownership must be set BEFORE seeding: seeding trims
+        // immediately if the restored transcript is over the structured cap,
+        // and that seed-time trim reads the agent's current breadcrumb flag
+        // to decide whether a leading synthetic marker counts as a real
+        // turn. Setting it after would let that first trim mistreat it.
         let stored_crumb = state
             .session_backend
             .as_ref()
@@ -566,7 +569,7 @@ async fn handle_socket(
             })
             .unwrap_or(false);
         agent.set_history_has_trim_breadcrumb(stored_crumb);
-        event
+        agent.seed_history_with_event(&stored_messages)
     };
 
     let (approval_event_tx, mut approval_event_rx) =
@@ -933,27 +936,41 @@ fn session_queue_ws_error_code(error: &crate::session_queue::SessionQueueError) 
     }
 }
 
-fn persist_conversation_messages(
+/// Replace the session's durable transcript and breadcrumb flag with
+/// `durable`/`breadcrumb_present`, unless the session was deleted between the
+/// turn starting and this post-turn persistence — in which case the
+/// `aborted` / `done` / `error` frames are still sent to the client, but the
+/// row `DELETE /api/sessions/{id}` just wiped is not re-created.
+fn replace_conversation_state_unless_deleted(
     backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
     session_key: &str,
-    messages: &[zeroclaw_providers::ConversationMessage],
+    durable: &[zeroclaw_providers::ChatMessage],
+    breadcrumb_present: bool,
 ) {
-    // if the user deleted the session between the turn starting and
-    // the post-turn persistence, don't resurrect it. The `aborted` / `done`
-    // / `error` frames are still sent to the client; we just refuse to
-    // re-create the row that `DELETE /api/sessions/{id}` just wiped.
     if !backend.session_exists(session_key) {
         return;
     }
-    for message in messages {
-        let zeroclaw_providers::ConversationMessage::Chat(message) = message else {
-            continue;
-        };
-        if message.role == "system" {
-            continue;
-        }
-        let _ = backend.append(session_key, message);
-    }
+    let _ = backend.replace_conversation_state(session_key, durable, breadcrumb_present);
+}
+
+/// Replace the session's durable transcript and breadcrumb flag with the
+/// agent's own authoritative post-turn history, as one state. Appending only
+/// the turn's delta on top of a transcript the agent's loop already trimmed
+/// underneath it can resurrect turns the live agent dropped; replacing with
+/// `agent.history()` keeps the store in sync with what the agent actually
+/// retains.
+fn persist_agent_conversation_state(
+    backend: &dyn zeroclaw_infra::session_backend::SessionBackend,
+    session_key: &str,
+    agent: &zeroclaw_runtime::agent::Agent,
+) {
+    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+    replace_conversation_state_unless_deleted(
+        backend,
+        session_key,
+        &durable,
+        agent.history_has_trim_breadcrumb(),
+    );
 }
 
 fn has_assistant_chat_message(messages: &[zeroclaw_providers::ConversationMessage]) -> bool {
@@ -1402,15 +1419,7 @@ async fn process_chat_message(
             if still_exists {
                 match &result {
                     Err(error) if !error.new_messages.is_empty() => {
-                        persist_conversation_messages(
-                            backend.as_ref(),
-                            session_key,
-                            &error.new_messages,
-                        );
-                        let _ = backend.set_session_trim_breadcrumb(
-                            session_key,
-                            agent.history_has_trim_breadcrumb(),
-                        );
+                        persist_agent_conversation_state(backend.as_ref(), session_key, agent);
                         if !has_assistant_chat_message(&error.new_messages) {
                             let marker = zeroclaw_runtime::i18n::get_required_cli_string(
                                 "turn-interrupted-by-user",
@@ -1489,9 +1498,7 @@ async fn process_chat_message(
     match result {
         Ok(outcome) => {
             if let Some(ref backend) = state.session_backend {
-                persist_conversation_messages(backend.as_ref(), session_key, &outcome.new_messages);
-                let _ = backend
-                    .set_session_trim_breadcrumb(session_key, agent.history_has_trim_breadcrumb());
+                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
             }
 
             // Fire-and-forget memory consolidation so facts from WS sessions
@@ -1599,9 +1606,7 @@ async fn process_chat_message(
             if let Some(ref backend) = state.session_backend
                 && !e.new_messages.is_empty()
             {
-                persist_conversation_messages(backend.as_ref(), session_key, &e.new_messages);
-                let _ = backend
-                    .set_session_trim_breadcrumb(session_key, agent.history_has_trim_breadcrumb());
+                persist_agent_conversation_state(backend.as_ref(), session_key, agent);
             }
 
             // Set session state to error
@@ -2578,6 +2583,7 @@ data: {\"type\":\"message_stop\"}\n\n",
 
     struct DeletedSessionBackend {
         append_calls: std::sync::Mutex<Vec<String>>,
+        rewrite_calls: std::sync::Mutex<Vec<String>>,
     }
 
     impl zeroclaw_infra::session_backend::SessionBackend for DeletedSessionBackend {
@@ -2595,6 +2601,17 @@ data: {\"type\":\"message_stop\"}\n\n",
             ));
             Ok(())
         }
+        fn rewrite_messages(
+            &self,
+            session_key: &str,
+            messages: &[zeroclaw_providers::ChatMessage],
+        ) -> std::io::Result<()> {
+            self.rewrite_calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:{}", session_key, messages.len()));
+            Ok(())
+        }
         fn remove_last(&self, _session_key: &str) -> std::io::Result<bool> {
             Ok(false)
         }
@@ -2608,22 +2625,22 @@ data: {\"type\":\"message_stop\"}\n\n",
     }
 
     #[test]
-    fn persist_conversation_messages_skips_deleted_session() {
-        use zeroclaw_providers::{ChatMessage, ConversationMessage};
+    fn replace_conversation_state_skips_deleted_session() {
         let backend = DeletedSessionBackend {
             append_calls: std::sync::Mutex::new(Vec::new()),
+            rewrite_calls: std::sync::Mutex::new(Vec::new()),
         };
-        let messages = vec![
-            ConversationMessage::Chat(ChatMessage::user("hi")),
-            ConversationMessage::Chat(ChatMessage::assistant("[interrupted by user]")),
+        let durable = vec![
+            zeroclaw_providers::ChatMessage::user("hi"),
+            zeroclaw_providers::ChatMessage::assistant("[interrupted by user]"),
         ];
 
-        persist_conversation_messages(&backend, "gw_deleted", &messages);
+        replace_conversation_state_unless_deleted(&backend, "gw_deleted", &durable, false);
 
         assert!(
-            backend.append_calls.lock().unwrap().is_empty(),
-            "persist_conversation_messages must not resurrect a session whose \
-             session_exists() returned false (see #7126)"
+            backend.rewrite_calls.lock().unwrap().is_empty(),
+            "replacing durable state must not resurrect a session whose \
+             session_exists() returned false"
         );
     }
 

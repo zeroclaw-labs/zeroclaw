@@ -24,7 +24,9 @@ use zeroclaw_api::jsonrpc::{
     JsonRpcResponse, RpcOutbound, SopDecideRequest, SopRunOverlayRequest, SopRunRequest,
     SopRunResponse, SopRunsRequest, SopSaveRequest, SopSelectRequest,
 };
-use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
+#[cfg(test)]
+use zeroclaw_api::model_provider::ChatMessage;
+use zeroclaw_api::model_provider::ConversationMessage;
 use zeroclaw_api::runtime_status::RuntimeConfigKind;
 use zeroclaw_commands::{CommandSurface, commands_for_surface};
 
@@ -1664,19 +1666,24 @@ impl RpcDispatcher {
                             ));
                         }
                         message_count = data.messages.len();
+                        // Breadcrumb provenance is the store's own canonical
+                        // record alongside the transcript, never inferred
+                        // from message text. Set it BEFORE seeding: seeding
+                        // trims immediately if the restored transcript is
+                        // over the structured cap, and that seed-time trim
+                        // reads the agent's current breadcrumb flag to decide
+                        // whether a leading synthetic marker counts as a
+                        // real turn.
+                        self.ctx
+                            .sessions
+                            .set_history_has_trim_breadcrumb(&session_id, data.trim_breadcrumb)
+                            .await;
                         let seed_event = self
                             .ctx
                             .sessions
                             .seed_conversation_history_with_event(&session_id, data.messages)
                             .await;
                         self.forward_seed_event(&session_id, seed_event).await;
-                        // Breadcrumb provenance is the store's own canonical
-                        // record alongside the transcript, never inferred
-                        // from message text.
-                        self.ctx
-                            .sessions
-                            .set_history_has_trim_breadcrumb(&session_id, data.trim_breadcrumb)
-                            .await;
                         // Restore the durable TodoWrite plan into the fresh
                         // in-memory session and re-emit it so the resuming /
                         // reconnecting client's tracker repopulates without a
@@ -1748,15 +1755,14 @@ impl RpcDispatcher {
                     let _ = backend.set_session_agent_alias(&session_key, &req.agent_alias);
                     let stored = backend.load(&session_key);
                     if !stored.is_empty() {
-                        let seed_event = self
-                            .ctx
-                            .sessions
-                            .seed_history_with_event(&session_id, &stored)
-                            .await;
-                        self.forward_seed_event(&session_id, seed_event).await;
                         // Breadcrumb provenance is the backend's own
                         // canonical record alongside the transcript, never
-                        // inferred from message text.
+                        // inferred from message text. Set it BEFORE seeding:
+                        // seeding trims immediately if the restored
+                        // transcript is over the structured cap, and that
+                        // seed-time trim reads the agent's current breadcrumb
+                        // flag to decide whether a leading synthetic marker
+                        // counts as a real turn.
                         let stored_crumb = backend
                             .get_session_trim_breadcrumb(&session_key)
                             .ok()
@@ -1766,6 +1772,12 @@ impl RpcDispatcher {
                             .sessions
                             .set_history_has_trim_breadcrumb(&session_id, stored_crumb)
                             .await;
+                        let seed_event = self
+                            .ctx
+                            .sessions
+                            .seed_history_with_event(&session_id, &stored)
+                            .await;
+                        self.forward_seed_event(&session_id, seed_event).await;
                         message_count = stored.len();
                     }
                 }
@@ -2089,18 +2101,22 @@ impl RpcDispatcher {
             .await
             .ok()?;
         let trim_breadcrumb = data.trim_breadcrumb;
+        // Breadcrumb provenance is the store's own canonical record alongside
+        // the transcript, never inferred from message text. Set it BEFORE
+        // seeding: seeding trims immediately if the restored transcript is
+        // over the structured cap, and that seed-time trim reads the
+        // agent's current breadcrumb flag to decide whether a leading
+        // synthetic marker counts as a real turn.
+        self.ctx
+            .sessions
+            .set_history_has_trim_breadcrumb(sid, trim_breadcrumb)
+            .await;
         let seed_event = self
             .ctx
             .sessions
             .seed_conversation_history_with_event(sid, data.messages)
             .await;
         self.forward_seed_event(sid, seed_event).await;
-        // Breadcrumb provenance is the store's own canonical record alongside
-        // the transcript, never inferred from message text.
-        self.ctx
-            .sessions
-            .set_history_has_trim_breadcrumb(sid, trim_breadcrumb)
-            .await;
         self.ctx.sessions.touch(sid).await;
 
         ::zeroclaw_log::record!(
@@ -2423,17 +2439,14 @@ impl RpcDispatcher {
         match chat_mode {
             crate::rpc::types::ChatMode::Acp => {
                 if let Some(ref store) = self.ctx.acp_session_store
-                    && let Some(detail) = persist_acp_turn(
-                        store,
-                        sid,
-                        &outcome,
-                        self.ctx
-                            .sessions
-                            .history_has_trim_breadcrumb(sid)
-                            .await
-                            .unwrap_or(false),
-                    )
-                    .await
+                    && let Some(agent) = self.ctx.sessions.get_agent(sid).await
+                    && let Some(detail) = {
+                        let agent = agent.lock().await;
+                        let full_history = agent.history().to_vec();
+                        let trim_breadcrumb = agent.history_has_trim_breadcrumb();
+                        drop(agent);
+                        persist_acp_turn(store, sid, &outcome, full_history, trim_breadcrumb).await
+                    }
                 {
                     ::zeroclaw_log::record!(
                         WARN,
@@ -2445,31 +2458,22 @@ impl RpcDispatcher {
                 }
             }
             crate::rpc::types::ChatMode::Chat => {
-                if let Some(ref backend) = self.ctx.session_backend {
+                if let Some(ref backend) = self.ctx.session_backend
+                    && let Some(agent) = self.ctx.sessions.get_agent(sid).await
+                {
                     let key = format!("rpc_{sid}");
-                    let _ = backend.append(&key, &ChatMessage::user(&prompt));
-                    match &outcome {
-                        Ok(TurnOutcome::Completed { text, .. }) => {
-                            let _ = backend.append(&key, &ChatMessage::assistant(text));
-                        }
-                        Ok(TurnOutcome::Cancelled { partial_text, .. })
-                            if !partial_text.is_empty() =>
-                        {
-                            let _ = backend.append(&key, &ChatMessage::assistant(partial_text));
-                        }
-                        _ => {}
-                    }
-                    // Keep the store's breadcrumb provenance flag in sync
-                    // with the transcript it describes, alongside the same
-                    // append: a restore must never re-infer it from message
-                    // text.
-                    let trim_breadcrumb = self
-                        .ctx
-                        .sessions
-                        .history_has_trim_breadcrumb(sid)
-                        .await
-                        .unwrap_or(false);
-                    let _ = backend.set_session_trim_breadcrumb(&key, trim_breadcrumb);
+                    // Replace the durable transcript and breadcrumb flag with
+                    // the agent's own authoritative post-turn history, as one
+                    // state, rather than appending this turn's prompt/response
+                    // delta on top of a transcript the agent's loop may have
+                    // already trimmed underneath it.
+                    let agent = agent.lock().await;
+                    let durable = zeroclaw_providers::durable_chat_messages(agent.history());
+                    let _ = backend.replace_conversation_state(
+                        &key,
+                        &durable,
+                        agent.history_has_trim_breadcrumb(),
+                    );
                 }
             }
         }
@@ -5369,29 +5373,33 @@ fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: 
     cfg.effective_max_context_tokens(agent_alias) as u64
 }
 
-/// Persist the exact turn delta captured before structured history trimming.
-/// Empty and failed turns intentionally remain no-ops.
+/// Replace the durable ACP transcript with the agent's own authoritative
+/// post-turn history, as one state with its breadcrumb flag. Empty and
+/// failed turns intentionally remain no-ops (matching the prior append-only
+/// behavior) — `outcome` only gates *whether* this turn produced anything to
+/// persist; the write itself always uses `full_history`, the caller's
+/// snapshot of `agent.history()` taken after this turn's trimming, rather
+/// than appending only this turn's delta on top of a transcript the agent's
+/// loop may have already trimmed underneath it.
 async fn persist_acp_turn(
     store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
     session_id: &str,
     outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+    full_history: Vec<ConversationMessage>,
     trim_breadcrumb: bool,
 ) -> Option<String> {
-    let messages = match outcome {
+    match outcome {
         Ok(TurnOutcome::Completed { messages, .. })
         | Ok(TurnOutcome::Cancelled { messages, .. })
-            if !messages.is_empty() =>
-        {
-            messages.clone()
-        }
+            if !messages.is_empty() => {}
         _ => return None,
-    };
+    }
     let store = Arc::clone(store);
     let session_id = session_id.to_string();
     match tokio::task::spawn_blocking(move || {
-        store.append_turn(&session_id, &messages)?;
+        store.replace_messages(&session_id, &full_history)?;
         // Keep the store's breadcrumb provenance flag in sync with the
-        // transcript it describes, alongside the same append: a restore
+        // transcript it describes, alongside the same replace: a restore
         // must never re-infer it from message text.
         store.set_trim_breadcrumb(&session_id, trim_breadcrumb)
     })
@@ -9472,9 +9480,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn acp_persistence_appends_complete_pretrim_delta_at_cap() {
-        use zeroclaw_api::model_provider::ConversationMessage;
-
+    async fn acp_persistence_replaces_transcript_with_the_authoritative_history() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store =
             Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
@@ -9493,14 +9499,74 @@ mod tests {
             text: "new-assistant".into(),
             messages: new_messages.clone(),
         });
+        // The caller's snapshot of the agent's authoritative post-turn
+        // history — here, the agent's loop retained everything and appended
+        // the new turn, so it's the full existing set plus the new turn. A
+        // caller whose loop trimmed older turns would pass a shorter slice,
+        // and the store must reflect exactly that, not append on top of the
+        // 50 rows already on disk.
+        let full_history: Vec<_> = existing
+            .iter()
+            .cloned()
+            .chain(new_messages.iter().cloned())
+            .collect();
 
-        assert_eq!(persist_acp_turn(&store, sid, &outcome, false).await, None);
+        assert_eq!(
+            persist_acp_turn(&store, sid, &outcome, full_history.clone(), false).await,
+            None
+        );
 
         let restored = store.load_session(sid).unwrap().unwrap();
-        assert_eq!(restored.messages.len(), 52);
+        assert_eq!(restored.messages.len(), full_history.len());
         assert_eq!(
             serde_json::to_value(&restored.messages[50..]).unwrap(),
             serde_json::to_value(&new_messages).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn acp_persistence_replace_drops_turns_the_caller_no_longer_retains() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store =
+            Arc::new(zeroclaw_infra::acp_session_store::AcpSessionStore::new(tmp.path()).unwrap());
+        let sid = "trim-drops-old-turns";
+        store.create_session(sid, "agent", "/tmp").unwrap();
+        let existing = (0..10)
+            .map(|index| ConversationMessage::Chat(ChatMessage::user(format!("old-{index}"))))
+            .collect::<Vec<_>>();
+        store.append_turn(sid, &existing).unwrap();
+
+        let new_messages = vec![ConversationMessage::Chat(ChatMessage::assistant(
+            "new-assistant",
+        ))];
+        let outcome = Ok(TurnOutcome::Completed {
+            text: "new-assistant".into(),
+            messages: new_messages.clone(),
+        });
+        // Simulate the agent's loop dropping the oldest 8 turns to fit the
+        // budget: the caller's authoritative snapshot has only the newest 2
+        // old turns plus the new one, not all 10 + the new one.
+        let full_history: Vec<_> = existing[8..]
+            .iter()
+            .cloned()
+            .chain(new_messages.iter().cloned())
+            .collect();
+
+        assert_eq!(
+            persist_acp_turn(&store, sid, &outcome, full_history.clone(), false).await,
+            None
+        );
+
+        let restored = store.load_session(sid).unwrap().unwrap();
+        assert_eq!(
+            restored.messages.len(),
+            3,
+            "the store must reflect exactly the caller's authoritative history, not the old \
+             10 rows plus an appended delta"
+        );
+        assert_eq!(
+            serde_json::to_value(&restored.messages).unwrap(),
+            serde_json::to_value(&full_history).unwrap()
         );
     }
 
@@ -9516,10 +9582,16 @@ mod tests {
             partial_text: String::new(),
             messages: Vec::new(),
         });
-        assert_eq!(persist_acp_turn(&store, sid, &empty, false).await, None);
+        assert_eq!(
+            persist_acp_turn(&store, sid, &empty, Vec::new(), false).await,
+            None
+        );
 
         let failed = Err(crate::rpc::turn::TurnError::AgentError("failed".into()));
-        assert_eq!(persist_acp_turn(&store, sid, &failed, false).await, None);
+        assert_eq!(
+            persist_acp_turn(&store, sid, &failed, Vec::new(), false).await,
+            None
+        );
         assert!(
             store
                 .load_session(sid)
@@ -9920,7 +9992,6 @@ mod tests {
     #[tokio::test]
     async fn session_messages_falls_back_to_acp_store_for_acp_sessions() {
         use serde_json::from_value;
-        use zeroclaw_api::model_provider::{ChatMessage, ConversationMessage};
         use zeroclaw_providers::{ToolCall, ToolResultMessage};
 
         let tmp = tempfile::TempDir::new().unwrap();

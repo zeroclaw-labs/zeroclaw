@@ -230,6 +230,24 @@ pub trait SessionBackend: Send + Sync {
         Ok(None)
     }
 
+    /// Replace a session's durable transcript and its breadcrumb provenance
+    /// together, as one authoritative post-turn state. Callers that own a
+    /// trimmed in-memory history (the agent's loop history after budget
+    /// enforcement) must call this instead of appending only the turn's
+    /// delta: appending on top of a transcript the loop already trimmed lets
+    /// the store resurrect turns the live agent dropped, and writing the
+    /// breadcrumb flag separately from the transcript it describes leaves a
+    /// window where a reader sees one without the other.
+    fn replace_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<()> {
+        self.rewrite_messages(session_key, messages)?;
+        self.set_session_trim_breadcrumb(session_key, breadcrumb_present)
+    }
+
     fn set_session_context(
         &self,
         _session_key: &str,
