@@ -28,16 +28,16 @@ thiserror = "2.0"
 tokio = { version = "1.50", default-features = false, features = ["sync", "macros", "net", "rt", "time"] }
 toml = "1.0"
 toml_edit = "0.25"
-wasmtime = { version = "47.0.3", default-features = false, features = [
+wasmtime = { version = "47.0.4", default-features = false, features = [
   "component-model",
   "runtime",
   "std",
   "async",
 ], optional = true }
-wasmtime-wasi = { version = "47.0.3", default-features = false, features = [
+wasmtime-wasi = { version = "47.0.4", default-features = false, features = [
   "p2",
 ], optional = true }
-wasmtime-wasi-http = { version = "47.0.3", default-features = false, features = [
+wasmtime-wasi-http = { version = "47.0.4", default-features = false, features = [
   "p2",
   "default-send-request",
 ], optional = true }
