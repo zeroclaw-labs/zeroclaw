@@ -53,6 +53,17 @@ fn anysearch_config_parse_error(path: &Path, line: Option<usize>) -> anyhow::Err
 /// rejects requests that carry no User-Agent at all.
 const SERPLY_USER_AGENT: &str = "ZeroClaw/1.0 (https://zeroclaw.ai)";
 
+/// Hard cap on the bytes buffered from a Serply success response.
+///
+/// `max_results`, `cap_result_content`, and the render caps bound only the
+/// parsed projection of the body, not how much the HTTP client buffers in
+/// order to build the JSON value, so the success body is streamed through the
+/// shared bounded reader up to this limit before decoding. A well-formed SERP
+/// payload is a few tens of KiB; 1 MiB leaves generous headroom while keeping
+/// a misbehaving or compromised upstream from forcing an arbitrarily large
+/// allocation in a long-lived runtime.
+const SERPLY_RESPONSE_LIMIT_BYTES: usize = 1024 * 1024;
+
 /// Non-disclosing description of a `config.toml` parse failure.
 ///
 /// `toml::de::Error` renders an annotated snippet through `Display`, and that
@@ -1282,12 +1293,23 @@ impl WebSearchTool {
             return Err(http_search_failure("serply", status));
         }
 
-        // The query-bearing URL also rides along on decode failures, so the
-        // response path is normalized the same way as the request path.
-        let json: serde_json::Value = response
-            .json()
+        // The success body is streamed through the shared bounded reader
+        // before JSON decoding: the parse/render caps bound only the parsed
+        // projection, so decoding straight off the response would let the
+        // upstream dictate how much this long-lived process buffers. The
+        // query-bearing URL also rides along on read and decode failures, so
+        // the response path is normalized the same way as the request path.
+        let body = response_body::read_bounded(response, Some(SERPLY_RESPONSE_LIMIT_BYTES))
             .await
-            .map_err(|err| transport_search_failure("serply", "response", &err))?;
+            .map_err(|err| match err.downcast_ref::<reqwest::Error>() {
+                Some(err) => transport_search_failure("serply", "response", err),
+                None => bounded_body_search_failure("serply", "body"),
+            })?;
+        if body.overflowed {
+            return Err(bounded_body_search_failure("serply", "oversized"));
+        }
+        let json: serde_json::Value = serde_json::from_slice(&body.bytes)
+            .map_err(|_| bounded_body_search_failure("serply", "decode"))?;
         self.parse_serply_results(&json, query)
     }
 
@@ -1890,6 +1912,20 @@ fn transport_search_failure(provider: &str, stage: &str, err: &reqwest::Error) -
         "{provider} search failed (search_status={}, transport={category}, stage={stage}). {}",
         search_status.as_str(),
         search_status_hint(search_status)
+    ))
+}
+
+/// Build a provider failure for the bounded success-body path (stream read,
+/// byte-cap overflow, or JSON decode of the capped bytes), mirroring
+/// `transport_search_failure`'s tag vocabulary. `category` is a compile-time
+/// tag (`body`, `oversized`, `decode`); the response bytes, the JSON parse
+/// error (which can quote body fragments), and the query-bearing URL never
+/// reach the message.
+fn bounded_body_search_failure(provider: &str, category: &str) -> anyhow::Error {
+    anyhow::Error::msg(format!(
+        "{provider} search failed (search_status={}, transport={category}, stage=response). {}",
+        SearchStatus::Unavailable.as_str(),
+        search_status_hint(SearchStatus::Unavailable)
     ))
 }
 
@@ -3819,6 +3855,121 @@ mod tests {
                 .contains("search_status=unavailable, transport=decode, stage=response"),
             "undecodable body must be classified as an unavailable response-stage failure: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_serply_oversized_response_is_rejected_and_query_free() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A 200 whose valid-JSON body exceeds the byte cap: the bounded reader
+        // must reject it instead of handing a multi-megabyte value to
+        // serde_json, and the rejection must stay query-free.
+        let padding = "x".repeat(SERPLY_RESPONSE_LIMIT_BYTES);
+        let body = format!("{{\"results\": [], \"padding\": \"{padding}\"}}");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/search/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("{}/v1/search/", server.uri());
+
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("a body over the byte cap must be rejected");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=oversized, stage=response"),
+            "an over-cap body must be classified as an unavailable response-stage failure: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_serply_bounded_reader_stops_at_the_cap_without_content_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // A chunked response with no Content-Length whose terminal chunk is
+        // withheld until the test releases it. The server streams one byte
+        // more than the cap and then parks, so the only way the call can
+        // return before the 15 s client timeout is for the bounded reader to
+        // stop at the cap instead of buffering the unterminated stream.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut remaining = SERPLY_RESPONSE_LIMIT_BYTES + 1;
+            while remaining > 0 {
+                let chunk_len = remaining.min(chunk.len());
+                stream
+                    .write_all(format!("{chunk_len:x}\r\n").as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&chunk[..chunk_len]).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+                remaining -= chunk_len;
+            }
+            let _ = release_rx.await;
+            let _ = stream.write_all(b"0\r\n\r\n").await;
+        });
+
+        let (_tmp, tool) = serply_tool_with_key("serply-test-key");
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .expect("client builder should succeed without a proxy");
+        let query = serply_private_query();
+        let endpoint = format!("http://{addr}/v1/search/");
+
+        let started = Instant::now();
+        let err = tool
+            .search_serply_with_client(&client, &endpoint, &query)
+            .await
+            .expect_err("an over-cap unterminated stream must be rejected");
+
+        assert_serply_transport_error_is_query_free(&err, &query, &endpoint);
+        assert!(
+            err.to_string()
+                .contains("search_status=unavailable, transport=oversized, stage=response"),
+            "an over-cap chunked body must be classified as oversized, not timeout: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the reader must stop at the cap while the server still holds the stream open"
+        );
+
+        drop(release_tx);
+        let _ = server.await;
     }
 
     // ── Format characterization ──────────────────────────────────────────
