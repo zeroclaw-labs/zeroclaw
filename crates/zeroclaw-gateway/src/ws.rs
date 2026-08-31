@@ -1426,7 +1426,6 @@ async fn process_chat_message(
             let needs_marker = match &result {
                 Err(error) => !has_assistant_chat_message(&error.new_messages),
                 Ok(_) => false,
-                _ => true,
             };
             let durable = if needs_marker {
                 let marker =
