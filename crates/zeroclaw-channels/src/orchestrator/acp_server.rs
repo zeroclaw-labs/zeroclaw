@@ -1760,8 +1760,9 @@ impl AcpServer {
         // Persist authoritative state even for failures that happened after a
         // trim. The error delta may be empty, but the live agent has already
         // dropped turns.
-        if turn_result.is_err() {
-            if let Some(store) = &self.store {
+        if turn_result.is_err()
+            && let Some(store) = &self.store
+        {
                 let store = store.clone();
                 let sid = session_id.clone();
                 let (full_history, crumb_present) = {
@@ -1791,7 +1792,6 @@ impl AcpServer {
                     );
                 }
             }
-        }
 
         let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
             let (diagnostic, rpc_error) = acp_turn_failure(&e);
