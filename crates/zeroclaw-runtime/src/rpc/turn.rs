@@ -393,6 +393,7 @@ mod tests {
 
     #[test]
     fn terminal_completion_keeps_diagnostic_and_delivery_text_separate() {
+        let expected = crate::agent::semantic_empty_terminal_completion_message(None);
         let err = StreamedTurnError {
             error: anyhow::Error::new(
                 zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion,
@@ -409,10 +410,46 @@ mod tests {
             outcome.to_string(),
             "Agent turn failed: provider completed without final text or tool calls"
         );
-        assert_eq!(
-            outcome.user_message(),
-            Some("The model provider returned an invalid semantic completion.")
+        assert_eq!(outcome.user_message(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn provider_terminal_completion_keeps_retry_diagnostic_out_of_rpc_delivery() {
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::Connection,
+            Some("http://localhost:11434/v1/chat/completions".to_string()),
+            "All model providers/models failed after 3 failure event(s). Events: \
+                 event 1 (retry 1/3): retryable"
+                .to_string(),
+        ));
+        let expected = crate::agent::terminal_completion_error_message(&error, None)
+            .expect("provider failures have a canonical localized projection");
+        let err = StreamedTurnError {
+            error,
+            committed_response: String::new(),
+            new_messages: Vec::new(),
+        };
+
+        let outcome = match outcome_from_task_result(Err(err), String::new()) {
+            Err(error) => error,
+            Ok(_) => panic!("provider terminal completion must fail"),
+        };
+        let user_message = outcome
+            .user_message()
+            .expect("terminal completion supplies a user message");
+        assert!(
+            outcome
+                .to_string()
+                .contains("All model providers/models failed")
         );
+        assert_eq!(user_message, expected);
+        assert!(user_message.contains("http://localhost:11434/v1/chat/completions"));
+        assert!(!user_message.contains("retry 1/3"));
+        assert!(!user_message.contains("All model providers/models failed"));
     }
 
     #[tokio::test]

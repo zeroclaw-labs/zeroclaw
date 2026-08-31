@@ -16,7 +16,9 @@ use ratatui::{
 };
 use tokio::sync::{broadcast, mpsc};
 
-use crate::attachment::{PendingAttachment, build_attachments_json, cleanup_attachment_temps};
+use crate::attachment::{
+    CleanupReport, PendingAttachment, build_attachments_json, cleanup_attachment_temps,
+};
 use crate::client::{
     ApprovalDecision, RpcClient, RpcNotification, SessionEntry, SessionUpdate, TurnEndOutcome,
     method, parse_session_update,
@@ -26,6 +28,12 @@ use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::input_bar::{InputBarAction, InputBarState};
 use crate::jsonrpc::RpcOutbound;
 use crate::mouse;
+#[cfg(test)]
+use crate::text_selection::{CellPoint, TextCell as TranscriptCell, row_breaks_for_line};
+use crate::text_selection::{
+    TextRowBreak as TranscriptRowBreak, TextSelection as TranscriptSelection,
+    TextSnapshot as TranscriptSnapshot, borrow_line, row_breaks_for_lines, wrapped_rows,
+};
 use crate::theme;
 use crate::turn_status::TurnStatus;
 
@@ -37,6 +45,16 @@ const APPROVAL_OVERLAY_HEIGHT: u16 = 7;
 const GIT_BRANCH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const CANCEL_WATCHDOG: Duration = Duration::from_secs(30);
 const COPY_FEEDBACK_TTL: Duration = Duration::from_secs(1);
+
+fn append_cleanup_notice(mut message: String, cleanup: Option<String>) -> String {
+    if let Some(cleanup) = cleanup {
+        if !message.is_empty() {
+            message.push_str("; ");
+        }
+        message.push_str(&cleanup);
+    }
+    message
+}
 
 // ── Chat pane (tab mode) ─────────────────────────────────────────
 
@@ -921,26 +939,40 @@ impl Chat {
             ChatPhase::Active(ref mut state) => state.take_next_dispatchable(),
             _ => None,
         };
-        let Some(msg) = next else { return };
+        let Some(QueuedMessage {
+            text, attachments, ..
+        }) = next
+        else {
+            return;
+        };
         let sid = match self.phase {
             ChatPhase::Active(ref state) => state.session_id.clone(),
-            _ => return,
+            _ => {
+                let _ = cleanup_attachment_temps(&attachments);
+                return;
+            }
         };
 
         let transport = self.rpc.transport();
-        let attachments_json = if msg.attachments.is_empty() {
+        let attachments_json = if attachments.is_empty() {
             Vec::new()
         } else {
-            match build_attachments_json(&msg.attachments, transport) {
+            match build_attachments_json(&attachments, transport) {
                 Ok(json) => json,
                 Err(e) => {
                     if let ChatPhase::Active(ref mut state) = self.phase {
+                        let cleanup_report = cleanup_attachment_temps(&attachments);
+                        state.surface_cleanup_report(cleanup_report);
                         state
                             .entries
                             .push(ChatEntry::SystemMessage(Arc::<str>::from(
                                 crate::i18n::t_args(
                                     "zc-queue-dispatch-failed",
-                                    &[("error", &e.to_string())],
+                                    // The anyhow context includes the local
+                                    // attachment path. Keep it out of the
+                                    // transcript; the cleanup notice already
+                                    // reports the bounded, actionable count.
+                                    &[("error", &e.root_cause().to_string())],
                                 ),
                             )));
                         state.mark_dirty_append();
@@ -951,16 +983,19 @@ impl Chat {
         };
 
         if let ChatPhase::Active(ref mut state) = self.phase {
-            let att_names: Vec<String> =
-                msg.attachments.iter().map(|a| a.filename.clone()).collect();
-            let text = if msg.text.is_empty() {
+            let att_names: Vec<String> = attachments.iter().map(|a| a.filename.clone()).collect();
+            let prompt = if text.is_empty() {
                 None
             } else {
-                Some(msg.text.clone())
+                Some(text.clone())
             };
-            state.push_user_message(text, att_names);
+            state.own_active_turn_attachments(attachments);
+            state.push_user_message(prompt, att_names);
+        } else {
+            let _ = cleanup_attachment_temps(&attachments);
+            return;
         }
-        self.spawn_prompt(sid, msg.text, attachments_json);
+        self.spawn_prompt(sid, text, attachments_json);
     }
 
     fn spawn_prompt(&self, sid: String, prompt: String, attachments_json: Vec<serde_json::Value>) {
@@ -1548,7 +1583,8 @@ impl Chat {
                     return false;
                 }
                 InputBarAction::StatusMessage(msg) => {
-                    state.set_info_notice(msg);
+                    let cleanup_notice = state.input_bar.take_cleanup_report().notice();
+                    state.set_info_notice(append_cleanup_notice(msg, cleanup_notice));
                     return false;
                 }
                 InputBarAction::ToggleThinking => {
@@ -1574,7 +1610,10 @@ impl Chat {
                     return false;
                 }
                 InputBarAction::ClearQueue(idx) => {
-                    let notice = state.clear_queue_cmd(idx);
+                    let notice = append_cleanup_notice(
+                        state.clear_queue_cmd(idx),
+                        state.input_bar.take_cleanup_report().notice(),
+                    );
                     state.set_info_notice(notice);
                     return false;
                 }
@@ -1632,7 +1671,12 @@ impl Chat {
                     Self::open_provider_picker(&rpc, state).await;
                     return false;
                 }
-                InputBarAction::Consumed => return false,
+                InputBarAction::Consumed => {
+                    if let Some(message) = state.input_bar.take_cleanup_report().notice() {
+                        state.set_info_notice(message);
+                    }
+                    return false;
+                }
                 InputBarAction::NotHandled => { /* fall through to chat-specific keys */ }
             }
         }
@@ -2337,9 +2381,14 @@ impl Chat {
 
         if let ChatPhase::Active(ref mut state) = self.phase {
             // The file explorer renders above every parent overlay.
-            if state.input_bar.has_file_explorer() && state.input_bar.handle_mouse(mouse) {
-                state.clear_mouse_highlight();
-                return;
+            if state.input_bar.has_file_explorer() {
+                let consumed = state.input_bar.handle_mouse(mouse);
+                let cleanup_report = state.input_bar.take_cleanup_report();
+                state.surface_cleanup_report(cleanup_report);
+                if consumed {
+                    state.clear_mouse_highlight();
+                    return;
+                }
             }
 
             if state.model_picker.is_open() {
@@ -2426,7 +2475,10 @@ impl Chat {
                 }
             }
 
-            if state.input_bar.handle_mouse(mouse) {
+            let input_bar_consumed = state.input_bar.handle_mouse(mouse);
+            let cleanup_report = state.input_bar.take_cleanup_report();
+            state.surface_cleanup_report(cleanup_report);
+            if input_bar_consumed {
                 state.clear_mouse_highlight();
                 return;
             }
@@ -2691,7 +2743,10 @@ impl Chat {
         }
         let action = state.input_bar.handle_paste(text);
         if let InputBarAction::StatusMessage(msg) = action {
-            state.set_info_notice(msg);
+            let cleanup_notice = state.input_bar.take_cleanup_report().notice();
+            state.set_info_notice(append_cleanup_notice(msg, cleanup_notice));
+        } else if let Some(message) = state.input_bar.take_cleanup_report().notice() {
+            state.set_info_notice(message);
         }
     }
 
@@ -2752,6 +2807,8 @@ impl Chat {
     pub(crate) fn clear_input(&mut self) {
         if let ChatPhase::Active(s) = &mut self.phase {
             s.input_bar.reset();
+            let cleanup_report = s.input_bar.take_cleanup_report();
+            s.surface_cleanup_report(cleanup_report);
             s.mark_dirty_full();
         }
     }
@@ -3886,49 +3943,6 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
-/// Wrapped screen-row count for a single cached line at the given width.
-fn wrapped_rows(line: &Line<'static>, width: u16) -> u16 {
-    Paragraph::new(vec![borrow_line(line)])
-        .wrap(Wrap { trim: false })
-        .line_count(width) as u16
-}
-
-fn row_breaks_for_line(line: &Line<'static>, width: u16) -> Vec<TranscriptRowBreak> {
-    let text = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    let visual_lines = crate::input_bar::wrap_visual_lines(&text, width);
-    let expected_rows = usize::from(wrapped_rows(line, width));
-    if visual_lines.len() != expected_rows {
-        return vec![TranscriptRowBreak::Hard; expected_rows];
-    }
-
-    visual_lines
-        .iter()
-        .enumerate()
-        .map(|(index, current)| {
-            let Some(previous) = index.checked_sub(1).and_then(|i| visual_lines.get(i)) else {
-                return TranscriptRowBreak::Hard;
-            };
-            let gap = &text[previous.end..current.start];
-            if !gap.is_empty() && !gap.chars().all(|ch| ch == '\u{200b}') {
-                TranscriptRowBreak::SoftSpace
-            } else {
-                TranscriptRowBreak::SoftConcat
-            }
-        })
-        .collect()
-}
-
-fn row_breaks_for_lines(lines: &[Line<'static>], width: u16) -> Vec<TranscriptRowBreak> {
-    lines
-        .iter()
-        .flat_map(|line| row_breaks_for_line(line, width))
-        .collect()
-}
-
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
 fn copy_region(
     global_row: u16,
@@ -4005,19 +4019,6 @@ fn centered_copy_feedback_rect(label: &str, anchor: Rect) -> Option<Rect> {
     let center = anchor.x.saturating_add(anchor.width / 2);
     let x = center.saturating_sub(cells / 2);
     Some(Rect::new(x, anchor.y, cells, 1))
-}
-
-fn borrow_line<'a>(line: &'a Line<'static>) -> Line<'a> {
-    let spans: Vec<Span<'a>> = line
-        .spans
-        .iter()
-        .map(|s| Span::styled(s.content.as_ref(), s.style))
-        .collect();
-    let mut out = Line::from(spans).style(line.style);
-    if let Some(a) = line.alignment {
-        out = out.alignment(a);
-    }
-    out
 }
 
 fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
@@ -4213,38 +4214,7 @@ fn capture_transcript_snapshot(
     body: Rect,
     row_breaks: Vec<TranscriptRowBreak>,
 ) {
-    use unicode_width::UnicodeWidthStr;
-
-    let cells = {
-        let buffer = f.buffer_mut();
-        let mut cells = Vec::with_capacity(usize::from(body.width) * usize::from(body.height));
-        for y in body.y..body.y.saturating_add(body.height) {
-            let mut column = 0;
-            while column < body.width {
-                let symbol = buffer[(body.x + column, y)].symbol().to_string();
-                let width = (UnicodeWidthStr::width(symbol.as_str()) as u16)
-                    .max(1)
-                    .min(body.width - column);
-                cells.push(TranscriptCell {
-                    symbol,
-                    span_start: column,
-                });
-                for _ in 1..width {
-                    cells.push(TranscriptCell {
-                        symbol: String::new(),
-                        span_start: column,
-                    });
-                }
-                column += width;
-            }
-        }
-        cells
-    };
-    state.set_transcript_snapshot(TranscriptSnapshot {
-        area: body,
-        cells,
-        row_breaks,
-    });
+    state.set_transcript_snapshot(TranscriptSnapshot::capture(f, body, row_breaks));
 }
 
 fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
@@ -4253,19 +4223,7 @@ fn render_transcript_selection(f: &mut Frame, state: &ChatState) {
     else {
         return;
     };
-    let Some((start, end)) = snapshot.selection_bounds(selection) else {
-        return;
-    };
-
-    let buffer = f.buffer_mut();
-    for row in 0..snapshot.area.height {
-        for column in 0..snapshot.area.width {
-            if TranscriptSnapshot::bounds_contain(start, end, CellPoint { column, row }) {
-                buffer[(snapshot.area.x + column, snapshot.area.y + row)]
-                    .set_style(theme::selected_bg_style());
-            }
-        }
-    }
+    snapshot.render_selection(f, selection, theme::selected_bg_style());
 }
 
 fn render_transcript_copy_overlay(f: &mut Frame, state: &mut ChatState) {
@@ -5407,191 +5365,6 @@ struct CopyFeedback {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CellPoint {
-    column: u16,
-    row: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TranscriptSelection {
-    anchor: CellPoint,
-    head: CellPoint,
-    dragged: bool,
-}
-
-impl TranscriptSelection {
-    fn normalized(self) -> (CellPoint, CellPoint) {
-        if (self.anchor.row, self.anchor.column) <= (self.head.row, self.head.column) {
-            (self.anchor, self.head)
-        } else {
-            (self.head, self.anchor)
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptCell {
-    symbol: String,
-    span_start: u16,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TranscriptRowBreak {
-    Hard,
-    SoftSpace,
-    SoftConcat,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TranscriptSnapshot {
-    area: Rect,
-    cells: Vec<TranscriptCell>,
-    /// Separator before each visible row, derived from source wrap ranges.
-    row_breaks: Vec<TranscriptRowBreak>,
-}
-
-impl TranscriptSnapshot {
-    fn point_at(&self, column: u16, row: u16) -> Option<CellPoint> {
-        if !mouse::in_rect(column, row, self.area) {
-            return None;
-        }
-        Some(CellPoint {
-            column: column - self.area.x,
-            row: row - self.area.y,
-        })
-    }
-
-    fn cell(&self, point: CellPoint) -> Option<&TranscriptCell> {
-        if point.column >= self.area.width || point.row >= self.area.height {
-            return None;
-        }
-        let index =
-            usize::from(point.row) * usize::from(self.area.width) + usize::from(point.column);
-        self.cells.get(index)
-    }
-
-    fn has_text_at(&self, point: CellPoint) -> bool {
-        let Some(cell) = self.cell(point) else {
-            return false;
-        };
-        self.cell(CellPoint {
-            column: cell.span_start,
-            row: point.row,
-        })
-        .is_some_and(|origin| !origin.symbol.chars().all(char::is_whitespace))
-    }
-
-    fn row_text_bounds(&self, row: u16) -> Option<(u16, u16)> {
-        let first =
-            (0..self.area.width).find(|&column| self.has_text_at(CellPoint { column, row }))?;
-        let last = (0..self.area.width)
-            .rev()
-            .find(|&column| self.has_text_at(CellPoint { column, row }))?;
-        Some((first, last))
-    }
-
-    fn clamp_outer_whitespace(&self, mut point: CellPoint) -> CellPoint {
-        if let Some((first, last)) = self.row_text_bounds(point.row) {
-            point.column = point.column.clamp(first, last);
-        }
-        point
-    }
-
-    fn selection_bounds(&self, selection: TranscriptSelection) -> Option<(CellPoint, CellPoint)> {
-        if !selection.dragged {
-            return None;
-        }
-        let (mut start, mut end) = selection.normalized();
-        start = self.clamp_outer_whitespace(start);
-        end = self.clamp_outer_whitespace(end);
-        start.column = self.cell(start)?.span_start;
-        let end_cell = self.cell(end)?;
-        let origin = self.cell(CellPoint {
-            column: end_cell.span_start,
-            row: end.row,
-        })?;
-        end.column = end_cell
-            .span_start
-            .saturating_add(
-                (unicode_width::UnicodeWidthStr::width(origin.symbol.as_str()) as u16)
-                    .max(1)
-                    .saturating_sub(1),
-            )
-            .min(self.area.width.saturating_sub(1));
-        Some((start, end))
-    }
-
-    fn bounds_contain(start: CellPoint, end: CellPoint, point: CellPoint) -> bool {
-        (point.row, point.column) >= (start.row, start.column)
-            && (point.row, point.column) <= (end.row, end.column)
-    }
-
-    fn selected_text(&self, selection: TranscriptSelection) -> Option<String> {
-        if self.cells.is_empty() {
-            return None;
-        }
-
-        let (start, end) = self.selection_bounds(selection)?;
-        let start_row = usize::from(start.row);
-        let end_row = usize::from(end.row);
-        let mut text = String::new();
-
-        for row_idx in start_row..=end_row {
-            let first_col = if row_idx == start_row {
-                start.column
-            } else {
-                0
-            };
-            let last_col = if row_idx == end_row {
-                end.column
-            } else {
-                self.area.width.saturating_sub(1)
-            };
-
-            let mut row_text = String::new();
-            for column in first_col..=last_col {
-                let point = CellPoint {
-                    column,
-                    row: row_idx as u16,
-                };
-                let Some(cell) = self.cell(point) else {
-                    continue;
-                };
-                if cell.span_start == column {
-                    row_text.push_str(&cell.symbol);
-                }
-            }
-            let row_text = row_text.trim_end_matches(' ');
-            if row_idx > start_row {
-                match self
-                    .row_breaks
-                    .get(row_idx)
-                    .copied()
-                    .unwrap_or(TranscriptRowBreak::Hard)
-                {
-                    TranscriptRowBreak::Hard => text.push('\n'),
-                    TranscriptRowBreak::SoftSpace => text.push(' '),
-                    TranscriptRowBreak::SoftConcat => {}
-                }
-            }
-            text.push_str(row_text);
-        }
-
-        text.chars().any(|ch| !ch.is_whitespace()).then_some(text)
-    }
-
-    fn selection_anchor_rect(&self, selection: TranscriptSelection) -> Option<Rect> {
-        if !selection.dragged {
-            return None;
-        }
-        let (start, end) = selection.normalized();
-        let y = self.area.y.saturating_add(start.row);
-        let height = end.row.saturating_sub(start.row).saturating_add(1);
-        Some(Rect::new(self.area.x, y, self.area.width, height))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum QueueItemStatus {
     Pending,
     Injected,
@@ -5629,6 +5402,10 @@ pub struct ChatState {
     /// used to throttle re-fetches.
     pub git_branch_last_fetch: Option<Instant>,
     pub input_bar: InputBarState,
+    /// Attachments owned by the currently dispatched turn. Once an input-bar
+    /// submission leaves the composer, this is the sole owner until the turn
+    /// reaches a terminal outcome.
+    active_turn_attachments: Vec<PendingAttachment>,
     entries: Vec<ChatEntry>,
     streaming_text: String,
     streaming_thought: String,
@@ -5780,6 +5557,7 @@ impl ChatState {
             git_hash: None,
             git_branch_last_fetch: None,
             input_bar: InputBarState::with_shared_commands(commands),
+            active_turn_attachments: Vec::new(),
             entries: Vec::new(),
             streaming_text: String::new(),
             streaming_thought: String::new(),
@@ -5869,9 +5647,12 @@ impl ChatState {
 
         self.clear_mouse_highlight();
         let action = self.input_bar.handle_key(key);
+        let cleanup_notice = self.input_bar.take_cleanup_report().notice();
         // Explorer confirmation can reject an attachment (for example a file
         // over the size limit). Preserve that feedback instead of swallowing it.
         if let InputBarAction::StatusMessage(message) = action {
+            self.set_info_notice(append_cleanup_notice(message, cleanup_notice));
+        } else if let Some(message) = cleanup_notice {
             self.set_info_notice(message);
         }
         self.mark_dirty_full();
@@ -6958,7 +6739,9 @@ impl ChatState {
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
-        self.input_bar.cleanup_temps();
+        let mut cleanup_report = self.cleanup_active_turn_attachments();
+        cleanup_report.merge(self.input_bar.take_cleanup_report());
+        self.surface_cleanup_report(cleanup_report);
         if !clean && !self.resume_override && !self.message_queue.is_empty() {
             self.queue_paused = true;
         }
@@ -6998,6 +6781,15 @@ impl ChatState {
         self.turn_started_at = Instant::now();
     }
 
+    fn own_active_turn_attachments(&mut self, attachments: Vec<PendingAttachment>) {
+        debug_assert!(self.active_turn_attachments.is_empty());
+        self.active_turn_attachments = attachments;
+    }
+
+    fn cleanup_active_turn_attachments(&mut self) -> CleanupReport {
+        cleanup_attachment_temps(&std::mem::take(&mut self.active_turn_attachments))
+    }
+
     const QUEUE_CAP: usize = 32;
     const QUEUE_SIDEBAR_COLS_MIN: u16 = 24;
     const QUEUE_SIDEBAR_COLS_MAX: u16 = 80;
@@ -7016,10 +6808,14 @@ impl ChatState {
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
         if text.trim().is_empty() && attachments.is_empty() {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         let pending = self.message_queue.len();
         if pending >= Self::QUEUE_CAP {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
                 &[("cap", &Self::QUEUE_CAP.to_string())],
@@ -7041,9 +6837,13 @@ impl ChatState {
         attachments: Vec<PendingAttachment>,
     ) -> Result<(), String> {
         if text.trim().is_empty() && attachments.is_empty() {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t("zc-queue-empty"));
         }
         if self.message_queue.len() >= Self::QUEUE_CAP {
+            let cleanup_report = cleanup_attachment_temps(&attachments);
+            self.surface_cleanup_report(cleanup_report);
             return Err(crate::i18n::t_args(
                 "zc-queue-full",
                 &[("cap", &Self::QUEUE_CAP.to_string())],
@@ -7131,6 +6931,12 @@ impl ChatState {
     /// and consistent rendering with model-switch notes.
     pub fn set_info_notice(&mut self, msg: String) {
         self.info_message = Some(crate::widgets::InfoMessage::note(msg));
+    }
+
+    fn surface_cleanup_report(&mut self, report: CleanupReport) {
+        if let Some(message) = report.notice() {
+            self.set_info_notice(message);
+        }
     }
 
     fn set_overlay_copy_feedback(&mut self, anchor: Rect) {
@@ -7316,7 +7122,8 @@ impl ChatState {
             return false;
         };
         if let Some(message) = self.message_queue.remove(position) {
-            cleanup_attachment_temps(&message.attachments);
+            let cleanup_report = cleanup_attachment_temps(&message.attachments);
+            self.surface_cleanup_report(cleanup_report);
         }
         let ids = self.editable_ids();
         self.queue_sel = ids.get(position.min(ids.len().saturating_sub(1))).copied();
@@ -7358,9 +7165,12 @@ impl ChatState {
                 if count == 0 {
                     return crate::i18n::t("zc-queue-clear-empty");
                 }
-                self.clear_queue();
+                let cleanup_report = self.clear_queue();
                 self.mark_dirty_full();
-                crate::i18n::t_args("zc-queue-cleared-all", &[("count", &count.to_string())])
+                append_cleanup_notice(
+                    crate::i18n::t_args("zc-queue-cleared-all", &[("count", &count.to_string())]),
+                    cleanup_report.notice(),
+                )
             }
             Some(n) => {
                 if count == 0 {
@@ -7373,27 +7183,33 @@ impl ChatState {
                     );
                 }
                 let pos = n - 1;
+                let mut cleanup_report = CleanupReport::default();
                 if let Some(msg) = self.message_queue.remove(pos) {
-                    cleanup_attachment_temps(&msg.attachments);
+                    cleanup_report = cleanup_attachment_temps(&msg.attachments);
                     if self.queue_sel == Some(msg.id) {
                         let ids = self.editable_ids();
                         self.queue_sel = ids.get(pos.min(ids.len().saturating_sub(1))).copied();
                     }
                 }
                 self.mark_dirty_full();
-                crate::i18n::t_args("zc-queue-cleared-one", &[("index", &n.to_string())])
+                append_cleanup_notice(
+                    crate::i18n::t_args("zc-queue-cleared-one", &[("index", &n.to_string())]),
+                    cleanup_report.notice(),
+                )
             }
         }
     }
 
-    fn clear_queue(&mut self) {
+    fn clear_queue(&mut self) -> CleanupReport {
+        let mut cleanup_report = CleanupReport::default();
         for msg in self.message_queue.drain(..) {
-            cleanup_attachment_temps(&msg.attachments);
+            cleanup_report.merge(cleanup_attachment_temps(&msg.attachments));
         }
         self.next_queue_id = 0;
         self.queue_paused = false;
         self.resume_override = false;
         self.queue_sel = None;
+        cleanup_report
     }
 
     fn load_history(
@@ -7443,6 +7259,7 @@ impl ChatState {
         self.model_provider_ref = None;
         self.model = None;
         self.input_bar.reset();
+        let mut cleanup_report = self.input_bar.take_cleanup_report();
         self.entries.clear();
         self.streaming_text.clear();
         self.streaming_thought.clear();
@@ -7483,7 +7300,9 @@ impl ChatState {
         // Rebuilding from freshly resolved settings also applies any Config-pane
         // edit made since this pane's `ChatState` was constructed.
         self.todo_tracker.reset_for_session(todo_settings);
-        self.clear_queue();
+        cleanup_report.merge(self.cleanup_active_turn_attachments());
+        cleanup_report.merge(self.clear_queue());
+        self.surface_cleanup_report(cleanup_report);
     }
 }
 
@@ -11989,6 +11808,144 @@ mod tests {
         }
     }
 
+    fn clipboard_att(path: &std::path::Path, filename: &str) -> PendingAttachment {
+        PendingAttachment {
+            path: path.to_path_buf(),
+            mime_type: "image/png".to_string(),
+            filename: filename.to_string(),
+            size_bytes: 1,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatched_attachments_are_cleaned_on_completion_without_touching_user_files() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("clipboard.png");
+        std::fs::write(&clipboard_path, b"clipboard").expect("write clipboard temp");
+        let user_path = dir.path().join("user.png");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            rpc,
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active
+            .enqueue_message(
+                "send attachments".to_string(),
+                vec![
+                    clipboard_att(&clipboard_path, "clipboard.png"),
+                    PendingAttachment {
+                        path: user_path.clone(),
+                        mime_type: "image/png".to_string(),
+                        filename: "user.png".to_string(),
+                        size_bytes: 4,
+                        source: crate::attachment::AttachmentSource::File,
+                    },
+                ],
+            )
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.pump_queue();
+
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(state.turn_in_flight);
+        assert_eq!(state.active_turn_attachments.len(), 2);
+        assert!(clipboard_path.exists());
+        state.commit_turn(String::new(), true);
+
+        assert!(
+            !clipboard_path.exists(),
+            "active clipboard temp must be removed"
+        );
+        assert!(user_path.exists(), "user-selected file must be preserved");
+        assert!(state.active_turn_attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn serialization_failure_cleans_dispatched_clipboard_temp_and_reports_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("clipboard-temp");
+        std::fs::create_dir(&clipboard_path).expect("create forced-failure path");
+        let user_path = dir.path().join("user.png");
+        std::fs::write(&user_path, b"user").expect("write user file");
+
+        let (tx, _rx) = mpsc::channel::<String>(16);
+        let rpc = Arc::new(RpcOutbound::new(tx));
+        let client = Arc::new(RpcClient::with_rpc_transport(
+            rpc,
+            crate::client::Transport::Wss,
+        ));
+        let mut chat = Chat::new(client, PaneKind::Chat);
+        let mut active = state();
+        active
+            .enqueue_message(
+                "cannot serialize".to_string(),
+                vec![
+                    clipboard_att(&clipboard_path, "clipboard.png"),
+                    PendingAttachment {
+                        path: user_path.clone(),
+                        mime_type: "image/png".to_string(),
+                        filename: "user.png".to_string(),
+                        size_bytes: 4,
+                        source: crate::attachment::AttachmentSource::File,
+                    },
+                ],
+            )
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+
+        chat.pump_queue();
+
+        let ChatPhase::Active(state) = &chat.phase else {
+            panic!("expected active chat");
+        };
+        assert!(!state.turn_in_flight);
+        assert!(state.active_turn_attachments.is_empty());
+        assert!(
+            clipboard_path.exists(),
+            "failed cleanup must leave the path"
+        );
+        assert!(user_path.exists(), "user-selected file must be preserved");
+        assert!(
+            state
+                .info_message
+                .as_ref()
+                .is_some_and(|message| message.text.contains("1 temporary file"))
+        );
+        let clipboard_path = clipboard_path.to_string_lossy();
+        assert!(state.entries.iter().all(|entry| match entry {
+            ChatEntry::SystemMessage(text) => !text.contains(clipboard_path.as_ref()),
+            _ => true,
+        }));
+    }
+
+    #[test]
+    fn completion_does_not_delete_an_unsent_composer_attachment() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let clipboard_path = dir.path().join("composer.png");
+        std::fs::write(&clipboard_path, b"clipboard").expect("write clipboard temp");
+
+        let mut active = state();
+        active.input_bar.load_for_edit(
+            String::new(),
+            vec![clipboard_att(&clipboard_path, "composer.png")],
+        );
+        active.turn_in_flight = true;
+
+        active.commit_turn(String::new(), false);
+
+        assert!(clipboard_path.exists());
+        assert_eq!(active.input_bar.pending_attachments().len(), 1);
+    }
+
     #[test]
     fn enqueue_dispatches_immediately_when_idle() {
         let mut s = state();
@@ -13044,9 +13001,15 @@ mod tests {
     }
 
     fn test_chat() -> (Chat, mpsc::Receiver<String>) {
+        test_chat_with_transport(crate::client::Transport::Local)
+    }
+
+    fn test_chat_with_transport(
+        transport: crate::client::Transport,
+    ) -> (Chat, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel::<String>(16);
         let rpc = Arc::new(RpcOutbound::new(tx));
-        let client = Arc::new(RpcClient::with_rpc(rpc));
+        let client = Arc::new(RpcClient::with_rpc_transport(rpc, transport));
         (Chat::new(client, PaneKind::Chat), rx)
     }
 

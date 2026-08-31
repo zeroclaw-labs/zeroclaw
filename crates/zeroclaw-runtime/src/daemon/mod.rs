@@ -641,7 +641,10 @@ pub async fn run(
     // RPC transports: Unix socket and WSS (remote TUI connections).
     // Build the shared RpcContext if either transport is configured.
     let socket_client_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let need_rpc_ctx = registry.has_socket_start() || registry.has_wss_start();
+    let need_rpc_ctx = registry.has_socket_start()
+        || registry.has_wss_start()
+        || registry.has_relay_start()
+        || registry.has_enroll_start();
 
     // Extract shared SOP engine from registry for RpcContext.
     let (sop_engine, sop_audit) = registry.take_sop_engine();
@@ -733,6 +736,36 @@ pub async fn run(
             }
         };
 
+        // THE certificate audit logger for this daemon iteration. Built once
+        // here and shared through RpcContext so enrollment, in-band renewal
+        // and the issued-cert ledger all append through a single Merkle-chain
+        // writer. A per-request logger recovers the same chain tip as its
+        // siblings and races them into duplicate sequence numbers, which makes
+        // `verify_chain` reject a file no single writer got wrong.
+        //
+        // Best-effort, like the ACP store above: a logger that cannot be
+        // constructed (e.g. `sign_events` with no usable signing key) leaves
+        // `cert_audit` unset, and the certificate paths then refuse to issue
+        // rather than issue untraceably.
+        let cert_audit: Option<std::sync::Arc<crate::security::audit::AuditLogger>> =
+            match crate::security::audit::AuditLogger::open_shared(
+                config.security.audit.clone(),
+                config.data_dir.clone(),
+            ) {
+                Ok(logger) => Some(logger),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "certificate audit logger unavailable: enrollment and certificate \
+                         renewal will refuse to issue"
+                    );
+                    None
+                }
+            };
+
         let hooks: Option<std::sync::Arc<crate::hooks::HookRunner>> = if config.hooks.enabled {
             Some(std::sync::Arc::new(crate::hooks::HookRunner::from_config(
                 &config.hooks,
@@ -765,6 +798,7 @@ pub async fn run(
             sop_engine,
             sop_audit,
             hooks,
+            cert_audit,
         }))
     } else {
         None
@@ -824,6 +858,56 @@ pub async fn run(
                 let ctx = rpc_ctx.clone();
                 let start = wss_start.clone();
                 let cancel = wss_cancel.clone();
+                let count = count.clone();
+                async move { start(ctx, cancel, count).await }
+            },
+        ));
+    }
+
+    // Relay bridge: keeps an outbound connection to a nominated relay so clients
+    // can reach this daemon through it. Supervised like the WSS listener; the
+    // starter parks when `[relay]` is disabled.
+    if let Some(relay_start) = registry.take_relay_start() {
+        let rpc_ctx = rpc_ctx
+            .clone()
+            .expect("rpc_ctx built when relay_start is Some");
+        let relay_start = std::sync::Arc::new(relay_start);
+        let relay_cancel = channels_cancel.clone();
+        let count = socket_client_count.clone();
+        handles.push(spawn_component_supervisor(
+            "relay",
+            initial_backoff,
+            max_backoff,
+            relay_cancel.clone(),
+            move || {
+                let ctx = rpc_ctx.clone();
+                let start = relay_start.clone();
+                let cancel = relay_cancel.clone();
+                let count = count.clone();
+                async move { start(ctx, cancel, count).await }
+            },
+        ));
+    }
+
+    // Certificate enrollment endpoint: the bootstrap surface a certless client
+    // reaches for its first cert. Supervised like the WSS listener; the starter
+    // parks when `[enroll]` is disabled.
+    if let Some(enroll_start) = registry.take_enroll_start() {
+        let rpc_ctx = rpc_ctx
+            .clone()
+            .expect("rpc_ctx built when enroll_start is Some");
+        let enroll_start = std::sync::Arc::new(enroll_start);
+        let enroll_cancel = channels_cancel.clone();
+        let count = socket_client_count.clone();
+        handles.push(spawn_component_supervisor(
+            "enroll",
+            initial_backoff,
+            max_backoff,
+            enroll_cancel.clone(),
+            move || {
+                let ctx = rpc_ctx.clone();
+                let start = enroll_start.clone();
+                let cancel = enroll_cancel.clone();
                 let count = count.clone();
                 async move { start(ctx, cancel, count).await }
             },

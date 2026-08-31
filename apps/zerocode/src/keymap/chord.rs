@@ -48,6 +48,23 @@ impl Chord {
                 == normalise_mods(event.code, event.modifiers)
     }
 
+    /// Whether two chords claim the same key event.
+    ///
+    /// Not `==`. [`matches`](Self::matches) compares platform-normalised
+    /// modifiers, so two chords that differ on the wire can still own one
+    /// event: on darwin `normalise_mods` rewrites `CONTROL` to `SUPER` for
+    /// every chord the host has not reserved, which makes `ctrl+a` and
+    /// `super+a` two entries in config and one chord at dispatch. Anything
+    /// deciding which of two chords owns a key asks this, or it arbitrates a
+    /// collision the dispatcher cannot see and leaves the loser advertised in
+    /// Help.
+    #[must_use]
+    pub fn same_key(&self, other: &Self) -> bool {
+        self.code == other.code
+            && normalise_mods(self.code, self.modifiers)
+                == normalise_mods(other.code, other.modifiers)
+    }
+
     /// `Ctrl+K` on most platforms; `⌘K` on darwin. On darwin, a
     /// host-reserved chord's control label is the literal word `Ctrl`
     /// (not the `⌘` glyph) and needs a separator to stay readable —
