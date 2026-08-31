@@ -247,9 +247,14 @@ Telegram.
   behavior as the text form `/model <hint>` on this sender. The picker never
   creates user- or agent-scoped overrides.
 - Route hints that would collide with the command flag syntax (`--user`,
-  `--agent`, or any `--flag`) are filtered out of the picker; use the text
-  command for those or fix the hint in `config.toml`. Unselectable options are
-  also skipped when the provider or target no longer resolves.
+  `--agent`, or any `--flag`) are filtered out of the picker. The text
+  command is not a fallback for them: `/model --user <hint>` and
+  `/model --agent <hint>` are broader-scope commands, and any other
+  leading `--flag` opens the help response. Rename or fix the hint in
+  `config.toml` instead, and use `/model <hint>` only for hints that
+  round-trip through the parser without being read as scope syntax.
+  Unselectable options are also skipped when the provider or target no
+  longer resolves.
 - The text alternatives remain available: `/model <hint>` for a session-scoped
   route, `/model --user <hint>` / `/model --agent <hint>` for the broader
   scopes (if permitted), and `/models <provider>` to list models of a provider.
