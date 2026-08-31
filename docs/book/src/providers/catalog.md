@@ -529,7 +529,7 @@ Crusoe Managed Inference example:
 
 ```toml
 [providers.models.crusoe.default]
-model   = "deepseek-ai/Deepseek-V4-Flash"   # bare Crusoe catalog ID; see /v1/models with a key set
+model   = "deepseek-ai/DeepSeek-V4-Flash"   # bare Crusoe catalog ID; see /v1/models with a key set
 api_key = "..."
 ```
 

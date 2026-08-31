@@ -1473,7 +1473,7 @@ mod crusoe_tests {
     fn crusoe_alias_round_trips_through_config() {
         let toml = r#"
 [providers.models.crusoe.default]
-model = "deepseek-ai/Deepseek-V4-Flash"
+model = "deepseek-ai/DeepSeek-V4-Flash"
 "#;
         let config: Config = toml::from_str(toml).expect("crusoe alias deserializes");
         let alias = config
@@ -1484,7 +1484,7 @@ model = "deepseek-ai/Deepseek-V4-Flash"
             .expect("crusoe.default present");
         assert_eq!(
             alias.base.model.as_deref(),
-            Some("deepseek-ai/Deepseek-V4-Flash")
+            Some("deepseek-ai/DeepSeek-V4-Flash")
         );
     }
 }
