@@ -5121,12 +5121,12 @@ mod tests {
 
     // ── Crusoe catalog / context-window boundary regression ────
     //
-    // The bot review (PR #9338, 2026-08-31) identified a missing boundary
-    // regression for the Crusoe catalog and context-window discovery paths.
-    // Crusoe has `MODELS_DEV_KEY = None`, so a configured credential forces
-    // the shared native `/models` path. This test pins the response contract
-    // (id-shaped entries, bearer auth, context_length field) so the three
-    // user-visible paths — `list_models`, `list_models_with_pricing`, and
+    // The bot review identified a missing boundary regression for the
+    // Crusoe catalog and context-window discovery paths. Crusoe has
+    // `MODELS_DEV_KEY = None`, so a configured credential forces the shared
+    // native `/models` path. This test pins the response contract (id-shaped
+    // entries, bearer auth, context_length field) so the three user-visible
+    // paths — `list_models`, `list_models_with_pricing`, and
     // `fetch_context_window` — cannot silently drift.
 
     /// Redacted Crusoe-shaped `/v1/models` response fixture.
