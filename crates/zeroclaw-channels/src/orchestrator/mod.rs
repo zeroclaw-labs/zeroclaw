@@ -26881,7 +26881,13 @@ BTC is currently around $65,000 based on latest tool output."#
     /// reported failure.
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn message_dispatch_late_revoked_model_picker_selection_stays_inert() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let mut ctx = channel_runtime_context_for_defaults_test(
             tmp.path(),
@@ -26956,7 +26962,13 @@ BTC is currently around $65,000 based on latest tool output."#
     /// past the early gate, so the gate cannot mask a missing late check.
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn runtime_command_late_revoked_model_picker_selection_does_not_mutate_route() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         let tmp = tempfile::TempDir::new().unwrap();
         let mut ctx = channel_runtime_context_for_defaults_test(
             tmp.path(),
@@ -27013,7 +27025,13 @@ BTC is currently around $65,000 based on latest tool output."#
 
     #[cfg(feature = "channel-telegram")]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn telegram_model_picker_username_change_updates_only_current_sender_session() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        #[cfg(feature = "channel-telegram")]
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         use wiremock::matchers::{body_partial_json, method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 

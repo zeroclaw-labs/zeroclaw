@@ -97,6 +97,21 @@ fn claim_lock(claim: &Arc<Mutex<ClaimState>>) -> MutexGuard<'_, ClaimState> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// Shared serialization boundary for every test that touches the
+/// process-global registry, in any module of this crate: the default test
+/// runner is parallel, and a global op such as [`clear_abandoned`] (or a
+/// purge under a paused clock) must never observe or destroy another
+/// test's in-flight registration.
+#[cfg(test)]
+static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn registry_test_lock() -> MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Lazily reclaim stale `Open` entries older than
 /// [`DELIVERY_ACK_ENTRY_TTL`]. A stale `Open` entry is always an orphan:
 /// the callback's ack wait is bounded at 5s, so no live queued message can
@@ -322,15 +337,12 @@ mod tests {
 
     use super::ClaimState;
 
-    /// The registry is process-global, so every test in this module
-    /// serializes on this lock: a concurrently running test must not purge
-    /// or observe another test's entries (the default runner is parallel).
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
+    /// Every test in this module serializes on the crate-wide registry
+    /// test lock shared with the Telegram and orchestrator picker tests:
+    /// a concurrently running test must not purge or clear another test's
+    /// entries (the default runner is parallel).
     fn test_lock() -> MutexGuard<'static, ()> {
-        TEST_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        super::registry_test_lock()
     }
 
     fn is_registered(message_id: &str) -> bool {

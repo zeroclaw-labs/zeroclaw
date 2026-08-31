@@ -2011,15 +2011,33 @@ impl TelegramChannel {
                             .await;
                         }
                         crate::model_picker_delivery::RevokeOutcome::AlreadyApplied => {
-                            tokio::join!(
-                                self.disable_model_picker_keyboard(callback),
+                            // With a live queue the missing registration
+                            // means the route mutation really did run. If
+                            // the queue is already closed, the registration
+                            // was reclaimed by teardown (`clear_abandoned`)
+                            // while this callback was still in flight — the
+                            // route can never apply, so report unavailability
+                            // instead of a phantom queued state.
+                            if tx.is_closed() {
+                                self.restore_model_picker_keyboard(previous_keyboard).await;
                                 self.answer_model_picker_callback(
                                     callback_id,
                                     i18n::get_required_cli_string(
-                                        "channel-telegram-model-picker-queued",
+                                        "channel-telegram-model-picker-unavailable",
                                     ),
-                                ),
-                            );
+                                )
+                                .await;
+                            } else {
+                                tokio::join!(
+                                    self.disable_model_picker_keyboard(callback),
+                                    self.answer_model_picker_callback(
+                                        callback_id,
+                                        i18n::get_required_cli_string(
+                                            "channel-telegram-model-picker-queued",
+                                        ),
+                                    ),
+                                );
+                            }
                         }
                     }
                 }
@@ -8350,7 +8368,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn model_picker_full_control_queue_does_not_consume_selection_token() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8681,7 +8704,12 @@ mod tests {
     /// the one-shot selection token must survive and the callback answers
     /// with the "unavailable" string instead of confirming the switch.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn model_picker_closed_control_queue_does_not_consume_selection_token() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8755,7 +8783,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn model_picker_selection_queues_existing_model_command_and_consumes_keyboard() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8865,7 +8898,12 @@ mod tests {
     /// be restored, and the callback must answer `unavailable` — never
     /// `queued` for a selection that was silently discarded.
     #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)]
     async fn model_picker_post_enqueue_shutdown_restores_picker_and_reports_unavailable() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -8967,7 +9005,12 @@ mod tests {
     /// the late dispatch observes `take_revoked` and leaves it inert
     /// instead of applying the route change after the UI reported failure.
     #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)]
     async fn model_picker_ack_timeout_revokes_selection_and_restores_picker() {
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -9059,6 +9102,100 @@ mod tests {
             "timed-out selection must be marked revoked for the late dispatch"
         );
         assert!(!crate::model_picker_delivery::take_revoked(&message.id));
+    }
+
+    /// The forced-teardown boundary: the queue accepted the selection, but
+    /// the runtime receiver is dropped before consumption and
+    /// `clear_abandoned` reclaims the registry while the callback is still
+    /// in its acknowledgement wait. The callback must not report `queued`
+    /// for a route that can never apply: `revoke` observes the reclaimed
+    /// registration as `AlreadyApplied`, and the closed queue downgrades
+    /// the answer to `unavailable` with the picker cohort restored.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::await_holding_lock)]
+    async fn model_picker_teardown_clears_inflight_ack_and_reports_unavailable() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Serialize on the crate-wide registry test lock: the picker
+        // delivery-ack registry is process-global (see
+        // `model_picker_delivery::registry_test_lock`).
+        let _registry_guard = crate::model_picker_delivery::registry_test_lock();
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/answerCallbackQuery$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "main",
+            Arc::new(|| vec!["test_user".into()]),
+            false,
+        )
+        .with_persistence(Arc::new(RwLock::new(model_picker_config())))
+        .with_api_base(server.uri());
+        let token = uuid::Uuid::new_v4().to_string();
+        channel
+            .insert_pending_model_picker_batch(vec![(
+                token.clone(),
+                PendingModelPicker {
+                    created_at: Instant::now(),
+                    expires_at: Instant::now() + TELEGRAM_MODEL_PICKER_TTL,
+                    requesting_user_id: "123".into(),
+                    reply_target: "-10042:9".into(),
+                    thread_ts: Some("9".into()),
+                    channel_alias: "main".into(),
+                    picker_message_id: 77,
+                    owner_agent_alias: "assistant".into(),
+                    current: ModelPickerSelection {
+                        model_provider: "openai.primary".into(),
+                        model: "gpt-current".into(),
+                    },
+                    runtime_routes: model_picker_runtime_routes(&model_picker_config()),
+                    action: ModelPickerAction::Select(ModelPickerOption {
+                        hint: "fast".into(),
+                        model_provider: "openai.fast".into(),
+                        model: "gpt-fast".into(),
+                    }),
+                },
+            )])
+            .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        let callback = model_picker_callback(&token, "test_user", -10042, 9, 77);
+        let ((), _queued) = tokio::join!(
+            channel.handle_model_picker_callback(&callback, &tx),
+            async {
+                // The accepted-enqueue boundary: the selection reached the
+                // queue, then the receiver dies before consumption and the
+                // teardown sweep reclaims the registry mid-wait.
+                let queued = rx.recv().await.expect("selection must enter the queue");
+                drop(rx);
+                crate::model_picker_delivery::clear_abandoned();
+                queued
+            }
+        );
+
+        assert!(
+            channel
+                .pending_model_pickers
+                .lock()
+                .await
+                .contains_key(&token),
+            "picker cohort must be restored when teardown kills the queue mid-wait"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let answer: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(
+            answer["text"],
+            i18n::get_required_cli_string("channel-telegram-model-picker-unavailable"),
+            "a selection whose queue died before consumption must not report queued"
+        );
     }
 
     #[test]
