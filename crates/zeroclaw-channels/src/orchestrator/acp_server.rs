@@ -1708,6 +1708,40 @@ impl AcpServer {
         };
 
         if was_cancelled {
+            // Persist the authoritative trimmed history even for cooperative/
+            // hard cancellations that occurred after the loop trimmed. The
+            // cancelled delta is empty, so a delta-append would leave the
+            // durable store with the pre-trim transcript.
+            if let Some(store) = &self.store {
+                let store = store.clone();
+                let sid = session_id.clone();
+                let (full_history, crumb_present) = {
+                    let session = session_arc_for_breadcrumb.lock().await;
+                    (
+                        session.agent.history().to_vec(),
+                        session.agent.history_has_trim_breadcrumb(),
+                    )
+                };
+                let persisted = tokio::task::spawn_blocking(move || {
+                    store.replace_messages(&sid, &full_history)?;
+                    store.set_trim_breadcrumb(&sid, crumb_present)
+                })
+                .await;
+                if let Some(detail) = match persisted {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(join) => Some(join.to_string()),
+                } {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Channel)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({ "error": detail })),
+                        "Failed to persist cancelled turn; session continues in memory"
+                    );
+                }
+            }
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete).with_category(::zeroclaw_log::EventCategory::Channel)
@@ -1723,15 +1757,51 @@ impl AcpServer {
             return Ok(Self::cancelled_prompt_result(session_id, &accumulated_text));
         }
 
+        // Persist authoritative state even for failures that happened after a
+        // trim. The error delta may be empty, but the live agent has already
+        // dropped turns.
+        if turn_result.is_err() {
+            if let Some(store) = &self.store {
+                let store = store.clone();
+                let sid = session_id.clone();
+                let (full_history, crumb_present) = {
+                    let session = session_arc_for_breadcrumb.lock().await;
+                    (
+                        session.agent.history().to_vec(),
+                        session.agent.history_has_trim_breadcrumb(),
+                    )
+                };
+                let persisted = tokio::task::spawn_blocking(move || {
+                    store.replace_messages(&sid, &full_history)?;
+                    store.set_trim_breadcrumb(&sid, crumb_present)
+                })
+                .await;
+                if let Some(detail) = match persisted {
+                    Ok(Ok(())) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(join) => Some(join.to_string()),
+                } {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_category(::zeroclaw_log::EventCategory::Channel)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({ "error": detail })),
+                        "Failed to persist failed turn; session continues in memory"
+                    );
+                }
+            }
+        }
+
         let (result_text, new_turn_msgs) = turn_result.map_err(|e| {
             let (diagnostic, rpc_error) = acp_turn_failure(&e);
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_category(::zeroclaw_log::EventCategory::Channel)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({
-                    "error": diagnostic,
-                })),
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "error": diagnostic,
+                    })),
                 "ACP session/prompt turn failed"
             );
             rpc_error

@@ -5374,26 +5374,19 @@ fn context_usage_max_tokens(cfg: &zeroclaw_config::schema::Config, agent_alias: 
 }
 
 /// Replace the durable ACP transcript with the agent's own authoritative
-/// post-turn history, as one state with its breadcrumb flag. Empty and
-/// failed turns intentionally remain no-ops (matching the prior append-only
-/// behavior) — `outcome` only gates *whether* this turn produced anything to
-/// persist; the write itself always uses `full_history`, the caller's
-/// snapshot of `agent.history()` taken after this turn's trimming, rather
-/// than appending only this turn's delta on top of a transcript the agent's
-/// loop may have already trimmed underneath it.
+/// post-turn history, as one state with its breadcrumb flag. This is invoked
+/// for every terminal outcome — completed, cancelled (even with an empty
+/// delta), and failed — because the live agent may have already trimmed
+/// older turns before the turn was cancelled or failed. Persisting only a
+/// delta would leave the durable store with the pre-trim transcript that the
+/// next restore would resurrect.
 async fn persist_acp_turn(
     store: &Arc<zeroclaw_infra::acp_session_store::AcpSessionStore>,
     session_id: &str,
-    outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
+    _outcome: &Result<TurnOutcome, crate::rpc::turn::TurnError>,
     full_history: Vec<ConversationMessage>,
     trim_breadcrumb: bool,
 ) -> Option<String> {
-    match outcome {
-        Ok(TurnOutcome::Completed { messages, .. })
-        | Ok(TurnOutcome::Cancelled { messages, .. })
-            if !messages.is_empty() => {}
-        _ => return None,
-    }
     let store = Arc::clone(store);
     let session_id = session_id.to_string();
     match tokio::task::spawn_blocking(move || {

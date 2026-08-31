@@ -6723,11 +6723,19 @@ async fn process_channel_message_body(
                 // A fresh v2 session that happens to start with the
                 // breadcrumb text will have an explicit `false` entry after
                 // its first turn, so it will not be misclassified here.
+                // Migration is locale-independent: check the canonical English
+                // breadcrumb (stable across locales) plus the current-locale
+                // string, covering both the historical value and any future
+                // translation. This is best-effort for unmarked legacy state;
+                // a genuine user message that collides with the breadcrumb on
+                // its one-time v1 migration will be misclassified until the
+                // next persist upgrades it to v2.
                 let leading_system = history.iter().take_while(|m| m.role == "system").count();
                 if let Some(first) = history.get(leading_system) {
-                    let crumb =
-                        zeroclaw_runtime::i18n::get_required_cli_string("history-trim-breadcrumb");
-                    first.role == "user" && first.content == crumb
+                    first.role == "user"
+                        && zeroclaw_runtime::agent::history::is_history_trim_breadcrumb_text(
+                            &first.content,
+                        )
                 } else {
                     false
                 }

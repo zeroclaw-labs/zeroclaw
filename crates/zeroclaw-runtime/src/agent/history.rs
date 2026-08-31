@@ -421,11 +421,40 @@ pub fn load_interactive_session_history(
     Ok(history)
 }
 
+/// Canonical breadcrumb text used for trim markers. This is the English
+/// string that has been stable across all locales; it is the locale-
+/// independent anchor for legacy migration. Injected breadcrumbs are always
+/// produced via `get_required_cli_string("history-trim-breadcrumb")`, which
+/// currently resolves to this same English text in every locale. Checking
+/// the canonical value makes restore independent of the current process
+/// locale.
+pub const HISTORY_TRIM_BREADCRUMB_CANONICAL: &str =
+    "[earlier turns omitted to fit the context window]";
+
+pub fn is_history_trim_breadcrumb_text(text: &str) -> bool {
+    if text == HISTORY_TRIM_BREADCRUMB_CANONICAL {
+        return true;
+    }
+    // Best-effort cross-locale coverage: if a future translation changes the
+    // breadcrumb in a non-English locale, a legacy v1 file trimmed in that
+    // locale will still be recognised after a restart with a different locale.
+    // v2 files carry an explicit flag and never reach this path.
+    text == crate::i18n::get_required_cli_string("history-trim-breadcrumb")
+}
+
 /// Load interactive history plus the persisted breadcrumb provenance. Legacy
 /// files without the flag are migrated by inspecting the restored history:
 /// if the first non-system message equals the breadcrumb string, the flag is
-/// recovered as true. This keeps the crumb classification authoritative
-/// across restarts and locale-pinned English breadcrumb text.
+/// recovered as true. v2 records carry an explicit
+/// `history_has_trim_breadcrumb` (true or false) so a genuine user message
+/// that collides with the breadcrumb text keeps its real turn-boundary role.
+/// Legacy v1 migration is locale-independent: it checks the canonical
+/// English breadcrumb plus the current-locale string, covering both the
+/// stable historical value and any future translated variant. A v1 file whose
+/// first user turn genuinely equals the breadcrumb text cannot be
+/// distinguished from a synthetic marker on its one-time migration; after the
+/// next persist the file becomes v2 with the (mis)classified flag, which is
+/// the documented one-time limitation for unmarked legacy state.
 pub fn load_interactive_session_history_with_crumb(
     path: &Path,
     system_prompt: &str,
@@ -461,9 +490,7 @@ pub fn load_interactive_session_history_with_crumb(
             .take_while(|m| m.role == "system")
             .count();
         if let Some(first) = state.history.get(leading_system) {
-            let breadcrumb_content =
-                crate::i18n::get_required_cli_string("history-trim-breadcrumb");
-            if first.role == "user" && first.content == breadcrumb_content {
+            if first.role == "user" && is_history_trim_breadcrumb_text(&first.content) {
                 has_crumb = true;
             }
         }

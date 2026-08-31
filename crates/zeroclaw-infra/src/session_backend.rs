@@ -231,13 +231,16 @@ pub trait SessionBackend: Send + Sync {
     }
 
     /// Replace a session's durable transcript and its breadcrumb provenance
-    /// together, as one authoritative post-turn state. Callers that own a
-    /// trimmed in-memory history (the agent's loop history after budget
-    /// enforcement) must call this instead of appending only the turn's
-    /// delta: appending on top of a transcript the loop already trimmed lets
-    /// the store resurrect turns the live agent dropped, and writing the
-    /// breadcrumb flag separately from the transcript it describes leaves a
-    /// window where a reader sees one without the other.
+    /// with the agent's authoritative post-turn state. Callers that own a
+    /// trimmed in-memory history must use this instead of appending only the
+    /// turn's delta. The default implementation performs two separate writes
+    /// (`rewrite_messages` then `set_session_trim_breadcrumb`); they are
+    /// serialized under the caller's lock (channel per-sender lock or the
+    /// store's mutation guard) so concurrent turns cannot interleave, but the
+    /// pair is not crash-atomic. A crash between the two writes can leave
+    /// transcript and flag temporarily out of sync, recoverable on the next
+    /// trim. Backends that can provide a transaction (e.g. SQLite) should
+    /// override this to make the pair atomic.
     fn replace_conversation_state(
         &self,
         session_key: &str,

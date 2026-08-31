@@ -73,8 +73,10 @@ impl SessionStore {
     }
 
     /// Persist whether the session's transcript starts with the synthetic
-    /// trim breadcrumb.
+    /// trim breadcrumb. Respects the migration fence: fails if the JSONL
+    /// store has been migrated to SQLite.
     pub fn set_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
+        let _guard = self.mutation_guard()?;
         std::fs::write(
             self.trim_breadcrumb_path(session_key),
             if present { b"1" as &[u8] } else { b"0" },
@@ -240,15 +242,22 @@ impl SessionStore {
         Ok(count)
     }
 
-    /// Delete a regular session JSONL file. Returns `true` if the file existed.
+    /// Delete a session's JSONL file and its breadcrumb sidecar. Returns
+    /// `true` if either file existed. The sidecar is removed even when the
+    /// transcript file is already absent (or not a regular JSONL session
+    /// file) so stale provenance cannot affect a later session that reuses
+    /// the same key.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         let _guard = self.mutation_guard()?;
         let path = self.session_path(session_key);
+        let crumb_path = self.trim_breadcrumb_path(session_key);
         if !is_regular_jsonl_session_file(&path) {
-            return Ok(false);
+            let had_crumb = crumb_path.exists();
+            let _ = std::fs::remove_file(&crumb_path);
+            return Ok(had_crumb);
         }
         std::fs::remove_file(&path)?;
-        let _ = std::fs::remove_file(self.trim_breadcrumb_path(session_key));
+        let _ = std::fs::remove_file(crumb_path);
         Ok(true)
     }
 
@@ -383,11 +392,34 @@ impl SessionBackend for SessionStore {
     }
 
     fn rewrite_messages(&self, session_key: &str, messages: &[ChatMessage]) -> std::io::Result<()> {
+        let _guard = self.mutation_guard()?;
         self.rewrite(session_key, messages)
     }
 
     fn set_session_trim_breadcrumb(&self, session_key: &str, present: bool) -> std::io::Result<()> {
         self.set_trim_breadcrumb(session_key, present)
+    }
+
+    fn replace_conversation_state(
+        &self,
+        session_key: &str,
+        messages: &[ChatMessage],
+        breadcrumb_present: bool,
+    ) -> std::io::Result<()> {
+        // Hold the migration fence across both writes so a concurrent
+        // migration cannot interleave, and the transcript+flag pair is not
+        // observed partially. Still not crash-atomic (two files) — a crash
+        // between the writes can leave them out of sync.
+        let _guard = self.mutation_guard()?;
+        self.rewrite(session_key, messages)?;
+        std::fs::write(
+            self.trim_breadcrumb_path(session_key),
+            if breadcrumb_present {
+                b"1" as &[u8]
+            } else {
+                b"0"
+            },
+        )
     }
 
     fn get_session_trim_breadcrumb(&self, session_key: &str) -> std::io::Result<Option<bool>> {

@@ -1414,48 +1414,41 @@ async fn process_chat_message(
     };
 
     if was_cancelled {
-        if let Some(ref backend) = state.session_backend {
-            let still_exists = backend.session_exists(session_key);
-            if still_exists {
-                match &result {
-                    Err(error) if !error.new_messages.is_empty() => {
-                        persist_agent_conversation_state(backend.as_ref(), session_key, agent);
-                        if !has_assistant_chat_message(&error.new_messages) {
-                            let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                                "turn-interrupted-by-user",
-                            );
-                            let truncated = if accumulated_text.is_empty() {
-                                marker
-                            } else {
-                                format!("{accumulated_text}\n\n{marker}")
-                            };
-                            let assistant_msg =
-                                zeroclaw_providers::ChatMessage::assistant(&truncated);
-                            // Re-check before the raw append — the user can
-                            // delete the session between the outer check and
-                            // here; `persist_conversation_messages` already
-                            // re-checks internally.
-                            if backend.session_exists(session_key) {
-                                let _ = backend.append(session_key, &assistant_msg);
-                            }
-                        }
-                    }
-                    _ => {
-                        let marker = zeroclaw_runtime::i18n::get_required_cli_string(
-                            "turn-interrupted-by-user",
-                        );
-                        let truncated = if accumulated_text.is_empty() {
-                            marker
-                        } else {
-                            format!("{accumulated_text}\n\n{marker}")
-                        };
-                        let assistant_msg = zeroclaw_providers::ChatMessage::assistant(&truncated);
-                        if backend.session_exists(session_key) {
-                            let _ = backend.append(session_key, &assistant_msg);
-                        }
-                    }
-                }
-            }
+        if let Some(ref backend) = state.session_backend
+            && backend.session_exists(session_key)
+        {
+            // Persist the agent's authoritative post-turn history as one state,
+            // even when the turn produced noDelta or was hard-cancelled. The
+            // live agent may have already trimmed older turns before the
+            // cancellation was observed; persisting only a delta marker would
+            // leave the durable store with the pre-trim transcript that the
+            // next restore would resurrect.
+            let needs_marker = match &result {
+                Err(error) => !has_assistant_chat_message(&error.new_messages),
+                Ok(_) => false,
+                _ => true,
+            };
+            let durable = if needs_marker {
+                let marker =
+                    zeroclaw_runtime::i18n::get_required_cli_string("turn-interrupted-by-user");
+                let truncated = if accumulated_text.is_empty() {
+                    marker
+                } else {
+                    format!("{accumulated_text}\n\n{marker}")
+                };
+                let mut d = zeroclaw_providers::durable_chat_messages(agent.history());
+                d.push(zeroclaw_providers::ChatMessage::assistant(&truncated));
+                d
+            } else {
+                zeroclaw_providers::durable_chat_messages(agent.history())
+            };
+            let crumb = agent.history_has_trim_breadcrumb();
+            replace_conversation_state_unless_deleted(
+                backend.as_ref(),
+                session_key,
+                &durable,
+                crumb,
+            );
         }
 
         // Inform the client the turn was aborted
@@ -1603,9 +1596,7 @@ async fn process_chat_message(
             );
         }
         Err(e) => {
-            if let Some(ref backend) = state.session_backend
-                && !e.new_messages.is_empty()
-            {
+            if let Some(ref backend) = state.session_backend {
                 persist_agent_conversation_state(backend.as_ref(), session_key, agent);
             }
 
