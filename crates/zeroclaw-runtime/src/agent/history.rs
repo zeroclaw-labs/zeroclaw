@@ -489,10 +489,11 @@ pub fn load_interactive_session_history_with_crumb(
             .iter()
             .take_while(|m| m.role == "system")
             .count();
-        if let Some(first) = state.history.get(leading_system) {
-            if first.role == "user" && is_history_trim_breadcrumb_text(&first.content) {
-                has_crumb = true;
-            }
+        if let Some(first) = state.history.get(leading_system)
+            && first.role == "user"
+            && is_history_trim_breadcrumb_text(&first.content)
+        {
+            has_crumb = true;
         }
     }
 
