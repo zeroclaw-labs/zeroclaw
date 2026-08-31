@@ -977,6 +977,11 @@ sop-rpc-decision-unauthorized = L’identité RPC n’est pas autorisée à rés
 sop-rpc-policy-missing = La politique d’approbation SOP « {$name} » n’est pas configurée.
 sop-rpc-policy-unavailable = La politique du SOP en attente est indisponible : {$reason}.
 
+# ── Approbation des outils dans le terminal ──
+# Les raccourcis ASCII restent alignés sur l'analyseur de réponses Rust.
+cli-approval-request = 🔧 L'agent veut exécuter : {$tool}
+cli-approval-prompt = { "   " }[Y] Oui / [N] Non / [A] Toujours pour {$tool} :{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply
@@ -1001,6 +1006,7 @@ channel-telegram-approval-ack-approved = Approuvé
 channel-telegram-approval-ack-always-approved = Toujours approuvé
 channel-telegram-approval-ack-denied = Refusé
 channel-telegram-approval-ack-unknown = Action inconnue
+channel-telegram-approval-ack-already-resolved = Approbation déjà résolue
 channel-discord-approval-btn-allow-once = Autoriser une fois
 channel-discord-approval-btn-allow-session = Autoriser pour cette session
 channel-discord-approval-btn-allow-always = Toujours autoriser
@@ -1009,3 +1015,21 @@ channel-approval-opt-allow-once = Autoriser une fois
 channel-approval-opt-allow-always = Toujours autoriser
 channel-approval-opt-reject = Rejeter
 channel-approval-opt-reject-with-edit = Rejeter avec modification
+cli-agent-error-provider-context-window = La requête est trop volumineuse pour le modèle sélectionné. Réduisez la conversation ou choisissez un modèle avec une fenêtre de contexte plus grande.
+cli-agent-error-provider-credentials-missing = Le fournisseur de modèle sélectionné n'a aucun identifiant configuré. Ajoutez sa clé API ou choisissez un autre fournisseur.
+cli-agent-error-provider-credentials-missing-named = Le fournisseur de modèle {$provider} n'a aucun identifiant configuré. Ajoutez sa clé API ou choisissez un autre fournisseur.
+cli-agent-error-provider-authentication = Le fournisseur de modèle sélectionné a refusé ses identifiants. Vérifiez les identifiants configurés.
+cli-agent-error-provider-authentication-named = Le fournisseur de modèle {$provider} a refusé ses identifiants. Vérifiez les identifiants configurés.
+cli-agent-error-provider-rate-limited = Le fournisseur de modèle sélectionné a limité la requête. Attendez, vérifiez le quota ou choisissez un autre fournisseur.
+cli-agent-error-provider-server = Le fournisseur de modèle sélectionné a renvoyé une erreur serveur. Réessayez ou choisissez un autre fournisseur.
+cli-agent-error-provider-model-not-found = Le modèle sélectionné est indisponible. Vérifiez le nom de modèle configuré.
+cli-agent-error-provider-client-request = Le fournisseur de modèle sélectionné a refusé la requête. Vérifiez la configuration du fournisseur et la requête.
+cli-agent-error-provider-connection-local = Le serveur de modèle local à {$endpoint} est indisponible. Démarrez-le ou mettez à jour le point de terminaison.
+cli-agent-error-provider-connection-remote = Impossible d'atteindre le fournisseur de modèle à {$endpoint}. Vérifiez l'accès réseau ou choisissez un autre fournisseur.
+cli-agent-error-provider-connection = Impossible d'atteindre le fournisseur de modèle sélectionné. Vérifiez l'accès réseau ou choisissez un autre fournisseur.
+cli-agent-error-provider-timeout = Le fournisseur de modèle sélectionné a expiré. Réessayez ou choisissez un autre fournisseur.
+cli-agent-error-provider-generic = Le fournisseur de modèle sélectionné a échoué. Vérifiez la configuration du fournisseur ou choisissez un autre fournisseur.
+cli-delegate-error-invalid-semantic-completion = L'agent '{$agent_name}' a échoué : le fournisseur de modèle a renvoyé une réponse sémantique non valide.
+cli-agent-error-invalid-semantic-completion = Le fournisseur de modèle a renvoyé une réponse sémantique non valide.
+cli-delegate-error-incomplete-after-provider-tools = L'agent '{$agent_name}' a échoué : le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.
+cli-agent-error-incomplete-after-provider-tools = Le fournisseur de modèle s'est arrêté après l'exécution des outils sans fournir de réponse finale.

@@ -3224,12 +3224,15 @@ mod tests {
             .await
             .expect_err("an existing same-port webhook must be rejected");
 
-        assert!(errors.iter().any(|error| {
-            error.field == "channels[0].fields.port"
-                && error.message
-                    == "webhook port 8090 is already used by enabled webhook `already-active` — \
-                        each enabled webhook needs its own port"
-        }));
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.port"
+                    && error.message.contains("8090")
+                    && error.message.contains("already-active")
+            }),
+            "localized port conflict must preserve its field and parameters: {errors:?}"
+        );
         let after = std::fs::read_to_string(&config.config_path).unwrap();
         assert_eq!(
             after, before,
@@ -3318,12 +3321,12 @@ mod tests {
 
         assert!(
             errors.iter().any(|error| {
-                error.field == "channels[0].fields.port"
-                    && error.message
-                        == "webhook port 8090 is already used by enabled webhook `existing` — \
-                            each enabled webhook needs its own port"
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.port"
+                    && error.message.contains("8090")
+                    && error.message.contains("existing")
             }),
-            "CLI surface must render the localized conflict string; got {errors:?}"
+            "localized port conflict must preserve its field and parameters; got {errors:?}"
         );
     }
 
@@ -3340,10 +3343,14 @@ mod tests {
         let errors = validate_only_with_surface(&submission, &cfg, Surface::Cli)
             .expect_err("empty webhook secret must be rejected");
 
-        assert!(errors.iter().any(|error| {
-            error.field == "channels[0].fields.secret"
-                && error.message == "Webhook shared secret is required"
-        }));
+        assert!(
+            errors.iter().any(|error| {
+                error.step == QuickstartStep::Channels
+                    && error.field == "channels[0].fields.secret"
+                    && !error.message.trim().is_empty()
+            }),
+            "localized webhook secret validation must preserve its field: {errors:?}"
+        );
     }
 
     #[test]

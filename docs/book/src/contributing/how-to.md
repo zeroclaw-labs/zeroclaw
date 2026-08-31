@@ -113,11 +113,9 @@ feat(scope): short description
 
 Body uses the PR template. **The testing section is required**: explain how the change was checked, and paste the checks that match the change. The reviewer-run A/B recipe under `How you can test` is only needed when manual verification adds useful signal; mark it `N/A` for docs-only, pure-refactor, or trivial changes without a meaningful reviewer test path. For docs-only PRs, use `scripts/ci/docs_quality_gate.sh` and `scripts/ci/docs_links_gate.sh` or explain why link checking had no added links to inspect. For Rust/code PRs, use the evidence that matches the changed surface: required CI checks, focused crate or regression tests, manual smoke, or full workspace checks when broad coverage proves something narrower evidence would miss. Fresh required CI is enough when it covers the changed surface; extra local Cargo is not required just to duplicate the same head, target, and feature set. Add more evidence when the PR depends on a known CI coverage gap: platform-specific tests, cross-platform lint, desktop app coverage, release target builds, stale CI, or unavailable CI. "It works on my machine" is not evidence.
 
-Risk labels:
+Risk labels describe the actual change and consequence, not its broad path. Follow the [maintainer label guide](../maintainers/labels.md#risk-labels): `risk:low` is documentation, fixtures, or mechanical metadata with no production, compatibility, build, release, or governance effect; `risk:medium` is ordinary behavioral work; and `risk:high` is a concrete trust, credential, compatibility, governance, or release-authority boundary. `domain:security` is independent from `risk:*` and identifies an effective security boundary.
 
-- `risk:low`: rollback is a revert; no user action needed
-- `risk:medium`: users may need to update config / env / CLI usage; rollback plan required
-- `risk:high`: security-critical, schema changes, breaking behaviour. Rollback plan, feature flag, and observable failure symptoms required
+A PR carrying either `risk:high` or `domain:security` needs deep review, a rollback plan matched to the change, and two independent Core Team approvals before merge. Use `risk:manual` when a maintainer needs to freeze future automatic risk replacement; it cannot lower the review requirement.
 
 ## After the PR
 

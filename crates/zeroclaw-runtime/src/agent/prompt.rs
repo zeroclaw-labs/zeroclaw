@@ -9,6 +9,12 @@ use std::fmt::Write;
 use std::path::Path;
 use zeroclaw_config::schema::IdentityConfig;
 
+pub(crate) const TIMESTAMP_ORIENTATION: &str = "This is an interactive conversation with a user; a leading `[CURRENT DATE & TIME: ...]` line on their message is timestamp metadata added by the runtime, not log or API data — treat it as an ordinary conversational message and respond naturally and directly.\n\n";
+
+pub(crate) fn append_timestamp_orientation(prompt: &mut String) {
+    prompt.push_str(TIMESTAMP_ORIENTATION);
+}
+
 pub struct PromptContext<'a> {
     pub workspace_dir: &'a Path,
     pub agent_workspace_dir: &'a Path,

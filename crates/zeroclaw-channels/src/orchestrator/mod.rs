@@ -135,9 +135,29 @@ type CronChannelRegistry = Arc<HashMap<String, Arc<dyn Channel>>>;
 
 /// Live channel registry consulted by `deliver_announcement` so cron sends reuse the
 /// authenticated channel instance (Matrix E2EE can't tolerate per-send session restore).
-/// Replaced wholesale by each `start_channels` call.
+/// Replaced wholesale by the active channel task and cleared when that task ends.
 static CRON_CHANNEL_REGISTRY: std::sync::RwLock<Option<CronChannelRegistry>> =
     std::sync::RwLock::new(None);
+
+/// Owns one published registry generation for the lifetime of its channel task.
+/// A stale task must not clear a newer task's replacement when it finally exits.
+struct CronChannelRegistryLease {
+    published: CronChannelRegistry,
+}
+
+impl Drop for CronChannelRegistryLease {
+    fn drop(&mut self) {
+        let mut current = CRON_CHANNEL_REGISTRY
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if current
+            .as_ref()
+            .is_some_and(|registry| Arc::ptr_eq(registry, &self.published))
+        {
+            *current = Some(Arc::new(HashMap::new()));
+        }
+    }
+}
 
 /// Observer wrapper that forwards tool-call events to a channel sender
 /// for real-time threaded notifications.
@@ -484,7 +504,7 @@ struct ChannelRuntimeContext {
     prompt_config: Arc<zeroclaw_config::schema::Config>,
     memory: Arc<dyn Memory>,
     memory_strategy: Arc<dyn MemoryStrategy>,
-    tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry>,
     observer: Arc<dyn Observer>,
     system_prompt: Arc<String>,
     model: Arc<String>,
@@ -596,13 +616,22 @@ impl InFlightTaskCompletion {
     }
 }
 
-fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    // Include thread_ts for per-topic memory isolation in forum groups
+fn conversation_memory_key_in_scope(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel_scope: &str,
+) -> String {
+    // Preserve the established autosave identity shape. Only the channel
+    // scope is resolved separately so multi-listener webhooks can add the
+    // alias without changing the rest of the operator-visible key.
     let raw = match &msg.thread_ts {
-        Some(tid) => format!("{}_{}_{}_{}", msg.channel, tid, msg.sender, msg.id),
-        None => format!("{}_{}_{}", msg.channel, msg.sender, msg.id),
+        Some(tid) => format!("{channel_scope}_{tid}_{}_{}", msg.sender, msg.id),
+        None => format!("{channel_scope}_{}_{}", msg.sender, msg.id),
     };
     sanitize_session_key(&raw)
+}
+
+fn conversation_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    conversation_memory_key_in_scope(msg, &msg.channel)
 }
 
 /// The channel prefix used in session/route keys: the channel type plus the
@@ -615,8 +644,10 @@ fn channel_scope(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     }
 }
 
-pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
-    let channel_scope = channel_scope(msg);
+fn conversation_history_key_in_scope(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel_scope: &str,
+) -> String {
     let thread_scope = match msg.thread_ts.as_deref() {
         // Matrix thread_ts is a delivery anchor, not a topic boundary: root
         // and follow-ups must share one sender+room session.
@@ -635,6 +666,46 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
         }
     };
     sanitize_session_key(&raw)
+}
+
+pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
+    conversation_history_key_in_scope(msg, &channel_scope(msg))
+}
+
+/// Resolve the history namespace from the live channel registry.
+///
+/// Webhook inbound messages always retain their configured alias for owner
+/// routing. A sole active webhook also has the registry's canonical bare
+/// `webhook` entry, which preserves the pre-alias history namespace. Multiple
+/// active webhooks have only composite entries and therefore remain isolated.
+fn runtime_conversation_history_key(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> String {
+    if msg.channel == "webhook" && ctx.channels_by_name.contains_key("webhook") {
+        conversation_history_key_in_scope(msg, &msg.channel)
+    } else {
+        conversation_history_key(msg)
+    }
+}
+
+/// Resolve durable autosave identity from the live channel registry.
+///
+/// Existing unaliased channels and a sole webhook retain the established key
+/// shape. A multi-webhook registry has no bare `webhook` entry, so only that
+/// collision-prone case adds the trusted listener alias to the channel scope.
+fn runtime_conversation_memory_key(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> String {
+    if msg.channel == "webhook"
+        && msg.channel_alias.is_some()
+        && !ctx.channels_by_name.contains_key("webhook")
+    {
+        conversation_memory_key_in_scope(msg, &channel_scope(msg))
+    } else {
+        conversation_memory_key(msg)
+    }
 }
 
 fn scope_override_key(
@@ -913,6 +984,9 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
         "whatsapp" | "whatsapp-web" => Some(
             "When responding on WhatsApp Web:\n\
              - Be concise and direct\n\
+             - WhatsApp has its own formatting syntax and does not render Markdown. Use *single asterisks* for bold, _underscores_ for italic, and ~tildes~ for strikethrough.\n\
+             - Do not use **double asterisks**, # headers, or [label](url) Markdown links: WhatsApp renders none of them, so the raw characters reach the reader as literal punctuation.\n\
+             - Start each list item with a dash and a space. Leave bare URLs unwrapped; WhatsApp links them automatically.\n\
              - For media attachments use markers: [IMAGE:<path>], [DOCUMENT:<path>], [VIDEO:<path>], [AUDIO:<path>], or [VOICE:<path>]\n\
              - To send a native location pin, use marker: [LOCATION:<latitude>,<longitude>,<name>,<address>] where name and address are optional. Double-quote the name if it contains commas; the trailing address may contain commas without quoting.\n\
              - Marker paths must refer to local files inside the configured workspace directory. Absolute paths and workspace-relative paths are accepted when they stay inside that workspace.\n\
@@ -2889,7 +2963,7 @@ fn build_scope_override_summary(
             scope_line(OverrideScope::Agent),
         )
     };
-    let sender_key = conversation_history_key(msg);
+    let sender_key = runtime_conversation_history_key(ctx, msg);
     let session = ctx
         .route_overrides
         .lock()
@@ -2926,7 +3000,7 @@ async fn handle_runtime_command_if_needed(
         return true;
     };
 
-    let sender_key = conversation_history_key(msg);
+    let sender_key = runtime_conversation_history_key(ctx, msg);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, msg, &sender_key, &defaults_snapshot);
 
@@ -6081,7 +6155,7 @@ async fn process_channel_message_body(
         .await;
     }
 
-    let history_key = conversation_history_key(&msg);
+    let history_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
     stamp_session_routing_context(ctx.as_ref(), &msg, &history_key);
     if msg.passive_context {
         record_passive_context(ctx.as_ref(), &msg, &history_key);
@@ -6280,7 +6354,7 @@ async fn process_channel_message_body(
         && autosave_content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS
         && !zeroclaw_memory::should_skip_autosave_content(&autosave_content)
     {
-        let autosave_key = conversation_memory_key(&msg);
+        let autosave_key = runtime_conversation_memory_key(ctx.as_ref(), &msg);
         let _ = ctx
             .memory
             .store(
@@ -8264,7 +8338,7 @@ async fn dispatch_channel_sop_gate(
         Some(msg.sender.clone()),
     );
     let outcome = match engine.lock() {
-        Ok(mut guard) => guard.resolve_via_broker(&run_id, decision, principal),
+        Ok(mut guard) => guard.resolve_via_broker_deferred(&run_id, decision, principal),
         Err(_) => return true,
     };
     match outcome {
@@ -8511,7 +8585,7 @@ async fn run_message_dispatch_loop(
         // ── Debounce: accumulate rapid messages per sender ──────────
         // CLI messages bypass debouncing so the interactive loop stays responsive.
         let msg = if msg.channel != "cli" {
-            let debounce_key = conversation_history_key(&msg);
+            let debounce_key = runtime_conversation_history_key(ctx.as_ref(), &msg);
 
             // Resolve effective debounce window: per-channel override wins,
             // otherwise falls back to the global default from ChannelsConfig.
@@ -9794,6 +9868,19 @@ fn configured_channel_map(configured: &[ConfiguredChannel]) -> HashMap<String, A
     map
 }
 
+fn publish_cron_channel_registry(
+    configured: &[ConfiguredChannel],
+) -> (CronChannelRegistry, CronChannelRegistryLease) {
+    let registry = Arc::new(configured_channel_map(configured));
+    *CRON_CHANNEL_REGISTRY
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&registry));
+    let lease = CronChannelRegistryLease {
+        published: Arc::clone(&registry),
+    };
+    (registry, lease)
+}
+
 fn find_channel_for_message<'a>(
     channels: &'a HashMap<String, Arc<dyn Channel>>,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -10005,6 +10092,26 @@ pub fn register_channels_for_tools(
     names
 }
 
+/// Resolve the `transcription_provider` configured on the enabled agent that
+/// owns `channel_key` (for example `"telegram.support"` or
+/// `"voice_wake.frontdoor"`). Returns an empty string when no owning agent
+/// declares a preference. `channel_key` only selects which agent to consult
+/// — it is never itself treated as a provider identity, and the returned
+/// value must not be confused with the channel alias embedded in the key.
+///
+/// Gated to match its callers: with both transcribing channels compiled out
+/// this has no call sites, and an ungated definition trips the dead-code lint
+/// under a no-default-features build.
+#[cfg(any(feature = "channel-telegram", feature = "voice-wake"))]
+fn resolve_agent_transcription_provider(config: &Config, channel_key: &str) -> String {
+    let enabled_agents = enabled_agent_aliases(config);
+    build_owner_by_channel_key(config, &enabled_agents, &[channel_key.to_string()])
+        .get(channel_key)
+        .and_then(|owner| config.agents.get(owner))
+        .map(|agent| agent.transcription_provider.as_str().to_string())
+        .unwrap_or_default()
+}
+
 /// Per-alias Matrix state directory. Each `[channels.matrix.<alias>]` block
 /// must own its own session/crypto store so two bots under one daemon don't
 /// restore each other's `session.json` and run as the wrong account. The
@@ -10072,19 +10179,8 @@ fn collect_configured_channels(
             Arc::new(move || cfg_arc.read().channel_voice_peers("telegram", &alias))
         };
         let channel_key = format!("telegram.{alias}");
-        let agent_transcription_provider = config
-            .agents
-            .values()
-            .filter(|a| a.enabled && a.channels.iter().any(|c| c.as_str() == channel_key))
-            .find_map(|a| {
-                let s = a.transcription_provider.as_str();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s.to_string())
-                }
-            })
-            .unwrap_or_default();
+        let agent_transcription_provider =
+            resolve_agent_transcription_provider(&config, &channel_key);
         channels.push(ConfiguredChannel {
             display_name: "Telegram",
             alias: Some(alias.clone()),
@@ -11504,14 +11600,25 @@ fn collect_configured_channels(
         if !vw.enabled {
             continue;
         }
+        let channel_key = format!("voice_wake.{alias}");
+        let transcription_config_arc = Arc::clone(config_arc);
+        let transcription_channel_key = channel_key.clone();
         channels.push(ConfiguredChannel {
             display_name: "VoiceWake",
             alias: Some(alias.clone()),
-            channel: Arc::new(VoiceWakeChannel::new(
-                alias.clone(),
-                vw.clone(),
-                config.transcription.clone(),
-            )),
+            channel: Arc::new(
+                VoiceWakeChannel::new(alias.clone(), vw.clone(), config.transcription.clone())
+                    .with_transcription_manager_factory(move || {
+                        let config = transcription_config_arc.read();
+                        let provider = resolve_agent_transcription_provider(
+                            &config,
+                            &transcription_channel_key,
+                        );
+                        crate::transcription::TranscriptionManager::from_config_with_provider(
+                            &config, provider,
+                        )
+                    }),
+            ),
         });
     }
 
@@ -11773,15 +11880,24 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     Ok(())
 }
 
-fn build_owner_by_channel_key(
+fn enabled_agent_aliases(config: &Config) -> Vec<String> {
+    let mut aliases: Vec<String> = config
+        .agents
+        .iter()
+        .filter(|(_, agent)| agent.enabled)
+        .map(|(alias, _)| alias.clone())
+        .collect();
+    aliases.sort();
+    aliases
+}
+
+/// Canonical explicit owner decision shared by channel construction and the
+/// inbound router. Sorted aliases preserve the router's established
+/// last-writer-wins behavior for duplicate bindings.
+fn explicit_owner_by_channel_key(
     config: &Config,
     enabled_agents: &[String],
-    collected_channel_keys: &[String],
 ) -> HashMap<String, String> {
-    // Owner map: `<channel_type>.<alias>` (and bare `<channel_type>` for
-    // backward-compat with cron callers / singleton channels) → agent_alias.
-    // Built from each enabled agent's `agents.<alias>.channels` list — the
-    // schema treats this as the source of truth for channel ownership.
     let mut owner_by_channel_key: HashMap<String, String> = HashMap::new();
     for alias_str in enabled_agents {
         let Some(agent_cfg) = config.agents.get(alias_str) else {
@@ -11802,6 +11918,19 @@ fn build_owner_by_channel_key(
             }
         }
     }
+    owner_by_channel_key
+}
+
+fn build_owner_by_channel_key(
+    config: &Config,
+    enabled_agents: &[String],
+    collected_channel_keys: &[String],
+) -> HashMap<String, String> {
+    // Owner map: `<channel_type>.<alias>` (and bare `<channel_type>` for
+    // backward-compat with cron callers / singleton channels) → agent_alias.
+    // Built from each enabled agent's `agents.<alias>.channels` list — the
+    // schema treats this as the source of truth for channel ownership.
+    let mut owner_by_channel_key = explicit_owner_by_channel_key(config, enabled_agents);
 
     let any_binding_declared_anywhere = config.agents.values().any(|a| !a.channels.is_empty());
 
@@ -11847,7 +11976,7 @@ fn build_owner_by_channel_key(
 /// The per-agent tool registry, prompt sections, and channel/deferred-MCP handles
 /// `start_channels` needs from [`assemble_channel_agent_tools`].
 struct ChannelAssembledTools {
-    tools: Vec<Box<dyn Tool>>,
+    tools: zeroclaw_runtime::tools::scoped::ScopedToolRegistry,
     deferred_section: String,
     pinned_section: String,
     ask_user_handle: Option<tools::PerToolChannelHandle>,
@@ -11965,7 +12094,10 @@ async fn assemble_channel_agent_tools(
         ..
     } = assembled;
     ChannelAssembledTools {
-        tools: registry.into_inner(),
+        // Keep the registry SEALED out to `start_channels` (no `into_inner()`):
+        // it flows into `ChannelRuntimeContext.tools_registry` and then the
+        // engine carrier as `&ScopedToolRegistry`.
+        tools: registry,
         deferred_section,
         pinned_section,
         ask_user_handle,
@@ -12037,19 +12169,10 @@ pub async fn start_channels(
 
     zeroclaw_providers::pricing::spawn_refresher(config_arc.clone());
 
-    let enabled_agents: Vec<String> = {
-        let mut v: Vec<String> = config
-            .agents
-            .iter()
-            .filter(|(_, a)| a.enabled)
-            .map(|(alias, _)| alias.clone())
-            .collect();
-        if v.is_empty() {
-            anyhow::bail!("start_channels requires at least one enabled [agents.<alias>] entry");
-        }
-        v.sort();
-        v
-    };
+    let enabled_agents = enabled_agent_aliases(&config);
+    if enabled_agents.is_empty() {
+        anyhow::bail!("start_channels requires at least one enabled [agents.<alias>] entry");
+    }
 
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -12102,6 +12225,7 @@ pub async fn start_channels(
         };
 
     let mut channels_by_name_shared: Option<Arc<HashMap<String, Arc<dyn Channel>>>> = None;
+    let mut cron_channel_registry_lease: Option<CronChannelRegistryLease> = None;
     let mut collected_channel_keys: Vec<String> = Vec::new();
     let mut max_in_flight_messages: Option<usize> = None;
     let mut listener_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
@@ -12474,11 +12598,10 @@ pub async fn start_channels(
             )
             .await;
             append_configured_plugin_channels(&mut configured_channels, plugin_channels);
-            let channels: Vec<Arc<dyn Channel>> = configured_channels
-                .iter()
-                .map(|cc| Arc::clone(&cc.channel))
-                .collect();
-            if channels.is_empty() {
+            let (channels_by_name, registry_lease) =
+                publish_cron_channel_registry(&configured_channels);
+            cron_channel_registry_lease = Some(registry_lease);
+            if configured_channels.is_empty() {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -12533,17 +12656,12 @@ pub async fn start_channels(
             }
             drop(tx);
 
-            // Composite-key registry (see `composite_channel_key`).
-            let cbn = Arc::new(configured_channel_map(&configured_channels));
-            *CRON_CHANNEL_REGISTRY
-                .write()
-                .unwrap_or_else(|e| e.into_inner()) = Some(Arc::clone(&cbn));
-
-            let in_flight = max_in_flight_messages_for_config(channels.len(), &config.channels);
+            let in_flight =
+                max_in_flight_messages_for_config(configured_channels.len(), &config.channels);
             println!("  🚦 In-flight message limit: {in_flight}");
 
             max_in_flight_messages = Some(in_flight);
-            channels_by_name_shared = Some(cbn);
+            channels_by_name_shared = Some(channels_by_name);
             rx_holder = Some(rx);
         }
 
@@ -12618,7 +12736,8 @@ pub async fn start_channels(
             max_tool_iterations: config.effective_max_tool_iterations(agent_alias.as_str()),
             min_relevance_score: config.memory.min_relevance_score,
             conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS)
+                    .expect("MAX_CONVERSATION_SENDERS must be positive"),
             ))),
             pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
             provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
@@ -12784,6 +12903,7 @@ pub async fn start_channels(
     for h in listener_handles {
         let _ = h.await;
     }
+    drop(cron_channel_registry_lease);
 
     Ok(())
 }
@@ -13169,7 +13289,9 @@ fn concurrent_persist_lock_serialization() {
                 std::path::PathBuf::new(),
             ),
         ),
-        tools_registry: Arc::new(vec![]),
+        tools_registry: Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+        ),
         observer: Arc::new(NoopObserver),
         system_prompt: Arc::new(String::new()),
         model: Arc::new("test".into()),
@@ -14543,6 +14665,73 @@ temperature = 0.3
         );
     }
 
+    struct CronChannelRegistryRestore(Option<CronChannelRegistry>);
+
+    impl Drop for CronChannelRegistryRestore {
+        fn drop(&mut self) {
+            *CRON_CHANNEL_REGISTRY
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = self.0.take();
+        }
+    }
+
+    #[tokio::test]
+    async fn ending_channel_task_clears_stale_delivery_handles() {
+        let previous = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let _restore = CronChannelRegistryRestore(previous);
+
+        let stale = mock_channel("wecom_ws");
+        let (_published, stale_lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WeCom WebSocket",
+            alias: Some("removed".to_string()),
+            channel: stale,
+        }]);
+
+        let current = mock_channel("wecom_ws");
+        let (_published, current_lease) = publish_cron_channel_registry(&[ConfiguredChannel {
+            display_name: "WeCom WebSocket",
+            alias: Some("current".to_string()),
+            channel: current,
+        }]);
+
+        drop(stale_lease);
+        assert!(
+            CRON_CHANNEL_REGISTRY
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|registry| registry.contains_key("wecom_ws.current")),
+            "ending an older task must not clear the newer registry generation"
+        );
+
+        drop(current_lease);
+
+        let registry = CRON_CHANNEL_REGISTRY
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("ended channel task must publish an initialized empty registry");
+        assert!(registry.is_empty());
+
+        let err = deliver_announcement(
+            &Config::default(),
+            "wecom_ws.removed",
+            "recipient",
+            None,
+            "message",
+        )
+        .await
+        .expect_err("removed channel must not use its stale live handle");
+        assert!(
+            err.to_string()
+                .contains("[channels.wecom_ws.removed] not configured"),
+            "delivery must fall back to the current empty config: {err:#}"
+        );
+    }
+
     #[test]
     fn find_channel_for_message_resolves_by_composite_key_for_multi_alias() {
         // Two Discord bots in the registry: only the composite key
@@ -14680,7 +14869,9 @@ temperature = 0.3
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(String::new()),
             model: Arc::new("test-model".to_string()),
@@ -14741,6 +14932,337 @@ temperature = 0.3
             sop_engine: None,
             sop_audit: None,
         })
+    }
+
+    #[cfg(feature = "channel-webhook")]
+    async fn receive_webhook_test_message(
+        alias: &str,
+        sender: &str,
+    ) -> (ChannelMessage, Arc<dyn Channel>) {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let webhook = Arc::new(WebhookChannel::new(
+            alias.to_string(),
+            0,
+            None,
+            None,
+            None,
+            None,
+            Some("test-secret".to_string()),
+            None,
+            None,
+            None,
+        ));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let listener_webhook = Arc::clone(&webhook);
+        let task = zeroclaw_spawn::spawn!(async move {
+            listener_webhook
+                .listen_with_listener(listener, tx)
+                .await
+                .ok();
+        });
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "sender": sender,
+            "content": "hello"
+        }))
+        .unwrap();
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"test-secret").unwrap();
+        mac.update(&body);
+        let signature = hex::encode(mac.finalize().into_bytes());
+        let status = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/webhook"))
+            .header("content-type", "application/json")
+            .header("x-webhook-signature", signature)
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status();
+        assert_eq!(status, reqwest::StatusCode::OK);
+        let msg = rx.recv().await.expect("webhook message");
+        task.abort();
+        let channel: Arc<dyn Channel> = webhook;
+        (msg, channel)
+    }
+
+    #[cfg(feature = "channel-webhook")]
+    #[tokio::test]
+    async fn webhook_gateway_routes_aliases_without_stranding_singleton_history() {
+        let (single_msg, single_channel) = receive_webhook_test_message("primary", "alice").await;
+        let single_registry = Arc::new(configured_channel_map(&[ConfiguredChannel {
+            display_name: "Webhook",
+            alias: Some("primary".to_string()),
+            channel: single_channel,
+        }]));
+        let single_store_dir = TempDir::new().unwrap();
+        let single_store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(single_store_dir.path()).unwrap());
+        let single_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::clone(&single_registry),
+            session_store: Some(Arc::clone(&single_store)),
+            ..(*router_test_ctx()).clone()
+        });
+
+        assert_eq!(single_msg.channel_alias.as_deref(), Some("primary"));
+        let legacy_msg = ChannelMessage {
+            channel_alias: None,
+            ..single_msg.clone()
+        };
+        let legacy_key = conversation_history_key(&legacy_msg);
+        assert_eq!(
+            runtime_conversation_history_key(single_ctx.as_ref(), &single_msg),
+            legacy_key
+        );
+        let legacy_autosave_key = conversation_memory_key(&legacy_msg);
+        assert_eq!(legacy_autosave_key, "webhook_alice_webhook_0");
+        assert_eq!(
+            runtime_conversation_memory_key(single_ctx.as_ref(), &single_msg),
+            legacy_autosave_key,
+            "a sole webhook must retain the established operator-visible autosave key"
+        );
+
+        let mut passive_single_msg = single_msg.clone();
+        passive_single_msg.passive_context = true;
+        process_channel_message(
+            Arc::clone(&single_ctx),
+            passive_single_msg,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            single_ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(&legacy_key)
+                .is_some(),
+            "the actual history write must remain under the legacy singleton key"
+        );
+        assert_eq!(single_store.load(&legacy_key).len(), 1);
+        assert!(
+            single_store
+                .load(&conversation_history_key(&single_msg))
+                .is_empty(),
+            "the aliased key must not strand the singleton's durable history"
+        );
+
+        let (alpha_msg, alpha_channel) = receive_webhook_test_message("alpha", "alice").await;
+        let (beta_msg, beta_channel) = receive_webhook_test_message("beta", "alice").await;
+        let multi_registry = Arc::new(configured_channel_map(&[
+            ConfiguredChannel {
+                display_name: "Webhook",
+                alias: Some("alpha".to_string()),
+                channel: alpha_channel,
+            },
+            ConfiguredChannel {
+                display_name: "Webhook",
+                alias: Some("beta".to_string()),
+                channel: beta_channel,
+            },
+        ]));
+        assert!(!multi_registry.contains_key("webhook"));
+
+        let multi_store_dir = TempDir::new().unwrap();
+        let multi_store: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(multi_store_dir.path()).unwrap());
+        let alpha_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::clone(&multi_registry),
+            agent_alias: Arc::new("alpha-agent".to_string()),
+            session_store: Some(Arc::clone(&multi_store)),
+            ..(*router_test_ctx()).clone()
+        });
+        let beta_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::clone(&multi_registry),
+            agent_alias: Arc::new("beta-agent".to_string()),
+            session_store: Some(Arc::clone(&multi_store)),
+            ..(*router_test_ctx()).clone()
+        });
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "alpha-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["webhook.alpha".into()],
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "beta-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["webhook.beta".into()],
+                ..Default::default()
+            },
+        );
+        let enabled_agents = vec!["alpha-agent".to_string(), "beta-agent".to_string()];
+        let collected_keys = vec!["webhook.alpha".to_string(), "webhook.beta".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_keys);
+        let router = AgentRouter::multi(
+            HashMap::from([
+                ("alpha-agent".to_string(), Arc::clone(&alpha_ctx)),
+                ("beta-agent".to_string(), Arc::clone(&beta_ctx)),
+            ]),
+            owners,
+            None,
+            None,
+        );
+
+        let resolved_alpha = router.resolve(&alpha_msg).expect("alpha owner");
+        let resolved_beta = router.resolve(&beta_msg).expect("beta owner");
+        assert!(Arc::ptr_eq(&resolved_alpha, &alpha_ctx));
+        assert!(Arc::ptr_eq(&resolved_beta, &beta_ctx));
+        let alpha_key = runtime_conversation_history_key(resolved_alpha.as_ref(), &alpha_msg);
+        let beta_key = runtime_conversation_history_key(resolved_beta.as_ref(), &beta_msg);
+        assert_ne!(alpha_key, beta_key);
+
+        let mut passive_alpha_msg = alpha_msg;
+        passive_alpha_msg.passive_context = true;
+        let mut passive_beta_msg = beta_msg;
+        passive_beta_msg.passive_context = true;
+        process_channel_message(
+            Arc::clone(&resolved_alpha),
+            passive_alpha_msg,
+            CancellationToken::new(),
+        )
+        .await;
+        process_channel_message(
+            Arc::clone(&resolved_beta),
+            passive_beta_msg,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            resolved_alpha
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(&alpha_key)
+                .is_some()
+        );
+        assert!(
+            resolved_beta
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .peek(&beta_key)
+                .is_some()
+        );
+        assert_eq!(multi_store.load(&alpha_key).len(), 1);
+        assert_eq!(multi_store.load(&beta_key).len(), 1);
+    }
+
+    #[cfg(feature = "channel-webhook")]
+    #[tokio::test]
+    async fn webhook_autosave_uses_canonical_history_identity_for_shared_agent_aliases() {
+        let (mut alpha_msg, alpha_channel) =
+            receive_webhook_test_message("alpha", "shared-sender").await;
+        let (mut beta_msg, beta_channel) =
+            receive_webhook_test_message("beta", "shared-sender").await;
+        alpha_msg.content = "trigger format error: alpha keeps this durable fact".to_string();
+        beta_msg.content = "trigger format error: beta keeps this different fact".to_string();
+        assert_eq!(alpha_msg.id, beta_msg.id, "listener counters must overlap");
+        assert_eq!(alpha_msg.reply_target, beta_msg.reply_target);
+
+        let registry = Arc::new(configured_channel_map(&[
+            ConfiguredChannel {
+                display_name: "Webhook",
+                alias: Some("alpha".to_string()),
+                channel: alpha_channel,
+            },
+            ConfiguredChannel {
+                display_name: "Webhook",
+                alias: Some("beta".to_string()),
+                channel: beta_channel,
+            },
+        ]));
+        assert!(!registry.contains_key("webhook"));
+
+        let memory_dir = TempDir::new().unwrap();
+        let memory = Arc::new(SqliteMemory::new("shared-agent", memory_dir.path()).unwrap());
+        let memory_for_ctx: Arc<dyn Memory> = memory.clone();
+        let shared_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::clone(&registry),
+            model_provider: Arc::new(FormatErrorModelProvider),
+            agent_alias: Arc::new("shared-agent".to_string()),
+            memory: memory_for_ctx,
+            auto_save_memory: true,
+            ack_reactions: false,
+            ..(*router_test_ctx()).clone()
+        });
+
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "shared-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["webhook.alpha".into(), "webhook.beta".into()],
+                ..Default::default()
+            },
+        );
+        let owners = build_owner_by_channel_key(
+            &config,
+            &["shared-agent".to_string()],
+            &["webhook.alpha".to_string(), "webhook.beta".to_string()],
+        );
+        let router = AgentRouter::multi(
+            HashMap::from([("shared-agent".to_string(), Arc::clone(&shared_ctx))]),
+            owners,
+            None,
+            None,
+        );
+        let resolved_alpha = router.resolve(&alpha_msg).expect("alpha owner");
+        let resolved_beta = router.resolve(&beta_msg).expect("beta owner");
+        assert!(Arc::ptr_eq(&resolved_alpha, &resolved_beta));
+
+        let alpha_history_key =
+            runtime_conversation_history_key(resolved_alpha.as_ref(), &alpha_msg);
+        let beta_history_key = runtime_conversation_history_key(resolved_beta.as_ref(), &beta_msg);
+        let alpha_autosave_key =
+            runtime_conversation_memory_key(resolved_alpha.as_ref(), &alpha_msg);
+        let beta_autosave_key = runtime_conversation_memory_key(resolved_beta.as_ref(), &beta_msg);
+        assert_ne!(alpha_history_key, beta_history_key);
+        assert_ne!(alpha_autosave_key, beta_autosave_key);
+
+        process_channel_message(
+            Arc::clone(&resolved_alpha),
+            alpha_msg.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+        process_channel_message(
+            Arc::clone(&resolved_beta),
+            beta_msg.clone(),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(memory.count().await.unwrap(), 2);
+        let alpha_entry = memory
+            .get(&alpha_autosave_key)
+            .await
+            .unwrap()
+            .expect("alpha autosave");
+        let beta_entry = memory
+            .get(&beta_autosave_key)
+            .await
+            .unwrap()
+            .expect("beta autosave");
+        assert_eq!(alpha_entry.content, alpha_msg.content);
+        assert_eq!(beta_entry.content, beta_msg.content);
+        assert_eq!(
+            alpha_entry.session_id.as_deref(),
+            Some(alpha_history_key.as_str())
+        );
+        assert_eq!(
+            beta_entry.session_id.as_deref(),
+            Some(beta_history_key.as_str())
+        );
     }
 
     #[test]
@@ -15304,7 +15826,9 @@ temperature = 0.3
                     zeroclaw_dir.to_path_buf(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new(model.to_string()),
@@ -15781,7 +16305,9 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -15876,7 +16402,9 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -15993,7 +16521,9 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -16112,7 +16642,9 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("system".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -17123,7 +17655,9 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(tools),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(tools),
+            ),
             observer,
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -17227,7 +17761,9 @@ api_key = "anthropic-key"
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer,
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -19440,7 +19976,7 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name: HashMap<String, Arc<dyn Channel>>,
         provider_impl: Arc<HistoryCaptureModelProvider>,
         prompt_config: Arc<Config>,
-        tools_registry: Arc<Vec<Box<dyn Tool>>>,
+        tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry>,
     ) -> Arc<ChannelRuntimeContext> {
         Arc::new(ChannelRuntimeContext {
             channels_by_name: Arc::new(channels_by_name),
@@ -19541,7 +20077,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -19658,9 +20198,13 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(
-                zeroclaw_runtime::tools::SessionsCurrentTool::new(Arc::clone(&session_store)),
-            )]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(zeroclaw_runtime::tools::SessionsCurrentTool::new(
+                        Arc::clone(&session_store),
+                    )),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -19774,7 +20318,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -19925,7 +20473,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -20048,7 +20600,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -20193,7 +20749,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -20321,7 +20881,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -20434,7 +20998,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -20567,7 +21135,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -20724,7 +21294,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -20900,7 +21472,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(model_switch_tool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(model_switch_tool),
+                ]),
+            ),
             observer: observer.clone(),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -21386,7 +21962,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -21494,7 +22072,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -21612,7 +22194,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(MockPriceTool),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -21980,7 +22566,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -22124,7 +22712,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -22283,7 +22873,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -22452,7 +23044,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -22597,7 +23191,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -22731,7 +23327,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -23215,7 +23813,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -23343,7 +23943,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -23474,7 +24076,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -23597,7 +24201,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -23720,7 +24326,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -24130,7 +24738,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -25682,6 +26292,43 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(for_y, vec!["alice".to_string()]);
     }
 
+    fn webhook_agent_scope_msg(sender: &str, alias: &str) -> zeroclaw_api::channel::ChannelMessage {
+        zeroclaw_api::channel::ChannelMessage {
+            sender: sender.into(),
+            reply_target: "chan-1".into(),
+            channel: "webhook".into(),
+            channel_alias: Some(alias.into()),
+            thread_ts: None,
+            content: "/model --agent gpt-4o".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Now that webhook inbound messages carry a real `channel_alias`, a
+    /// `peer_groups` entry scoped to `webhook.<alias>` can match it the same
+    /// way a dotted Discord/Slack/etc. scope already does. Pin both sides:
+    /// the configured alias is granted, and a different alias on the same
+    /// channel type is not.
+    #[test]
+    fn webhook_alias_scoped_peer_group_grants_admin_only_for_matching_alias() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut groups = std::collections::HashMap::new();
+        groups.insert(
+            "webhook_admins".into(),
+            peer_group("webhook.support", &["alice"], true),
+        );
+        let ctx = channel_runtime_context_with_peer_groups(tmp.path(), groups);
+
+        assert!(is_agent_scope_authorized(
+            &ctx,
+            &webhook_agent_scope_msg("alice", "support")
+        ));
+        assert!(!is_agent_scope_authorized(
+            &ctx,
+            &webhook_agent_scope_msg("alice", "other")
+        ));
+    }
+
     // --- SSOT normalization + wildcard + leading-`@` + case-insensitive.
     // The gate routes through `allowlist::is_user_allowed`, so the
     // helpers below must mirror the inbound-channel normalization shape
@@ -26660,7 +27307,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -26836,7 +27485,11 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![Box::new(NamedMockTool("read_skill"))]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![
+                    Box::new(NamedMockTool("read_skill")),
+                ]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new(initial_system_prompt),
             model: Arc::new("test-model".to_string()),
@@ -27169,12 +27822,14 @@ BTC is currently around $65,000 based on latest tool output."#
             },
         );
         let prompt_config = Arc::new(prompt_config);
-        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(
-            zeroclaw_runtime::tools::SendMessageToPeerTool::new(
-                Arc::clone(&prompt_config),
-                "test-agent",
-            ),
-        )]);
+        let tools_registry: Arc<zeroclaw_runtime::tools::scoped::ScopedToolRegistry> = Arc::new(
+            zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(
+                zeroclaw_runtime::tools::SendMessageToPeerTool::new(
+                    Arc::clone(&prompt_config),
+                    "test-agent",
+                ),
+            )]),
+        );
         let runtime_ctx = peer_prompt_test_context(
             channels_by_name,
             provider_impl.clone(),
@@ -27303,7 +27958,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(Vec::new()),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new()),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -27727,7 +28384,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channels_by_name,
             provider_impl.clone(),
             Arc::new(prompt_config),
-            Arc::new(vec![]),
+            Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
         );
 
         process_channel_message(
@@ -27786,7 +28445,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -27870,6 +28531,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     file_name: "sticker.png".to_string(),
                     data: vec![1, 2, 3, 4],
                     mime_type: Some("image/png".to_string()),
+                    marker: None,
                 }],
                 subject: None,
                 internal_sop_event: None,
@@ -27942,7 +28604,9 @@ BTC is currently around $65,000 based on latest tool output."#
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -28129,6 +28793,28 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             block.contains("Do not use http://, https://, data:, file:"),
             "whatsapp block must say URL schemes are refused"
+        );
+        assert!(
+            block.contains("does not render Markdown"),
+            "whatsapp block must say Markdown is not rendered: the send path is a byte-for-byte passthrough, so an unstated policy ships the model's guess verbatim"
+        );
+        assert!(
+            block.contains("*single asterisks* for bold"),
+            "whatsapp block must teach WhatsApp bold, not Markdown bold"
+        );
+        assert!(
+            block.contains("_underscores_ for italic"),
+            "whatsapp block must teach WhatsApp italic"
+        );
+        assert!(
+            block.contains("~tildes~ for strikethrough"),
+            "whatsapp block must teach WhatsApp strikethrough"
+        );
+        assert!(
+            channel_delivery_instructions("telegram")
+                .expect("telegram must have a delivery-instructions block")
+                .contains("Use **bold** for key terms"),
+            "control: telegram keeps its own double-asterisk syntax, so the two arms stayed distinct"
         );
         assert_eq!(
             channel_delivery_instructions("whatsapp-web"),
@@ -29104,6 +29790,167 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    // Regression: Voice Wake bound its transcription manager to its own
+    // channel alias instead of the owning agent's `transcription_provider`,
+    // so any config whose alias wasn't coincidentally also a provider key
+    // selected the wrong provider or failed lookup. Agent alias, channel
+    // alias, and provider name are all distinct here so the assertions
+    // cannot pass through accidental identity coupling.
+    #[cfg(feature = "voice-wake")]
+    #[test]
+    fn resolve_agent_transcription_provider_uses_owning_agent_not_channel_alias() {
+        let mut config = Config::default();
+        config.channels.voice_wake.insert(
+            "frontdoor".to_string(),
+            zeroclaw_config::schema::VoiceWakeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "wake-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["voice_wake.frontdoor".into()],
+                transcription_provider: "groq.default".into(),
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_agent_transcription_provider(&config, "voice_wake.frontdoor");
+        assert_eq!(resolved, "groq.default");
+        assert_ne!(
+            resolved, "frontdoor",
+            "must not resolve to the channel alias"
+        );
+    }
+
+    #[cfg(feature = "voice-wake")]
+    #[test]
+    fn resolve_agent_transcription_provider_empty_when_owner_has_no_preference() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "wake-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["voice_wake.frontdoor".into()],
+                ..Default::default()
+            },
+        );
+
+        let resolved = resolve_agent_transcription_provider(&config, "voice_wake.frontdoor");
+        assert!(resolved.is_empty());
+    }
+
+    #[cfg(feature = "voice-wake")]
+    #[test]
+    fn voice_wake_provider_uses_same_canonical_co_owner_as_router() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.agents.insert(
+            "zeta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["voice_wake.frontdoor".into()],
+                transcription_provider: "groq.primary".into(),
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "alpha".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["voice_wake.frontdoor".into()],
+                transcription_provider: "deepgram.backup".into(),
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        let owners = build_owner_by_channel_key(
+            &config,
+            &enabled_agents,
+            &["voice_wake.frontdoor".to_string()],
+        );
+
+        assert_eq!(
+            owners.get("voice_wake.frontdoor").map(String::as_str),
+            Some("zeta")
+        );
+        assert_eq!(
+            resolve_agent_transcription_provider(&config, "voice_wake.frontdoor"),
+            "groq.primary"
+        );
+    }
+
+    #[cfg(feature = "voice-wake")]
+    #[test]
+    fn voice_wake_provider_uses_same_legacy_fallback_owner_as_router() {
+        let mut config = Config::default();
+        config.agents.clear();
+        config.channels.voice_wake.insert(
+            "frontdoor".to_string(),
+            zeroclaw_config::schema::VoiceWakeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "legacy".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec![],
+                transcription_provider: "local_whisper.office".into(),
+                ..Default::default()
+            },
+        );
+
+        let enabled_agents = enabled_agent_aliases(&config);
+        let collected_channel_keys = vec!["voice_wake.frontdoor".to_string()];
+        let owners = build_owner_by_channel_key(&config, &enabled_agents, &collected_channel_keys);
+
+        assert_eq!(
+            owners.get("voice_wake.frontdoor").map(String::as_str),
+            Some("legacy"),
+            "AgentRouter must assign the enabled channel to the legacy fallback owner"
+        );
+        assert_eq!(
+            resolve_agent_transcription_provider(&config, "voice_wake.frontdoor"),
+            "local_whisper.office",
+            "Voice Wake must select that same fallback owner's provider"
+        );
+    }
+
+    #[cfg(feature = "voice-wake")]
+    #[test]
+    fn collect_configured_channels_builds_voice_wake_for_agent_with_transcription_provider() {
+        let mut config = Config::default();
+        config.channels.voice_wake.insert(
+            "frontdoor".to_string(),
+            zeroclaw_config::schema::VoiceWakeConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        );
+        config.agents.insert(
+            "wake-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                enabled: true,
+                channels: vec!["voice_wake.frontdoor".into()],
+                transcription_provider: "groq.default".into(),
+                ..Default::default()
+            },
+        );
+
+        let config_arc = Arc::new(RwLock::new(config));
+        let channels = collect_configured_channels(&config_arc, "test", &[], None, None);
+        let entry = channels
+            .iter()
+            .find(|entry| entry.display_name == "VoiceWake")
+            .expect("enabled VoiceWake channel referenced by an enabled agent must be collected");
+        assert_eq!(entry.alias.as_deref(), Some("frontdoor"));
+    }
+
     struct AlwaysFailChannel {
         name: &'static str,
         calls: Arc<AtomicUsize>,
@@ -29818,7 +30665,9 @@ This is an example JSON object for profile settings."#;
             channels_by_name,
             provider_impl.clone(),
             Arc::new(zeroclaw_config::schema::Config::default()),
-            Arc::new(vec![]),
+            Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
         );
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
             multimodal: zeroclaw_config::schema::MultimodalConfig {
@@ -29853,6 +30702,7 @@ This is an example JSON object for profile settings."#;
                     file_name: "route.png".to_string(),
                     data: vec![1, 2, 3, 4],
                     mime_type: Some("image/png".to_string()),
+                    marker: None,
                 }],
                 subject: None,
                 internal_sop_event: None,
@@ -29903,6 +30753,343 @@ This is an example JSON object for profile settings."#;
         );
     }
 
+    /// An image uploaded "as file" through Telegram, with the media pipeline
+    /// ENABLED and a vision-capable provider, must not pick up a second,
+    /// base64-inlined `[IMAGE:data:` copy in the outgoing prompt or in stored
+    /// history. The channel emits the same re-loadable `[IMAGE:<path>]` marker
+    /// for image documents as for photos, and the pipeline recognizes it as
+    /// already marked instead of describing it again.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn telegram_image_document_with_enabled_pipeline_never_inlines_base64() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "documents/file_11" }
+            })))
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/documents/file_11$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .mount(&mock_server)
+            .await;
+
+        let workspace = tempfile::TempDir::new().unwrap();
+        let telegram = crate::telegram::TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+
+        // An extensionless image document is the historic double-describe
+        // path: it used to render as `[Document:]` while `kind()` classified
+        // it as an image, so the pipeline saw an undescribed image.
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 8,
+                "chat": { "id": 556 },
+                "from": { "username": "alice", "id": 99 },
+                "document": {
+                    "file_id": "doc11",
+                    "file_name": "upload",
+                    "mime_type": "image/jpeg",
+                    "file_size": 4
+                },
+                "caption": "please describe"
+            }
+        });
+        let msg = telegram
+            .try_parse_attachment_message(&update)
+            .await
+            .expect_parsed("image document update should parse");
+        assert!(
+            msg.content.contains("[IMAGE:"),
+            "channel must emit the path marker for image documents: {}",
+            msg.content
+        );
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider {
+            calls: std::sync::Mutex::new(Vec::new()),
+            vision: true,
+        });
+        let base_ctx = peer_prompt_test_context(
+            channels_by_name,
+            provider_impl.clone(),
+            Arc::new(zeroclaw_config::schema::Config::default()),
+            Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
+        );
+        let ctx = Arc::new(ChannelRuntimeContext {
+            workspace_dir: Arc::new(workspace.path().to_path_buf()),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                enabled: true,
+                describe_images: true,
+                ..Default::default()
+            },
+            ..(*base_ctx).clone()
+        });
+
+        process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
+
+        // Marker resolution legitimately inlines ONE base64 copy of the
+        // `[IMAGE:<path>]` marker at provider-call time; the double-describe
+        // bug added a SECOND copy via the pipeline's own annotation. Assert
+        // the annotation is absent and no message carries more than one copy.
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!calls.is_empty(), "provider must have been called");
+        for call in calls.iter() {
+            for (role, content) in call {
+                assert!(
+                    !content.contains("will be processed by vision model"),
+                    "media pipeline must not re-describe a channel-marked image \
+                     ({role}): {content}"
+                );
+                assert!(
+                    content.matches("[IMAGE:data:").count() <= 1,
+                    "outgoing {role} message must not inline the image twice: {content}"
+                );
+            }
+        }
+        drop(calls);
+
+        // The persisted user turn is the enriched content verbatim, so it must
+        // carry the path marker but never base64.
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut stored_turns = 0usize;
+        for (_, history) in histories.iter() {
+            for msg in history.iter() {
+                stored_turns += 1;
+                assert!(
+                    !msg.content.contains("IMAGE:data:"),
+                    "stored history must not persist base64: {}",
+                    msg.content
+                );
+            }
+        }
+        assert!(stored_turns > 0, "history must have stored the turn");
+    }
+
+    /// An UNSUPPORTED image document (HEIC and the extensionless
+    /// declared-`image/*` variant) the multimodal loader rejects. `kind()`
+    /// still reads the `image/*` MIME as `Image`, so before the disposition was
+    /// recorded the pipeline re-described it and added an `[IMAGE:data:...]`
+    /// copy the provider then dropped. Driven through the REAL parser and
+    /// orchestrator with the pipeline enabled and a vision provider, it must
+    /// stay a document end to end: the saved path reaches the provider and
+    /// stored history, with no image annotation, no inline base64, and no
+    /// load-failure replacement.
+    #[cfg(feature = "channel-telegram")]
+    #[tokio::test]
+    async fn telegram_unsupported_image_document_stays_a_document_end_to_end() {
+        async fn run_case(file_name: &str, mime: &str) {
+            use wiremock::matchers::{method, path_regex};
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+
+            let mock_server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path_regex(r"/bot[^/]+/getFile$"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": true,
+                    "result": { "file_path": "documents/heic_1" }
+                })))
+                .mount(&mock_server)
+                .await;
+            // An ISO-BMFF `ftyp heic` header: recognized as neither a provider
+            // image extension nor provider image magic, so
+            // `provider_loadable_image_mime()` is `None` while `kind()` still
+            // reads the declared `image/*` MIME as `Image`.
+            let heic_bytes: Vec<u8> = vec![
+                0x00, 0x00, 0x00, 0x18, b'f', b't', b'y', b'p', b'h', b'e', b'i', b'c', 0x00, 0x00,
+                0x00, 0x00,
+            ];
+            Mock::given(method("GET"))
+                .and(path_regex(r"/file/bot[^/]+/documents/heic_1$"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(heic_bytes.clone()))
+                .mount(&mock_server)
+                .await;
+
+            let workspace = tempfile::TempDir::new().unwrap();
+            let telegram = crate::telegram::TelegramChannel::new(
+                "fake-token".into(),
+                "telegram_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_api_base(mock_server.uri())
+            .with_workspace_dir(workspace.path().to_path_buf());
+
+            let mut document = serde_json::json!({
+                "file_id": "heic1",
+                "mime_type": mime,
+                "file_size": heic_bytes.len(),
+            });
+            // The extensionless variant carries no file name, so the declared
+            // MIME is its only image signal.
+            if !file_name.is_empty() {
+                document["file_name"] = serde_json::json!(file_name);
+            }
+            let update = serde_json::json!({
+                "message": {
+                    "message_id": 12,
+                    "chat": { "id": 557 },
+                    "from": { "username": "alice", "id": 99 },
+                    "document": document,
+                    "caption": "please describe"
+                }
+            });
+
+            let msg = telegram
+                .try_parse_attachment_message(&update)
+                .await
+                .expect_parsed("unsupported image document update should parse");
+            assert!(
+                msg.content.contains("[Document:"),
+                "an unsupported image document must render as a document \
+                 ({file_name}/{mime}): {}",
+                msg.content
+            );
+            assert!(
+                !msg.content.contains("[IMAGE:"),
+                "an unsupported image document must not earn an image marker \
+                 ({file_name}/{mime}): {}",
+                msg.content
+            );
+            let document_path = msg
+                .attachments
+                .first()
+                .and_then(|a| a.marker_target())
+                .expect("the channel must record the document target")
+                .to_string();
+
+            let channel_impl = Arc::new(TelegramRecordingChannel::default());
+            let channel: Arc<dyn Channel> = channel_impl.clone();
+            let mut channels_by_name = HashMap::new();
+            channels_by_name.insert(channel.name().to_string(), channel);
+
+            let provider_impl = Arc::new(HistoryCaptureModelProvider {
+                calls: std::sync::Mutex::new(Vec::new()),
+                vision: true,
+            });
+            let base_ctx = peer_prompt_test_context(
+                channels_by_name,
+                provider_impl.clone(),
+                Arc::new(zeroclaw_config::schema::Config::default()),
+                Arc::new(
+                    zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+                ),
+            );
+            let ctx = Arc::new(ChannelRuntimeContext {
+                workspace_dir: Arc::new(workspace.path().to_path_buf()),
+                media_pipeline: zeroclaw_config::schema::MediaPipelineConfig {
+                    enabled: true,
+                    describe_images: true,
+                    ..Default::default()
+                },
+                ..(*base_ctx).clone()
+            });
+
+            process_channel_message(Arc::clone(&ctx), msg, CancellationToken::new()).await;
+
+            let calls = provider_impl
+                .calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                !calls.is_empty(),
+                "provider must have been called ({file_name}/{mime})"
+            );
+            let mut document_path_reached_user_turn = false;
+            for call in calls.iter() {
+                for (role, content) in call {
+                    assert!(
+                        !content.contains("will be processed by vision model"),
+                        "an unsupported image document must not be described as an image \
+                         ({role}): {content}"
+                    );
+                    assert!(
+                        !content.contains("IMAGE:data:"),
+                        "an unsupported image document must not be inlined as base64 \
+                         ({role}): {content}"
+                    );
+                    assert!(
+                        !content.contains("could not be loaded"),
+                        "an unsupported image document must not become a load-failure note \
+                         ({role}): {content}"
+                    );
+                    if role == "user" && content.contains(&document_path) {
+                        document_path_reached_user_turn = true;
+                    }
+                }
+            }
+            assert!(
+                document_path_reached_user_turn,
+                "the document path must reach the provider on the user turn \
+                 ({file_name}/{mime})"
+            );
+            drop(calls);
+
+            let histories = ctx
+                .conversation_histories
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut stored_turns = 0usize;
+            let mut document_path_persisted = false;
+            for (_, history) in histories.iter() {
+                for msg in history.iter() {
+                    stored_turns += 1;
+                    assert!(
+                        !msg.content.contains("IMAGE:data:"),
+                        "stored history must not persist base64 ({file_name}/{mime}): {}",
+                        msg.content
+                    );
+                    assert!(
+                        !msg.content.contains("will be processed by vision model"),
+                        "stored history must not carry an image annotation \
+                         ({file_name}/{mime}): {}",
+                        msg.content
+                    );
+                    if msg.content.contains(&document_path) {
+                        document_path_persisted = true;
+                    }
+                }
+            }
+            assert!(
+                stored_turns > 0,
+                "history must have stored the turn ({file_name}/{mime})"
+            );
+            assert!(
+                document_path_persisted,
+                "stored history must retain the document path ({file_name}/{mime})"
+            );
+        }
+
+        // The reviewer's two boundaries: a named HEIC document, and an
+        // extensionless document whose only image signal is the declared MIME.
+        run_case("photo.heic", "image/heic").await;
+        run_case("scan", "image/heic").await;
+    }
+
     #[tokio::test]
     async fn e2e_photo_attachment_rejected_by_non_vision_provider() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -29926,7 +31113,9 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -30046,7 +31235,9 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -30208,7 +31399,9 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("You are a helpful assistant.".to_string()),
             model: Arc::new("test-model".to_string()),
@@ -30468,7 +31661,9 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -30621,7 +31816,9 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -30766,7 +31963,9 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -30931,7 +32130,9 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("default-model".to_string()),
@@ -31496,7 +32697,9 @@ This is an example JSON object for profile settings."#;
                     std::path::PathBuf::new(),
                 ),
             ),
-            tools_registry: Arc::new(vec![]),
+            tools_registry: Arc::new(
+                zeroclaw_runtime::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]),
+            ),
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),

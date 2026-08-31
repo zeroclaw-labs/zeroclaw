@@ -987,6 +987,9 @@ pub async fn run(
     }
 
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: glibc's parameter-free process allocator trim may release free
+    // arenas after all daemon tasks have been joined; no Rust pointers are
+    // retained across the call.
     unsafe {
         libc::malloc_trim(0);
     }
@@ -1061,10 +1064,11 @@ pub fn stderr_is_interactive_foreground() -> bool {
     if !std::io::IsTerminal::is_terminal(&std::io::stderr()) {
         return false;
     }
-    // SAFETY: these libc calls take no pointers. `tcgetpgrp` returns -1 when
-    // stderr has no controlling terminal; `getpgrp` cannot fail.
-    let foreground_pgrp = unsafe { libc::tcgetpgrp(libc::STDERR_FILENO) };
-    let own_pgrp = unsafe { libc::getpgrp() };
+    let (foreground_pgrp, own_pgrp) = {
+        // SAFETY: these libc calls take no pointers. `tcgetpgrp` returns -1
+        // when stderr has no controlling terminal; `getpgrp` cannot fail.
+        unsafe { (libc::tcgetpgrp(libc::STDERR_FILENO), libc::getpgrp()) }
+    };
     stderr_foreground_decision(foreground_pgrp, own_pgrp)
 }
 
@@ -3404,7 +3408,9 @@ mod tests {
         // Give the signal handler time to register
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        // Send SIGHUP to ourselves — should be ignored by the handler
+        // Send SIGHUP to ourselves — should be ignored by the handler.
+        // SAFETY: `raise` targets the current process with a valid signal
+        // constant and passes no pointers across FFI.
         unsafe { libc::raise(libc::SIGHUP) };
 
         // The future should NOT complete within a short window
@@ -5055,6 +5061,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             pinned_resources: vec![],
             tls_ca_cert_path: None,
+            max_response_bytes: None,
         });
         let agent_alias = "ops".to_string();
         config.mcp_bundles.insert(

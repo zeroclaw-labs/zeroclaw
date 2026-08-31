@@ -974,6 +974,11 @@ sop-rpc-decision-unauthorized = La identidad RPC no está autorizada para resolv
 sop-rpc-policy-missing = La política de aprobación de SOP '{$name}' no está configurada.
 sop-rpc-policy-unavailable = La política del SOP en espera no está disponible: {$reason}.
 
+# ── Aprobación de herramientas en la terminal ──
+# Los atajos ASCII se mantienen alineados con el analizador de respuestas de Rust.
+cli-approval-request = 🔧 El agente quiere ejecutar: {$tool}
+cli-approval-prompt = { "   " }[Y] Sí / [N] No / [A] Siempre para {$tool}:{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply
@@ -998,6 +1003,7 @@ channel-telegram-approval-ack-approved = Aprobado
 channel-telegram-approval-ack-always-approved = Siempre aprobado
 channel-telegram-approval-ack-denied = Denegado
 channel-telegram-approval-ack-unknown = Acción desconocida
+channel-telegram-approval-ack-already-resolved = Aprobación ya resuelta
 channel-discord-approval-btn-allow-once = Permitir una vez
 channel-discord-approval-btn-allow-session = Permitir esta sesión
 channel-discord-approval-btn-allow-always = Permitir siempre
@@ -1006,3 +1012,21 @@ channel-approval-opt-allow-once = Permitir una vez
 channel-approval-opt-allow-always = Permitir siempre
 channel-approval-opt-reject = Rechazar
 channel-approval-opt-reject-with-edit = Rechazar con edición
+cli-agent-error-provider-context-window = La solicitud es demasiado grande para el modelo seleccionado. Reduce la conversación o elige un modelo con una ventana de contexto mayor.
+cli-agent-error-provider-credentials-missing = El proveedor de modelo seleccionado no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.
+cli-agent-error-provider-credentials-missing-named = El proveedor de modelo {$provider} no tiene credenciales configuradas. Añade su clave de API o elige otro proveedor.
+cli-agent-error-provider-authentication = El proveedor de modelo seleccionado rechazó sus credenciales. Revisa las credenciales configuradas.
+cli-agent-error-provider-authentication-named = El proveedor de modelo {$provider} rechazó sus credenciales. Revisa las credenciales configuradas.
+cli-agent-error-provider-rate-limited = El proveedor de modelo seleccionado limitó la solicitud. Espera, revisa la cuota o elige otro proveedor.
+cli-agent-error-provider-server = El proveedor de modelo seleccionado devolvió un error de servidor. Inténtalo de nuevo o elige otro proveedor.
+cli-agent-error-provider-model-not-found = El modelo seleccionado no está disponible. Revisa el nombre de modelo configurado.
+cli-agent-error-provider-client-request = El proveedor de modelo seleccionado rechazó la solicitud. Revisa la configuración del proveedor y la solicitud.
+cli-agent-error-provider-connection-local = El servidor de modelo local en {$endpoint} no está disponible. Inícialo o actualiza el endpoint.
+cli-agent-error-provider-connection-remote = No se puede alcanzar el proveedor de modelo en {$endpoint}. Revisa el acceso de red o elige otro proveedor.
+cli-agent-error-provider-connection = No se puede alcanzar el proveedor de modelo seleccionado. Revisa el acceso de red o elige otro proveedor.
+cli-agent-error-provider-timeout = El proveedor de modelo seleccionado agotó el tiempo de espera. Inténtalo de nuevo o elige otro proveedor.
+cli-agent-error-provider-generic = El proveedor de modelo seleccionado falló. Revisa la configuración del proveedor o elige otro proveedor.
+cli-delegate-error-invalid-semantic-completion = El agente '{$agent_name}' falló: el proveedor de modelo devolvió una finalización semántica no válida.
+cli-agent-error-invalid-semantic-completion = El proveedor de modelo devolvió una finalización semántica no válida.
+cli-delegate-error-incomplete-after-provider-tools = El agente '{$agent_name}' falló: el proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.
+cli-agent-error-incomplete-after-provider-tools = El proveedor de modelo terminó después de ejecutar herramientas sin una respuesta final.

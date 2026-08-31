@@ -974,6 +974,11 @@ sop-rpc-decision-unauthorized = RPC プリンシパルには、この SOP ステ
 sop-rpc-policy-missing = SOP 承認ポリシー '{$name}' が構成されていません。
 sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できません: {$reason}。
 
+# ── ターミナルでのツール承認 ──
+# ASCII ショートカットは Rust 側の応答パーサーと一致させます。
+cli-approval-request = 🔧 エージェントが実行しようとしています: {$tool}
+cli-approval-prompt = { "   " }[Y] はい / [N] いいえ / [A] 常に許可（{$tool}）:{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply
@@ -998,6 +1003,7 @@ channel-telegram-approval-ack-approved = 承認しました
 channel-telegram-approval-ack-always-approved = 常に承認しました
 channel-telegram-approval-ack-denied = 拒否しました
 channel-telegram-approval-ack-unknown = 不明な操作です
+channel-telegram-approval-ack-already-resolved = 承認はすでに処理済みです
 channel-discord-approval-btn-allow-once = 今回のみ許可
 channel-discord-approval-btn-allow-session = このセッションのみ許可
 channel-discord-approval-btn-allow-always = 常に許可
@@ -1006,3 +1012,21 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+cli-agent-error-provider-context-window = リクエストが選択したモデルのコンテキストウィンドウを超えています。会話を短くするか、より大きなコンテキストウィンドウを持つモデルを選択してください。
+cli-agent-error-provider-credentials-missing = 選択したモデルプロバイダーの認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-credentials-missing-named = モデルプロバイダー {$provider} の認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-authentication = 選択したモデルプロバイダーが認証情報を拒否しました。設定した認証情報を確認してください。
+cli-agent-error-provider-authentication-named = モデルプロバイダー {$provider} が認証情報を拒否しました。設定した認証情報を確認してください。
+cli-agent-error-provider-rate-limited = 選択したモデルプロバイダーがリクエストをレート制限しました。待機するか、クォータを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-server = 選択したモデルプロバイダーがサーバーエラーを返しました。再試行するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-model-not-found = 選択したモデルを利用できません。設定したモデル名を確認してください。
+cli-agent-error-provider-client-request = 選択したモデルプロバイダーがリクエストを拒否しました。プロバイダー設定とリクエストを確認してください。
+cli-agent-error-provider-connection-local = {$endpoint} のローカルモデルサーバーを利用できません。起動するか、エンドポイントを更新してください。
+cli-agent-error-provider-connection-remote = {$endpoint} のモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-connection = 選択したモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-timeout = 選択したモデルプロバイダーがタイムアウトしました。再試行するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-generic = 選択したモデルプロバイダーで失敗しました。プロバイダー設定を確認するか、別のプロバイダーを選択してください。
+cli-delegate-error-invalid-semantic-completion = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-agent-error-invalid-semantic-completion = モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-delegate-error-incomplete-after-provider-tools = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
+cli-agent-error-incomplete-after-provider-tools = モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。

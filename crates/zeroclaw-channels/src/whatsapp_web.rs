@@ -1491,6 +1491,7 @@ impl WhatsAppWebChannel {
             file_name,
             data,
             mime_type,
+            marker: None,
         });
     }
 
@@ -2484,7 +2485,7 @@ impl Channel for WhatsAppWebChannel {
             .map(|vs| vs.contains(&message.recipient))
             .unwrap_or(false);
 
-        if is_voice_chat && self.tts_manager.is_some() {
+        if is_voice_chat && let Some(tts_manager) = self.tts_manager.clone() {
             let content = &text_content;
             // Only queue substantive natural-language replies for voice.
             // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
@@ -2510,7 +2511,6 @@ impl Channel for WhatsAppWebChannel {
                 let client_clone = client.clone();
                 let to_clone = to.clone();
                 let recipient = message.recipient.clone();
-                let tts_manager = self.tts_manager.clone().unwrap();
                 zeroclaw_spawn::spawn!(async move {
                     // Wait 10 seconds — long enough for the agent to finish its
                     // full tool chain and send the final answer.

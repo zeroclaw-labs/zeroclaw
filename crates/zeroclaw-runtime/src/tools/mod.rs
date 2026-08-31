@@ -210,6 +210,10 @@ impl Tool for ArcToolRef {
         self.0.spec()
     }
 
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.0.invocation_triggers()
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.0.execute(args).await
     }
@@ -272,6 +276,10 @@ impl Tool for ArcDelegatingTool {
     // `parameters_schema()`, deep-cloning MCP schemas every loop iteration.
     fn spec(&self) -> zeroclaw_api::tool::ToolSpec {
         self.inner.spec()
+    }
+
+    fn invocation_triggers(&self) -> Vec<String> {
+        self.inner.invocation_triggers()
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
@@ -431,7 +439,10 @@ pub fn register_skill_tools_with_context_and_runtime(
     );
 }
 
-pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<dyn Tool>> {
+pub async fn collect_mcp_elevation_arcs(
+    registry: &Arc<McpRegistry>,
+    security: &Arc<zeroclaw_config::policy::SecurityPolicy>,
+) -> Vec<Arc<dyn Tool>> {
     let mut arcs: Vec<Arc<dyn Tool>> = Vec::new();
     for name in registry.tool_names() {
         if let Some(def) = registry.get_tool_def(&name).await {
@@ -439,6 +450,7 @@ pub async fn collect_mcp_elevation_arcs(registry: &Arc<McpRegistry>) -> Vec<Arc<
                 name,
                 def,
                 Arc::clone(registry),
+                Arc::clone(security),
             )));
         }
     }
@@ -510,6 +522,35 @@ pub struct AllToolsResult {
     /// be trusted. `None` when no agents are configured.
     #[cfg(test)]
     pub(crate) delegate_tool: Option<Arc<DelegateTool>>,
+}
+
+impl AllToolsResult {
+    /// Wrap an already-built tool vector as `assemble` INPUT, with every
+    /// side-channel handle empty. This mints an `AllToolsResult` (the input to
+    /// [`crate::tools::scoped::ScopedToolRegistry::assemble`]), NOT a
+    /// `ScopedToolRegistry` - it does not touch the seal. (`AllToolsResult`'s
+    /// fields are all `pub`, so a caller could already hand-roll this literal;
+    /// the helper just centralizes the "all handles empty" shape.) Used by the
+    /// paths that already own a fixed / pre-filtered tool set (the skill-review
+    /// harness, bounded delegation, and the `zeroclaw-eval` replay harness) and
+    /// route it through `assemble` only to seal it: they pass `skills: &[]`,
+    /// `connect_mcp: false`, `connect_peripherals: false`, so the empty handles
+    /// here are never read by the assembly. `pub` (not `pub(crate)`) so the
+    /// out-of-crate `zeroclaw-eval` harness can reach it.
+    pub fn from_prebuilt_tools(tools: Vec<Box<dyn Tool>>) -> Self {
+        Self {
+            tools,
+            delegate_handle: None,
+            ask_user_handle: None,
+            channel_room_handle: None,
+            reaction_handle: Arc::new(RwLock::new(HashMap::new())),
+            poll_handle: None,
+            escalate_handle: None,
+            unfiltered_tool_arcs: Vec::new(),
+            #[cfg(test)]
+            delegate_tool: None,
+        }
+    }
 }
 
 /// Create full tool registry including memory tools and optional Composio
@@ -666,7 +707,17 @@ pub fn all_tools_with_runtime(
     let register_coding_cli_tools = has_shell_access && persistent_writes;
     let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
-    let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
+    let sandbox_extra_roots = crate::security::SandboxExtraRoots {
+        read_write: security.allowed_roots.clone(),
+        read_only: security.allowed_roots_read_only.clone(),
+        write_only: security.allowed_roots_write_only.clone(),
+    };
+    let sandbox = create_sandbox(
+        &sandbox_cfg,
+        runtime_kind,
+        Some(&security.workspace_dir),
+        &sandbox_extra_roots,
+    );
     let coding_cli_executor = coding_cli_executor::RuntimeCodingCliExecutor::shared(
         runtime.clone(),
         sandbox.clone(),
@@ -727,7 +778,7 @@ pub fn all_tools_with_runtime(
             agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronListTool::new(config.clone())),
+        Arc::new(CronListTool::new(config.clone(), agent_alias)),
         Arc::new(CronRemoveTool::new(
             config.clone(),
             security.clone(),
@@ -742,9 +793,10 @@ pub fn all_tools_with_runtime(
         Arc::new(CronRunTool::new_with_runtime(
             config.clone(),
             security.clone(),
+            agent_alias,
             runtime.clone(),
         )),
-        Arc::new(CronRunsTool::new(config.clone())),
+        Arc::new(CronRunsTool::new(config.clone(), agent_alias)),
         Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
         Arc::new(MemoryRecallTool::new(memory.clone())),
         Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
@@ -2575,6 +2627,66 @@ const = true
     }
 
     #[test]
+    fn send_via_triggers_survive_production_registry_boxing() {
+        // Regression: every arc in the registry is re-boxed as an
+        // `ArcDelegatingTool`, which must forward `invocation_triggers()` —
+        // otherwise the trait default erases send_via's vocabulary and the
+        // pre-turn prefilter can never match it. Build the real registry and
+        // assert the boxed send_via still carries its live triggers.
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec![],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = zeroclaw_config::schema::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let tools = all_tools_with_runtime(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            Arc::new(NativeRuntime::new()),
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+        )
+        .tools;
+
+        let send_via = tools
+            .iter()
+            .find(|t| t.name() == "send_via")
+            .expect("send_via is always registered");
+        let triggers = send_via.invocation_triggers();
+        assert!(
+            triggers.iter().any(|t| t == "send this to"),
+            "boxed send_via must keep its static triggers; got {triggers:?}"
+        );
+    }
+
+    #[test]
     fn sop_tools_present_when_engine_provided() {
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
@@ -2671,10 +2783,20 @@ const = true
             workspace_dir: &std::path::Path,
         ) -> anyhow::Result<tokio::process::Command> {
             *self.seen_command.lock().unwrap() = Some(command.to_string());
+            #[cfg(windows)]
+            let mut process = {
+                let mut process = tokio::process::Command::new("cmd.exe");
+                process.args(["/D", "/S", "/C", "echo zc-runtime"]);
+                process
+            };
+            #[cfg(not(windows))]
             let mut process = tokio::process::Command::new("/bin/sh");
+            #[cfg(not(windows))]
             process
                 .args(["-c", "printf '%s' \"$0\"", "zc-runtime"])
                 .current_dir(workspace_dir);
+            #[cfg(windows)]
+            process.current_dir(workspace_dir);
             Ok(process)
         }
     }

@@ -2,6 +2,7 @@
 //! These functions were originally in `channels/mod.rs` but live here to
 //! break a circular dependency between the channels and agent modules.
 
+use crate::agent::prompt::{TIMESTAMP_ORIENTATION, append_timestamp_orientation};
 use crate::identity;
 use crate::security::AutonomyLevel;
 use crate::skills::Skill;
@@ -11,6 +12,7 @@ use zeroclaw_api::runtime_traits::{POSIX_DELETION_GUIDANCE, ShellProfile};
 pub const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 pub const NO_TOOLS_TASK_FRAMING: &str = "No tools are available for this turn";
 pub const NATIVE_TOOLS_TASK_FRAMING: &str = "Use tools when the request requires action";
+const TRUNCATION_MARKER: &str = "\n\n[System prompt truncated to fit context budget]\n";
 
 fn load_openclaw_bootstrap_files(
     prompt: &mut String,
@@ -440,7 +442,8 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         }
     }
 
-    // ── 8. Channel Capabilities (skipped in compact_context mode) ──
+    // ── 8. Channel Capabilities (full copy skipped in compact_context
+    //       mode; the timestamp orientation below emits in both modes) ──
     if !compact_context {
         prompt.push_str("## Channel Capabilities\n\n");
         prompt.push_str("- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n");
@@ -467,18 +470,49 @@ pub fn build_system_prompt_with_mode_and_autonomy(
             prompt.push_str("- NEVER narrate or describe your tool usage. Do NOT say 'Let me fetch...', 'I will use...', 'Searching...', or similar. Give the FINAL ANSWER only — no intermediate steps, no tool mentions, no progress updates.\n");
         }
         prompt.push_str("- Calibration note: agents in this system currently err on the side of silence when a response would be appropriate, which users find frustrating. Skew toward replying. Memory is supplementary context that informs how you respond, not a gate on whether you respond.\n\n");
-    } // end if !compact_context (Channel Capabilities)
+    } // end if !compact_context (full Channel Capabilities copy)
+
+    // Emitted unconditionally: small local models mistake the enrichment
+    // prefix for log/API data without this orientation. The prefix format
+    // is canonical in agent.rs `Agent::enrich_user_message` — keep in sync.
+    //
+    // This orientation is runtime-owned and must survive the compact/finite
+    // `max_system_prompt_chars` budget: it is what stops small local models
+    // from reading the timestamp prefix as a log/API payload.
+    // Because truncation below keeps only the *top* portion of the prompt,
+    // the orientation is re-emitted inside the retained budget after any
+    // truncation rather than left in the truncatable tail.
+    append_timestamp_orientation(&mut prompt);
 
     // ── 9. Truncation (max_system_prompt_chars budget) ──────────
     if max_system_prompt_chars > 0 && prompt.len() > max_system_prompt_chars {
-        // Truncate on a char boundary, keeping the top portion (identity + safety).
-        let mut end = max_system_prompt_chars;
-        // Ensure we don't split a multi-byte UTF-8 character.
-        while !prompt.is_char_boundary(end) && end > 0 {
-            end -= 1;
+        // The orientation is runtime-critical, so it must land inside the
+        // budget. Reserve room for the orientation (and the truncation
+        // marker) at the head-retained portion, then re-append it so it
+        // always survives even when the assembled prompt overflows.
+        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
+        if max_system_prompt_chars >= reserved {
+            // Keep the top portion (identity + safety) minus the reserved tail.
+            let mut end = max_system_prompt_chars - reserved;
+            // Ensure we don't split a multi-byte UTF-8 character.
+            while end > 0 && !prompt.is_char_boundary(end) {
+                end -= 1;
+            }
+            prompt.truncate(end);
+            prompt.push_str(TRUNCATION_MARKER);
+            append_timestamp_orientation(&mut prompt);
+        } else {
+            // When the budget cannot hold both retained content and the
+            // critical tail, prioritize as much of the orientation as fits.
+            // This preserves the full orientation whenever possible without
+            // violating the configured prompt ceiling for very small budgets.
+            let mut end = max_system_prompt_chars.min(TIMESTAMP_ORIENTATION.len());
+            while end > 0 && !TIMESTAMP_ORIENTATION.is_char_boundary(end) {
+                end -= 1;
+            }
+            prompt.clear();
+            prompt.push_str(&TIMESTAMP_ORIENTATION[..end]);
         }
-        prompt.truncate(end);
-        prompt.push_str("\n\n[System prompt truncated to fit context budget]\n");
     }
 
     if prompt.is_empty() {
@@ -538,6 +572,50 @@ fn inject_workspace_file(
 mod tests {
     use super::*;
     use zeroclaw_config::schema::SkillsPromptInjectionMode;
+
+    fn prompt_with_compact_context(compact_context: bool) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            &[],
+            &[],
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            compact_context,
+            0,
+            true,
+            false,
+            None,
+        )
+    }
+
+    /// Build a prompt with a finite `max_system_prompt_chars` budget and
+    /// enough registered tools to overflow it, forcing the truncation path.
+    fn prompt_with_finite_budget(
+        compact_context: bool,
+        max_system_prompt_chars: usize,
+        tools: &[(&str, &str)],
+    ) -> String {
+        build_system_prompt_with_mode_and_autonomy(
+            std::path::Path::new("/tmp"),
+            "test-model",
+            tools,
+            &[],
+            None,
+            None,
+            None,
+            false,
+            SkillsPromptInjectionMode::Full,
+            compact_context,
+            max_system_prompt_chars,
+            true,
+            false,
+            None,
+        )
+    }
 
     /// Helper: build the prompt with a given shell profile and one registered
     /// tool, named by `tool_name` so a caller can pick which command-taking
@@ -834,6 +912,15 @@ mod tests {
     }
 
     #[test]
+    fn compact_context_carries_timestamp_orientation() {
+        let prompt = prompt_with_compact_context(true);
+        assert!(
+            prompt.contains("timestamp metadata added by the runtime"),
+            "compact system prompt must orient the model on the date/time-prefix convention: {prompt}"
+        );
+    }
+
+    #[test]
     fn full_autonomy_authorizes_shell_when_registered() {
         let tools = [
             ("shell", "Run a shell command"),
@@ -890,6 +977,134 @@ mod tests {
                 && !auth.contains("not blocked by any security policy"),
             "block must not claim the tools are exempt from all security policy"
         );
+    }
+
+    #[test]
+    fn non_compact_context_keeps_full_channel_capabilities_section() {
+        let prompt = prompt_with_compact_context(false);
+        assert!(
+            prompt.contains("You are running as a messaging bot"),
+            "full system prompt must retain the existing Channel Capabilities copy: {prompt}"
+        );
+        assert!(
+            prompt.contains("timestamp metadata added by the runtime"),
+            "full system prompt must carry the timestamp orientation too: {prompt}"
+        );
+    }
+
+    #[test]
+    fn timestamp_orientation_survives_finite_budget_truncation() {
+        // Regression guard: finite `max_system_prompt_chars` is a supported production config,
+        // and the runtime-owned timestamp orientation must survive it rather
+        // than being chopped off in the truncatable tail. Register enough
+        // tools and pick a budget small enough to force the truncation path.
+        let tools: [(&str, &str); 12] = [
+            (
+                "shell",
+                "Run a shell command with a long description to add bulk",
+            ),
+            (
+                "file_read",
+                "Read a file with a long description to add bulk",
+            ),
+            (
+                "file_write",
+                "Write a file with a long description to add bulk",
+            ),
+            (
+                "file_edit",
+                "Edit a file with a long description to add bulk",
+            ),
+            (
+                "http_request",
+                "Make an HTTP request with a long description to add bulk",
+            ),
+            (
+                "web_search",
+                "Search the web with a long description to add bulk",
+            ),
+            (
+                "web_fetch",
+                "Fetch a page with a long description to add bulk",
+            ),
+            ("calculator", "Do math with a long description to add bulk"),
+            ("weather", "Get weather with a long description to add bulk"),
+            (
+                "memory_store",
+                "Store memory with a long description to add bulk",
+            ),
+            (
+                "memory_recall",
+                "Recall memory with a long description to add bulk",
+            ),
+            (
+                "canvas",
+                "Render to a canvas with a long description to add bulk",
+            ),
+        ];
+
+        for compact in [false, true] {
+            // A budget well below the assembled prompt length so truncation
+            // definitely runs, but large enough to hold the retained head plus
+            // the reserved orientation.
+            let budget = 600;
+            let prompt = prompt_with_finite_budget(compact, budget, &tools);
+
+            // Truncation must actually have fired (otherwise the test proves
+            // nothing about the retained-budget guarantee).
+            assert!(
+                prompt.contains("[System prompt truncated to fit context budget]"),
+                "compact={compact}: expected truncation to fire at budget {budget}; prompt was:\n{prompt}"
+            );
+            // The runtime-owned orientation must survive inside the budget.
+            assert!(
+                prompt.contains("timestamp metadata added by the runtime"),
+                "compact={compact}: timestamp orientation must survive finite-budget truncation; prompt was:\n{prompt}"
+            );
+            assert!(
+                prompt.len() <= budget,
+                "compact={compact}: prompt length {} exceeded budget {budget}",
+                prompt.len()
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_orientation_respects_budgets_at_and_below_reserved_tail() {
+        let tools = [(
+            "shell",
+            "Run a shell command with enough description to overflow",
+        )];
+        let reserved = TIMESTAMP_ORIENTATION.len() + TRUNCATION_MARKER.len();
+
+        for compact in [false, true] {
+            for budget in [
+                1,
+                TIMESTAMP_ORIENTATION.len() - 1,
+                TIMESTAMP_ORIENTATION.len(),
+                reserved - 1,
+                reserved,
+            ] {
+                let prompt = prompt_with_finite_budget(compact, budget, &tools);
+                assert!(
+                    prompt.len() <= budget,
+                    "compact={compact}: prompt length {} exceeded budget {budget}",
+                    prompt.len()
+                );
+
+                if budget >= TIMESTAMP_ORIENTATION.len() {
+                    assert!(
+                        prompt.ends_with(TIMESTAMP_ORIENTATION),
+                        "compact={compact}: full orientation must survive budget {budget}: {prompt}"
+                    );
+                } else {
+                    assert!(
+                        TIMESTAMP_ORIENTATION.starts_with(&prompt),
+                        "compact={compact}: tiny budget {budget} must retain a bounded orientation prefix: {prompt}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

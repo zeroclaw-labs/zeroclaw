@@ -40,7 +40,6 @@ pub mod routines;
 pub mod rpc;
 pub mod security;
 pub mod service;
-pub mod skillforge;
 pub mod skills;
 pub mod sop;
 pub mod subagent;

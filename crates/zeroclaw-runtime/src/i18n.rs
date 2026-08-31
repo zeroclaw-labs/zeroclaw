@@ -824,6 +824,50 @@ mod tests {
     }
 
     #[test]
+    fn cli_approval_prompt_strings_format_in_all_locales() {
+        let tool = "shell";
+        let cases = [
+            ("cli-approval-request", &["shell"][..]),
+            ("cli-approval-prompt", &["shell", "[Y]", "[N]", "[A]"][..]),
+        ];
+
+        for (source, locale) in [
+            (include_str!("../locales/en/cli.ftl"), "en"),
+            (include_str!("../locales/es/cli.ftl"), "es"),
+            (include_str!("../locales/fr/cli.ftl"), "fr"),
+            (include_str!("../locales/ja/cli.ftl"), "ja"),
+            (include_str!("../locales/zh-CN/cli.ftl"), "zh-CN"),
+        ] {
+            for (key, expected_parts) in cases {
+                let value = format_ftl_message(source, locale, key, &[("tool", tool)])
+                    .unwrap_or_else(|| panic!("{key} should format in {locale}"));
+                for expected in expected_parts {
+                    assert!(
+                        value.contains(expected),
+                        "{key} in {locale} should preserve {expected:?}; got: {value:?}"
+                    );
+                }
+                if key == "cli-approval-prompt" {
+                    assert!(
+                        value.ends_with(' ') && !value.ends_with("  "),
+                        "{key} in {locale} should end with exactly one space; got: {value:?}"
+                    );
+                }
+            }
+        }
+
+        let english = include_str!("../locales/en/cli.ftl");
+        assert_eq!(
+            format_ftl_message(english, "en", "cli-approval-request", &[("tool", tool)]).as_deref(),
+            Some("🔧 Agent wants to execute: shell")
+        );
+        assert_eq!(
+            format_ftl_message(english, "en", "cli-approval-prompt", &[("tool", tool)]).as_deref(),
+            Some("   [Y]es / [N]o / [A]lways for shell: ")
+        );
+    }
+
+    #[test]
     fn channel_compile_guidance_cli_strings_format_from_fluent() {
         let cases = [
             (
@@ -1452,6 +1496,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_terminal_failure_endpoint_messages_are_owned_by_each_locale() {
+        for locale in ["en", "es", "fr", "ja", "zh-CN"] {
+            let sources = load_cli_ftl_sources(locale);
+            for key in [
+                "cli-agent-error-provider-connection-local",
+                "cli-agent-error-provider-connection-remote",
+            ] {
+                let formatted = format_cli_string_with_args(
+                    &sources,
+                    key,
+                    &[("endpoint", "http://127.0.0.1:11434/v1")],
+                )
+                .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("http://127.0.0.1:11434/v1"),
+                    "{locale}: {key} must own endpoint grammar: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{$endpoint}"),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn provider_credential_messages_are_owned_by_each_locale() {
+        for (source, locale) in committed_locale_sources() {
+            let missing = format_ftl_message(
+                source,
+                locale,
+                "cli-agent-error-provider-credentials-missing",
+                &[],
+            )
+            .unwrap_or_else(|| panic!("{locale}: missing-credentials message should format"));
+            assert!(!missing.is_empty(), "{locale}: missing-credentials message");
+
+            for key in [
+                "cli-agent-error-provider-credentials-missing-named",
+                "cli-agent-error-provider-authentication-named",
+            ] {
+                let formatted =
+                    format_ftl_message(source, locale, key, &[("provider", "custom.test")])
+                        .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("custom.test"),
+                    "{locale}: {key} must include the configured provider: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{$provider}"),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_completion_messages_are_owned_by_each_locale() {
+        for (source, locale) in committed_locale_sources() {
+            for key in [
+                "cli-agent-error-invalid-semantic-completion",
+                "cli-agent-error-incomplete-after-provider-tools",
+            ] {
+                let formatted = format_ftl_message(source, locale, key, &[])
+                    .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(!formatted.is_empty(), "{locale}: {key} should not be empty");
+            }
+
+            for key in [
+                "cli-delegate-error-invalid-semantic-completion",
+                "cli-delegate-error-incomplete-after-provider-tools",
+            ] {
+                let formatted =
+                    format_ftl_message(source, locale, key, &[("agent_name", "delegate")])
+                        .unwrap_or_else(|| panic!("{locale}: {key} should format"));
+                assert!(
+                    formatted.contains("delegate"),
+                    "{locale}: {key} must include the agent name: {formatted}"
+                );
+                assert!(
+                    !formatted.contains("{$agent_name}"),
+                    "{locale}: {key} left an unformatted placeholder: {formatted}"
+                );
+            }
+        }
+    }
+
     /// Argless `channel-approval-*` keys must be defined and non-empty in
     /// every committed locale.
     const CHANNEL_APPROVAL_ARGLESS_KEYS: &[&str] = &[
@@ -1476,7 +1608,7 @@ mod tests {
         "channel-approval-opt-reject-with-edit",
     ];
 
-    fn channel_approval_locale_sources() -> [(&'static str, &'static str); 5] {
+    fn committed_locale_sources() -> [(&'static str, &'static str); 5] {
         [
             (include_str!("../locales/en/cli.ftl"), "en"),
             (include_str!("../locales/es/cli.ftl"), "es"),
@@ -1492,7 +1624,7 @@ mod tests {
         // `channel-approval-*` key must be defined in all 5 committed
         // locales, and the complete Rust-built reply commands — plus the
         // tool arg — must survive translation verbatim.
-        for (source, locale) in channel_approval_locale_sources() {
+        for (source, locale) in committed_locale_sources() {
             for key in CHANNEL_APPROVAL_ARGLESS_KEYS {
                 let value = format_ftl_message(source, locale, key, &[])
                     .unwrap_or_else(|| panic!("{locale}: {key} should be defined"));

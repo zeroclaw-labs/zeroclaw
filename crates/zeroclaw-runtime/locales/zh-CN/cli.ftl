@@ -973,6 +973,11 @@ sop-rpc-decision-unauthorized = RPC 主体无权对该 SOP 步骤作出决策。
 sop-rpc-policy-missing = 未配置 SOP 审批策略“{$name}”。
 sop-rpc-policy-unavailable = 暂停的 SOP 策略不可用：{$reason}。
 
+# ── 终端工具审批 ──
+# ASCII 快捷键与 Rust 响应解析器保持一致。
+cli-approval-request = 🔧 代理想要执行：{$tool}
+cli-approval-prompt = { "   " }[Y] 是 / [N] 否 / [A] 始终允许 {$tool}：{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply
@@ -997,6 +1002,7 @@ channel-telegram-approval-ack-approved = 已批准
 channel-telegram-approval-ack-always-approved = 已始终批准
 channel-telegram-approval-ack-denied = 已拒绝
 channel-telegram-approval-ack-unknown = 未知操作
+channel-telegram-approval-ack-already-resolved = 审批已被处理
 channel-discord-approval-btn-allow-once = 仅本次允许
 channel-discord-approval-btn-allow-session = 本会话允许
 channel-discord-approval-btn-allow-always = 始终允许
@@ -1005,3 +1011,21 @@ channel-approval-opt-allow-once = 仅本次允许
 channel-approval-opt-allow-always = 始终允许
 channel-approval-opt-reject = 拒绝
 channel-approval-opt-reject-with-edit = 编辑后拒绝
+cli-agent-error-provider-context-window = 请求超过了所选模型的上下文窗口。请缩短对话或选择上下文窗口更大的模型。
+cli-agent-error-provider-credentials-missing = 所选模型提供商未配置凭据。请添加其 API 密钥或选择其他提供商。
+cli-agent-error-provider-credentials-missing-named = 模型提供商 {$provider} 未配置凭据。请添加其 API 密钥或选择其他提供商。
+cli-agent-error-provider-authentication = 所选模型提供商拒绝了凭据。请检查已配置的凭据。
+cli-agent-error-provider-authentication-named = 模型提供商 {$provider} 拒绝了凭据。请检查已配置的凭据。
+cli-agent-error-provider-rate-limited = 所选模型提供商对请求进行了速率限制。请等待、检查配额或选择其他提供商。
+cli-agent-error-provider-server = 所选模型提供商返回了服务器错误。请重试或选择其他提供商。
+cli-agent-error-provider-model-not-found = 所选模型不可用。请检查已配置的模型名称。
+cli-agent-error-provider-client-request = 所选模型提供商拒绝了请求。请检查提供商配置和请求。
+cli-agent-error-provider-connection-local = {$endpoint} 上的本地模型服务器不可用。请启动它或更新端点。
+cli-agent-error-provider-connection-remote = 无法连接到 {$endpoint} 上的模型提供商。请检查网络访问或选择其他提供商。
+cli-agent-error-provider-connection = 无法连接到所选模型提供商。请检查网络访问或选择其他提供商。
+cli-agent-error-provider-timeout = 所选模型提供商超时。请重试或选择其他提供商。
+cli-agent-error-provider-generic = 所选模型提供商失败。请检查提供商配置或选择其他提供商。
+cli-delegate-error-invalid-semantic-completion = 代理 '{$agent_name}' 失败：模型提供商返回了无效的语义完成结果。
+cli-agent-error-invalid-semantic-completion = 模型提供商返回了无效的语义完成结果。
+cli-delegate-error-incomplete-after-provider-tools = 代理 '{$agent_name}' 失败：模型提供商执行工具后未返回最终响应便结束了。
+cli-agent-error-incomplete-after-provider-tools = 模型提供商执行工具后未返回最终响应便结束了。

@@ -15,7 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 
-use crate::attachment::PendingAttachment;
+use crate::attachment::{CleanupReport, PendingAttachment, remove_clipboard_temp};
 use crate::clipboard;
 use crate::file_explorer::{ExplorerAction, FileExplorerState};
 use crate::mouse;
@@ -676,6 +676,7 @@ pub(crate) struct InputBarState {
     last_attachment_manager_area: Option<Rect>,
     file_explorer: Option<FileExplorerState>,
     clipboard_temps: Vec<PathBuf>,
+    cleanup_report: CleanupReport,
 
     // Phase 1: Soft-wrap / dynamic height
     /// Vertical scroll offset within the input bar (0-based row index of first visible line).
@@ -746,6 +747,7 @@ impl InputBarState {
             last_attachment_manager_area: None,
             file_explorer: None,
             clipboard_temps: Vec::new(),
+            cleanup_report: CleanupReport::default(),
             scroll_offset: 0,
             last_input_area: Rect::default(),
             last_inner_width: 0,
@@ -797,6 +799,19 @@ impl InputBarState {
 
     pub fn has_attachment_manager(&self) -> bool {
         self.attachment_manager.is_some()
+    }
+
+    /// Open an explorer with one selected path for parent-level key-routing
+    /// tests, so the test can exercise a real explorer confirmation result.
+    #[cfg(test)]
+    pub(crate) fn open_file_explorer_for_test(&mut self, path: PathBuf) {
+        let start_dir = path
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let mut explorer = FileExplorerState::new(start_dir);
+        explorer.select_path_for_test(path);
+        self.file_explorer = Some(explorer);
     }
 
     /// Whether the input bar is in text-input mode (input non-empty or an
@@ -1124,7 +1139,8 @@ impl InputBarState {
         let removed = self.pending_attachments.remove(index);
         if removed.source == crate::attachment::AttachmentSource::Clipboard {
             self.clipboard_temps.retain(|path| path != &removed.path);
-            let _ = std::fs::remove_file(removed.path);
+            self.cleanup_report
+                .merge(remove_clipboard_temp(&removed.path));
         }
 
         if self.pending_attachments.is_empty() {
@@ -1187,8 +1203,14 @@ impl InputBarState {
     /// Remove clipboard temp files (called after turn completes).
     pub fn cleanup_temps(&mut self) {
         for path in self.clipboard_temps.drain(..) {
-            let _ = std::fs::remove_file(path);
+            self.cleanup_report.merge(remove_clipboard_temp(&path));
         }
+    }
+
+    /// Take cleanup failures accumulated by attachment removal or lifecycle
+    /// cleanup. The caller surfaces the bounded report through the info bar.
+    pub(crate) fn take_cleanup_report(&mut self) -> CleanupReport {
+        std::mem::take(&mut self.cleanup_report)
     }
 
     // ── Key handling ─────────────────────────────────────────
@@ -1669,7 +1691,7 @@ impl InputBarState {
                         ))
                     }
                     Err(e) => {
-                        let _ = std::fs::remove_file(&tmp_path);
+                        self.cleanup_report.merge(remove_clipboard_temp(&tmp_path));
                         InputBarAction::StatusMessage(crate::i18n::t_args(
                             "zc-input-clipboard-error",
                             &[("error", &e.to_string())],
@@ -2301,6 +2323,63 @@ mod tests {
     }
 
     #[test]
+    fn alt_backspace_deletes_previous_word() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello ");
+        assert_eq!(bar.cursor(), 6);
+    }
+
+    #[test]
+    fn plain_backspace_still_deletes_one_grapheme() {
+        // The word-delete chord differs from Backspace only by ALT, so an
+        // over-permissive match would silently turn every Backspace into a
+        // word delete.
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello worl");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
+    fn alt_backspace_deletes_the_selection_when_one_is_active() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("hello world");
+        bar.selection = Some((6, 11));
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "hello ");
+        assert!(bar.selection.is_none());
+    }
+
+    #[test]
+    fn alt_backspace_normalizes_cursor_after_joining_emoji_graphemes() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut bar = input_bar_with_shared_commands();
+        bar.insert_text("🇺x🇸");
+        bar.move_cursor_left();
+
+        let action = bar.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT));
+
+        assert!(matches!(action, InputBarAction::Consumed));
+        assert_eq!(bar.input(), "🇺🇸");
+        assert_eq!(bar.cursor(), bar.input().len());
+    }
+
+    #[test]
     fn alt_arrows_move_by_word_without_changing_input() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let mut bar = input_bar_with_shared_commands();
@@ -2572,6 +2651,30 @@ mod tests {
         assert!(bar.pending_attachments().is_empty());
         assert!(bar.clipboard_temps().is_empty());
         assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn removing_clipboard_attachment_surfaces_failed_cleanup() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut bar = input_bar_with_shared_commands();
+        bar.clipboard_temps.push(dir.path().to_path_buf());
+        bar.add_attachment(PendingAttachment {
+            path: dir.path().to_path_buf(),
+            mime_type: "image/png".into(),
+            filename: "clip.png".into(),
+            size_bytes: 0,
+            source: crate::attachment::AttachmentSource::Clipboard,
+        });
+
+        bar.remove_attachment(0);
+
+        assert!(bar.pending_attachments().is_empty());
+        assert!(bar.clipboard_temps().is_empty());
+        assert_eq!(bar.take_cleanup_report().failed_count(), 1);
+        assert!(
+            dir.path().exists(),
+            "failed cleanup must leave the path visible"
+        );
     }
 
     #[test]

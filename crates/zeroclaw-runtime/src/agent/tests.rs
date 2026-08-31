@@ -336,7 +336,9 @@ fn build_agent_with(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(dispatcher)
@@ -353,7 +355,9 @@ fn build_agent_with_memory(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(mem)
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -370,7 +374,9 @@ fn build_agent_with_config(
 ) -> Agent {
     Agent::builder()
         .model_provider(model_provider)
-        .tools(tools)
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            tools,
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))
@@ -751,12 +757,9 @@ async fn history_trims_after_max_messages() {
         retained_messages.len(),
         max_history,
     );
-    let mut turns = retained_messages.chunks_exact(2);
-    assert!(
-        turns.remainder().is_empty(),
-        "history must retain whole turns"
-    );
-    assert!(turns.all(|turn| matches!(
+    let (turns, remainder) = retained_messages.as_chunks::<2>();
+    assert!(remainder.is_empty(), "history must retain whole turns");
+    assert!(turns.iter().all(|turn| matches!(
         turn,
         [ConversationMessage::Chat(user), ConversationMessage::Chat(assistant)]
             if user.role == "user" && assistant.role == "assistant"
@@ -1154,7 +1157,9 @@ async fn history_contains_all_expected_entries_after_tool_loop() {
 #[tokio::test]
 async fn builder_fails_without_provider() {
     let result = Agent::builder()
-        .tools(vec![])
+        .tools(crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(
+            vec![],
+        ))
         .memory(make_memory())
         .observer(make_observer())
         .tool_dispatcher(Box::new(NativeToolDispatcher))

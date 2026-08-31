@@ -338,7 +338,7 @@ pub struct ChannelMessage {
     /// when the platform supports multiple bot instances. Session-key
     /// construction uses this so two bots on the same platform compute
     /// distinct session IDs and don't share conversation history. `None`
-    /// for channels without an alias concept (webhook, cli).
+    /// for channels without an alias concept (cli).
     pub channel_alias: Option<String>,
     pub timestamp: u64,
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
@@ -1195,6 +1195,7 @@ mod tests {
                 file_name: "test.pdf".to_string(),
                 data: vec![1, 2, 3],
                 mime_type: Some("application/pdf".to_string()),
+                marker: None,
             },
         ]);
 

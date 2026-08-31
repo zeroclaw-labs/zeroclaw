@@ -33,7 +33,6 @@ inkjet = { version = "0.11", default-features = false, features = [
     "language-hcl", "language-zig", "language-scala", "language-php",
     "language-dart",
 ] }
-async-trait = "0.1"
 crossterm = { version = "0.29", features = ["event-stream"] }
 ratatui = { version = "0.30", default-features = true, features = ["unstable-rendered-line-info"] }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }

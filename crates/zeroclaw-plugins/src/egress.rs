@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use zeroclaw_infra::net_guard::{
     Nat64Prefix, NetworkGuardError, PrivateNetworkAccess, ResolvedDestination, egress_host_matches,
-    normalize_egress_patterns, normalize_host, parse_nat64_prefixes,
+    egress_pattern_contains, normalize_egress_patterns, normalize_host, parse_nat64_prefixes,
 };
 
 use crate::PluginPermission;
@@ -108,8 +108,9 @@ impl EgressPolicy {
     ///
     /// # Errors
     ///
-    /// Returns [`EgressError`] for an invalid host pattern, an invalid NAT64
-    /// prefix, or a zero connection ceiling.
+    /// Returns [`EgressError`] for an invalid host pattern, a private carveout
+    /// that is broader than every host grant, an invalid NAT64 prefix, or a
+    /// zero connection ceiling.
     pub fn new(
         hosts: &[String],
         allow_private: &[String],
@@ -124,6 +125,15 @@ impl EgressPolicy {
         let allow_private =
             normalize_egress_patterns(allow_private, "plugins.entries.egress_allow_private")
                 .map_err(|error| EgressError::InvalidHostPattern(error.to_string()))?;
+        if let Some(private) = allow_private.iter().find(|private| {
+            !hosts
+                .iter()
+                .any(|grant| egress_pattern_contains(grant, private))
+        }) {
+            return Err(EgressError::InvalidHostPattern(format!(
+                "plugins.entries.egress_allow_private entry {private:?} is not granted by plugins.entries.egress_hosts; the carveout relaxes an address class for a granted destination, it does not grant one"
+            )));
+        }
         let nat64_prefixes = parse_nat64_prefixes(nat64_prefixes, "security.nat64_prefixes")
             .map_err(|error| EgressError::InvalidNat64Prefix(error.to_string()))?;
         Ok(Self {
@@ -949,6 +959,14 @@ mod tests {
             matches!(error, EgressError::InvalidNat64Prefix(_)),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn a_private_carveout_cannot_widen_an_exact_host_grant() {
+        let error = EgressPolicy::new(&owned(&["example.com"]), &owned(&["*.example.com"]), &[], 4)
+            .unwrap_err();
+        assert!(matches!(error, EgressError::InvalidHostPattern(_)));
+        assert!(error.to_string().contains("not granted by"));
     }
 
     #[test]

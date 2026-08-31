@@ -168,6 +168,8 @@ pub(crate) async fn prepare_tool_calls(
             &tool_name,
             &mut tool_args,
             ctx.channel_name,
+            ctx.channel
+                .map(zeroclaw_api::attribution::Attributable::alias),
             ctx.channel_reply_target,
         );
 

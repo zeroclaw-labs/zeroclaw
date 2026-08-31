@@ -2497,9 +2497,7 @@ pub async fn handle_options_prop(
         header::ALLOW,
         HeaderValue::from_static("GET, PUT, DELETE, OPTIONS"),
     );
-    response
-        .headers_mut()
-        .insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
+    insert_etag(&mut response, etag);
     response
 }
 
@@ -2510,10 +2508,14 @@ fn schema_response(_label: &'static str) -> Response {
         header::ALLOW,
         HeaderValue::from_static("GET, PUT, PATCH, OPTIONS"),
     );
+    insert_etag(&mut response, etag);
     response
-        .headers_mut()
-        .insert(header::ETAG, HeaderValue::from_str(etag).unwrap());
-    response
+}
+
+fn insert_etag(response: &mut Response, etag: &str) {
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        response.headers_mut().insert(header::ETAG, value);
+    }
 }
 
 fn cached_schema() -> (&'static serde_json::Value, &'static str) {
@@ -2562,6 +2564,13 @@ mod tests {
     use std::time::Duration;
     use zeroclaw_providers::ModelProvider;
     use zeroclaw_runtime::security::pairing::PairingGuard;
+
+    #[test]
+    fn invalid_etag_value_is_omitted_instead_of_panicking() {
+        let mut response = StatusCode::OK.into_response();
+        insert_etag(&mut response, "invalid\nheader");
+        assert!(!response.headers().contains_key(header::ETAG));
+    }
 
     // dirty_entry_for / CascadeReport::dirty_paths tests live in
     // zeroclaw_config::alias_refs — single source of truth (the gateway and CLI

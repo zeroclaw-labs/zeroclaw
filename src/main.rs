@@ -408,8 +408,6 @@ mod security_status;
 #[cfg(feature = "agent-runtime")]
 mod service;
 #[cfg(feature = "agent-runtime")]
-mod skillforge;
-#[cfg(feature = "agent-runtime")]
 mod skills;
 #[cfg(feature = "agent-runtime")]
 mod sop;
@@ -4278,7 +4276,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 return Ok(());
             }
             Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
-                unreachable!()
+                anyhow::bail!("documentation command was not handled before runtime dispatch")
             }
             _ => {
                 anyhow::bail!(
@@ -4307,7 +4305,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
         Commands::Onboard { .. }
         | Commands::Completions { .. }
         | Commands::MarkdownHelp
-        | Commands::MarkdownSchema => unreachable!(),
+        | Commands::MarkdownSchema => {
+            anyhow::bail!("pre-runtime command was not handled before runtime dispatch")
+        }
 
         Commands::Quickstart {
             model_provider,
@@ -6393,6 +6393,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 };
 
+                // The withheld-capability notice is recorded once per config
+                // application, and the record written during startup describes
+                // the config as it was loaded. A patch that turns the section on
+                // is a new application of that setting, so the state before the
+                // ops run is captured here to tell that transition apart from a
+                // patch that leaves an already-enabled section alone.
+                #[cfg(feature = "agent-runtime")]
+                let verifiable_intent_was_enabled = config.verifiable_intent.enabled;
+
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
                 for (idx, op) in ops.iter().enumerate() {
@@ -6658,6 +6667,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     config_patch_fail_json_or_human(json, api_err, human)?;
                 }
                 Box::pin(config.save_dirty()).await?;
+
+                // Report the withheld tool when this patch is what enabled the
+                // section. The helper returns early while it stays disabled, so
+                // the guard is only about the already-enabled case: the startup
+                // call has recorded that one for this process, and recording it
+                // again here would restore the second copy this command used to
+                // write. The trace sink was installed before the command
+                // dispatched, so the record has somewhere to go.
+                #[cfg(feature = "agent-runtime")]
+                if !verifiable_intent_was_enabled {
+                    warn_verifiable_intent_withheld(&config);
+                }
 
                 if json {
                     let body = serde_json::json!({"saved": true, "results": results});
@@ -7443,7 +7464,7 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             .await
         }
         // List/Validate/Show are dispatched on the local synchronous path.
-        _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
+        _ => anyhow::bail!("local SOP verb reached the gateway dispatch path"),
     }
 }
 
@@ -8266,7 +8287,21 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            // Operator-facing posture notice, not runtime bookkeeping. An event
+            // with no category stores as `internal`, and the dashboard Logs view
+            // hides that category by default, so an uncategorised notice is
+            // absent from the history an operator actually reads.
+            .with_category(::zeroclaw_log::EventCategory::System)
+            // The config surface reports this same fact as a structured
+            // warning. Carrying its code and path here is what lets an operator
+            // correlate the two rather than read them as separate problems;
+            // `with_attrs` persists them to the trace and serves them from the
+            // logs API, which the ephemeral variant would not.
+            .with_attrs(::serde_json::json!({
+                "code": ::zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD,
+                "path": "verifiable_intent.enabled",
+            })),
         "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
     );
 }

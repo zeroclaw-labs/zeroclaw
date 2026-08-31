@@ -1397,6 +1397,7 @@ mod tests {
             "aggregates must expand, not appear as leaves"
         );
         assert!(r.default_features.contains(&"gateway".to_string()));
+        assert!(!r.default_features.contains(&"channel-git".to_string()));
     }
 
     #[test]
@@ -1428,8 +1429,17 @@ mod tests {
     #[test]
     fn dist_matches_lean_release_contract() {
         let features = resolve_feature_list(&root(), &Selection::Dist).unwrap();
+        assert!(features.contains(&"channel-git".to_string()));
         let mut expected = resolve_feature_list(&root(), &Selection::Full).unwrap();
-        expected.extend(["channel-matrix", "channel-lark", "whatsapp-web"].map(str::to_owned));
+        expected.extend(
+            [
+                "channel-matrix",
+                "channel-lark",
+                "channel-git",
+                "whatsapp-web",
+            ]
+            .map(str::to_owned),
+        );
         expected.sort();
         expected.dedup();
         assert_eq!(features, expected);
@@ -1511,6 +1521,7 @@ mod tests {
             "distribution extras come from Cargo.toml registry"
         );
         assert!(extras.contains(&"channel-lark".to_string()));
+        assert!(extras.contains(&"channel-git".to_string()));
         assert!(extras.contains(&"whatsapp-web".to_string()));
     }
 
