@@ -3912,23 +3912,71 @@ fn truncate_at_unclosed_protocol_fence(s: &str, known_tool_names: &HashSet<Strin
     s.to_string()
 }
 
-/// Reconstruct the cumulative text expected by MultiMessage finalizers.
+/// Largest byte length `k` (on a UTF-8 boundary) such that `streamed_text`
+/// already ends with `delivered_response[..k]`.
 ///
-/// Their paragraph offsets are measured against the text supplied to
-/// `update_draft`. Terminal runtime deltas intentionally contain only the new
-/// segment, so a tool-call narration already streamed to the draft can be
-/// absent from `outbound_response`. Preserve that streamed prefix when the
-/// final response is its suffix; otherwise retain the canonical final response
-/// because the two representations no longer describe the same stream.
-fn cumulative_multi_message_final_text(
-    streamed_text: &str,
-    outbound_response: &str,
-    delivered_response: &str,
-) -> String {
-    streamed_text.strip_suffix(outbound_response).map_or_else(
-        || delivered_response.to_string(),
-        |streamed_prefix| format!("{streamed_prefix}{delivered_response}"),
-    )
+/// This is the span the visible stream and the canonical final response share
+/// at the seam, so it must not be re-emitted when the two representations have
+/// diverged and we append the final response as the trailing remainder.
+fn cumulative_final_trailing_overlap(streamed_text: &str, delivered_response: &str) -> usize {
+    let mut end = delivered_response.len();
+    while end > 0 {
+        if delivered_response.is_char_boundary(end)
+            && streamed_text.ends_with(&delivered_response[..end])
+        {
+            return end;
+        }
+        end -= 1;
+    }
+    0
+}
+
+/// Reconcile the canonical final response into the cumulative visible-stream
+/// byte coordinate system used by MultiMessage finalizers.
+///
+/// Discord and Matrix MultiMessage finalizers flush `final[sent_so_far..]`,
+/// where `sent_so_far` is a byte offset into the visible cumulative text that
+/// `update_draft` received (`streamed_text`). The text handed to
+/// `finalize_draft` must therefore begin with exactly those visible bytes, or
+/// the offset selects the wrong content — and when the final text is shorter
+/// than `sent_so_far`, the finalizer's `text.len() > sent_so_far` guard drops
+/// the trailing stop reason entirely.
+///
+/// So keep `streamed_text` as the coordinate base and append only content the
+/// stream has not already carried:
+///   * identical / empty stream: nothing to reconcile;
+///   * the final response extends the stream (a runtime stop reason or provider
+///     footer appended after streaming): append only that final-only tail;
+///   * final sanitization removed an already-streamed leading prefix (e.g. a
+///     tool narration line): every delivered byte is already visible, so keep
+///     the stream verbatim and let the finalizer flush the unsent tail once;
+///   * divergent (sanitization rewrote the interior, e.g. a terminal fallback
+///     replacing a malformed payload): preserve the visible coordinate and
+///     append the canonical response past any shared seam so it is delivered
+///     exactly once without duplicating the streamed tail.
+fn cumulative_multi_message_final_text(streamed_text: &str, delivered_response: &str) -> String {
+    if streamed_text.is_empty() {
+        // Nothing was streamed (draft suppressed, or finalize fires before any
+        // visible frame). The finalizer flushes from offset 0, so the canonical
+        // response is the whole message.
+        return delivered_response.to_string();
+    }
+    if delivered_response == streamed_text {
+        return streamed_text.to_string();
+    }
+    if let Some(final_only) = delivered_response.strip_prefix(streamed_text) {
+        // The final response is the visible stream plus genuinely final-only
+        // content. Keep the streamed prefix verbatim; append only the tail.
+        return format!("{streamed_text}{final_only}");
+    }
+    if streamed_text.ends_with(delivered_response) {
+        // Final sanitization dropped a leading, already-streamed prefix. The
+        // stream already contains every delivered byte, so finalize it as-is;
+        // the finalizer's cumulative offset flushes the unsent tail once.
+        return streamed_text.to_string();
+    }
+    let overlap = cumulative_final_trailing_overlap(streamed_text, delivered_response);
+    format!("{streamed_text}{}", &delivered_response[overlap..])
 }
 
 /// Pump draft deltas to the channel transport, sanitizing every partial on the
@@ -7769,11 +7817,7 @@ async fn process_channel_message_body(
                             let streamed_text = streamed_draft_text
                                 .lock()
                                 .unwrap_or_else(|e| e.into_inner());
-                            cumulative_multi_message_final_text(
-                                &streamed_text,
-                                &outbound_response,
-                                &delivered_response,
-                            )
+                            cumulative_multi_message_final_text(&streamed_text, &delivered_response)
                         } else {
                             delivered_response.clone()
                         };
@@ -17323,6 +17367,18 @@ api_key = "anthropic-key"
         /// what the transport actually received rather than on a sanitizer it
         /// called itself. Progress text lands in `progress_messages`.
         draft_updates: tokio::sync::Mutex<Vec<String>>,
+        /// When set, `update_draft`/`finalize_draft` faithfully model the real
+        /// Discord/Matrix MultiMessage cumulative byte-offset bookkeeping: each
+        /// `\n\n`-bounded paragraph is emitted as its own message and the final
+        /// flush sends `text[sent_so_far..]`. This lets a test exercise the exact
+        /// coordinate arithmetic under test rather than a simplified stand-in.
+        cumulative_offset: bool,
+        /// Byte offset into the cumulative visible stream already emitted as
+        /// paragraphs, mirroring the adapters' `multi_message_sent_len`.
+        multi_sent_len: std::sync::Mutex<usize>,
+        /// Paragraphs actually emitted to the room/channel, in order, including
+        /// the final flush — the messages a user would really receive.
+        emitted_paragraphs: tokio::sync::Mutex<Vec<String>>,
     }
 
     struct ExpiringTypingChannel {
@@ -17352,6 +17408,22 @@ api_key = "anthropic-key"
                 stall_start_typing: false,
                 stall_stop_typing: false,
                 draft_updates: tokio::sync::Mutex::new(Vec::new()),
+                cumulative_offset: false,
+                multi_sent_len: std::sync::Mutex::new(0),
+                emitted_paragraphs: tokio::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A MultiMessage channel that models the real adapters' cumulative
+        /// byte-offset paragraph delivery and final flush (see
+        /// [`Self::cumulative_offset`]). `name` selects the adapter identity
+        /// (`"discord"` or `"matrix"`); both share the same offset algorithm.
+        fn multi_message_cumulative(channel_name: &'static str) -> Self {
+            Self {
+                channel_name,
+                supports_multi_message_streaming: true,
+                cumulative_offset: true,
+                ..Self::new(false, false)
             }
         }
 
@@ -17360,14 +17432,6 @@ api_key = "anthropic-key"
                 channel_name: "matrix",
                 supports_multi_message_streaming: stream_mode
                     == zeroclaw_config::schema::MatrixStreamMode::MultiMessage,
-                ..Self::new(false, false)
-            }
-        }
-
-        fn multi_message(channel_name: &'static str) -> Self {
-            Self {
-                channel_name,
-                supports_multi_message_streaming: true,
                 ..Self::new(false, false)
             }
         }
@@ -17720,6 +17784,60 @@ api_key = "anthropic-key"
             text: &str,
         ) -> anyhow::Result<()> {
             self.draft_updates.lock().await.push(text.to_string());
+            if self.cumulative_offset && self.supports_multi_message_streaming {
+                // Mirror the Discord/Matrix MultiMessage `update_draft`: emit
+                // every complete `\n\n`-bounded paragraph (fence-aware) from the
+                // cumulative visible text and advance the sent-length counter
+                // exactly as the real adapters do.
+                let mut emitted = self.emitted_paragraphs.lock().await;
+                let mut sent = self
+                    .multi_sent_len
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if text.len() < *sent {
+                    // A Clear reset the accumulated text; reset our counter.
+                    *sent = 0;
+                    return Ok(());
+                }
+                loop {
+                    if text.len() <= *sent {
+                        break;
+                    }
+                    let new_text = &text[*sent..];
+                    let bytes = new_text.as_bytes();
+                    let mut scan_pos = 0;
+                    let mut in_fence = false;
+                    let mut found = false;
+                    while scan_pos < bytes.len() {
+                        let ch = bytes[scan_pos];
+                        if ch == b'`'
+                            && scan_pos + 2 < bytes.len()
+                            && bytes[scan_pos + 1] == b'`'
+                            && bytes[scan_pos + 2] == b'`'
+                            && (scan_pos == 0 || bytes[scan_pos - 1] == b'\n')
+                        {
+                            in_fence = !in_fence;
+                        }
+                        if !in_fence
+                            && ch == b'\n'
+                            && scan_pos + 1 < bytes.len()
+                            && bytes[scan_pos + 1] == b'\n'
+                        {
+                            let paragraph = new_text[..scan_pos].trim().to_string();
+                            *sent += scan_pos + 2;
+                            if !paragraph.is_empty() {
+                                emitted.push(paragraph);
+                            }
+                            found = true;
+                            break;
+                        }
+                        scan_pos += 1;
+                    }
+                    if !found {
+                        break;
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -17762,6 +17880,20 @@ api_key = "anthropic-key"
                 .lock()
                 .await
                 .push(format!("{recipient}:{message_id}:{text}"));
+            if self.cumulative_offset && self.supports_multi_message_streaming {
+                // Mirror the Discord/Matrix MultiMessage `finalize_draft`: flush
+                // `text[sent_so_far..]` as the final message when non-empty.
+                let sent = *self
+                    .multi_sent_len
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if text.len() > sent {
+                    let remaining = text[sent..].trim().to_string();
+                    if !remaining.is_empty() {
+                        self.emitted_paragraphs.lock().await.push(remaining);
+                    }
+                }
+            }
             Ok(())
         }
 
@@ -34989,19 +35121,34 @@ Done."#;
     }
 
     /// Regression at the channel streaming/finalization boundary: malformed
-    /// protocol exhaustion sends only a display-safe terminal fallback after a
-    /// prior tool narration. A MultiMessage finalizer's offset is cumulative,
-    /// so the fallback must remain after the already sent narration exactly
-    /// once.
+    /// protocol exhaustion. A tool narration and a display-safe terminal
+    /// fallback are streamed live as two MultiMessage paragraphs (the fallback
+    /// is what the stream shows once the malformed protocol payload has been
+    /// held back). MultiMessage commits the narration paragraph live and keeps
+    /// the trailing fallback pending behind its cumulative byte offset. Final
+    /// sanitization then drops the leading narration line from the canonical
+    /// response, leaving only the fallback body — modeled here via
+    /// `delivered_response`, exactly as the stop-reason regressions model their
+    /// final sanitizer. Because the finalizer flushes `text[sent_so_far..]`
+    /// against the cumulative visible coordinate, the reconciled final text must
+    /// keep that coordinate so the complete fallback is delivered after the
+    /// already-sent narration exactly once: never merged into the narration
+    /// paragraph, and never duplicated. Feeding the narration-stripped canonical
+    /// response in directly would slice past the fallback with the cumulative
+    /// offset and strand it.
     #[tokio::test]
     async fn multi_message_finalization_keeps_terminal_malformed_fallback_after_narration() {
         use zeroclaw_runtime::agent::loop_::StreamDelta;
 
-        let channel_impl = Arc::new(DraftRecordingChannel::multi_message("discord"));
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("discord"));
         let channel: Arc<dyn Channel> = channel_impl.clone();
+
         let narration = "Checking the requested records.\n\n";
         let fallback = "I couldn't complete that response safely.";
-        let streamed_text = Arc::new(Mutex::new(String::new()));
+        // Final sanitization keeps only the fallback body after dropping the
+        // leading narration line that was already streamed live.
+        let delivered_response = fallback.to_string();
+
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tx.send(StreamDelta::Text(narration.to_string()))
             .await
@@ -35011,6 +35158,7 @@ Done."#;
             .unwrap();
         drop(tx);
 
+        let streamed_text = Arc::new(Mutex::new(String::new()));
         run_draft_updater(
             channel,
             "chat-1".to_string(),
@@ -35023,18 +35171,32 @@ Done."#;
 
         let final_text = cumulative_multi_message_final_text(
             &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
-            fallback,
-            fallback,
+            &delivered_response,
         );
+        // The narration was already committed live; the cumulative offset must
+        // leave the complete fallback as the unsent tail for finalization.
         assert_eq!(
             &final_text[narration.len()..],
             fallback,
             "the cumulative offset must leave the complete fallback for finalization"
         );
         assert_eq!(final_text.matches(fallback).count(), 1);
+
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
         assert_eq!(
-            channel_impl.draft_updates.lock().await.last(),
-            Some(&final_text)
+            emitted.as_slice(),
+            [narration.trim().to_string(), fallback.to_string()],
+            "the already-streamed narration stays put and the terminal fallback is flushed after it"
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == fallback).count(),
+            1,
+            "the complete terminal fallback must be delivered exactly once"
         );
     }
 
@@ -35078,7 +35240,6 @@ Done."#;
         let final_text = cumulative_multi_message_final_text(
             &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
             &terminal_segment,
-            &terminal_segment,
         );
         let sent_so_far = narration.len() + summary.len() + "\n\n".len();
         assert_eq!(
@@ -35091,6 +35252,176 @@ Done."#;
         assert_eq!(
             channel_impl.draft_updates.lock().await.last(),
             Some(&final_text)
+        );
+    }
+
+    /// Real-adapter regression for the exact cumulative-offset arithmetic:
+    /// a leading tool narration is streamed live as its own MultiMessage
+    /// paragraph, then final sanitization drops that narration line from the
+    /// canonical response. Because the finalizer flushes `text[sent_so_far..]`
+    /// against the cumulative visible stream, the reconciled final text must
+    /// keep the streamed coordinate so the complete stop reason is delivered
+    /// exactly once. Feeding the canonical (narration-stripped) response
+    /// directly would slice past the stop reason and drop it.
+    #[tokio::test]
+    async fn multi_message_finalization_delivers_stop_reason_when_final_sanitizer_drops_narration_discord()
+     {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("discord"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let narration = "Looking through the available records.\n\n";
+        let answer = "Here is the best partial answer I have.";
+        let stop_reason = "Stopped after reaching the tool-call limit.";
+        let body = format!("{answer}\n\n{stop_reason}");
+        // The final sanitizer keeps only the body after dropping the leading
+        // narration line that was already streamed live.
+        let delivered_response = body.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(body.clone())).await.unwrap();
+        drop(tx);
+
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            rx,
+        )
+        .await;
+
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &delivered_response,
+        );
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                narration.trim().to_string(),
+                answer.to_string(),
+                stop_reason.to_string(),
+            ],
+            "the already-streamed narration and body stay put and the stop reason is flushed last"
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == stop_reason).count(),
+            1,
+            "the complete stop reason must be delivered exactly once"
+        );
+    }
+
+    /// The Matrix MultiMessage finalizer shares the same `text[sent_so_far..]`
+    /// cumulative-offset flush, so it needs the same guarantee: dropping a
+    /// streamed leading narration from the canonical response must not strand
+    /// the trailing stop reason.
+    #[tokio::test]
+    async fn multi_message_finalization_delivers_stop_reason_when_final_sanitizer_drops_narration_matrix()
+     {
+        use zeroclaw_runtime::agent::loop_::StreamDelta;
+
+        let channel_impl = Arc::new(DraftRecordingChannel::multi_message_cumulative("matrix"));
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let narration = "Checked the linked calendars.\n\n";
+        let answer = "You have two overlapping meetings on Tuesday.";
+        let stop_reason = "Stopped early because the tool budget was exhausted.";
+        let body = format!("{answer}\n\n{stop_reason}");
+        let delivered_response = body.clone();
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        tx.send(StreamDelta::Text(narration.to_string()))
+            .await
+            .unwrap();
+        tx.send(StreamDelta::Text(body.clone())).await.unwrap();
+        drop(tx);
+
+        let streamed_text = Arc::new(Mutex::new(String::new()));
+        run_draft_updater(
+            channel,
+            "chat-1".to_string(),
+            "draft-1".to_string(),
+            no_tools(),
+            Arc::clone(&streamed_text),
+            rx,
+        )
+        .await;
+
+        let final_text = cumulative_multi_message_final_text(
+            &streamed_text.lock().unwrap_or_else(|e| e.into_inner()),
+            &delivered_response,
+        );
+        channel_impl
+            .finalize_draft("chat-1", "draft-1", &final_text, false)
+            .await
+            .unwrap();
+
+        let emitted = channel_impl.emitted_paragraphs.lock().await;
+        assert_eq!(
+            emitted.as_slice(),
+            [
+                narration.trim().to_string(),
+                answer.to_string(),
+                stop_reason.to_string(),
+            ]
+        );
+        assert_eq!(
+            emitted.iter().filter(|m| m.as_str() == stop_reason).count(),
+            1,
+            "the complete stop reason must be delivered exactly once"
+        );
+    }
+
+    /// Unit coverage for the reconciliation branches of
+    /// [`cumulative_multi_message_final_text`], including the divergent case
+    /// (a terminal fallback replacing a malformed payload) where the visible
+    /// coordinate must be preserved and the canonical text appended once.
+    #[test]
+    fn cumulative_multi_message_final_text_reconciles_against_the_visible_stream() {
+        // Empty stream: the canonical response is the whole message.
+        assert_eq!(
+            cumulative_multi_message_final_text("", "final answer"),
+            "final answer"
+        );
+        // Identical: unchanged.
+        assert_eq!(
+            cumulative_multi_message_final_text("a\n\nb", "a\n\nb"),
+            "a\n\nb"
+        );
+        // Extends: append only the final-only tail (footer / stop reason).
+        assert_eq!(
+            cumulative_multi_message_final_text("a\n\nb", "a\n\nb\n\nc"),
+            "a\n\nb\n\nc"
+        );
+        // Leading narration stripped from the canonical response: keep the
+        // visible stream verbatim so the finalizer flushes the unsent tail.
+        assert_eq!(
+            cumulative_multi_message_final_text("narration\n\nstop", "stop"),
+            "narration\n\nstop"
+        );
+        // Divergent (terminal fallback replaced the payload): the visible
+        // stream stays the coordinate base and the canonical text is appended
+        // once, past any shared seam.
+        assert_eq!(
+            cumulative_multi_message_final_text("narration\n\n", "fallback text"),
+            "narration\n\nfallback text"
+        );
+        // Divergent with a shared seam: the overlap is not duplicated.
+        assert_eq!(
+            cumulative_multi_message_final_text("live XYZ", "XYZ done"),
+            "live XYZ done"
         );
     }
 
