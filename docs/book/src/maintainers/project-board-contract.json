@@ -110,7 +110,7 @@
       "state": "open",
       "labels_any": ["type:tracker", "type:rfc"],
       "status": "Backlog",
-      "reason": "Tracker and RFC issues are accepted coordination surfaces, not ordinary pickup-ready implementation tasks.",
+      "reason": "Tracker and RFC issues are active coordination surfaces, not ordinary pickup-ready implementation tasks.",
       "confidence": "medium",
       "use_label_warnings": true
     },

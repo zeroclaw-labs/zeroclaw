@@ -1,6 +1,7 @@
 import { useLocation } from 'react-router-dom';
 import { basePath } from '../../lib/basePath';
 import { findActiveNavPath } from './sidebarNav';
+import { railAsideStyle, railLinkClassName, railNavClassName } from './sidebarRail';
 import { SidebarNavLink } from './SidebarNavLink';
 import {
   Activity,
@@ -21,7 +22,8 @@ import {
   Wrench,
 } from 'lucide-react';
 import { t } from '@/lib/i18n';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { getStatus } from '@/lib/api';
 import { useVersionCheck } from '@/hooks/useVersionCheck';
 import { UpgradeDialog } from '@/components/UpgradeDialog';
@@ -89,10 +91,22 @@ const navPaths = navGroups.flatMap((group) => group.items.map((item) => item.to)
 
 // ── Desktop rail item ───────────────────────────────────────────────────────
 // Icon-only nav item for the slim rail. The icon is the affordance; the label
-// is exposed three ways: title (native tooltip), aria-label (screen readers),
-// and a token-styled popover to the right shown on hover OR keyboard focus.
-// Active state = accent icon + a 2px left accent bar + subtle accent tint, with
-// aria-current="page" so assistive tech announces the current section.
+// is exposed three ways: title (native tooltip, used as a screen-reader /
+// no-JS fallback), aria-label (screen readers), and a token-styled popover to
+// the right shown on hover OR keyboard focus.
+//
+// The popover is rendered into `document.body` via `createPortal` so it
+// lives outside the desktop `<nav>`'s DOM subtree (the `<nav>` is a scroll
+// container with `overflow-y: auto`; rendering the popover inside the
+// subtree would make it a positioned descendant of that scroll container,
+// which we don't want). With the portal, the popover is rendered into
+// the top-level body and `position: fixed` pins it to viewport coords
+// computed from the NavLink's bounding rect, with `scroll` / `resize`
+// listeners re-anchoring it while it is visible. Because the popover was
+// the only content that ever extended past the rail's right border, the
+// nav needs no horizontal overflow handling at all: `overflow-y: auto`
+// alone leaves `scrollWidth === clientWidth`, so no `overflow-x` value
+// (hidden or clip) is applied to either the `<nav>` or the `<aside>`.
 function RailNavItem({
   item,
   activePath,
@@ -104,55 +118,120 @@ function RailNavItem({
 }) {
   const { to, icon: Icon, labelKey } = item;
   const text = t(labelKey);
-  return (
-    <SidebarNavLink
-      to={to}
-      activePath={activePath}
-      onClick={onClick}
-      title={text}
-      aria-label={text}
-      className={({ isActive }) =>
-        [
-          'group relative flex h-10 w-10 mx-auto items-center justify-center',
-          'rounded-[var(--radius-md)] transition-colors duration-150',
-          'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
-          isActive
-            ? 'bg-pc-accent/10 text-pc-accent'
-            : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
-        ].join(' ')
+  const linkRef = useRef<HTMLAnchorElement>(null);
+  // Tooltip anchor in viewport coords, derived from the DOM: `tooltipTop`
+  // is the vertical center of the NavLink (so the popover visually aligns
+  // with the icon) and `tooltipLeft` is the rail's right edge (the closest
+  // `<aside>`) plus the 8 px visual gap —
+  // i.e. the popover sits flush against the rail. Both are `null` together
+  // when the popover should not render. Deriving both from the rect means
+  // the rail's `w-14` width is no longer hard-coded into the popover's
+  // horizontal position.
+  // Hover and keyboard focus are tracked independently so a mouseleave does
+  // not hide a tooltip that should remain visible while the link is still
+  // `document.activeElement` (the "hover or keyboard focus" visibility
+  // contract). `tooltipVisible` is their union; the position state is only
+  // meaningful while it is true.
+  const [hovered, setHovered] = useState(false);
+  const [focused, setFocused] = useState(false);
+  const tooltipVisible = hovered || focused;
+  const [tooltipTop, setTooltipTop] = useState<number | null>(null);
+  const [tooltipLeft, setTooltipLeft] = useState<number | null>(null);
+
+  // Re-anchor the popover while it is visible so it tracks the NavLink across
+  // viewport scrolls and resize events, and compute the initial position when
+  // visibility flips to true (hover or focus). Cleanup on unmount / hide.
+  useEffect(() => {
+    if (!tooltipVisible) return;
+    const update = () => {
+      const linkRect = linkRef.current?.getBoundingClientRect();
+      // Anchor the popover to the rail's right edge (the closest `<aside>`),
+      // not the link's right edge. The rail is `w-14` (56 px) and the desired
+      // gap is 8 px; deriving from the rail's actual rect keeps the visual gap
+      // stable regardless of how the link is positioned within the rail
+      // (centered icon, full-width item, future layout changes, etc.) — i.e.
+      // the rail's `w-14` is no longer duplicated into the popover's
+      // horizontal position.
+      const railRect = linkRef.current
+        ?.closest('aside')
+        ?.getBoundingClientRect();
+      if (linkRect && railRect) {
+        setTooltipTop(linkRect.top + linkRect.height / 2);
+        setTooltipLeft(railRect.right + 8); // 8 px gap from the rail's right edge
       }
-    >
-      {({ isActive }) => (
-        <>
-          {/* 2px left accent bar marking the active item against the rail edge. */}
-          {isActive && (
-            <span
-              aria-hidden="true"
-              className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+    };
+    update();
+    window.addEventListener('scroll', update, true);
+    window.addEventListener('resize', update);
+    return () => {
+      window.removeEventListener('scroll', update, true);
+      window.removeEventListener('resize', update);
+    };
+  }, [tooltipVisible]);
+
+  return (
+    <>
+      <SidebarNavLink
+        to={to}
+        activePath={activePath}
+        ref={linkRef}
+        onClick={onClick}
+        onMouseEnter={() => setHovered(true)}
+        onMouseLeave={() => setHovered(false)}
+        onFocus={() => setFocused(true)}
+        onBlur={() => setFocused(false)}
+        title={text}
+        aria-label={text}
+        className={({ isActive }) =>
+          [
+            railLinkClassName,
+            'rounded-[var(--radius-md)] transition-colors duration-150',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--pc-focus)]',
+            isActive
+              ? 'bg-pc-accent/10 text-pc-accent'
+              : 'text-pc-text-muted hover:text-pc-text-secondary hover:bg-[var(--pc-hover)]',
+          ].join(' ')
+        }
+      >
+        {({ isActive }) => (
+          <>
+            {/* 2px left accent bar marking the active item against the rail edge. */}
+            {isActive && (
+              <span
+                aria-hidden="true"
+                className="absolute left-0 top-1.5 bottom-1.5 w-0.5 rounded-full bg-pc-accent"
+              />
+            )}
+            <Icon
+              className={`h-[22px] w-[22px] shrink-0 transition-colors ${
+                isActive
+                  ? 'text-pc-accent'
+                  : 'group-hover:text-pc-text-secondary'
+              }`}
             />
-          )}
-          <Icon
-            className={`h-[22px] w-[22px] shrink-0 transition-colors ${
-              isActive ? 'text-pc-accent' : 'group-hover:text-pc-text-secondary'
-            }`}
-          />
-          {/* Tooltip popover to the right — appears on pointer hover and on
-              keyboard focus (focus-within) so the rail is usable without a
-              mouse. Token-styled; non-interactive so it never traps focus. */}
+          </>
+        )}
+      </SidebarNavLink>
+      {tooltipVisible &&
+        tooltipTop !== null &&
+        createPortal(
           <span
             role="tooltip"
-            className="pointer-events-none absolute left-full ml-2 z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
+            className="pointer-events-none fixed z-9999 whitespace-nowrap rounded-[var(--radius-sm)] px-2 py-1 text-xs"
             style={{
+              top: tooltipTop,
+              left: tooltipLeft ?? 0, // set alongside tooltipTop in the `update` closure
+              transform: 'translateY(-50%)',
               background: 'var(--pc-bg-elevated)',
               color: 'var(--pc-text-primary)',
               border: '1px solid var(--pc-border)',
             }}
           >
             {text}
-          </span>
-        </>
-      )}
-    </SidebarNavLink>
+          </span>,
+          document.body,
+        )}
+    </>
   );
 }
 
@@ -279,11 +358,11 @@ export default function Sidebar({ open, onClose }: SidebarProps) {
           divider rules between the icon clusters. */}
       <aside
         className="hidden md:flex fixed top-0 left-0 h-screen w-14 flex-col border-r z-50"
-        style={{ background: 'var(--pc-bg-sidebar)', borderColor: 'var(--pc-border)' }}
+        style={railAsideStyle}
         aria-label={t('nav.aria.primary')}
       >
         <RailLogo />
-        <nav className="flex-1 overflow-y-auto py-3 px-1.5" aria-label={t('nav.aria.primary')}>
+        <nav className={railNavClassName} aria-label={t('nav.aria.primary')}>
           {navGroups.map((group, index) => (
             <div key={group.headingKey} className="space-y-1" role="group" aria-label={t(group.headingKey)}>
               {/* Thin divider between clusters (skipped before the first). */}

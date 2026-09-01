@@ -48,6 +48,23 @@ impl Chord {
                 == normalise_mods(event.code, event.modifiers)
     }
 
+    /// Whether two chords claim the same key event.
+    ///
+    /// Not `==`. [`matches`](Self::matches) compares platform-normalised
+    /// modifiers, so two chords that differ on the wire can still own one
+    /// event: on darwin `normalise_mods` rewrites `CONTROL` to `SUPER` for
+    /// every chord the host has not reserved, which makes `ctrl+a` and
+    /// `super+a` two entries in config and one chord at dispatch. Anything
+    /// deciding which of two chords owns a key asks this, or it arbitrates a
+    /// collision the dispatcher cannot see and leaves the loser advertised in
+    /// Help.
+    #[must_use]
+    pub fn same_key(&self, other: &Self) -> bool {
+        self.code == other.code
+            && normalise_mods(self.code, self.modifiers)
+                == normalise_mods(other.code, other.modifiers)
+    }
+
     /// `Ctrl+K` on most platforms; `⌘K` on darwin. On darwin, a
     /// host-reserved chord's control label is the literal word `Ctrl`
     /// (not the `⌘` glyph) and needs a separator to stay readable —
@@ -59,6 +76,13 @@ impl Chord {
             let label = control_display_label(&self.code);
             literal_word_control = cfg!(target_os = "macos") && label == "Ctrl";
             parts.push(label);
+        }
+        if self.modifiers.contains(KeyModifiers::SUPER) {
+            parts.push(if cfg!(target_os = "macos") {
+                "⌘"
+            } else {
+                "Super"
+            });
         }
         if self.modifiers.contains(KeyModifiers::ALT) {
             parts.push(if cfg!(target_os = "macos") {
@@ -423,6 +447,24 @@ mod tests {
         assert_eq!(Chord::ctrl('x').display(), "⌘x");
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn display_explicit_super_on_darwin() {
+        assert_eq!(
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER).display(),
+            "⌘c"
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn display_explicit_super_on_non_darwin() {
+        assert_eq!(
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER).display(),
+            "Super+c"
+        );
+    }
+
     #[test]
     fn display_arrow_keys() {
         assert_eq!(Chord::key(KeyCode::Up).display(), "↑");
@@ -440,6 +482,7 @@ mod tests {
     fn wire_round_trips_modifiers() {
         for c in [
             Chord::ctrl('k'),
+            Chord::with(KeyCode::Char('c'), KeyModifiers::SUPER),
             Chord::shift(KeyCode::Up),
             Chord::with(
                 KeyCode::Down,

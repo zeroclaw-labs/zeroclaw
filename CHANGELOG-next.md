@@ -13,6 +13,10 @@ ZeroClaw v0.8.4 is a maintenance and hardening release spanning **262 commits** 
 
 ## What's New
 
+### Web and Search
+
+- **Web search output caps and scrape hygiene** (#9824): all six `web_search` provider parsers now cap per-result content and total output; the DuckDuckGo path rotates realistic browser headers and throttles consecutive scrapes; the tool is registered behind the standard rate limiter; provider-blocked and SearXNG misconfiguration errors now give the model and operator accurate next steps.
+
 ### Memory and Retrieval
 
 - Add opt-in retrieval caching, a gated rerank stage, typed memory classification and fact extraction, configuration validation, migration reindex hooks, and content scanning at write and recall boundaries (#8897, #8895, #8900, #8899, #8984).

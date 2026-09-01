@@ -551,24 +551,34 @@ fn build_base_info() -> serde_json::Value {
     })
 }
 
-static CODE_BLOCK_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```").unwrap());
-static IMAGE_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").unwrap());
-static LINK_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").unwrap());
-static HEADING_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").unwrap());
-static BLOCKQUOTE_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^>\s?").unwrap());
-static BULLET_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(?m)^\s*[-*+]\s+").unwrap());
-static EMPHASIS_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"(\*\*|__|~~|`|\*)").unwrap());
-static TABLE_SEPARATOR_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"^\|[\s:|-]+\|$").unwrap());
-static TABLE_ROW_RE: LazyLock<regex::Regex> =
-    LazyLock::new(|| regex::Regex::new(r"^\|(.+)\|$").unwrap());
+static CODE_BLOCK_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"```[^\n]*\n?([\s\S]*?)```")
+        .expect("static WeChat code-block regex must compile")
+});
+static IMAGE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"!\[[^\]]*\]\([^)]*\)").expect("static WeChat image regex must compile")
+});
+static LINK_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"\[([^\]]+)\]\([^)]*\)").expect("static WeChat link regex must compile")
+});
+static HEADING_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^\s{0,3}#{1,6}\s+").expect("static WeChat heading regex must compile")
+});
+static BLOCKQUOTE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^>\s?").expect("static WeChat blockquote regex must compile")
+});
+static BULLET_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?m)^\s*[-*+]\s+").expect("static WeChat bullet regex must compile")
+});
+static EMPHASIS_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(\*\*|__|~~|`|\*)").expect("static WeChat emphasis regex must compile")
+});
+static TABLE_SEPARATOR_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^\|[\s:|-]+\|$").expect("static WeChat table-separator regex must compile")
+});
+static TABLE_ROW_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^\|(.+)\|$").expect("static WeChat table-row regex must compile")
+});
 
 fn markdown_to_plain_text(text: &str) -> String {
     let mut result = CODE_BLOCK_RE.replace_all(text, "$1").into_owned();
@@ -634,10 +644,22 @@ fn render_login_qr(code: &str) -> anyhow::Result<String> {
 
 /// Build common request headers for iLink API.
 fn build_headers(token: Option<&str>) -> reqwest::header::HeaderMap {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("Content-Type", "application/json".parse().unwrap());
-    headers.insert("AuthorizationType", "ilink_bot_token".parse().unwrap());
-    headers.insert("X-WECHAT-UIN", random_wechat_uin().parse().unwrap());
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        reqwest::header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    headers.insert(
+        HeaderName::from_static("authorizationtype"),
+        HeaderValue::from_static("ilink_bot_token"),
+    );
+    let uin = random_wechat_uin();
+    headers.insert(
+        HeaderName::from_static("x-wechat-uin"),
+        HeaderValue::from_str(&uin).expect("base64 WeChat UIN must be a valid header value"),
+    );
     if let Some(t) = token
         && !t.is_empty()
         && let Ok(val) = format!("Bearer {t}").parse()
@@ -848,7 +870,11 @@ impl WeChatChannel {
             if let Some(ref token) = account.token
                 && !token.is_empty()
             {
-                *self.bot_token.write().unwrap() = Some(token.clone());
+                let mut bot_token = match self.bot_token.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *bot_token = Some(token.clone());
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -856,7 +882,11 @@ impl WeChatChannel {
                 );
             }
             if let Some(ref id) = account.account_id {
-                *self.account_id.write().unwrap() = Some(id.clone());
+                let mut account_id = match self.account_id.write() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *account_id = Some(id.clone());
             }
         }
 
@@ -1740,7 +1770,10 @@ impl WeChatChannel {
                     urlencoding::encode(&qrcode)
                 );
                 let mut headers = reqwest::header::HeaderMap::new();
-                headers.insert("iLink-App-ClientVersion", "1".parse().unwrap());
+                headers.insert(
+                    reqwest::header::HeaderName::from_static("ilink-app-clientversion"),
+                    reqwest::header::HeaderValue::from_static("1"),
+                );
 
                 let poll_result = tokio::time::timeout(
                     QR_POLL_TIMEOUT + Duration::from_secs(5),

@@ -121,6 +121,14 @@ pub async fn migrate_openclaw_memory(
 }
 
 fn target_memory_backend(config: &Config) -> Result<Box<dyn Memory>> {
+    let backend = zeroclaw_memory::backend_kind_from_dotted(&config.memory.backend);
+    if zeroclaw_memory::classify_memory_backend(&backend)
+        == zeroclaw_memory::MemoryBackendKind::Qdrant
+    {
+        bail!(crate::i18n::get_required_cli_string(
+            "cli-migrate-openclaw-qdrant-unsupported"
+        ));
+    }
     zeroclaw_memory::create_memory_for_migration(config)
 }
 
@@ -611,6 +619,21 @@ mod tests {
             .err()
             .expect("backend=none should be rejected for migration target");
         assert!(err.to_string().contains("disables persistence"));
+    }
+
+    #[test]
+    fn migration_target_rejects_qdrant_with_localized_operator_guidance() {
+        let target = TempDir::new().unwrap();
+        let mut config = test_config(target.path());
+        config.memory.backend = "qdrant.default".to_string();
+
+        let err = target_memory_backend(&config)
+            .err()
+            .expect("Qdrant is not a supported OpenClaw migration target");
+        let expected =
+            crate::i18n::get_required_cli_string("cli-migrate-openclaw-qdrant-unsupported");
+        assert_eq!(err.to_string(), expected);
+        assert!(!err.to_string().contains("create_memory_"));
     }
 
     // ── §7.1 / §7.2 Config backward compatibility & migration tests ──

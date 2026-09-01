@@ -85,7 +85,7 @@ fn dir_signature(dir: &Path) -> Option<u64> {
                 stack.push(path);
             } else if file_type.is_file() {
                 // Decline to cache rather than fingerprint a file we can't read.
-                let digest = hash_file_contents(&path)?;
+                let digest = hash_file_fingerprint(&path)?;
                 entries.insert(path, (1, digest));
             } else {
                 return None;
@@ -98,6 +98,47 @@ fn dir_signature(dir: &Path) -> Option<u64> {
         path.hash(&mut hasher);
         fingerprint.hash(&mut hasher);
     }
+    Some(hasher.finish())
+}
+
+/// Fingerprint one file for the directory signature.
+///
+/// How much of a file has to be digested follows from how much of it can
+/// change a load decision, and those are not the same for every file. The
+/// audit parses markdown and TOML in full, and the loader reads the manifest
+/// and the skill body out of them, so their whole contents count. Every other
+/// file is only ever inspected for a leading shebang
+/// ([`audit::SHEBANG_SNIFF_BYTES`]); nothing on the load path reads further
+/// into one. Digesting a bundled model or image in full would therefore make
+/// cache validation scale with payload size while distinguishing nothing.
+///
+/// Length is folded in for the sniffed files so truncation past the prefix is
+/// still visible, which costs a `stat` the walk has already done.
+///
+/// This is not a weakening of the freshness contract: it computes the same
+/// function of the inputs that actually feed a load decision. If a file type
+/// gains a full-content reader on the load path, it belongs in
+/// [`audit::audit_reads_full_contents`] and this follows automatically.
+fn hash_file_fingerprint(path: &Path) -> Option<u64> {
+    if super::audit::audit_reads_full_contents(path) {
+        return hash_file_contents(path);
+    }
+    hash_file_prefix(path)
+}
+
+/// Hash the leading [`audit::SHEBANG_SNIFF_BYTES`] of a file, plus its length.
+fn hash_file_prefix(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let mut prefix = Vec::with_capacity(super::audit::SHEBANG_SNIFF_BYTES);
+    Read::take(file, super::audit::SHEBANG_SNIFF_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .ok()?;
+
+    let mut hasher = DefaultHasher::new();
+    prefix.hash(&mut hasher);
+    len.hash(&mut hasher);
     Some(hasher.finish())
 }
 
@@ -283,6 +324,132 @@ mod tests {
             2,
             "editing skill content must bust the cache"
         );
+    }
+
+    /// A bundled asset's body is not an input to any load decision, so
+    /// digesting it in full would make cache validation scale with payload
+    /// size while distinguishing nothing. Editing past the sniffed prefix must
+    /// therefore be a cache hit.
+    #[test]
+    fn edits_past_the_sniffed_prefix_of_an_asset_do_not_bust_the_cache() {
+        let local_cache = RwLock::new(HashMap::new());
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        write(&skills_dir, "alpha", "body\n");
+
+        // Same length, differing only well past the shebang window.
+        let asset = skills_dir.join("alpha/model.bin");
+        let mut first = vec![b'A'; 4096];
+        first[2048] = b'X';
+        std::fs::write(&asset, &first).unwrap();
+
+        let calls = AtomicUsize::new(0);
+        let load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
+        };
+
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut second = vec![b'A'; 4096];
+        second[2048] = b'Y';
+        std::fs::write(&asset, &second).unwrap();
+
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a change no load decision can observe must not force a reload"
+        );
+    }
+
+    /// The other half of that trade. The audit sniffs the leading bytes of
+    /// every file for a shebang, so a benign asset turning into a script is a
+    /// verdict change and must be seen.
+    #[test]
+    fn gaining_a_shebang_inside_the_prefix_busts_the_cache() {
+        let local_cache = RwLock::new(HashMap::new());
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        write(&skills_dir, "alpha", "body\n");
+
+        // Equal-length payloads that differ only inside the sniffed prefix, so
+        // the reload can come from nothing but the prefix bytes flipping from
+        // benign content to a shell shebang. `hash_file_prefix` also folds the
+        // file length into the fingerprint, so a length change alone would bust
+        // the cache and this test would pass even if the prefix were ignored.
+        let benign = b"plain data, nothing executable in this file\n";
+        let mut script = b"#!/bin/sh\necho hi\n".to_vec();
+        while script.len() < benign.len() {
+            script.push(b'#'); // filler comment bytes, still within the 128-byte prefix
+        }
+        assert_eq!(
+            benign.len(),
+            script.len(),
+            "fixtures must be equal length so only the prefix content differs"
+        );
+        assert!(
+            script.len() <= crate::skills::audit::SHEBANG_SNIFF_BYTES,
+            "both payloads must fit inside the sniffed prefix window"
+        );
+
+        let asset = skills_dir.join("alpha/payload");
+        std::fs::write(&asset, benign).unwrap();
+
+        let calls = AtomicUsize::new(0);
+        let load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
+        };
+
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        std::fs::write(&asset, &script).unwrap();
+
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a file becoming script-like changes the audit verdict and must reload"
+        );
+    }
+
+    /// Truncation or extension is visible even when the sniffed prefix is
+    /// identical, since length is folded into the fingerprint.
+    #[test]
+    fn changing_only_length_past_the_prefix_busts_the_cache() {
+        let local_cache = RwLock::new(HashMap::new());
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        write(&skills_dir, "alpha", "body\n");
+
+        let asset = skills_dir.join("alpha/blob.bin");
+        std::fs::write(&asset, vec![b'Z'; 4096]).unwrap();
+
+        let calls = AtomicUsize::new(0);
+        let load = || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            LoadOutput {
+                skills: Vec::new(),
+                dropped: vec![],
+            }
+        };
+
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        std::fs::write(&asset, vec![b'Z'; 8192]).unwrap();
+
+        cached_load_in(&local_cache, &skills_dir, false, "test", load);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

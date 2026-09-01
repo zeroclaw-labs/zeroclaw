@@ -73,8 +73,7 @@ bump "setup.bat" \
 # ── Workspace Cargo.toml ───────────────────────────────────────────
 # Bumps [workspace.package] version (the root version inherited by every child
 # crate via `version.workspace = true`) and the version pins on every path dep
-# in [workspace.dependencies], skipping aardvark* which tracks an independent
-# version.
+# in [workspace.dependencies].
 echo "Workspace Cargo.toml..."
 ROOT_CARGO="$REPO_ROOT/Cargo.toml"
 if [[ -f "$ROOT_CARGO" ]]; then
@@ -85,14 +84,12 @@ if [[ -f "$ROOT_CARGO" ]]; then
   perl -pi -e '
     if (!$done && s/^version = "[^"]+"/version = "'"$VERSION"'"/) { $done = 1 }
   ' "$ROOT_CARGO"
-  # [workspace.dependencies] path-dep version pins, skipping aardvark*. Covers
-  # both crates/ and apps/ path deps (e.g. apps/zerocode) so every in-tree
-  # member tracks the workspace version; a missed apps/ pin leaves the lockfile
-  # unresolvable and breaks `cargo metadata` mid-bump.
+  # [workspace.dependencies] path-dep version pins. Covers both crates/ and
+  # apps/ path deps (e.g. apps/zerocode) so every in-tree member tracks the
+  # workspace version; a missed apps/ pin leaves the lockfile unresolvable and
+  # breaks `cargo metadata` mid-bump.
   perl -pi -e '
-    if (!/path = "crates\/aardvark/) {
-      s{(path = "(?:crates|apps)/[^"]+", version = ")[^"]+(")}{${1}'"$VERSION"'${2}}g
-    }
+    s{(path = "(?:crates|apps)/[^"]+", version = ")[^"]+(")}{${1}'"$VERSION"'${2}}g
   ' "$ROOT_CARGO"
   after="$(sha256sum "$ROOT_CARGO" | awk '{print $1}')"
   if [[ "$before" != "$after" ]]; then

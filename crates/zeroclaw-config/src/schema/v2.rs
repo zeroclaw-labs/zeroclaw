@@ -102,6 +102,7 @@ pub const V3_CHANNEL_TYPES: &[&str] = &[
     "mqtt",
     "amqp",
     "filesystem",
+    "plugin",
 ];
 
 impl V2Config {
@@ -240,11 +241,73 @@ impl V2Config {
                 "providers.fallback eradicated"
             );
         }
-        let mut aliased_models = alias_provider_models(new_providers.remove("models"));
+        let (mut aliased_models, mut provenance) =
+            alias_provider_models(new_providers.remove("models"));
 
         // V3 ModelProviderConfig absorbed the V2 [providers] globals
         // (api_key, default_model, etc.) inline; fold them down.
-        fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
+        let folded = fold_providers_globals_into_models(&mut new_providers, &mut aliased_models);
+        // Reflect the fold in alias provenance so the later bare-vision rewrite
+        // never reads authority the fold did not earn. An explicit
+        // `default_provider` or the synthesized OpenRouter fallback registers as
+        // the producer of the slot it created; a no-`default_provider` fold over
+        // more than one canonical family marks the target ambiguous instead, so
+        // the slot's credential cannot be gifted to whichever family iteration
+        // selected (see the struct doc above the fold).
+        // A bare `[multimodal] vision_model_provider = "<family>"` cannot select
+        // the migrated V3 alias: runtime resolves only dotted `<family>.<alias>`
+        // refs to typed alias config, so a bare ref reaches the legacy
+        // configless construction path and loses the alias's api_key. Rewrite
+        // it to the migrated alias only when the alias slot's effective source
+        // identity matches the reference's canonical variant. `fold_owned`
+        // records slots whose producer is an explicit fold ownership record
+        // (`default_provider` selector or synthesized fallback), which states
+        // ownership even when its spelling differs from the reference.
+        let mut fold_owned = std::collections::HashSet::new();
+        match folded {
+            GlobalFold::Producer(source) => {
+                let (raw_type, _) = split_colon_url_provider(&source);
+                let (family, alias, _) = normalize_provider_type(&raw_type, "default");
+                provenance
+                    .entry((family.clone(), alias.clone()))
+                    .or_default()
+                    .insert(source);
+                fold_owned.insert((family, alias));
+            }
+            GlobalFold::Owned { family, alias } => {
+                // The explicit selector overlaid an equivalent existing slot.
+                // The slot keeps its existing sole producer; the ownership
+                // record alone lets the canonical-source guard rewrite a
+                // canonical-spelling reference to this slot.
+                fold_owned.insert((family, alias));
+            }
+            GlobalFold::Ambiguous { family, alias } => {
+                // Bolt two distinct, never-producible sentinel sources onto the
+                // slot. The bare-rewrite only fires on exactly one equivalently
+                // normalized producer, so the fold sees a collided slot and
+                // leaves the target bare (fail-closed) instead of redirecting a
+                // credential that has no stated owner.
+                let slot = provenance
+                    .entry((family.clone(), alias.clone()))
+                    .or_default();
+                slot.insert(format!("<unowned-globals:{family}:{alias}:1>"));
+                slot.insert(format!("<unowned-globals:{family}:{alias}:2>"));
+            }
+            GlobalFold::None => {}
+        }
+
+        // A bare `[multimodal] vision_model_provider = "<family>"` cannot select
+        // the migrated V3 alias: runtime resolves only dotted `<family>.<alias>`
+        // refs to typed alias config, so a bare ref reaches the legacy
+        // configless construction path and loses the alias's api_key. Rewrite
+        // it to the migrated alias only when the alias slot's effective source
+        // identity matches the reference's canonical variant.
+        rewrite_bare_vision_provider_reference(
+            &mut passthrough,
+            &aliased_models,
+            &provenance,
+            &fold_owned,
+        );
 
         // V3 dropped cost.prices: the V2 keys ("<provider>/<model>")
         // don't carry the V3 alias path, so remapping is fragile.
@@ -499,6 +562,11 @@ fn dot_delivery_channel(job: &mut toml::Table) {
     }
 }
 
+/// The one canonical serialized spelling of [`AuthMode::OAuth`] for materialized
+/// V3 alias fields (`#[serde(rename_all = "snake_case")]`). Variant extras must
+/// emit this exact value or migration output fails config deserialization.
+const AUTH_MODE_OAUTH: &str = "o_auth";
+
 fn normalize_provider_type(
     raw: &str,
     incoming_alias: &str,
@@ -639,7 +707,10 @@ fn normalize_provider_type(
     }
     if matches!(raw, "qwen-code" | "qwen-oauth" | "qwen_oauth") {
         extras.push(("endpoint", toml::Value::String("code".to_string())));
-        extras.push(("auth_mode", toml::Value::String("oauth".to_string())));
+        extras.push((
+            "auth_mode",
+            toml::Value::String(AUTH_MODE_OAUTH.to_string()),
+        ));
         return ("qwen".to_string(), incoming_alias.to_string(), extras);
     }
     if matches!(raw, "bailian" | "aliyun-bailian" | "aliyun") {
@@ -682,7 +753,10 @@ fn normalize_provider_type(
     }
     if matches!(raw, "minimax-oauth" | "minimax-oauth-global") {
         extras.push(("endpoint", toml::Value::String("intl".to_string())));
-        extras.push(("auth_mode", toml::Value::String("oauth".to_string())));
+        extras.push((
+            "auth_mode",
+            toml::Value::String(AUTH_MODE_OAUTH.to_string()),
+        ));
         return ("minimax".to_string(), incoming_alias.to_string(), extras);
     }
     if matches!(raw, "minimax-cn" | "minimaxi" | "minimax-portal-cn") {
@@ -691,7 +765,10 @@ fn normalize_provider_type(
     }
     if matches!(raw, "minimax-oauth-cn") {
         extras.push(("endpoint", toml::Value::String("cn".to_string())));
-        extras.push(("auth_mode", toml::Value::String("oauth".to_string())));
+        extras.push((
+            "auth_mode",
+            toml::Value::String(AUTH_MODE_OAUTH.to_string()),
+        ));
         return ("minimax".to_string(), incoming_alias.to_string(), extras);
     }
 
@@ -721,12 +798,27 @@ fn normalize_provider_type(
     (raw.to_string(), incoming_alias.to_string(), extras)
 }
 
-fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
+/// Alias-wrap V2 flat provider models into the V3 `<family>.<alias>` shape.
+/// Returns the migrated table together with a provenance map recording, for
+/// each `(family, alias)` slot, every raw provider key that wrote to it. The
+/// rewrite of a vision reference needs that provenance so it cannot infer
+/// source selection from the post-canonicalization alias count (variants such
+/// as `qwen-code` collapse onto the same `qwen.default` slot).
+fn alias_provider_models(
+    models: Option<toml::Value>,
+) -> (
+    toml::Table,
+    std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
+) {
     let flat = match models {
         Some(toml::Value::Table(t)) => t,
-        _ => return toml::Table::new(),
+        _ => return (toml::Table::new(), std::collections::HashMap::new()),
     };
     let mut aliased = toml::Table::new();
+    let mut provenance: std::collections::HashMap<
+        (String, String),
+        std::collections::BTreeSet<String>,
+    > = std::collections::HashMap::new();
     for (provider_id, mut config) in flat {
         // Colon-URL form like `"anthropic-custom:https://..."`: split the URL
         // out into `uri` and use only the prefix as the seed for normalization.
@@ -754,19 +846,366 @@ fn alias_provider_models(models: Option<toml::Value>) -> toml::Table {
         }
 
         let entry = aliased
-            .entry(provider_type)
+            .entry(provider_type.clone())
             .or_insert_with(|| toml::Value::Table(toml::Table::new()));
         if let toml::Value::Table(entry_table) = entry {
-            entry_table.insert(alias, config);
+            entry_table.insert(alias.clone(), config);
+        }
+        provenance
+            .entry((provider_type, alias))
+            .or_default()
+            .insert(provider_id);
+    }
+    (aliased, provenance)
+}
+
+/// Whether the materialized alias entry at `aliased_models[family][alias]`
+/// carries the effective source identity the reference or selector names: for
+/// every variant extra the spelling implies (endpoint/auth_mode/wire_api/uri),
+/// the entry must hold that exact value, and a colon-URL form additionally
+/// requires the entry's `uri` to equal the reference URL. Comparing against the
+/// materialized values (after operator overrides) rather than re-normalizing
+/// the raw producer key is what lets an override such as
+/// `[providers.models.qwen] endpoint = "intl"` count as the `intl` endpoint a
+/// `qwen-intl` reference names, while a genuinely different effective variant
+/// still fails closed.
+fn effective_source_identity_matches(
+    aliased_models: &toml::Table,
+    family: &str,
+    alias: &str,
+    expected_extras: &[(&'static str, toml::Value)],
+    expected_url: Option<&str>,
+) -> bool {
+    source_identity_matches_inner(
+        aliased_models,
+        family,
+        alias,
+        expected_extras,
+        expected_url,
+        false,
+    )
+}
+
+/// Relaxed variant used only when provenance proves the sole raw producer IS
+/// the reference's own canonical spelling: operator-selected settings on the
+/// materialized alias (`auth_mode = "o_auth"` plus OAuth credential fields, a
+/// `wire_api` override, or Codex subscription auth via
+/// `requires_openai_auth`) are configuration on the same source, not
+/// different named variants, so their presence must not block the rewrite.
+fn source_identity_matches_ignoring_alias_operator_fields(
+    aliased_models: &toml::Table,
+    family: &str,
+    alias: &str,
+    expected_extras: &[(&'static str, toml::Value)],
+    expected_url: Option<&str>,
+) -> bool {
+    source_identity_matches_inner(
+        aliased_models,
+        family,
+        alias,
+        expected_extras,
+        expected_url,
+        true,
+    )
+}
+
+fn source_identity_matches_inner(
+    aliased_models: &toml::Table,
+    family: &str,
+    alias: &str,
+    expected_extras: &[(&'static str, toml::Value)],
+    expected_url: Option<&str>,
+    allow_alias_operator_fields: bool,
+) -> bool {
+    let Some(toml::Value::Table(family_table)) = aliased_models.get(family) else {
+        return false;
+    };
+    let Some(toml::Value::Table(alias_table)) = family_table.get(alias) else {
+        return false;
+    };
+    // URI is identity-bearing: require exact normalized equality. The
+    // global `api_path` composition (`base + api_path` → `uri`) is handled
+    // at the fold site where the selector's URL is composed with the same
+    // `api_path` before the equivalence check, so the rewrite can require
+    // exact equality without a permissive prefix. A base URL must not match
+    // an unrelated `/v2` endpoint merely because it is a slash-descendant.
+    match (
+        expected_url,
+        alias_table.get("uri").and_then(toml::Value::as_str),
+    ) {
+        (Some(expected), Some(actual)) => {
+            if actual != expected {
+                let exp_trim = expected.trim_end_matches('/');
+                let act_trim = actual.trim_end_matches('/');
+                if act_trim != exp_trim {
+                    return false;
+                }
+            }
+        }
+        (Some(_), None) => return false,
+        (None, Some(actual_uri)) => {
+            // A bare reference (no URL) must not accept a variant URI.
+            // For families where URI is a variant selector (e.g. stepfun-intl),
+            // an alias with a variant URI should not be selected by a bare
+            // family reference. For generic families like `custom` or
+            // `llamacpp`, the URI is just connection info and a bare reference
+            // is allowed to select a single alias regardless of its URI
+            // (covered by the provenance single-producer check). Only reject
+            // when the alias's URI is a known variant endpoint.
+            let is_variant_uri = actual_uri == "https://api.stepfun.com/intl/v1"
+                || actual_uri == "https://api.stepfun.ai/v1"
+                || actual_uri.starts_with("https://api.stepfun.com/")
+                || actual_uri.starts_with("https://api.stepfun.ai/");
+            if is_variant_uri && family == "stepfun" {
+                // The reference itself may be `stepfun-intl`, whose normalized
+                // identity carries the same variant URI as an extra. In that
+                // case the early URI check must not reject before the
+                // expected-extra equality below is evaluated — only a genuinely
+                // bare `stepfun` reference should fail closed against an
+                // intl-only producer.
+                let expects_this_uri = expected_extras.iter().any(|(field, expected)| {
+                    *field == "uri"
+                        && expected.as_str().is_some_and(|s| {
+                            s == actual_uri
+                                || s.trim_end_matches('/') == actual_uri.trim_end_matches('/')
+                        })
+                });
+                if !expects_this_uri {
+                    return false;
+                }
+            }
+            // Otherwise, allow bare reference to match URI-bearing alias
+            // (e.g. custom:https://... or llamacpp with user-provided URI).
+        }
+        (None, None) => {}
+    }
+    // Expected extras must exactly match the alias's identity-bearing fields.
+    // A bare reference with no variant identity must not accept a variant
+    // source (e.g. `stepfun` must not match `stepfun-intl`'s intl endpoint,
+    // or `qwen` must not match `qwen-intl`'s endpoint).
+    // We include `uri` here as well because some variants (stepfun-intl)
+    // encode their identity via URI extras rather than expected_url.
+    let identity_fields = [
+        "endpoint",
+        "auth_mode",
+        "wire_api",
+        "requires_openai_auth",
+        "uri",
+    ];
+    // First check expected subset
+    if !expected_extras.iter().all(|(field, expected)| {
+        let Some(actual) = alias_table.get(*field) else {
+            return false;
+        };
+        if *field == "uri"
+            && let (Some(exp_str), Some(act_str)) = (expected.as_str(), actual.as_str())
+        {
+            return exp_str.trim_end_matches('/') == act_str.trim_end_matches('/');
+        }
+        actual == expected
+    }) {
+        return false;
+    }
+    // Then reject extra identity fields present on the alias that the
+    // reference did not name. For `uri`, only reject when the alias's URI
+    // is a variant identity (see above) and the reference is bare; generic
+    // custom/llamacpp URIs are exempted to preserve existing
+    // `v2_colon_url_source_rewrites_bare_custom` behavior.
+    for field in identity_fields {
+        let expected_has = expected_extras.iter().any(|(f, _)| *f == field);
+        let alias_has = alias_table.contains_key(field);
+        if alias_has && !expected_has {
+            if field == "uri" {
+                // Apply same variant-uri allowance as above.
+                if let Some(uri) = alias_table.get("uri").and_then(toml::Value::as_str) {
+                    let is_variant = uri == "https://api.stepfun.com/intl/v1"
+                        || uri == "https://api.stepfun.ai/v1"
+                        || uri.starts_with("https://api.stepfun.com/")
+                        || uri.starts_with("https://api.stepfun.ai/");
+                    if is_variant && family == "stepfun" {
+                        return false;
+                    }
+                    // For other families/URIs, allow bare match.
+                    continue;
+                }
+            } else if allow_alias_operator_fields
+                && matches!(field, "auth_mode" | "wire_api" | "requires_openai_auth")
+            {
+                // Operator-selected auth flow, wire protocol, or Codex
+                // subscription auth on the canonical source itself: not
+                // variant markers, so do not fail closed on them. The only
+                // spelling that implies these extras (`openai-codex`)
+                // materializes a different alias (`openai.codex`), so within
+                // this relaxation an unmatched field can only come from the
+                // operator's own `[providers.models.<family>]` entry.
+                continue;
+            } else {
+                return false;
+            }
         }
     }
-    aliased
+    // `uri` already handled via expected_url; ensure no stray uri when
+    // expected_url is None is already covered above.
+    true
+}
+
+/// Rewrite a `[multimodal] vision_model_provider` reference to the dotted
+/// `<family>.<alias>` form the runtime resolves. The reference is resolved
+/// through the same [`normalize_provider_type`] mapping used by
+/// [`alias_provider_models`], so legacy spellings select their migrated alias:
+/// `grok` -> `xai.default`, `openai-codex` -> `openai.codex`,
+/// `opencode-go` -> `opencode.go`, and dot-bearing `llama.cpp` ->
+/// `llamacpp.default`. The rewrite only happens when the target `(family,
+/// alias)` slot has exactly one raw producer AND that slot's EFFECTIVE source
+/// identity (the actual endpoint/auth_mode/uri values after operator
+/// overrides) matches the reference's expected identity — see
+/// [`effective_source_identity_matches`]. That preserves raw-provider
+/// provenance: a bare or variant reference is never redirected to an alias
+/// supplied by a differently-named source, and a collided slot (e.g. `qwen`
+/// plus `qwen-intl` both writing `qwen.default`) is left unchanged. A
+/// reference spelled as its own canonical family additionally requires the
+/// sole raw producer to be that exact canonical spelling (or a `fold_owned`
+/// slot, whose explicit `default_provider`/fallback selector states ownership
+/// even under a different spelling): canonicalization makes a legacy synonym's
+/// retained table look equivalent, but a bare `xai` reference must not adopt
+/// credentials from a `[providers.models.grok]` source the file never named.
+/// A colon-URL reference is rewritten only when its full URL identity matches
+/// the sole producer of the migrated alias; unmatched or collided colon
+/// references, already-valid dotted refs, and unknown families are left
+/// untouched so the runtime keeps failing closed.
+fn rewrite_bare_vision_provider_reference(
+    passthrough: &mut toml::Table,
+    aliased_models: &toml::Table,
+    provenance: &std::collections::HashMap<(String, String), std::collections::BTreeSet<String>>,
+    fold_owned: &std::collections::HashSet<(String, String)>,
+) {
+    let Some(toml::Value::Table(multimodal)) = passthrough.get_mut("multimodal") else {
+        return;
+    };
+    let Some(toml::Value::String(reference)) = multimodal.get("vision_model_provider") else {
+        return;
+    };
+    // A colon-URL reference (`custom:https://...`) keeps its URL as part of
+    // the source identity; other colon-bearing strings do not canonicalize to
+    // a configured alias and fall through to the no-match preserve below.
+    let (reference_type, reference_url) = split_colon_url_provider(reference);
+    let (canonical_family, canonical_alias, reference_extras) =
+        normalize_provider_type(&reference_type, "default");
+    let Some(producers) = provenance.get(&(canonical_family.clone(), canonical_alias.clone()))
+    else {
+        // No source produced the alias the reference names (unknown family,
+        // an already-valid dotted ref, or the reference's variant is absent) —
+        // preserve.
+        return;
+    };
+    // A single producer is required: two sources collapsing onto the same slot
+    // (synonyms `gemini`/`google`, variants `qwen`/`qwen-intl`, or two colon-URL
+    // forms) are ambiguous regardless of whether they normalize equivalently,
+    // because the materialized table retains only one of their configs.
+    if producers.len() != 1 {
+        return;
+    }
+    // Canonical-source ownership: a reference typed as the canonical family
+    // itself (`xai`, not the legacy synonym `grok`) must not inherit a legacy
+    // synonym's credentials merely because both spellings normalize to the
+    // same slot and the retained table's identity matches. Require the sole
+    // producer to name this family under its canonical spelling (a colon-URL
+    // form keeps the family as its base type, so its URL identity stays
+    // verifiable below), or the slot to carry an explicit fold ownership
+    // record (an explicit `default_provider` selector — registered when the
+    // fold created the slot or when it overlaid an equivalent existing slot,
+    // or the synthesized fallback — so it states ownership of this exact
+    // credential). A variant-spelled reference (`grok`, `qwen-intl`) keeps
+    // the effective-identity behavior below: naming a non-canonical spelling
+    // IS naming a differently spelled source.
+    let sole_raw = producers.iter().next().expect("len 1");
+    let (sole_base_type, _) = split_colon_url_provider(sole_raw);
+    let reference_names_canonical_spelling =
+        reference_type == canonical_family && reference_url.is_none();
+    if reference_names_canonical_spelling
+        && sole_base_type != canonical_family.as_str()
+        && !fold_owned.contains(&(canonical_family.clone(), canonical_alias.clone()))
+    {
+        return;
+    }
+    let effective_matches = effective_source_identity_matches(
+        aliased_models,
+        &canonical_family,
+        &canonical_alias,
+        &reference_extras,
+        reference_url.as_deref(),
+    );
+    if !effective_matches {
+        // The strict matcher rejects every identity-bearing alias field the
+        // reference did not name. That is correct for a provider-name variant
+        // (`qwen-code`, `stepfun-intl`, `openai-codex`), but it is too strict
+        // when the sole producer is the reference's own canonical spelling
+        // and the alias carries an operator-selected auth setting: a V2
+        // config like `[providers.models.qwen] auth_mode = "o_auth"`
+        // materializes `qwen.default` with the expected `endpoint = "cn"`
+        // plus that explicit auth field, while the bare `qwen` reference
+        // names only the `cn` endpoint. The alias is still the uniquely
+        // sourced canonical credential — it must be reachable via the dotted
+        // alias rather than staying on the configless path.
+        //
+        // Distinguish the two cases via provenance: only when the sole raw
+        // producer normalizes to exactly the same `(family, alias, extras)`
+        // as the reference (and is spelled identically) can the unmatched
+        // identity field be operator configuration rather than a different
+        // named source. A genuine variant (`qwen-code`, `minimax-oauth`,
+        // `stepfun-intl`, …) normalizes to different extras or a different
+        // raw name and stays fail-closed. Endpoint and URI identity remain
+        // strict even in this relaxed path.
+        let sole_raw = producers.iter().next().expect("len 1");
+        let (prod_family, prod_alias, prod_extras) = normalize_provider_type(sole_raw, "default");
+        let producer_is_reference = sole_raw == reference
+            && prod_family == canonical_family
+            && prod_alias == canonical_alias
+            && prod_extras == reference_extras;
+        if !(producer_is_reference
+            && source_identity_matches_ignoring_alias_operator_fields(
+                aliased_models,
+                &canonical_family,
+                &canonical_alias,
+                &reference_extras,
+                reference_url.as_deref(),
+            ))
+        {
+            return;
+        }
+    }
+    multimodal.insert(
+        "vision_model_provider".to_string(),
+        toml::Value::String(format!("{canonical_family}.{canonical_alias}")),
+    );
+}
+
+/// Outcome of folding V2 `[providers]` globals onto `aliased_models`, used to
+/// keep alias provenance accurate for the bare-vision rewrite.
+enum GlobalFold {
+    /// Nothing to register: no value globals and no default provider.
+    None,
+    /// The fold created the target slot (explicit `default_provider`, the
+    /// OpenRouter fallback, or a missing `default` alias in a single-family
+    /// config); the given raw source becomes its producer.
+    Producer(String),
+    /// The explicit `default_provider` selector overlaid an already-materialized
+    /// alias whose completed identity matches the selector. No second producer
+    /// is registered (the slot keeps its existing sole producer), but the
+    /// selector explicitly states ownership of that slot's folded credentials,
+    /// so the canonical-source ownership guard may still rewrite a
+    /// canonical-spelling reference to this slot.
+    Owned { family: String, alias: String },
+    /// The fold wrote unowned globals into a target across multiple canonical
+    /// families with no `default_provider` to establish ownership. The target
+    /// must stay ambiguous: do not let the bare-vision rewrite claim it.
+    Ambiguous { family: String, alias: String },
 }
 
 fn fold_providers_globals_into_models(
     new_providers: &mut toml::Table,
     aliased_models: &mut toml::Table,
-) {
+) -> GlobalFold {
     let g_api_key = new_providers.remove("api_key");
     let g_api_url = new_providers.remove("api_url");
     let g_api_path = new_providers.remove("api_path");
@@ -775,7 +1214,15 @@ fn fold_providers_globals_into_models(
     let g_default_temperature = new_providers.remove("default_temperature");
     let g_provider_timeout_secs = new_providers.remove("provider_timeout_secs");
     let g_provider_max_tokens = new_providers.remove("provider_max_tokens");
-    let g_extra_headers = new_providers.remove("extra_headers");
+    let mut g_extra_headers = new_providers.remove("extra_headers");
+    // An empty `extra_headers = {}` table is a semantic no-op: it adds no
+    // headers and cannot establish alias ownership. Treat it as absent so a
+    // valid keyed vision alias remains reachable across multiple families.
+    if let Some(toml::Value::Table(ref t)) = g_extra_headers
+        && t.is_empty()
+    {
+        g_extra_headers = None;
+    }
 
     let any_value_globals = g_api_key.is_some()
         || g_api_url.is_some()
@@ -787,42 +1234,140 @@ fn fold_providers_globals_into_models(
         || g_extra_headers.is_some();
 
     if !any_value_globals && g_default_provider.is_none() {
-        return;
+        return GlobalFold::None;
     }
 
-    let (target_type, target_alias, colon_url, normalized_extras) =
+    // `source_key` is `Some(raw)` only when this fold introduces a *new*
+    // producer of the target slot that `alias_provider_models` could not
+    // already know about: an explicit `default_provider` string that
+    // materializes a slot, the synthesized `openrouter` fallback when no
+    // models exist at all, or a missing `default` alias created beside an
+    // existing non-default alias in a single-family config. When the fold
+    // merely overlays an already-materialized `default` alias — either the
+    // explicit `default_provider` naming a slot a model already wrote to, or
+    // the `aliased_models.keys().first()` reuse with an existing `default` in
+    // a single-family config — that slot's raw source is already registered,
+    // so re-inserting the canonical family name would count it twice. Across
+    // multiple canonical families with no `default_provider`, the globals are
+    // unowned: the fold claims no producer and instead marks the target
+    // `ambiguous`, so a bare vision reference cannot be redirected to a
+    // credential with no stated owner.
+    let (target_type, target_alias, colon_url, normalized_extras, mut source_key, ambiguous) =
         match g_default_provider.as_ref().and_then(toml::Value::as_str) {
             Some(s) => {
                 let (raw_type, url) = split_colon_url_provider(s);
                 let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
-                (canonical, alias, url, extras)
+                // The explicit selector is registered as a NEW producer of the
+                // target slot unless the fold's final alias state matches the
+                // selector's effective identity. Equivalence is deliberately NOT
+                // decided here (pre-fold): the fold below may itself supply the
+                // `uri` (and other normalized extras) that makes the materialized
+                // alias exactly match a selector whose URL the pre-fold alias
+                // lacked — e.g. a bare `[providers.models.custom]` whose missing
+                // URI is filled by a matching `custom:https://...` default
+                // provider. Deciding equivalence before the fold would register
+                // the selector as a second producer, make the slot ambiguous, and
+                // strand the vision reference on the configless path despite the
+                // fold producing the exact credential-bearing alias. Conversely,
+                // a selector that names a genuinely different source (a distinct
+                // URL, or a variant the existing alias does not hold after the
+                // fold) still registers as a distinct producer so the rewrite
+                // stays fail-closed. The post-fold re-check below resolves this.
+                // Preserve the full colon-bearing selector as the producer
+                // identity when it carries a URL. Recording only the stripped
+                // prefix here would collapse `custom:https://B` to `custom` and
+                // dedupe against an existing bare `custom` producer, so the
+                // non-equivalent URL selector would fail to make the slot
+                // ambiguous and the bare reference could rewrite against the
+                // wrong URI.
+                let source_key = Some(s.to_string());
+                (canonical, alias, url, extras, source_key, false)
             }
-            None => match aliased_models.keys().next() {
-                Some(k) => (k.clone(), "default".to_string(), None, Vec::new()),
-                None => (
+            None => match aliased_models.keys().len() {
+                // No migrated family at all: synthesize the OpenRouter default.
+                0 => (
                     "openrouter".to_string(),
                     "default".to_string(),
                     None,
                     Vec::new(),
+                    Some("openrouter".to_string()),
+                    false,
                 ),
+                // A single migrated canonical family owns the unowned globals.
+                1 => {
+                    let k = aliased_models.keys().next().expect("len 1").clone();
+                    let default_existed = aliased_models
+                        .get(&k)
+                        .and_then(toml::Value::as_table)
+                        .is_some_and(|t| t.contains_key("default"));
+                    let source_key = (!default_existed).then(|| k.clone());
+                    (
+                        k,
+                        "default".to_string(),
+                        None,
+                        Vec::new(),
+                        source_key,
+                        false,
+                    )
+                }
+                // Multiple distinct canonical families and no `default_provider`
+                // to say which one owns the global credentials. Nothing ties the
+                // unowned value(s) to whichever family iteration selects, so the
+                // fold must not claim a producer. Whether the target is marked
+                // ambiguous is decided below once the fold has run, so a no-op
+                // overlay that changes nothing keeps its existing single-owner
+                // provenance (see the `ambiguous` return).
+                _ => {
+                    let k = aliased_models.keys().next().expect("len > 1").clone();
+                    (
+                        k.clone(),
+                        "default".to_string(),
+                        None,
+                        Vec::new(),
+                        None,
+                        true,
+                    )
+                }
             },
         };
+
+    // Whether the target alias slot was already materialized by
+    // `alias_provider_models` before this fold ran. The explicit
+    // `default_provider` equivalence re-check below only suppresses the
+    // selector-as-producer when it OVERLAYS an already-existing equivalent
+    // slot; when the selector itself creates the alias from scratch, it is
+    // the slot's sole producer and must be registered even though the
+    // completed alias naturally matches its own identity.
+    let target_existed = aliased_models
+        .get(&target_type)
+        .and_then(toml::Value::as_table)
+        .is_some_and(|t| t.contains_key(&target_alias));
 
     let provider_value = aliased_models
         .entry(target_type.clone())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
     let provider_table = match provider_value.as_table_mut() {
         Some(t) => t,
-        None => return,
+        None => return GlobalFold::None,
     };
     let alias_value = provider_table
         .entry(target_alias.clone())
         .or_insert_with(|| toml::Value::Table(toml::Table::new()));
     let alias_table = match alias_value.as_table_mut() {
         Some(t) => t,
-        None => return,
+        None => return GlobalFold::None,
     };
 
+    // Preserve `api_path` for the selector-vs-alias equivalence check below;
+    // the `uri_source` match consumes `g_api_path`, but the selector's URL
+    // must be composed with the same path before comparing to the completed
+    // alias URI (otherwise `custom:https://vision.example.invalid` with
+    // `api_path = "/v1"` would materialize `…/v1` yet the selector would be
+    // compared as the bare base and the rewrite would stay incorrectly bare).
+    let g_api_path_for_composition = g_api_path
+        .as_ref()
+        .and_then(toml::Value::as_str)
+        .map(|s| s.to_string());
     let base_url_source = colon_url.map(toml::Value::String).or(g_api_url);
     let uri_source = match (base_url_source, g_api_path) {
         (Some(toml::Value::String(b)), Some(toml::Value::String(p))) => {
@@ -840,6 +1385,10 @@ fn fold_providers_globals_into_models(
     };
 
     // Per-provider entries take precedence: only fill missing slots.
+    // `folded_some` records whether the globals actually landed on this alias
+    // at all, so a no-op overlay across multiple families (every value shadowed
+    // by an existing per-provider field) keeps its single-owner provenance.
+    let mut folded_some = false;
     for (target_key, source) in [
         ("api_key", g_api_key),
         ("uri", uri_source),
@@ -853,6 +1402,7 @@ fn fold_providers_globals_into_models(
             && !alias_table.contains_key(target_key)
         {
             alias_table.insert(target_key.to_string(), value);
+            folded_some = true;
         }
     }
 
@@ -862,6 +1412,7 @@ fn fold_providers_globals_into_models(
     for (field, value) in normalized_extras {
         if !alias_table.contains_key(field) {
             alias_table.insert(field.to_string(), value);
+            folded_some = true;
         }
     }
 
@@ -873,6 +1424,83 @@ fn fold_providers_globals_into_models(
             ),
             "[providers] globals folded onto model_providers.."
         );
+    }
+    // Decide explicit-`default_provider` equivalence against the COMPLETED alias
+    // state, not the pre-fold one. The fold may have just supplied the `uri` (and
+    // other normalized extras) that makes the materialized alias exactly match
+    // the selector — a bare `[providers.models.custom]` whose missing URI is
+    // filled by a matching `custom:https://...` default provider, or a `qwen`
+    // entry whose endpoint override the fold left in place. When the final alias
+    // matches the selector AND the slot already existed, the selector completed
+    // an existing slot rather than naming a second source, so it must not be
+    // registered as an extra producer (that would make the slot ambiguous and
+    // strand the vision reference on the configless path). When the selector
+    // CREATED the alias from scratch (no `[providers.models]` entry), the match
+    // is expected: the fold materialized the slot to exactly the selector's
+    // identity, and the selector remains that slot's producer so the bare vision
+    // reference can still be rewritten to the credential-bearing alias. A
+    // selector the completed alias still does not match — a distinct URL, or a
+    // variant the fold could not apply — stays a separate producer so the
+    // rewrite fails closed.
+    let mut overlay_owned_slot: Option<(String, String)> = None;
+    if let Some(selector) = g_default_provider.as_ref().and_then(toml::Value::as_str) {
+        let (raw_type, url) = split_colon_url_provider(selector);
+        let (canonical, alias, extras) = normalize_provider_type(&raw_type, "default");
+        // Compose the selector's URL with the same `api_path` the fold used
+        // for its URI, so the equivalence check compares the effective
+        // provider-facing identity (base + path) rather than the raw base.
+        let composed_url = match (url.as_deref(), g_api_path_for_composition.as_deref()) {
+            (Some(base), Some(path)) => {
+                let trimmed = base.trim_end_matches('/');
+                let suffix = if path.starts_with('/') {
+                    path.to_string()
+                } else {
+                    format!("/{path}")
+                };
+                Some(format!("{trimmed}{suffix}"))
+            }
+            (Some(base), None) => Some(base.to_string()),
+            (None, _) => None,
+        };
+        if target_existed
+            && effective_source_identity_matches(
+                aliased_models,
+                &canonical,
+                &alias,
+                &extras,
+                composed_url.as_deref().or(url.as_deref()),
+            )
+        {
+            source_key = None;
+            // The selector overlaid an equivalent existing slot: no second
+            // producer is registered, but the selector still states ownership
+            // of this exact slot. Record it so a canonical-spelling vision
+            // reference backed only by a legacy-synonym producer can still
+            // rewrite to the credential-bearing alias.
+            overlay_owned_slot = Some((canonical.clone(), alias.clone()));
+        }
+    }
+    if ambiguous {
+        // A no-op overlay across multiple families — the globals were fully
+        // shadowed by existing per-provider fields (`folded_some` is false) —
+        // changed nothing on the target, so the slot keeps its single-owner
+        // provenance and the bare vision rewrite may still fire. Only a fold
+        // that actually created or augmented the target makes its ownership
+        // unestablished and marks it ambiguous.
+        if folded_some {
+            GlobalFold::Ambiguous {
+                family: target_type,
+                alias: target_alias,
+            }
+        } else {
+            GlobalFold::None
+        }
+    } else if let Some(source) = source_key {
+        GlobalFold::Producer(source)
+    } else if let Some((family, alias)) = overlay_owned_slot {
+        GlobalFold::Owned { family, alias }
+    } else {
+        GlobalFold::None
     }
 }
 

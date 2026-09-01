@@ -6,10 +6,12 @@ wit/
   v0/                 ← zeroclaw:plugin@0.x (experimental → stable)
     .frozen           ← created when v0 stabilizes; absent = experimental
     channel.wit
+    config.wit
     logging.wit
     memory.wit
     plugin-info.wit
     README.md
+    secrets.wit
     tool.wit
     types.wit
   v1/                 ← (future) breaking changes → zeroclaw:plugin@1.0.0
@@ -20,9 +22,12 @@ Each `vN/` directory maps to one WIT package major version. Minor bumps (0.2,
 
 #### Breaking vs non-breaking changes
 
-**Breaking — requires a new `vN+1/` directory:**
+**Breaking for a frozen `vN/` directory — requires a new `vN+1/` directory:**
 
-- Removing or renaming any type, function, record field, or variant case
+- Removing or renaming any type, function, record field, enum case, or variant case
+- Adding a case to an existing enum or variant: these are closed types, so an
+  old component and a new host (or a new component and an old host) can fail to
+  link
 - Changing the type of any function parameter or return value
 - Changing the type of any record field
 - Reordering fields in a record
@@ -31,7 +36,8 @@ Each `vN/` directory maps to one WIT package major version. Minor bumps (0.2,
 
 - Adding new `flags` bits to `*-capabilities`
 - Adding new capability-gated functions to an interface
-- Adding new record types, variant types, or enums
+- Adding new record types, variant types, or enums (but not cases to an
+  existing enum or variant)
 - Adding new WIT `interface` definitions to the package
 - Adding new `world` definitions
 
@@ -45,12 +51,15 @@ Each `vN/` directory maps to one WIT package major version. Minor bumps (0.2,
 
 All current content in `wit/v0/` is gated behind
 `@unstable(feature = plugins-wit-v0)`. It graduates when the first
-stable Component Model release ships.
+stable Component Model release ships. Until a version directory is frozen, it
+is experimental: components must be rebuilt against the WIT shipped by the
+target host, including after additions to existing enums or variants.
 
 #### Host compatibility window
 
-The host maintains adapters for **the current major version and one previous
-(N-1)**:
+After a version directory is frozen, the host maintains adapters for **the
+current major version and one previous (N-1)**. This compatibility window does
+not apply to unfrozen experimental versions:
 
 | When ships   | Supported | Dropped |
 | ------------ | --------- | ------- |
@@ -75,6 +84,20 @@ declared stable. After it exists:
   addressed before merge.
 
 #### Migration guide for plugin authors
+
+**Current experimental V0:** the tool and channel worlds import the `secrets`
+interface, and the channel world also imports `config`. Channel `configure`
+changed from `configure(config: string)` to `configure()`. Rebuild both kinds of
+component against the current `wit/v0/` definitions before installing them on
+this host. Channel authors must update source to call `config.get` for the typed
+public object during `configure` and again in every operational export that
+uses config; call `secrets.get` at the same point of use and do not retain either
+value in warm guest state. Tool authors keep the existing `__config` injection
+and `secrets.get`-during-`execute` contract. Publish each rebuilt component's new
+registry digest, and re-sign if any signature-covered manifest content changes.
+Prebuilt components from the earlier experimental worlds are not a conformance
+target; this is an intentional pre-stability break while `wit/v0/.frozen` is
+absent.
 
 **Targeting a minor bump (e.g. 0.1 → 0.2):** recompile. No source changes
 needed for items added via `@since`.

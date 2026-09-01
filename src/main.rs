@@ -408,8 +408,6 @@ mod security_status;
 #[cfg(feature = "agent-runtime")]
 mod service;
 #[cfg(feature = "agent-runtime")]
-mod skillforge;
-#[cfg(feature = "agent-runtime")]
 mod skills;
 #[cfg(feature = "agent-runtime")]
 mod sop;
@@ -428,10 +426,10 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, GatewayCommands,
-    HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands, ProvidersCommands,
-    ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands, SopCommands,
-    SopGraphFormat,
+    AgentsCommands, ChannelCommands, ChannelsCommands, CronCommands, CronDeliveryArgs,
+    GatewayCommands, HardwareCommands, IntegrationCommands, MigrateCommands, PeripheralCommands,
+    ProvidersCommands, ServiceCommands, ServiceLogStream, SkillBundleCommands, SkillCommands,
+    SopCommands, SopGraphFormat,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -803,9 +801,9 @@ Examples:
   zeroclaw cron add '0 9 * * 1-5' 'Good morning' --agent sentinel --prompt --tz America/New_York
   zeroclaw cron add '*/30 * * * *' 'Check system health' --agent sentinel --prompt
   zeroclaw cron add '*/5 * * * *' 'echo ok' --agent sentinel
-  zeroclaw cron add-at 2025-01-15T14:00:00Z 'Send reminder' --agent
-  zeroclaw cron add-every 60000 'Ping heartbeat'
-  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent
+  zeroclaw cron add-at 2099-01-15T14:00:00Z 'Send reminder' --agent sentinel --prompt
+  zeroclaw cron add-every 60000 'Ping heartbeat' --agent sentinel --prompt
+  zeroclaw cron once 30m 'Run backup in 30 minutes' --agent sentinel --prompt
   zeroclaw cron pause TASK_ID
   zeroclaw cron update TASK_ID --expression '0 8 * * *' --tz Europe/London")]
     Cron {
@@ -1094,7 +1092,7 @@ Examples (Windows PowerShell):
     #[command(hide = true)]
     MarkdownSchema,
 
-    /// Launch or install the companion desktop app
+    /// Launch the companion desktop app, or open its download page
     // i18n-exempt: clap derive help — framework requires a compile-time literal
     #[command(long_about = "\
 Launch the ZeroClaw companion desktop app.
@@ -1103,13 +1101,14 @@ The companion app is a lightweight menu bar / system tray application \
 that connects to the same gateway as the CLI. It provides quick access \
 to the dashboard, status monitoring, and device pairing.
 
-Use --install to download the pre-built companion app for your platform.
+Use --install to open the download page for your platform. It does not \
+install anything itself.
 
 Examples:
   zeroclaw desktop              # launch the companion app
-  zeroclaw desktop --install    # download and install it")]
+  zeroclaw desktop --install    # open the download page")]
     Desktop {
-        /// Download and install the companion app
+        /// Open the companion app's download page
         #[arg(long)]
         install: bool,
     },
@@ -2596,7 +2595,7 @@ fn ensure_map_key_for_prop_path(config: &mut Config, prop_path: &str) -> Result<
         // when `created == false`, or a bogus tail-field on an
         // ALREADY-EXISTING alias would delete a legitimate, pre-existing
         // config entry that has nothing to do with this call.
-        if config.get_prop(prop_path).is_err() {
+        if config.get_prop(prop_path).is_err() && !Config::prop_is_secret(prop_path) {
             let _ = config.delete_map_key(section_path, key);
             return Ok(false);
         }
@@ -2805,58 +2804,95 @@ fn plugin_host_with_configured_security(
 }
 
 #[cfg(feature = "plugins-wasm")]
-async fn seed_plugin_config_entry(
-    config: &mut crate::config::schema::Config,
+fn installed_plugin_config_entries(
+    host: &zeroclaw::plugins::host::PluginHost,
     plugin_name: &str,
+) -> Result<Vec<(zeroclaw::plugins::PluginCapability, String)>> {
+    let manifest = host
+        .manifest(plugin_name)
+        .ok_or_else(|| anyhow::Error::msg("installed plugin manifest is unavailable"))?;
+    if manifest.config_schema.is_none()
+        || !manifest
+            .capabilities
+            .contains(&zeroclaw::plugins::PluginCapability::Tool)
+    {
+        return Ok(Vec::new());
+    }
+
+    // Tool registration currently owns the only package-name runtime binding.
+    // Alias-owned channel bindings must seed their actual instance key when
+    // their production construction path lands; install must not invent one.
+    let scope = zeroclaw::plugins::instance::PluginInstanceScope::for_package_binding(
+        manifest,
+        zeroclaw::plugins::PluginCapability::Tool,
+        std::iter::empty(),
+    )?;
+    Ok(vec![(
+        zeroclaw::plugins::PluginCapability::Tool,
+        scope.id().config_entry_key()?,
+    )])
+}
+
+/// Seed empty `[[plugins.entries]]` blocks for a freshly installed plugin's
+/// canonical default instance keys. `config set
+/// plugins.entries.<instance-key>.config.<key>` routes through natural-key path
+/// resolution, which only matches entries already present in live config.
+/// Idempotent: existing entries and operator values remain untouched.
+#[cfg(feature = "plugins-wasm")]
+async fn seed_plugin_config_entries(
+    config: &mut crate::config::schema::Config,
+    entries: &[(zeroclaw::plugins::PluginCapability, String)],
 ) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+
     let whole_config_degraded = config
         .degraded_security
         .iter()
         .any(|s| s == crate::config::migration::WHOLE_CONFIG_SENTINEL);
     if whole_config_degraded || config.degraded_sections.iter().any(|s| s == "plugins") {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seed-skipped",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the \
-                 [plugins] section on disk is malformed. Repair it, add \
-                 `[[plugins.entries]]` with the plugin name, then set values \
-                 with `zeroclaw config set plugins.entries.<name>.config.<key>`."
-            )
-        );
+        for (_, instance_key) in entries {
+            eprintln!(
+                "{}",
+                ta(
+                    "cli-plugin-config-entry-seed-skipped",
+                    &[("name", instance_key)],
+                    "warning: skipped seeding the plugin config entry: the \
+                     [plugins] section on disk is malformed. Repair it, add \
+                     `[[plugins.entries]]` with the instance key, then set values \
+                     with `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+                )
+            );
+        }
         return Ok(());
     }
-    if plugin_name.is_empty() || plugin_name.contains('.') {
-        eprintln!(
-            "{}",
-            ta(
-                "cli-plugin-config-entry-seed-unaddressable",
-                &[("name", plugin_name)],
-                "warning: skipped seeding the plugin config entry: the plugin \
-                 name cannot be addressed by a dotted config path. Add a \
-                 `[[plugins.entries]]` block to the config file by hand."
-            )
-        );
+
+    let mut created = Vec::new();
+    for (_, instance_key) in entries {
+        if config
+            .create_map_key("plugins.entries", instance_key)
+            .map_err(anyhow::Error::msg)?
+        {
+            config.mark_dirty(&format!("plugins.entries.{instance_key}"));
+            created.push(instance_key);
+        }
+    }
+    if created.is_empty() {
         return Ok(());
     }
-    let created = config
-        .create_map_key("plugins.entries", plugin_name)
-        .map_err(anyhow::Error::msg)?;
-    if !created {
-        return Ok(());
-    }
-    config.mark_dirty(&format!("plugins.entries.{plugin_name}"));
     Box::pin(config.save_dirty()).await?;
-    println!(
-        "{}",
-        ta(
-            "cli-plugin-config-entry-seeded",
-            &[("name", plugin_name)],
-            "Seeded config entry. Set plugin config values with \
-             `zeroclaw config set plugins.entries.<name>.config.<key>`."
-        )
-    );
+    for instance_key in created {
+        println!(
+            "{}",
+            ta(
+                "cli-plugin-config-entry-seeded",
+                &[("name", instance_key)],
+                "Seeded config entry. Set plugin config values with \
+                 `zeroclaw config set plugins.entries.<instance-key>.config.<key>`."
+            )
+        );
+    }
     Ok(())
 }
 
@@ -2962,6 +2998,596 @@ enum SecurityCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Issue a client certificate from the daemon's mTLS CA for connecting over WSS.
+    ///
+    /// Reads the per-daemon CA at `<data_dir>/tls/ca.{crt,key}` (auto-generated on
+    /// first run when `[wss]` is enabled) and writes a `clientAuth` certificate +
+    /// key that zerocode (or any client) can present to the mutually-authenticated
+    /// WSS plane.
+    IssueClientCert {
+        /// Subject/device identity stamped into the certificate (CN).
+        #[arg(long, default_value = "zerocode")]
+        name: String,
+
+        /// Directory to write the certificate / key. Defaults to `<data_dir>/tls`.
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+
+        /// Overwrite an existing certificate/key for this name.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Revoke an issued client certificate so the daemon refuses it at the next
+    /// WSS handshake (threat A5). The revoke is written to the issued-cert ledger,
+    /// which materializes `<data_dir>/tls/revoked` for the verifier - no daemon
+    /// restart needed. Identify the cert by `--fingerprint` (its SHA-256 hex) or
+    /// `--device` (revokes every active cert that device holds).
+    RevokeClientCert {
+        /// SHA-256 fingerprint (hex) of the certificate to revoke.
+        #[arg(long, conflicts_with = "device", required_unless_present = "device")]
+        fingerprint: Option<String>,
+
+        /// Device id whose active certificates should ALL be revoked.
+        #[arg(
+            long,
+            conflicts_with = "fingerprint",
+            required_unless_present = "fingerprint"
+        )]
+        device: Option<String>,
+    },
+
+    /// List the still-active client certificates issued by this daemon's CA
+    /// (device id, fingerprint, validity) by reading the issued-cert ledger.
+    ListClientCerts {
+        /// Emit machine-readable JSON instead of a text table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Ask the running daemon to mint another enrollment pairing code.
+    ///
+    /// This adds another browser/zerocode device without restarting the daemon.
+    /// It is a local operator command: the request is exchanged through the
+    /// daemon's data dir, not through the public enrollment route.
+    EnrollPaircode {
+        /// Mint a new one-time enrollment code.
+        #[arg(long)]
+        new: bool,
+
+        /// Seconds to wait for the running daemon to answer.
+        #[arg(long, default_value_t = 5)]
+        timeout_secs: u64,
+    },
+
+    /// Request an on-demand relay node-id rotation. The running daemon mints a
+    /// fresh id, registers it alongside the old one for a grace window, then
+    /// retires the old id; the new id reaches clients in-band on their next
+    /// certificate renewal. Only applies when `[relay].node_id` is auto-minted.
+    RelayRotateNodeId,
+}
+
+/// Issue a WSS client certificate signed by the daemon's per-daemon mTLS CA.
+/// CA private-key at-rest protection sourced from the environment (decision:
+/// opt-in passphrase, 0600 floor; threat A4). `ZEROCLAW_CA_PASSPHRASE` (or a file
+/// referenced by `ZEROCLAW_CA_PASSPHRASE_FILE`) enables scrypt + XChaCha20-Poly1305
+/// encryption of the CA key at rest; unset keeps the plaintext-0600 default so
+/// zero-config and headless bring-up are unaffected. The daemon sources it
+/// identically at CA generation (the WSS path) and at every CA read (enrollment
+/// + this CLI), so the on-disk form always matches.
+#[cfg(feature = "agent-runtime")]
+fn ca_key_protection_from_env() -> zeroclaw_tls::CaKeyProtection {
+    zeroclaw_tls::CaKeyProtection::from_env()
+}
+
+/// Resolve the WSS mTLS policy without conflating the auto-CA and BYO-CA modes.
+///
+/// The WSS plane is always mTLS. `enabled` controls only whether the configured
+/// CA replaces the daemon-generated CA; certificate pins apply in either mode.
+#[cfg(feature = "agent-runtime")]
+fn resolve_wss_client_auth(
+    client_auth: Option<&zeroclaw_config::schema::WssClientAuthConfig>,
+) -> Result<(Option<String>, Vec<String>)> {
+    if let Some(config) = client_auth
+        && !config.ca_cert_path.is_empty()
+        && !config.enabled
+    {
+        anyhow::bail!(
+            "[wss.client_auth].ca_cert_path is set but [wss.client_auth].enabled is false. \
+             Set enabled = true to use your CA, or clear ca_cert_path to auto-generate one."
+        );
+    }
+
+    let pinned = client_auth
+        .map(|config| config.pinned_certs.clone())
+        .unwrap_or_default();
+    let byo_ca = client_auth
+        .filter(|config| config.enabled && !config.ca_cert_path.is_empty())
+        .map(|config| config.ca_cert_path.clone());
+    Ok((byo_ca, pinned))
+}
+
+#[cfg(feature = "agent-runtime")]
+fn wss_server_sans(wss_cfg: &zeroclaw_config::schema::WssConfig) -> Vec<String> {
+    if wss_cfg.sans.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    sans.extend(
+        wss_cfg
+            .sans
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .cloned(),
+    );
+    sans
+}
+
+#[cfg(all(test, feature = "agent-runtime"))]
+mod wss_client_auth_tests {
+    use super::*;
+
+    #[test]
+    fn auto_ca_honors_configured_client_certificate_pins() {
+        let auth = zeroclaw_config::schema::WssClientAuthConfig {
+            pinned_certs: vec!["a".repeat(64)],
+            ..Default::default()
+        };
+
+        let (byo_ca, pinned) = resolve_wss_client_auth(Some(&auth)).expect("valid auto-CA policy");
+        assert!(byo_ca.is_none(), "the daemon CA remains selected");
+        assert_eq!(
+            pinned, auth.pinned_certs,
+            "pins must reach the mTLS acceptor"
+        );
+    }
+
+    #[test]
+    fn disabled_byo_ca_is_rejected_before_listener_startup() {
+        let auth = zeroclaw_config::schema::WssClientAuthConfig {
+            ca_cert_path: "/etc/zeroclaw/client-ca.pem".into(),
+            ..Default::default()
+        };
+
+        let err =
+            resolve_wss_client_auth(Some(&auth)).expect_err("disabled BYO CA must fail closed");
+        assert!(err.to_string().contains("enabled is false"));
+    }
+
+    #[test]
+    fn wss_server_sans_adds_local_and_configured_sans() {
+        let cfg = zeroclaw_config::schema::WssConfig {
+            sans: vec!["relay.example.test".into(), " ".into()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            wss_server_sans(&cfg),
+            vec![
+                "localhost".to_string(),
+                "127.0.0.1".to_string(),
+                "relay.example.test".to_string(),
+            ]
+        );
+        assert!(wss_server_sans(&zeroclaw_config::schema::WssConfig::default()).is_empty());
+    }
+}
+
+#[cfg(feature = "agent-runtime")]
+fn issue_wss_client_cert(
+    config: &Config,
+    name: &str,
+    out_dir: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
+    let tls_dir = config.data_dir.join("tls");
+    let ca_cert = tls_dir.join("ca.crt");
+    let ca_key = tls_dir.join("ca.key");
+    if !ca_cert.exists() || !ca_key.exists() {
+        anyhow::bail!(
+            "no daemon mTLS CA found at {}. Start the daemon once with [wss] enabled to \
+             auto-generate it, or configure a bring-your-own CA.",
+            tls_dir.display()
+        );
+    }
+
+    // Per-device file names so issuing certs for multiple devices does not clobber.
+    let slug: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let has_out_dir = out_dir.is_some();
+    let dest = out_dir.unwrap_or(tls_dir);
+    let cert_path = dest.join(format!("client-{slug}.crt"));
+    let key_path = dest.join(format!("client-{slug}.key"));
+    let cert_tmp_path = dest.join(format!(".client-{slug}.crt.tmp"));
+    let key_tmp_path = dest.join(format!(".client-{slug}.key.tmp"));
+    if !force && (cert_path.exists() || key_path.exists()) {
+        anyhow::bail!(
+            "{} already exists. Pass --force to overwrite, or --out-dir / --name for a new one.",
+            key_path.display()
+        );
+    }
+
+    let ca_cert_pem = std::fs::read_to_string(&ca_cert)?;
+    // Read the CA key honoring any at-rest passphrase, so an encrypted CA still
+    // signs from the CLI (the key never leaves this process).
+    let ca_key_pem = zeroclaw_tls::load_ca_key_pem(&ca_key, &ca_key_protection_from_env())?;
+    let issued = zeroclaw_tls::issue_client_cert(&ca_cert_pem, &ca_key_pem, name)?;
+
+    // Directory 0700, private key written 0600 atomically (no world-readable window).
+    if let Some(parent) = key_path.parent() {
+        std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).ok();
+        }
+    }
+    std::fs::write(&cert_tmp_path, issued.cert_pem.as_bytes())
+        .with_context(|| format!("write staged certificate {}", cert_tmp_path.display()))?;
+    if let Err(e) = zeroclaw_tls::certgen::write_private_pem(&key_tmp_path, &issued.key_pem) {
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        return Err(e)
+            .with_context(|| format!("write staged private key {}", key_tmp_path.display()));
+    }
+
+    // Record the issuance in the daemon-owned ledger so this cert is revocable and
+    // appears in the canonical "who holds which cert" record (actor = operator).
+    //
+    // Deliberately BEFORE the staged files are published: a ledger this command
+    // could not write must not leave certificate material on disk, and an
+    // over-recorded credential is recoverable where an unrecorded one is not
+    // (see CertLedger::record_issued). The row is therefore active-but-
+    // undelivered until the renames below succeed.
+    use zeroclaw_runtime::security::cert_ledger::{
+        CertLedger, CertStatus, IssuanceActor, LedgerEntry,
+    };
+    let ledger_result = (|| -> Result<(CertLedger, String)> {
+        let fingerprint = zeroclaw_tls::single_cert_pem_sha256_fingerprint(&issued.cert_pem)
+            .context("parse staged issued certificate")?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let ledger = CertLedger::open_at(&config.data_dir, None, effective_crl_path(config))?;
+        ledger.record_issued(
+            &LedgerEntry {
+                device_id: name.to_string(),
+                fingerprint: fingerprint.clone(),
+                not_before: now - 300,
+                not_after: now + 30 * 86_400,
+                status: CertStatus::Active,
+                token_hash: String::new(),
+                actor: IssuanceActor::Operator.label(),
+                issued_at: now,
+            },
+            false,
+        )?;
+        Ok((ledger, fingerprint))
+    })();
+    let (ledger, fingerprint) = match ledger_result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&cert_tmp_path);
+            let _ = std::fs::remove_file(&key_tmp_path);
+            return Err(e);
+        }
+    };
+
+    // Publication. A rename that fails leaves the ledger row undelivered, which
+    // is exactly what the undelivered sweep needs to see: the operator never
+    // got a usable pair, so the certificate is revoked at the next ledger open
+    // rather than sitting active forever for a credential nobody holds.
+    //
+    // Both failure paths name the STAGED path as well as the destination - the
+    // destination alone does not tell an operator which half of the operation
+    // got where - and clear the staged material, so a private key never
+    // survives a failed publish as a stray dotfile.
+    if let Err(e) = std::fs::rename(&key_tmp_path, &key_path).with_context(|| {
+        format!(
+            "publish private key {} from staged {}",
+            key_path.display(),
+            key_tmp_path.display()
+        )
+    }) {
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        let _ = std::fs::remove_file(&key_tmp_path);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&cert_tmp_path, &cert_path).with_context(|| {
+        format!(
+            "publish certificate {} from staged {}",
+            cert_path.display(),
+            cert_tmp_path.display()
+        )
+    }) {
+        let _ = std::fs::remove_file(&key_path);
+        let _ = std::fs::remove_file(&cert_tmp_path);
+        return Err(e);
+    }
+
+    // Published: the operator now holds both halves, so the credential is
+    // delivered. Marking BEFORE this point would have recorded a delivery the
+    // filesystem never made.
+    ledger.mark_delivered(&fingerprint).with_context(|| {
+        format!(
+            "record delivery of certificate {fingerprint}; the files were published but the \
+             ledger could not record it, so this certificate will be revoked as undelivered - \
+             re-issue it with --force"
+        )
+    })?;
+
+    // When issuing into a separate out-dir, also lay it out as a drop-in client
+    // `tls/` directory (ca.crt + client.crt + client.key). zerocode looks for
+    // exactly these names under its <config-dir>/tls, so a client that copies this
+    // directory needs no --tls-* flags at all.
+    if has_out_dir {
+        // The primary publish above already succeeded; a failure here must
+        // still fail the command loudly - reporting success while the drop-in
+        // directory is missing or stale hands the operator dead credentials.
+        std::fs::copy(&ca_cert, dest.join("ca.crt")).with_context(|| {
+            format!(
+                "copy ca.crt into {}; the primary credentials were issued but this \
+                 drop-in directory is incomplete - fix the directory and re-run with \
+                 --force, or copy the published files by hand",
+                dest.display()
+            )
+        })?;
+        std::fs::write(dest.join("client.crt"), issued.cert_pem.as_bytes()).with_context(|| {
+            format!(
+                "write client.crt into {}; the primary credentials were issued but \
+                 this drop-in directory is incomplete",
+                dest.display()
+            )
+        })?;
+        zeroclaw_tls::certgen::write_private_pem(&dest.join("client.key"), &issued.key_pem)
+            .with_context(|| {
+                format!(
+                    "write client.key into {}; the primary credentials were issued but \
+                     this drop-in directory is incomplete",
+                    dest.display()
+                )
+            })?;
+    }
+
+    let cert_path_display = cert_path.display().to_string();
+    let key_path_display = key_path.display().to_string();
+    let ca_cert_display = ca_cert.display().to_string();
+    println!(
+        "{}",
+        ta("cli-mtls-issued-client-cert", &[("name", name)], "issued")
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-cert-path",
+            &[("path", &cert_path_display)],
+            "cert"
+        )
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-key-path",
+            &[("path", &key_path_display)],
+            "key"
+        )
+    );
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-issued-ca-path",
+            &[("path", &ca_cert_display)],
+            "CA"
+        )
+    );
+
+    let relay = &config.relay;
+    // node_id is auto-minted when unset, so resolve the real one (persisted) for
+    // the guidance rather than requiring the operator to have pinned it.
+    let relay_ready = relay.enabled && !relay.url.is_empty();
+    let relay_node = if relay_ready {
+        zeroclaw_runtime::relay::ensure_node_id(&config.data_dir, &relay.node_id)
+            .unwrap_or_else(|_| relay.node_id.clone())
+    } else {
+        relay.node_id.clone()
+    };
+    if has_out_dir {
+        println!();
+        println!("{}", t("cli-mtls-dropin-line-1", "drop-in TLS dir"));
+        println!("{}", t("cli-mtls-dropin-line-2", "client key"));
+        println!("{}", t("cli-mtls-dropin-line-3", "automatic TLS material"));
+    }
+    println!();
+    if relay_ready {
+        // The relay tunnels to the daemon's loopback listener, so the client does
+        // not name a host: --connect defaults to wss://127.0.0.1 in relay mode.
+        // The OUTER hop to the relay needs the relay's OWN ca (--relay-ca), which
+        // is a different trust root from the daemon CA (--tls-ca-cert).
+        let mut relay_flags = String::new();
+        if !relay.relay_host.is_empty() {
+            let _ = write!(relay_flags, " --relay-host {}", relay.relay_host);
+        }
+        if relay.relay_insecure {
+            relay_flags.push_str(" --relay-insecure");
+        } else if !relay.relay_ca_path.is_empty() {
+            let _ = write!(relay_flags, " --relay-ca {}", relay.relay_ca_path);
+        } else {
+            relay_flags.push_str(" --relay-ca <relay-ca.crt>");
+        }
+        println!("{}", t("cli-mtls-relay-connect-header", "relay connect"));
+        if has_out_dir {
+            // i18n-exempt: literal zerocode command line; the flags are not translatable
+            println!(
+                "  zerocode --config-dir <dir-with-the-tls-folder> --relay {} --relay-node {}{}",
+                relay.url, relay_node, relay_flags
+            );
+        } else {
+            // i18n-exempt: literal zerocode command line; the flags are not translatable
+            println!(
+                "  zerocode --relay {} --relay-node {}{} --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+                relay.url,
+                relay_node,
+                relay_flags,
+                ca_cert.display(),
+                cert_path.display(),
+                key_path.display()
+            );
+        }
+        println!("{}", t("cli-mtls-relay-ca-note-1", "relay CA note"));
+        println!("{}", t("cli-mtls-relay-ca-note-2", "daemon CA note"));
+    } else {
+        println!("{}", t("cli-mtls-direct-connect-header", "direct connect"));
+        // i18n-exempt: literal zerocode command line; the flags are not translatable
+        println!(
+            "  zerocode --connect wss://<host>:<port> --tls-ca-cert {} --tls-client-cert {} --tls-client-key {}",
+            ca_cert.display(),
+            cert_path.display(),
+            key_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Revoke an issued client certificate (or every active cert a device holds) in
+/// the daemon ledger, which materializes `<data_dir>/tls/revoked` so the WSS
+/// verifier refuses it at the next handshake (threat A5). The operator-driven
+/// counterpart to `issue-client-cert`.
+#[cfg(feature = "agent-runtime")]
+fn revoke_wss_client_cert(
+    config: &Config,
+    fingerprint: Option<String>,
+    device: Option<String>,
+) -> Result<()> {
+    use zeroclaw_runtime::security::cert_ledger::CertLedger;
+    // `operator` matches the issuance actor `issue-client-cert` records.
+    const ACTOR: &str = "operator";
+    let ledger = CertLedger::open_at(&config.data_dir, None, effective_crl_path(config))?;
+    let changed = if let Some(fp) = fingerprint {
+        let fp = fp.trim().to_ascii_lowercase();
+        if ledger.mark_revoked(&fp, ACTOR)? {
+            println!(
+                "{}",
+                ta(
+                    "cli-mtls-revoked-certificate",
+                    &[("fingerprint", &fp)],
+                    "revoked"
+                )
+            );
+            true
+        } else {
+            println!(
+                "{}",
+                ta(
+                    "cli-mtls-revoke-no-active-fingerprint",
+                    &[("fingerprint", &fp)],
+                    "not found"
+                )
+            );
+            false
+        }
+    } else if let Some(device_id) = device {
+        let n = ledger.revoke_device(&device_id, ACTOR)?;
+        let n_s = n.to_string();
+        println!(
+            "{}",
+            ta(
+                "cli-mtls-revoked-device-certs",
+                &[("count", &n_s), ("device", &device_id)],
+                "revoked"
+            )
+        );
+        n > 0
+    } else {
+        // clap requires exactly one of --fingerprint / --device; defensive only.
+        anyhow::bail!("provide --fingerprint <hex> or --device <id>");
+    };
+    if changed {
+        // Report the path the verifier ACTUALLY reads - the same one the ledger
+        // materialized to above. Printing the ledger default here would name a
+        // file the verifier never consults whenever `[wss.client_auth].crl_path`
+        // is set, which is exactly the moment (incident response) the operator
+        // needs the real path.
+        let revoked_path = effective_crl_path(config).display().to_string();
+        println!(
+            "{}",
+            ta(
+                "cli-mtls-revoked-list-updated",
+                &[("path", &revoked_path)],
+                "updated"
+            )
+        );
+    }
+    Ok(())
+}
+
+/// The revoked-fingerprint list this daemon's WSS verifier actually reads:
+/// `[wss.client_auth].crl_path` when set, else the ledger default. Operator
+/// commands must materialize to this path or a revocation is reported but never
+/// enforced.
+#[cfg(feature = "agent-runtime")]
+fn effective_crl_path(config: &Config) -> std::path::PathBuf {
+    zeroclaw_runtime::security::cert_ledger::effective_revoked_list_path(
+        &config.data_dir,
+        config.wss.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+    )
+}
+
+/// List the still-active client certificates this daemon's CA has issued, read
+/// from the issued-cert ledger. Read-only operator visibility into who holds a
+/// live certificate.
+#[cfg(feature = "agent-runtime")]
+fn list_wss_client_certs(config: &Config, json: bool) -> Result<()> {
+    use zeroclaw_runtime::security::cert_ledger::CertLedger;
+    let ledger = CertLedger::open_at(&config.data_dir, None, effective_crl_path(config))?;
+    let active = ledger.list_active()?;
+    if json {
+        let rows: Vec<serde_json::Value> = active
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "device_id": e.device_id,
+                    "fingerprint": e.fingerprint,
+                    "not_before": e.not_before,
+                    "not_after": e.not_after,
+                    "issued_at": e.issued_at,
+                    "actor": e.actor,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if active.is_empty() {
+        println!("{}", t("cli-mtls-list-no-active-certs", "no active certs"));
+        return Ok(());
+    }
+    let active_len = active.len().to_string();
+    println!(
+        "{}",
+        ta(
+            "cli-mtls-list-active-header",
+            &[("count", &active_len)],
+            "active certs"
+        )
+    );
+    for e in &active {
+        // i18n-exempt: structured cert row; device/not_after/actor are field identifiers
+        println!(
+            "  {}  device={}  not_after={}  actor={}",
+            e.fingerprint, e.device_id, e.not_after, e.actor
+        );
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -3404,6 +4030,500 @@ fn main() -> Result<()> {
     async_main(command)
 }
 
+/// True when a desktop entry's `Name` deliberately identifies ZeroClaw: it is
+/// exactly "ZeroClaw" or "ZeroClaw" followed by a separator (e.g. "ZeroClaw
+/// Companion"), case-insensitively. Matching the visible application name — not
+/// any field that merely contains the substring "zeroclaw" — is what stops an
+/// unrelated entry (or a lookalike like `not-zeroclaw-helper`) from qualifying.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_zeroclaw_name(name: &str) -> bool {
+    let lower = name.trim().to_ascii_lowercase();
+    match lower.strip_prefix("zeroclaw") {
+        Some("") => true,
+        Some(rest) => rest.starts_with([' ', '-', '_']),
+        None => false,
+    }
+}
+
+/// Reserved characters that the Desktop Entry Specification requires to be
+/// double-quoted in an `Exec` value. Encountering one outside quotes means the
+/// value is malformed, so parsing fails closed rather than launching a partially
+/// interpreted path.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+const EXEC_RESERVED_CHARS: &[char] = &[
+    '"', '`', '$', '\\', '>', '<', '~', '|', '&', ';', '*', '?', '#', '(', ')', '\'',
+];
+
+/// Apply the Desktop Entry Specification's general string-value unescape rules
+/// (`\s \n \t \r \\`) to the raw `Exec` value. The spec applies this layer
+/// *before* the `Exec` quoting rules, so e.g. a literal `$` in a quoted path is
+/// written `\\$`: the general layer turns `\\` into `\`, leaving `\$` for the
+/// quoting layer. Any other escape, or a dangling backslash, is malformed and
+/// fails closed (`None`).
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn unescape_desktop_value(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    // An escape consumes the following char too; the `while let` body advances
+    // the same iterator, so it can't be a `for` loop.
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('s') => out.push(' '),
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// A `%X` token is a known desktop-entry field code (or `%%`, a literal percent).
+/// An unknown field code invalidates the whole `Exec` command line per the spec.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_known_field_code(token: &str) -> bool {
+    token == "%%"
+        || matches!(
+            token,
+            "%f" | "%F"
+                | "%u"
+                | "%U"
+                | "%i"
+                | "%c"
+                | "%k"
+                | "%d"
+                | "%D"
+                | "%n"
+                | "%N"
+                | "%v"
+                | "%m"
+        )
+}
+
+/// Tokenize a (general-unescaped) desktop-entry `Exec` value into its whitespace-
+/// separated arguments, applying the `Exec` quoting rules to each. Each token is
+/// returned with a flag recording whether it was quoted, so field-code
+/// validation can reject a field code that appears inside a quoted argument (the
+/// Desktop Entry Specification forbids that). Fails closed (`None`) on any
+/// malformed token: an unterminated quote, a dangling or invalid escape, a raw
+/// reserved character (`"`, `` ` ``, `$`, `\` unquoted or an unescaped `$`/`` ` ``
+/// inside quotes), or text directly adjacent to a closing quote (e.g. `"…"junk`).
+/// Validating the whole line — not just the first token — is what keeps a
+/// malformed entry from launching its first argument.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn tokenize_exec_line(line: &str) -> Option<Vec<(String, bool)>> {
+    let mut tokens = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while matches!(chars.peek(), Some(c) if c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+        let mut token = String::new();
+        let quoted = chars.peek() == Some(&'"');
+        if quoted {
+            chars.next(); // opening quote
+            loop {
+                match chars.next() {
+                    Some('"') => break, // closing quote
+                    Some('\\') => match chars.next() {
+                        Some(esc @ ('"' | '`' | '$' | '\\')) => token.push(esc),
+                        _ => return None, // invalid or dangling escape inside quotes
+                    },
+                    // An unterminated quote, or an unescaped reserved character
+                    // (`$`/`` ` ``) inside quotes: fail closed.
+                    None | Some('$' | '`') => return None,
+                    Some(c) => token.push(c),
+                }
+            }
+            // A closing quote must end the token; adjacent text is malformed.
+            if matches!(chars.peek(), Some(c) if !c.is_whitespace()) {
+                return None;
+            }
+        } else {
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                if EXEC_RESERVED_CHARS.contains(&c) {
+                    return None; // a reserved character must be quoted
+                }
+                token.push(c);
+                chars.next();
+            }
+        }
+        tokens.push((token, quoted));
+    }
+    Some(tokens)
+}
+
+/// Validate the field codes carried by a single tokenized `Exec` argument per the
+/// Desktop Entry Specification. Inside a token, the only permitted `%` is the
+/// escaped literal `%%`; a bare, embedded, or unknown field code (`%U`, `%Z`,
+/// `ZeroClaw-%Z.AppImage`, `--flag=%U`) invalidates the command line. The one
+/// exception is that an *argument* (never the program) that was *not* quoted may
+/// be exactly one known standalone field code such as `%U`. A field code inside a
+/// quoted argument is always rejected.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn exec_token_field_codes_ok(token: &str, quoted: bool, is_program: bool) -> bool {
+    // A lone, unquoted, standalone known field code is a valid argument — but the
+    // program (executable) can never be a field code, so it has no exception.
+    if !is_program && !quoted && is_known_field_code(token) {
+        return true;
+    }
+    // Otherwise every `%` must be the escaped literal `%%`.
+    let mut chars = token.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' && chars.next() != Some('%') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Parse the program token (first argument) from a desktop-entry `Exec=` value,
+/// per the Desktop Entry Specification. The general string-unescape layer is
+/// applied first (see [`unescape_desktop_value`]), then the whole command line is
+/// tokenized with the `Exec` quoting rules (see [`tokenize_exec_line`]). Parsing
+/// fails closed (`None`) on malformed input anywhere on the line — an unterminated
+/// quote, a dangling/invalid escape, an unquoted reserved character, text adjacent
+/// to a closing quote, an unknown field code (e.g. `%Z`), an `=` in the program
+/// token, or a program token that is empty or itself a field code — rather than
+/// launching a partially interpreted path.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn parse_exec_program(exec: &str) -> Option<String> {
+    let unescaped = unescape_desktop_value(exec)?;
+    let mut tokens = tokenize_exec_line(&unescaped)?.into_iter();
+    let (program, program_quoted) = tokens.next()?;
+    // The executable may not be empty, carry an `=`, or contain any field code
+    // (bare or embedded — only an escaped `%%` literal is allowed). This rejects
+    // a program like `ZeroClaw-%Z.AppImage` whose basename would otherwise pass
+    // the AppImage-name check.
+    if program.is_empty()
+        || program.contains('=')
+        || !exec_token_field_codes_ok(&program, program_quoted, true)
+    {
+        return None;
+    }
+    // Every argument token must likewise carry no field code, except a single
+    // unquoted standalone known field code. An unknown, embedded, or quoted field
+    // code anywhere on the line invalidates it.
+    for (token, quoted) in tokens {
+        if !exec_token_field_codes_ok(&token, quoted, false) {
+            return None;
+        }
+    }
+    Some(program)
+}
+
+/// The published companion-app binary name (the `Exec` of `ZeroClaw.desktop` in
+/// the v0.8.3 Debian package). This is the single source of truth for the
+/// supported non-AppImage executable, so discovery cannot select a lookalike
+/// such as `zeroclaw-helper` or `zeroclaw-evil`.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+const ZEROCLAW_DESKTOP_BIN: &str = "zeroclaw-desktop";
+
+/// True when a desktop entry's resolved `Exec` program is a supported ZeroClaw
+/// executable: either the exact published binary `zeroclaw-desktop`, or a
+/// ZeroClaw AppImage in the published `ZeroClaw-*.AppImage` form. It is bound to
+/// those forms — not to any `zeroclaw*` basename — so a deliberate ZeroClaw
+/// `Name` cannot be paired with a lookalike (`zeroclaw-helper`, `zeroclaw-evil`)
+/// to preempt the real app.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_zeroclaw_program(program: &str) -> bool {
+    let Some(name) = Path::new(program).file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let lower = name.to_ascii_lowercase();
+    lower == ZEROCLAW_DESKTOP_BIN || is_zeroclaw_appimage_name(name)
+}
+
+/// True when a bare file name is a supported ZeroClaw AppImage in the published
+/// `ZeroClaw-*.AppImage` form: it begins with "zeroclaw-" (the separator is
+/// required) and ends with ".appimage", case-insensitively. Requiring the
+/// separator rejects lookalikes with no boundary such as `ZeroClawevil.AppImage`
+/// as well as `not-zeroclaw-helper.AppImage`.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_zeroclaw_appimage_name(file_name: &str) -> bool {
+    let lower = file_name.to_ascii_lowercase();
+    lower.starts_with("zeroclaw-") && lower.ends_with(".appimage")
+}
+
+/// Read the `Exec` target from a desktop entry, but only when the entry is a
+/// ZeroClaw application, so an unrelated `.desktop` file is never launched.
+/// Identity is a bounded combination, not a display name alone: the entry must
+/// be `Type=Application`, its `Name` must deliberately identify ZeroClaw (see
+/// [`is_zeroclaw_name`]), and its resolved `Exec` program must be a ZeroClaw
+/// executable (see [`is_zeroclaw_program`]). Only the `[Desktop Entry]` group is
+/// consulted, a `Hidden=true` ("masked") entry is ignored, and the `Exec` value
+/// is parsed with the desktop-entry quoting grammar (see [`parse_exec_program`]).
+///
+/// Gated with the `desktop` command's `which` dependency (`agent-runtime`) on
+/// Linux, matching its sole caller and the desktop-entry tests.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn zeroclaw_desktop_exec(contents: &str) -> Option<String> {
+    let mut in_entry = false;
+    let mut name: Option<String> = None;
+    let mut exec: Option<String> = None;
+    let mut entry_type: Option<String> = None;
+    let mut hidden = false;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_entry || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // Only the default (non-localized) key matters; first occurrence wins.
+        match key.trim() {
+            "Name" if name.is_none() => name = Some(value.trim().to_string()),
+            "Exec" if exec.is_none() => exec = Some(value.trim().to_string()),
+            "Type" if entry_type.is_none() => entry_type = Some(value.trim().to_string()),
+            "Hidden" if value.trim().eq_ignore_ascii_case("true") => hidden = true,
+            _ => {}
+        }
+    }
+    if hidden {
+        return None;
+    }
+    // A launchable app entry only: `Type` must be `Application`, per the
+    // published `ZeroClaw.desktop` contract. A non-`Application` entry (e.g.
+    // `Link`/`Directory`) never resolves.
+    if !entry_type
+        .as_deref()
+        .is_some_and(|t| t.eq_ignore_ascii_case("Application"))
+    {
+        return None;
+    }
+    if !is_zeroclaw_name(&name?) {
+        return None;
+    }
+    let program = parse_exec_program(&exec?)?;
+    if !is_zeroclaw_program(&program) {
+        return None;
+    }
+    Some(program)
+}
+
+/// True when `path` is a regular file with an execute bit set.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+/// Resolve a desktop-entry command to an executable file: an absolute path is
+/// taken as-is (and must be executable), a bare command name is resolved through
+/// `PATH`. Non-executable candidates are rejected so a broken entry is skipped.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn resolve_executable(command: &str) -> Option<PathBuf> {
+    let candidate = Path::new(command);
+    if candidate.is_absolute() {
+        return is_executable(candidate).then(|| candidate.to_path_buf());
+    }
+    // A relative value containing a path separator (e.g. `./zeroclaw-helper`) would be
+    // resolved by `which` against the current working directory, letting a desktop entry
+    // launch a binary from wherever `zeroclaw desktop` happened to run. Per the Desktop
+    // Entry spec `Exec` must be an absolute path or a bare executable name resolved on
+    // `PATH`, so reject any relative value that carries a separator.
+    if command.contains('/') {
+        return None;
+    }
+    which::which(command).ok()
+}
+
+/// Maximum accepted size of one XDG desktop entry. Desktop files are small
+/// metadata documents; bounding ambient entries prevents one unrelated file
+/// from consuming unbounded memory before a valid ZeroClaw entry is reached.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+const DESKTOP_ENTRY_MAX_BYTES: u64 = 256 * 1024;
+
+/// Open and read a desktop entry without following its final symlink, blocking
+/// on a FIFO, or trusting pathname metadata that can change before the open.
+/// Classification and the byte limit are both applied to the opened handle.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn read_desktop_entry(path: &Path) -> Option<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > DESKTOP_ENTRY_MAX_BYTES {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    let mut limited = file.take(DESKTOP_ENTRY_MAX_BYTES + 1);
+    limited.read_to_end(&mut bytes).ok()?;
+    if u64::try_from(bytes.len()).ok()? > DESKTOP_ENTRY_MAX_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// Recursively collect `.desktop` entries under `root` (an `applications`
+/// directory) as `(desktop-file-id, path)` pairs. Per the Desktop Entry
+/// Specification the ID is the path relative to `root` with directory
+/// separators replaced by `-`, so a nested `kde/foo.desktop` has ID
+/// `kde-foo.desktop`. Deriving IDs recursively (rather than from top-level
+/// basenames only) is what lets a nested higher-precedence entry correctly
+/// mask the same ID in a lower-precedence directory.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn collect_desktop_entries(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<(String, PathBuf)>,
+    visited: &mut std::collections::HashSet<PathBuf>,
+) {
+    // Guard against directory cycles (e.g. a bind mount pointing back up the tree) by
+    // tracking canonical paths already scanned.
+    let canonical = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !visited.insert(canonical) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `entry.file_type()` does not follow symlinks, so a directory symlink such as
+        // `applications/loop -> .` is not treated as a directory and is never recursed
+        // into — preventing an unbounded traversal.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            collect_desktop_entries(root, &path, out, visited);
+        } else if file_type.is_file()
+            && path.extension().and_then(|e| e.to_str()) == Some("desktop")
+            && let Ok(rel) = path.strip_prefix(root)
+        {
+            let id = rel.to_string_lossy().replace('/', "-");
+            out.push((id, path));
+        }
+    }
+}
+
+/// Scan `applications` subdirectories of the given XDG base dirs (already in
+/// precedence order) for a ZeroClaw desktop entry and return its executable
+/// `Exec` target. The first occurrence of a desktop-file ID wins and shadows the
+/// same ID in later (lower-precedence) directories, matching XDG masking.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn discover_desktop_app(data_dirs: &[PathBuf]) -> Option<PathBuf> {
+    let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for base in data_dirs {
+        let root = base.join("applications");
+        let mut files: Vec<(String, PathBuf)> = Vec::new();
+        let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        collect_desktop_entries(&root, &root, &mut files, &mut visited);
+        files.sort(); // deterministic order by desktop-file ID within a directory
+        for (id, path) in files {
+            if !seen_ids.insert(id) {
+                continue; // shadowed by a higher-precedence entry with the same ID
+            }
+            let Some(contents) = read_desktop_entry(&path) else {
+                continue;
+            };
+            if let Some(target) =
+                zeroclaw_desktop_exec(&contents).and_then(|cmd| resolve_executable(&cmd))
+            {
+                return Some(target);
+            }
+        }
+    }
+    None
+}
+
+/// Discover an installed companion app on Linux that is not on `PATH`, such as
+/// an AppImage registered in the application menu. Reads the `Exec` target from
+/// a ZeroClaw XDG desktop entry (honouring `$XDG_DATA_HOME`/`$XDG_DATA_DIRS`
+/// precedence), then falls back to scanning common AppImage install locations.
+/// Returns the launchable binary/AppImage path.
+#[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+fn find_linux_desktop_app() -> Option<PathBuf> {
+    let home = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf());
+
+    // XDG application dirs in precedence order: $XDG_DATA_HOME first, then each
+    // $XDG_DATA_DIRS entry. Unset or empty falls back to the spec defaults. Per
+    // the Base Directory Specification a relative value is invalid and must be
+    // ignored, so it is never searched from the process working directory.
+    let mut data_dirs: Vec<PathBuf> = Vec::new();
+    match std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        Some(v) => data_dirs.push(v),
+        None => {
+            if let Some(home) = &home {
+                data_dirs.push(home.join(".local/share"));
+            }
+        }
+    }
+    let extra = std::env::var_os("XDG_DATA_DIRS")
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    for dir in extra.split(':').filter(|s| !s.is_empty()) {
+        let path = PathBuf::from(dir);
+        if path.is_absolute() {
+            data_dirs.push(path);
+        }
+    }
+
+    if let Some(target) = discover_desktop_app(&data_dirs) {
+        return Some(target);
+    }
+
+    // Fall back to scanning common AppImage locations for a ZeroClaw image that
+    // was made executable but never registered on PATH. `read_dir` order is
+    // unspecified, so collect every match and pick deterministically: within
+    // a directory the lexicographically greatest file name (so a higher version
+    // like `ZeroClaw-2...` is preferred over `ZeroClaw-1...`); earlier
+    // directories in the list keep priority.
+    if let Some(home) = &home {
+        for dir in [home.join("Applications"), home.join(".local/bin")] {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut matches: Vec<PathBuf> = entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| {
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or_default();
+                    is_zeroclaw_appimage_name(name) && is_executable(path)
+                })
+                .collect();
+            if !matches.is_empty() {
+                matches.sort();
+                return matches.pop();
+            }
+        }
+    }
+
+    None
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn async_main(command: clap::Command) -> Result<()> {
@@ -3746,7 +4866,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 return Ok(());
             }
             Commands::Completions { .. } | Commands::MarkdownHelp | Commands::MarkdownSchema => {
-                unreachable!()
+                anyhow::bail!("documentation command was not handled before runtime dispatch")
             }
             _ => {
                 anyhow::bail!(
@@ -3775,7 +4895,9 @@ async fn async_main(command: clap::Command) -> Result<()> {
         Commands::Onboard { .. }
         | Commands::Completions { .. }
         | Commands::MarkdownHelp
-        | Commands::MarkdownSchema => unreachable!(),
+        | Commands::MarkdownSchema => {
+            anyhow::bail!("pre-runtime command was not handled before runtime dispatch")
+        }
 
         Commands::Quickstart {
             model_provider,
@@ -4230,9 +5352,10 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let canvas_store_for_channels = canvas_store_for_channels.clone();
                 let mut registry = daemon::DaemonRegistry::new();
 
-                // SOP loading is gated on `[sop] sops_dir`: unset disables all
-                // SOP runtime behavior, matching the documented rollback path.
-                let (sop_engine, sop_audit) = if current_config.sop.sops_dir.is_some() {
+                // SOP loading is gated on `runtime_enabled()`: `sops_dir` is unset
+                // (or empty) by default, so SOP runtime behavior is off until an
+                // operator opts in by setting a directory.
+                let (sop_engine, sop_audit) = if current_config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> = Arc::from(
                         zeroclaw_memory::create_memory_from_config(&current_config, None)?,
                     );
@@ -4240,6 +5363,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         current_config.sop.clone(),
                         &current_config.data_dir,
+                        &current_config.install_root_dir(),
                         mem,
                         sop_adapters,
                     );
@@ -4349,26 +5473,450 @@ async fn async_main(command: clap::Command) -> Result<()> {
 
                 registry.register_wss(Box::new(|ctx, cancel, client_count| {
                     Box::pin(async move {
-                        let wss_cfg = ctx.config.read().wss.clone();
+                        let (wss_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (cfg.wss.clone(), cfg.data_dir.clone())
+                        };
                         if !wss_cfg.enabled {
                             // WSS disabled — park until cancelled.
                             cancel.cancelled().await;
                             return Ok(());
                         }
+                        // The remote WSS plane is ALWAYS mutually authenticated; there
+                        // is no server-only / plaintext fallback. In auto-CA mode the
+                        // same generated CA verifies client certificates, and any
+                        // configured pin allowlist remains enforced.
+                        let (byo_ca, pinned) =
+                            resolve_wss_client_auth(wss_cfg.client_auth.as_ref())?;
+                        // Bring-your-own mTLS when an operator CA is configured;
+                        // otherwise auto-generate a per-daemon CA + server certificate
+                        // under the data dir (secure by default, zero config).
+                        let (cert_path, key_path, ca_cert_path) = match byo_ca {
+                            Some(ca_cert_path) => {
+                                if wss_cfg.cert_path.is_empty() || wss_cfg.key_path.is_empty() {
+                                    anyhow::bail!(
+                                        "[wss.client_auth].ca_cert_path is set (bring-your-own mTLS) \
+                                         but [wss].cert_path/key_path are not. Provide the server \
+                                         certificate and key, or clear ca_cert_path to auto-generate \
+                                         the CA and server certificate."
+                                    );
+                                }
+                                (wss_cfg.cert_path.clone(), wss_cfg.key_path.clone(), ca_cert_path)
+                            }
+                            None => {
+                                // Generate (or reuse) the per-daemon CA + server
+                                // cert. The CA key is encrypted at rest when a
+                                // passphrase is configured (same source the
+                                // enrollment + CLI read paths use), else 0600.
+                                // [wss].sans adds the hostnames/IPs a remote client
+                                // uses to reach the daemon to the server cert. The
+                                // enrollment endpoint uses the same resolver so both
+                                // TLS surfaces present matching daemon identities.
+                                let server_sans = wss_server_sans(&wss_cfg);
+                                let mats = zeroclaw_tls::ensure_server_materials_protected(
+                                    &data_dir.join("tls"),
+                                    &server_sans,
+                                    &ca_key_protection_from_env(),
+                                )?;
+                                (
+                                    mats.server_cert_path.to_string_lossy().into_owned(),
+                                    mats.server_key_path.to_string_lossy().into_owned(),
+                                    mats.ca_cert_path.to_string_lossy().into_owned(),
+                                )
+                            }
+                        };
+                        // Connect-time revocation refusal (A5): default to the
+                        // ledger-materialized list under <data_dir>/tls/revoked
+                        // (the daemon rewrites it on every revoke), overridable by
+                        // [wss.client_auth].crl_path.
+                        // Resolve the effective CRL path exactly once, with the
+                        // SAME normalization the ledger and operator CLI use
+                        // (trim; blank means unset), and hand that one value to
+                        // both the ledger and the TLS acceptor below. Selecting
+                        // the raw string here let a whitespace spelling install
+                        // no revocation verifier while the ledger materialized
+                        // the default file - revocation must never be split or
+                        // disabled by an accepted configuration spelling.
+                        let crl_path =
+                            zeroclaw_runtime::security::cert_ledger::effective_revoked_list_path(
+                                &data_dir,
+                                wss_cfg.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+                            )
+                            .to_string_lossy()
+                            .into_owned();
+                        // Materialize to the path the verifier will read,
+                        // including a configured override. Skipping this when an
+                        // override is set left `revoke-client-cert` writing to
+                        // the default file while the handshake honoured a stale
+                        // one, so a revoked cert kept authenticating.
+                        {
+                            let ledger =
+                                zeroclaw_runtime::security::cert_ledger::CertLedger::open_at(
+                                    &data_dir,
+                                    None,
+                                    std::path::PathBuf::from(&crl_path),
+                                )
+                                .context(
+                                    "open cert ledger before starting WSS revocation checks",
+                                )?;
+                            ledger.materialize_revocations().context(
+                                "materialize cert revocations before starting WSS listener",
+                            )?;
+                        }
                         let tls_acceptor = zeroclaw_runtime::rpc::wss::build_tls_acceptor(
-                            &wss_cfg.cert_path,
-                            &wss_cfg.key_path,
+                            &cert_path,
+                            &key_path,
+                            &ca_cert_path,
+                            &pinned,
+                            &crl_path,
                         )?;
                         let bind_addr: std::net::SocketAddr =
                             format!("{}:{}", wss_cfg.bind, wss_cfg.port).parse()?;
+                        let wss_limits = zeroclaw_runtime::rpc::wss::WssLimits {
+                            max_pending_handshakes: wss_cfg.max_pending_handshakes,
+                            handshake_timeout: std::time::Duration::from_secs(
+                                wss_cfg.handshake_timeout_secs,
+                            ),
+                            max_sessions: wss_cfg.max_sessions,
+                            max_sessions_per_client: wss_cfg.max_sessions_per_client,
+                            incomplete_message_timeout: std::time::Duration::from_secs(
+                                wss_cfg.incomplete_message_timeout_secs,
+                            ),
+                        };
                         zeroclaw_runtime::rpc::wss::run_wss_listener(
                             ctx,
                             cancel,
                             client_count,
                             tls_acceptor,
                             bind_addr,
+                            wss_limits,
                         )
                         .await
+                    })
+                }));
+
+                // Shared between the relay bridge and the enrollment endpoint:
+                // the bridge registers its enroll-dial source ports here so the
+                // endpoint can classify those loopback connections as
+                // relay-routed rather than direct (finding: relay enrollment
+                // collapsed every client to the bridge's loopback identity, so
+                // one hostile client's failures locked out all relay enrollees).
+                let enroll_bridge_ports: zeroclaw_runtime::enroll::BridgePortSet =
+                    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+                let enroll_bridge_ports_for_bridge = enroll_bridge_ports.clone();
+                let enroll_bridge_ports_for_endpoint = enroll_bridge_ports.clone();
+                // Relay bridge: keep an outbound connection to a nominated relay
+                // so clients behind NAT can reach this daemon through it. The
+                // relay forwards to the local WSS listener (loopback), where the
+                // inner mTLS terminates; it never decrypts anything.
+                registry.register_relay(Box::new(move |ctx, cancel, _client_count| {
+                    let enroll_bridge_ports_for_bridge = enroll_bridge_ports_for_bridge.clone();
+                    Box::pin(async move {
+                        let (relay_cfg, wss_cfg, enroll_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (
+                                cfg.relay.clone(),
+                                cfg.wss.clone(),
+                                cfg.enroll.clone(),
+                                cfg.data_dir.clone(),
+                            )
+                        };
+                        if !relay_cfg.enabled {
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        if !wss_cfg.enabled {
+                            return Err(anyhow::Error::msg(
+                                "[relay] is enabled but [wss] is not. The relay forwards clients to \
+                                 the local WSS listener, so enable [wss] (it provides the mutually \
+                                 authenticated plane the relay tunnels).",
+                            ));
+                        }
+                        if relay_cfg.url.is_empty() {
+                            return Err(anyhow::Error::msg(
+                                "[relay] is enabled but relay.url is required.",
+                            ));
+                        }
+                        // Persistent Ed25519 identity the relay binds the node-id to.
+                        let signing_key_pkcs8 =
+                            zeroclaw_runtime::relay::ensure_signing_key(&data_dir)?;
+                        // node_id is an unguessable 128-bit capability: auto-minted +
+                        // persisted unless the operator pinned one in [relay].node_id.
+                        let node_id = zeroclaw_runtime::relay::ensure_node_id(
+                            &data_dir,
+                            &relay_cfg.node_id,
+                        )?;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "node_id": node_id,
+                                "relay": relay_cfg.url,
+                            })),
+                            "relay bridge: node_id (give clients this as --relay-node)"
+                        );
+                        // Default the relay's expected cert name to its host:port host.
+                        let relay_host = if relay_cfg.relay_host.is_empty() {
+                            relay_cfg
+                                .url
+                                .rsplit_once(':')
+                                .map(|(h, _)| h.to_string())
+                                .unwrap_or_else(|| relay_cfg.url.clone())
+                        } else {
+                            relay_cfg.relay_host.clone()
+                        };
+                        // Rotation is permitted only for an auto-minted id (a
+                        // pinned [relay].node_id is fixed).
+                        let rotation_allowed = relay_cfg.node_id.trim().is_empty();
+                        let node_id_rotation_days = relay_cfg.node_id_rotation_days;
+                        let bridge_cfg = zeroclaw_runtime::relay::RelayBridgeConfig {
+                            relay_addr: relay_cfg.url,
+                            relay_host,
+                            node_id,
+                            relay_token: Some(relay_cfg.token).filter(|t| !t.is_empty()),
+                            local_wss_addr: format!("127.0.0.1:{}", wss_cfg.port),
+                            local_enroll_addr: enroll_cfg
+                                .enabled
+                                .then(|| format!("127.0.0.1:{}", enroll_cfg.port)),
+                            enroll_bridge_ports: Some(enroll_bridge_ports_for_bridge.clone()),
+                            signing_key_pkcs8,
+                            relay_ca_path: Some(relay_cfg.relay_ca_path)
+                                .filter(|p| !p.is_empty()),
+                            relay_insecure: relay_cfg.relay_insecure,
+                            relay_tofu: relay_cfg.tofu,
+                            outer_client_cert: Some(relay_cfg.outer_client_cert)
+                                .filter(|p| !p.is_empty()),
+                            outer_client_key: Some(relay_cfg.outer_client_key)
+                                .filter(|p| !p.is_empty()),
+                            max_conns: 256,
+                            // Bridge-side OPEN-flood cap (A6): fast-reject beyond
+                            // ~20 new conns/sec (burst 60) so an OPEN flood cannot
+                            // force unbounded loopback mTLS handshakes.
+                            open_burst: 60,
+                            open_rate_per_sec: 20.0,
+                            data_dir: data_dir.clone(),
+                            node_id_rotation_days,
+                            rotation_allowed,
+                        };
+                        zeroclaw_runtime::relay::run_relay_bridge(bridge_cfg, cancel).await
+                    })
+                }));
+
+                // Certificate enrollment endpoint: the bootstrap surface a
+                // certless client reaches for its FIRST cert (server-auth TLS +
+                // one-time pairing code, CSR-only). The daemon owns the CA, so
+                // this works with no gateway. It is NOT the mTLS RPC plane.
+                registry.register_enroll(Box::new(move |ctx, cancel, _client_count| {
+                    let enroll_bridge_ports = enroll_bridge_ports_for_endpoint.clone();
+                    Box::pin(async move {
+                        let (enroll_cfg, wss_cfg, relay_cfg, data_dir) = {
+                            let cfg = ctx.config.read();
+                            (
+                                cfg.enroll.clone(),
+                                cfg.wss.clone(),
+                                cfg.relay.clone(),
+                                cfg.data_dir.clone(),
+                            )
+                        };
+                        if !enroll_cfg.enabled {
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        if !wss_cfg.enabled {
+                            return Err(anyhow::Error::msg(
+                                "[enroll] is enabled but [wss] is not. Enrollment issues client \
+                                 certificates for the mutually authenticated WSS plane; enable [wss].",
+                            ));
+                        }
+                        // Issuance needs the daemon CA *private key*. Two
+                        // bring-your-own forms exist:
+                        //   1. BYO-CA with key (in-band): the operator drops
+                        //      ca.crt + ca.key into <data_dir>/tls; the issuer
+                        //      loads and signs against them (handled below by
+                        //      ensure_server_materials_protected's load path).
+                        //   2. BYO-CA without key (external CA): the WSS verifier
+                        //      trusts an external CA cert whose key the daemon does
+                        //      not hold. It cannot sign - fail closed: do not open
+                        //      the endpoint (provision client certs out of band).
+                        let byo_ca = wss_cfg
+                            .client_auth
+                            .as_ref()
+                            .filter(|c| c.enabled)
+                            .map(|c| !c.ca_cert_path.is_empty())
+                            .unwrap_or(false);
+                        if byo_ca {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                ),
+                                "enrollment endpoint disabled: a bring-your-own CA has no signing \
+                                 key; provision client certs out of band"
+                            );
+                            cancel.cancelled().await;
+                            return Ok(());
+                        }
+                        // Per-daemon CA + server cert. Loaded when the operator has
+                        // provisioned their own ca.{crt,key} (BYO-CA with key),
+                        // otherwise auto-generated (secure by default). Same
+                        // passphrase source as the WSS gen + CLI read paths, so the
+                        // on-disk CA-key form always matches.
+                        let tls_dir = data_dir.join("tls");
+                        let ca_provided =
+                            tls_dir.join("ca.crt").exists() && tls_dir.join("ca.key").exists();
+                        let protection = ca_key_protection_from_env();
+                        let server_sans = wss_server_sans(&wss_cfg);
+                        let mats = zeroclaw_tls::ensure_server_materials_protected(
+                            &tls_dir,
+                            &server_sans,
+                            &protection,
+                        )?;
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note,
+                            ),
+                            if ca_provided {
+                                "enrollment signing against an operator-provided CA \
+                                 (<data_dir>/tls/ca.*)"
+                            } else {
+                                "enrollment signing against the auto-generated per-daemon CA"
+                            }
+                        );
+                        let ca_cert_pem = std::fs::read_to_string(&mats.ca_cert_path)?;
+                        let ca_key_pem =
+                            zeroclaw_tls::load_ca_key_pem(&mats.ca_key_path, &protection)?;
+                        let ca_fingerprint = {
+                            let ders =
+                                zeroclaw_tls::load_certs(&mats.ca_cert_path.to_string_lossy())?;
+                            zeroclaw_tls::cert_sha256_fingerprint(ders[0].as_ref())
+                        };
+
+                        // Server-authentication-only TLS (no client cert; this is
+                        // the bootstrap surface, explicitly not the mTLS plane).
+                        let acceptor =
+                            zeroclaw_tls::build_tls_acceptor(&zeroclaw_tls::ServerConfigParams {
+                                cert_path: mats.server_cert_path.to_string_lossy().into_owned(),
+                                key_path: mats.server_key_path.to_string_lossy().into_owned(),
+                                client_auth: None,
+                            })?;
+
+                        // Relay coordinates handed to the enrolled client (shared
+                        // with the renew path). The pin (relay LEAF sha256) is
+                        // sourced from the relay bridge's pin store when present.
+                        let relay_profile =
+                            zeroclaw_runtime::enroll::relay_profile(&data_dir, &relay_cfg);
+
+                        // One-time pairing code gates enrollment. Print it AND the
+                        // CA-bound short-auth-string so the operator reads both to
+                        // the client out of band (no blind trust-on-first-use).
+                        let pairing = std::sync::Arc::new(zeroclaw_config::pairing::PairingGuard::new(
+                            true,
+                            &[],
+                        ));
+                        if let Some(code) = pairing.pairing_code() {
+                            let sas = zeroclaw_tls::enrollment_sas(&code, &ca_fingerprint);
+                            let enroll_bind = enroll_cfg.bind.to_string();
+                            let enroll_port = enroll_cfg.port.to_string();
+                            println!();
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-enroll-endpoint-ready",
+                                    &[("bind", &enroll_bind), ("port", &enroll_port)],
+                                    "enrollment ready"
+                                )
+                            );
+                            println!(
+                                "{}",
+                                t("cli-enroll-confirm-sas-line-1", "confirm SAS")
+                            );
+                            println!("{}", t("cli-enroll-confirm-sas-line-2", "match SAS"));
+                            println!(
+                                "{}",
+                                ta("cli-enroll-pairing-code", &[("code", &code)], "code")
+                            );
+                            println!("{}", ta("cli-enroll-sas", &[("sas", &sas)], "SAS"));
+                            println!();
+                        }
+
+                        // Reserved migration knob. Code-less enrollment needs a
+                        // separate client trust anchor before certs can be cached.
+                        let allow_unpaired_until = {
+                            let s = enroll_cfg.allow_unpaired_enrollment.trim();
+                            if !s.is_empty() {
+                                anyhow::bail!(
+                                    "[enroll].allow_unpaired_enrollment is reserved for a future \
+                                     no-code enrollment flow and is not supported in this release. \
+                                     Clear it and use the printed pairing code."
+                                );
+                            }
+                            None
+                        };
+
+                        // The daemon's shared certificate audit logger, built
+                        // once in `daemon::run` and handed to every certificate
+                        // path through the RPC context. Enrollment must not
+                        // build its own: a second logger over the same file
+                        // recovers the same Merkle-chain tip as the renewal
+                        // path and races it into duplicate sequence numbers,
+                        // which makes `verify_chain` reject the trail.
+                        let audit = ctx
+                            .cert_audit
+                            .clone()
+                            .context(
+                                "the enrollment endpoint requires the daemon's certificate \
+                                 audit logger; it failed to initialize at startup (see the \
+                                 startup error) and enrollment will not issue certificates \
+                                 without an audit trail",
+                            )?;
+                        // Materialize revocations to the file the WSS verifier
+                        // ACTUALLY reads - the same `[wss.client_auth].crl_path`
+                        // resolution the acceptor above performs. Opening on the
+                        // ledger default instead meant an enrollment-path
+                        // revocation (including the undelivered sweep, which
+                        // runs on this long-lived handle) rewrote
+                        // `<data_dir>/tls/revoked` while the verifier kept
+                        // reading an unchanged operator-managed file: revoked in
+                        // SQLite, still accepted at the handshake.
+                        let ledger = std::sync::Arc::new(
+                            zeroclaw_runtime::security::cert_ledger::CertLedger::open_at(
+                                &data_dir,
+                                Some(audit),
+                                zeroclaw_runtime::security::cert_ledger::effective_revoked_list_path(
+                                    &data_dir,
+                                    wss_cfg.client_auth.as_ref().map(|c| c.crl_path.as_str()),
+                                ),
+                            )?,
+                        );
+
+                        let bind_addr: std::net::SocketAddr =
+                            format!("{}:{}", enroll_cfg.bind, enroll_cfg.port).parse()?;
+                        let server = std::sync::Arc::new(zeroclaw_runtime::enroll::EnrollServer {
+                            bind_addr,
+                            acceptor,
+                            ca_cert_pem,
+                            ca_key_pem,
+                            ledger,
+                            pairing,
+                            static_client_pins_configured: wss_cfg
+                                .client_auth
+                                .as_ref()
+                                .map(|auth| !auth.pinned_certs.is_empty())
+                                .unwrap_or(false),
+                            allow_unpaired_until,
+                            relay_profile,
+                            bridge_ports: Some(enroll_bridge_ports.clone()),
+                            relay_attempt_bucket:
+                                zeroclaw_runtime::enroll::RelayAttemptBucket::default(),
+                            paircode_admin_data_dir: Some(data_dir.clone()),
+                        });
+                        zeroclaw_runtime::enroll::serve(server, cancel).await
                     })
                 }));
 
@@ -4868,17 +6416,69 @@ async fn async_main(command: clap::Command) -> Result<()> {
         }
 
         #[cfg(feature = "agent-runtime")]
-        Commands::Security {
-            security_command: SecurityCommands::Status { agent, json },
-        } => {
-            let report = security_status::build_report(&config, &agent)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                security_status::print_report(&report);
+        Commands::Security { security_command } => match security_command {
+            SecurityCommands::Status { agent, json } => {
+                let report = security_status::build_report(&config, &agent)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report)?);
+                } else {
+                    security_status::print_report(&report);
+                }
+                Ok(())
             }
-            Ok(())
-        }
+            SecurityCommands::IssueClientCert {
+                name,
+                out_dir,
+                force,
+            } => issue_wss_client_cert(&config, &name, out_dir, force),
+            SecurityCommands::RevokeClientCert {
+                fingerprint,
+                device,
+            } => revoke_wss_client_cert(&config, fingerprint, device),
+            SecurityCommands::ListClientCerts { json } => list_wss_client_certs(&config, json),
+            SecurityCommands::EnrollPaircode { new, timeout_secs } => {
+                if !new {
+                    anyhow::bail!("pass --new to mint a fresh enrollment pairing code");
+                }
+                let generated = zeroclaw_runtime::enroll::request_new_paircode(
+                    &config.data_dir,
+                    std::time::Duration::from_secs(timeout_secs),
+                )
+                .await?;
+                println!(
+                    "{}",
+                    ta(
+                        "cli-enroll-pairing-code",
+                        &[("code", &generated.pairing_code)],
+                        "pairing code"
+                    )
+                );
+                println!(
+                    "{}",
+                    ta("cli-enroll-sas", &[("sas", &generated.sas)], "SAS")
+                );
+                Ok(())
+            }
+            SecurityCommands::RelayRotateNodeId => {
+                if !config.relay.node_id.trim().is_empty() {
+                    anyhow::bail!(
+                        "[relay].node_id is pinned, so the node-id is fixed and not rotatable. \
+                         Clear it to auto-mint (and enable rotation)."
+                    );
+                }
+                zeroclaw_runtime::relay::request_node_id_rotation(&config.data_dir)?;
+                let rotate_secs = 15.to_string();
+                println!(
+                    "{}",
+                    ta(
+                        "cli-relay-rotation-requested",
+                        &[("secs", &rotate_secs)],
+                        "relay node-id rotation requested"
+                    )
+                );
+                Ok(())
+            }
+        },
 
         Commands::Estop {
             estop_command,
@@ -5007,13 +6607,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }));
 
                 let cancel = tokio_util::sync::CancellationToken::new();
-                let (sop_engine, sop_audit) = if config.sop.sops_dir.is_some() {
+                let (sop_engine, sop_audit) = if config.sop.runtime_enabled() {
                     let mem: Arc<dyn zeroclaw_memory::Memory> =
                         Arc::from(zeroclaw_memory::create_memory_from_config(&config, None)?);
                     let sop_adapters = build_sop_adapters(&config);
                     let (engine, audit) = zeroclaw_runtime::sop::build_sop_engine(
                         config.sop.clone(),
                         &config.data_dir,
+                        &config.install_root_dir(),
                         mem,
                         sop_adapters,
                     );
@@ -5090,14 +6691,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
         Commands::Desktop {
             install: do_install,
         } => {
-            let download_url = "https://www.zeroclawlabs.ai/download";
+            // The marketing download page is not live; point at the GitHub
+            // releases page, which hosts the desktop download assets (.deb /
+            // .AppImage / .dmg) for the latest release.
+            let download_url = "https://github.com/zeroclaw-labs/zeroclaw/releases/latest";
 
             if do_install {
                 println!(
                     "{}",
                     t(
                         "cli-desktop-download",
-                        "Download the ZeroClaw companion app:"
+                        "Opening the ZeroClaw companion app download page:"
                     )
                 );
                 println!();
@@ -5122,7 +6726,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                         "{}",
                         t(
                             "cli-desktop-linux-pkg",
-                            "  Download the .deb or .AppImage for your architecture."
+                            "  The page provides .deb and .AppImage downloads by architecture."
                         )
                     );
                 }
@@ -5211,6 +6815,14 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     && let Ok(path) = which::which("zeroclaw-desktop")
                 {
                     found = Some(path);
+                }
+
+                // 5. Linux: an AppImage registered in the application menu is
+                //    not on PATH and has no fixed binary name, so discover it
+                //    from its desktop entry or common AppImage locations.
+                #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+                if found.is_none() {
+                    found = find_linux_desktop_app();
                 }
 
                 found
@@ -5847,6 +7459,15 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     }
                 };
 
+                // The withheld-capability notice is recorded once per config
+                // application, and the record written during startup describes
+                // the config as it was loaded. A patch that turns the section on
+                // is a new application of that setting, so the state before the
+                // ops run is captured here to tell that transition apart from a
+                // patch that leaves an already-enabled section alone.
+                #[cfg(feature = "agent-runtime")]
+                let verifiable_intent_was_enabled = config.verifiable_intent.enabled;
+
                 let mut results: Vec<serde_json::Value> = Vec::with_capacity(ops.len());
 
                 for (idx, op) in ops.iter().enumerate() {
@@ -6113,6 +7734,18 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 }
                 Box::pin(config.save_dirty()).await?;
 
+                // Report the withheld tool when this patch is what enabled the
+                // section. The helper returns early while it stays disabled, so
+                // the guard is only about the already-enabled case: the startup
+                // call has recorded that one for this process, and recording it
+                // again here would restore the second copy this command used to
+                // write. The trace sink was installed before the command
+                // dispatched, so the record has somewhere to go.
+                #[cfg(feature = "agent-runtime")]
+                if !verifiable_intent_was_enabled {
+                    warn_verifiable_intent_withheld(&config);
+                }
+
                 if json {
                     let body = serde_json::json!({"saved": true, "results": results});
                     println!("{}", serde_json::to_string_pretty(&body)?);
@@ -6295,6 +7928,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                 let mut host = plugin_host_with_configured_security(&config)?;
                 if plugin_registry::is_local_plugin_source(&source) {
                     let name = host.install(&source)?;
+                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6303,7 +7937,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
                 } else {
                     let registry_url = plugin_registry::registry_url(registry.as_deref());
                     println!(
@@ -6322,6 +7956,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                     .await?;
                     let plugin_dir = downloaded.plugin_dir().display().to_string();
                     let name = host.install(&plugin_dir)?;
+                    let config_entries = installed_plugin_config_entries(&host, &name)?;
                     println!(
                         "{}",
                         ta(
@@ -6333,7 +7968,7 @@ async fn async_main(command: clap::Command) -> Result<()> {
                             "Plugin installed"
                         )
                     );
-                    Box::pin(seed_plugin_config_entry(&mut config, &name)).await?;
+                    Box::pin(seed_plugin_config_entries(&mut config, &config_entries)).await?;
                 }
                 Ok(())
             }
@@ -6380,6 +8015,17 @@ async fn async_main(command: clap::Command) -> Result<()> {
                                 "Permissions"
                             )
                         );
+                        for (capability, key) in installed_plugin_config_entries(&host, &info.name)?
+                        {
+                            println!(
+                                "{}",
+                                ta(
+                                    "cli-plugin-config-entry-key",
+                                    &[("capability", &format!("{capability:?}")), ("key", &key),],
+                                    "Config entry key"
+                                )
+                            );
+                        }
                         match &info.wasm_path {
                             Some(path) => println!(
                                 "{}",
@@ -6884,7 +8530,7 @@ async fn sop_admin_request(cmd: SopCommands, config: &crate::config::Config) -> 
             .await
         }
         // List/Validate/Show are dispatched on the local synchronous path.
-        _ => unreachable!("local SOP verbs are handled by sop::handle_command"),
+        _ => anyhow::bail!("local SOP verb reached the gateway dispatch path"),
     }
 }
 
@@ -7707,7 +9353,21 @@ fn warn_verifiable_intent_withheld(config: &Config) {
     ::zeroclaw_log::record!(
         WARN,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+            // Operator-facing posture notice, not runtime bookkeeping. An event
+            // with no category stores as `internal`, and the dashboard Logs view
+            // hides that category by default, so an uncategorised notice is
+            // absent from the history an operator actually reads.
+            .with_category(::zeroclaw_log::EventCategory::System)
+            // The config surface reports this same fact as a structured
+            // warning. Carrying its code and path here is what lets an operator
+            // correlate the two rather than read them as separate problems;
+            // `with_attrs` persists them to the trace and serves them from the
+            // logs API, which the ephemeral variant would not.
+            .with_attrs(::serde_json::json!({
+                "code": ::zeroclaw_config::validation_warnings::VERIFIABLE_INTENT_TOOL_WITHHELD,
+                "path": "verifiable_intent.enabled",
+            })),
         "verifiable_intent: vi_verify is not registered as a model-callable tool because no credential chain verifier exists yet (see #9328)"
     );
 }
@@ -8282,6 +9942,524 @@ mod tests {
     use clap::{CommandFactory, Parser};
     use std::net::TcpListener;
 
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_reads_appimage_from_entry() {
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/home/user/Applications/ZeroClaw-x86_64.AppImage %U\n\
+             Icon=zeroclaw\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(entry).as_deref(),
+            Some("/home/user/Applications/ZeroClaw-x86_64.AppImage")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_ignores_unrelated_entry() {
+        let entry = "[Desktop Entry]\n\
+             Name=Some Other App\n\
+             Exec=/usr/bin/other %F\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(entry), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_rejects_substring_lookalike() {
+        // Identity is the visible Name, not any field containing "zeroclaw":
+        // an unrelated entry whose Exec merely mentions the substring must not
+        // qualify, otherwise it could preempt the real companion app.
+        let entry = "[Desktop Entry]\n\
+             Name=Unrelated App\n\
+             Exec=/tmp/not-zeroclaw-helper %U\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(entry), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_keeps_quoted_path_with_spaces() {
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=\"/home/user/My Applications/ZeroClaw-x86_64.AppImage\" %U\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(entry).as_deref(),
+            Some("/home/user/My Applications/ZeroClaw-x86_64.AppImage")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_rejects_unquoted_reserved_and_escaped_space() {
+        // Per the Desktop Entry spec a space (a reserved character) must be
+        // quoted; a backslash-escaped space outside quotes is malformed. The
+        // parser fails closed rather than launching a partially interpreted path.
+        let escaped_space = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/home/user/My\\ Apps/zeroclaw-desktop %U\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(escaped_space), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_decodes_quoted_literal_dollar_and_backslash() {
+        // A literal `$` in a quoted path is written `\\$` (general unescape
+        // `\\`->`\`, then the Exec layer unescapes `\$`->`$`); a literal
+        // backslash is written `\\\\`.
+        let dollar = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=\"/opt/\\\\$dir/zeroclaw-desktop\" %U\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(dollar).as_deref(),
+            Some("/opt/$dir/zeroclaw-desktop")
+        );
+        let backslash = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=\"/opt/a\\\\\\\\b/zeroclaw-desktop\"\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(backslash).as_deref(),
+            Some("/opt/a\\b/zeroclaw-desktop")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn parse_exec_program_fails_closed_on_malformed_input() {
+        // Unterminated quote.
+        assert_eq!(parse_exec_program("\"/opt/zeroclaw-desktop"), None);
+        // Dangling escape inside a quote.
+        assert_eq!(parse_exec_program("\"/opt/zeroclaw\\"), None);
+        // Dangling escape outside quotes (invalid general escape).
+        assert_eq!(parse_exec_program("/opt/zeroclaw\\"), None);
+        // A forbidden `=` in the executable token.
+        assert_eq!(parse_exec_program("/opt/a=b/zeroclaw-desktop"), None);
+        // Unquoted reserved character.
+        assert_eq!(parse_exec_program("/opt/$HOME/zeroclaw-desktop"), None);
+        // A valid bare token still parses.
+        assert_eq!(
+            parse_exec_program("zeroclaw-desktop %U").as_deref(),
+            Some("zeroclaw-desktop")
+        );
+        // The WHOLE line is validated, not just the first token:
+        // an unknown field code invalidates it.
+        assert_eq!(parse_exec_program("zeroclaw-desktop %Z"), None);
+        // Text directly adjacent to a closing quote is malformed.
+        assert_eq!(parse_exec_program("\"/opt/zeroclaw-desktop\"junk"), None);
+        // A raw (unescaped) reserved character inside quotes is malformed.
+        assert_eq!(parse_exec_program("\"/opt/$HOME/zeroclaw-desktop\""), None);
+        assert_eq!(parse_exec_program("\"/opt/`x`/zeroclaw-desktop\""), None);
+        // Known field codes and extra plain args are accepted.
+        assert_eq!(
+            parse_exec_program("zeroclaw-desktop %U --flag").as_deref(),
+            Some("zeroclaw-desktop")
+        );
+        assert_eq!(
+            parse_exec_program("zeroclaw-desktop %%").as_deref(),
+            Some("zeroclaw-desktop")
+        );
+        // A field code embedded in the PROGRAM token (not just a leading `%`)
+        // invalidates it, even though the basename would pass the AppImage-name
+        // check — both an unknown (`%Z`) and a known (`%U`) code are rejected.
+        assert_eq!(parse_exec_program("/tmp/ZeroClaw-%Z.AppImage"), None);
+        assert_eq!(parse_exec_program("/tmp/ZeroClaw-%U.AppImage"), None);
+        // A field code embedded in an ARGUMENT token (must stand alone) is
+        // rejected for both unknown and known codes.
+        assert_eq!(parse_exec_program("zeroclaw-desktop --flag=%Z"), None);
+        assert_eq!(parse_exec_program("zeroclaw-desktop --flag=%U"), None);
+        // A field code inside a quoted argument is rejected — the quote context
+        // is retained so `"%U"` cannot masquerade as a standalone field code.
+        assert_eq!(parse_exec_program("zeroclaw-desktop \"%U\""), None);
+        // An escaped literal percent embedded in a path stays valid.
+        assert_eq!(
+            parse_exec_program("/opt/zeroclaw-desktop 100%%done").as_deref(),
+            Some("/opt/zeroclaw-desktop")
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_strips_field_codes_and_quotes() {
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw Companion\n\
+             Exec=\"/opt/zeroclaw/zeroclaw-desktop\" %u\n\
+             Type=Application\n";
+        assert_eq!(
+            zeroclaw_desktop_exec(entry).as_deref(),
+            Some("/opt/zeroclaw/zeroclaw-desktop")
+        );
+        // A bare field code with no real command must not resolve.
+        let bad = "[Desktop Entry]\nName=ZeroClaw\nExec=%U\nType=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(bad), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_honours_hidden_and_group_scope() {
+        // Otherwise a fully valid ZeroClaw Application entry — it resolves only
+        // because `Hidden=true` masks it, so the fixture actually exercises the
+        // Hidden rule rather than passing on some other missing field.
+        let masked = "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=ZeroClaw\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n\
+             Hidden=true\n";
+        assert_eq!(zeroclaw_desktop_exec(masked), None);
+
+        // Only the [Desktop Entry] group is consulted. The main group is an
+        // otherwise valid ZeroClaw Application with no Name of its own, so it
+        // resolves iff a `Name=ZeroClaw` from the Desktop Action group leaks in.
+        // It must not.
+        let action_only = "[Desktop Entry]\n\
+             Type=Application\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n\
+             [Desktop Action foo]\n\
+             Name=ZeroClaw\n\
+             Exec=/tmp/evil\n";
+        assert_eq!(zeroclaw_desktop_exec(action_only), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn is_zeroclaw_name_matches_deliberate_identity() {
+        assert!(is_zeroclaw_name("ZeroClaw"));
+        assert!(is_zeroclaw_name("zeroclaw"));
+        assert!(is_zeroclaw_name("ZeroClaw Companion"));
+        assert!(is_zeroclaw_name("ZeroClaw-desktop"));
+        assert!(!is_zeroclaw_name("ZeroClawesome"));
+        assert!(!is_zeroclaw_name("Not ZeroClaw"));
+        assert!(!is_zeroclaw_name("Some Other App"));
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_honours_precedence_masking_and_executability() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        fn write_entry(dir: &Path, id: &str, exec: &Path) {
+            let apps = dir.join("applications");
+            std::fs::create_dir_all(&apps).unwrap();
+            std::fs::write(
+                apps.join(id),
+                format!(
+                    "[Desktop Entry]\nName=ZeroClaw\nExec={}\nType=Application\n",
+                    exec.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+
+        // Both are the supported `zeroclaw-desktop` binary, in separate dirs.
+        let high_bin = high.path().join("zeroclaw-desktop");
+        let low_bin = low.path().join("zeroclaw-desktop");
+        write_exec(&high_bin);
+        write_exec(&low_bin);
+
+        // Same desktop-file ID in both dirs: the higher-precedence one wins.
+        write_entry(high.path(), "ZeroClaw.desktop", &high_bin);
+        write_entry(low.path(), "ZeroClaw.desktop", &low_bin);
+
+        let dirs = [high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(
+            discover_desktop_app(&dirs).as_deref(),
+            Some(high_bin.as_path())
+        );
+
+        // A non-executable Exec target is skipped rather than returned.
+        let broken = tempfile::tempdir().unwrap();
+        let non_exec = broken.path().join("zeroclaw-desktop");
+        std::fs::write(&non_exec, "not executable").unwrap();
+        write_entry(broken.path(), "ZeroClaw.desktop", &non_exec);
+        assert_eq!(discover_desktop_app(&[broken.path().to_path_buf()]), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_skips_lookalike_ordered_before_real_app() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+
+        // A lexically earlier entry (`000...`) with a ZeroClaw Name but a
+        // lookalike executable must not preempt the real companion app.
+        let lookalike = dir.path().join("zeroclaw-helper");
+        let real = dir.path().join("zeroclaw-desktop");
+        write_exec(&lookalike);
+        write_exec(&real);
+        std::fs::write(
+            apps.join("000-lookalike.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                lookalike.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            apps.join("zzz-real.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_desktop_app(&[dir.path().to_path_buf()]).as_deref(),
+            Some(real.as_path())
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_higher_precedence_hidden_masks_lower_valid() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        fn write_entry(dir: &Path, body: &str) {
+            let apps = dir.join("applications");
+            std::fs::create_dir_all(&apps).unwrap();
+            std::fs::write(apps.join("ZeroClaw.desktop"), body).unwrap();
+        }
+
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        let low_bin = low.path().join("zeroclaw-desktop");
+        write_exec(&low_bin);
+
+        // A higher-precedence Hidden=true entry masks the same desktop-file ID in
+        // the lower directory, so the lower (valid) entry must not be launched.
+        write_entry(
+            high.path(),
+            "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec=/opt/zeroclaw/zeroclaw-desktop\nHidden=true\n",
+        );
+        write_entry(
+            low.path(),
+            &format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                low_bin.display()
+            ),
+        );
+
+        let dirs = [high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(discover_desktop_app(&dirs), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn resolve_executable_rejects_relative_path_with_separator() {
+        // A relative Exec value with a separator would be resolved by `which` against the
+        // current working directory, so it must be rejected rather than launched.
+        assert_eq!(resolve_executable("./zeroclaw-helper"), None);
+        assert_eq!(resolve_executable("../bin/zeroclaw-helper"), None);
+        assert_eq!(resolve_executable("sub/dir/zeroclaw-helper"), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn collect_desktop_entries_does_not_follow_directory_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+        std::fs::write(
+            apps.join("ZeroClaw.desktop"),
+            "[Desktop Entry]\nName=ZeroClaw\nExec=/usr/bin/zeroclaw\nType=Application\n",
+        )
+        .unwrap();
+        // A directory symlink pointing back at its own parent would recurse forever if
+        // followed. The scan must treat it as a non-directory and terminate.
+        std::os::unix::fs::symlink(&apps, apps.join("loop")).unwrap();
+
+        let mut out: Vec<(String, PathBuf)> = Vec::new();
+        let mut visited: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+        collect_desktop_entries(&apps, &apps, &mut out, &mut visited);
+
+        // Terminates (no infinite loop) and collects only the real entry.
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "ZeroClaw.desktop");
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_skips_special_symlink_and_oversized_entries() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let apps = dir.path().join("applications");
+        std::fs::create_dir_all(&apps).unwrap();
+
+        let fifo = apps.join("000-fifo.desktop");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo_name` is a live, NUL-terminated pathname and the mode is
+        // a valid permission bitmask. The return value is checked immediately.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_desktop_entry(&fifo), None);
+
+        let fifo_link = apps.join("001-fifo-link.desktop");
+        std::os::unix::fs::symlink(&fifo, &fifo_link).unwrap();
+        assert_eq!(read_desktop_entry(&fifo_link), None);
+
+        let oversized = apps.join("002-oversized.desktop");
+        let oversized_len = usize::try_from(DESKTOP_ENTRY_MAX_BYTES).unwrap() + 1;
+        std::fs::write(&oversized, vec![b'x'; oversized_len]).unwrap();
+        assert_eq!(read_desktop_entry(&oversized), None);
+
+        let real = dir.path().join("zeroclaw-desktop");
+        std::fs::write(&real, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = std::fs::metadata(&real).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&real, permissions).unwrap();
+        std::fs::write(
+            apps.join("zzz-real.desktop"),
+            format!(
+                "[Desktop Entry]\nType=Application\nName=ZeroClaw\nExec={}\n",
+                real.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            discover_desktop_app(&[dir.path().to_path_buf()]).as_deref(),
+            Some(real.as_path())
+        );
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_rejects_zeroclaw_name_with_unrelated_exec() {
+        // A ZeroClaw display name paired with an unrelated executable must not
+        // resolve: identity is Type + Name + a ZeroClaw-shaped Exec target, not
+        // the display name alone. A lexically earlier entry like this must not
+        // preempt the real app.
+        let entry = "[Desktop Entry]\n\
+             Name=ZeroClaw Helper\n\
+             Exec=/tmp/unrelated %U\n\
+             Type=Application\n";
+        assert_eq!(zeroclaw_desktop_exec(entry), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn zeroclaw_desktop_exec_requires_application_type() {
+        // A non-Application entry never resolves, even with a ZeroClaw Name and
+        // a ZeroClaw executable.
+        let link = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n\
+             Type=Link\n";
+        assert_eq!(zeroclaw_desktop_exec(link), None);
+
+        // Missing Type is also rejected (the published entry always sets it).
+        let no_type = "[Desktop Entry]\n\
+             Name=ZeroClaw\n\
+             Exec=/opt/zeroclaw/zeroclaw-desktop\n";
+        assert_eq!(zeroclaw_desktop_exec(no_type), None);
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn is_zeroclaw_appimage_name_anchors_identity() {
+        // The published `ZeroClaw-*.AppImage` form (separator required).
+        assert!(is_zeroclaw_appimage_name("ZeroClaw-x86_64.AppImage"));
+        assert!(is_zeroclaw_appimage_name("zeroclaw-aarch64.appimage"));
+        // A no-boundary lookalike must not qualify.
+        assert!(!is_zeroclaw_appimage_name("ZeroClawevil.AppImage"));
+        // Missing the separator (not a published form).
+        assert!(!is_zeroclaw_appimage_name("zeroclaw.appimage"));
+        // A lookalike whose name merely contains the substring must not qualify.
+        assert!(!is_zeroclaw_appimage_name("not-zeroclaw-helper.AppImage"));
+        assert!(!is_zeroclaw_appimage_name("ZeroClaw.txt"));
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn is_zeroclaw_program_binds_to_supported_names() {
+        // Exact published binary, or a published-form AppImage.
+        assert!(is_zeroclaw_program("/usr/bin/zeroclaw-desktop"));
+        assert!(is_zeroclaw_program(
+            "/home/user/Applications/ZeroClaw-x86_64.AppImage"
+        ));
+        // Lookalikes sharing the prefix are rejected.
+        assert!(!is_zeroclaw_program("/tmp/zeroclaw-helper"));
+        assert!(!is_zeroclaw_program("/tmp/zeroclaw-evil"));
+        assert!(!is_zeroclaw_program("/usr/bin/zeroclaw"));
+    }
+
+    #[cfg(all(feature = "agent-runtime", target_os = "linux"))]
+    #[test]
+    fn discover_desktop_app_masks_nested_desktop_file_ids() {
+        use std::os::unix::fs::PermissionsExt;
+
+        fn write_exec(path: &Path) {
+            std::fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+            let mut perms = std::fs::metadata(path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(path, perms).unwrap();
+        }
+        fn write_nested_entry(dir: &Path, rel_id: &str, exec: &Path) {
+            let full = dir.join("applications").join(rel_id);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(
+                full,
+                format!(
+                    "[Desktop Entry]\nName=ZeroClaw\nExec={}\nType=Application\n",
+                    exec.display()
+                ),
+            )
+            .unwrap();
+        }
+
+        let high = tempfile::tempdir().unwrap();
+        let low = tempfile::tempdir().unwrap();
+        let high_bin = high.path().join("zeroclaw-desktop");
+        let low_bin = low.path().join("zeroclaw-desktop");
+        write_exec(&high_bin);
+        write_exec(&low_bin);
+
+        // Same nested desktop-file ID (`vendor/ZeroClaw.desktop` -> ID
+        // `vendor-ZeroClaw.desktop`) in both dirs: the higher-precedence entry
+        // must mask the lower one, which only works if IDs are derived
+        // recursively rather than from top-level basenames.
+        write_nested_entry(high.path(), "vendor/ZeroClaw.desktop", &high_bin);
+        write_nested_entry(low.path(), "vendor/ZeroClaw.desktop", &low_bin);
+
+        let dirs = [high.path().to_path_buf(), low.path().to_path_buf()];
+        assert_eq!(
+            discover_desktop_app(&dirs).as_deref(),
+            Some(high_bin.as_path())
+        );
+    }
+
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn openrc_log_writer_cli_maps_only_known_streams() {
@@ -8754,6 +10932,322 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn issue_client_cert_cleans_staged_material_when_ledger_record_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let tls_dir = config.data_dir.join("tls");
+        zeroclaw_tls::ensure_server_materials(&tls_dir, &[]).expect("daemon TLS materials");
+        std::fs::create_dir(tls_dir.join("ledger.db")).expect("poison ledger path");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ledger"), "got: {err}");
+        assert!(!out.path().join("client-dev_under_test.crt").exists());
+        assert!(!out.path().join("client-dev_under_test.key").exists());
+        assert!(!out.path().join(".client-dev_under_test.crt.tmp").exists());
+        assert!(!out.path().join(".client-dev_under_test.key.tmp").exists());
+    }
+
+    /// `delivered_at` for a fingerprint, straight from the ledger table. The
+    /// ledger exposes no reader for it (nothing in production asks), so the
+    /// operator-CLI test reads SQLite directly.
+    #[cfg(feature = "agent-runtime")]
+    fn cert_delivered_at(data_dir: &std::path::Path, fingerprint: &str) -> Option<i64> {
+        let conn = rusqlite::Connection::open(data_dir.join("tls").join("ledger.db")).unwrap();
+        conn.query_row(
+            "SELECT delivered_at FROM issued_certs WHERE fingerprint = ?1",
+            rusqlite::params![fingerprint],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// The operator CLI's publication boundary, which is the most direct of the
+    /// three: `issue-client-cert` records the issuance and only then renames
+    /// the staged key and certificate into place. A rename that fails leaves an
+    /// ACTIVE ledger row for a credential that was never published, and a retry
+    /// used to add a SECOND active row for the same device rather than
+    /// replacing the first.
+    /// The drop-in copies into --out-dir are operator-facing credentials, not
+    /// cosmetic output: a failure there must fail the command rather than
+    /// report a successful issuance over a missing or stale ca.crt.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn issue_client_cert_out_dir_drop_in_failure_fails_the_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        zeroclaw_tls::ensure_server_materials(&config.data_dir.join("tls"), &[])
+            .expect("daemon TLS materials");
+
+        // Obstruct the drop-in ca.crt with a non-empty directory so the copy
+        // fails after the primary named files were published.
+        let ca_dest = out.path().join("ca.crt");
+        std::fs::create_dir(&ca_dest).expect("obstruct ca.crt");
+        std::fs::write(ca_dest.join("occupied"), b"x").expect("occupy it");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_dropin_test",
+            Some(out.path().to_path_buf()),
+            true,
+        )
+        .expect_err("an incomplete drop-in directory must fail the command")
+        .to_string();
+        assert!(
+            err.contains("ca.crt") && err.contains("drop-in"),
+            "the error must name the drop-in file and directory: {err}"
+        );
+        assert!(
+            err.contains("issued"),
+            "the error must say the primary credentials were still issued: {err}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn issue_client_cert_rename_failure_leaves_an_undelivered_row_that_reconciles_away() {
+        use zeroclaw_runtime::security::cert_ledger::{CertLedger, CertStatus, revoked_list_path};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = tempfile::tempdir().expect("out tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        zeroclaw_tls::ensure_server_materials(&config.data_dir.join("tls"), &[])
+            .expect("daemon TLS materials");
+
+        // Make the publication rename fail the way a real filesystem does:
+        // the destination is a non-empty directory, so renaming a file onto it
+        // cannot succeed. `--force` gets past the "already exists" guard, which
+        // is exactly how an operator re-issuing over a broken layout arrives
+        // here.
+        let key_dest = out.path().join("client-dev_under_test.key");
+        std::fs::create_dir(&key_dest).expect("obstruct the key destination");
+        std::fs::write(key_dest.join("occupied"), b"x").expect("occupy it");
+
+        let err = issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            true,
+        )
+        .expect_err("an unpublishable certificate must fail the command")
+        .to_string();
+        assert!(
+            err.contains("publish private key"),
+            "the error must say publication failed: {err}"
+        );
+        assert!(
+            err.contains(".client-dev_under_test.key.tmp"),
+            "the error must name the STAGED file, not only the destination: {err}"
+        );
+        // Staged material is not left lying around as a stray private key.
+        assert!(!out.path().join(".client-dev_under_test.key.tmp").exists());
+        assert!(!out.path().join(".client-dev_under_test.crt.tmp").exists());
+
+        // The row is active - promotion happens before publication by design -
+        // but undelivered, because the rename never succeeded.
+        let ghost = {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("open ledger");
+            let active = ledger.list_active().expect("list active");
+            assert_eq!(
+                active.len(),
+                1,
+                "the issuance was recorded before publishing"
+            );
+            active[0].fingerprint.clone()
+        };
+        assert_eq!(
+            cert_delivered_at(&config.data_dir, &ghost),
+            None,
+            "a failed rename must not mark the certificate delivered"
+        );
+
+        // Once the delivery deadline passes, the next ledger open revokes it.
+        {
+            let conn =
+                rusqlite::Connection::open(config.data_dir.join("tls").join("ledger.db")).unwrap();
+            conn.execute(
+                "UPDATE issued_certs SET issued_at = issued_at - 7200 WHERE fingerprint = ?1",
+                rusqlite::params![ghost],
+            )
+            .unwrap();
+        }
+        {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+            assert_eq!(
+                ledger.status_of(&ghost).expect("status"),
+                Some(CertStatus::Revoked),
+                "an unpublished certificate must be reconciled to revoked"
+            );
+        }
+        let crl = std::fs::read_to_string(revoked_list_path(&config.data_dir)).expect("read crl");
+        assert!(
+            crl.lines().any(|l| l == ghost),
+            "the reconciled revocation must reach the verifier's file, got: {crl:?}"
+        );
+
+        // The retry - the operator clears the obstruction and re-issues - must
+        // end with exactly ONE usable credential, not two.
+        std::fs::remove_dir_all(&key_dest).expect("clear the obstruction");
+        issue_wss_client_cert(
+            &config,
+            "dev_under_test",
+            Some(out.path().to_path_buf()),
+            true,
+        )
+        .expect("the retry must publish");
+
+        let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+        let active = ledger.list_active().expect("list active");
+        assert_eq!(
+            active.len(),
+            1,
+            "the retry must not leave a second active row for the same device, got: {:?}",
+            active.iter().map(|e| &e.fingerprint).collect::<Vec<_>>()
+        );
+        let published = active[0].fingerprint.clone();
+        assert_ne!(published, ghost, "the retry mints a fresh certificate");
+        assert!(
+            cert_delivered_at(&config.data_dir, &published).is_some(),
+            "a published certificate must be recorded as delivered"
+        );
+        assert_eq!(
+            ledger.status_of(&ghost).expect("status"),
+            Some(CertStatus::Revoked),
+            "the first attempt stays revoked - not duplicated into a second active row"
+        );
+        // And the files the operator asked for are actually there.
+        assert!(out.path().join("client-dev_under_test.crt").is_file());
+        assert!(out.path().join("client-dev_under_test.key").is_file());
+    }
+
+    /// Operator revocation through the `revoke-client-cert` handler writes the
+    /// fingerprint into `<data_dir>/tls/revoked` - the exact file the WSS
+    /// verifier reads - so a revoked cert is refused at the next handshake (A5).
+    /// Guards the production trigger for revocation (the path the ledger revoke
+    /// API exposes but nothing operator-facing reached before this command).
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn revoke_client_cert_handler_materializes_the_revoked_file() {
+        use zeroclaw_runtime::security::cert_ledger::{
+            CertLedger, CertStatus, IssuanceActor, LedgerEntry, revoked_list_path,
+        };
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Config {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let fp = "ab".repeat(32); // 64-hex fingerprint
+        {
+            let ledger = CertLedger::open(&config.data_dir, None).expect("open ledger");
+            ledger
+                .record_issued(
+                    &LedgerEntry {
+                        device_id: "dev_under_test".to_string(),
+                        fingerprint: fp.clone(),
+                        not_before: 0,
+                        not_after: i64::MAX,
+                        status: CertStatus::Active,
+                        token_hash: String::new(),
+                        actor: IssuanceActor::Operator.label(),
+                        issued_at: 0,
+                    },
+                    false,
+                )
+                .expect("record issued");
+        }
+
+        // The operator command revokes by fingerprint.
+        revoke_wss_client_cert(&config, Some(fp.clone()), None).expect("revoke");
+
+        // The verifier's input file now lists the fingerprint, and the ledger
+        // reflects the revocation.
+        let revoked = std::fs::read_to_string(revoked_list_path(&config.data_dir))
+            .expect("read revoked file");
+        assert!(
+            revoked.lines().any(|l| l == fp),
+            "revoked file must list the revoked fingerprint, got: {revoked:?}"
+        );
+        let ledger = CertLedger::open(&config.data_dir, None).expect("reopen ledger");
+        assert_eq!(
+            ledger.status_of(&fp).expect("status"),
+            Some(CertStatus::Revoked)
+        );
+    }
+
+    /// `revoke-client-cert` requires exactly one of --fingerprint / --device,
+    /// and `list-client-certs` parses.
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn revoke_and_list_client_cert_cli_parsing() {
+        // Neither selector -> rejected.
+        assert!(Cli::try_parse_from(["zeroclaw", "security", "revoke-client-cert"]).is_err());
+        // Both selectors -> rejected (mutually exclusive).
+        assert!(
+            Cli::try_parse_from([
+                "zeroclaw",
+                "security",
+                "revoke-client-cert",
+                "--fingerprint",
+                "ab",
+                "--device",
+                "d",
+            ])
+            .is_err()
+        );
+        // Exactly one selector -> parses.
+        let cli = Cli::try_parse_from([
+            "zeroclaw",
+            "security",
+            "revoke-client-cert",
+            "--fingerprint",
+            "abcd",
+        ])
+        .expect("single selector parses");
+        match cli.command {
+            Commands::Security {
+                security_command:
+                    SecurityCommands::RevokeClientCert {
+                        fingerprint,
+                        device,
+                    },
+            } => {
+                assert_eq!(fingerprint.as_deref(), Some("abcd"));
+                assert!(device.is_none());
+            }
+            other => panic!("expected revoke-client-cert, got {other:?}"),
+        }
+        // list-client-certs parses with --json.
+        let cli = Cli::try_parse_from(["zeroclaw", "security", "list-client-certs", "--json"])
+            .expect("list parses");
+        assert!(matches!(
+            cli.command,
+            Commands::Security {
+                security_command: SecurityCommands::ListClientCerts { json: true }
+            }
+        ));
+    }
+
+    /// `--rotate` parses and is mutually exclusive with `--new` and
+    /// `--rotate-device` so the destructive path cannot be silently combined
+    /// with "add another client".
     #[test]
     #[cfg(feature = "agent-runtime")]
     fn gateway_get_paircode_rotate_flags_parse_and_conflict() {
@@ -9418,6 +11912,31 @@ mod tests {
                 .iter_entries()
                 .any(|(family, alias, _)| family == "openai" && alias == "alloy"),
             "tts alias should resolve after materialization"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "agent-runtime")]
+    fn config_set_materializes_first_dynamic_secret_map_entry() {
+        let mut config = Config::default();
+        let path = "providers.models.openai.fresh.extra_headers.X-Foo";
+
+        let created = ensure_map_key_for_prop_path(&mut config, path)
+            .expect("known dynamic secret-map path should materialize");
+
+        assert!(created, "missing provider alias should be created");
+        config
+            .set_prop_persistent(path, "bar")
+            .expect("first dynamic secret-map entry should be writable");
+        assert_eq!(
+            config
+                .providers
+                .models
+                .openai
+                .get("fresh")
+                .and_then(|provider| provider.base.extra_headers.get("X-Foo"))
+                .map(String::as_str),
+            Some("bar")
         );
     }
 

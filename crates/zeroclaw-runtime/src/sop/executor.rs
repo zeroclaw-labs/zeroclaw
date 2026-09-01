@@ -114,14 +114,17 @@ pub(crate) fn drain_step_calls(sink: &StepCallSink) -> Vec<StepToolCall> {
 }
 
 /// Queue a live action when the current tool call is running inside an agent
-/// turn. Only `ExecuteStep` actions are queued; all other variants are already
-/// terminal or blocked.
+/// turn. Agent and deterministic execution actions need a driver; all other
+/// variants are already terminal or blocked.
 pub(crate) fn enqueue_live_action(
     engine: Arc<Mutex<SopEngine>>,
     audit: Option<Arc<SopAuditLogger>>,
     action: &SopRunAction,
 ) {
-    if !matches!(action, SopRunAction::ExecuteStep { .. }) {
+    if !matches!(
+        action,
+        SopRunAction::ExecuteStep { .. } | SopRunAction::DeterministicStep { .. }
+    ) {
         return;
     }
 
@@ -148,7 +151,76 @@ pub(crate) fn drain_live_actions(queue: &LiveActionQueue) -> Vec<QueuedSopAction
 
 /// Upper bound on steps a single headless drive may execute, so a routing
 /// cycle can never pin a background task forever.
-const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
+pub(crate) const MAX_HEADLESS_DRIVE_STEPS: usize = 128;
+
+/// Terminalize a run whose driver consumed `MAX_HEADLESS_DRIVE_STEPS`, and log
+/// the outcome. Shared by every driver — the two headless ones here and the
+/// live agent turn — so all three agree on the bound and on who owns the
+/// durable failure when it is hit.
+pub(crate) fn fail_exhausted_step_budget(engine: &Arc<Mutex<SopEngine>>, run_id: &str) {
+    let terminal = {
+        let mut guard = match engine.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.fail_headless_step_budget(run_id)
+    };
+    match terminal {
+        Ok(_) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({"run_id": run_id})),
+            "SOP driver: step budget exhausted; run failed"
+        ),
+        Err(e) => ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                .with_attrs(::serde_json::json!({
+                    "run_id": run_id,
+                    "error": e.to_string(),
+                })),
+            "SOP driver: failed to persist step-budget terminal state"
+        ),
+    }
+}
+
+/// Drive deterministic actions through a shared engine without retaining its
+/// mutex across step boundaries.
+pub(crate) async fn drive_shared_deterministic_run(
+    engine: &Arc<Mutex<SopEngine>>,
+    first_action: SopRunAction,
+) -> Result<SopRunAction> {
+    let mut action = first_action;
+    for _ in 0..MAX_HEADLESS_DRIVE_STEPS {
+        let run_id = match &action {
+            SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            terminal => return Ok(terminal.clone()),
+        };
+        let next = {
+            let mut guard = match engine.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.advance_headless_deterministic_step(&run_id, action)?
+        };
+        if !matches!(next, SopRunAction::DeterministicStep { .. }) {
+            return Ok(next);
+        }
+        action = next;
+        tokio::task::yield_now().await;
+    }
+    let run_id = match action {
+        SopRunAction::DeterministicStep { run_id, .. } => run_id,
+        terminal => return Ok(terminal),
+    };
+    let mut guard = match engine.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.fail_headless_step_budget(&run_id)
+}
 
 /// Spawn a background task that drives a resumed SOP action to its next
 /// blocking or terminal state. Gate-clearing surfaces without an ambient agent
@@ -202,6 +274,36 @@ async fn drive_headless_run(
                 step,
                 context,
             } => {
+                let cancel_at_boundary = {
+                    let mut guard = match engine.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    guard.finish_requested_cancellation(&run_id)
+                };
+                match cancel_at_boundary {
+                    Ok(Some(cancelled)) => {
+                        action = cancelled;
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "run_id": run_id,
+                                "error": e.to_string(),
+                            })),
+                            "SOP headless driver: failed to finish requested cancellation"
+                        );
+                        return;
+                    }
+                }
                 let agent_alias = step
                     .agent
                     .clone()
@@ -284,21 +386,14 @@ async fn drive_headless_run(
                         Ok(g) => g,
                         Err(poisoned) => poisoned.into_inner(),
                     };
-                    guard.drive_headless_deterministic(&run_id, action)
+                    guard.advance_headless_deterministic_step(&run_id, action)
                 };
                 match next {
-                    Ok(SopRunAction::DeterministicStep { .. }) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(
-                                module_path!(),
-                                ::zeroclaw_log::Action::Note
-                            )
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"run_id": run_id})),
-                            "SOP headless driver: deterministic drive made no progress"
-                        );
-                        return;
+                    Ok(next @ SopRunAction::DeterministicStep { .. }) => {
+                        action = next;
+                        // Give a waiting cancel request a scheduling point before
+                        // this task attempts to reacquire the shared engine lock.
+                        tokio::task::yield_now().await;
                     }
                     Ok(next) => action = next,
                     Err(e) => {
@@ -362,6 +457,18 @@ async fn drive_headless_run(
                 );
                 return;
             }
+            SopRunAction::Cancelled { run_id, sop_name } => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Cancel)
+                        .with_attrs(::serde_json::json!({
+                            "run_id": run_id,
+                            "sop_name": sop_name,
+                        })),
+                    "SOP headless driver: run cancelled"
+                );
+                return;
+            }
             SopRunAction::Failed {
                 run_id,
                 sop_name,
@@ -382,12 +489,12 @@ async fn drive_headless_run(
             }
         }
     }
-    ::zeroclaw_log::record!(
-        WARN,
-        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-        "SOP headless driver: step budget exhausted; leaving run in place"
-    );
+    let run_id = match &action {
+        SopRunAction::ExecuteStep { run_id, .. }
+        | SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+        _ => return,
+    };
+    fail_exhausted_step_budget(&engine, &run_id);
 }
 
 pub(crate) fn advance_sop_step(
@@ -401,10 +508,14 @@ pub(crate) fn advance_sop_step(
     let action = engine
         .advance_step(run_id, result)
         .with_context(|| format!("failed to advance SOP run {run_id}"))?;
+    // `Cancelled` is as terminal as `Completed` / `Failed`: omitting it here means
+    // `audit_sop_step` never reaches `log_run_complete`, so a boundary cancellation
+    // leaves the in-memory audit record showing `Running` while the durable run and
+    // the engine metrics are already terminal.
     let finished_run = match &action {
-        SopRunAction::Completed { run_id, .. } | SopRunAction::Failed { run_id, .. } => {
-            engine.get_run(run_id).cloned()
-        }
+        SopRunAction::Completed { run_id, .. }
+        | SopRunAction::Failed { run_id, .. }
+        | SopRunAction::Cancelled { run_id, .. } => engine.get_run(run_id).cloned(),
         _ => None,
     };
     Ok((action, finished_run))
@@ -445,9 +556,10 @@ pub(crate) async fn audit_sop_step(
 mod tests {
     use super::*;
     use crate::sop::metrics::SopMetricsCollector;
+    use crate::sop::store::{InMemoryRunStore, SopRunStore};
     use crate::sop::types::{
-        Sop, SopEvent, SopExecutionMode, SopPriority, SopStep, SopStepResult, SopStepStatus,
-        SopTrigger, SopTriggerSource,
+        Sop, SopEvent, SopExecutionMode, SopPriority, SopRunStatus, SopStep, SopStepKind,
+        SopStepResult, SopStepStatus, SopTrigger, SopTriggerSource,
     };
     use serde_json::json;
     use zeroclaw_config::schema::SopConfig;
@@ -492,6 +604,66 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn shared_deterministic_budget_exhaustion_fails_run_and_releases_claim() {
+        let store = Arc::new(InMemoryRunStore::new());
+        let sop_name = "deterministic-loop";
+        let sop = Sop {
+            name: sop_name.to_string(),
+            description: "bounded deterministic loop".to_string(),
+            version: "0.1.0".to_string(),
+            priority: SopPriority::Normal,
+            execution_mode: SopExecutionMode::Deterministic,
+            triggers: vec![SopTrigger::Manual],
+            steps: vec![SopStep {
+                number: 1,
+                title: "Loop".to_string(),
+                kind: SopStepKind::Capability,
+                capability: Some("noop".to_string()),
+                routing: crate::sop::StepRouting {
+                    next: Some(1),
+                    ..Default::default()
+                },
+                ..SopStep::default()
+            }],
+            cooldown_secs: 0,
+            max_concurrent: 1,
+            location: None,
+            deterministic: true,
+            admission_policy: crate::sop::types::SopAdmissionPolicy::Parallel,
+            max_pending_approvals: 0,
+            agent: None,
+        };
+        let store_for_engine: Arc<dyn SopRunStore> = store.clone();
+        let mut engine = SopEngine::new(SopConfig::default()).with_store(store_for_engine);
+        engine.set_sops_for_test(vec![sop]);
+        let first_action = engine.start_run(sop_name, manual_event()).unwrap();
+        let run_id = match &first_action {
+            SopRunAction::DeterministicStep { run_id, .. } => run_id.clone(),
+            other => panic!("expected deterministic step, got {other:?}"),
+        };
+        let engine = Arc::new(Mutex::new(engine));
+
+        let terminal = drive_shared_deterministic_run(&engine, first_action)
+            .await
+            .expect("budget exhaustion should persist a terminal failure");
+
+        assert!(matches!(
+            terminal,
+            SopRunAction::Failed { ref reason, .. }
+                if reason == "SOP headless driver step budget exhausted"
+        ));
+        let guard = engine.lock().unwrap();
+        assert_eq!(guard.get_run(&run_id).unwrap().status, SopRunStatus::Failed);
+        assert!(!guard.active_runs().contains_key(&run_id));
+        drop(guard);
+        assert_eq!(
+            store.claim_counts(sop_name).unwrap(),
+            (0, 0),
+            "terminal budget failure must free the run's concurrency claim"
+        );
+    }
+
     #[test]
     fn live_executor_records_terminal_metrics_once() {
         let collector = SopMetricsCollector::shared();
@@ -527,6 +699,67 @@ mod tests {
         assert_eq!(
             collector.get_metric_value("sop.live-once.runs_completed"),
             Some(json!(1u64))
+        );
+    }
+
+    /// Regression guard: a run cancelled at a step boundary
+    /// must be reported as a finished run, so `audit_sop_step` reaches
+    /// `log_run_complete`. `advance_sop_step` previously captured `finished_run`
+    /// only for `Completed` and `Failed`, leaving the in-memory audit record at
+    /// `Running` while the durable run and the engine metrics were already terminal.
+    #[test]
+    fn boundary_cancellation_reports_a_finished_run_for_the_audit_projection() {
+        let mut engine = SopEngine::new(SopConfig::default());
+        engine.set_sops_for_test(vec![test_sop("cancel-at-boundary")]);
+        let action = engine
+            .start_run("cancel-at-boundary", manual_event())
+            .unwrap();
+        let run_id = extract_run_id(&action);
+
+        // Operator Stop on a Running run: durable CancelRequested, run retained and
+        // still claimed until the driver reaches a safe boundary.
+        let outcome = engine
+            .cancel_run_idempotent(
+                &run_id,
+                Some("operator requested stop".to_string()),
+                Some("gateway:operator".to_string()),
+            )
+            .unwrap();
+        assert!(
+            matches!(outcome, Some(crate::sop::engine::CancelOutcome::Requested)),
+            "a Running run must enter CancelRequested rather than terminalizing immediately"
+        );
+
+        let engine = Arc::new(Mutex::new(engine));
+        // The driver reaches the next step boundary and finalizes the cancellation.
+        let (action, finished_run) = advance_sop_step(
+            &engine,
+            &run_id,
+            SopStepResult {
+                effective_agent: None,
+                step_number: 1,
+                status: SopStepStatus::Completed,
+                output: "ok".to_string(),
+                started_at: "2026-06-28T00:00:00Z".to_string(),
+                completed_at: Some("2026-06-28T00:00:01Z".to_string()),
+                tool_calls: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(action, SopRunAction::Cancelled { .. }),
+            "the boundary must finalize the requested cancellation, got {action:?}"
+        );
+        let finished = finished_run.expect(
+            "a boundary cancellation must surface the finished run so the audit \
+             projection can log run completion",
+        );
+        assert_eq!(finished.run_id, run_id);
+        assert_eq!(
+            finished.status,
+            SopRunStatus::Cancelled,
+            "the audited run must carry the terminal Cancelled status"
         );
     }
 

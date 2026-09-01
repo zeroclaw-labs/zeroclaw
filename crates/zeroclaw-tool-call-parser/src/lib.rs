@@ -2,6 +2,7 @@
 
 use regex::Regex;
 use std::{collections::HashSet, sync::LazyLock};
+pub use zeroclaw_api::model_provider::strip_think_tags;
 
 /// A single parsed tool call extracted from LLM output.
 #[derive(Debug, Clone)]
@@ -31,6 +32,64 @@ fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
         None => serde_json::Value::Object(serde_json::Map::new()),
     };
     unwrap_nested_json_strings(initial)
+}
+
+/// Canonical vocabulary of terminal markers emitted by providers that must be
+/// stripped from final response text. This is the single source of truth for
+/// the marker vocabulary, shared by the non-streaming
+/// [`strip_trailing_terminal_markers`] helper and the streaming state machine
+/// (`zeroclaw-runtime`'s `StreamTerminalMarkerStripper`) so a vocabulary or
+/// matching-rule change cannot drift one path.
+///
+/// Order matters: longer spellings must precede shorter ones so a suffix check
+/// matches the most specific marker first.
+pub const TERMINAL_MARKERS: [&str; 2] = ["<|eom|>", "<eom>"];
+
+/// Strip trailing terminal markers (`<eom>`, `<|eom|>`) from a response string.
+/// Handles stacked markers with arbitrary whitespace between them.
+///
+/// Terminal markers are protocol metadata that should not appear in user-visible text.
+/// This function iteratively removes trailing markers and whitespace until none remain.
+///
+/// # Examples
+///
+/// ```
+/// use zeroclaw_tool_call_parser::strip_trailing_terminal_markers;
+///
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<|eom|>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom><|eom|>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>  \n"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Summary<eom>           <|eom|>"), "Summary");
+/// assert_eq!(strip_trailing_terminal_markers("Text with <eom> inline"), "Text with <eom> inline");
+/// ```
+pub fn strip_trailing_terminal_markers(text: &str) -> String {
+    let mut result = text.to_string();
+
+    loop {
+        // Look for a recognized marker at the end of the trailing-whitespace-
+        // trimmed tail. When the trimmed tail ends in a marker, remove the
+        // marker AND the whitespace that followed it (the marker suffix).
+        // Whitespace BEFORE the marker belongs to the response text and is
+        // preserved — this matches the streaming stripper, which keeps e.g.
+        // `"Answer\n<eom>"` as `"Answer\n"`. If no marker is found, unmarked
+        // trailing whitespace (e.g. `"Answer\n"`) is ordinary text and is
+        // preserved too, so the two paths share one policy.
+        let trimmed = result.trim_end();
+        let mut stripped = false;
+        for marker in TERMINAL_MARKERS {
+            if let Some(prefix) = trimmed.strip_suffix(marker) {
+                result = prefix.to_string();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+
+    result
 }
 
 /// Recursively unwrap stringified JSON objects/arrays nested inside tool arguments.
@@ -800,8 +859,14 @@ fn extract_xml_pairs(input: &str) -> Vec<(&str, &str)> {
     let mut results = Vec::new();
     let mut search_start = 0;
     while let Some(open_cap) = XML_OPEN_TAG_RE.captures(&input[search_start..]) {
-        let full_open = open_cap.get(0).unwrap();
-        let tag_name = open_cap.get(1).unwrap().as_str();
+        let Some(full_open) = open_cap.get(0) else {
+            break;
+        };
+        let Some(tag_name) = open_cap.get(1) else {
+            search_start += full_open.end();
+            continue;
+        };
+        let tag_name = tag_name.as_str();
         let open_end = search_start + full_open.end();
 
         let closing_tag = format!("</{tag_name}>");
@@ -2285,7 +2350,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut last_end = 0;
 
         for cap in MD_TOOL_CALL_RE.captures_iter(response) {
-            let full_match = cap.get(0).unwrap();
+            let Some(full_match) = cap.get(0) else {
+                continue;
+            };
             // Range-aware: a fence that OPENS before a refused span and runs
             // through it must be refused too, not just one that starts inside.
             if range_hits_rejected_span(&rejected_tools_spans, full_match.start(), full_match.end())
@@ -2331,7 +2398,9 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
         let mut last_end = 0;
 
         for cap in MD_TOOL_NAME_RE.captures_iter(response) {
-            let full_match = cap.get(0).unwrap();
+            let Some(full_match) = cap.get(0) else {
+                continue;
+            };
             // Range-aware: a fence that OPENS before a refused span and runs
             // through it must be refused too, not just one that starts inside.
             if range_hits_rejected_span(&rejected_tools_spans, full_match.start(), full_match.end())
@@ -2501,30 +2570,6 @@ pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     (text_parts.join("\n"), calls)
 }
 
-/// Remove `<think>...</think>` blocks from model output.
-/// Qwen and other reasoning models embed chain-of-thought inline in the
-/// response text using `<think>` tags.  These must be removed before parsing
-/// tool-call tags or displaying output.
-pub fn strip_think_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
-    loop {
-        if let Some(start) = rest.find("<think>") {
-            result.push_str(&rest[..start]);
-            if let Some(end) = rest[start..].find("</think>") {
-                rest = &rest[start + end + "</think>".len()..];
-            } else {
-                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
-                break;
-            }
-        } else {
-            result.push_str(rest);
-            break;
-        }
-    }
-    result.trim().to_string()
-}
-
 /// Strip prompt-guided tool artifacts from visible output while preserving
 /// raw model text in history for future turns.
 pub fn strip_tool_result_blocks(text: &str) -> String {
@@ -2668,8 +2713,10 @@ pub fn build_native_assistant_history_from_parsed_calls(
         "tool_calls": calls_json,
     });
 
-    if let Some(rc) = reasoning_content {
-        obj.as_object_mut().unwrap().insert(
+    if let Some(rc) = reasoning_content
+        && let Some(obj) = obj.as_object_mut()
+    {
+        obj.insert(
             "reasoning_content".to_string(),
             serde_json::Value::String(rc.to_string()),
         );
@@ -3752,7 +3799,10 @@ Done."#;
                     .get("attributes")
                     .and_then(|attributes| attributes.get("_file"))
                     .and_then(|value| value.as_str())
-                    .is_some_and(|file| file.ends_with("zeroclaw-tool-call-parser/src/lib.rs"));
+                    .is_some_and(|file| {
+                        file.replace('\\', "/")
+                            .ends_with("zeroclaw-tool-call-parser/src/lib.rs")
+                    });
                 if matches_message && matches_source {
                     break 'search event;
                 }
@@ -5341,5 +5391,96 @@ Let me check the result."#;
         assert_eq!(default_param_for_tool("http_request"), "url");
         assert_eq!(default_param_for_tool("browser_open"), "url");
         assert_eq!(default_param_for_tool("unknown_tool"), "input");
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_basic() {
+        assert_eq!(strip_trailing_terminal_markers("Summary<eom>"), "Summary");
+        assert_eq!(strip_trailing_terminal_markers("Summary<|eom|>"), "Summary");
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_preserves_unmarked_whitespace() {
+        // No marker present: trailing whitespace is ordinary text and must be
+        // preserved, matching the streaming path which never trims whitespace
+        // that is not part of a marker suffix.
+        assert_eq!(strip_trailing_terminal_markers("Answer\n"), "Answer\n");
+        assert_eq!(strip_trailing_terminal_markers("Answer  "), "Answer  ");
+        assert_eq!(
+            strip_trailing_terminal_markers("Plain response\n\n"),
+            "Plain response\n\n"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_whitespace_before_marker() {
+        // Whitespace BEFORE a recognized marker belongs to the response text
+        // and is preserved, matching the streaming stripper ("Answer\n<eom>"
+        // streams as "Answer\n"). Only the marker itself (plus any whitespace
+        // that followed it) is removed.
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary  <eom>"),
+            "Summary  "
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary \n\t<|eom|>"),
+            "Summary \n\t"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_stacked() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom><|eom|>"),
+            "Summary"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<|eom|><eom>"),
+            "Summary"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_with_whitespace() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>  \n"),
+            "Summary"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>\t\n  "),
+            "Summary"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Summary<eom>           <|eom|>"),
+            "Summary"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_preserves_inline() {
+        assert_eq!(
+            strip_trailing_terminal_markers("Text with <eom> inline"),
+            "Text with <eom> inline"
+        );
+        assert_eq!(
+            strip_trailing_terminal_markers("Code: <|eom|> here"),
+            "Code: <|eom|> here"
+        );
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_empty() {
+        assert_eq!(strip_trailing_terminal_markers(""), "");
+        // Pure whitespace with no marker is ordinary text and is preserved,
+        // matching the streaming path (which never trims unmarked whitespace).
+        assert_eq!(strip_trailing_terminal_markers("   "), "   ");
+        assert_eq!(strip_trailing_terminal_markers("<eom>"), "");
+    }
+
+    #[test]
+    fn strip_trailing_terminal_markers_marker_only_with_whitespace() {
+        assert_eq!(strip_trailing_terminal_markers("<eom>\n"), "");
+        assert_eq!(strip_trailing_terminal_markers("<|eom|>  "), "");
+        assert_eq!(strip_trailing_terminal_markers("<eom>\n<|eom|>"), "");
     }
 }
