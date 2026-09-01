@@ -1121,6 +1121,7 @@ pub struct QuickstartPane {
     selector_list_rect: Option<Rect>,
     selector_row_rects: Vec<Rect>,
     leave_requested: bool,
+    dismissal_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl QuickstartPane {
@@ -1145,6 +1146,7 @@ impl QuickstartPane {
             selector_list_rect: None,
             selector_row_rects: Vec::new(),
             leave_requested: false,
+            dismissal_task: None,
         }
     }
 
@@ -1287,14 +1289,26 @@ impl QuickstartPane {
         }
     }
 
-    pub async fn dismiss_beacon(&self) {
+    pub fn dismiss_beacon(&mut self) {
         if self.applied_alias.is_some() {
             return;
         }
-        let _ = self
-            .rpc
-            .quickstart_dismiss(&self.run_id, QuickstartSurface::Tui, self.last_step)
-            .await;
+        if self
+            .dismissal_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
+
+        let rpc = Arc::clone(&self.rpc);
+        let run_id = self.run_id.clone();
+        let last_step = self.last_step;
+        self.dismissal_task = Some(tokio::spawn(async move {
+            let _ = rpc
+                .quickstart_dismiss(&run_id, QuickstartSurface::Tui, last_step)
+                .await;
+        }));
     }
 
     pub async fn handle_mouse(&mut self, mouse: crossterm::event::MouseEvent, _content: Rect) {
@@ -2542,6 +2556,14 @@ impl QuickstartPane {
     }
 }
 
+impl Drop for QuickstartPane {
+    fn drop(&mut self) {
+        if let Some(task) = self.dismissal_task.take() {
+            task.abort();
+        }
+    }
+}
+
 fn generate_run_id() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3766,6 +3788,71 @@ mod tests {
         pane.open_picker_modal(Selector::RuntimeProfile);
 
         assert!(pane.active_modal.is_none());
+    }
+
+    #[tokio::test]
+    async fn dismissal_is_deduplicated_while_the_response_is_withheld() {
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(2);
+        let outbound = std::sync::Arc::new(crate::jsonrpc::RpcOutbound::new(writer_tx));
+        let rpc = std::sync::Arc::new(crate::client::RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::app::CrossReconnectState::default(),
+        ));
+        let mut pane = QuickstartPane::new(rpc, reconnect_state);
+        pane.run_id = "run-test".into();
+        pane.last_step = Some(QuickstartStep::RiskProfile);
+
+        pane.dismiss_beacon();
+        pane.dismiss_beacon();
+
+        let raw = tokio::time::timeout(std::time::Duration::from_millis(200), writer_rx.recv())
+            .await
+            .expect("dismissal should be sent")
+            .expect("RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::QUICKSTART_DISMISS);
+        assert_eq!(request["params"]["run_id"], "run-test");
+        assert_eq!(request["params"]["surface"], "tui");
+        assert_eq!(request["params"]["last_step"], "risk_profile");
+        assert_eq!(outbound.pending_count(), 1);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), writer_rx.recv())
+                .await
+                .is_err(),
+            "a pending dismissal must not be duplicated"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_pane_aborts_pending_dismissal() {
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel(1);
+        let outbound = std::sync::Arc::new(crate::jsonrpc::RpcOutbound::new(writer_tx));
+        let rpc = std::sync::Arc::new(crate::client::RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::app::CrossReconnectState::default(),
+        ));
+        let mut pane = QuickstartPane::new(rpc, reconnect_state);
+        pane.dismiss_beacon();
+
+        let _request =
+            tokio::time::timeout(std::time::Duration::from_millis(200), writer_rx.recv())
+                .await
+                .expect("dismissal should be sent")
+                .expect("RPC writer should remain connected");
+        assert_eq!(outbound.pending_count(), 1);
+
+        drop(pane);
+        for _ in 0..100 {
+            if outbound.pending_count() == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            outbound.pending_count(),
+            0,
+            "dropping QuickstartPane must cancel its pending dismissal RPC"
+        );
     }
 
     #[test]

@@ -549,13 +549,16 @@ async fn switch_mode(
         dashboard_pane.on_pane_blur();
     }
     if *mode == Mode::Quickstart && next != Mode::Quickstart {
-        quickstart.dismiss_beacon().await;
+        quickstart.dismiss_beacon();
+    }
+    if *mode == Mode::Sop && next != Mode::Sop {
+        sop_pane.on_pane_blur();
     }
     if !matches!(conn_state, ConnectionState::Disconnected { .. }) {
         match next {
             Mode::Acp => acp_pane.refresh_if_inactive().await,
             Mode::Chat => chat_pane.refresh_if_inactive().await,
-            Mode::Sop => sop_pane.refresh().await,
+            Mode::Sop => sop_pane.refresh(),
             _ => {}
         }
     }
@@ -1378,7 +1381,7 @@ fn leg_after_adoption(
 
 async fn refresh_visible_sop_after_reconnect(mode: Mode, pane: &mut sop_pane::SopPane) {
     if mode == Mode::Sop {
-        pane.refresh().await;
+        pane.refresh();
     }
 }
 
@@ -2606,28 +2609,244 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mode_switch_to_sop_returns_before_a_withheld_list_response() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = Arc::new(Mutex::new(CrossReconnectState::default()));
+        let mut mode = Mode::Config;
+        let conn_state = ConnectionState::Connected;
+        let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
+        let mut quickstart =
+            quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
+        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let mut sop_pane = sop_pane::SopPane::new(rpc);
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            switch_mode(
+                &mut mode,
+                Mode::Sop,
+                &conn_state,
+                &mut dashboard_pane,
+                &mut quickstart,
+                &mut acp_pane,
+                &mut chat_pane,
+                &mut sop_pane,
+            ),
+        )
+        .await
+        .expect("entering SOP mode must not await the list response");
+        assert_eq!(mode, Mode::Sop);
+
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("mode entry should send a list request")
+            .expect("RPC writer should remain connected");
+        let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(request["method"], crate::client::method::SOPS_LIST);
+    }
+
+    #[tokio::test]
+    async fn sop_reentry_discards_pre_blur_list_and_requests_one_fresh_result() {
+        let (tx, mut rx) = mpsc::channel::<String>(4);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = Arc::new(Mutex::new(CrossReconnectState::default()));
+        let mut mode = Mode::Config;
+        let conn_state = ConnectionState::Connected;
+        let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
+        let mut quickstart =
+            quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
+        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let mut sop_pane = sop_pane::SopPane::new(rpc);
+
+        switch_mode(
+            &mut mode,
+            Mode::Sop,
+            &conn_state,
+            &mut dashboard_pane,
+            &mut quickstart,
+            &mut acp_pane,
+            &mut chat_pane,
+            &mut sop_pane,
+        )
+        .await;
+        let first_raw = rx.recv().await.expect("first list request");
+        let first_request: serde_json::Value = serde_json::from_str(&first_raw).unwrap();
+        let first_id = first_request["id"].as_str().unwrap().to_string();
+
+        switch_mode(
+            &mut mode,
+            Mode::Config,
+            &conn_state,
+            &mut dashboard_pane,
+            &mut quickstart,
+            &mut acp_pane,
+            &mut chat_pane,
+            &mut sop_pane,
+        )
+        .await;
+        switch_mode(
+            &mut mode,
+            Mode::Sop,
+            &conn_state,
+            &mut dashboard_pane,
+            &mut quickstart,
+            &mut acp_pane,
+            &mut chat_pane,
+            &mut sop_pane,
+        )
+        .await;
+        assert!(
+            rx.try_recv().is_err(),
+            "single-flight re-entry must wait for the older request to settle"
+        );
+
+        outbound.dispatch_response(
+            &first_id,
+            Some(serde_json::json!([{ "name": "old" }])),
+            None,
+        );
+        let mut fresh_id = None;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            sop_pane.tick();
+            while let Ok(raw) = rx.try_recv() {
+                let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                if request["method"] == crate::client::method::SOPS_LIST {
+                    fresh_id = request["id"].as_str().map(String::from);
+                }
+            }
+            if fresh_id.is_some() {
+                break;
+            }
+        }
+        assert_eq!(
+            sop_pane.selected_name(),
+            None,
+            "the pre-blur response must not become authoritative after re-entry"
+        );
+        let fresh_id = fresh_id.expect("fresh list request after re-entry");
+        assert_ne!(fresh_id, first_id);
+
+        outbound.dispatch_response(
+            &fresh_id,
+            Some(serde_json::json!([{ "name": "fresh" }])),
+            None,
+        );
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            sop_pane.tick();
+            if sop_pane.selected_name() == Some("fresh") {
+                break;
+            }
+        }
+        assert_eq!(sop_pane.selected_name(), Some("fresh"));
+        while let Ok(raw) = rx.try_recv() {
+            let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_ne!(
+                request["method"],
+                crate::client::method::SOPS_LIST,
+                "only one authoritative follow-up may be sent"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mode_switch_leaves_quickstart_for_sop_before_withheld_responses() {
+        let (tx, mut rx) = mpsc::channel::<String>(1);
+        let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
+        let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
+        let reconnect_state = Arc::new(Mutex::new(CrossReconnectState::default()));
+        let mut mode = Mode::Quickstart;
+        let conn_state = ConnectionState::Connected;
+        let mut dashboard_pane = dashboard::Dashboard::new(Arc::clone(&rpc), "test", false);
+        let mut quickstart =
+            quickstart_pane::QuickstartPane::new(Arc::clone(&rpc), reconnect_state);
+        let mut acp_pane = acp::Acp::new(Arc::clone(&rpc));
+        let mut chat_pane = chat::Chat::new(Arc::clone(&rpc), chat::PaneKind::Chat);
+        let mut sop_pane = sop_pane::SopPane::new(rpc);
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            switch_mode(
+                &mut mode,
+                Mode::Sop,
+                &conn_state,
+                &mut dashboard_pane,
+                &mut quickstart,
+                &mut acp_pane,
+                &mut chat_pane,
+                &mut sop_pane,
+            ),
+        )
+        .await
+        .expect("leaving Quickstart must not await dismissal or SOP refresh");
+        assert_eq!(mode, Mode::Sop);
+
+        let mut methods = Vec::new();
+        for _ in 0..2 {
+            let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+                .await
+                .expect("mode switch should send both background requests")
+                .expect("RPC writer should remain connected");
+            let request: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            let method = request["method"].as_str().unwrap().to_string();
+            if method == crate::client::method::QUICKSTART_DISMISS {
+                assert_eq!(request["params"]["surface"], "tui");
+            }
+            methods.push(method);
+        }
+        assert!(
+            methods
+                .iter()
+                .any(|method| method == crate::client::method::QUICKSTART_DISMISS),
+            "mode switch should send dismissal telemetry: {methods:?}"
+        );
+        assert!(
+            methods
+                .iter()
+                .any(|method| method == crate::client::method::SOPS_LIST),
+            "mode switch should refresh SOPs: {methods:?}"
+        );
+        assert_eq!(outbound.pending_count(), 2, "both responses are withheld");
+    }
+
+    #[tokio::test]
     async fn reconnect_refreshes_the_sop_list_when_it_remains_visible() {
         let (tx, mut rx) = mpsc::channel::<String>(1);
         let outbound = Arc::new(crate::jsonrpc::RpcOutbound::new(tx));
         let rpc = Arc::new(RpcClient::with_rpc(Arc::clone(&outbound)));
         let mut pane = sop_pane::SopPane::new(rpc);
 
-        let responder = tokio::spawn(async move {
-            let raw = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .expect("visible reconnect should request the SOP list")
-                .expect("RPC request channel should stay open");
-            let request: serde_json::Value =
-                serde_json::from_str(&raw).expect("RPC request should be JSON");
-            assert_eq!(request["method"], crate::client::method::SOPS_LIST);
-            let id = request["id"]
-                .as_str()
-                .expect("RPC request should carry an id");
-            outbound.dispatch_response(id, Some(serde_json::json!([{ "name": "deploy" }])), None);
-        });
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            refresh_visible_sop_after_reconnect(Mode::Sop, &mut pane),
+        )
+        .await
+        .expect("visible reconnect must not await the list response");
 
-        refresh_visible_sop_after_reconnect(Mode::Sop, &mut pane).await;
-        responder.await.expect("RPC responder should complete");
+        let raw = tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("visible reconnect should request the SOP list")
+            .expect("RPC request channel should stay open");
+        let request: serde_json::Value =
+            serde_json::from_str(&raw).expect("RPC request should be JSON");
+        assert_eq!(request["method"], crate::client::method::SOPS_LIST);
+        let id = request["id"]
+            .as_str()
+            .expect("RPC request should carry an id");
+        outbound.dispatch_response(id, Some(serde_json::json!([{ "name": "deploy" }])), None);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            pane.tick();
+            if pane.selected_name().is_some() {
+                break;
+            }
+        }
 
         assert_eq!(pane.selected_name(), Some("deploy"));
     }

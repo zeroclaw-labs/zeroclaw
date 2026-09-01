@@ -120,6 +120,11 @@ pub(crate) struct Chat {
     /// picker can swap to the populated list without blocking the draw loop.
     model_fetch_tx: mpsc::Sender<ModelFetchResult>,
     model_fetch_rx: mpsc::Receiver<ModelFetchResult>,
+    /// Request-form `session/prompt` completions. Terminal notifications remain
+    /// transcript authority; this channel only prevents a lost terminal frame
+    /// from leaving the matching local turn stuck in flight.
+    prompt_completion_tx: mpsc::Sender<PromptCompletion>,
+    prompt_completion_rx: mpsc::Receiver<PromptCompletion>,
     phase: ChatPhase,
     pane_kind: PaneKind,
     /// One-shot session id to reattach to on the next session start, set by
@@ -193,6 +198,12 @@ struct ModelFetchResult {
     current: Option<String>,
 }
 
+struct PromptCompletion {
+    session_id: String,
+    turn_generation: u64,
+    error: Option<String>,
+}
+
 fn should_retry_on_entry(phase: &ChatPhase) -> bool {
     matches!(phase, ChatPhase::Error(_) | ChatPhase::PickAgent { .. })
 }
@@ -201,6 +212,7 @@ impl Chat {
     pub(crate) fn new(rpc: Arc<RpcClient>, pane_kind: PaneKind) -> Self {
         let (git_branch_tx, git_branch_rx) = mpsc::channel(4);
         let (model_fetch_tx, model_fetch_rx) = mpsc::channel(4);
+        let (prompt_completion_tx, prompt_completion_rx) = mpsc::channel(4);
         Self {
             rpc: rpc.clone(),
             rpc_out: rpc.rpc.clone(),
@@ -211,6 +223,8 @@ impl Chat {
             git_branch_inflight: false,
             model_fetch_tx,
             model_fetch_rx,
+            prompt_completion_tx,
+            prompt_completion_rx,
             phase: ChatPhase::PickAgent {
                 agents: Vec::new(),
                 list_state: ListState::default(),
@@ -643,6 +657,36 @@ impl Chat {
         }
     }
 
+    fn drain_prompt_completions(&mut self) {
+        let mut settled = false;
+        while let Ok(completion) = self.prompt_completion_rx.try_recv() {
+            let ChatPhase::Active(ref mut state) = self.phase else {
+                continue;
+            };
+            if state.session_id != completion.session_id
+                || state.turn_generation != completion.turn_generation
+                || !state.turn_in_flight
+            {
+                continue;
+            }
+
+            // The response proves the handler returned, but only the missing
+            // terminal notification distinguishes completed from cancelled or
+            // failed. Settle conservatively so queued work cannot auto-run.
+            state.settle_turn_from_prompt_response();
+            if let Some(error) = completion.error {
+                state.set_info_notice(crate::i18n::t_args(
+                    "zc-queue-dispatch-failed",
+                    &[("error", &error)],
+                ));
+            }
+            settled = true;
+        }
+        if settled {
+            self.pump_queue();
+        }
+    }
+
     fn drain_inbound_requests(&mut self) {
         loop {
             let req = match self.inbound_rx.try_recv() {
@@ -995,20 +1039,42 @@ impl Chat {
             let _ = cleanup_attachment_temps(&attachments);
             return;
         }
-        self.spawn_prompt(sid, text, attachments_json);
+        let turn_generation = match self.phase {
+            ChatPhase::Active(ref state) => state.turn_generation,
+            _ => return,
+        };
+        self.spawn_prompt(sid, turn_generation, text, attachments_json);
     }
 
-    fn spawn_prompt(&self, sid: String, prompt: String, attachments_json: Vec<serde_json::Value>) {
+    fn spawn_prompt(
+        &self,
+        sid: String,
+        turn_generation: u64,
+        prompt: String,
+        attachments_json: Vec<serde_json::Value>,
+    ) {
         let rpc_arc = self.rpc_out.clone();
+        let completion_tx = self.prompt_completion_tx.clone();
         tokio::spawn(async move {
             let mut params = serde_json::json!({
-                "session_id": sid,
+                "session_id": &sid,
                 "prompt": prompt,
             });
             if !attachments_json.is_empty() {
                 params["attachments"] = serde_json::Value::Array(attachments_json);
             }
-            rpc_arc.notify(method::SESSION_PROMPT, params).await;
+            let error = rpc_arc
+                .request(method::SESSION_PROMPT, params)
+                .await
+                .err()
+                .map(|e| format!("{} ({})", e.message, e.code));
+            let _ = completion_tx
+                .send(PromptCompletion {
+                    session_id: sid,
+                    turn_generation,
+                    error,
+                })
+                .await;
         });
     }
 
@@ -1075,6 +1141,7 @@ impl Chat {
 
     pub(crate) fn draw(&mut self, frame: &mut Frame, area: Rect) {
         self.drain_notifications();
+        self.drain_prompt_completions();
         self.drain_inbound_requests();
         self.settle_stuck_cancel();
         self.drain_git_branch_results();
@@ -5412,6 +5479,9 @@ pub struct ChatState {
     pending_approval: Option<PendingApproval>,
     pending_elicitation: Option<PendingElicitation>,
     pub turn_in_flight: bool,
+    /// Monotonic local turn identity. Prompt responses use it to avoid
+    /// settling a newer queued turn after the prior terminal notification.
+    turn_generation: u64,
     /// Set when any streaming text was flushed during the current turn.
     /// Used by `commit_turn` to decide whether `full_text` is a fallback
     /// (no streaming happened) or a duplicate (streaming already committed).
@@ -5564,6 +5634,7 @@ impl ChatState {
             pending_approval: None,
             pending_elicitation: None,
             turn_in_flight: false,
+            turn_generation: 0,
             turn_had_streaming_text: false,
             turn_had_tool_calls: false,
             turn_status: TurnStatus::Idle,
@@ -6736,6 +6807,21 @@ impl ChatState {
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         self.mark_dirty_append();
+        self.settle_turn_lifecycle(clean);
+    }
+
+    fn settle_turn_from_prompt_response(&mut self) {
+        if self.flush_streaming_text() {
+            self.turn_had_streaming_text = true;
+        }
+        self.flush_streaming_thought();
+        self.turn_had_streaming_text = false;
+        self.turn_had_tool_calls = false;
+        self.mark_dirty_append();
+        self.settle_turn_lifecycle(false);
+    }
+
+    fn settle_turn_lifecycle(&mut self, clean: bool) {
         self.turn_in_flight = false;
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
@@ -6773,6 +6859,7 @@ impl ChatState {
         });
         self.mark_dirty_append();
         self.turn_in_flight = true;
+        self.turn_generation = self.turn_generation.wrapping_add(1);
         self.turn_had_streaming_text = false;
         self.turn_had_tool_calls = false;
         // Start a fresh status + animation anchor. We're `Working` until the
@@ -7277,6 +7364,7 @@ impl ChatState {
         self.pending_approval = None;
         self.pending_elicitation = None;
         self.turn_in_flight = false;
+        self.turn_generation = self.turn_generation.wrapping_add(1);
         self.turn_status = TurnStatus::Idle;
         self.cancel_started_at = None;
         self.browse_cursor = None;
@@ -13011,6 +13099,137 @@ mod tests {
         let rpc = Arc::new(RpcOutbound::new(tx));
         let client = Arc::new(RpcClient::with_rpc_transport(rpc, transport));
         (Chat::new(client, PaneKind::Chat), rx)
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_settles_turn_when_terminal_update_is_lagged() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("hello".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_queue();
+        let request = next_rpc_request(&mut writer_rx, "prompt request should be sent").await;
+        assert_eq!(request["method"], method::SESSION_PROMPT);
+
+        let (notif_tx, notif_rx) = broadcast::channel(1);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "done"
+                }),
+            })
+            .unwrap();
+        notif_tx
+            .send(RpcNotification {
+                method: "unrelated".to_string(),
+                params: serde_json::Value::Null,
+            })
+            .unwrap();
+
+        chat.drain_notifications();
+
+        assert!(
+            active_state(&mut chat).turn_in_flight,
+            "the lagged terminal frame reproduces the stale in-flight state"
+        );
+        active_state(&mut chat)
+            .enqueue_message("wait for explicit resume".to_string(), Vec::new())
+            .unwrap();
+        respond_ok(&chat.rpc_out, &request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        assert!(!active.turn_in_flight);
+        assert!(matches!(active.turn_status, TurnStatus::Idle));
+        assert!(active.queue_paused());
+        assert_eq!(active.queue_len(), 1);
+        assert!(
+            active
+                .entries()
+                .iter()
+                .all(|entry| !matches!(entry, ChatEntry::AgentMessage(_))),
+            "the lifecycle fence must not invent the dropped final transcript content"
+        );
+    }
+
+    #[tokio::test]
+    async fn prior_prompt_completion_does_not_settle_next_queued_turn() {
+        let (mut chat, mut writer_rx) = test_chat();
+        let mut active = state();
+        active
+            .enqueue_message("first".to_string(), Vec::new())
+            .unwrap();
+        chat.phase = ChatPhase::Active(Box::new(active));
+        chat.pump_queue();
+        let first_generation = active_state(&mut chat).turn_generation;
+        let first_request =
+            next_rpc_request(&mut writer_rx, "first prompt request should be sent").await;
+        active_state(&mut chat)
+            .enqueue_message("second".to_string(), Vec::new())
+            .unwrap();
+
+        let (notif_tx, notif_rx) = broadcast::channel(4);
+        chat.notif_rx = notif_rx;
+        notif_tx
+            .send(RpcNotification {
+                method: "session/update".to_string(),
+                params: serde_json::json!({
+                    "type": "turn_complete",
+                    "session_id": "sess-1",
+                    "outcome": "completed",
+                    "content": "done"
+                }),
+            })
+            .unwrap();
+        chat.drain_notifications();
+
+        let second_generation = active_state(&mut chat).turn_generation;
+        assert_ne!(second_generation, first_generation);
+        assert!(active_state(&mut chat).turn_in_flight);
+        let second_request =
+            next_rpc_request(&mut writer_rx, "second prompt request should be sent").await;
+        assert_ne!(second_request["id"], first_request["id"]);
+
+        respond_ok(&chat.rpc_out, &first_request, serde_json::json!({}));
+        tokio::task::yield_now().await;
+        chat.drain_prompt_completions();
+
+        let active = active_state(&mut chat);
+        assert!(
+            active.turn_in_flight,
+            "the prior response fence must not settle the newly dispatched turn"
+        );
+        assert_eq!(
+            active
+                .entries()
+                .iter()
+                .filter(|entry| matches!(entry, ChatEntry::AgentMessage(_)))
+                .count(),
+            1,
+            "the surviving terminal notification must commit exactly once"
+        );
+    }
+
+    #[test]
+    fn restored_session_state_is_idle() {
+        let mut active = state();
+        active.push_user_message(Some("old prompt".to_string()), Vec::new());
+        active.reset_for_session(
+            "sess-restored".to_string(),
+            Some("restored".to_string()),
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+
+        assert!(!active.turn_in_flight);
+        assert!(matches!(active.turn_status, TurnStatus::Idle));
     }
 
     fn chat_with_active_input(kind: PaneKind) -> Chat {
