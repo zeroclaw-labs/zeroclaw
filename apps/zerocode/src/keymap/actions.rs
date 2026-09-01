@@ -16,7 +16,6 @@ macro_rules! keyactions {
             $( $variant ),*
         }
 
-        #[allow(dead_code)]
         impl $name {
             /// Stable per-enum tag namespacing serialized keys
             /// (`"<tag>.<variant>"`).
