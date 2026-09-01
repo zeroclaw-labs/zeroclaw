@@ -15760,7 +15760,9 @@ pub struct MatrixConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub enabled: bool,
-    /// Matrix homeserver URL (e.g. `"https://matrix.org"`).
+    /// Matrix server name or homeserver URL (e.g. `"matrix.org"` or
+    /// `"https://matrix.example.org"`). Server names use standard
+    /// `/.well-known/matrix/client` discovery.
     #[tab(Connection)]
     pub homeserver: String,
     /// Matrix access token for the bot account. When unset, the channel

@@ -1561,7 +1561,7 @@ mod client {
     }
 
     async fn access_token_login(client: &Client, config: &MatrixConfig) -> Result<()> {
-        let identity = resolve_access_token_identity(config).await?;
+        let identity = resolve_access_token_identity(config, &client.homeserver()).await?;
         let user_id = identity.user_id.parse().context("parse matrix.user_id")?;
         let device_id = identity.device_id.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -1612,6 +1612,7 @@ mod client {
 
     pub(super) async fn resolve_access_token_identity(
         config: &MatrixConfig,
+        homeserver: &reqwest::Url,
     ) -> Result<AccessTokenIdentity> {
         let configured_user_id = non_empty_config_value(config.user_id.as_deref());
         let configured_device_id = non_empty_config_value(config.device_id.as_deref());
@@ -1625,7 +1626,7 @@ mod client {
             });
         }
 
-        let whoami = fetch_access_token_whoami(config).await?;
+        let whoami = fetch_access_token_whoami(config, homeserver).await?;
 
         if let Some(ref configured) = configured_user_id
             && configured != &whoami.user_id
@@ -1656,12 +1657,15 @@ mod client {
         })
     }
 
-    async fn fetch_access_token_whoami(config: &MatrixConfig) -> Result<WhoamiResponse> {
+    async fn fetch_access_token_whoami(
+        config: &MatrixConfig,
+        homeserver: &reqwest::Url,
+    ) -> Result<WhoamiResponse> {
         let access_token = config
             .access_token
             .as_deref()
             .context("matrix: whoami requires access_token")?;
-        let url = matrix_client_api_url(&config.homeserver, WHOAMI_ENDPOINT)?;
+        let url = matrix_client_api_url(homeserver, WHOAMI_ENDPOINT);
         let response = reqwest::Client::builder()
             .timeout(WHOAMI_TIMEOUT)
             .build()
@@ -1763,8 +1767,8 @@ mod client {
         truncated
     }
 
-    fn matrix_client_api_url(homeserver: &str, endpoint_path: &str) -> Result<reqwest::Url> {
-        let mut url = reqwest::Url::parse(homeserver).context("parse matrix homeserver URL")?;
+    fn matrix_client_api_url(homeserver: &reqwest::Url, endpoint_path: &str) -> reqwest::Url {
+        let mut url = homeserver.clone();
         let base_path = url.path().trim_end_matches('/');
         let endpoint_path = endpoint_path.trim_start_matches('/');
         let full_path = if base_path.is_empty() || base_path == "/" {
@@ -1775,7 +1779,7 @@ mod client {
         url.set_path(&full_path);
         url.set_query(None);
         url.set_fragment(None);
-        Ok(url)
+        url
     }
 
     fn session_blob_from(client: &Client) -> Option<session::SessionBlob> {
@@ -8358,6 +8362,10 @@ mod tests {
             }
         }
 
+        fn resolved_homeserver(url: &str) -> reqwest::Url {
+            reqwest::Url::parse(url).unwrap()
+        }
+
         #[test]
         fn relogin_requires_both_password_and_user_id() {
             assert!(can_password_relogin(&cfg(Some("pw"), Some("@bot:m"))));
@@ -8444,9 +8452,112 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let identity = resolve_access_token_identity(&access_token_cfg(server.uri()))
+            let identity = resolve_access_token_identity(
+                &access_token_cfg(server.uri()),
+                &resolved_homeserver(&server.uri()),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(identity.user_id, "@bot:example.org");
+            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
+        }
+
+        #[tokio::test]
+        async fn access_token_whoami_uses_discovered_delegated_homeserver() {
+            let root = MockServer::start().await;
+            let delegated = MockServer::start().await;
+
+            Mock::given(method("GET"))
+                .and(path("/.well-known/matrix/client"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "m.homeserver": { "base_url": delegated.uri() }
+                })))
+                .expect(1)
+                .mount(&root)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/_matrix/client/versions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["v1.1"],
+                    "unstable_features": {}
+                })))
+                .mount(&delegated)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(WHOAMI_PATH))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org",
+                    "device_id": "DEVICE42"
+                })))
+                .expect(1)
+                .mount(&delegated)
+                .await;
+
+            let server_name =
+                matrix_sdk::ruma::ServerName::parse(root.address().to_string()).unwrap();
+            let client = matrix_sdk::Client::builder()
+                .insecure_server_name_no_tls(&server_name)
+                .build()
                 .await
                 .unwrap();
+            assert_eq!(
+                client.homeserver().as_str().trim_end_matches('/'),
+                delegated.uri()
+            );
+
+            let identity = resolve_access_token_identity(
+                &access_token_cfg(server_name.to_string()),
+                &client.homeserver(),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(identity.user_id, "@bot:example.org");
+            assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
+            assert!(
+                root.received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|request| request.url.path() != WHOAMI_PATH)
+            );
+        }
+
+        #[tokio::test]
+        async fn access_token_whoami_preserves_direct_homeserver_url_and_base_path() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/matrix/_matrix/client/versions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "versions": ["v1.1"],
+                    "unstable_features": {}
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/matrix{WHOAMI_PATH}")))
+                .and(header("authorization", "Bearer secret-token"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "user_id": "@bot:example.org",
+                    "device_id": "DEVICE42"
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let homeserver = format!("{}/matrix", server.uri());
+            let client = matrix_sdk::Client::builder()
+                .server_name_or_homeserver_url(&homeserver)
+                .build()
+                .await
+                .unwrap();
+            let identity =
+                resolve_access_token_identity(&access_token_cfg(homeserver), &client.homeserver())
+                    .await
+                    .unwrap();
 
             assert_eq!(identity.user_id, "@bot:example.org");
             assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
@@ -8464,9 +8575,12 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let err = resolve_access_token_identity(&access_token_cfg(server.uri()))
-                .await
-                .unwrap_err();
+            let err = resolve_access_token_identity(
+                &access_token_cfg(server.uri()),
+                &resolved_homeserver(&server.uri()),
+            )
+            .await
+            .unwrap_err();
 
             assert!(
                 err.to_string()
@@ -8481,7 +8595,10 @@ mod tests {
             config.user_id = Some(" @bot:example.org ".into());
             config.device_id = Some(" DEVICE42 ".into());
 
-            let identity = resolve_access_token_identity(&config).await.unwrap();
+            let identity =
+                resolve_access_token_identity(&config, &resolved_homeserver("http://127.0.0.1:9"))
+                    .await
+                    .unwrap();
 
             assert_eq!(identity.user_id, "@bot:example.org");
             assert_eq!(identity.device_id.as_deref(), Some("DEVICE42"));
@@ -8502,7 +8619,9 @@ mod tests {
             let mut config = access_token_cfg(server.uri());
             config.user_id = Some("@configured:example.org".into());
 
-            let err = resolve_access_token_identity(&config).await.unwrap_err();
+            let err = resolve_access_token_identity(&config, &resolved_homeserver(&server.uri()))
+                .await
+                .unwrap_err();
 
             assert!(
                 err.to_string()
@@ -8525,9 +8644,12 @@ mod tests {
                 .mount(&server)
                 .await;
 
-            let err = resolve_access_token_identity(&access_token_cfg(server.uri()))
-                .await
-                .unwrap_err();
+            let err = resolve_access_token_identity(
+                &access_token_cfg(server.uri()),
+                &resolved_homeserver(&server.uri()),
+            )
+            .await
+            .unwrap_err();
             let message = err.to_string();
 
             assert!(message.contains("M_FORBIDDEN: token rejected"), "{message}");
@@ -8550,7 +8672,9 @@ mod tests {
             let mut config = access_token_cfg(server.uri());
             config.device_id = Some("CONFIGURED_DEVICE".into());
 
-            let err = resolve_access_token_identity(&config).await.unwrap_err();
+            let err = resolve_access_token_identity(&config, &resolved_homeserver(&server.uri()))
+                .await
+                .unwrap_err();
 
             assert!(
                 err.to_string()
