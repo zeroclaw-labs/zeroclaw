@@ -13093,6 +13093,9 @@ name = "wit-bindgen"
 version = "0.57.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
+dependencies = [
+ "bitflags 2.13.1",
+]
 
 [[package]]
 name = "wit-bindgen-core"
@@ -13836,6 +13839,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeroclaw-egress-plugin-fixture"
+version = "0.0.0"
+dependencies = [
+ "wasi 0.14.7+wasi-0.2.4",
+ "wit-bindgen 0.51.0",
+]
+
+[[package]]
 name = "zeroclaw-eval"
 version = "0.8.4"
 dependencies = [
@@ -14038,18 +14049,23 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "http-body-util",
+ "hyper",
  "jsonschema",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "toml 1.1.2+spec-1.1.0",
  "toml_edit 0.25.12+spec-1.1.0",
  "wasmtime",
  "wasmtime-wasi",
  "wasmtime-wasi-http",
+ "webpki-roots 1.0.7",
  "zeroclaw-api",
  "zeroclaw-config",
  "zeroclaw-infra",
