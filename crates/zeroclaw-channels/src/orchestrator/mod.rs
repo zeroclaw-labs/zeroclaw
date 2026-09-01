@@ -1236,7 +1236,7 @@ fn build_channel_turn_context_preamble(
     };
 
     let mut preamble = format!(
-        "[turn-context] time={time} date={date} tz={tz} \
+        "[turn-context] time={time} date={date} weekday={weekday} tz={tz} \
          channel={channel} reply_target={reply_target} sender={sender} \
          message_id={message_id}. The sender field is the platform-specific \
          user ID of the person who sent this message. Use it to distinguish \
@@ -1247,6 +1247,7 @@ fn build_channel_turn_context_preamble(
          message reaches the user.\n\n",
         time = now.format("%H:%M:%S"),
         date = now.format("%Y-%m-%d"),
+        weekday = now.format("%A"),
         tz = now.format("%Z"),
         channel = channel_name,
         reply_target = reply_target,
