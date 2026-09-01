@@ -4421,6 +4421,20 @@ mod tests {
     /// fetch. The typed envelope records that fallback as non-owned, so the
     /// pipeline replaces the URL with inline data and provider preparation
     /// sees one effective image reference without a false partial-load note.
+    /// A real 1x1 JPEG.
+    ///
+    /// Provider preparation now fully decodes image bytes rather than sniffing
+    /// their header, so a fixture that only carries the JPEG magic number is
+    /// rejected as corrupt. Tests that assert an image survives preparation
+    /// must serve bytes that actually decode.
+    fn valid_jpeg_bytes() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(1, 1, image::Rgb([255, 0, 0])))
+            .write_to(&mut buf, image::ImageFormat::Jpeg)
+            .expect("test JPEG encodes");
+        buf.into_inner()
+    }
+
     #[tokio::test]
     async fn image_with_no_workspace_is_enriched_rather_than_dropped() {
         use crate::orchestrator::media_pipeline::MediaPipeline;
@@ -4430,7 +4444,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/attachments/1/photo.jpg"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0xFFu8, 0xD8, 0xFF, 0xE0]))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(valid_jpeg_bytes()))
             .mount(&server)
             .await;
 

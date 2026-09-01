@@ -2450,11 +2450,13 @@ impl RpcDispatcher {
                     model_provider.as_ref(),
                     &model_name,
                 );
+                let multimodal_config = config.multimodal.clone();
                 (
                     model_provider,
                     model_provider_name,
                     model_name,
                     tool_dispatcher,
+                    multimodal_config,
                 )
             };
             Some(built)
@@ -2469,8 +2471,13 @@ impl RpcDispatcher {
             .await
             .ok_or_else(|| rpc_err(SESSION_NOT_FOUND, "Session not found"))?;
 
-        if let Some((model_provider, model_provider_name, model_name, tool_dispatcher)) =
-            built_model_provider
+        if let Some((
+            model_provider,
+            model_provider_name,
+            model_name,
+            tool_dispatcher,
+            multimodal_config,
+        )) = built_model_provider
         {
             self.ctx
                 .sessions
@@ -2482,6 +2489,7 @@ impl RpcDispatcher {
                     model_name,
                     tool_dispatcher,
                     None,
+                    multimodal_config,
                 )
                 .await
                 .then_some(())
@@ -3299,7 +3307,14 @@ impl RpcDispatcher {
                 continue;
             };
 
-            let (model_provider, model_provider_name, model_name, tool_dispatcher, temperature) = {
+            let (
+                model_provider,
+                model_provider_name,
+                model_name,
+                tool_dispatcher,
+                temperature,
+                multimodal_config,
+            ) = {
                 let config = ctx.config.read();
                 let Some(model_provider_ref) =
                     resolve_provider_ref(&config, &agent_alias, &overrides)
@@ -3343,12 +3358,14 @@ impl RpcDispatcher {
                             model_provider.as_ref(),
                             &model_name,
                         );
+                        let multimodal_config = config.multimodal.clone();
                         (
                             model_provider,
                             model_provider_name,
                             model_name,
                             tool_dispatcher,
                             overrides.temperature.or(provider_temperature),
+                            multimodal_config,
                         )
                     }
                     Err(e) => {
@@ -3380,6 +3397,7 @@ impl RpcDispatcher {
                     model_name,
                     tool_dispatcher,
                     Some(temperature),
+                    multimodal_config,
                 )
                 .await;
         }

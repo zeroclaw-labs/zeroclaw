@@ -376,6 +376,10 @@ impl SessionStore {
     /// When `temperature` is `None`, the agent's temperature is left unchanged
     /// — used by `session/configure` where temperature is already committed
     /// via `set_overrides_gated`.
+    ///
+    /// `multimodal_config` must be the same `[multimodal]` policy snapshot the
+    /// caller built the provider box from, so the agent-side preparation pass
+    /// and the provider boundary stay on one policy after a live refresh.
     pub async fn apply_model_provider(
         &self,
         id: &str,
@@ -385,6 +389,7 @@ impl SessionStore {
         model_name: String,
         tool_dispatcher: Box<dyn ToolDispatcher>,
         temperature: Option<Option<f64>>,
+        multimodal_config: zeroclaw_config::schema::MultimodalConfig,
     ) -> bool {
         let done = self.wait_test_gate().await;
         let agent = {
@@ -406,6 +411,7 @@ impl SessionStore {
         guard.set_model_provider_name(model_provider_name);
         guard.set_model_name(model_name);
         guard.set_tool_dispatcher(tool_dispatcher);
+        guard.set_multimodal_config(multimodal_config);
         if let Some(t) = temperature {
             guard.set_temperature(t);
         }
@@ -1409,6 +1415,7 @@ mod tests {
                 "stale-model".into(),
                 Box::new(NativeToolDispatcher),
                 Some(Some(0.99)),
+                zeroclaw_config::schema::MultimodalConfig::default(),
             )
             .await;
         assert!(
@@ -1453,6 +1460,7 @@ mod tests {
                 "new-model".into(),
                 Box::new(NativeToolDispatcher),
                 Some(Some(0.42)),
+                zeroclaw_config::schema::MultimodalConfig::default(),
             )
             .await;
         assert!(applied, "current generation must be accepted");
@@ -1466,6 +1474,57 @@ mod tests {
             guard.temperature_for_test(),
             Some(0.42),
             "temperature must be set on the captured agent under the generation check"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_model_provider_applies_multimodal_policy_to_captured_agent() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        // A live refresh swaps the provider alongside a tightened
+        // `[multimodal]` policy; the agent-side preparation pass must see the
+        // same snapshot the provider boundary was built from, or a refresh
+        // that lowers the caps leaves the agent counting against the old,
+        // looser limits.
+        let refreshed = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 1,
+            max_image_size_mb: 1,
+            ..Default::default()
+        };
+
+        let applied = store
+            .apply_model_provider(
+                "s",
+                captured_gen,
+                Box::new(StubProvider),
+                "new-provider".into(),
+                "new-model".into(),
+                Box::new(NativeToolDispatcher),
+                None,
+                refreshed,
+            )
+            .await;
+        assert!(applied, "current generation must be accepted");
+
+        let agent = store.get_agent("s").await.unwrap();
+        let guard = agent.lock().await;
+        assert_eq!(
+            guard.multimodal_config_for_test().max_images,
+            1,
+            "max_images must be refreshed on the captured agent"
+        );
+        assert_eq!(
+            guard.multimodal_config_for_test().max_image_size_mb,
+            1,
+            "max_image_size_mb must be refreshed on the captured agent"
         );
     }
 }

@@ -655,6 +655,16 @@ pub struct ModelProviderRuntimeOptions {
     pub chat_template_kwargs: Option<serde_json::Value>,
     /// Path to a custom CA certificate file for TLS connections.
     pub tls_ca_cert_path: Option<String>,
+    /// The configured `[multimodal]` policy.
+    ///
+    /// Providers normalize image markers on their own boundary (a channel can
+    /// call `chat` with raw `[IMAGE:<path>]` markers that never passed through
+    /// the runtime), and that normalization now decodes pixels and applies
+    /// `max_images` / `max_image_size_mb`. Carrying the configured policy here
+    /// keeps that second pass on the same rules the runtime already applied,
+    /// instead of silently reverting to defaults and re-trimming history a
+    /// configured request had legitimately accepted.
+    pub multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
 impl Default for ModelProviderRuntimeOptions {
@@ -680,6 +690,7 @@ impl Default for ModelProviderRuntimeOptions {
             vision: None,
             chat_template_kwargs: None,
             tls_ca_cert_path: None,
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
         }
     }
 }
@@ -743,6 +754,7 @@ pub fn model_provider_runtime_options_from_model_provider_entry(
         vision: entry.and_then(|e| e.vision),
         chat_template_kwargs: entry.and_then(|e| e.chat_template_kwargs.clone()),
         tls_ca_cert_path,
+        multimodal: config.multimodal.clone(),
     }
 }
 
@@ -1750,18 +1762,41 @@ pub fn create_model_provider_from_ref_with_model(
             .map(ToString::to_string);
         return Ok(ResolvedModelProviderRef { provider, model });
     }
-    let provider = create_model_provider_inner(
-        None,
-        name,
-        "default",
-        None,
-        None,
-        &ModelProviderRuntimeOptions::default(),
-    )?;
+    let options = bare_family_runtime_options(config);
+    let provider = create_model_provider_inner(None, name, "default", None, None, &options)?;
     Ok(ResolvedModelProviderRef {
         provider,
         model: None,
     })
+}
+
+/// Runtime options for a **bare family** reference (e.g. `ollama`), which has no
+/// alias entry to resolve.
+///
+/// Provider construction for these names stays on the family-default path
+/// (`config = None` at `create_model_provider_inner`) — that is what keeps a
+/// dotted-but-dangling ref fail-closed, per the exclusions documented in
+/// [`create_model_provider_from_ref_with_model`]. The config-owned
+/// `[multimodal]` policy must still reach the provider, though.
+///
+/// `ModelProviderRuntimeOptions::default()` embeds `MultimodalConfig::default()`
+/// (`max_images = 4`, `max_image_size_mb = 5`). A configured
+/// `vision_model_provider = "ollama"` with `max_images = 8` would otherwise
+/// re-normalize already-prepared messages under the default cap at the provider
+/// boundary. Because `trim_old_images` strips a message's images as a unit, that
+/// silently drops *every* image in an over-cap message rather than trimming to
+/// the configured limit.
+///
+/// Only config-owned policy is carried across; every entry-specific option
+/// (kind, URI, credentials, `vision`, ...) stays at its default, since a bare
+/// family name names no entry to take them from.
+fn bare_family_runtime_options(
+    config: &zeroclaw_config::schema::Config,
+) -> ModelProviderRuntimeOptions {
+    ModelProviderRuntimeOptions {
+        multimodal: config.multimodal.clone(),
+        ..ModelProviderRuntimeOptions::default()
+    }
 }
 
 fn create_resilient_model_provider_from_ref_with_model_override(
@@ -3445,6 +3480,49 @@ mod tests {
         );
         // Same fail-closed behavior as the legacy factory the vision route used.
         assert!(create_model_provider("llamacpp.typo", None).is_err());
+    }
+
+    #[test]
+    fn bare_family_vision_provider_carries_the_configured_multimodal_policy() {
+        use zeroclaw_config::schema::Config;
+        // A bare `vision_model_provider = "ollama"` resolves through the
+        // family-default branch, which previously passed
+        // `ModelProviderRuntimeOptions::default()` and so silently reverted the
+        // provider boundary to `max_images = 4` / `max_image_size_mb = 5`.
+        //
+        // The runtime prepares history under the configured policy, then the
+        // vision provider re-normalizes the already-prepared markers. Running
+        // that second pass under defaults re-trims a history the operator's
+        // configuration had legitimately accepted — and because
+        // `trim_old_images` strips a message's images as a unit, an over-cap
+        // message loses every image rather than being trimmed to the cap.
+        //
+        // Dotted aliases already resolved this through
+        // `provider_runtime_options_for_alias`; this pins the bare branch.
+        let mut config = Config::default();
+        config.multimodal.max_images = 8;
+        config.multimodal.max_image_size_mb = 10;
+
+        let options = bare_family_runtime_options(&config);
+
+        assert_eq!(
+            options.multimodal.max_images, 8,
+            "a bare family ref must carry the configured max_images, not the default 4"
+        );
+        assert_eq!(
+            options.multimodal.max_image_size_mb, 10,
+            "a bare family ref must carry the configured max_image_size_mb, not the default 5"
+        );
+
+        // Entry-specific options have no alias to come from and must stay unset,
+        // exactly as they were before the multimodal policy was threaded through.
+        let defaults = ModelProviderRuntimeOptions::default();
+        assert_eq!(options.provider_kind, defaults.provider_kind);
+        assert_eq!(options.provider_api_url, defaults.provider_api_url);
+        assert_eq!(
+            options.vision, defaults.vision,
+            "a bare family ref must not inherit a provider-specific vision override"
+        );
     }
 
     // ── Error cases ──────────────────────────────────────────

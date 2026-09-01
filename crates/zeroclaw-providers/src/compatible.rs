@@ -79,6 +79,15 @@ pub struct OpenAiCompatibleModelProvider {
     tls_ca_cert_pem: Option<Vec<u8>>,
     /// Extra JSON fields merged into every API request body.
     extra_body: Option<serde_json::Value>,
+    /// The configured `[multimodal]` policy.
+    ///
+    /// This provider normalizes image markers on its own boundary — a channel
+    /// can call `chat` with raw `[IMAGE:<path>]` markers that never passed
+    /// through the runtime — and that normalization decodes pixels and applies
+    /// `max_images` / `max_image_size_mb`. Holding the configured policy keeps
+    /// the boundary pass on the same rules the runtime already applied instead
+    /// of silently reverting to defaults.
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
     /// Memoized cleaned tool schemas: each registered schema is cleaned once
     /// per strategy per provider instance and then `Arc`-shared into every
     /// request body instead of being deep-copied per request. `Arc` so
@@ -433,9 +442,21 @@ pub struct OpenAiCompatibleBuilder {
     auth_model_provider: Option<String>,
     auth_service: Option<AuthService>,
     auth_profile_override: Option<String>,
+    multimodal: zeroclaw_config::schema::MultimodalConfig,
 }
 
 impl OpenAiCompatibleBuilder {
+    /// The configured `[multimodal]` policy this provider normalizes under.
+    ///
+    /// Defaults to `MultimodalConfig::default()`; `apply_compat_options`
+    /// overwrites it with the operator's configured policy so the provider
+    /// boundary does not re-trim history under different rules than the
+    /// runtime already applied.
+    pub fn multimodal(mut self, config: zeroclaw_config::schema::MultimodalConfig) -> Self {
+        self.multimodal = config;
+        self
+    }
+
     /// Human-readable display name (e.g. `"Groq"`, `"MiniMax"`). Surfaced
     /// in logs, `Attributable` output, and the onboarding UI. Required.
     pub fn display_name(mut self, name: &str) -> Self {
@@ -688,6 +709,7 @@ impl OpenAiCompatibleBuilder {
             public_model_listing: self.public_model_listing,
             tls_ca_cert_pem,
             extra_body: self.extra_body,
+            multimodal: self.multimodal,
             schema_cache: std::sync::Arc::new(zeroclaw_api::schema::SchemaCleanCache::new()),
         }
     }
@@ -729,6 +751,7 @@ impl OpenAiCompatibleModelProvider {
             auth_model_provider: None,
             auth_service: None,
             auth_profile_override: None,
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
         }
     }
     /// Add the configured custom CA certificate to a reqwest builder.
@@ -2309,11 +2332,18 @@ impl OpenAiCompatibleModelProvider {
         }
     }
 
+    /// Normalize image markers into inline data URIs for the upstream request.
+    ///
+    /// Takes the configured policy rather than `MultimodalConfig::default()`:
+    /// this pass decodes pixels and applies `max_images` / `max_image_size_mb`,
+    /// so running it under defaults would re-trim a history the runtime had
+    /// already accepted under the operator's configuration.
     async fn normalize_messages_for_upstream(
+        &self,
         messages: &[ChatMessage],
     ) -> anyhow::Result<Vec<ChatMessage>> {
-        let config = zeroclaw_config::schema::MultimodalConfig::default();
-        let prepared = multimodal::prepare_messages_for_provider(messages, &config).await?;
+        let prepared =
+            multimodal::prepare_messages_for_provider(messages, &self.multimodal).await?;
         Ok(prepared.messages)
     }
 
@@ -2917,11 +2947,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             role: "user".to_string(),
             content: message.to_string(),
         };
-        let normalized_user =
-            Self::normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
-                .await?
-                .pop()
-                .unwrap_or(user_msg);
+        let normalized_user = self
+            .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
+            .await?
+            .pop()
+            .unwrap_or(user_msg);
         let normalized_message = normalized_user.content;
 
         let merge = self.effective_merge_system(model);
@@ -3026,7 +3056,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<String> {
         let credential = self.resolve_credential().await?;
 
-        let normalized = Self::normalize_messages_for_upstream(messages).await?;
+        let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
         let effective_messages = Self::flatten_system_messages(&normalized, merge);
         // Strip native tool constructs for non-native-tool model_providers.
@@ -3111,7 +3141,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.resolve_credential().await?;
 
-        let normalized = Self::normalize_messages_for_upstream(messages).await?;
+        let normalized = self.normalize_messages_for_upstream(messages).await?;
         let merge = self.effective_merge_system(model);
         let effective_messages = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
@@ -3223,7 +3253,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
     ) -> anyhow::Result<ProviderChatResponse> {
         let credential = self.resolve_credential().await?;
 
-        let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
+        let normalized = self
+            .normalize_messages_for_upstream(request.messages)
+            .await?;
         let merge = self.effective_merge_system(model);
         let effective_messages = Self::flatten_system_messages(&normalized, merge);
         let effective_messages = if self.native_tool_calling {
@@ -3391,7 +3423,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            let normalized = match Self::normalize_messages_for_upstream(&messages_owned).await {
+            let normalized = match provider
+                .normalize_messages_for_upstream(&messages_owned)
+                .await
+            {
                 Ok(n) => n,
                 Err(err) => {
                     let _ = tx
@@ -3591,10 +3626,9 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 role: "user".to_string(),
                 content: message_owned,
             };
-            let normalized_user = match Self::normalize_messages_for_upstream(std::slice::from_ref(
-                &user_msg,
-            ))
-            .await
+            let normalized_user = match provider
+                .normalize_messages_for_upstream(std::slice::from_ref(&user_msg))
+                .await
             {
                 Ok(mut msgs) => msgs.pop().unwrap_or(user_msg),
                 Err(err) => {
@@ -3723,7 +3757,10 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
         let handle = ::zeroclaw_spawn::spawn!(async move {
-            let normalized = match Self::normalize_messages_for_upstream(&messages_owned).await {
+            let normalized = match provider
+                .normalize_messages_for_upstream(&messages_owned)
+                .await
+            {
                 Ok(n) => n,
                 Err(err) => {
                     let _ = tx
@@ -6840,11 +6877,17 @@ mod tests {
             content: format!("Caption please [IMAGE:{}]", path_str),
         };
 
-        let normalized = OpenAiCompatibleModelProvider::normalize_messages_for_upstream(
-            std::slice::from_ref(&msg),
-        )
-        .await
-        .expect("normalize ok");
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .build();
+
+        let normalized = provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalize ok");
 
         assert_eq!(normalized.len(), 1);
         let content = &normalized[0].content;
@@ -6855,6 +6898,93 @@ mod tests {
         assert!(
             !content.contains(&path_str),
             "raw local path must not leak to upstream, got: {content}"
+        );
+    }
+
+    /// A real 1x1 PNG. Content validation drops undecodable bytes, so a bare
+    /// signature would be skipped before reaching the boundary assertions.
+    fn boundary_test_png() -> Vec<u8> {
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .expect("test PNG encodes");
+        buf.into_inner()
+    }
+
+    #[tokio::test]
+    async fn provider_boundary_honours_the_configured_multimodal_policy() {
+        // The provider boundary re-normalizes messages, and that pass now
+        // decodes pixels and applies `max_images`. Under
+        // `MultimodalConfig::default()` it would trim to 4 images, silently
+        // discarding one the runtime had already accepted under a configured
+        // `max_images = 8`. The configured policy must reach the provider.
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let mut markers = String::from("compare these");
+        for index in 0..5 {
+            let path = tmp.path().join(format!("shot{index}.png"));
+            std::fs::write(&path, boundary_test_png()).expect("write fixture");
+            markers.push_str(&format!(" [IMAGE:{}]", path.display()));
+        }
+        let msg = ChatMessage {
+            role: "user".into(),
+            content: markers,
+        };
+
+        let configured = zeroclaw_config::schema::MultimodalConfig {
+            max_images: 8,
+            max_image_size_mb: 10,
+            ..Default::default()
+        };
+
+        let provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .multimodal(configured)
+            .build();
+
+        let normalized = provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalization succeeds");
+
+        let content = &normalized[0].content;
+        let surviving = content.matches("[IMAGE:data:image/png;base64,").count();
+        assert_eq!(
+            surviving, 5,
+            "all five images must survive the configured max_images = 8; \
+             a default-config boundary pass would have trimmed to 4: {content}"
+        );
+
+        // The default policy is what the boundary used before this fix. With
+        // all five markers in one message it is not a "keep 4" trim: the
+        // per-request cap is exceeded, and `trim_old_images` strips a
+        // message's images as a unit, so every image is dropped. That is the
+        // outcome the configured policy must override — pin it so a
+        // regression cannot quietly restore the default-config boundary pass.
+        let default_provider = OpenAiCompatibleModelProvider::builder("test")
+            .display_name("Test")
+            .base_url("https://example.invalid/v1")
+            .credential(Some("k"))
+            .auth_style(AuthStyle::Bearer)
+            .build();
+        let default_normalized = default_provider
+            .normalize_messages_for_upstream(std::slice::from_ref(&msg))
+            .await
+            .expect("normalization succeeds");
+        let default_surviving = default_normalized[0]
+            .content
+            .matches("[IMAGE:data:image/png;base64,")
+            .count();
+        assert_eq!(
+            default_surviving, 0,
+            "under the default max_images = 4 this five-image message loses \
+             every image; that is the data loss the configured policy prevents"
         );
     }
 

@@ -20,6 +20,12 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 chacha20poly1305 = "0.10"
 hex = "0.4"
 hmac = "0.12"
+image = { version = "0.25", default-features = false, features = [
+  "gif",
+  "jpeg",
+  "png",
+  "webp",
+] }
 parking_lot = "0.12"
 rand = "0.10"
 regex = "1.10"

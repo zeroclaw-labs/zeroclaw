@@ -253,6 +253,10 @@ pub fn apply_compat_options(
     if opts.replay_assistant_reasoning == Some(false) {
         b = b.without_assistant_reasoning_replay();
     }
+    // The configured `[multimodal]` policy. Without this the provider boundary
+    // would re-normalize already-prepared messages under defaults and could
+    // trim images the runtime had accepted under the operator's settings.
+    b = b.multimodal(opts.multimodal.clone());
     // `provider_extra` alias is captured before `build()` because the WARN
     // path below reads it for logging. Only object-shaped JSON is threaded
     // through; other shapes produce a WARN and are ignored (matching the
