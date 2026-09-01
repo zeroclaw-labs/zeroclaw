@@ -2619,6 +2619,45 @@ fn production_factory_rejects_hailo_vision_override() {
 }
 
 #[tokio::test]
+async fn native_hailo_allows_default_system_prompt_media_documentation() {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fake Hailo server");
+    let addr = listener.local_addr().expect("fake Hailo address");
+    let app = Router::new()
+        .route("/api/chat", post(count_chat_requests))
+        .with_state(requests.clone());
+    let server = zeroclaw_spawn::spawn!(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("serve fake Hailo server");
+    });
+
+    // This is the marker documentation injected by the normal channel-aware
+    // default system prompt. It must remain trusted prose, not image input.
+    let default_system_prompt = concat!(
+        "When responding on Discord:\n",
+        "- For media attachments use markers: [IMAGE:<absolute-path>], ",
+        "[DOCUMENT:<absolute-path>]\n",
+        "- Keep normal text outside markers."
+    );
+    let response = hailo_provider(&format!("http://{addr}"))
+        .chat_with_system(
+            Some(default_system_prompt),
+            "Reply with exactly: HAILO_DEFAULT_PROMPT_OK",
+            "qwen3:1.7b",
+            Some(0.2),
+        )
+        .await
+        .expect("default system prompt documentation must not be rejected");
+
+    assert_eq!(response, "HAILO_NATIVE_OK");
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.abort();
+}
+
+#[tokio::test]
 async fn native_hailo_rejects_image_inputs_instead_of_dropping_them() {
     // A valid opaque 1x1 RGB PNG containing one red pixel (RGB 255, 0, 0).
     const ONE_PIXEL_RED_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";

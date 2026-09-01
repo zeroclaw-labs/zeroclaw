@@ -855,14 +855,17 @@ impl HailoOllamaModelProvider {
         let mut candidates = Vec::new();
 
         for message in messages {
+            // System prompts legitimately document the marker syntax. Only
+            // non-system content can carry image residue into this provider.
             if message
                 .images
                 .as_ref()
                 .is_some_and(|images| !images.is_empty())
-                || message
-                    .content
-                    .as_deref()
-                    .is_some_and(multimodal::carries_image_marker)
+                || (message.role != "system"
+                    && message
+                        .content
+                        .as_deref()
+                        .is_some_and(multimodal::carries_image_marker))
             {
                 return Err(anyhow::Error::new(NonRetryableProviderError::new(
                     "Hailo-Ollama does not support image inputs",
