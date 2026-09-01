@@ -5,6 +5,8 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::agent::loop_::scrub_for_export;
+use crate::agent::turn::redact::scrub_credentials_value;
 use crate::hooks::traits::{HookHandler, HookResult};
 use zeroclaw_api::tool::ToolResult;
 use zeroclaw_config::schema::WebhookAuditConfig;
@@ -105,43 +107,21 @@ pub struct WebhookAuditHook {
 }
 
 impl WebhookAuditHook {
-    pub fn new(config: WebhookAuditConfig) -> Self {
-        // Warn if enabled but no URL configured.
-        if config.enabled && config.url.is_empty() {
-            ::zeroclaw_log::record!(
-                WARN,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                    .with_attrs(::serde_json::json!({"hook": "webhook-audit"})),
-                "webhook-audit hook is enabled but no URL is configured — audit events will be dropped"
-            );
+    pub fn new(config: WebhookAuditConfig) -> Result<Self, String> {
+        if config.url.is_empty() {
+            return Err("webhook URL is required when webhook audit is enabled".to_string());
         }
-
-        // Validate URL against SSRF if one is provided.
-        if !config.url.is_empty()
-            && let Err(e) = validate_webhook_url(&config.url)
-        {
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(
-                        ::serde_json::json!({"hook": "webhook-audit", "error": format!("{}", e)})
-                    ),
-                "webhook URL validation failed"
-            );
-            panic!("webhook-audit: {e}");
-        }
+        validate_webhook_url(&config.url)?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
-            .expect("failed to build webhook HTTP client");
-        Self {
+            .map_err(|e| format!("failed to build webhook HTTP client: {e}"))?;
+        Ok(Self {
             config,
             client,
             pending_args: Arc::new(Mutex::new(HashMap::new())),
-        }
+        })
     }
 }
 
@@ -239,6 +219,29 @@ fn truncate_args(args: Value, max_bytes: u64) -> Value {
     }
 }
 
+fn scrub_export_string_leaves(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                scrub_export_string_leaves(value);
+            }
+        }
+        Value::Array(items) => {
+            for value in items {
+                scrub_export_string_leaves(value);
+            }
+        }
+        Value::String(value) => *value = scrub_for_export(value),
+        _ => {}
+    }
+}
+
+fn prepare_args_for_export(args: Value, max_bytes: u64) -> Value {
+    let mut scrubbed = scrub_credentials_value(args);
+    scrub_export_string_leaves(&mut scrubbed);
+    truncate_args(scrubbed, max_bytes)
+}
+
 #[async_trait]
 impl HookHandler for WebhookAuditHook {
     fn name(&self) -> &str {
@@ -268,11 +271,6 @@ impl HookHandler for WebhookAuditHook {
     }
 
     async fn on_after_tool_call(&self, tool: &str, result: &ToolResult, duration: Duration) {
-        // Skip if no URL configured.
-        if self.config.url.is_empty() {
-            return;
-        }
-
         // Skip tools that don't match the configured patterns.
         if !matches_any_pattern(&self.config.tool_patterns, tool) {
             return;
@@ -296,7 +294,7 @@ impl HookHandler for WebhookAuditHook {
                 entry
             };
             match raw {
-                Some(a) => truncate_args(a, self.config.max_args_bytes),
+                Some(a) => prepare_args_for_export(a, self.config.max_args_bytes),
                 None => Value::Null,
             }
         } else {
@@ -408,6 +406,7 @@ mod tests {
             include_args,
             max_args_bytes: 4096,
         })
+        .expect("valid webhook audit fixture")
     }
 
     #[tokio::test]
@@ -483,6 +482,71 @@ mod tests {
         assert_eq!(result, args);
     }
 
+    #[test]
+    fn prepare_args_for_export_scrubs_credentials() {
+        let secret = "SUPERSECRETVALUE123";
+        let args = serde_json::json!({"command": format!("echo api_key={secret}")});
+
+        let exported = prepare_args_for_export(args, 0);
+
+        assert!(!exported.to_string().contains(secret));
+    }
+
+    #[test]
+    fn prepare_args_for_export_preserves_structure_for_sensitive_keys() {
+        let secret = "SYNTHETIC-CREDENTIAL-VALUE";
+        let args = serde_json::json!({
+            "request": {
+                "access_token": secret,
+                "status": "ok"
+            },
+            "count": 3
+        });
+
+        let exported = prepare_args_for_export(args, 0);
+
+        assert!(exported.is_object());
+        assert_eq!(exported["request"]["status"], "ok");
+        assert_eq!(exported["count"], 3);
+        assert!(exported["request"]["access_token"].is_string());
+        assert!(!exported.to_string().contains(secret));
+    }
+
+    #[test]
+    fn prepare_args_for_export_scrubs_provider_tokens_and_image_markers() {
+        let provider_token = ["ghp_", "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"].concat();
+        let args = serde_json::json!({
+            "request": {
+                "command": format!("deploy with {provider_token}"),
+                "attachment": "[IMAGE:data:image/png;base64,AAAA]"
+            }
+        });
+
+        let exported = prepare_args_for_export(args, 0);
+
+        assert!(exported.is_object());
+        assert!(!exported.to_string().contains(&provider_token));
+        assert_eq!(
+            exported["request"]["attachment"],
+            "[IMAGE:<image data elided>]"
+        );
+    }
+
+    #[test]
+    fn prepare_args_for_export_scrubs_before_truncation() {
+        let secret = "PLAINVALUE1234567890";
+        let args = serde_json::json!({
+            "credentials": {
+                "primary": secret
+            }
+        });
+
+        let exported = prepare_args_for_export(args, 48);
+
+        assert!(exported.is_object());
+        assert!(!exported.to_string().contains(secret));
+    }
+
     // ── on_after_tool_call tests ─────────────────────────────────
 
     #[tokio::test]
@@ -501,24 +565,32 @@ mod tests {
         assert!(pending.is_empty());
     }
 
-    #[tokio::test]
-    async fn on_after_tool_call_skips_empty_url() {
-        // Empty URL + enabled triggers a warning, but should not panic.
-        let hook = WebhookAuditHook::new(WebhookAuditConfig {
+    #[test]
+    fn constructor_rejects_empty_url_without_panicking() {
+        let result = WebhookAuditHook::new(WebhookAuditConfig {
             enabled: true,
             url: String::new(),
             tool_patterns: vec!["Bash".to_string()],
             include_args: false,
             max_args_bytes: 4096,
         });
-        let result = ToolResult {
-            success: true,
-            output: "ok".into(),
-            error: None,
-        };
-        // Should return immediately without spawning any HTTP request.
-        hook.on_after_tool_call("Bash", &result, Duration::from_millis(5))
-            .await;
+
+        let error = result.err().expect("empty URL must be rejected");
+        assert!(error.contains("URL is required"));
+    }
+
+    #[test]
+    fn constructor_rejects_invalid_url_without_panicking() {
+        let result = WebhookAuditHook::new(WebhookAuditConfig {
+            enabled: true,
+            url: "http://example.com/audit".to_string(),
+            tool_patterns: vec!["Bash".to_string()],
+            include_args: false,
+            max_args_bytes: 4096,
+        });
+
+        let error = result.err().expect("insecure URL must be rejected");
+        assert!(error.contains("must use https"));
     }
 
     // ── URL validation tests ─────────────────────────────────────

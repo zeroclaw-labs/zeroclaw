@@ -62,6 +62,10 @@ cargo test --locked
 # Format and lint (required before PR)
 ./scripts/ci/rust_quality_gate.sh
 
+# Rustdoc warnings (required CI lint step; fatal via .cargo/config.toml).
+# Excludes zeroclaw-desktop — same surface as docs-deploy / xtask build_api.
+cargo doc --no-deps --workspace --exclude zeroclaw-desktop
+
 # Full CI parity in Docker
 ./dev/ci.sh all
 ```

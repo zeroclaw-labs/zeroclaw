@@ -407,12 +407,41 @@ fn has_script_suffix(raw: &str) -> bool {
         .any(|suffix| lowered.ends_with(suffix))
 }
 
+/// Leading bytes of a file that can change an audit verdict.
+///
+/// Only the shebang line is read from a file the audit does not otherwise
+/// parse, and a shebang lives at the very start. Nothing downstream reads
+/// past this point of such a file, which is what lets the skill-load cache
+/// fingerprint them without reading their whole body. Changing this constant
+/// changes how much of each file the cache must digest, so the two must move
+/// together.
+pub(super) const SHEBANG_SNIFF_BYTES: usize = 128;
+
+/// Whether the audit parses this file's entire contents, as opposed to
+/// sniffing its leading bytes.
+///
+/// The skill-load cache resolves against this to decide how much of a file it
+/// must digest, so a file type that gains a full-content reader anywhere on
+/// the load path has to be added here at the same time.
+pub(super) fn audit_reads_full_contents(path: &Path) -> bool {
+    is_markdown_file(path) || is_toml_file(path)
+}
+
 fn has_shell_shebang(path: &Path) -> bool {
-    let Ok(content) = fs::read(path) else {
+    use std::io::Read;
+    // Bounded read: the interpreter is parsed out of the first line, so
+    // slurping a large binary here only to discard it is waste.
+    let Ok(file) = fs::File::open(path) else {
         return false;
     };
-    let prefix = &content[..content.len().min(128)];
-    let shebang_line = String::from_utf8_lossy(prefix)
+    let mut prefix = Vec::with_capacity(SHEBANG_SNIFF_BYTES);
+    if std::io::Read::take(file, SHEBANG_SNIFF_BYTES as u64)
+        .read_to_end(&mut prefix)
+        .is_err()
+    {
+        return false;
+    }
+    let shebang_line = String::from_utf8_lossy(&prefix)
         .lines()
         .next()
         .unwrap_or_default()

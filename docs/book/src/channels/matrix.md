@@ -423,7 +423,39 @@ RUST_LOG=zeroclaw::channels::matrix=debug,matrix_sdk_crypto=debug zeroclaw daemo
 
 {{#streaming channel="Matrix" mode="stream_mode" path="channels.matrix.<alias>.stream_mode"}}
 
-Matrix specifics: in `partial` mode, tool-execution status is shown through the same edit pipeline. In `multi_message` mode each paragraph posts as its own threaded message, and the split is code-fence-aware, so blank lines inside fenced blocks don't break a code block across messages.
+Matrix specifics: in `partial` mode, tool-execution status is shown through the same edit pipeline as answer text. In `single_message` mode, tool/progress status updates are edited into one sliding draft while the final answer is sent as a separate Matrix message. `stream_draft_lines` controls visible progress lines: `0` removes only the line-count limit; it never creates a second progress message. `message_max_bytes` caps both draft and final event content, counting rendered Markdown (including generated HTML) and Matrix reply/edit relation metadata rather than only Markdown source. Oversized progress drops complete oldest lines or entries so the window retains newest activity; an oversized individual item is replaced by a visible alert. The separate final response retains a UTF-8-safe prefix. Progress content is escaped before Markdown rendering, so reasoning remains readable across lines while user/model/tool content cannot introduce Markdown or HTML formatting. Values below `512` use that effective minimum so a non-empty serialized Matrix event can fit. The budget does not apply to approval prompts, system notices, scheduled delivery, or other ordinary sends. Choose a budget below the Matrix event limit. `stream_reasoning` controls provider reasoning visibility in that progress draft: `off` suppresses reasoning-derived draft updates, `status` emits liveness ticks without raw reasoning text, and `full` emits raw provider reasoning text into the progress draft. `stream_draft_delete` controls whether durable progress transcripts are deleted before the final answer is posted; delete failures are logged and final answer delivery still proceeds. Placeholder-only drafts are removed before the final answer even when transcript retention is enabled. In `multi_message` mode each paragraph posts as its own threaded message, and the split is code-fence-aware, so blank lines inside fenced blocks don't break a code block across messages.
+
+`stream_tool_arguments` controls which tool arguments appear in `single_message`
+progress lines. Missing or empty configuration uses conservative per-tool
+defaults; skill wrappers, plugins, MCP tools, and unresolved names show their
+names only. A single `default_base` entry selects `none`, `safe`, or `all`,
+while exact-name tool rules can replace that base or add and remove fields:
+
+```toml
+stream_tool_arguments = [
+    { default_base = "safe", argument_chars = 60 },
+    { tool = "delegate", base = "none", include = ["agent", "background", "prompt"], argument_chars = 0 },
+    { tool = "mock_tool", base = "all", exclude = ["token"] },
+]
+```
+
+Rule order is irrelevant, duplicate tool/default entries are rejected, and an
+omitted rule `base` inherits `default_base`. `include` adds fields after the
+base is selected; `exclude` removes them. Runtime-only fields are never shown,
+credential-named fields are redacted recursively within every selected value,
+and every rendered value passes credential leak detection and one-line
+normalization before it reaches Matrix. Including a composite remains an
+explicit operator disclosure decision, but does not bypass credential
+redaction.
+In `safe` mode, only the recommended top-level scalar arguments are rendered;
+nulls, arrays, and objects are omitted. Selecting `all` or naming an argument
+in `include` is explicit operator opt-in to compact JSON rendering of a
+composite value.
+`argument_chars` on the default entry changes the inherited per-value cap from
+`60`; the same field on a tool rule overrides it for that tool. `0` keeps full
+values while `message_max_bytes` still bounds the rendered draft. Explicit
+`all` applies to unknown tools; use an exact-name rule when enabling arguments
+for only one extension tool.
 
 ## 8. Auto-recovery from corrupted local state
 

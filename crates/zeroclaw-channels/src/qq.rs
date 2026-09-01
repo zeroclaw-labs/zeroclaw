@@ -1211,7 +1211,7 @@ impl QQChannel {
             anyhow::bail!("Download failed ({}): {url}", resp.status());
         }
 
-        let bytes = resp.bytes().await?.to_vec();
+        let bytes = crate::util::read_response_body_limited(resp, QQ_MAX_UPLOAD_BYTES).await?;
         tokio::fs::write(&dest, &bytes).await?;
 
         Ok((dest, bytes))
@@ -2460,6 +2460,51 @@ allowed_users = ["user1"]
         assert!(result.contains("[VOICE:"));
         assert!(result.contains("qq_files/download_"));
         assert!(result.contains(".wav]"));
+    }
+
+    #[tokio::test]
+    async fn oversized_attachment_keeps_remote_marker_without_writing_file() {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            QQ_MAX_UPLOAD_BYTES + 1
+        )
+        .into_bytes();
+        let (server_url, server) = crate::util::spawn_raw_http_response(response, true).await;
+
+        let workspace = tempfile::tempdir().expect("workspace tempdir");
+        let ch = QQChannel::new(
+            "id".into(),
+            "secret".into(),
+            "qq_test_alias",
+            Arc::new(Vec::new),
+        )
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let remote_url = format!("{server_url}/oversized.png");
+        let payload = json!({
+            "attachments": [{
+                "content_type": "image/png",
+                "filename": "oversized.png",
+                "url": remote_url
+            }]
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            composed_content(&ch, &payload),
+        )
+        .await
+        .expect("declared oversize must be rejected before reading the body")
+        .unwrap();
+        server.abort();
+
+        assert!(
+            result.contains(&format!("[IMAGE:{remote_url}]")),
+            "unexpected composed content: {result:?}"
+        );
+        let mut files = tokio::fs::read_dir(workspace.path().join("qq_files"))
+            .await
+            .unwrap();
+        assert!(files.next_entry().await.unwrap().is_none());
     }
 
     #[tokio::test]

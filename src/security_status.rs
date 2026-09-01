@@ -72,10 +72,16 @@ pub struct GatewayStatus {
 pub fn build_report(config: &Config, agent_alias: &str) -> Result<SecurityStatusReport> {
     let resolved = resolve_agent_context(config, agent_alias)?;
     let sandbox_config = sandbox_config_from_policy(&resolved.policy);
+    let sandbox_extra_roots = zeroclaw_runtime::security::SandboxExtraRoots {
+        read_write: resolved.policy.allowed_roots.clone(),
+        read_only: resolved.policy.allowed_roots_read_only.clone(),
+        write_only: resolved.policy.allowed_roots_write_only.clone(),
+    };
     let sandbox = zeroclaw_runtime::security::sandbox_posture(
         &sandbox_config,
         config.runtime.kind.as_wire(),
         Some(&resolved.policy.workspace_dir),
+        &sandbox_extra_roots,
     );
 
     let secret_fields = config.secret_fields();

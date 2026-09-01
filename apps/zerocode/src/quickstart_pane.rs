@@ -3551,6 +3551,98 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quickstart_submission_adapter_preserves_provider_webhook_and_agent_name() {
+        let mut form = complete_form();
+        form.provider_fields
+            .insert("api_key".into(), "placeholder-provider-credential".into());
+        form.channels.push(ChannelDraft {
+            channel_type: "webhook".into(),
+            alias: "incoming".into(),
+            fields: std::collections::HashMap::from([
+                ("secret".into(), "placeholder-webhook-secret".into()),
+                ("port".into(), "18080".into()),
+            ]),
+            mode: SelectorMode::Fresh,
+        });
+
+        let rpc_params = serde_json::json!({
+            "submission": form.to_submission(),
+        });
+
+        assert_eq!(
+            rpc_params.as_object().map(|params| params.len()),
+            Some(1),
+            "quickstart/apply must receive only the submission parameter"
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/model_provider/mode")
+                .and_then(serde_json::Value::as_str),
+            Some("fresh")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/model_provider/value/provider_type")
+                .and_then(serde_json::Value::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/model_provider/value/alias")
+                .and_then(serde_json::Value::as_str),
+            Some("default")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/model_provider/value/model")
+                .and_then(serde_json::Value::as_str),
+            Some("claude-3-5-haiku-20241022")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/model_provider/value/fields/api_key")
+                .and_then(serde_json::Value::as_str),
+            Some("placeholder-provider-credential")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/channels/0/mode")
+                .and_then(serde_json::Value::as_str),
+            Some("fresh")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/channels/0/value/channel_type")
+                .and_then(serde_json::Value::as_str),
+            Some("webhook")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/channels/0/value/alias")
+                .and_then(serde_json::Value::as_str),
+            Some("incoming")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/channels/0/value/fields/secret")
+                .and_then(serde_json::Value::as_str),
+            Some("placeholder-webhook-secret")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/channels/0/value/fields/port")
+                .and_then(serde_json::Value::as_str),
+            Some("18080")
+        );
+        assert_eq!(
+            rpc_params
+                .pointer("/submission/agent/name")
+                .and_then(serde_json::Value::as_str),
+            Some("bob")
+        );
+    }
+
     fn selectable_labels(options: &[PickerOption]) -> Vec<&str> {
         options
             .iter()

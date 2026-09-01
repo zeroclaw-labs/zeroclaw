@@ -65,7 +65,6 @@ export default defineConfig(({ command }) => ({
       "/webhook":        { target: gatewayTarget, changeOrigin: true },
       "/whatsapp":       { target: gatewayTarget, changeOrigin: true },
       "/linq":           { target: gatewayTarget, changeOrigin: true },
-      "/wati":           { target: gatewayTarget, changeOrigin: true },
       "/nextcloud-talk": { target: gatewayTarget, changeOrigin: true },
       "/hooks":          { target: gatewayTarget, changeOrigin: true },
     },

@@ -8,9 +8,20 @@ use std::sync::{Arc, OnceLock, Weak};
 use zeroclaw_api::model_provider::ChatMessage;
 pub use zeroclaw_api::session_keys::sanitize_session_key;
 
-type MutationLock = parking_lot::Mutex<()>;
+#[derive(Default)]
+pub(crate) struct MutationState {
+    migrated: bool,
+    receipt_state_uncertain: bool,
+}
 
-static MUTATION_LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, Weak<MutationLock>>>> =
+pub(crate) type MutationLock = parking_lot::Mutex<MutationState>;
+
+struct MutationLockRecord {
+    lock: Weak<MutationLock>,
+    migrated: bool,
+}
+
+static MUTATION_LOCKS: OnceLock<parking_lot::Mutex<HashMap<PathBuf, MutationLockRecord>>> =
     OnceLock::new();
 
 /// Append-only JSONL session store for channel conversations.
@@ -25,6 +36,19 @@ impl SessionStore {
         let sessions_dir = workspace_dir.join("sessions");
         std::fs::create_dir_all(&sessions_dir)?;
         let mutation_lock = mutation_lock_for(&sessions_dir)?;
+        {
+            let mut state = mutation_lock.lock();
+            match crate::session_sqlite::has_committed_jsonl_import_receipts(workspace_dir) {
+                Ok(true) => mark_session_directory_migrated(&sessions_dir, &mut state)?,
+                Ok(false) => state.receipt_state_uncertain = false,
+                Err(error) => {
+                    state.receipt_state_uncertain = true;
+                    return Err(std::io::Error::other(format!(
+                        "Failed to inspect durable JSONL migration state: {error:#}"
+                    )));
+                }
+            }
+        }
         Ok(Self {
             sessions_dir,
             mutation_lock,
@@ -65,8 +89,18 @@ impl SessionStore {
 
     /// Append a single message to the session JSONL file.
     pub fn append(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         self.append_unlocked(session_key, message)
+    }
+
+    fn mutation_guard(&self) -> std::io::Result<parking_lot::MutexGuard<'_, MutationState>> {
+        let guard = self.mutation_lock.lock();
+        if guard.migrated || guard.receipt_state_uncertain {
+            return Err(std::io::Error::other(
+                "JSONL session store is inactive after SQLite migration",
+            ));
+        }
+        Ok(guard)
     }
 
     fn append_unlocked(&self, session_key: &str, message: &ChatMessage) -> std::io::Result<()> {
@@ -87,7 +121,7 @@ impl SessionStore {
     /// Rewrite approach: load all messages, drop the last, rewrite. This is
     /// O(n) but rollbacks are rare.
     pub fn remove_last(&self, session_key: &str) -> std::io::Result<bool> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let mut messages = self.load(session_key);
         if messages.is_empty() {
             return Ok(false);
@@ -113,7 +147,7 @@ impl SessionStore {
     where
         F: FnOnce(tempfile::NamedTempFile, &Path) -> std::io::Result<()>,
     {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let mut messages = self.load(session_key);
         let Some(last) = messages.last_mut() else {
             return Ok(false);
@@ -125,7 +159,7 @@ impl SessionStore {
 
     /// Compact a session file by rewriting only valid messages (removes corrupt lines).
     pub fn compact(&self, session_key: &str) -> std::io::Result<()> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let messages = self.load(session_key);
         self.rewrite(session_key, &messages)
     }
@@ -160,7 +194,7 @@ impl SessionStore {
     /// Clear all messages from a session by truncating its JSONL file.
     /// The file is preserved (empty) so the session key remains in `list_sessions`.
     pub fn clear_messages(&self, session_key: &str) -> std::io::Result<usize> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let count = self.load(session_key).len();
         if count > 0 {
             self.rewrite(session_key, &[])?;
@@ -170,7 +204,7 @@ impl SessionStore {
 
     /// Delete a session's JSONL file. Returns `true` if the file existed.
     pub fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
-        let _guard = self.mutation_lock.lock();
+        let _guard = self.mutation_guard()?;
         let path = self.session_path(session_key);
         if !path.exists() {
             return Ok(false);
@@ -203,19 +237,62 @@ impl SessionStore {
     }
 }
 
-fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
+pub(crate) fn mutation_lock_for(sessions_dir: &Path) -> std::io::Result<Arc<MutationLock>> {
     let key = sessions_dir.canonicalize()?;
     let registry = MUTATION_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
     let mut locks = registry.lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
+    locks.retain(|_, record| record.migrated || record.lock.strong_count() > 0);
 
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+    if let Some(lock) = locks.get(&key).and_then(|record| record.lock.upgrade()) {
         return Ok(lock);
     }
 
-    let lock = Arc::new(MutationLock::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
+    let migrated = locks.get(&key).is_some_and(|record| record.migrated);
+    let lock = Arc::new(MutationLock::new(MutationState {
+        migrated,
+        receipt_state_uncertain: false,
+    }));
+    locks.insert(
+        key,
+        MutationLockRecord {
+            lock: Arc::downgrade(&lock),
+            migrated,
+        },
+    );
     Ok(lock)
+}
+
+pub(crate) fn mark_session_directory_migrated(
+    sessions_dir: &Path,
+    state: &mut MutationState,
+) -> std::io::Result<()> {
+    state.migrated = true;
+    state.receipt_state_uncertain = false;
+    let key = sessions_dir.canonicalize()?;
+    let registry = MUTATION_LOCKS.get_or_init(|| parking_lot::Mutex::new(HashMap::new()));
+    if let Some(record) = registry.lock().get_mut(&key) {
+        record.migrated = true;
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_session_directory_receipt_state_uncertain(state: &mut MutationState) {
+    state.receipt_state_uncertain = true;
+}
+
+pub(crate) fn clear_session_directory_receipt_state_uncertain(state: &mut MutationState) {
+    state.receipt_state_uncertain = false;
+}
+
+#[cfg(test)]
+pub(crate) fn forget_session_directory_migration_state_for_test(
+    sessions_dir: &Path,
+) -> std::io::Result<()> {
+    let key = sessions_dir.canonicalize()?;
+    if let Some(registry) = MUTATION_LOCKS.get() {
+        registry.lock().remove(&key);
+    }
+    Ok(())
 }
 
 impl SessionBackend for SessionStore {
@@ -537,6 +614,7 @@ mod tests {
         writeln!(file, r#"{{"role":"user","content":"ok"}}"#).unwrap();
         writeln!(file, "corrupt line").unwrap();
         writeln!(file, r#"{{"role":"assistant","content":"hi"}}"#).unwrap();
+        drop(file);
 
         store.compact(key).unwrap();
 

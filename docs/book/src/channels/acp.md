@@ -71,7 +71,7 @@ Every resolved alias, regardless of which step selected it, must name an **enabl
 
 Standalone **`zeroclaw acp`** (stdio subprocess) does not read `?agent=`; use an explicit `agentAlias` or `[acp].default_agent` there instead.
 
-The optional **`cwd`** parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session file-access boundary, it becomes the `workspace_dir` inside the `SecurityPolicy` that all file tools enforce. The agent's persistent data directory (memory, identity, cron) remains the daemon-level `workspace_dir` from config.
+The optional **`cwd`** parameter (aliases: `workspaceDir`, `workspace_dir`) pins the per-session file-access boundary, it becomes the `workspace_dir` inside the `SecurityPolicy` that all file tools enforce. It does **not** relocate the agent's own persistent state: per-agent plaintext state (`MEMORY.md`, `IDENTITY.md`, `SOUL.md`) lives in the resolved **agent workspace** (`agent_workspace_dir(<alias>)`, i.e. `[agents.<alias>]` workspace), which remains an additional permitted root; shared SQLite stores and cron state live under `config.data_dir`. None of these is a single daemon-level `workspace_dir`.
 
 ```json
 → {"jsonrpc":"2.0","id":2,"method":"session/new","params":{
@@ -84,7 +84,9 @@ The optional **`cwd`** parameter (aliases: `workspaceDir`, `workspace_dir`) pins
   }}
 ```
 
-`cwd` is canonicalized on intake, `../` traversal cannot escape the intended root. If `cwd` is omitted, the server uses the daemon's launch directory.
+`cwd` is canonicalized on intake, `../` traversal cannot escape the intended root. An explicit `cwd` is honored exactly as the session boundary, including a narrower subdirectory under the agent's workspace.
+
+If `cwd` is **omitted**, the server uses the resolved agent's workspace directory (`[agents.<alias>]` workspace), not the daemon's launch directory. The one special case is a `cwd` that canonicalizes to the install root itself: clients such as Thunderbolt send `.` as a placeholder, which resolves to the daemon's working directory. That lone placeholder is treated as "no meaningful cwd" and also falls back to the per-agent workspace, so uploads and the tool sandbox stay out of the daemon root. Any other explicit path, including one below the install root, is pinned as given and never widened.
 
 ### `session/prompt`
 
@@ -199,7 +201,10 @@ When a tool requires user approval (via `always_ask` in the autonomy config, or 
   }}
 ```
 
-The server-issued id (`"zc-out-N"`) is always a string prefixed `zc-out-`, disjoint from any integer or string ids the client uses for its own requests.
+The server-issued id (`"zc-out-N"`) is always a string prefixed `zc-out-`.
+Correlation is directional: each peer matches responses only against its own
+pending-request map, so the same textual id may be in flight independently in
+both directions.
 
 Response shape:
 - `{"outcome": {"outcome": "selected", "optionId": "<id>"}}`, user picked an option
@@ -384,7 +389,9 @@ ACP v0 clients (using the flat `{streaming, maxSessions, ...}` initialize respon
 
 ACP inherits the running config's autonomy level. When `[autonomy] level = "supervised"`, medium-risk tool calls trigger approval via the ACP back-channel, a `session/request_permission` outbound request the client must acknowledge. In `full` mode, tool calls execute without approval and `workspace_only` is implicitly disabled (the agent can reach paths outside the session cwd); `forbidden_paths` still apply.
 
-The `cwd` from `session/new` becomes the `SecurityPolicy` workspace boundary used by all file and shell tools for that session. Note: the agent's system prompt currently reflects the daemon's global `workspace_dir` rather than the session `cwd`, this does not affect enforcement, only the directory the model believes it is working in.
+The `cwd` from `session/new` becomes the `SecurityPolicy` workspace boundary used by all file and shell tools for that session. The agent's system prompt reflects that same effective session workspace: the prompt's "Working directory" is rendered from `SecurityPolicy.workspace_dir` (the session `cwd`, or the agent workspace when `cwd` is omitted), while the agent's identity and personality (`IDENTITY.md`, `SOUL.md`) are loaded from the separate agent workspace. The model therefore sees the directory its file and shell tools are actually rooted at.
+
+**Two-root file authority.** Setting the session `cwd` scopes *file and shell tool* paths (read/write/list, shell launch CWD, and embedded-resource `uploads/`) to that directory. It does not make the session an exclusive jail: the resolved **agent workspace remains an allowed root**, so the agent's own resources (skills, identity, and per-agent state under `[agents.<alias>]`) stay reachable regardless of the session `cwd`. In other words, `workspaceDir` controls where *session file operations* are rooted, while the agent workspace continues to back the agent's own config-scoped resources. When `cwd` is omitted (or is the install-root placeholder), the two coincide because the session is rooted at the agent workspace itself.
 
 ## Memory
 

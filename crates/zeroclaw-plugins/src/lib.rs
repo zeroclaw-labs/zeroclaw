@@ -5,7 +5,13 @@
 #[cfg(feature = "plugins-wasmtime")]
 pub mod component;
 #[cfg(feature = "plugins-wasmtime")]
+mod component_config;
+#[cfg(feature = "plugins-wasmtime")]
 mod component_logging;
+#[cfg(feature = "plugins-wasmtime")]
+mod component_secrets;
+pub mod config;
+pub mod egress;
 pub mod endpoint;
 pub mod error;
 pub mod host;
@@ -13,7 +19,11 @@ pub mod instance;
 pub mod registry;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod runtime;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod services;
 pub mod signature;
+#[cfg(feature = "plugins-wasmtime")]
+pub mod wasi_http;
 #[cfg(feature = "plugins-wasmtime")]
 pub mod wasm_channel;
 #[cfg(feature = "plugins-wasmtime")]
@@ -45,6 +55,14 @@ pub struct PluginManifest {
     /// Permissions this plugin requests
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// Draft 2020-12 JSON Schema for this plugin's private config object.
+    /// Required exactly when `config_read` is requested.
+    /// Direct top-level string properties marked `x-secret: true` are withheld
+    /// from public config and served through the scoped secrets import during
+    /// tool execution or channel service calls. Channel calls obtain the
+    /// remaining typed public object through the scoped config import.
+    #[serde(default)]
+    pub config_schema: Option<serde_json::Value>,
     /// Ed25519 signature over the canonical manifest (base64url-encoded).
     /// Set by the plugin publisher when signing the manifest.
     #[serde(default)]
@@ -52,6 +70,28 @@ pub struct PluginManifest {
     /// Hex-encoded Ed25519 public key of the publisher who signed this manifest.
     #[serde(default)]
     pub publisher_key: Option<String>,
+    /// Destinations this plugin declares it needs.
+    ///
+    /// This is a signature-covered **attestation of intent**, never a grant:
+    /// nothing here confers network reach. The effective allowlist is the
+    /// operator's `plugins.entries[].egress_hosts`. Keeping the two apart is
+    /// what shuts the self-grant path — an unsigned component that writes its
+    /// own `[egress]` table still reaches nothing.
+    #[serde(default)]
+    pub egress: PluginEgressDeclaration,
+}
+
+/// The optional `[egress]` table of a plugin manifest.
+///
+/// Absent, empty, and "declares nothing" are the same state, so a manifest that
+/// predates this field parses unchanged and declares no destinations.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PluginEgressDeclaration {
+    /// Exact hosts or `*.suffix` patterns, in the strict egress grammar
+    /// (`zeroclaw_infra::net_guard::normalize_egress_pattern`). Invalid grammar
+    /// rejects the whole manifest at discovery and at install.
+    #[serde(default)]
+    pub hosts: Vec<String>,
 }
 
 /// What a plugin can do.
@@ -76,6 +116,11 @@ pub enum PluginCapability {
 pub enum PluginPermission {
     /// Can make HTTP requests
     HttpClient,
+    /// Can open host-mediated outbound WebSocket connections.
+    #[serde(rename = "websocket_client")]
+    WebSocketClient,
+    /// Can open host-mediated outbound TCP, TLS, and STARTTLS connections.
+    SocketClient,
     /// Can read from the filesystem (within sandbox)
     FileRead,
     /// Can write to the filesystem (within sandbox)

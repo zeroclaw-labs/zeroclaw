@@ -105,13 +105,16 @@ pub struct LocaleEntry {
 
 pub fn locale_entries() -> Vec<LocaleEntry> {
     let path = repo_root().join("locales.toml");
-    let raw = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("locales.toml not found at {}", path.display()));
+    let raw = std::fs::read_to_string(&path);
+    // INVARIANT: xtask runs from this workspace and `locales.toml` is a
+    // checked-in repository input exercised by the mdBook contributor gates.
+    let raw = raw.unwrap_or_else(|_| panic!("locales.toml not found at {}", path.display()));
     let table: toml::Table = raw.parse().expect("locales.toml is invalid TOML");
-    table
-        .get("locale")
-        .and_then(|v| v.as_array())
-        .unwrap_or_else(|| panic!("locales.toml missing [[locale]] entries"))
+    let locales = table.get("locale").and_then(|value| value.as_array());
+    // INVARIANT: the checked-in locale registry uses one or more `[[locale]]`
+    // tables; mdBook generation and locale consistency tests enforce the shape.
+    locales
+        .expect("locales.toml missing [[locale]] entries")
         .iter()
         .filter_map(|entry| {
             let code = entry.get("code")?.as_str()?.to_string();

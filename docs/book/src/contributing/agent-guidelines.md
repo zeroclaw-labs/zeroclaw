@@ -73,18 +73,12 @@ The stability-tier definitions and versioning policy live in [FND-001](../founda
 | `zeroclaw-macros` | Beta | Tightly coupled to the config schema |
 | `zeroclaw-eval` | Experimental | Agent evaluation harness with deterministic replay of LLM trace fixtures |
 | `zeroclaw-spawn` | Beta | Attribution-propagating `tokio::spawn` wrapper layered on `zeroclaw-log` |
-| `robot-kit` | Experimental | Robot control toolkit: drive, vision, speech, sensors, and safety |
-| `aardvark-sys` | Experimental | Low-level FFI bindings for the Total Phase Aardvark adapter; the only crate where `unsafe` is permitted |
 
 Stable components follow the breaking-change policy. Beta components may make breaking changes in a MINOR release with changelog notes. Experimental components carry no stability guarantee. Tiers are promoted, never demoted, through deliberate team decision.
 
-Change-risk routing is:
+Change-risk routing is consequence-based, not path-based. Use the [maintainer label guide](../maintainers/labels.md#risk-labels) for the canonical definitions: `risk:low` covers documentation, fixtures, and mechanical metadata with no production, compatibility, build, release, or governance effect; `risk:medium` covers ordinary behavioral work; and `risk:high` covers concrete trust, credential, compatibility, governance, or release-authority boundaries. `domain:security` is independent from `risk:*` and identifies an effective security boundary.
 
-- **Low:** docs, chores, and tests without behavior changes.
-- **Medium:** most implementation changes without boundary or security impact.
-- **High:** `crates/zeroclaw-runtime/src/`, especially `src/security/`; `crates/zeroclaw-gateway/src/`; `crates/zeroclaw-tools/src/`; `.github/workflows/`; access control; and other trust-boundary changes.
-
-Classify uncertainty upward. Validation and rollback evidence should match the actual blast radius, not only the number of changed lines. Use [How to contribute](./how-to.md) for PR mechanics and [Testing](./testing.md) for the validation taxonomy.
+A PR carrying either `risk:high` or `domain:security` needs deep review and two independent Core Team approvals before merge. Classify uncertainty upward. Validation and rollback evidence should match the actual blast radius, not only the number of changed lines. Use [How to contribute](./how-to.md) for PR mechanics and [Testing](./testing.md) for the validation taxonomy.
 
 ## Skill Discovery
 

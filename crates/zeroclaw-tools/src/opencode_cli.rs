@@ -1,12 +1,15 @@
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::process::Command;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 use zeroclaw_config::policy::ToolOperation;
 use zeroclaw_config::schema::OpenCodeCliConfig;
+
+use crate::coding_cli::{
+    CodingCliCommand, CodingCliExecutionError, CodingCliExecutor, DirectCodingCliExecutor,
+    add_safe_env,
+};
 
 /// Environment variables safe to pass through to the `opencode` subprocess.
 const SAFE_ENV_VARS: &[&str] = &[
@@ -16,11 +19,29 @@ const SAFE_ENV_VARS: &[&str] = &[
 pub struct OpenCodeCliTool {
     security: Arc<SecurityPolicy>,
     config: OpenCodeCliConfig,
+    executor: Arc<dyn CodingCliExecutor>,
 }
 
 impl OpenCodeCliTool {
+    /// Construct a standalone tool that executes directly on the host.
+    ///
+    /// Runtime registries should use `new_with_executor` so the configured
+    /// runtime and sandbox own process execution.
     pub fn new(security: Arc<SecurityPolicy>, config: OpenCodeCliConfig) -> Self {
-        Self { security, config }
+        Self::new_with_executor(security, config, DirectCodingCliExecutor::shared())
+    }
+
+    /// Construct the tool with an injected process executor.
+    pub fn new_with_executor(
+        security: Arc<SecurityPolicy>,
+        config: OpenCodeCliConfig,
+        executor: Arc<dyn CodingCliExecutor>,
+    ) -> Self {
+        Self {
+            security,
+            config,
+            executor,
+        }
     }
 }
 
@@ -55,10 +76,10 @@ impl Tool for OpenCodeCliTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
-        // Enforce act policy
+        // The production wrapper owns accounting; the adapter owns authorization.
         if let Err(error) = self
             .security
-            .enforce_tool_operation(ToolOperation::Act, "opencode_cli")
+            .authorize_tool_operation(ToolOperation::Act, "opencode_cli")
         {
             return Ok(ToolResult {
                 success: false,
@@ -134,36 +155,13 @@ impl Tool for OpenCodeCliTool {
         };
 
         // Build CLI command
-        let mut cmd = Command::new("opencode");
+        let mut cmd = CodingCliCommand::new("opencode", work_dir.clone(), self.config.timeout_secs);
         cmd.arg("run").arg(prompt);
 
-        // Environment: clear everything, pass only safe vars + configured passthrough.
-        cmd.env_clear();
-        for var in SAFE_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-        for var in &self.config.env_passthrough {
-            let trimmed = var.trim();
-            if !trimmed.is_empty()
-                && let Ok(val) = std::env::var(trimmed)
-            {
-                cmd.env(trimmed, val);
-            }
-        }
+        add_safe_env(&mut cmd, SAFE_ENV_VARS, &self.config.env_passthrough);
 
-        cmd.current_dir(&work_dir);
-        // Execute with timeout — use kill_on_drop(true) so the child process
-        // is automatically killed when the future is dropped on timeout,
-        // preventing zombie processes.
-        let timeout = Duration::from_secs(self.config.timeout_secs);
-        cmd.kill_on_drop(true);
-
-        let result = tokio::time::timeout(timeout, cmd.output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
+        match self.executor.output(cmd).await {
+            Ok(output) => {
                 let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -187,7 +185,7 @@ impl Tool for OpenCodeCliTool {
                     },
                 })
             }
-            Ok(Err(e)) => {
+            Err(CodingCliExecutionError::Io(e)) => {
                 let err_msg = e.to_string();
                 let msg = if err_msg.contains("No such file or directory")
                     || err_msg.contains("not found")
@@ -203,18 +201,19 @@ impl Tool for OpenCodeCliTool {
                     error: Some(msg),
                 })
             }
-            Err(_) => {
-                // Timeout — kill_on_drop(true) ensures the child is killed
-                // when the future is dropped.
-                Ok(ToolResult {
-                    success: false,
-                    output: ToolOutput::default(),
-                    error: Some(format!(
-                        "OpenCode CLI timed out after {}s and was killed",
-                        self.config.timeout_secs
-                    )),
-                })
-            }
+            Err(CodingCliExecutionError::Timeout) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "OpenCode CLI timed out after {}s and was killed",
+                    self.config.timeout_secs
+                )),
+            }),
+            Err(CodingCliExecutionError::Prepare(e)) => Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!("Failed to prepare opencode execution: {e}")),
+            }),
         }
     }
 }
@@ -266,7 +265,10 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });
-        let tool = OpenCodeCliTool::new(security, test_config());
+        let tool = crate::wrappers::RateLimitedTool::new(
+            OpenCodeCliTool::new(security.clone(), test_config()),
+            security,
+        );
         let result = tool
             .execute(json!({"prompt": "hello"}))
             .await

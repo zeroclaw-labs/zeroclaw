@@ -1,9 +1,21 @@
 //! Auto-detection of available security features
 
 use crate::security::traits::Sandbox;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use zeroclaw_config::schema::{SandboxBackend, SandboxConfig};
+
+/// Extra filesystem roots beyond the primary workspace that a sandbox should
+/// also grant access to, mirroring `SecurityPolicy`'s allowed-roots tiers
+/// (`allowed_roots`, `allowed_roots_read_only`, `allowed_roots_write_only`).
+/// Only backends that build per-path rulesets (currently Landlock) consume
+/// this; others ignore it.
+#[derive(Debug, Clone, Default)]
+pub struct SandboxExtraRoots {
+    pub read_write: Vec<PathBuf>,
+    pub read_only: Vec<PathBuf>,
+    pub write_only: Vec<PathBuf>,
+}
 
 const NOOP_DESCRIPTION: &str = "No sandboxing (application-layer security only)";
 const LANDLOCK_DESCRIPTION: &str = "Linux kernel LSM sandboxing (filesystem access control)";
@@ -21,12 +33,25 @@ pub struct SandboxPosture {
     pub fallback: bool,
 }
 
-/// Inspect sandbox backend selection without constructing a sandbox instance.
+/// Inspect sandbox backend selection without returning a usable sandbox.
+///
+/// This does not enforce anything, but on Linux it is **not** a minimal or
+/// side-effect-free probe: `landlock_available` reaches
+/// `LandlockSandbox::with_roots`, which builds the full ruleset execution will
+/// use — opening every configured path and emitting the same DEBUG/WARN
+/// diagnostics for absent, unopenable, or unenforceable roots. That is
+/// deliberate. Deciding availability from a cheaper probe is what let posture
+/// report a backend as active while every subsequent spawn failed; validating
+/// through the real construction keeps the two answers in step.
+///
+/// The ruleset is dropped without `restrict_self`, so the calling process is
+/// never confined.
 #[must_use]
 pub fn sandbox_posture(
     sandbox: &SandboxConfig,
     runtime_kind: &str,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
 ) -> SandboxPosture {
     let requested_backend = sandbox_backend_name(&sandbox.backend);
     if matches!(sandbox.backend, SandboxBackend::None) || sandbox.enabled == Some(false) {
@@ -34,7 +59,7 @@ pub fn sandbox_posture(
     }
 
     let active_backend =
-        configured_backend_selection(&sandbox.backend, runtime_kind, workspace_dir);
+        configured_backend_selection(&sandbox.backend, runtime_kind, workspace_dir, extra_roots);
 
     sandbox_posture_result(
         requested_backend,
@@ -106,28 +131,37 @@ fn configured_backend_selection(
     backend: &SandboxBackend,
     runtime_kind: &str,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
 ) -> SelectedSandboxBackend {
     if matches!(backend, SandboxBackend::Auto) {
-        return detect_best_backend(runtime_kind, workspace_dir);
+        return detect_best_backend(runtime_kind, workspace_dir, extra_roots);
     }
 
     SelectedSandboxBackend::from_config(backend)
-        .filter(|selected| sandbox_backend_available(*selected, workspace_dir))
+        .filter(|selected| sandbox_backend_available(*selected, workspace_dir, extra_roots))
         .unwrap_or(SelectedSandboxBackend::None)
 }
 
-fn detect_best_backend(runtime_kind: &str, workspace_dir: Option<&Path>) -> SelectedSandboxBackend {
+fn detect_best_backend(
+    runtime_kind: &str,
+    workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
+) -> SelectedSandboxBackend {
     let skip_docker = runtime_kind == "native";
     #[cfg(target_os = "linux")]
     {
         #[cfg(feature = "sandbox-landlock")]
         {
-            if sandbox_backend_available(SelectedSandboxBackend::Landlock, workspace_dir) {
+            if sandbox_backend_available(
+                SelectedSandboxBackend::Landlock,
+                workspace_dir,
+                extra_roots,
+            ) {
                 return SelectedSandboxBackend::Landlock;
             }
         }
 
-        if sandbox_backend_available(SelectedSandboxBackend::Firejail, workspace_dir) {
+        if sandbox_backend_available(SelectedSandboxBackend::Firejail, workspace_dir, extra_roots) {
             return SelectedSandboxBackend::Firejail;
         }
     }
@@ -136,17 +170,27 @@ fn detect_best_backend(runtime_kind: &str, workspace_dir: Option<&Path>) -> Sele
     {
         #[cfg(feature = "sandbox-bubblewrap")]
         {
-            if sandbox_backend_available(SelectedSandboxBackend::Bubblewrap, workspace_dir) {
+            if sandbox_backend_available(
+                SelectedSandboxBackend::Bubblewrap,
+                workspace_dir,
+                extra_roots,
+            ) {
                 return SelectedSandboxBackend::Bubblewrap;
             }
         }
 
-        if sandbox_backend_available(SelectedSandboxBackend::SandboxExec, workspace_dir) {
+        if sandbox_backend_available(
+            SelectedSandboxBackend::SandboxExec,
+            workspace_dir,
+            extra_roots,
+        ) {
             return SelectedSandboxBackend::SandboxExec;
         }
     }
 
-    if !skip_docker && sandbox_backend_available(SelectedSandboxBackend::Docker, workspace_dir) {
+    if !skip_docker
+        && sandbox_backend_available(SelectedSandboxBackend::Docker, workspace_dir, extra_roots)
+    {
         return SelectedSandboxBackend::Docker;
     }
 
@@ -156,10 +200,11 @@ fn detect_best_backend(runtime_kind: &str, workspace_dir: Option<&Path>) -> Sele
 fn sandbox_backend_available(
     backend: SelectedSandboxBackend,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
 ) -> bool {
     match backend {
         SelectedSandboxBackend::None => true,
-        SelectedSandboxBackend::Landlock => landlock_available(workspace_dir),
+        SelectedSandboxBackend::Landlock => landlock_available(workspace_dir, extra_roots),
         SelectedSandboxBackend::Firejail => {
             #[cfg(target_os = "linux")]
             {
@@ -213,12 +258,18 @@ fn seatbelt_available() -> bool {
 }
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
-fn landlock_available(workspace_dir: Option<&Path>) -> bool {
-    super::landlock::LandlockSandbox::with_workspace(workspace_dir.map(Path::to_path_buf)).is_ok()
+fn landlock_available(workspace_dir: Option<&Path>, extra_roots: &SandboxExtraRoots) -> bool {
+    super::landlock::LandlockSandbox::with_roots(
+        workspace_dir.map(Path::to_path_buf),
+        extra_roots.read_write.clone(),
+        extra_roots.read_only.clone(),
+        extra_roots.write_only.clone(),
+    )
+    .is_ok()
 }
 
 #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
-fn landlock_available(_workspace_dir: Option<&Path>) -> bool {
+fn landlock_available(_workspace_dir: Option<&Path>, _extra_roots: &SandboxExtraRoots) -> bool {
     false
 }
 
@@ -238,6 +289,7 @@ pub fn create_sandbox(
     sandbox: &SandboxConfig,
     runtime_kind: &str,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
 ) -> Arc<dyn Sandbox> {
     let backend = &sandbox.backend;
 
@@ -248,11 +300,12 @@ pub fn create_sandbox(
 
     match backend {
         SandboxBackend::Auto | SandboxBackend::None => {
-            detect_best_sandbox(runtime_kind, workspace_dir)
+            detect_best_sandbox(runtime_kind, workspace_dir, extra_roots)
         }
         requested => {
-            let selected = configured_backend_selection(requested, runtime_kind, workspace_dir);
-            if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
+            let selected =
+                configured_backend_selection(requested, runtime_kind, workspace_dir, extra_roots);
+            if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots) {
                 return sandbox;
             }
             log_requested_backend_unavailable(selected_backend_label(requested));
@@ -261,9 +314,13 @@ pub fn create_sandbox(
     }
 }
 
-fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<dyn Sandbox> {
-    let selected = detect_best_backend(runtime_kind, workspace_dir);
-    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir) {
+fn detect_best_sandbox(
+    runtime_kind: &str,
+    workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
+) -> Arc<dyn Sandbox> {
+    let selected = detect_best_backend(runtime_kind, workspace_dir, extra_roots);
+    if let Some(sandbox) = create_selected_sandbox(selected, workspace_dir, extra_roots) {
         log_auto_backend_selection(selected, runtime_kind);
         return sandbox;
     }
@@ -275,20 +332,29 @@ fn detect_best_sandbox(runtime_kind: &str, workspace_dir: Option<&Path>) -> Arc<
 fn create_selected_sandbox(
     selected: SelectedSandboxBackend,
     workspace_dir: Option<&Path>,
+    extra_roots: &SandboxExtraRoots,
 ) -> Option<Arc<dyn Sandbox>> {
     match selected {
         SelectedSandboxBackend::None => None,
         SelectedSandboxBackend::Landlock => {
             #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
             {
-                super::landlock::LandlockSandbox::with_workspace(
+                super::landlock::LandlockSandbox::with_roots(
                     workspace_dir.map(Path::to_path_buf),
+                    extra_roots.read_write.clone(),
+                    extra_roots.read_only.clone(),
+                    extra_roots.write_only.clone(),
                 )
                 .map(|sandbox| Arc::new(sandbox) as Arc<dyn Sandbox>)
                 .ok()
             }
             #[cfg(not(all(feature = "sandbox-landlock", target_os = "linux")))]
             {
+                // Landlock is the only backend that consumes the extra roots, so
+                // without it the parameter is genuinely unused. Bind it here to
+                // keep the signature uniform across cfgs without tripping
+                // `-D warnings` on the feature-disabled build.
+                let _ = extra_roots;
                 None
             }
         }
@@ -466,7 +532,7 @@ mod tests {
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox("", None);
+        let sandbox = detect_best_sandbox("", None, &SandboxExtraRoots::default());
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
     }
@@ -478,7 +544,7 @@ mod tests {
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "", None, &SandboxExtraRoots::default());
         assert_eq!(sandbox.name(), "none");
     }
 
@@ -489,7 +555,7 @@ mod tests {
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
         };
-        let posture = sandbox_posture(&sandbox_cfg, "", None);
+        let posture = sandbox_posture(&sandbox_cfg, "", None, &SandboxExtraRoots::default());
         assert_eq!(posture.requested_backend, "none");
         assert_eq!(posture.active_backend, "none");
         assert!(!posture.fallback);
@@ -502,7 +568,7 @@ mod tests {
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "", None, &SandboxExtraRoots::default());
         // Should return some sandbox (at least NoopSandbox)
         assert!(sandbox.is_available());
     }
@@ -512,7 +578,7 @@ mod tests {
         // When runtime.kind = "native", Docker must be skipped in auto-detection
         // even when Docker is installed on the host. The sandbox must be
         // NoopSandbox or something OS-native (Landlock, Firejail, Seatbelt).
-        let sandbox = detect_best_sandbox("native", None);
+        let sandbox = detect_best_sandbox("native", None, &SandboxExtraRoots::default());
         assert_ne!(sandbox.name(), "docker");
     }
 
@@ -523,7 +589,7 @@ mod tests {
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let posture = sandbox_posture(&sandbox_cfg, "native", None);
+        let posture = sandbox_posture(&sandbox_cfg, "native", None, &SandboxExtraRoots::default());
         assert_ne!(posture.active_backend, "docker");
     }
 
@@ -534,8 +600,8 @@ mod tests {
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
-        let posture = sandbox_posture(&sandbox_cfg, "native", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "native", None, &SandboxExtraRoots::default());
+        let posture = sandbox_posture(&sandbox_cfg, "native", None, &SandboxExtraRoots::default());
 
         assert_eq!(posture.active_backend, sandbox.name());
     }
@@ -549,7 +615,7 @@ mod tests {
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
         };
-        let sandbox = create_sandbox(&sandbox_cfg, "native", None);
+        let sandbox = create_sandbox(&sandbox_cfg, "native", None, &SandboxExtraRoots::default());
         // If Docker is available, it will be selected; if not, NoopSandbox fallback.
         assert!(sandbox.is_available());
     }

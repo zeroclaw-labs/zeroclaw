@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = ROOT / ".github/workflows/release-stable-manual.yml"
 ATTEST_ACTION_REF = (
-    "actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1"
+    "actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2"
 )
 WORKFLOW = WORKFLOW_PATH.read_text(encoding="utf-8")
 

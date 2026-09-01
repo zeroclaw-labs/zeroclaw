@@ -29,8 +29,8 @@ macro_rules! record {
 macro_rules! attribution_span {
     ($attributable:expr) => {{
         let __zc_thing = $attributable;
-        let __zc_role = ::zeroclaw_api::attribution::Attributable::role(__zc_thing);
-        let __zc_alias = ::zeroclaw_api::attribution::Attributable::alias(__zc_thing);
+        let __zc_role = $crate::__private::zeroclaw_api::attribution::Attributable::role(__zc_thing);
+        let __zc_alias = $crate::__private::zeroclaw_api::attribution::Attributable::alias(__zc_thing);
         $crate::__private::tracing::info_span!(
             target: "zeroclaw_log_internal_attribution",
             "zeroclaw_attribution",
