@@ -3632,7 +3632,7 @@ mod tests {
                 sent_tx
                     .send((recipient, message))
                     .await
-                    .map_err(|e| anyhow::anyhow!("reaction test hook closed: {e}"))
+                    .map_err(|e| anyhow::Error::msg(format!("reaction test hook closed: {e}")))
             })
         }));
 
