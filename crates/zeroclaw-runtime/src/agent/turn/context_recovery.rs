@@ -13,6 +13,7 @@ use zeroclaw_providers::ChatMessage;
 /// `llm_response` failure log line.
 pub(crate) fn record_llm_failure(
     ctx: &TurnCtx<'_>,
+    model: &str,
     llm_started_at: Instant,
     iteration: usize,
     e: &anyhow::Error,
@@ -26,7 +27,7 @@ pub(crate) fn record_llm_failure(
     };
     ctx.observer.record_event(&ObserverEvent::LlmResponse {
         model_provider: ctx.provider_name.to_string(),
-        model: ctx.model.to_string(),
+        model: model.to_string(),
         duration: llm_started_at.elapsed(),
         success: false,
         error_message: Some(safe_error.clone()),
@@ -46,7 +47,7 @@ pub(crate) fn record_llm_failure(
             .with_outcome(::zeroclaw_log::EventOutcome::Failure)
             .with_duration(u64::try_from(llm_started_at.elapsed().as_millis()).unwrap_or(u64::MAX))
             .with_attrs(::serde_json::json!({
-                "model": ctx.model,
+                "model": model,
                 "iteration": iteration + 1,
                 "error": safe_error,
                 "trace_id": ctx.turn_id,

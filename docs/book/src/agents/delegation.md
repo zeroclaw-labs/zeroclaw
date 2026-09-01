@@ -85,7 +85,7 @@ What CAN be made deterministic is **availability**: tools that aren't in the par
 
 What's verifiable end-to-end:
 
-1. The literal output strings the tool returns to the model on each path (success, refusal, failure). Quoted verbatim below, sourced from `tools/spawn_subagent.rs` and `tools/delegate.rs`.
+1. Protocol-owned tool output and refusal strings are literal Rust contracts. User-visible terminal-completion failure delivery is a Fluent catalog contract: the English source is named below, and a non-English catalog or disk override that defines the same key may render it differently.
 2. The literal config knobs that change behavior (`allowed_tools`, `max_delegation_depth`, etc.).
 3. The structured tracing span shape that scopes everything emitted during the child run.
 
@@ -171,29 +171,39 @@ If the target agent's `[runtime_profiles.<target>].agentic = true`, `delegate` b
 
 This policy lives on the target, not the caller. Same-profile peers use the shared risk profile. Explicit cross-profile delegates use the target's risk profile after the reachability and delegation-policy gates. Bounded agentic delegates receive only the caller-capped tool registry intersected with the target's tool policy; independent agentic delegates receive the target-owned tool registry. A missing target risk profile refuses before the sub-loop starts. A configured profile that leaves zero executable child tools still permits a normal model turn with no tools.
 
+When the target's configured Reliable provider chain mixes native-tool-capable and text-only candidates, `strict_tool_parsing = false` uses one text/XML tool protocol for the whole agentic turn so every reachable fallback can execute tools. If effective tools remain and `strict_tool_parsing = true`, ZeroClaw rejects the mixed chain before making a provider request because strict parsing forbids that text/XML fallback protocol. Uniform chains are unchanged: all-native chains use native tool transport, while deliberately all-text chains follow the configured text-tool policy.
+
 ### `delegate`: output strings the model sees
 
-Exact, sourced from `crates/zeroclaw-runtime/src/tools/delegate.rs`.
+User-visible failure strings are localized Fluent messages. Their English source
+of truth is `crates/zeroclaw-runtime/locales/en/cli.ftl`; examples below show
+the current English catalog values, not a wire-level string contract. The
+remaining listed strings are protocol/tool outputs unless this section labels
+them as Fluent keys.
 
-1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by the target agent's response. If the target returned an empty string, the body is the literal `[Empty response]`.
-2. Synchronous failure: error field begins with `Agent '<target>' failed: <wrapped error>`.
-3. Synchronous timeout (when the target's runtime profile sets `delegation_timeout_secs`): error field is `Agent '<target>' timed out after <N>s`.
-4. Background spawn success: output is the three-line literal
+1. Synchronous success: output begins with `[Agent '<target>' (<provider_type>/<model>)]\n` followed by a non-empty target agent response. When the target recovers through a configured provider fallback, its header instead identifies the requested and served provider/model, for example `[Agent 'reviewer' (requested: anthropic.primary/claude; served: openai.terra/gpt-5.6-terra, agentic)]`. For an agentic target, this attribution describes the model request that produced the final response, not an earlier request that only produced a tool call. The result also ends with the localized `delegate-provider-fallback-warning`. In English: `Warning: The delegated agent recovered through a provider fallback. Provider failure details were logged and omitted from this result.` This attribution and warning belong to the delegated result; they must not be presented as a fallback of the calling agent. They intentionally omit rejected-provider error details, endpoints, and credentials. Retrying the same configured candidate does not produce this warning; reaching a later configured candidate does, even when its provider and model labels match the first candidate.
+2. A terminal empty response is a synchronous failure: its error field uses
+   `cli-delegate-error-invalid-semantic-completion`, with `agent_name` set to
+   the target. In English: `Agent '<target>' failed: model provider returned an
+   invalid semantic completion.`
+3. Other synchronous failures: error field begins with `Agent '<target>' failed: <wrapped error>`. If every configured provider candidate fails, `<wrapped error>` is Reliable's ordered safe summary of the failure events, retry count, failure class, phase, and fixed remediation hint. Provider response bodies, endpoints, aliases, models, and credentials are not returned to the calling agent; investigate provider-attempt logs through the installation's normal operator logging policy when more detail is needed. The result remains an error, not a recovery warning.
+4. Synchronous timeout (when the target's runtime profile sets `delegation_timeout_secs`): error field is `Agent '<target>' timed out after <N>s`.
+5. Background spawn success: output is the three-line literal
    ```text
    Background task started for agent '<target>'.
    task_id: <uuid>
    Use action='check_result' with task_id='<uuid>' to retrieve the result.
    ```
-   The result file lives at `<workspace>/delegate_results/<uuid>.json`. While running, the file's `status` field is `running`; terminal states are `completed`, `failed`, or `cancelled`.
-5. `action="check_result"` with an unknown task id: error is `No result found for task_id '<uuid>'`.
-6. `action="await_sessions"` with `task_ids: [<uuid>, ...]` waits for multiple background result files at once. The output is a JSON object with `status` (`complete` or `timeout`), `completed`, `pending`, `missing`, `failed`, and `results`. `timeout_ms` defaults to 30000 and is capped at 120000; on timeout the tool returns partial results and an error saying one or more tasks are still pending or missing. Duplicate task IDs are rejected.
-7. Parallel fan-out output: begins with `[Parallel delegation: <N> agents]\n\n`, followed by per-agent blocks separated by `\n\n`, each block beginning with `--- <target> (success=<bool>) ---\n`. On per-agent failure the inner block is `--- <target> (success=false) ---\nError: <wrapped error>`.
-8. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
-9. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
-10. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
-11. Independent target whose risk profile has `always_ask` entries: error is `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".`
-12. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
-13. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
+   The result file lives at `<workspace>/delegate_results/<uuid>.json`. While running, the file's `status` field is `running`; terminal states are `completed`, `failed`, or `cancelled`. A completed task that recovered through a configured provider fallback stores the same requested-versus-served attribution and generic recovery warning in its `output`; retrieve it with `check_result` or `await_sessions`. A failed task stores the same safe terminal summary as synchronous delegation, not provider response details.
+6. `action="check_result"` with an unknown task id: error is `No result found for task_id '<uuid>'`.
+7. `action="await_sessions"` with `task_ids: [<uuid>, ...]` waits for multiple background result files at once. The output is a JSON object with `status` (`complete` or `timeout`), `completed`, `pending`, `missing`, `failed`, and `results`. `timeout_ms` defaults to 30000 and is capped at 120000; on timeout the tool returns partial results and an error saying one or more tasks are still pending or missing. Duplicate task IDs are rejected.
+8. Parallel fan-out output: begins with `[Parallel delegation: <N> agents]\n\n`, followed by per-agent blocks separated by `\n\n`, each block beginning with `--- <target> (success=<bool>) ---\n`. A recovered target keeps its requested-versus-served attribution and generic fallback warning inside its own block. On per-agent failure the inner block is `--- <target> (success=false) ---\nError: <wrapped error>`.
+9. Unknown target agent: error is `Unknown agent '<target>'. Available agents: <comma-separated list>`.
+10. Depth exceeded (controlled by the parent's `runtime_profile.max_delegation_depth`, default 3): error is `Delegation depth limit reached (<depth>/<max>).`
+11. Unknown action: error is `Unknown action '<value>'. Use delegate/check_result/list_results/cancel_task/await_sessions.`
+12. Independent target whose risk profile has `always_ask` entries: error is `delegate target "<target>" cannot run in independent mode from "<caller>": risk profile "<profile>" has always_ask entries (<list>). See ZeroClaw docs, "Delegation & SubAgents" > "What's not supported".`
+13. Agentic target with a missing target risk profile: error is `Agent '<target>' is agentic but risk_profile '<target_profile>' is not configured`.
+14. Agentic target with zero executable child tools: no error is emitted for the empty tool set itself; the target receives a normal model turn without tools.
 
 ### `delegate`: how to verify it actually fired
 

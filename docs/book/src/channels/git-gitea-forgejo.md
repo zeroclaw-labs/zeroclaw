@@ -58,7 +58,7 @@ For the full field reference, see the [Git channel](./git.md#configure) page.
 
 ## 5. Verify
 
-The git channel is **not** in the lean default build. Build it with `--features channel-git` (or the broader `channels-full`):
+The Git channel is included in standard distribution artifacts, but not in the lean Cargo default. For a custom source build, include `channel-git` (and `agent-runtime` when disabling default features):
 
 ```bash
 cargo build --features channel-git

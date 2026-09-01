@@ -66,6 +66,27 @@ Per-server fields (`[[mcp.servers]]`), generated from the schema:
 
 `tool_timeout_secs` is an optional per-call timeout; it must be greater than 0 and is capped at 600 seconds.
 
+### Custom CA trust
+
+For an HTTP or SSE server whose certificate is issued by a private CA, set
+`tls_ca_cert_path` to an absolute path containing one or more PEM-encoded CA
+certificates. The configured certificates are added to the default trust store;
+certificate-chain, expiry, and hostname verification remain enabled.
+
+A relative, missing, unreadable, empty, oversized, non-regular, or invalid CA
+file is a hard connection error for that server. The path must resolve to a
+regular file no larger than 1 MiB. Symlinks are followed, so certificate
+rotation and mounted-secret layouts that publish the bundle through a symlink
+work as configured; the resolved file is validated after it is opened, and a
+symlink that resolves to a directory, device, or FIFO is rejected. ZeroClaw
+never disables verification or silently
+falls back when this field is set. The configured server URL and any message
+endpoint advertised by an SSE server must use `https://`; plaintext URLs and
+downgrade redirects are rejected before request headers or content are sent.
+The value is applied when the MCP session starts; restart the affected session
+after changing it. Remove the field and restart the session to return to the
+default trust store. Stdio servers ignore it.
+
 ## Top-level fields
 
 {{#config-fields mcp}}
@@ -156,6 +177,35 @@ empty, so servers without it are unaffected.
 
 Pinned content is read once per run (no live refresh) and is labeled
 `trust="untrusted-external"` so the model treats it as data, not instructions.
+
+### Embedded resource blobs in tool results
+
+When an MCP `tools/call` result includes a content item shaped as
+`type: "resource"` with a nested `blob` (base64), ZeroClaw does **not** dump that
+base64 into the model context. Instead it materializes the bytes under the
+session workspace `uploads/` directory (same shared helper and 10 MB limit as
+ACP inbound `resource.blob`) and replaces the model-facing tool output with
+non-blob provenance text plus a `[Document: …]` or `[IMAGE:…]` marker. This is
+gated by content shape, not by tool name. Materialization does not auto-deliver
+the file to ACP clients; the agent still calls `deliver_file` when outbound
+delivery is needed. See [ACP `session/prompt` blob intake](../channels/acp.md#sessionprompt).
+
+Because the result comes from an untrusted server, two per-call bounds are
+enforced before any blob is decoded, hashed, or written: at most **64** resource
+blobs per `tools/call` result, and an estimated aggregate decoded size of at most
+**10 MiB** across all of them. A result that exceeds either bound has every
+resource blob degraded to an `[attachment unavailable: …]` marker and writes
+nothing to disk, so an array of many empty or tiny blobs cannot force per-item
+work. Each individual blob is still bounded by the same 10 MB per-file limit.
+
+Separate from these *decoded* budgets, each HTTP/SSE MCP server also has a
+transport-level response-body cap, `max_response_bytes`, enforced on the raw
+*encoded* wire bytes before the body is parsed so a server cannot force an
+unbounded read. It is not the 10 MiB decoded limit above: it defaults to
+**16,078,168 bytes**, the base64 expansion of the 10 MiB decoded aggregate plus
+JSON-RPC envelope headroom, so a valid near-limit blob still reaches
+materialization. Set `max_response_bytes` on a server to override it; `0` or
+leaving it unset uses that default.
 
 ### Security
 

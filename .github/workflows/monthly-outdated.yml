@@ -36,7 +36,7 @@ jobs:
           toolchain: 1.96.1
 
       - name: Install cargo-outdated
-        run: cargo install cargo-outdated@0.16.0 --locked
+        run: cargo install cargo-outdated@0.19.0 --locked
 
       - name: Run outdated check
         id: scan
@@ -44,6 +44,8 @@ jobs:
         shell: bash
         run: |
           OUTPUT_FILE="${{ runner.temp }}/outdated-output.txt"
+          JSON_FILE="${{ runner.temp }}/outdated-output.json"
+          ERROR_FILE="${{ runner.temp }}/outdated-error.txt"
 
           # Write header
           {
@@ -56,23 +58,36 @@ jobs:
             echo
           } > "$OUTPUT_FILE"
 
-          # Run outdated with exit code capture (exit 1 = outdated found — expected)
+          # Use a dedicated findings code so cargo-outdated's fatal exit 1
+          # cannot be mistaken for a successful dependency report.
           set +e
-          cargo outdated --workspace --exit-code 1 &>> "$OUTPUT_FILE"
-          exit_code=$?
+          cargo outdated --workspace --format json --exit-code 10 > "$JSON_FILE" 2> "$ERROR_FILE"
+          scanner_exit_code=$?
           set -e
+          cat "$ERROR_FILE" >&2
 
-          echo "scan_exit_code=$exit_code" >> "$GITHUB_OUTPUT"
-
-          # exit > 1 = crash/network error — don't create garbage issue
-          if [ "$exit_code" -gt 1 ]; then
-            echo "::error::cargo outdated crashed with exit code $exit_code. Check the step log for details."
+          if scan_result=$(bash scripts/ci/monthly_outdated_result.sh classify "$scanner_exit_code" "$JSON_FILE"); then
+            if [[ "$scan_result" == "outdated" ]]; then
+              bash scripts/ci/monthly_outdated_result.sh render "$JSON_FILE" >> "$OUTPUT_FILE"
+            fi
+          else
+            scan_result="failure"
+            cat "$ERROR_FILE" >> "$OUTPUT_FILE"
           fi
-          exit "$exit_code"
+
+          echo "scan_result=$scan_result" >> "$GITHUB_OUTPUT"
+          echo "scanner_exit_code=$scanner_exit_code" >> "$GITHUB_OUTPUT"
+
+          case "$scan_result" in
+            clean) exit 0 ;;
+            outdated) exit 1 ;;
+            failure) exit 2 ;;
+            *) echo "::error::Unexpected scan result: $scan_result"; exit 2 ;;
+          esac
 
       - name: Open issue on outdated dependencies
         id: outdated_issue
-        if: steps.scan.outputs.scan_exit_code == '1'
+        if: steps.scan.outputs.scan_result == 'outdated'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -119,18 +134,19 @@ jobs:
           echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
 
       - name: Propagate scan failure
-        if: steps.scan.outputs.scan_exit_code != '0'
+        if: steps.scan.outputs.scan_result != 'clean'
         env:
           ISSUE_URL: ${{ steps.outdated_issue.outputs.issue_url }}
-          SCAN_EXIT_CODE: ${{ steps.scan.outputs.scan_exit_code }}
+          SCAN_RESULT: ${{ steps.scan.outputs.scan_result }}
+          SCANNER_EXIT_CODE: ${{ steps.scan.outputs.scanner_exit_code }}
         run: |
-          if [[ "$SCAN_EXIT_CODE" == "1" ]]; then
+          if [[ "$SCAN_RESULT" == "outdated" ]]; then
             if [[ -n "$ISSUE_URL" ]]; then
               echo "::error::Outdated dependencies detected. See $ISSUE_URL for details."
             else
               echo "::error::Outdated dependencies detected. Repository issues are disabled or issue creation was skipped; inspect this workflow log for details."
             fi
           else
-            echo "::error::cargo outdated failed with exit code $SCAN_EXIT_CODE. Inspect the scan step log for details."
+            echo "::error::cargo outdated failed with exit code $SCANNER_EXIT_CODE. Inspect the scan step log for details."
           fi
           exit 1

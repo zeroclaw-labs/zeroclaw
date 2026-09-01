@@ -141,6 +141,9 @@ impl Tool for SopExecuteTool {
                     SopRunAction::Completed { run_id, sop_name } => {
                         format!("SOP '{sop_name}' run {run_id} completed immediately (no steps).")
                     }
+                    SopRunAction::Cancelled { run_id, sop_name } => {
+                        format!("SOP '{sop_name}' run {run_id} was cancelled.")
+                    }
                     SopRunAction::Failed { run_id, reason, .. } => {
                         format!("SOP run {run_id} failed: {reason}")
                     }
@@ -186,6 +189,7 @@ fn action_run_id(action: &SopRunAction) -> Option<&str> {
         SopRunAction::ExecuteStep { run_id, .. }
         | SopRunAction::WaitApproval { run_id, .. }
         | SopRunAction::Completed { run_id, .. }
+        | SopRunAction::Cancelled { run_id, .. }
         | SopRunAction::Failed { run_id, .. }
         | SopRunAction::DeterministicStep { run_id, .. }
         | SopRunAction::CheckpointWait { run_id, .. }

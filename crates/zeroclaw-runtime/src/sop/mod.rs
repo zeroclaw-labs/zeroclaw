@@ -31,7 +31,10 @@ pub use binding::{
 pub use capability::{
     CapabilityContext, CapabilityInfo, CapabilityResult, SopCapability, SopCapabilityRegistry,
 };
-pub use engine::{MaintenanceSummary, SopEngine, err_is_resume_at_capacity};
+pub use engine::{
+    CancelOutcome, MaintenanceSummary, SopEngine, err_is_cancellation_persistence_retained,
+    err_is_resume_at_capacity, err_is_terminal_persistence_retained,
+};
 pub use executor::{drive_resumed_broker_action, spawn_headless_run_driver};
 pub use graph::{
     FlowRole, GraphDiagnostic, GraphLayout, GraphLegend, GraphNode, GraphPin, GraphSeverity,
@@ -109,9 +112,21 @@ pub struct SopEngineAdapters {
 /// Callers receive `Arc<Mutex<SopEngine>>` and `Arc<SopAuditLogger>`
 /// handles — never call `SopEngine::new` or `SopAuditLogger::new`
 /// directly outside this module.
+///
+/// The two directory arguments serve different roles and must not be conflated:
+/// - `data_dir` is the daemon state dir. It anchors the durable run store, which
+///   lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
+/// - `install_root` is the install root (`config.install_root_dir()`, i.e.
+///   `config_path`'s parent). It anchors SOP-*definition* loading, so a relative
+///   `[sop] sops_dir` (documented `shared/sops`) resolves to `<install>/shared/sops`
+///   — the same directory the web/RPC SOP author writes to. Passing `data_dir` for
+///   both (the historical bug) made the engine load definitions from `<data_dir>/sops`,
+///   which authored SOPs never populate, so every manual trigger reported "no
+///   matching manual trigger".
 pub fn build_sop_engine(
     config: SopConfig,
-    workspace_dir: &Path,
+    data_dir: &Path,
+    install_root: &Path,
     audit_memory: Arc<dyn Memory>,
     adapters: SopEngineAdapters,
 ) -> (Arc<Mutex<SopEngine>>, Arc<SopAuditLogger>) {
@@ -122,10 +137,10 @@ pub fn build_sop_engine(
     } = adapters;
     // Select the run-state backend from config (default: durable sqlite, so parked
     // HITL runs survive a restart). A backend-open failure must not crash daemon
-    // startup, so fall back to in-memory with a loud log. `workspace_dir` here is the
-    // daemon data dir (every caller passes `config.data_dir`), so a durable store
-    // lands at `<data_dir>/sop/runs.db` unless `[sop] run_state_dir` overrides it.
-    let store = store::build_run_store(&config, workspace_dir).unwrap_or_else(|e| {
+    // startup, so fall back to in-memory with a loud log. The run store is anchored
+    // at the daemon data dir, so a durable store lands at `<data_dir>/sop/runs.db`
+    // unless `[sop] run_state_dir` overrides it.
+    let store = store::build_run_store(&config, data_dir).unwrap_or_else(|e| {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -158,7 +173,7 @@ pub fn build_sop_engine(
         .with_run_notifier(run_tx)
         .with_approval_broker(approval_broker)
         .with_capabilities(Arc::new(capabilities));
-    engine.reload(workspace_dir);
+    engine.reload(install_root);
     engine.restore_runs();
     let engine = Arc::new(Mutex::new(engine));
     let audit = Arc::new(SopAuditLogger::new(audit_memory));
@@ -180,24 +195,30 @@ pub fn parse_execution_mode(s: &str) -> SopExecutionMode {
 
 // ── SOP directory helpers ───────────────────────────────────────
 
-/// Return the default SOPs directory: `<workspace>/sops`.
-fn sops_dir(workspace_dir: &Path) -> PathBuf {
-    workspace_dir.join("sops")
+/// Canonical fallback SOPs directory: `<install>/shared/sops`.
+fn default_sops_dir(install_root: &Path) -> PathBuf {
+    install_root.join("shared").join("sops")
 }
 
-/// Resolve the SOPs directory from config, falling back to workspace default.
+/// Resolve the SOPs directory from config, falling back to the canonical
+/// shared default.
 ///
-/// A relative `config_dir` (the common case in the documented
-/// `<workspace>/sops` layout) resolves against `workspace_dir`; an
-/// absolute or `~`-prefixed value is used as-is (`Path::join` replaces
-/// the base entirely when the joined path is itself absolute).
-pub fn resolve_sops_dir(workspace_dir: &Path, config_dir: Option<&str>) -> PathBuf {
+/// A relative `config_dir` resolves against `install_root` (the install root,
+/// `config_path`'s parent), matching the `skill-bundles` convention: the
+/// documented `shared/sops` value yields `<install>/shared/sops`, the same
+/// directory the web/RPC SOP author writes to and the CLI scans. An absolute
+/// or `~`-prefixed value is used as-is (`Path::join` replaces the base entirely
+/// when the joined path is itself absolute). Unset, empty, or whitespace-only
+/// falls back to the canonical `<install>/shared/sops` — the same disabled
+/// sentinel `SopConfig::runtime_enabled()` recognizes, so the CLI/RPC scan root
+/// never diverges from whether the daemon built an engine.
+pub fn resolve_sops_dir(install_root: &Path, config_dir: Option<&str>) -> PathBuf {
     match config_dir {
-        Some(dir) if !dir.is_empty() => {
+        Some(dir) if !dir.trim().is_empty() => {
             let expanded = shellexpand::tilde(dir);
-            workspace_dir.join(expanded.as_ref())
+            install_root.join(expanded.as_ref())
         }
-        _ => sops_dir(workspace_dir),
+        _ => default_sops_dir(install_root),
     }
 }
 
@@ -220,13 +241,13 @@ fn resolve_sop_dir(sops_dir: &Path, name: &str) -> Result<PathBuf> {
 
 // ── SOP loading ─────────────────────────────────────────────────
 
-/// Load all SOPs from the configured directory.
+/// Load all SOPs from the configured directory, resolved against `install_root`.
 pub fn load_sops(
-    workspace_dir: &Path,
+    install_root: &Path,
     config_dir: Option<&str>,
     default_execution_mode: SopExecutionMode,
 ) -> Vec<Sop> {
-    let dir = resolve_sops_dir(workspace_dir, config_dir);
+    let dir = resolve_sops_dir(install_root, config_dir);
     load_sops_from_directory(&dir, default_execution_mode)
 }
 
@@ -497,6 +518,194 @@ fn normalize_manifest_steps(mut steps: Vec<SopStep>) -> Vec<SopStep> {
 
 // ── Markdown step parser ────────────────────────────────────────
 
+/// A parser behavior or `SOP.md` bullet understood by [`parse_steps`].
+///
+/// The catalog is the source for the generated syntax reference. Bullet
+/// prefixes are also consumed by the parser below, so adding a supported
+/// bullet requires updating one source-side entry rather than a separate
+/// hand-maintained documentation list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SopStepSyntaxKey {
+    StepsSection,
+    NumberedItem,
+    BoldTitle,
+    Tools,
+    AllowTools,
+    DenyTools,
+    RequiresConfirmation,
+    Kind,
+    Capability,
+    With,
+    Input,
+    Output,
+    When,
+    Next,
+    Terminal,
+    DependsOn,
+    Switch,
+    OnFailure,
+    Mode,
+    Agent,
+    Call,
+    Prompt,
+    Policy,
+    Edit,
+    ContinuationBody,
+}
+
+impl SopStepSyntaxKey {
+    fn bullet_prefixes(self) -> &'static [&'static str] {
+        match self {
+            Self::Tools => &["tools:"],
+            Self::AllowTools => &["allow-tools:", "allow_tools:"],
+            Self::DenyTools => &["deny-tools:", "deny_tools:"],
+            Self::RequiresConfirmation => &["requires_confirmation:"],
+            Self::Kind => &["kind:"],
+            Self::Capability => &["capability:"],
+            Self::With => &["with:"],
+            Self::Input => &["input:"],
+            Self::Output => &["output:"],
+            Self::When => &["when:"],
+            Self::Next => &["next:"],
+            Self::Terminal => &["terminal:"],
+            Self::DependsOn => &["depends_on:", "depends-on:"],
+            Self::Switch => &["switch:"],
+            Self::OnFailure => &["on_failure:", "on-failure:"],
+            Self::Mode => &["mode:"],
+            Self::Agent => &["agent:"],
+            Self::Call => &["call:"],
+            Self::Prompt => &["prompt:"],
+            Self::Policy => &["policy:"],
+            Self::Edit => &["edit:"],
+            Self::StepsSection | Self::NumberedItem | Self::BoldTitle | Self::ContinuationBody => {
+                &[]
+            }
+        }
+    }
+}
+
+/// One source-owned entry in the generated SOP syntax reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SopStepSyntaxSpec {
+    /// The parser behavior or bullet this entry documents.
+    pub key: SopStepSyntaxKey,
+    /// Human-readable explanation rendered into `docs/book/src/sop/syntax.md`.
+    pub description: &'static str,
+}
+
+/// Parser behavior and bullet catalog used by the SOP syntax reference.
+pub const SOP_STEP_SYNTAX_CATALOG: &[SopStepSyntaxSpec] = &[
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::StepsSection,
+        description: "The `## Steps` section is parsed until the next level-two heading.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::NumberedItem,
+        description: "Numbered items (`1.`, `2.`, ...) define step order.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::BoldTitle,
+        description: "Leading bold text (`**Title**`) becomes the step title; the remaining text becomes its body.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Tools,
+        description: "`- tools:` maps to `suggested_tools` and provides advisory tool names for the step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::AllowTools,
+        description: "`- allow-tools:` (or `- allow_tools:`) defines an explicit per-step tool allow-list.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::DenyTools,
+        description: "`- deny-tools:` (or `- deny_tools:`) defines an explicit per-step tool deny-list.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::RequiresConfirmation,
+        description: "`- requires_confirmation: true` enforces approval for that step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Kind,
+        description: "`- kind:` accepts `execute` (default), `checkpoint`/`approval`, or `capability`; a checkpoint pauses deterministic execution, while `requires_confirmation: true` requires approval in any execution mode.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Capability,
+        description: "`- capability:` names the deterministic capability used by a `kind: capability` step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::With,
+        description: "`- with:` supplies the structured input for a capability step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Input,
+        description: "`- input:` attaches a JSON Schema-like input contract to the step boundary.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Output,
+        description: "`- output:` attaches a JSON Schema-like output contract to the step boundary.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::When,
+        description: "`- when:` is evaluated against accumulated completed-step outputs after the current step finishes. A false guard bypasses `switch` and explicit `next`, taking the linear successor or completing when the step is terminal or has no successor. With a true or absent guard, a non-empty `switch` takes precedence over `next`; without a switch, an explicit `next` is used before terminal or linear routing.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Next,
+        description: "`- next:` routes to an explicit successor only when the top-level `when` allows routing and no `switch` ports are declared; ineligible routed steps are marked `skipped` and leave the run `pending` instead of dispatching.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Terminal,
+        description: "`- terminal: true` completes the run instead of advancing to another step; the final step also completes when it has no linear successor.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::DependsOn,
+        description: "`- depends_on:` (or `- depends-on:`) lists prerequisite steps for a non-linear run.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Switch,
+        description: "`- switch:` defines ordered `name>condition>step` ports for multi-branch routing. With a true or absent top-level `when`, the first matching port wins; an unmatched switch completes the run, and `next` plus the linear successor are ignored. A false top-level `when` bypasses switch evaluation.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::OnFailure,
+        description: "`- on_failure:` (or `- on-failure:`) accepts `fail`, `retry:<count>`, or `goto:<step>` and is enforced for reported step failures and output-schema failures.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Mode,
+        description: "`- mode:` overrides the SOP execution mode for that step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Agent,
+        description: "`- agent:` overrides the parent agent alias for that step.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Call,
+        description: "`- call:` adds a JSON planned tool call to the step when the value parses as a planned call.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Prompt,
+        description: "`- prompt:` sets the approval-gate notice template.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Policy,
+        description: "`- policy:` names an approval-broker policy in `[sop.approval].policies`; the policy gates approval through required-group membership and quorum. An absent policy fails closed rather than clearing on a single approval, while omission leaves the gate unpoliced.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::Edit,
+        description: "`- edit:` opts a checkpoint into editing the named field before resume.",
+    },
+    SopStepSyntaxSpec {
+        key: SopStepSyntaxKey::ContinuationBody,
+        description: "Unrecognized sub-bullets and other non-empty continuation lines are appended to the step body.",
+    },
+];
+
+fn parse_step_bullet(bullet: &str) -> Option<(SopStepSyntaxKey, &str)> {
+    SOP_STEP_SYNTAX_CATALOG.iter().find_map(|spec| {
+        spec.key
+            .bullet_prefixes()
+            .iter()
+            .find_map(|prefix| bullet.strip_prefix(prefix).map(|value| (spec.key, value)))
+    })
+}
+
 /// Parse procedure steps from SOP.md content.
 /// Expects a `## Steps` heading followed by numbered items (`1.`, `2.`, …).
 /// Each item's first bold text (`**...**`) is the step title; the rest is body.
@@ -552,85 +761,101 @@ pub fn parse_steps(md: &str) -> Vec<SopStep> {
         // Sub-bullet parsing (only when inside a step)
         if current.number.is_some() && trimmed.starts_with("- ") {
             let bullet = trimmed.trim_start_matches("- ").trim();
-            if let Some(tools_str) = bullet.strip_prefix("tools:") {
-                current.tools = parse_csv_list(tools_str);
-            } else if let Some(tools_str) = bullet
-                .strip_prefix("allow-tools:")
-                .or_else(|| bullet.strip_prefix("allow_tools:"))
-            {
-                ensure_scope(&mut current.scope).allow = Some(parse_csv_list(tools_str));
-            } else if let Some(tools_str) = bullet
-                .strip_prefix("deny-tools:")
-                .or_else(|| bullet.strip_prefix("deny_tools:"))
-            {
-                ensure_scope(&mut current.scope).deny = parse_csv_list(tools_str);
-            } else if bullet.starts_with("requires_confirmation:") {
-                if let Some(val) = bullet.strip_prefix("requires_confirmation:") {
-                    current.requires_confirmation = val.trim().eq_ignore_ascii_case("true");
+            if let Some((key, val)) = parse_step_bullet(bullet) {
+                match key {
+                    SopStepSyntaxKey::Tools => {
+                        current.tools = parse_csv_list(val);
+                    }
+                    SopStepSyntaxKey::AllowTools => {
+                        ensure_scope(&mut current.scope).allow = Some(parse_csv_list(val));
+                    }
+                    SopStepSyntaxKey::DenyTools => {
+                        ensure_scope(&mut current.scope).deny = parse_csv_list(val);
+                    }
+                    SopStepSyntaxKey::RequiresConfirmation => {
+                        current.requires_confirmation = val.trim().eq_ignore_ascii_case("true");
+                    }
+                    SopStepSyntaxKey::Kind => {
+                        current.kind = parse_step_kind(val);
+                    }
+                    SopStepSyntaxKey::Capability => {
+                        current.capability = Some(val.trim().to_string());
+                    }
+                    SopStepSyntaxKey::With => {
+                        current.capability_input = Some(parse_value_fragment(val.trim()));
+                    }
+                    SopStepSyntaxKey::Input => {
+                        ensure_schema(&mut current.schema).input =
+                            Some(parse_value_fragment(val.trim()));
+                    }
+                    SopStepSyntaxKey::Output => {
+                        ensure_schema(&mut current.schema).output =
+                            Some(parse_value_fragment(val.trim()));
+                    }
+                    SopStepSyntaxKey::When => {
+                        let val = val.trim();
+                        if !val.is_empty() {
+                            current.routing.when = Some(val.to_string());
+                        }
+                    }
+                    SopStepSyntaxKey::Next => {
+                        current.routing.next = val.trim().parse::<u32>().ok();
+                    }
+                    SopStepSyntaxKey::Terminal => {
+                        current.routing.terminal = val.trim().eq_ignore_ascii_case("true");
+                    }
+                    SopStepSyntaxKey::DependsOn => {
+                        current.routing.depends_on = parse_u32_list(val);
+                    }
+                    SopStepSyntaxKey::Switch => {
+                        current.routing.switch = parse_switch_rules(val);
+                    }
+                    SopStepSyntaxKey::OnFailure => {
+                        current.on_failure = parse_step_failure(val);
+                    }
+                    SopStepSyntaxKey::Mode => {
+                        current.mode = Some(parse_execution_mode(val));
+                    }
+                    SopStepSyntaxKey::Agent => {
+                        let trimmed_val = val.trim();
+                        current.agent = (!trimmed_val.is_empty()).then(|| trimmed_val.to_string());
+                    }
+                    SopStepSyntaxKey::Call => {
+                        if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
+                            current.calls.push(call);
+                        }
+                    }
+                    SopStepSyntaxKey::Prompt => {
+                        let val = val.trim();
+                        if !val.is_empty() {
+                            current.gate_prompt = Some(val.to_string());
+                        }
+                    }
+                    SopStepSyntaxKey::Policy => {
+                        let val = val.trim();
+                        current.policy = if val.is_empty() {
+                            None
+                        } else {
+                            Some(val.to_string())
+                        };
+                    }
+                    SopStepSyntaxKey::Edit => {
+                        // Editable-field opt-in for a checkpoint gate: the named field of
+                        // the piped value an approver may amend before the run resumes.
+                        let val = val.trim();
+                        current.edit = if val.is_empty() {
+                            None
+                        } else {
+                            Some(val.to_string())
+                        };
+                    }
+                    SopStepSyntaxKey::StepsSection
+                    | SopStepSyntaxKey::NumberedItem
+                    | SopStepSyntaxKey::BoldTitle
+                    | SopStepSyntaxKey::ContinuationBody => {
+                        unreachable!("non-bullet SOP syntax key returned by parse_step_bullet")
+                    }
                 }
-            } else if bullet.starts_with("kind:") {
-                if let Some(val) = bullet.strip_prefix("kind:") {
-                    current.kind = parse_step_kind(val);
-                }
-            } else if let Some(val) = bullet.strip_prefix("capability:") {
-                current.capability = Some(val.trim().to_string());
-            } else if let Some(val) = bullet.strip_prefix("with:") {
-                current.capability_input = Some(parse_value_fragment(val.trim()));
-            } else if let Some(val) = bullet.strip_prefix("input:") {
-                ensure_schema(&mut current.schema).input = Some(parse_value_fragment(val.trim()));
-            } else if let Some(val) = bullet.strip_prefix("output:") {
-                ensure_schema(&mut current.schema).output = Some(parse_value_fragment(val.trim()));
-            } else if let Some(val) = bullet.strip_prefix("when:") {
-                let val = val.trim();
-                if !val.is_empty() {
-                    current.routing.when = Some(val.to_string());
-                }
-            } else if let Some(val) = bullet.strip_prefix("next:") {
-                current.routing.next = val.trim().parse::<u32>().ok();
-            } else if let Some(val) = bullet.strip_prefix("terminal:") {
-                current.routing.terminal = val.trim().eq_ignore_ascii_case("true");
-            } else if let Some(val) = bullet
-                .strip_prefix("depends_on:")
-                .or_else(|| bullet.strip_prefix("depends-on:"))
-            {
-                current.routing.depends_on = parse_u32_list(val);
-            } else if let Some(val) = bullet.strip_prefix("switch:") {
-                current.routing.switch = parse_switch_rules(val);
-            } else if let Some(val) = bullet
-                .strip_prefix("on_failure:")
-                .or_else(|| bullet.strip_prefix("on-failure:"))
-            {
-                current.on_failure = parse_step_failure(val);
-            } else if let Some(val) = bullet.strip_prefix("mode:") {
-                current.mode = Some(parse_execution_mode(val));
-            } else if let Some(val) = bullet.strip_prefix("agent:") {
-                let trimmed_val = val.trim();
-                current.agent = (!trimmed_val.is_empty()).then(|| trimmed_val.to_string());
-            } else if let Some(val) = bullet.strip_prefix("call:") {
-                if let Ok(call) = serde_json::from_str::<PlannedToolCall>(val.trim()) {
-                    current.calls.push(call);
-                }
-            } else if let Some(val) = bullet.strip_prefix("prompt:") {
-                let val = val.trim();
-                if !val.is_empty() {
-                    current.gate_prompt = Some(val.to_string());
-                }
-            } else if let Some(val) = bullet.strip_prefix("policy:") {
-                let val = val.trim();
-                current.policy = if val.is_empty() {
-                    None
-                } else {
-                    Some(val.to_string())
-                };
-            } else if let Some(val) = bullet.strip_prefix("edit:") {
-                // Editable-field opt-in for a checkpoint gate: the named field of
-                // the piped value an approver may amend before the run resumes.
-                let val = val.trim();
-                current.edit = if val.is_empty() {
-                    None
-                } else {
-                    Some(val.to_string())
-                };
             } else {
                 // Continuation body line
                 if !current.body.is_empty() {
@@ -1129,27 +1354,112 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_sops_dir_joins_relative_config_value_to_workspace() {
-        let workspace = Path::new("/home/user/.zoder/data");
-        let resolved = resolve_sops_dir(workspace, Some("shared/sops"));
-        assert_eq!(resolved, workspace.join("shared/sops"));
+    fn resolve_sops_dir_joins_relative_config_value_to_install_root() {
+        // The documented `shared/sops` must resolve to `<install>/shared/sops`,
+        // not double the `shared` segment. Regression guard for a config that
+        // carries `sops_dir = "shared/sops"`.
+        let install_root = Path::new("/test/install");
+        let resolved = resolve_sops_dir(install_root, Some("shared/sops"));
+        assert_eq!(resolved, install_root.join("shared").join("sops"));
+    }
+
+    #[test]
+    fn resolve_sops_dir_joins_bare_relative_value_under_install_root() {
+        let install_root = Path::new("/test/install");
+        let resolved = resolve_sops_dir(install_root, Some("custom-sops"));
+        assert_eq!(resolved, install_root.join("custom-sops"));
     }
 
     #[test]
     fn resolve_sops_dir_keeps_absolute_config_value_as_is() {
-        let workspace = Path::new("/home/user/.zoder/data");
-        let resolved = resolve_sops_dir(workspace, Some("/srv/shared/sops"));
+        let install_root = Path::new("/test/install");
+        let resolved = resolve_sops_dir(install_root, Some("/srv/shared/sops"));
         assert_eq!(resolved, Path::new("/srv/shared/sops"));
     }
 
     #[test]
-    fn resolve_sops_dir_falls_back_to_workspace_sops_when_unset() {
-        let workspace = Path::new("/home/user/.zoder/data");
-        assert_eq!(resolve_sops_dir(workspace, None), workspace.join("sops"));
+    fn resolve_sops_dir_falls_back_to_shared_sops_when_unset() {
+        let install_root = Path::new("/test/install");
+        let canonical = install_root.join("shared").join("sops");
+        assert_eq!(resolve_sops_dir(install_root, None), canonical);
+        assert_eq!(resolve_sops_dir(install_root, Some("")), canonical);
+        // Whitespace-only is the disabled sentinel `runtime_enabled()` also
+        // rejects; the scan root must fall back, not join a garbage segment.
+        assert_eq!(resolve_sops_dir(install_root, Some("   ")), canonical);
+    }
+
+    // Boundary regression: for the documented `sops_dir = "shared/sops"`, the
+    // authoring write path (`create_sop_typed`, used by web/RPC), the runtime/CLI
+    // load path (`load_sops`), and the delete path (`delete_sop_typed`) must all
+    // resolve against the install root and converge on `<install>/shared/sops`.
+    // This is the documented shared-workspace configuration; before the
+    // install-root base it doubled to `<install>/shared/shared/sops` and authored
+    // SOPs were invisible to loading.
+    #[test]
+    fn shared_sops_config_converges_across_author_load_and_delete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path();
+        let config_dir = Some("shared/sops");
+        let canonical = install_root.join("shared").join("sops");
+
+        // The authoring surface resolves the write directory the same way the
+        // loader does — one resolver, one root.
+        let author_dir = resolve_sops_dir(install_root, config_dir);
         assert_eq!(
-            resolve_sops_dir(workspace, Some("")),
-            workspace.join("sops")
+            author_dir, canonical,
+            "author path must target <install>/shared/sops"
         );
+
+        // Author a SOP (web/RPC `handle_sop_create` -> `create_sop_typed`).
+        let sop = authoring_sop(vec![titled_step(1, "Do the thing")]);
+        create_sop_typed(&author_dir, &sop).expect("author create should succeed");
+        assert!(
+            canonical.join("authoring").join("SOP.toml").exists(),
+            "authored SOP.toml must land under <install>/shared/sops"
+        );
+        assert!(
+            !install_root
+                .join("shared")
+                .join("shared")
+                .join("sops")
+                .exists(),
+            "resolution must not double the shared segment"
+        );
+
+        // The runtime/CLI loader sees the authored SOP through the same base.
+        let loaded = load_sops(install_root, config_dir, SopExecutionMode::Supervised);
+        assert_eq!(loaded.len(), 1, "loader must see exactly the authored SOP");
+        assert_eq!(loaded[0].name, "authoring");
+
+        // Delete resolves to the same directory and removes it.
+        delete_sop_typed(&author_dir, "authoring").expect("delete should succeed");
+        assert!(
+            !canonical.join("authoring").exists(),
+            "delete must remove the SOP from <install>/shared/sops"
+        );
+        assert!(
+            load_sops(install_root, config_dir, SopExecutionMode::Supervised).is_empty(),
+            "loader must see the SOP gone after delete"
+        );
+    }
+
+    #[test]
+    fn absolute_sops_dir_converges_across_author_and_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let install_root = tmp.path().join("install");
+        let abs_sops = tmp.path().join("elsewhere").join("sops");
+        std::fs::create_dir_all(&install_root).unwrap();
+        let config_dir = Some(abs_sops.to_string_lossy());
+        let config_dir = config_dir.as_deref();
+
+        // An absolute value ignores the install root entirely.
+        assert_eq!(resolve_sops_dir(&install_root, config_dir), abs_sops);
+
+        let sop = authoring_sop(vec![titled_step(1, "Do the thing")]);
+        create_sop_typed(&abs_sops, &sop).expect("author create should succeed");
+        let loaded = load_sops(&install_root, config_dir, SopExecutionMode::Supervised);
+        assert_eq!(loaded.len(), 1, "absolute-path SOP must load");
+        assert_eq!(loaded[0].name, "authoring");
     }
 
     fn authoring_sop(steps: Vec<SopStep>) -> Sop {

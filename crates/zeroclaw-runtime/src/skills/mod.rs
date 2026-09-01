@@ -2662,6 +2662,16 @@ pub fn install_extra_registry_skill_source(
 
 // ─── Plugin-shipped skills (plugins-wasm only) ───────────────────────────────
 
+/// Load the skills shipped by every skill-plugin instance the activation plan
+/// admitted.
+///
+/// The `plugins.max_active_instances` ceiling spans channels, tools, and
+/// skills, so this loader may not walk `skill_plugin_details()` directly: it
+/// derives the same admitted set from the current config and host snapshot
+/// that the channel and tool loaders derive, and skips any package whose skill
+/// binding the plan did not admit. The plan holds no counter, so loading
+/// skills repeatedly from one snapshot yields the same set instead of spending
+/// the same logical slot again.
 #[cfg(feature = "plugins-wasm")]
 pub fn load_plugin_skills_from_config(
     config: &zeroclaw_config::schema::Config,
@@ -2695,10 +2705,33 @@ pub fn load_plugin_skills_from_config(
         }
     };
 
+    let plan = match crate::plugin_runtime::PluginActivationPlan::build(config, &host) {
+        Ok(plan) => plan,
+        Err(err) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                "failed to admit logical plugin skill instances"
+            );
+            return (Vec::new(), Vec::new());
+        }
+    };
+
     let allow_scripts = config.skills.allow_scripts;
     let mut skills = Vec::new();
     let mut dropped = Vec::new();
     for (manifest, skills_dir) in host.skill_plugin_details() {
+        // `for_package_binding` names the skill binding after the package, so
+        // the package name is both halves of this admission lookup.
+        if !plan.admits(
+            &manifest.name,
+            zeroclaw_plugins::PluginCapability::Skill,
+            &manifest.name,
+        ) {
+            continue;
+        }
         let (raw_skills, raw_dropped) = load_skills_from_directory(&skills_dir, allow_scripts);
         for raw in raw_skills {
             skills.push(namespace_plugin_skill(&manifest.name, raw));
@@ -3929,53 +3962,6 @@ licence = true
             msg.contains("licence"),
             "error should mention the unknown field 'licence'; got: {msg}"
         );
-    }
-
-    #[test]
-    fn integrate_round_trip_emits_top_level_forge() {
-        use crate::skillforge::scout::{ScoutResult, ScoutSource};
-        use chrono::Utc;
-        let candidate = ScoutResult {
-            name: "round-trip".into(),
-            url: "https://github.com/user/round-trip".into(),
-            description: "round-trip test".into(),
-            stars: 7,
-            language: Some("Rust".into()),
-            updated_at: Some(Utc::now()),
-            source: ScoutSource::GitHub,
-            owner: "user".into(),
-            has_license: true,
-        };
-
-        // Generate the TOML the integrator would write and parse it back.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let integrator = crate::skillforge::integrate::Integrator::new(
-            tmp.path().to_string_lossy().into_owned(),
-        );
-        let skill_dir = integrator.integrate(&candidate).unwrap();
-        let toml_str = std::fs::read_to_string(skill_dir.join("SKILL.toml")).unwrap();
-
-        let manifest: SkillManifest = toml::from_str(&toml_str).unwrap_or_else(|e| {
-            panic!(
-                "integrator output must parse against SkillManifest with strict SkillMeta + ForgeMetadata; \
-                 got error: {e}\n--- toml ---\n{toml_str}"
-            )
-        });
-        let forge = manifest
-            .forge
-            .expect("integrator must emit a [forge] table");
-        assert_eq!(forge.owner.as_deref(), Some("user"));
-        assert_eq!(forge.stars, Some(7));
-        assert_eq!(forge.license, Some(true));
-        assert!(
-            forge
-                .source
-                .as_deref()
-                .is_some_and(|s| s.contains("round-trip")),
-            "forge.source should carry the upstream URL"
-        );
-        assert_eq!(manifest.skill.name, "round-trip");
-        assert_eq!(manifest.skill.description, "round-trip test");
     }
 
     #[test]

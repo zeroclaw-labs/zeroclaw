@@ -143,7 +143,23 @@ async fn scheduled_run_does_not_leak_conversation_memory_into_provider_request()
         assert!(
             !body.contains(SECRET_SENTINEL),
             "Conversation memory leaked into scheduled-run LLM request #{i}: \
-             sentinel {SECRET_SENTINEL:?} found in body. Full body:\n{body}"
+            sentinel {SECRET_SENTINEL:?} found in body. Full body:\n{body}"
         );
     }
+    drop(bodies);
+
+    // Observe the real store after the scheduled turn. The planted row must
+    // remain, but a daemon-origin prompt must never create a `user_msg*`
+    // Conversation entry even though autosave is enabled by default.
+    let mem = SqliteMemory::new("sqlite", &workspace_dir).unwrap();
+    let conversation_entries = mem
+        .list(Some(&MemoryCategory::Conversation), None)
+        .await
+        .unwrap();
+    assert!(
+        conversation_entries
+            .iter()
+            .all(|entry| !zeroclaw_memory::is_user_autosave_key(&entry.key)),
+        "scheduled run created an autosaved user message: {conversation_entries:#?}"
+    );
 }

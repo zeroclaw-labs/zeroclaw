@@ -18,7 +18,7 @@ zeroclaw-runtime.workspace = true
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools.workspace = true
 anyhow = "1.0"
-lru = "0.16"
+lru = "0.18.2"
 rumqttc = { version = "0.25", optional = true }
 notify = { version = "6", optional = true }
 glob = { version = "0.3", optional = true }
@@ -37,7 +37,7 @@ axum = { version = "0.8", default-features = false, features = [
   "query",
   "tokio",
   "ws",
-] }
+], optional = true }
 async-imap = { version = "0.11", features = [
   "runtime-tokio",
 ], default-features = false, optional = true }
@@ -128,7 +128,6 @@ hex = "0.4"
 nanohtml2text = "0.2"
 rand = "0.10"
 webpki-roots = "1.0.6"
-tokio-socks = "0.5"
 
 # WhatsApp Web (optional). Pinned to oxidezap/whatsapp-rust @ cbcdd2a
 # until upstream ships 0.6.1 to crates.io.
@@ -140,7 +139,7 @@ wacore-binary = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcd
 waproto = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
 serde-big-array = { version = "0.5", optional = true }
 
-cpal = { version = "0.15", optional = true }
+cpal = { version = "0.18.1", optional = true }
 whatsapp-rust-ureq-http-client = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true }
 whatsapp-rust-tokio-transport = { git = "https://github.com/oxidezap/whatsapp-rust", rev = "cbcdd2a6b931d804f3c2693554dce75e654834e3", optional = true, default-features = false }
 qrcode = { version = "0.14", optional = true }
@@ -203,7 +202,6 @@ channels-full = [
   "channel-twitch",
   "channel-twitter",
   "channel-voice-call",
-  "channel-wati",
   "channel-wecom",
   "channel-wecom-ws",
   "channel-whatsapp-cloud",
@@ -217,14 +215,14 @@ channel-email = [
 ]
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
-channel-lark = ["dep:prost"]
+channel-lark = ["dep:axum", "dep:prost"]
 channel-git = ["provider-github", "provider-gitea"]
 # Forge providers for the git channel. `provider-github` (GitHub Apps) and
 # `provider-gitea` (Gitea/Forgejo PAT) are default-on under `channel-git`;
 # future forges (e.g. `provider-gitlab`) add their own sub-feature and deps here.
 provider-github = ["dep:jsonwebtoken", "dep:thiserror"]
 provider-gitea = []
-channel-line = []
+channel-line = ["dep:axum"]
 channel-nostr = ["dep:nostr-sdk"]
 whatsapp-web = [
   "dep:bytes",
@@ -257,7 +255,6 @@ channel-mqtt = ["dep:rumqttc"]
 channel-filesystem = ["dep:notify", "dep:glob"]
 channel-amqp = ["dep:lapin", "dep:tokio-executor-trait", "dep:tokio-reactor-trait", "dep:async-reactor-trait", "dep:p12-keystore", "dep:rustls-pemfile"]
 channel-linq = []
-channel-wati = []
 channel-nextcloud = []
 channel-mochat = []
 channel-wechat = [
@@ -270,14 +267,21 @@ channel-wechat = [
 channel-wecom = []
 channel-wecom-ws = ["dep:aes", "dep:cbc"]
 channel-clawdtalk = []
-channel-webhook = []
+channel-webhook = ["dep:axum"]
 channel-whatsapp-cloud = []
-channel-voice-call = []
+channel-voice-call = ["dep:axum"]
 channel-acp-server = []
 channel-matrix = ["dep:matrix-sdk", "dep:mime_guess"]
 voice-wake = ["dep:cpal"]
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+# Enables the runtime crate's test-only `ScopedToolRegistry::from_raw_for_test`
+# so channel test fixtures can mint the now-sealed `ChannelRuntimeContext`
+# tools registry. dev-dependency only: never enabled in the shipped channels lib.
+zeroclaw-runtime = { workspace = true, features = ["test-util"] }
 axum = { version = "0.8", default-features = false, features = [
   "http1",
   "json",
@@ -299,4 +303,8 @@ matrix-sdk-test = "0.18"
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"
-tokio = { version = "1.50", features = ["macros", "rt-multi-thread"] }
+# `test-util` is what `#[tokio::test(start_paused = true)]` needs, so a
+# duration-sensitive regression can assert the deadline the channel actually
+# waits without the suite sleeping for it. Dev-only, and the same feature
+# zeroclaw-providers already carries for the same reason.
+tokio = { version = "1.50", features = ["macros", "rt-multi-thread", "test-util"] }

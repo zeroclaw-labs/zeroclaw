@@ -5,14 +5,16 @@
 ignore = [
     # ── Live in both audit.toml and deny.toml ──────────────────────────────
     # Tracking: new ignores need a tracking issue URL reference.
-    # Each entry below mirrors the `reason` field in deny.toml.
-    # When a fix lands, remove from BOTH files.
+    # Each entry below summarizes the corresponding rationale in deny.toml.
+    # Re-evaluate both files; remove each entry once that tool's criteria are met.
     "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained; transitive dep awaiting upstream migration to rustls-pki-types
     "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained; in cargo-deny's resolved graph via matrix-sdk dev-deps; tracking #8519
+    "RUSTSEC-2026-0247",  # bitmaps unmaintained; matrix-sdk reaches imbl directly and via eyeball-im; tracking #9899 and matrix-org/matrix-rust-sdk#6859
 
     # ── cargo-audit reads the full Cargo.lock, so it flags advisories for
     # crates that cargo-deny (graph-aware) does not pull into the resolved
     # dependency graph. These entries are needed only in audit.toml. ──
+    "RUSTSEC-2026-0253",  # lru 0.16; residual Nostr cache path is absent from cargo-deny's resolved graph; migration tracked in #9602
     "RUSTSEC-2026-0049",  # rustls-webpki CRL matching bug; 0.102.x in Cargo.lock but not in resolved graph; awaiting rumqttc upgrade
     "RUSTSEC-2026-0098",  # rustls-webpki URI name constraints; same as above
     "RUSTSEC-2026-0099",  # rustls-webpki wildcard name constraints; same as above

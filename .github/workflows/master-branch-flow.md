@@ -7,7 +7,7 @@ Use with:
 - [`docs/book/src/maintainers/ci-and-actions.md`](../../docs/book/src/maintainers/ci-and-actions.md)
 - [`docs/book/src/maintainers/release-runbook.md`](../../docs/book/src/maintainers/release-runbook.md)
 
-Last updated: **July 2026** (merge queue disabled on `master`; maintainers
+Last updated: **August 2026** (merge queue disabled on `master`; maintainers
 merge directly. The `merge_group` CI plumbing is retained, so the queue can be
 re-enabled from branch protection with no code change).
 
@@ -27,6 +27,7 @@ Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWa
 | File | Trigger | Purpose |
 |---|---|---|
 | `ci.yml` | `pull_request` → `master`; `push` → `master`; `merge_group` (dormant) | Lint + test + build on PRs and trusted post-merge cache-warming runs. The `merge_group` trigger stays wired but never fires while the merge queue is disabled. |
+| `platform-tests.yml` | changes to this workflow in a `pull_request` → `master`; `workflow_dispatch`; nightly schedule | Advisory macOS/Windows workspace tests, outside the required PR gate and merge queue. |
 | `release-stable-manual.yml` | `workflow_dispatch`, tag push `v*` | Stable release (manual, version-gated) |
 | `docker-publish.yml` | `workflow_call`, `workflow_dispatch`, tag push `v*` | Build, sign, and scan the generated Docker variant matrix |
 | `trivy-scheduled.yml` | `workflow_dispatch`; weekly schedule | Re-scan published `dist` and `default-features` images for new CVEs |
@@ -41,10 +42,11 @@ Maintainers with merge authority: `JordanTheJet`, `Audacity88`, `WareWolf-MoonWa
 
 | Event | What runs |
 |---|---|
-| PR opened or updated against `master` | `ci.yml` (full lint + test + build) |
+| PR opened or updated against `master` | `ci.yml` (full lint + test + build); `platform-tests.yml` only when that workflow changes |
 | PR added to the merge queue (`merge_group`) | **Inactive**: the merge queue is currently disabled. If re-enabled, `ci.yml` runs the full gate on a temporary `gh-readonly-queue/master/…` branch stacking the base + earlier queue entries + this PR. |
 | Push to `master` | `ci.yml` (post-merge quality signal + trusted Rust cache warming) |
-| Manual dispatch | `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docker-publish.yml`, `trivy-scheduled.yml`, `project-dashboard-plan.yml`, or `release-stable-manual.yml` |
+| Nightly at 03:17 UTC | `platform-tests.yml` (scheduled macOS/Windows tests) |
+| Manual dispatch | `platform-tests.yml`, `cross-platform-build-manual.yml`, `cross-platform-clippy.yml`, `docker-publish.yml`, `trivy-scheduled.yml`, `project-dashboard-plan.yml`, or `release-stable-manual.yml` |
 | Tag push `vX.Y.Z` | `release-stable-manual.yml` (full release pipeline) and `docker-publish.yml` (generated variant matrix) |
 
 There is no automatic release on merge. `ci.yml` does run after trusted
@@ -71,7 +73,12 @@ tag push.
    - `test`: `cargo nextest run --locked --workspace --exclude zeroclaw-desktop` on `ubuntu-latest`.
    - `security`: `cargo deny check`.
    - `CI Required Gate`: composite job; branch protection requires this.
-3. Maintainer reviews. Once the gate is green and review policy is satisfied,
+3. When the PR changes `platform-tests.yml`, that workflow checks formatting,
+   then runs the same workspace nextest selection on `macos-14` and
+   `windows-latest` as non-blocking checks. Maintainers can manually
+   dispatch the workflow against other platform-sensitive branches.
+   `--no-fail-fast` inventories all platform failures.
+4. Maintainer reviews. Once the gate is green and review policy is satisfied,
    the maintainer merges the PR directly (squash).
 
 > **Merge queue (currently disabled).** `master` previously *required* a merge
@@ -100,8 +107,10 @@ for the full procedure. In summary:
 ### 3) Full Platform Build (manual)
 
 1. Maintainer runs `cross-platform-build-manual.yml` via `workflow_dispatch`.
-2. Build-only across additional targets not covered by the PR build matrix.
-3. No tests, no publish. Used to verify cross-compilation health.
+2. Builds additional targets not covered by the PR matrix and independently
+   verifies the pinned Linux `cross` and Windows Tauri CLI release tools.
+3. No publish. Set `release_tools_only` to skip web and release builds and run
+   only the native release-tool smoke.
 
 ---
 
@@ -129,8 +138,11 @@ for the full procedure. In summary:
 ```mermaid
 flowchart TD
   A["PR opened or updated → master"] --> B["ci.yml"]
+  A -. "workflow changed" .-> P["platform-tests.yml"]
   B --> L["lint\nfmt · clippy"]
   L --> T["test\ncargo nextest --workspace"]
+  P --> PF["fmt"]
+  PF --> PT["macOS · Windows\nscheduled nextest"]
   L --> BLD["build\nLinux · macOS · Windows"]
   L --> CHK["check\nall features · no default features"]
   L --> C32["check-32bit\ni686-unknown-linux-gnu"]

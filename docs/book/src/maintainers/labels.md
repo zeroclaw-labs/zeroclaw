@@ -47,7 +47,7 @@ Dependabot also seeds configured labels on its own PRs from `.github/dependabot.
 
 Today `.github/labeler.yml` owns only path and scope labels such as `docs`, `ci`, `channel`, `provider:openai`, and `tool:file`. It does not own `risk:*`, `size:*`, `type:*`, contributor-tier, status, resolution, stale, or pickup labels.
 
-If risk or size automation is added later, it should recalculate on every pushed PR update so the labels continue to describe the actual diff under review. Risk automation must honor `risk:manual` as an override that prevents future automated risk replacement for that PR until a maintainer removes the override.
+Size automation may recalculate on every pushed PR update so labels continue to describe the actual diff under review. #9345 owns the separate risk-classifier rollout. Its risk phase remains report-only until maintainers review the evidence and separately enable mutation. Report-only output must record the proposed risk, matching rule evidence, current risk, `risk:manual` state, and `domain:security` state so maintainers can audit mismatches and security-shaped work that escaped both triggers. Any future risk automation must honor `risk:manual` as a hard freeze: it cannot add, remove, or replace a PR's `risk:*` label until a maintainer removes the override.
 
 ## Cleanup protocol
 
@@ -102,7 +102,7 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | Label | Matches |
 |---|---|
 | `docs` | `docs/**`, `**/*.md`, `**/*.mdx`, `LICENSE`, `.markdownlint-cli2.yaml` |
-| `dependencies` | `Cargo.toml`, `Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
+| `dependencies` | `Cargo.toml`, `**/Cargo.toml`, `Cargo.lock`, `**/Cargo.lock`, `deny.toml`, `.github/dependabot.yml` |
 | `ci` | `.github/codeql/**`, `.github/workflows/**`, `.github/*.yaml`, `.github/*.yml`, `.github/*.json`, `.githooks/**` |
 | `core` | `src/*.rs` |
 | `cli` | `src/main.rs`, `src/lib.rs`, `src/commands/**`, `src/alias_cli/**`, `src/cli_input.rs`, `crates/zeroclaw-commands/**`, `crates/zeroclaw-runtime/src/cli_input.rs` |
@@ -121,12 +121,11 @@ Applied automatically by `pr-path-labeler.yml`. Globs live in `.github/labeler.y
 | `runtime` | `src/runtime/**`, `crates/zeroclaw-runtime/src/**` |
 | `quickstart` | `crates/zeroclaw-runtime/src/quickstart/**`, `crates/zeroclaw-gateway/src/api_quickstart.rs`, `apps/zerocode/src/quickstart_pane.rs`, `web/src/pages/quickstart/**` |
 | `desktop` | `apps/tauri/**` |
-| `hardware` | `src/hardware/**`, `crates/zeroclaw-hardware/**`, `crates/robot-kit/**`, `crates/aardvark-sys/**`, `firmware/**` |
+| `hardware` | `src/hardware/**`, `crates/zeroclaw-hardware/**`, `firmware/**` |
 | `web` | `web/**` |
 | `zerocode` | `apps/zerocode/**` |
 | `provider` | `src/providers/**`, `crates/zeroclaw-providers/src/**` |
 | `service` | `src/service/**`, `crates/zeroclaw-runtime/src/service/**` |
-| `skillforge` | `src/skillforge/**`, `crates/zeroclaw-runtime/src/skillforge/**` |
 | `skills` | `src/skills/**`, `crates/zeroclaw-runtime/src/skills/**` |
 | `tool` | `src/tools/**`, `crates/zeroclaw-tools/src/**` |
 | `tunnel` | `src/tunnel/**`, `crates/zeroclaw-runtime/src/tunnel/**` |
@@ -164,7 +163,9 @@ Some scoped component labels are manual routing labels rather than synchronized 
 
 `domain:architecture` identifies cross-component ownership, source-of-truth, dependency-direction, interface/contract, and architecture-decision work. Do not apply it merely because an issue is an RFC.
 
-`domain:security` identifies cross-cutting trust-boundary or security-impact work, including work outside the base `security` source paths. These domain labels remain manual because path matching cannot infer architectural or security impact reliably.
+`domain:security` identifies an effective authentication, authorization, credential, secret-handling, confinement, tool-permission, security-policy, cryptographic-identity, or untrusted-input boundary. Apply it when the changed behavior crosses that boundary, including outside canonical security paths. Do not apply it only because a PR discusses security, changes security documentation or tests, updates an advisory dependency, or performs generic hardening without changing a trust boundary. The label remains manual because path matching cannot reliably infer this consequence.
+
+`domain:security` is independent from `risk:*`. A PR carrying either `risk:high` or `domain:security` requires deep review and two independent Core Team approvals before merge. Automated review does not count as a Core Team approval.
 
 The following duplicate domain and product-surface labels are pending retirement. Do not apply them to new work. They remain live only until a separate exact operation packet migrates any remaining open references and deletes the definitions.
 
@@ -223,7 +224,6 @@ Each channel gets a `channel:<name>` label in addition to the base `channel` lab
 | `channel:slack` | `slack.rs` |
 | `channel:telegram` | `telegram.rs` |
 | `channel:twitter` | `twitter.rs` |
-| `channel:wati` | `wati.rs` |
 | `channel:wechat` | `crates/zeroclaw-channels/src/wechat.rs` |
 | `channel:webhook` | `webhook.rs` |
 | `channel:wecom` | `wecom.rs`, `wecom_ws.rs` |
@@ -304,16 +304,16 @@ New or manual applications should use the canonical no-space labels below. Exist
 
 | Label | Meaning |
 |---|---|
-| `risk:low` | No high-risk paths touched, small change |
-| `risk:medium` | Behavioral `crates/*/src/**` changes without boundary or security impact |
-| `risk:high` | Touches a high-risk path, or large security-adjacent change |
-| `risk:manual` | Maintainer override that freezes automated risk recalculation |
+| `risk:low` | Documentation, localization, fixtures, generated references, or mechanical metadata with no production, compatibility, build, release, or governance effect |
+| `risk:medium` | Ordinary behavioral production change, including most runtime, gateway, provider, channel, tool, config, application, and CI work |
+| `risk:high` | A concrete trust, credential, compatibility, governance, or release-authority boundary that needs deep review and two independent Core Team approvals |
+| `risk:manual` | Maintainer override that freezes future automated risk replacement; it does not lower review or approval requirements |
 
-High-risk paths (canonical set; other maintainer pages reference this list): `crates/zeroclaw-runtime/src/**`, `crates/zeroclaw-gateway/src/**`, `crates/zeroclaw-tools/src/**`, `crates/zeroclaw-runtime/src/security/**`, `.github/workflows/**`.
+`risk:*` describes the actual diff and its consequence, not broad component location. A production-inert test-only change inside a high-risk boundary may be `risk:medium` when the complete test-only boundary is demonstrable; #9530 is authoritative for that exception.
 
-Apply `risk:high` to any PR that raises the workspace MSRV, pinned Rust toolchain, generated installer/Docker toolchain baseline, or release workflow toolchain floor. Do not downgrade the risk just because the diff looks like CI, dependency, or docs housekeeping: a higher required Rust version affects downstream source builds, distro packages, container builds, and users pinned to older toolchains.
+Use `risk:manual` whenever a maintainer's intended risk differs from a future automatic result, including #9530's demonstrable production-inert test-only downgrade. Apply `risk:high` with `risk:manual` when a non-security change has a destructive, data-loss, breaking-default, governance, release-security, or another concrete high-risk consequence outside the stable automatic rules. This preserves the accepted manual escalation path rather than creating another label family. Record the rationale in the review or PR record.
 
-When uncertain, treat as higher risk.
+When uncertain, classify upward and ask a maintainer to resolve the boundary. Do not widen automatic path rules merely to avoid a review decision.
 
 ## Contributor tier labels
 
@@ -383,7 +383,8 @@ Applied manually: the auto-response automation that used to handle these was rem
 |---|---|
 | `r:needs-repro` | Incomplete bug report; request a deterministic repro |
 | `r:support` | Usage / help item better handled outside the bug backlog |
-| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. This is not a stale warning by itself. |
+| `needs-author-action` | Author response is needed before maintainers can continue the review or merge path. For PRs, apply this with request-changes reviews when the next step is on the author, and remove it when the author pushes a substantive update or provides requested information. For RFCs, apply it after a `REVISE` outcome while the author prepares the revision; remove it and restore `needs-maintainer-review` when a revised stable proposal is ready for Core action. This is not a stale warning by itself. |
+| `needs-maintainer-review` | A maintainer decision, review, or vote action is pending. On RFCs, use this while substantive Core discussion or ratification action is needed; remove it when the decision is recorded or the next action moves to the author or implementation. This label does not imply acceptance, ownership, or stale protection. |
 | `stale-candidate` | Dormant PR that is a candidate for closing. Follow the stale ramp in [Reviewer Playbook → PR backlog pruning](./reviewer-playbook.md#pr-backlog-pruning). Issue stale passes use `status:stale` instead. |
 
 ## Workflow labels
@@ -392,6 +393,7 @@ Applied manually to make cross-artifact coordination visible. These labels do no
 
 | Label | Purpose |
 |---|---|
+| `do-not-merge` | Explicit maintainer or governance hold on a PR. Use it with `status:blocked` when a PR is held by an external dependency, policy decision, or prerequisite that GitHub's native review and check state does not enforce, especially when the PR otherwise appears mergeable. When applying it, leave a PR comment that names the blocker, the condition for removing `do-not-merge` and any companion blocked label, and the checks required before merge; reviews and linked issues may support that record but do not replace it. Pair it with `needs-maintainer-review` when a high-risk PR is explicitly routed for another independent Core Team approval. Use it for future-line work that must not land on the active release line. Do not apply it merely for pending CI, draft state, a behind branch, ordinary review, or active `CHANGES_REQUESTED`. Remove it only after the recorded condition clears and a maintainer rechecks the current native review state, required checks, mergeability, [Definition of Done](./pr-workflow.md#definition-of-done-dod), and [merge checklist](./pr-workflow.md#maintainer-merge-checklist). |
 | `follow-up` | Scope deliberately carved out from a parent issue or PR; link the parent so the relationship is visible |
 | `release-gate` | Finding or work item that must be reconciled for the named release gate |
 | `stacked` | PR depends on another PR; include an explicit `Depends on #...` reference and merge it after its base |

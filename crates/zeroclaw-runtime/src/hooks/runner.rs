@@ -28,15 +28,31 @@ impl HookRunner {
         }
     }
 
+    pub(crate) fn is_empty(&self) -> bool {
+        self.handlers.is_empty()
+    }
+
     pub fn from_config(hooks: &zeroclaw_config::schema::HooksConfig) -> Self {
         let mut runner = Self::new();
         if hooks.builtin.command_logger {
             runner.register(Box::new(super::builtin::CommandLoggerHook::new()));
         }
         if hooks.builtin.webhook_audit.enabled {
-            runner.register(Box::new(super::builtin::WebhookAuditHook::new(
-                hooks.builtin.webhook_audit.clone(),
-            )));
+            match super::builtin::WebhookAuditHook::new(hooks.builtin.webhook_audit.clone()) {
+                Ok(hook) => runner.register(Box::new(hook)),
+                Err(error) => {
+                    ::zeroclaw_log::record!(
+                        ERROR,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "hook": "webhook-audit",
+                                "error": error,
+                            })),
+                        "webhook-audit hook configuration is invalid; hook disabled"
+                    );
+                }
+            }
         }
         runner
     }
@@ -199,11 +215,16 @@ impl HookRunner {
     ) -> HookResult<()> {
         for h in &self.handlers {
             let hook_name = h.name();
-            match AssertUnwindSafe(h.before_llm_call(messages, model))
+            let mut candidate_messages = messages.clone();
+            let mut candidate_model = model.clone();
+            match AssertUnwindSafe(h.before_llm_call(&mut candidate_messages, &mut candidate_model))
                 .catch_unwind()
                 .await
             {
-                Ok(HookResult::Continue(())) => {}
+                Ok(HookResult::Continue(())) => {
+                    *messages = candidate_messages;
+                    *model = candidate_model;
+                }
                 Ok(HookResult::Cancel(reason)) => {
                     ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"hook": hook_name, "reason": reason.to_string()})), "before_llm_call cancelled by hook");
                     return HookResult::Cancel(reason);
@@ -733,6 +754,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn panicking_before_llm_call_discards_partial_mutations() {
+        struct MutateThenPanicHook;
+
+        #[async_trait]
+        impl HookHandler for MutateThenPanicHook {
+            fn name(&self) -> &str {
+                "mutate-then-panic"
+            }
+
+            async fn before_llm_call(
+                &self,
+                messages: &mut Vec<ChatMessage>,
+                model: &mut String,
+            ) -> HookResult<()> {
+                messages[0].content = "partial mutation".into();
+                *model = "partial-model".into();
+                panic!("hook panic after mutation");
+            }
+        }
+
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(MutateThenPanicHook));
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "original request".into(),
+        }];
+        let mut model = "original-model".into();
+
+        let result = runner.run_before_llm_call(&mut messages, &mut model).await;
+
+        assert!(matches!(result, HookResult::Continue(())));
+        assert_eq!(messages[0].content, "original request");
+        assert_eq!(model, "original-model");
+    }
+
+    #[tokio::test]
     async fn cancelling_on_message_received_short_circuits_remaining_handlers() {
         // Same contract verified on a non-modifying-family hook to pin
         // consistent cancellation behavior across hook families.
@@ -878,6 +935,26 @@ mod tests {
             names.contains(&"command-logger"),
             "command-logger enabled → must be registered; got {names:?}"
         );
+    }
+
+    #[test]
+    fn from_config_skips_invalid_webhook_and_keeps_valid_builtins() {
+        let config = zeroclaw_config::schema::HooksConfig {
+            enabled: true,
+            builtin: zeroclaw_config::schema::BuiltinHooksConfig {
+                command_logger: true,
+                webhook_audit: zeroclaw_config::schema::WebhookAuditConfig {
+                    enabled: true,
+                    url: "http://example.com/audit".to_string(),
+                    ..Default::default()
+                },
+            },
+        };
+
+        let runner = HookRunner::from_config(&config);
+        let names: Vec<&str> = runner.handlers.iter().map(|h| h.name()).collect();
+
+        assert_eq!(names, vec!["command-logger"]);
     }
 
     #[tokio::test]

@@ -10,6 +10,12 @@ pub fn handle_command(
     init_system: InitSystem,
 ) -> Result<()> {
     match command {
+        crate::ServiceCommands::RunLaunchdDaemon => {
+            anyhow::bail!("internal launchd runner must dispatch before config loading")
+        }
+        crate::ServiceCommands::RunOpenrcLogWriter { .. } => {
+            anyhow::bail!("internal OpenRC logger must dispatch before config loading")
+        }
         crate::ServiceCommands::Install => install(config, init_system),
         crate::ServiceCommands::Start => start(config, init_system),
         crate::ServiceCommands::Stop => stop(config, init_system),

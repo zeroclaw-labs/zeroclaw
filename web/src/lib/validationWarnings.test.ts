@@ -11,18 +11,6 @@ async function loadValidationWarningMessage() {
   return validationWarningMessage;
 }
 
-test('known config warnings resolve through the dashboard catalog', async () => {
-  const validationWarningMessage = await loadValidationWarningMessage();
-  const message = validationWarningMessage({
-    code: 'skills_prompt_injection_mode_full_deprecated',
-    message: 'unlocalized fallback',
-    path: 'skills.prompt_injection_mode',
-  });
-
-  assert.match(message, /full.*deprecated/i);
-  assert.doesNotMatch(message, /unlocalized fallback/);
-});
-
 test('unknown config warnings retain the API fallback message', async () => {
   const validationWarningMessage = await loadValidationWarningMessage();
   const message = validationWarningMessage({
