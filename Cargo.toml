@@ -31,6 +31,7 @@ zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.8.4" }
 zerocode = { path = "apps/zerocode", version = "0.8.4" }
 directories = "6.0"
 sys-locale = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
 
 [package]
 name = "zeroclaw"
@@ -139,7 +140,7 @@ async-trait = "0.1"
 
 # Memory / persistence (migration.rs, behind agent-runtime)
 rusqlite = { version = "0.37", features = ["bundled"], optional = true }
-chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+chrono.workspace = true
 
 # Interactive CLI prompts (memory CLI uses dialoguer unconditionally)
 dialoguer = { version = "0.12", features = ["fuzzy-select"] }

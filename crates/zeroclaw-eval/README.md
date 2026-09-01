@@ -75,5 +75,8 @@ filter it to the effective allowlist; `shell` remains unavailable.
 - `observer::RecordingObserver` — captures tool-call outcomes and token usage.
 - `grader` — non-panicking `GradeResult` checks (the `Grader` trait is the
   extension point for side-effect/budget/LLM-judge graders in later phases).
+- `calibration` — structured judge-run and human-label schemas, JSONL helpers,
+  agreement statistics, and strict calibration-file validation bound to the
+  exact judge prompt and rubric contracts.
 - `runner` — builds an isolated agent per case, drives it, grades it.
 - `report` — pass/fail aggregation, table + JSON rendering.

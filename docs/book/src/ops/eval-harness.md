@@ -186,7 +186,7 @@ Gating is strictly per-case Pass to Fail flips; aggregate score deltas are never
 gate. To refresh a baseline after an intentional behavior change, re-run with
 `--write-baseline` and commit the updated file.
 
-## LLM judge (diagnostic only)
+## LLM judge and calibration
 
 A case can declare `expects.judge`: a list of rubrics, one per dimension. Each
 rubric has a `name`, a `rubric` string, a pass `threshold` (default 0.7 on the
@@ -196,13 +196,11 @@ a different provider reference than the one under test, since self-judging is
 biased (the harness warns when the exact configured references match).
 
 Each rubric is graded by one isolated judge call at temperature 0.0. The judge's
-0.0 to 1.0 score is reported against the threshold, but every judge grade is
-diagnostic: it never affects the case verdict or process exit code. An `unknown`
-verdict, a reply that does not exactly match the required JSON schema, an
-out-of-range score, or a transport error is reported as `UNKNOWN (diagnostic)`.
-Authoritative judge gating is intentionally unavailable until a calibration
-workflow can bind a result to the exact judge, prompt, rubric, and scoring
-contract.
+0.0 to 1.0 score is reported against the threshold and is diagnostic by default.
+An `unknown` verdict, a reply that does not exactly match the required JSON
+schema, an out-of-range score, or a transport error is reported as `UNKNOWN
+(diagnostic)`. A judge result affects the case verdict only when an explicitly
+enabled calibration gate accepts a calibration artifact for that exact judge.
 
 Provider fallbacks, model fallbacks, and model-route overrides are disabled for
 judge calls. The model-inclusive
@@ -225,6 +223,59 @@ Authoring rules: use one dimension per rubric entry; keep `name` and `rubric`
 nonempty; set a finite threshold from 0.0 through 1.0; and declare at least one
 deterministic check (response, workspace, tool, or budget) so the case is not
 judge-only.
+
+**Judge grades are diagnostic by default:** they are stripped from the pass/fail
+gate unless `[eval].judge_gate` is true and the model-specific calibration file
+under `evals/calibration/` is accepted. Its collision-safe filename combines a
+readable, sanitized model-inclusive `judge_ref` with a short hash; the CLI prints
+the exact path. The consumer requires schema `zeroclaw-eval/calibration/v1`, an
+exact `judge_ref`, the current judge prompt/scoring-contract hash, at least 50
+labeled records, and overall agreement of at least 0.85. Each individual grade
+also requires an entry for its exact rubric text, name, threshold, and transcript
+setting, with per-rubric agreement of at least 0.85. Changing the judge prompt or
+rubric therefore requires recalibration. A missing or rejected file produces a
+concrete warning and keeps judge grades diagnostic; a missing or low-agreement
+rubric entry keeps that rubric diagnostic.
+
+### Calibration workflow
+
+Build a calibration set with the CLI tooling:
+
+```bash
+# Run as many suites as needed to accumulate at least 50 judge runs.
+zeroclaw eval run --dump-records target/eval-calibration
+
+# Label every unique judge run. Use --judge-ref when a dump contains several.
+zeroclaw eval calibrate label \
+  --records target/eval-calibration \
+  --labeler "Reviewer name"
+
+# Summarize agreement and emit the validated calibration artifact.
+zeroclaw eval calibrate finalize \
+  --labels evals/calibration/labels/<judge-and-prompt-stem>.jsonl
+```
+
+`--dump-records` appends one entry per successful, parseable judge call to
+`judge-runs.jsonl`; repeated suite runs therefore accumulate toward the 50-label
+minimum. The label command deduplicates records by stable id and resumes an
+append-only labels file keyed by both judge reference and prompt contract, so
+interrupted sessions are safe to restart and older records cannot mix with a
+new prompt's calibration.
+
+Labeling is blind: before each pass/fail answer, the terminal shows the task,
+rubric, and response but withholds the judge's score, verdict, and reason. This
+prevents the judge's own conclusion from anchoring the human assessment. The
+judge result is revealed only after the human answers. For rubrics that included
+the agent conversation in judge evidence, the record preserves and displays it
+too. Press `t` to toggle transcript evidence, `p` or `f` to label, `u` to leave
+the record pending, or `q` to quit.
+
+Finalization refuses fewer than 50 labels, prints agreement, per-rubric results,
+and Cohen's kappa, and retains the prompt hash, per-rubric contract hashes,
+counts, agreement, and kappa in the compact artifact. Agreement below 0.85 warns
+but still emits so the evidence remains inspectable; such an artifact is rejected
+for gating. Pass `--min-agreement` to refuse emission below a stricter chosen
+floor. Commit the emitted calibration file, then set `[eval].judge_gate = true`.
 
 ## Exit-code contract
 
@@ -289,6 +340,9 @@ Records can be dumped as JSON:
 
 - `--dump-records <dir>` writes `<dir>/<case_id>.json` (record plus grades) for
   every case. The directory and files are restricted to the current user.
+- When judge grading is configured, the same option appends calibratable judge
+  calls to `<dir>/judge-runs.jsonl`. Repeated runs accumulate; readers deduplicate
+  stable record ids.
 - On every completed run, failed or errored cases are auto-dumped under
   `<install>/eval-artifacts/runs/<run-id>/`. The table footer prints the exact
   directory when any failed-case records exist. The owner-only
