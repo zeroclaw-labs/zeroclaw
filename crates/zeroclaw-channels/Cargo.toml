@@ -88,14 +88,14 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-webpki-roots-no-provider",
   "stream",
 ] }
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.37", optional = true, features = ["bundled"] }
 rustls = { version = "0.23", default-features = false, features = [
   "logging",
   "ring",
   "std",
   "tls12",
-] }
-rustls-pki-types = "1.14.0"
+], optional = true }
+rustls-pki-types = { version = "1.14.0", optional = true }
 serde = { version = "1.0", default-features = false, features = ["derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 sha2 = "0.10"
@@ -114,11 +114,11 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = [
   "logging",
   "ring",
   "tls12",
-] }
+], optional = true }
 tokio-tungstenite = { version = "0.29", default-features = false, features = [
   "connect",
   "rustls-tls-webpki-roots",
-] }
+], optional = true }
 tokio-util = { version = "0.7", default-features = false }
 toml = "1.0"
 urlencoding = "2.1"
@@ -127,7 +127,7 @@ uuid = { version = "1.22", default-features = false, features = ["std", "v4"] }
 hex = "0.4"
 nanohtml2text = "0.2"
 rand = "0.10"
-webpki-roots = "1.0.6"
+webpki-roots = { version = "1.0.6", optional = true }
 
 # WhatsApp Web (optional). Pinned to oxidezap/whatsapp-rust @ cbcdd2a
 # until upstream ships 0.6.1 to crates.io.
@@ -212,10 +212,15 @@ channel-email = [
   "dep:async-imap",
   "dep:lettre",
   "dep:mail-parser",
+  "dep:rustls",
+  "dep:rustls-pki-types",
+  "tls-client",
 ]
+tls-client = ["dep:tokio-rustls", "dep:webpki-roots"]
+ws-transport = ["zeroclaw-config/ws-transport", "dep:tokio-tungstenite"]
 image-normalization = ["dep:image"]
 channel-telegram = ["image-normalization"]
-channel-lark = ["dep:axum", "dep:prost"]
+channel-lark = ["dep:axum", "dep:prost", "ws-transport"]
 channel-git = ["provider-github", "provider-gitea"]
 # Forge providers for the git channel. `provider-github` (GitHub Apps) and
 # `provider-gitea` (Gitea/Forgejo PAT) are default-on under `channel-git`;
@@ -228,6 +233,7 @@ whatsapp-web = [
   "dep:bytes",
   "dep:prost",
   "dep:qrcode",
+  "dep:rusqlite",
   "dep:serde-big-array",
   "dep:wacore",
   "dep:wacore-binary",
@@ -238,15 +244,15 @@ whatsapp-web = [
   "image-normalization",
 ]
 # Channels with no optional deps (cfg gate only)
-channel-discord = []
-channel-slack = []
+channel-discord = ["ws-transport"]
+channel-slack = ["ws-transport"]
 channel-signal = []
-channel-mattermost = []
-channel-irc = []
+channel-mattermost = ["ws-transport"]
+channel-irc = ["tls-client"]
 channel-twitch = ["channel-irc"]
-channel-imessage = []
-channel-dingtalk = []
-channel-qq = []
+channel-imessage = ["dep:rusqlite"]
+channel-dingtalk = ["ws-transport"]
+channel-qq = ["ws-transport"]
 channel-bluesky = []
 channel-twitter = []
 channel-reddit = []
@@ -265,7 +271,7 @@ channel-wechat = [
   "dep:qrcode",
 ]
 channel-wecom = []
-channel-wecom-ws = ["dep:aes", "dep:cbc"]
+channel-wecom-ws = ["dep:aes", "dep:cbc", "ws-transport"]
 channel-clawdtalk = []
 channel-webhook = ["dep:axum"]
 channel-whatsapp-cloud = []
@@ -300,6 +306,7 @@ matrix-sdk = { version = "0.18", default-features = false, features = [
 ] }
 matrix-sdk-base = { version = "0.18", default-features = false, features = ["e2e-encryption"] }
 matrix-sdk-test = "0.18"
+rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3.26"
 toml = "1.0"
 wiremock = "0.6"
