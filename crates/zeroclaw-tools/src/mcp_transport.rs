@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::io::Read as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
@@ -47,6 +48,8 @@ const MCP_STREAMABLE_ACCEPT: &str = "application/json, text/event-stream";
 const MCP_JSON_CONTENT_TYPE: &str = "application/json";
 /// Streamable HTTP session header used to preserve MCP server state.
 const MCP_SESSION_ID_HEADER: &str = "Mcp-Session-Id";
+/// Maximum size of one operator-selected PEM CA file.
+const MAX_TLS_CA_BYTES: usize = 1024 * 1024;
 
 fn http_request_timeout_secs(
     request: &JsonRpcRequest,
@@ -79,6 +82,144 @@ fn apply_request_timeout(
     } else {
         req
     }
+}
+
+fn require_https_url(server_name: &str, url: &str, target: &str) -> Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .with_context(|| format!("MCP server `{server_name}`: invalid {target} URL"))?;
+    if parsed.scheme() != "https" {
+        bail!(
+            "MCP server `{server_name}`: tls_ca_cert_path requires an HTTPS {target}; \
+             refusing plaintext transport"
+        );
+    }
+    Ok(())
+}
+
+/// Open a candidate CA file without letting a special file block the caller.
+///
+/// The open itself carries `O_NONBLOCK` on unix so that a FIFO (or a symlink to
+/// one) substituted at `path` returns a handle immediately instead of parking
+/// the thread until a writer appears. Classification happens on the returned
+/// handle, never on a second pathname lookup, so the file object we validate is
+/// the same one we read.
+///
+/// Symlinks are followed deliberately: certificate rotation and mounted-secret
+/// deployments publish CA bundles through symlink indirection. Following them is
+/// safe here precisely because the resulting handle is classified after the
+/// open — a symlink that retargets to a special file still yields a handle we
+/// reject rather than a blocking open.
+fn open_tls_ca_file(path: &str) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    options.open(path)
+}
+
+fn load_tls_ca_pem(config: &McpServerConfig, path: &str) -> Result<Vec<u8>> {
+    let file = open_tls_ca_file(path).with_context(|| {
+        format!(
+            "MCP server `{}`: cannot read TLS CA certificate at `{path}`",
+            config.name
+        )
+    })?;
+    let opened_metadata = file.metadata().with_context(|| {
+        format!(
+            "MCP server `{}`: cannot inspect opened TLS CA certificate at `{path}`",
+            config.name
+        )
+    })?;
+    if !opened_metadata.file_type().is_file() {
+        bail!(
+            "MCP server `{}`: TLS CA certificate path must name a regular file: `{path}`",
+            config.name
+        );
+    }
+    if opened_metadata.len() > MAX_TLS_CA_BYTES as u64 {
+        bail!(
+            "MCP server `{}`: TLS CA certificate at `{path}` exceeds the {MAX_TLS_CA_BYTES}-byte limit",
+            config.name
+        );
+    }
+
+    let mut pem = Vec::with_capacity(opened_metadata.len() as usize + 1);
+    file.take(MAX_TLS_CA_BYTES as u64 + 1)
+        .read_to_end(&mut pem)
+        .with_context(|| {
+            format!(
+                "MCP server `{}`: cannot read TLS CA certificate at `{path}`",
+                config.name
+            )
+        })?;
+    if pem.len() > MAX_TLS_CA_BYTES {
+        bail!(
+            "MCP server `{}`: TLS CA certificate at `{path}` exceeds the {MAX_TLS_CA_BYTES}-byte limit",
+            config.name
+        );
+    }
+    Ok(pem)
+}
+
+/// Build the shared HTTP client for remote MCP transports.
+///
+/// The optional server-specific CA is additive: system/default roots remain
+/// enabled, and normal chain and hostname verification stay in force.
+fn build_remote_http_client(config: &McpServerConfig) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder();
+
+    if let Some(path) = config.tls_ca_cert_path.as_deref() {
+        let server_name = config.name.clone();
+        builder = builder.redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() >= 10 {
+                attempt.error(std::io::Error::other(format!(
+                    "MCP server `{server_name}`: too many redirects"
+                )))
+            } else if attempt.url().scheme() == "https" {
+                attempt.follow()
+            } else {
+                attempt.error(std::io::Error::other(format!(
+                    "MCP server `{server_name}`: tls_ca_cert_path forbids redirecting to plaintext"
+                )))
+            }
+        }));
+
+        if !std::path::Path::new(path).is_absolute() {
+            bail!(
+                "MCP server `{}`: TLS CA certificate path must be absolute: `{}`",
+                config.name,
+                path
+            );
+        }
+
+        let pem = load_tls_ca_pem(config, path)?;
+        let certificates = reqwest::Certificate::from_pem_bundle(&pem).with_context(|| {
+            format!(
+                "MCP server `{}`: invalid PEM CA certificate at `{}`",
+                config.name, path
+            )
+        })?;
+        if certificates.is_empty() {
+            bail!(
+                "MCP server `{}`: CA certificate file `{}` contained no certificates",
+                config.name,
+                path
+            );
+        }
+        for certificate in certificates {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+
+    builder.build().with_context(|| {
+        format!(
+            "failed to build HTTP client for MCP server `{}`",
+            config.name
+        )
+    })
 }
 
 // ── Transport Errors ───────────────────────────────────────────────────────
@@ -624,26 +765,49 @@ async fn stdio_child_exit_watcher(
     }
 }
 
+#[derive(Debug)]
 enum BoundedLine {
-    Line(Vec<u8>),
+    /// A single line with its trailing `\r` stripped, plus the exact number of
+    /// raw bytes consumed from the wire to produce it (content, any `\r`, and the
+    /// terminating `\n`). Callers enforcing a raw-byte response cap must count
+    /// `consumed`, not `bytes.len()`: for CRLF framing the stripped line is one
+    /// byte shorter than what the server actually sent, so rebuilding the count
+    /// as `bytes.len() + 1` undercounts every line by the dropped `\r`.
+    Line {
+        bytes: Vec<u8>,
+        consumed: u64,
+    },
     Oversized,
     Eof,
 }
 
-async fn read_bounded_line(
-    reader: &mut BufReader<tokio::process::ChildStdout>,
-) -> std::io::Result<BoundedLine> {
+/// Read one `\n`-terminated line, never allocating more than `limit` bytes.
+///
+/// Generic over any buffered async reader so both the stdio response loop and the
+/// persistent SSE stream reader can bound a single line before it is fully
+/// buffered: a compromised server cannot force an unbounded `String`/`Vec`
+/// allocation with one arbitrarily long unterminated line. When a line exceeds
+/// `limit` the excess is drained to the next newline and `Oversized` is returned,
+/// so the stream resynchronizes rather than tearing down.
+async fn read_bounded_line<R>(reader: &mut R, limit: usize) -> std::io::Result<BoundedLine>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     let mut line = Vec::new();
     let mut oversized = false;
+    let mut consumed_total: u64 = 0;
     loop {
         let buf = reader.fill_buf().await?;
         if buf.is_empty() {
-            return if line.is_empty() {
+            return if line.is_empty() && !oversized {
                 Ok(BoundedLine::Eof)
             } else if oversized {
                 Ok(BoundedLine::Oversized)
             } else {
-                Ok(BoundedLine::Line(line))
+                Ok(BoundedLine::Line {
+                    bytes: line,
+                    consumed: consumed_total,
+                })
             };
         }
 
@@ -651,7 +815,7 @@ async fn read_bounded_line(
         let consumed = newline.map_or(buf.len(), |index| index + 1);
         let content_len = newline.unwrap_or(buf.len());
         if !oversized {
-            if line.len().saturating_add(content_len) > MAX_LINE_BYTES {
+            if line.len().saturating_add(content_len) > limit {
                 oversized = true;
                 line.clear();
             } else {
@@ -659,6 +823,7 @@ async fn read_bounded_line(
             }
         }
         reader.consume(consumed);
+        consumed_total = consumed_total.saturating_add(consumed as u64);
         if newline.is_some() {
             if oversized {
                 return Ok(BoundedLine::Oversized);
@@ -666,9 +831,74 @@ async fn read_bounded_line(
             if line.last() == Some(&b'\r') {
                 line.pop();
             }
-            return Ok(BoundedLine::Line(line));
+            return Ok(BoundedLine::Line {
+                bytes: line,
+                consumed: consumed_total,
+            });
         }
     }
+}
+
+/// Base64 encodes 3 decoded bytes as 4 characters, so the largest legal decoded
+/// embedded-blob aggregate expands to this many bytes on the wire, before the
+/// surrounding JSON-RPC envelope. For the documented 10 MiB decoded budget this
+/// is 13,981,016 bytes. Derived from the single source of truth in
+/// [`crate::embedded_resource`] so the two layers cannot drift.
+const MAX_ENCODED_BLOB_BYTES: u64 = crate::embedded_resource::MAX_AGGREGATE_BLOB_BYTES
+    .div_ceil(3)
+    .saturating_mul(4);
+
+/// Headroom above the base64-expanded blob for the JSON-RPC envelope: the
+/// `{"jsonrpc","id","result":{"content":[{"type","resource",...}]}}` scaffolding,
+/// string escaping, and the bounded resource metadata the formatter keeps around
+/// each blob. 2 MiB comfortably covers the fixed framing plus the item-count cap.
+const RESPONSE_ENVELOPE_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Default maximum bytes for a single HTTP/SSE JSON-RPC response body when a
+/// server config does not override `max_response_bytes`.
+///
+/// The materialization stage enforces the *decoded* aggregate blob budget, but
+/// the transport sees *encoded* base64 wrapped in a JSON-RPC envelope. Sizing the
+/// transport cap to the decoded budget (as an earlier revision did) rejected a
+/// valid near-limit blob before the decoded-byte preflight could apply the
+/// documented boundary. The default now admits the base64-expanded blob plus
+/// bounded envelope overhead, so a legal near-limit response reaches
+/// materialization while a genuinely oversized one is still rejected before parse.
+const DEFAULT_MAX_RESPONSE_BYTES: u64 =
+    MAX_ENCODED_BLOB_BYTES.saturating_add(RESPONSE_ENVELOPE_OVERHEAD_BYTES);
+
+fn resolve_max_response_bytes(config: &McpServerConfig) -> u64 {
+    config
+        .max_response_bytes
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_MAX_RESPONSE_BYTES)
+}
+
+/// Read `resp`'s body as a UTF-8 string, rejecting a body larger than `limit`
+/// bytes at read time — a `Content-Length` fast-reject plus a streaming cap —
+/// instead of buffering the whole body with `resp.text()`. The streaming cap
+/// reads at most `limit + 1` bytes via tokio's own `Take` adapter, so a body
+/// over the cap is detected by length without ever buffering past it and without
+/// a hand-rolled `AsyncRead` that could violate the `read_to_end` contract.
+async fn read_body_bounded_to_string(resp: reqwest::Response, limit: u64) -> Result<String> {
+    if let Some(len) = resp.content_length()
+        && len > limit
+    {
+        anyhow::bail!("MCP response body Content-Length {len} exceeds the {limit}-byte limit");
+    }
+    let stream = resp
+        .bytes_stream()
+        .map(|item| item.map_err(std::io::Error::other));
+    let reader = tokio_util::io::StreamReader::new(stream);
+    let mut bounded = tokio::io::AsyncReadExt::take(reader, limit.saturating_add(1));
+    let mut bytes = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut bounded, &mut bytes)
+        .await
+        .context("failed to read HTTP response")?;
+    if bytes.len() as u64 > limit {
+        anyhow::bail!("MCP response body exceeds the {limit}-byte limit");
+    }
+    String::from_utf8(bytes).context("MCP response body was not valid UTF-8")
 }
 
 fn drain_pending_generation(pending: &PendingMap, generation: u64) {
@@ -735,8 +965,8 @@ async fn stdio_read_loop(
 ) {
     let mut reader = BufReader::new(stdout);
     loop {
-        match read_bounded_line(&mut reader).await {
-            Ok(BoundedLine::Line(line)) => {
+        match read_bounded_line(&mut reader, MAX_LINE_BYTES).await {
+            Ok(BoundedLine::Line { bytes: line, .. }) => {
                 let Ok(response) = serde_json::from_slice::<JsonRpcResponse>(&line) else {
                     continue;
                 };
@@ -910,6 +1140,9 @@ pub struct HttpTransport {
     /// read timeout. Tool calls use the configured budget when present; when
     /// absent, the client layer's outer tool-call timeout owns the budget.
     tool_timeout_secs: Option<u64>,
+    /// Per-server response-body byte cap, from `McpServerConfig.max_response_bytes`
+    /// (or the built-in default). Enforced at read time before parsing.
+    max_response_bytes: u64,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
     session_id: ParkingMutex<Option<String>>,
@@ -935,13 +1168,15 @@ impl HttpTransport {
             })?
             .clone();
 
-        let client = reqwest::Client::builder()
-            .build()
-            .context("failed to build HTTP client")?;
+        if config.tls_ca_cert_path.is_some() {
+            require_https_url(&config.name, &url, "configured remote URL")?;
+        }
+        let client = build_remote_http_client(config)?;
 
         Ok(Self {
             url,
             tool_timeout_secs: config.tool_timeout_secs,
+            max_response_bytes: resolve_max_response_bytes(config),
             client,
             headers: config.headers.clone(),
             session_id: ParkingMutex::new(None),
@@ -1060,7 +1295,7 @@ impl SharedMcpTransportConn for HttpTransport {
             .and_then(|v| v.to_str().ok())
             .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
         if is_sse {
-            let read_response = read_first_jsonrpc_from_sse_response(resp);
+            let read_response = read_first_jsonrpc_from_sse_response(resp, self.max_response_bytes);
             let maybe_resp = if let Some(sse_timeout) =
                 http_sse_read_timeout_secs(request, self.tool_timeout_secs)
             {
@@ -1082,7 +1317,7 @@ impl SharedMcpTransportConn for HttpTransport {
             return finish_response(request, lifecycle, response);
         }
 
-        let resp_text = resp.text().await.context("failed to read HTTP response")?;
+        let resp_text = read_body_bounded_to_string(resp, self.max_response_bytes).await?;
         let response = parse_jsonrpc_response_text(&resp_text)?;
         finish_response(request, lifecycle, response)
     }
@@ -1113,8 +1348,11 @@ pub struct SseTransport {
     sse_url: String,
     server_name: String,
     tool_timeout_secs: Option<u64>,
+    /// Per-server response-body byte cap, enforced at read time before parsing.
+    max_response_bytes: u64,
     client: reqwest::Client,
     headers: std::collections::HashMap<String, String>,
+    require_https: bool,
     conn: Mutex<SseConnState>,
     shared: std::sync::Arc<Mutex<SseSharedState>>,
     pending: SsePendingMap,
@@ -1147,16 +1385,20 @@ impl SseTransport {
             })?
             .clone();
 
-        let client = reqwest::Client::builder()
-            .build()
-            .context("failed to build HTTP client")?;
+        let require_https = config.tls_ca_cert_path.is_some();
+        if require_https {
+            require_https_url(&config.name, &sse_url, "configured remote URL")?;
+        }
+        let client = build_remote_http_client(config)?;
 
         Ok(Self {
             sse_url,
             server_name: config.name.clone(),
             tool_timeout_secs: config.tool_timeout_secs,
+            max_response_bytes: resolve_max_response_bytes(config),
             client,
             headers: config.headers.clone(),
+            require_https,
             conn: Mutex::new(SseConnState {
                 stream_state: SseStreamState::Unknown,
                 shutdown_tx: None,
@@ -1235,26 +1477,61 @@ impl SseTransport {
         let notify = self.notify.clone();
         let sse_url = self.sse_url.clone();
         let server_name = self.server_name.clone();
+        let max_response_bytes = self.max_response_bytes;
 
         conn.reader_task = Some(zeroclaw_spawn::spawn!(async move {
             let stream = resp
                 .bytes_stream()
                 .map(|item| item.map_err(std::io::Error::other));
             let reader = tokio_util::io::StreamReader::new(stream);
-            let mut lines = BufReader::new(reader).lines();
+            let mut reader = BufReader::new(reader);
+            // Bound each SSE line to the per-server response cap so one
+            // arbitrarily long unterminated `data:` line cannot force an
+            // unbounded allocation before the per-event counter below runs.
+            let line_limit = usize::try_from(max_response_bytes).unwrap_or(usize::MAX);
 
             let mut cur_event: Option<String> = None;
             let mut cur_id: Option<String> = None;
             let mut cur_data: Vec<String> = Vec::new();
+            // Bytes accumulated for the current event's `data:` lines. Reset at
+            // each event boundary. Bounds a single event so a persistent stream
+            // cannot accumulate unbounded event data before dispatch.
+            let mut cur_bytes: u64 = 0;
 
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => {
                         break;
                     }
-                    line = lines.next_line() => {
-                        let Ok(line_opt) = line else { break; };
-                        let Some(mut line) = line_opt else { break; };
+                    read = read_bounded_line(&mut reader, line_limit) => {
+                        let (raw, consumed) = match read {
+                            Ok(BoundedLine::Line { bytes, consumed }) => (bytes, consumed),
+                            Ok(BoundedLine::Oversized) => {
+                                // A single line already exceeded the response cap.
+                                // Drop the in-flight event and resync at the next
+                                // line rather than buffering the oversized payload.
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "mcp_server": &server_name,
+                                            "limit": max_response_bytes,
+                                        })),
+                                    "mcp_transport: dropping oversized SSE line before dispatch"
+                                );
+                                cur_data.clear();
+                                cur_event = None;
+                                cur_id = None;
+                                cur_bytes = 0;
+                                continue;
+                            }
+                            Ok(BoundedLine::Eof) | Err(_) => break,
+                        };
+                        // SSE is UTF-8; a non-UTF-8 line is malformed framing.
+                        let Ok(mut line) = String::from_utf8(raw) else {
+                            continue;
+                        };
                         if line.ends_with('\r') {
                             line.pop();
                         }
@@ -1265,6 +1542,7 @@ impl SseTransport {
                             let event = cur_event.take();
                             let data = cur_data.join("\n");
                             cur_data.clear();
+                            cur_bytes = 0;
                             let id = cur_id.take();
                             handle_sse_event(&server_name, &sse_url, &shared, &pending, &notify, event.as_deref(), id.as_deref(), data).await;
                             continue;
@@ -1279,6 +1557,28 @@ impl SseTransport {
                         }
                         if let Some(rest) = line.strip_prefix("data:") {
                             let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                            // Count the raw bytes consumed from the wire for this
+                            // line (prefix, any CR, and the newline), not the
+                            // CR-stripped payload, so a CRLF-framed event cannot
+                            // exceed the cap while the stripped lengths stay under.
+                            cur_bytes = cur_bytes.saturating_add(consumed);
+                            if cur_bytes > max_response_bytes {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(::serde_json::json!({
+                                            "mcp_server": &server_name,
+                                            "limit": max_response_bytes,
+                                        })),
+                                    "mcp_transport: dropping oversized SSE event data before dispatch"
+                                );
+                                cur_data.clear();
+                                cur_event = None;
+                                cur_id = None;
+                                cur_bytes = 0;
+                                continue;
+                            }
                             cur_data.push(rest.to_string());
                         }
                         if let Some(rest) = line.strip_prefix("id:") {
@@ -1527,21 +1827,54 @@ fn looks_like_sse_text(text: &str) -> bool {
 
 async fn read_first_jsonrpc_from_sse_response(
     resp: reqwest::Response,
+    limit: u64,
 ) -> Result<Option<JsonRpcResponse>> {
+    if let Some(len) = resp.content_length()
+        && len > limit
+    {
+        anyhow::bail!("MCP SSE response Content-Length {len} exceeds the {limit}-byte limit");
+    }
     let stream = resp
         .bytes_stream()
         .map(|item| item.map_err(std::io::Error::other));
+    // Read the SSE reply incrementally and return as soon as the first complete
+    // `message` event parses, rather than buffering to EOF. A compliant server
+    // may hold the SSE connection open for subsequent traffic after the response
+    // event, so waiting for EOF would stall a successful `tools/call` until the
+    // request/idle timeout. The byte total is still bounded at read time (each
+    // line via `read_bounded_line`, and the running total below) so an over-cap
+    // reply is rejected before any JSON parse.
     let reader = tokio_util::io::StreamReader::new(stream);
-    let mut lines = BufReader::new(reader).lines();
+    let mut reader = BufReader::new(reader);
+    let line_limit = usize::try_from(limit).unwrap_or(usize::MAX);
 
     let mut cur_event: Option<String> = None;
     let mut cur_data: Vec<String> = Vec::new();
+    let mut total_bytes: u64 = 0;
 
-    while let Ok(line_opt) = lines.next_line().await {
-        let Some(mut line) = line_opt else { break };
+    loop {
+        let (raw, consumed) = match read_bounded_line(&mut reader, line_limit).await {
+            Ok(BoundedLine::Line { bytes, consumed }) => (bytes, consumed),
+            Ok(BoundedLine::Oversized) => {
+                anyhow::bail!("MCP SSE response body exceeds the {limit}-byte limit");
+            }
+            Ok(BoundedLine::Eof) => break,
+            Err(e) => return Err(anyhow::Error::new(e).context("failed to read MCP SSE response")),
+        };
+        // Count the raw consumed wire bytes (including any stripped `\r` and the
+        // `\n`), not the CR-stripped line, so a CRLF-delimited body cannot exceed
+        // the cap while every stripped line length stays under it.
+        total_bytes = total_bytes.saturating_add(consumed);
+        if total_bytes > limit {
+            anyhow::bail!("MCP SSE response body exceeds the {limit}-byte limit");
+        }
+        // `read_bounded_line` already strips a trailing `\r` for newline-delimited
+        // lines; the guard covers the final unterminated line at EOF.
+        let mut line = String::from_utf8_lossy(&raw).into_owned();
         if line.ends_with('\r') {
             line.pop();
         }
+
         if line.is_empty() {
             if cur_event.is_none() && cur_data.is_empty() {
                 continue;
@@ -1622,6 +1955,13 @@ impl SharedMcpTransportConn for SseTransport {
             self.sse_url.clone()
         };
 
+        // The message endpoint can be supplied by the server via the SSE
+        // `endpoint` event, so re-check it here: a custom CA must never be
+        // downgraded to plaintext by a server-controlled redirect target.
+        if self.require_https {
+            require_https_url(&self.server_name, &message_url, "SSE message endpoint")?;
+        }
+
         // Acquire the epoch permit before registering a response waiter.
         // Cancellation while waiting for the permit is provably pre-write and
         // therefore cannot leak a pending sender.
@@ -1691,9 +2031,15 @@ impl SharedMcpTransportConn for SseTransport {
                     .is_some_and(|v| v.to_ascii_lowercase().contains("text/event-stream"));
 
                 if is_sse {
-                    got_direct = read_first_jsonrpc_from_sse_response(resp).await?;
+                    got_direct =
+                        read_first_jsonrpc_from_sse_response(resp, self.max_response_bytes).await?;
                 } else {
-                    let text = resp.text().await.unwrap_or_default();
+                    // Propagate a size-limit / read failure instead of masking it
+                    // as an empty body: swallowing it here would drop the request
+                    // onto the persistent stream wait forever. A genuinely empty
+                    // successful body still yields "" and falls through to the
+                    // stream, preserving the intentional async-delivery fallback.
+                    let text = read_body_bounded_to_string(resp, self.max_response_bytes).await?;
                     let trimmed = text.trim();
                     if !trimmed.is_empty() {
                         let json_str =
@@ -1806,6 +2152,164 @@ pub(crate) fn create_shared_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestTlsServer {
+        url: String,
+        ca_pem: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    #[derive(Clone)]
+    enum TestTlsBehavior {
+        JsonRpc,
+        Sse,
+        Redirect(String),
+    }
+
+    fn test_ca_file() -> tempfile::NamedTempFile {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(vec!["ZeroClaw MCP test CA".into()]).unwrap();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), cert.pem()).unwrap();
+        file
+    }
+
+    /// Install the `ring` `CryptoProvider` for this process (idempotent).
+    ///
+    /// The workspace test build links both `ring` (this crate) and `aws-lc-rs`
+    /// (pulled in transitively by the `matrix-sdk` dev-dependency), so rustls
+    /// cannot infer a process-level provider from crate features and panics
+    /// inside `ServerConfig::builder()`. Production is unaffected: the remote
+    /// transports build their clients through reqwest's `__rustls-ring`
+    /// feature, which selects the provider explicitly.
+    fn ensure_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    async fn spawn_test_tls_server() -> TestTlsServer {
+        spawn_test_tls_server_with_san("127.0.0.1").await
+    }
+
+    async fn spawn_test_tls_server_with_san(server_san: &str) -> TestTlsServer {
+        spawn_test_tls_server_with_behavior(server_san, TestTlsBehavior::JsonRpc).await
+    }
+
+    async fn serve_test_tls_connection(
+        stream: tokio::net::TcpStream,
+        acceptor: tokio_rustls::TlsAcceptor,
+        addr: std::net::SocketAddr,
+        behavior: TestTlsBehavior,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let Ok(mut stream) = acceptor.accept(stream).await else {
+            return;
+        };
+        let mut request = vec![0_u8; 4096];
+        let bytes_read = stream.read(&mut request).await.unwrap();
+        let is_get = request[..bytes_read].starts_with(b"GET ");
+
+        let response = match behavior {
+            TestTlsBehavior::JsonRpc => {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            }
+            TestTlsBehavior::Sse if is_get => {
+                let body = format!("event: endpoint\ndata: https://{addr}/messages\n\n");
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            }
+            TestTlsBehavior::Sse => {
+                let body = r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#;
+                format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+            }
+            TestTlsBehavior::Redirect(location) => {
+                format!(
+                    "HTTP/1.1 302 Found\r\nlocation: {location}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+            }
+        };
+        stream.write_all(response.as_bytes()).await.unwrap();
+        stream.shutdown().await.unwrap();
+    }
+
+    async fn spawn_test_tls_server_with_behavior(
+        server_san: &str,
+        behavior: TestTlsBehavior,
+    ) -> TestTlsServer {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        use rustls::pki_types::PrivatePkcs8KeyDer;
+        use std::sync::Arc;
+        use tokio_rustls::TlsAcceptor;
+
+        ensure_crypto_provider();
+
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["ZeroClaw MCP test CA".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let server_key = KeyPair::generate().unwrap();
+        let mut server_params = CertificateParams::new(vec![server_san.into()]).unwrap();
+        server_params.is_ca = IsCa::NoCa;
+        let server_cert = server_params
+            .signed_by(&server_key, &ca_cert, &ca_key)
+            .unwrap();
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![server_cert.der().clone()],
+                PrivatePkcs8KeyDer::from(server_key.serialize_der()).into(),
+            )
+            .unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connection_count = if matches!(&behavior, TestTlsBehavior::Sse) {
+            2
+        } else {
+            1
+        };
+        let task = ::zeroclaw_spawn::spawn!(async move {
+            let acceptor = TlsAcceptor::from(Arc::new(server_config));
+            let mut handlers = Vec::with_capacity(connection_count);
+            for _ in 0..connection_count {
+                let (stream, _) = listener.accept().await.unwrap();
+                let connection_acceptor = acceptor.clone();
+                let connection_behavior = behavior.clone();
+                handlers.push(::zeroclaw_spawn::spawn!(serve_test_tls_connection(
+                    stream,
+                    connection_acceptor,
+                    addr,
+                    connection_behavior,
+                )));
+            }
+            for handler in handlers {
+                handler.await.unwrap();
+            }
+        });
+
+        TestTlsServer {
+            url: format!("https://{addr}/mcp"),
+            ca_pem: ca_cert.pem(),
+            task,
+        }
+    }
 
     #[tokio::test]
     async fn stdio_routes_only_exact_numeric_id_and_preserves_other_waiters() {
@@ -2125,6 +2629,480 @@ mod tests {
             ..Default::default()
         };
         assert!(SseTransport::new(&config).is_err());
+    }
+
+    #[test]
+    fn remote_transports_without_custom_ca_build_unchanged() {
+        let http = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            ..Default::default()
+        };
+        let sse = McpServerConfig {
+            name: "test-sse".into(),
+            transport: McpTransport::Sse,
+            url: Some("https://localhost/sse".into()),
+            ..Default::default()
+        };
+        assert!(HttpTransport::new(&http).is_ok());
+        assert!(SseTransport::new(&sse).is_ok());
+    }
+
+    #[test]
+    fn remote_transports_with_custom_ca_reject_plaintext_configured_url() {
+        let ca_file = test_ca_file();
+        for transport in [McpTransport::Http, McpTransport::Sse] {
+            let config = McpServerConfig {
+                name: "internal".into(),
+                transport,
+                url: Some("http://internal.example/mcp".into()),
+                tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            };
+            let error = create_transport(&config)
+                .err()
+                .expect("custom CA must reject a plaintext configured URL");
+            let message = error.to_string();
+            assert!(message.contains("internal"));
+            assert!(message.contains("requires an HTTPS configured remote URL"));
+            assert!(message.contains("refusing plaintext transport"));
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_ca_rejects_plaintext_endpoint_advertised_by_https_sse_stream() {
+        let ca_file = test_ca_file();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Sse,
+            url: Some("https://internal.example/sse".into()),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).expect("HTTPS SSE transport should build");
+
+        handle_sse_event(
+            &transport.server_name,
+            &transport.sse_url,
+            &transport.shared,
+            &transport.pending,
+            &transport.notify,
+            Some("endpoint"),
+            None,
+            "http://internal.example/messages".to_string(),
+        )
+        .await;
+        // Mark the stream unsupported so the send path uses the cached
+        // endpoint directly instead of trying to open a real GET stream.
+        transport.conn.lock().await.stream_state = SseStreamState::Unsupported;
+
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("custom CA must reject a plaintext advertised endpoint");
+        let message = error.to_string();
+        assert!(message.contains("internal"));
+        assert!(message.contains("requires an HTTPS SSE message endpoint"));
+        assert!(message.contains("refusing plaintext transport"));
+    }
+
+    #[test]
+    fn remote_transport_rejects_relative_custom_ca_path() {
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some("internal-ca.pem".into()),
+            ..Default::default()
+        };
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("relative path must fail");
+        let message = error.to_string();
+        assert!(message.contains("internal"));
+        assert!(message.contains("must be absolute"));
+    }
+
+    #[test]
+    fn both_remote_transports_fail_closed_for_missing_custom_ca() {
+        for transport in [McpTransport::Http, McpTransport::Sse] {
+            let config = McpServerConfig {
+                name: "internal".into(),
+                transport,
+                url: Some("https://localhost/mcp".into()),
+                tls_ca_cert_path: Some("/nonexistent/zeroclaw-internal-ca.pem".into()),
+                ..Default::default()
+            };
+            let error = create_transport(&config)
+                .err()
+                .expect("missing CA must fail");
+            let message = error.to_string();
+            assert!(message.contains("internal"));
+            assert!(message.contains("/nonexistent/zeroclaw-internal-ca.pem"));
+            assert!(!message.contains("BEGIN CERTIFICATE"));
+        }
+    }
+
+    #[test]
+    fn remote_transport_fails_closed_for_invalid_custom_ca() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"not a certificate").unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("invalid CA must fail");
+        let message = error.to_string();
+        assert!(message.contains("internal"));
+        assert!(message.contains(&file.path().to_string_lossy().to_string()));
+        assert!(!message.contains("not a certificate"));
+    }
+
+    #[test]
+    fn remote_transport_rejects_oversized_custom_ca_before_reading() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file().set_len(MAX_TLS_CA_BYTES as u64 + 1).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("oversized CA must fail before PEM parsing");
+        let message = error.to_string();
+        assert!(message.contains("internal"));
+        assert!(message.contains("exceeds"));
+        assert!(message.contains(&MAX_TLS_CA_BYTES.to_string()));
+    }
+
+    #[test]
+    fn remote_transport_rejects_non_regular_custom_ca_path() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(directory.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("a directory must not be read as a CA bundle");
+        // The directory is refused by whichever layer sees it first. POSIX
+        // opens it and rejects the classified handle; Windows cannot open a
+        // directory as a file at all (`OpenOptions::open` needs
+        // `FILE_FLAG_BACKUP_SEMANTICS`, which the loader deliberately does not
+        // pass), so the refusal surfaces as the read failure instead. Either
+        // way the directory never reaches the PEM parser.
+        let message = error.to_string();
+        assert!(
+            message.contains("must name a regular file")
+                || message.contains("cannot read TLS CA certificate"),
+            "a directory CA path must be refused, got: {message}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_transport_rejects_special_custom_ca_file() {
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some("/dev/zero".into()),
+            ..Default::default()
+        };
+
+        let error = HttpTransport::new(&config)
+            .err()
+            .expect("a non-terminating device must be rejected");
+        assert!(error.to_string().contains("must name a regular file"));
+    }
+
+    /// Create a FIFO at `path` using the POSIX utility, so the test does not
+    /// need `unsafe` to reach `mkfifo(3)`.
+    #[cfg(unix)]
+    fn make_test_fifo(path: &std::path::Path) {
+        let status = std::process::Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo must be available on unix");
+        assert!(status.success(), "mkfifo failed for {}", path.display());
+    }
+
+    /// A CA path that alternates between a regular file and a FIFO must never
+    /// park the loader. The pathname is classified only through the opened
+    /// handle, so the losing side of the race is rejected rather than blocking
+    /// MCP registry startup on a writer that never arrives.
+    #[cfg(unix)]
+    #[test]
+    fn custom_ca_path_swapped_for_a_fifo_returns_instead_of_hanging() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let ca_path = directory.path().join("rotating-ca.pem");
+        let pem = test_ca_file();
+        let pem_bytes = std::fs::read(pem.path()).unwrap();
+
+        let config_for = |path: &std::path::Path| McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        // Alternate the same path between a readable bundle and a FIFO. Each
+        // iteration must terminate: the regular file loads, the FIFO is
+        // rejected as a non-regular file. A blocking open would hang here
+        // forever because nothing ever opens the FIFO for writing.
+        for _ in 0..10 {
+            std::fs::write(&ca_path, &pem_bytes).unwrap();
+            load_tls_ca_pem(&config_for(&ca_path), &ca_path.to_string_lossy())
+                .expect("a regular CA bundle must still load");
+
+            std::fs::remove_file(&ca_path).unwrap();
+            make_test_fifo(&ca_path);
+            let error = load_tls_ca_pem(&config_for(&ca_path), &ca_path.to_string_lossy())
+                .expect_err("a FIFO must be rejected, not opened for reading");
+            assert!(error.to_string().contains("must name a regular file"));
+
+            std::fs::remove_file(&ca_path).unwrap();
+        }
+    }
+
+    /// Certificate rotation and mounted-secret deployments publish CA bundles
+    /// through symlink indirection, so a symlink to a bounded regular file is
+    /// supported. A symlink pointing at a special file is still rejected,
+    /// because classification happens on the opened handle.
+    #[cfg(unix)]
+    #[test]
+    fn custom_ca_follows_symlinks_to_regular_files_but_not_to_special_files() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let pem = test_ca_file();
+        let pem_bytes = std::fs::read(pem.path()).unwrap();
+
+        let target = directory.path().join("real-ca.pem");
+        std::fs::write(&target, &pem_bytes).unwrap();
+        let link = directory.path().join("linked-ca.pem");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let config_for = |path: &std::path::Path| McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some("https://localhost/mcp".into()),
+            tls_ca_cert_path: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+
+        let loaded = load_tls_ca_pem(&config_for(&link), &link.to_string_lossy())
+            .expect("a symlink to a bounded regular CA file must load");
+        assert_eq!(loaded, pem_bytes);
+
+        let fifo_target = directory.path().join("special");
+        make_test_fifo(&fifo_target);
+        let fifo_link = directory.path().join("linked-special");
+        std::os::unix::fs::symlink(&fifo_target, &fifo_link).unwrap();
+
+        let error = load_tls_ca_pem(&config_for(&fifo_link), &fifo_link.to_string_lossy())
+            .expect_err("a symlink to a FIFO must be rejected");
+        assert!(error.to_string().contains("must name a regular file"));
+    }
+
+    #[tokio::test]
+    async fn private_ca_http_fails_unset_and_succeeds_with_matching_ca() {
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+
+        let server = spawn_test_tls_server().await;
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("a private CA must remain untrusted when the field is unset");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP request to MCP server failed")
+        );
+        server.task.await.unwrap();
+
+        let server = spawn_test_tls_server().await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &server.ca_pem).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let response = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .unwrap();
+        assert_eq!(response.id, Some(serde_json::Value::from(1)));
+        assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
+        server.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_ca_sse_fails_unset_and_succeeds_with_matching_ca() {
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+
+        let server = spawn_test_tls_server().await;
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Sse,
+            url: Some(server.url.replace("/mcp", "/sse")),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("a private CA must remain untrusted when the field is unset");
+        assert!(error.to_string().contains("SSE GET to MCP server failed"));
+        server.task.await.unwrap();
+
+        let server = spawn_test_tls_server_with_behavior("127.0.0.1", TestTlsBehavior::Sse).await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &server.ca_pem).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Sse,
+            url: Some(server.url.replace("/mcp", "/sse")),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = SseTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let response = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .unwrap();
+        assert_eq!(response.id, Some(serde_json::Value::from(1)));
+        assert_eq!(response.result, Some(serde_json::json!({"ok": true})));
+        transport.close().await.unwrap();
+        server.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn custom_ca_redirect_to_plaintext_sends_nothing_to_destination() {
+        let destination = wiremock::MockServer::start().await;
+        let redirect_target = format!("{}/capture", destination.uri());
+        let server = spawn_test_tls_server_with_behavior(
+            "127.0.0.1",
+            TestTlsBehavior::Redirect(redirect_target),
+        )
+        .await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &server.ca_pem).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            headers: std::collections::HashMap::from([(
+                "Authorization".into(),
+                "Bearer synthetic-test-token".into(),
+            )]),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let request = JsonRpcRequest::new(
+            1,
+            "initialize",
+            serde_json::json!({"synthetic": "request-body"}),
+        );
+
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("HTTPS-to-HTTP redirect must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP request to MCP server failed")
+        );
+        server.task.await.unwrap();
+        assert!(
+            destination
+                .received_requests()
+                .await
+                .expect("destination request log")
+                .is_empty(),
+            "redirect policy must block headers and content before the plaintext destination"
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_ca_does_not_trust_unrelated_ca_or_wrong_hostname() {
+        let request = JsonRpcRequest::new(1, "initialize", serde_json::json!({}));
+
+        let server = spawn_test_tls_server().await;
+        let wrong_ca_file = tempfile::NamedTempFile::new().unwrap();
+        let wrong_ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut wrong_ca_params =
+            rcgen::CertificateParams::new(vec!["unrelated test CA".into()]).unwrap();
+        wrong_ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let wrong_ca = wrong_ca_params.self_signed(&wrong_ca_key).unwrap();
+        std::fs::write(wrong_ca_file.path(), wrong_ca.pem()).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            tls_ca_cert_path: Some(wrong_ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("an unrelated CA must not authenticate the server");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP request to MCP server failed")
+        );
+        server.task.await.unwrap();
+
+        let server = spawn_test_tls_server_with_san("wrong.example").await;
+        let ca_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(ca_file.path(), &server.ca_pem).unwrap();
+        let config = McpServerConfig {
+            name: "internal".into(),
+            transport: McpTransport::Http,
+            url: Some(server.url),
+            tls_ca_cert_path: Some(ca_file.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).unwrap();
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let error = SharedMcpTransportConn::send_and_recv(&transport, &request, &lifecycle)
+            .await
+            .expect_err("a trusted CA must not bypass hostname verification");
+        assert!(
+            error
+                .to_string()
+                .contains("HTTP request to MCP server failed")
+        );
+        server.task.await.unwrap();
     }
 
     #[test]
@@ -2596,6 +3574,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_transport_rejects_oversized_body_via_content_length() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("x".repeat(8192)))
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            max_response_bytes: Some(1024),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = transport
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect_err("oversized body must be rejected before parse");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a size-limit rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_rejects_oversized_body_while_streaming_without_content_length() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // `Transfer-Encoding: chunked` omits Content-Length, so only the
+        // streaming cap can enforce the ceiling — the fast Content-Length reject
+        // cannot fire.
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Transfer-Encoding", "chunked")
+                    .set_body_string("y".repeat(8192)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            max_response_bytes: Some(1024),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = transport
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect_err("oversized streamed body must be rejected before parse");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a streaming size-limit rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_rejects_oversized_sse_body() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // A `text/event-stream` response whose accumulated event data exceeds the
+        // limit must be rejected by the SSE read path before any JSON parse.
+        let body = format!("event: message\ndata: {}\n\n", "z".repeat(8192));
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .insert_header("Transfer-Encoding", "chunked")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "test-http".into(),
+            transport: McpTransport::Http,
+            url: Some(server.uri()),
+            max_response_bytes: Some(1024),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = transport
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect_err("oversized SSE body must be rejected before parse");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected an SSE size-limit rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_sse_returns_first_event_without_waiting_for_eof() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Serve one request: a valid SSE `message` event, then hold the socket
+        // open. A reader that buffers to EOF would block here until the timeout;
+        // an incremental reader returns as soon as the event completes.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            // Drain the request head so the client's write side does not block.
+            let _ = sock.read(&mut buf).await;
+            let response = "HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: keep-alive\r\n\
+\r\n\
+event: message\n\
+data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n";
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            // Hold the connection open well past the assertion timeout.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let config = McpServerConfig {
+            name: "sse-eof".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("http://{addr}")),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let resp = timeout(
+            Duration::from_secs(5),
+            transport.send_and_recv(&req, &lifecycle),
+        )
+        .await
+        .expect("must return on the first complete SSE event, not wait for EOF")
+        .expect("valid SSE event must parse");
+        assert_eq!(resp.id, Some(serde_json::json!(1)));
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn http_transport_404_without_session_is_plain_error() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2821,5 +3954,288 @@ mod tests {
         drop(shared);
         assert!(transport.pending.lock().is_empty());
         assert!(rx.await.is_err(), "pending receiver must be released");
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_reports_oversized_before_buffering_whole_line() {
+        // A line far longer than the limit must be reported as `Oversized` without
+        // buffering the whole line, and the reader must resync at the next newline
+        // so following lines still parse. This is the exact bound the persistent
+        // SSE reader relies on to survive an unterminated `data:` flood.
+        let limit = 16usize;
+        let mut input = vec![b'x'; limit * 4];
+        input.push(b'\n');
+        input.extend_from_slice(b"short\n");
+        let mut reader = BufReader::new(&input[..]);
+
+        assert!(matches!(
+            read_bounded_line(&mut reader, limit).await.unwrap(),
+            BoundedLine::Oversized
+        ));
+        match read_bounded_line(&mut reader, limit).await.unwrap() {
+            BoundedLine::Line { bytes, .. } => assert_eq!(bytes, b"short"),
+            other => panic!("expected the next line to parse, got {other:?}"),
+        }
+        assert!(matches!(
+            read_bounded_line(&mut reader, limit).await.unwrap(),
+            BoundedLine::Eof
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_line_reports_consumed_wire_bytes_including_crlf() {
+        // The returned line has its trailing `\r` stripped, but `consumed` must
+        // report every raw byte taken off the wire: content, the `\r`, and the
+        // `\n`. The response-cap readers count `consumed`, so a CRLF line that is
+        // undercounted here would let an over-cap body through.
+        let input = b"ab\r\ncd\ne";
+        let mut reader = BufReader::new(&input[..]);
+
+        match read_bounded_line(&mut reader, 64).await.unwrap() {
+            BoundedLine::Line { bytes, consumed } => {
+                assert_eq!(bytes, b"ab", "CR must be stripped from the returned line");
+                assert_eq!(consumed, 4, "CRLF line consumes content + \\r + \\n");
+            }
+            other => panic!("expected a line, got {other:?}"),
+        }
+        match read_bounded_line(&mut reader, 64).await.unwrap() {
+            BoundedLine::Line { bytes, consumed } => {
+                assert_eq!(bytes, b"cd");
+                assert_eq!(consumed, 3, "LF-only line consumes content + \\n");
+            }
+            other => panic!("expected a line, got {other:?}"),
+        }
+        match read_bounded_line(&mut reader, 64).await.unwrap() {
+            BoundedLine::Line { bytes, consumed } => {
+                assert_eq!(bytes, b"e");
+                assert_eq!(
+                    consumed, 1,
+                    "unterminated final line consumes only its content"
+                );
+            }
+            other => panic!("expected a line, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn http_transport_sse_counts_crlf_response_by_wire_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A CRLF-delimited SSE response whose CR-stripped line lengths stay within
+        // the cap, but whose real wire bytes (each line's `\r` included) exceed it.
+        // The transport must reject it before parse. Regression: `read_bounded_line`
+        // drops the trailing `\r`, so a reader rebuilding the count as
+        // `line.len() + 1` undercounted every CRLF line by the dropped byte and
+        // admitted a body larger than the documented raw-wire ceiling.
+        let sse_lines = [
+            "data: {\"jsonrpc\":\"2.0\",",
+            "data: \"id\":1,",
+            "data: \"result\":{}}",
+            "", // blank line dispatches the event
+        ];
+        // The buggy accounting counted each line as its stripped length + 1 (the
+        // `\n` only). Size the cap to exactly that total: the CR-stripped body just
+        // fits, while the real CRLF wire body is one byte per line over.
+        let stripped_budget: u64 = sse_lines.iter().map(|line| line.len() as u64 + 1).sum();
+        let body_tail: String = sse_lines.iter().map(|line| format!("{line}\r\n")).collect();
+        // No Content-Length header: the length preflight is skipped, so the
+        // per-line running total is the only thing enforcing the cap.
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+Content-Type: text/event-stream\r\n\
+Connection: keep-alive\r\n\
+\r\n{body_tail}"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = zeroclaw_spawn::spawn!(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = sock.read(&mut buf).await;
+            sock.write_all(response.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            // Hold the socket open past the assertion timeout so the read decision
+            // is driven by the byte cap, not by EOF.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+
+        let config = McpServerConfig {
+            name: "sse-crlf".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("http://{addr}")),
+            max_response_bytes: Some(stripped_budget),
+            ..Default::default()
+        };
+        let transport = HttpTransport::new(&config).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = timeout(
+            Duration::from_secs(5),
+            transport.send_and_recv(&req, &lifecycle),
+        )
+        .await
+        .expect("must decide on the byte cap, not wait for EOF")
+        .expect_err("a response whose raw wire bytes exceed the cap must be rejected");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a wire-byte size-limit rejection, got: {err}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn default_response_cap_admits_base64_expanded_blob() {
+        // The transport ceiling must clear the base64 expansion of the decoded
+        // aggregate blob budget plus JSON overhead; otherwise a valid near-limit
+        // blob is rejected on the wire before the decoded-byte preflight runs.
+        let decoded = crate::embedded_resource::MAX_AGGREGATE_BLOB_BYTES;
+        let encoded = decoded.div_ceil(3) * 4;
+        assert_eq!(encoded, 13_981_016, "10 MiB decoded -> base64 length");
+        assert_eq!(MAX_ENCODED_BLOB_BYTES, encoded);
+        assert!(
+            DEFAULT_MAX_RESPONSE_BYTES > encoded,
+            "default cap {DEFAULT_MAX_RESPONSE_BYTES} must admit a full base64 blob \
+             {encoded} plus JSON-RPC envelope headroom"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_transport_admits_near_limit_blob_but_rejects_over_default_cap() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A valid JSON-RPC response whose encoded size sits just above the old
+        // 10 MiB decoded cap but within the base64-aware default envelope must be
+        // admitted so it can reach the decoded-byte materialization preflight.
+        let near_len = MAX_ENCODED_BLOB_BYTES as usize + 4096;
+        let prefix = r#"{"jsonrpc":"2.0","id":1,"result":{"padding":""#;
+        let suffix = r#""}}"#;
+        let pad = near_len.saturating_sub(prefix.len() + suffix.len());
+        let near_body = format!("{prefix}{}{suffix}", "a".repeat(pad));
+        assert!(
+            near_body.len() as u64 > 10 * 1024 * 1024,
+            "near-limit body must exceed the old decoded cap to be a regression"
+        );
+        assert!(near_body.len() as u64 <= DEFAULT_MAX_RESPONSE_BYTES);
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/near"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(near_body),
+            )
+            .mount(&server)
+            .await;
+        // A response one byte past the default envelope must be rejected before
+        // any JSON parse.
+        let over_body = "b".repeat(DEFAULT_MAX_RESPONSE_BYTES as usize + 1);
+        Mock::given(method("POST"))
+            .and(path("/over"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string(over_body),
+            )
+            .mount(&server)
+            .await;
+
+        let near_cfg = McpServerConfig {
+            name: "http-near".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("{}/near", server.uri())),
+            ..Default::default()
+        };
+        let near = HttpTransport::new(&near_cfg).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let resp = near
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect("near-limit response must reach materialization, not be rejected");
+        assert_eq!(resp.id, Some(serde_json::json!(1)));
+
+        let over_cfg = McpServerConfig {
+            name: "http-over".into(),
+            transport: McpTransport::Http,
+            url: Some(format!("{}/over", server.uri())),
+            ..Default::default()
+        };
+        let over = HttpTransport::new(&over_cfg).expect("build transport");
+        let req = JsonRpcRequest::new(1, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let err = over
+            .send_and_recv(&req, &lifecycle)
+            .await
+            .expect_err("a response past the default cap must be rejected before parse");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a size-limit rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_direct_post_oversized_body_propagates_instead_of_waiting() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A non-SSE POST reply larger than the cap must surface as an error rather
+        // than being silently emptied and dropped onto the persistent-stream wait.
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/json")
+                    .set_body_string("x".repeat(8192)),
+            )
+            .mount(&server)
+            .await;
+
+        let config = McpServerConfig {
+            name: "sse-direct-oversized".into(),
+            transport: McpTransport::Sse,
+            url: Some(format!("{}/sse", server.uri())),
+            max_response_bytes: Some(1024),
+            ..Default::default()
+        };
+        let transport = Arc::new(SseTransport::new(&config).expect("build transport"));
+        // A persistent reader that never delivers: if the oversized body were
+        // swallowed to an empty fallback, the request would wait here forever.
+        let reader = zeroclaw_spawn::spawn!(std::future::pending::<()>());
+        {
+            let mut conn = transport.conn.lock().await;
+            conn.stream_state = SseStreamState::Connected;
+            conn.reader_task = Some(reader);
+        }
+        {
+            let mut shared = transport.shared.lock().await;
+            shared.message_url = Some(format!("{}/messages", server.uri()));
+            shared.message_url_from_endpoint = true;
+        }
+
+        let request = JsonRpcRequest::new(9, "tools/call", serde_json::json!({}));
+        let lifecycle = McpRequestLifecycle::uncoordinated(0);
+        let result = timeout(
+            Duration::from_secs(5),
+            SharedMcpTransportConn::send_and_recv(transport.as_ref(), &request, &lifecycle),
+        )
+        .await
+        .expect("must not hang on the stream after an oversized direct body");
+        let err = result.expect_err("oversized direct POST body must propagate");
+        assert!(
+            err.to_string().to_lowercase().contains("limit"),
+            "expected a size-limit rejection, got: {err}"
+        );
+        assert!(
+            transport.pending.lock().is_empty(),
+            "the pending waiter must be released on the propagated error"
+        );
+        SharedMcpTransportConn::close(transport.as_ref())
+            .await
+            .expect("close transport");
     }
 }

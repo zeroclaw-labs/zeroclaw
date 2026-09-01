@@ -608,6 +608,15 @@ mod tests {
     }
 
     #[test]
+    fn retired_wati_kind_is_absent_from_default_trigger_registry() {
+        let registry = registry_from_config(&zeroclaw_config::schema::Config::default());
+        assert!(
+            registry.channels.iter().all(|row| row.channel != "wati"),
+            "the historical WATI attribution kind must not appear as a live SOP source"
+        );
+    }
+
+    #[test]
     fn every_channel_surfaces_enumerated_walkable_fields() {
         // Anti-drift guard: no channel may fall back to a free-typed condition
         // path. Every inbound channel must enumerate a closed field set so the

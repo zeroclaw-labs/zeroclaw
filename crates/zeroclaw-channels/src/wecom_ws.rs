@@ -17,6 +17,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use zeroclaw_api::channel::{Channel, ChannelConversationScope, ChannelMessage, SendMessage};
 use zeroclaw_config::schema::{StreamMode, WeComWsConfig};
 use zeroclaw_runtime::i18n;
+use zeroclaw_tool_call_parser::TERMINAL_MARKERS;
 
 // ── Constants ────────────────────────────────────────────────────────
 
@@ -33,7 +34,6 @@ const WECOM_WS_READY_POLL_MILLIS: u64 = 100;
 const WECOM_STREAM_CONFLICT_MAX_RETRIES: usize = 3;
 const WECOM_STREAM_CONFLICT_RETRY_BASE_MILLIS: u64 = 150;
 const WECOM_IDEMPOTENCY_MAX_KEYS: usize = 4096;
-const WECOM_PROVIDER_TRAILING_SENTINELS: &[&str] = &["<|eom|>"];
 
 const WECOM_MARKDOWN_MAX_BYTES: usize = 20_480;
 const WECOM_MARKDOWN_CHUNK_BYTES: usize = 8_000;
@@ -317,9 +317,14 @@ impl WeComWsChannel {
         policy_resolver: Arc<dyn Fn() -> WeComWsRuntimePolicy + Send + Sync>,
         workspace_dir: &Path,
     ) -> Result<Self> {
-        if config.stream_mode == StreamMode::MultiMessage {
+        let unsupported_stream_mode = match config.stream_mode {
+            StreamMode::MultiMessage => Some("multi_message"),
+            StreamMode::Off | StreamMode::Partial => None,
+        };
+        if let Some(mode) = unsupported_stream_mode {
             anyhow::bail!(
-                "WeCom WebSocket stream_mode=multi_message is not supported; use partial or off"
+                "WeCom WebSocket stream_mode={} is not supported; use partial or off",
+                mode
             );
         }
 
@@ -2404,7 +2409,7 @@ fn split_stream_content_and_overflow(input: &str) -> (String, Option<String>) {
 fn strip_trailing_provider_sentinels(input: &str) -> String {
     let mut trimmed = input.trim_end();
 
-    while let Some(sentinel) = WECOM_PROVIDER_TRAILING_SENTINELS
+    while let Some(sentinel) = TERMINAL_MARKERS
         .iter()
         .find(|sentinel| trimmed.ends_with(**sentinel))
     {
@@ -2789,6 +2794,21 @@ mod tests {
             strip_trailing_provider_sentinels("Literal <|eom|> marker in text."),
             "Literal <|eom|> marker in text."
         );
+    }
+
+    #[test]
+    fn strip_trailing_provider_sentinels_covers_shared_marker_vocabulary() {
+        // The channel reuses the parser crate's canonical terminal-marker
+        // vocabulary (single source of truth). Every marker added to
+        // `TERMINAL_MARKERS` must be stripped here too; a channel-local
+        // copy would go stale and violate the shared-vocabulary contract.
+        for marker in TERMINAL_MARKERS {
+            assert_eq!(
+                strip_trailing_provider_sentinels(&format!("Hi there!{marker}")),
+                "Hi there!",
+                "channel stripper must reuse TERMINAL_MARKERS for {marker:?}"
+            );
+        }
     }
 
     #[test]

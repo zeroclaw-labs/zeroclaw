@@ -237,13 +237,13 @@ impl Tool for GoogleWorkspaceTool {
             };
             if !s
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(
-                        "Invalid characters in 'sub_resource': only lowercase alphanumeric, underscore, and hyphen are allowed"
+                        "Invalid characters in 'sub_resource': only alphanumeric, underscore, and hyphen are allowed"
                             .into(),
                     ),
                 });
@@ -289,7 +289,8 @@ impl Tool for GoogleWorkspaceTool {
             });
         }
 
-        // Validate inputs contain no shell metacharacters
+        // Validate inputs contain no shell metacharacters. Uppercase must pass:
+        // Google API identifiers are camelCase (calendarList, quickAdd).
         for (label, value) in [
             ("service", service),
             ("resource", resource),
@@ -297,13 +298,13 @@ impl Tool for GoogleWorkspaceTool {
         ] {
             if !value
                 .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
             {
                 return Ok(ToolResult {
                     success: false,
                     output: ToolOutput::default(),
                     error: Some(format!(
-                        "Invalid characters in '{label}': only lowercase alphanumeric, underscore, and hyphen are allowed"
+                        "Invalid characters in '{label}': only alphanumeric, underscore, and hyphen are allowed"
                     )),
                 });
             }
@@ -646,6 +647,58 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("Invalid characters")
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_camelcase_resource_and_method_past_charset_validation() {
+        // Google API identifiers are camelCase (calendarList, quickAdd). The
+        // invalid `format` stops execution deterministically after the charset
+        // check, so this test never spawns `gws`.
+        let tool =
+            GoogleWorkspaceTool::new(test_security(), vec![], vec![], None, None, 60, 30, false);
+        let result = tool
+            .execute(json!({
+                "service": "calendar",
+                "resource": "calendarList",
+                "method": "quickAdd",
+                "format": "xml"
+            }))
+            .await
+            .expect("camelCase segments should return a result");
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("Invalid format"),
+            "camelCase should pass charset validation and fail on format, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_camelcase_sub_resource_past_charset_validation() {
+        // The zero-action rate limit trips right after the sub_resource charset
+        // check, so this test never spawns `gws`.
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            max_actions_per_hour: 0,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        });
+        let tool = GoogleWorkspaceTool::new(security, vec![], vec![], None, None, 60, 30, false);
+        let result = tool
+            .execute(json!({
+                "service": "gmail",
+                "resource": "users",
+                "sub_resource": "sendAs",
+                "method": "list"
+            }))
+            .await
+            .expect("camelCase sub_resource should return a result");
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("Rate limit"),
+            "camelCase sub_resource should pass charset validation and hit the rate limit, got: {err}"
         );
     }
 

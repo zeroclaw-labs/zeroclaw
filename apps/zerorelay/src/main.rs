@@ -1,0 +1,868 @@
+//! `zerorelay` - the ZeroClaw nominated relay (blind forwarder).
+//!
+//! Runs a public rendezvous: daemons behind NAT register over an outer TLS +
+//! WebSocket session and clients reach them by an opaque `node_id`. The relay
+//! pipes the inner client<->daemon mTLS as ciphertext and never terminates it.
+//!
+//! `zerorelay` is a standalone networking app (not daemon-path code), so bare
+//! `tokio::spawn` is the right primitive here; the `zeroclaw_spawn::spawn!` rule
+//! is for in-daemon tasks. Mirrors the `apps/zerocode` exemption (and lib.rs).
+#![allow(clippy::disallowed_methods)]
+
+use std::fs::File;
+use std::io::BufReader;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use std::collections::HashSet;
+
+use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use serde::Deserialize;
+use tokio_rustls::TlsAcceptor;
+use zerorelay::{
+    Admission, AdmissionPolicy, PublicOpenGuard, RelayConfig, RelayServer, RelayStatus,
+};
+
+/// Build-time version: `git describe` (tag + commits-since + short hash, `-dirty`
+/// when modified), or the crate version when git is unavailable. Set by build.rs.
+const VERSION: &str = env!("ZERORELAY_VERSION");
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "zerorelay",
+    about = "ZeroClaw nominated relay (blind forwarder)",
+    version = VERSION
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// Path to a relay.toml ([bind]/[tls]/[admission]/[limits]). Values it sets
+    /// are the base config; any CLI flag below overrides the file. The
+    /// [admission] section hot-reloads on SIGHUP. See relay.example.toml.
+    #[arg(long)]
+    config: Option<String>,
+
+    /// Address to listen on for daemon and client connections. [default: 0.0.0.0:8443]
+    #[arg(long)]
+    bind: Option<String>,
+
+    /// PEM certificate for the relay's own outer TLS identity (chain). When this
+    /// and --tls-key are omitted, the relay SELF-PROVISIONS a cert (no openssl).
+    #[arg(long)]
+    tls_cert: Option<String>,
+
+    /// PEM private key for `--tls-cert`.
+    #[arg(long)]
+    tls_key: Option<String>,
+
+    /// Directory for the self-provisioned TLS material (CA + server cert, written
+    /// on first run when --tls-cert/--tls-key are not given, reused after).
+    /// Default: $ZERORELAY_DATA_DIR or $HOME/.zerorelay, under tls/.
+    #[arg(long)]
+    tls_dir: Option<String>,
+
+    /// Extra Subject Alternative Name(s) for the self-provisioned cert (the relay's
+    /// public hostname / IP). localhost + 127.0.0.1 are always included. Repeatable.
+    #[arg(long = "tls-san")]
+    tls_san: Vec<String>,
+
+    /// Admission mode: `open` (any signed daemon may register) or `allowlist`.
+    /// [default: open]
+    #[arg(long)]
+    registration_mode: Option<String>,
+
+    /// Allowed daemon pubkey fingerprints (sha256 hex), allowlist mode. Unioned
+    /// with the file's [admission] allow list. Repeatable.
+    #[arg(long = "allow")]
+    allow: Vec<String>,
+
+    /// Denied daemon pubkey fingerprints (always rejected). Unioned with the
+    /// file's deny list. Repeatable.
+    #[arg(long = "deny")]
+    deny: Vec<String>,
+
+    /// Optional shared-secret gate a daemon must present in its Hello.
+    #[arg(long)]
+    relay_token: Option<String>,
+
+    /// Cap on simultaneously-open client connections per node-id. [default: 256]
+    #[arg(long)]
+    max_conns_per_node: Option<usize>,
+
+    /// Drop a client connection after this many seconds of inactivity. [default: 300]
+    #[arg(long)]
+    idle_timeout_secs: Option<u64>,
+
+    /// Lease TTL (seconds) advertised to daemons at registration. [default: 300]
+    #[arg(long)]
+    lease_ttl_secs: Option<u64>,
+
+    /// Global cap on sockets past accept but not yet admitted (TLS handshake, WS
+    /// upgrade, first control frame, and any refusal reply); excess sockets are
+    /// shed. Admitted connections do not count. [default: 256]
+    #[arg(long)]
+    max_pending_handshakes: Option<usize>,
+
+    /// Ceiling on simultaneously registered daemons. [default: 1024]
+    #[arg(long)]
+    max_registered_nodes: Option<usize>,
+
+    /// Deadline (seconds) covering TLS accept, the WS upgrade, and the first
+    /// control frame. [default: 10]
+    #[arg(long)]
+    handshake_timeout_secs: Option<u64>,
+
+    /// Write a per-node metrics snapshot (JSON) to this path, refreshed on a timer
+    /// and on SIGUSR1. Read it back with `zerorelay status --file <path>`.
+    #[arg(long)]
+    status_file: Option<String>,
+
+    /// Explicitly allow OPEN, tokenless registration on a public (non-loopback)
+    /// bind. Without this, such a configuration refuses to start: any daemon on
+    /// the internet could register and squat unclaimed node-ids. Prefer setting
+    /// [admission] relay_token or mode = "allowlist".
+    #[arg(long)]
+    allow_public_open: bool,
+}
+
+/// A `relay.toml`: every value optional, CLI flags override. The `[admission]`
+/// slice is what SIGHUP re-reads and swaps live.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    bind: Option<String>,
+    #[serde(default)]
+    tls: TlsFile,
+    #[serde(default)]
+    admission: AdmissionFile,
+    #[serde(default)]
+    limits: LimitsFile,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TlsFile {
+    cert: Option<String>,
+    key: Option<String>,
+    dir: Option<String>,
+    #[serde(default)]
+    sans: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdmissionFile {
+    /// "open" | "allowlist".
+    mode: Option<String>,
+    #[serde(default)]
+    allow: Vec<String>,
+    #[serde(default)]
+    deny: Vec<String>,
+    relay_token: Option<String>,
+    /// Outer-mTLS variant (additive admission on the OUTER TLS): "off" (default),
+    /// "optional", or "required". When on, `outer_client_ca` verifies the peer's
+    /// outer client cert. The inner mTLS is unaffected.
+    outer_client_auth: Option<String>,
+    /// PEM CA verifying outer client certs (required when outer_client_auth is on).
+    outer_client_ca: Option<String>,
+    /// Route to the node-id named by the outer client cert's CN, falling back to
+    /// the `Connect` frame (default false; only meaningful with outer client auth).
+    route_by_client_cert: Option<bool>,
+    /// See the --allow-public-open flag: opt-in for open+tokenless on a public bind.
+    allow_public_open: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LimitsFile {
+    max_conns_per_node: Option<usize>,
+    idle_timeout_secs: Option<u64>,
+    lease_ttl_secs: Option<u64>,
+    /// Per-source-IP connection-handshake rate cap (A6).
+    accept_burst_per_ip: Option<u32>,
+    accept_rate_per_ip: Option<f64>,
+    /// Per-node-id client-connect rate cap (A6).
+    connect_burst_per_node: Option<u32>,
+    connect_rate_per_node: Option<f64>,
+    /// Global pre-classification handshake bound + deadline (slowloris).
+    max_pending_handshakes: Option<usize>,
+    handshake_timeout_secs: Option<u64>,
+    /// Aggregate ceiling on simultaneously registered daemons.
+    max_registered_nodes: Option<usize>,
+}
+
+/// The CLI admission overrides, captured so SIGHUP can re-apply them on top of a
+/// freshly re-read file without re-parsing argv.
+#[derive(Clone)]
+struct AdmissionOverlay {
+    mode: Option<String>,
+    allow: Vec<String>,
+    deny: Vec<String>,
+    relay_token: Option<String>,
+}
+
+/// Resolve the admission policy: file `[admission]` as the base, CLI overlay on
+/// top. Scalars (mode, relay_token) take the CLI value when present; the allow /
+/// deny lists are the UNION of file + CLI. Deny always wins at admission time.
+fn normalize_admission_fingerprint(value: &str) -> Result<String> {
+    let normalized: String = value.trim().chars().filter(|c| *c != ':').collect();
+    if normalized.len() != 64 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        anyhow::bail!(
+            "invalid relay admission fingerprint '{value}': expected 64 hexadecimal characters, optionally colon-delimited"
+        );
+    }
+    Ok(normalized.to_ascii_lowercase())
+}
+
+fn normalize_admission_fingerprints(entries: &[String]) -> Result<HashSet<String>> {
+    entries
+        .iter()
+        .map(|entry| normalize_admission_fingerprint(entry))
+        .collect()
+}
+
+fn resolve_admission(file: &AdmissionFile, overlay: &AdmissionOverlay) -> Result<AdmissionPolicy> {
+    let mode_str = overlay.mode.clone().or_else(|| file.mode.clone());
+    let registration_mode = match mode_str.as_deref() {
+        None | Some("open") => Admission::Open,
+        Some("allowlist") => Admission::Allowlist,
+        Some(other) => anyhow::bail!("invalid admission mode '{other}' (open|allowlist)"),
+    };
+    let mut allow = normalize_admission_fingerprints(&file.allow)?;
+    allow.extend(normalize_admission_fingerprints(&overlay.allow)?);
+    let mut deny = normalize_admission_fingerprints(&file.deny)?;
+    deny.extend(normalize_admission_fingerprints(&overlay.deny)?);
+    let relay_token = overlay
+        .relay_token
+        .clone()
+        .or_else(|| file.relay_token.clone());
+    Ok(AdmissionPolicy {
+        registration_mode,
+        allow,
+        deny,
+        relay_token,
+    })
+}
+
+/// Load and parse a relay.toml.
+fn load_file_config(path: &str) -> Result<FileConfig> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading relay config {path}"))?;
+    toml::from_str(&text).with_context(|| format!("parsing relay config {path}"))
+}
+
+/// Read a relay `--status-file` snapshot and print it as a per-node table.
+fn print_status(path: &str) -> Result<()> {
+    let text = std::fs::read_to_string(path).with_context(|| {
+        format!("reading status file {path} (is --status-file set on the relay?)")
+    })?;
+    let status: RelayStatus =
+        serde_json::from_str(text.trim()).with_context(|| format!("parsing status file {path}"))?;
+    if status.nodes.is_empty() {
+        println!("no registered nodes");
+        return Ok(());
+    }
+    println!(
+        "{:<34}  {:>5}  {:>6}  {:>8}  {:>8}",
+        "node_id", "live", "total", "frames", "rejected"
+    );
+    for n in &status.nodes {
+        println!(
+            "{:<34}  {:>5}  {:>6}  {:>8}  {:>8}",
+            n.node_id, n.conns_live, n.conns_total, n.frames_relayed, n.connects_rejected
+        );
+    }
+    Ok(())
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// TCP-connect to a running relay and exit 0 if reachable. For container
+    /// HEALTHCHECK on shell-less images.
+    Healthcheck {
+        /// Address to probe.
+        #[arg(long, default_value = "127.0.0.1:8443")]
+        addr: String,
+    },
+    /// Print the running relay's per-node metrics from its --status-file snapshot
+    /// (counts only, never payloads). Send the relay SIGUSR1 first to refresh it.
+    Status {
+        /// Path to the relay's --status-file.
+        #[arg(long)]
+        file: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    if let Some(Command::Healthcheck { addr }) = &cli.command {
+        tokio::net::TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("relay not reachable at {addr}"))?;
+        return Ok(());
+    }
+
+    if let Some(Command::Status { file }) = &cli.command {
+        return print_status(file);
+    }
+
+    // relay.toml is the base; CLI flags override. Absent --config => an empty
+    // file config, so the CLI + builtin defaults reproduce the prior behavior.
+    let file = match cli.config.as_deref() {
+        Some(path) => load_file_config(path)?,
+        None => FileConfig::default(),
+    };
+
+    // The CLI admission overlay is captured so SIGHUP can re-apply it onto a
+    // freshly re-read file.
+    let overlay = AdmissionOverlay {
+        mode: cli.registration_mode.clone(),
+        allow: cli.allow.clone(),
+        deny: cli.deny.clone(),
+        relay_token: cli.relay_token.clone(),
+    };
+    let admission = resolve_admission(&file.admission, &overlay)?;
+
+    // Outer-mTLS variant (additive): optionally require/accept an outer client
+    // cert, verified against outer_client_ca. The inner mTLS is untouched.
+    let outer_verifier = build_outer_client_verifier(&file.admission)?;
+    let route_by_client_cert = file.admission.route_by_client_cert.unwrap_or(false);
+
+    // TLS material: CLI flag -> file [tls] -> self-provision.
+    let tls_cert = cli.tls_cert.clone().or_else(|| file.tls.cert.clone());
+    let tls_key = cli.tls_key.clone().or_else(|| file.tls.key.clone());
+    let tls_dir = cli.tls_dir.clone().or_else(|| file.tls.dir.clone());
+    let mut tls_sans = file.tls.sans.clone();
+    tls_sans.extend(cli.tls_san.iter().cloned());
+    let acceptor = match (tls_cert, tls_key) {
+        // Bring-your-own (e.g. a public-CA cert for the relay's hostname).
+        (Some(cert), Some(key)) => build_tls_acceptor(&cert, &key, outer_verifier.clone())
+            .with_context(|| format!("loading relay TLS material from {cert} / {key}"))?,
+        // Self-provision a cert on first run - no openssl needed.
+        (None, None) => {
+            provision_tls_acceptor(tls_dir.as_deref(), &tls_sans, outer_verifier.clone())?
+        }
+        _ => {
+            anyhow::bail!("tls cert and key must be given together (or neither, to self-provision)")
+        }
+    };
+
+    let bind = cli
+        .bind
+        .clone()
+        .or_else(|| file.bind.clone())
+        .unwrap_or_else(|| "0.0.0.0:8443".to_string());
+    let cfg = RelayConfig {
+        registration_mode: admission.registration_mode.clone(),
+        allow: admission.allow.clone(),
+        deny: admission.deny.clone(),
+        relay_token: admission.relay_token.clone(),
+        lease_ttl: Duration::from_secs(
+            cli.lease_ttl_secs
+                .or(file.limits.lease_ttl_secs)
+                .unwrap_or(300),
+        ),
+        max_conns_per_node: cli
+            .max_conns_per_node
+            .or(file.limits.max_conns_per_node)
+            .unwrap_or(256),
+        idle_timeout: Duration::from_secs(
+            cli.idle_timeout_secs
+                .or(file.limits.idle_timeout_secs)
+                .unwrap_or(300),
+        ),
+        accept_burst_per_ip: file.limits.accept_burst_per_ip.unwrap_or(30),
+        accept_rate_per_ip: file.limits.accept_rate_per_ip.unwrap_or(10.0),
+        connect_burst_per_node: file.limits.connect_burst_per_node.unwrap_or(60),
+        connect_rate_per_node: file.limits.connect_rate_per_node.unwrap_or(20.0),
+        route_by_client_cert,
+        max_pending_handshakes: cli
+            .max_pending_handshakes
+            .or(file.limits.max_pending_handshakes)
+            .unwrap_or(256),
+        handshake_timeout: Duration::from_secs(
+            cli.handshake_timeout_secs
+                .or(file.limits.handshake_timeout_secs)
+                .unwrap_or(10),
+        ),
+        max_registered_nodes: cli
+            .max_registered_nodes
+            .or(file.limits.max_registered_nodes)
+            .unwrap_or(1024),
+    };
+
+    // Fail closed (AGENTS.md: new external surfaces default closed): an OPEN,
+    // tokenless relay on a public bind admits any daemon on the internet and
+    // lets unclaimed node-ids be squatted. Refuse to start unless the operator
+    // explicitly opts in — loopback binds (dev/tests) are unaffected. The same
+    // guard is re-applied to every SIGHUP reload below, which is why the CLI
+    // opt-in is kept rather than consumed here.
+    PublicOpenGuard::new(
+        &bind,
+        cli.allow_public_open || file.admission.allow_public_open.unwrap_or(false),
+    )
+    .check_startup(&admission)?;
+
+    let listener = tokio::net::TcpListener::bind(&bind)
+        .await
+        .with_context(|| format!("binding relay on {bind}"))?;
+    let addr = listener.local_addr()?;
+    eprintln!(
+        "zerorelay listening on {addr} (outer TLS, mode: {:?})",
+        cfg.registration_mode
+    );
+
+    let server = RelayServer::new(cfg);
+    spawn_sighup_reloader(
+        server.clone(),
+        cli.config.clone(),
+        overlay,
+        bind.clone(),
+        cli.allow_public_open,
+    );
+    spawn_status_dumper(server.clone(), cli.status_file.clone());
+    server.serve(listener, acceptor).await
+}
+
+/// On SIGUSR1, snapshot per-node metrics to stderr (and to `--status-file` when
+/// set) - a read-only operational surface for a shell-less/stateless relay. Also
+/// refreshes the status file on a slow timer so `zerorelay status --file` stays
+/// reasonably current. No-op for the signal half on non-unix.
+#[cfg(unix)]
+fn spawn_status_dumper(server: RelayServer, status_file: Option<String>) {
+    use std::time::Duration as StdDuration;
+    tokio::spawn(async move {
+        let mut usr1 =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1()) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("zerorelay: cannot install SIGUSR1 handler ({e}); status dump off");
+                    return;
+                }
+            };
+        let mut tick = tokio::time::interval(StdDuration::from_secs(15));
+        loop {
+            let on_signal = tokio::select! {
+                _ = usr1.recv() => true,
+                _ = tick.tick() => false,
+            };
+            let status = server.status().await;
+            let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+            if let Some(path) = status_file.as_deref() {
+                let _ = std::fs::write(path, format!("{json}\n"));
+            }
+            if on_signal {
+                eprintln!("zerorelay status: {json}");
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_status_dumper(server: RelayServer, status_file: Option<String>) {
+    use std::time::Duration as StdDuration;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(StdDuration::from_secs(15));
+        loop {
+            tick.tick().await;
+            if let Some(path) = status_file.as_deref() {
+                let status = server.status().await;
+                let json = serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string());
+                let _ = std::fs::write(path, format!("{json}\n"));
+            }
+        }
+    });
+}
+
+/// One admission reload: re-read the file, re-apply the startup CLI overlay, and
+/// swap the live policy - unless the fail-closed public-open guard refuses it.
+///
+/// `bind` and `cli_allow_public_open` are carried from startup because neither
+/// hot-reloads: the listener is already bound, and the opt-in is a deliberate
+/// operator choice. Without them a reload could turn a token-gated or
+/// allowlisted public relay into an open, tokenless one - the exact
+/// configuration startup refuses. The opt-in is the CLI flag OR the freshly
+/// re-read file's own `allow_public_open`, matching startup's rule so an
+/// operator who genuinely wants an open public relay can still say so in the
+/// same edit.
+///
+/// Unix-only, like the SIGHUP handler that drives it.
+#[cfg(unix)]
+fn reload_admission_once(
+    server: &RelayServer,
+    path: &str,
+    overlay: &AdmissionOverlay,
+    bind: &str,
+    cli_allow_public_open: bool,
+) -> Result<()> {
+    let file = load_file_config(path)?;
+    let policy = resolve_admission(&file.admission, overlay)?;
+    let guard = PublicOpenGuard::new(
+        bind,
+        cli_allow_public_open || file.admission.allow_public_open.unwrap_or(false),
+    );
+    server.reload_admission(policy, &guard)
+}
+
+/// On SIGHUP, re-read the config file's `[admission]` section and swap the live
+/// admission policy (allow/deny/mode/token), re-applying the startup CLI overlay.
+/// Live connections are untouched. No-op when there is no `--config` file.
+#[cfg(unix)]
+fn spawn_sighup_reloader(
+    server: RelayServer,
+    config_path: Option<String>,
+    overlay: AdmissionOverlay,
+    bind: String,
+    cli_allow_public_open: bool,
+) {
+    tokio::spawn(async move {
+        let mut sighup = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("zerorelay: cannot install SIGHUP handler ({e}); admission reload off");
+                return;
+            }
+        };
+        while sighup.recv().await.is_some() {
+            let Some(path) = config_path.as_deref() else {
+                eprintln!("zerorelay: SIGHUP ignored (no --config to reload)");
+                continue;
+            };
+            match reload_admission_once(&server, path, &overlay, &bind, cli_allow_public_open) {
+                Ok(()) => eprintln!("zerorelay: reloaded admission from {path} (SIGHUP)"),
+                Err(e) => {
+                    eprintln!("zerorelay: SIGHUP reload failed, keeping current policy ({e:#})");
+                }
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+fn spawn_sighup_reloader(
+    _server: RelayServer,
+    _config_path: Option<String>,
+    _overlay: AdmissionOverlay,
+    _bind: String,
+    _cli_allow_public_open: bool,
+) {
+}
+
+/// Build an outer client-cert verifier for the outer-mTLS variant, or `None` when
+/// `outer_client_auth` is off. "optional" accepts unauthenticated peers too;
+/// "required" rejects a peer without a valid outer client cert.
+fn build_outer_client_verifier(
+    admission: &AdmissionFile,
+) -> Result<Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>> {
+    let mode = admission.outer_client_auth.as_deref().unwrap_or("off");
+    match mode {
+        "off" => Ok(None),
+        "optional" | "required" => {
+            let ca = admission.outer_client_ca.clone().ok_or_else(|| {
+                anyhow::Error::msg(format!(
+                    "[admission].outer_client_auth = {mode} requires [admission].outer_client_ca"
+                ))
+            })?;
+            let verifier = zeroclaw_tls::build_client_verifier(&zeroclaw_tls::ClientAuthParams {
+                ca_cert_path: ca,
+                require_client_cert: mode == "required",
+                pinned_certs: vec![],
+                crl_path: String::new(),
+            })?;
+            Ok(Some(verifier))
+        }
+        other => {
+            anyhow::bail!("invalid [admission].outer_client_auth '{other}' (off|optional|required)")
+        }
+    }
+}
+
+/// Build the outer TLS acceptor from the relay's own server cert + key. Outer TLS
+/// is server-authenticated; `client_verifier` adds the optional outer-mTLS variant
+/// (additive admission), but the inner mTLS stays the real RPC security boundary.
+fn build_tls_acceptor(
+    cert_path: &str,
+    key_path: &str,
+    client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<TlsAcceptor> {
+    let certs = load_certs(cert_path)?;
+    let key = load_key(key_path)?;
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("ring provider supports the default protocol versions")?;
+    let config = match client_verifier {
+        Some(v) => builder.with_client_cert_verifier(v),
+        None => builder.with_no_client_auth(),
+    }
+    .with_single_cert(certs, key)
+    .context("relay cert/key are not a valid pair")?;
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
+/// Self-provision the relay's outer TLS cert (CA + server leaf with SANs) on first
+/// run, reusing the daemon's `zeroclaw-tls` machinery so no openssl is needed.
+/// Reused on later runs. Prints the CA path daemons/clients should trust.
+fn provision_tls_acceptor(
+    tls_dir: Option<&str>,
+    extra_sans: &[String],
+    client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
+) -> Result<TlsAcceptor> {
+    let dir = tls_dir.map(PathBuf::from).unwrap_or_else(default_tls_dir);
+    let mut sans = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+    for s in extra_sans {
+        if !s.is_empty() && !sans.contains(s) {
+            sans.push(s.clone());
+        }
+    }
+    let mats = zeroclaw_tls::ensure_server_materials(&dir, &sans)
+        .with_context(|| format!("self-provisioning relay TLS in {}", dir.display()))?;
+    let acceptor = build_tls_acceptor(
+        &mats.server_cert_path.to_string_lossy(),
+        &mats.server_key_path.to_string_lossy(),
+        client_verifier,
+    )?;
+    eprintln!("zerorelay: self-provisioned outer TLS in {}", dir.display());
+    eprintln!("  SANs: {}", sans.join(", "));
+    eprintln!("  Trust this relay on daemons/clients with its CA:");
+    eprintln!(
+        "    daemon  [relay] relay_ca_path = \"{}\"",
+        mats.ca_cert_path.display()
+    );
+    eprintln!("    zerocode  --relay-ca {}", mats.ca_cert_path.display());
+    Ok(acceptor)
+}
+
+/// Default location for self-provisioned relay TLS material.
+fn default_tls_dir() -> PathBuf {
+    std::env::var_os("ZERORELAY_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".zerorelay")))
+        .unwrap_or_else(|| PathBuf::from("./zerorelay"))
+        .join("tls")
+}
+
+fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let mut rd = BufReader::new(File::open(path).with_context(|| format!("opening {path}"))?);
+    let certs: Vec<_> = rustls_pemfile::certs(&mut rd).collect::<Result<_, _>>()?;
+    if certs.is_empty() {
+        anyhow::bail!("no certificates found in {path}");
+    }
+    Ok(certs)
+}
+
+fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    let mut rd = BufReader::new(File::open(path).with_context(|| format!("opening {path}"))?);
+    rustls_pemfile::private_key(&mut rd)?.with_context(|| format!("no private key in {path}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn overlay(
+        mode: Option<&str>,
+        allow: &[&str],
+        deny: &[&str],
+        token: Option<&str>,
+    ) -> AdmissionOverlay {
+        AdmissionOverlay {
+            mode: mode.map(str::to_string),
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            deny: deny.iter().map(|s| s.to_string()).collect(),
+            relay_token: token.map(str::to_string),
+        }
+    }
+
+    fn fingerprint(hex: char) -> String {
+        hex.to_string().repeat(64)
+    }
+
+    #[test]
+    fn shipped_example_config_parses() {
+        // The relay.example.toml we ship (and bake into the image) must parse with
+        // `deny_unknown_fields` on, so a stale key never silently no-ops.
+        let text = include_str!("../relay.example.toml");
+        let file: FileConfig = toml::from_str(text).expect("example relay.toml parses");
+        assert_eq!(file.bind.as_deref(), Some("0.0.0.0:8443"));
+        assert_eq!(file.tls.dir.as_deref(), Some("/data/tls"));
+        assert_eq!(file.admission.mode.as_deref(), Some("open"));
+        assert_eq!(file.limits.max_conns_per_node, Some(256));
+    }
+
+    #[test]
+    fn cli_overrides_file_scalars_and_unions_lists() {
+        let file = AdmissionFile {
+            mode: Some("open".into()),
+            allow: vec![fingerprint('a')],
+            deny: vec![fingerprint('b')],
+            relay_token: Some("file_tok".into()),
+            ..Default::default()
+        };
+        // CLI flips the mode + token and adds an allow entry.
+        let cli_allow = fingerprint('c');
+        let pol = resolve_admission(
+            &file,
+            &overlay(Some("allowlist"), &[&cli_allow], &[], Some("cli_tok")),
+        )
+        .unwrap();
+        assert_eq!(pol.registration_mode, Admission::Allowlist); // CLI wins
+        assert_eq!(pol.relay_token.as_deref(), Some("cli_tok")); // CLI wins
+        assert!(pol.allow.contains(&fingerprint('a')) && pol.allow.contains(&fingerprint('c'))); // union
+        assert!(pol.deny.contains(&fingerprint('b')));
+    }
+
+    #[test]
+    fn file_only_admission_resolves() {
+        let file = AdmissionFile {
+            mode: Some("allowlist".into()),
+            allow: vec![fingerprint('d')],
+            ..Default::default()
+        };
+        let pol = resolve_admission(&file, &overlay(None, &[], &[], None)).unwrap();
+        assert_eq!(pol.registration_mode, Admission::Allowlist);
+        assert!(pol.allow.contains(&fingerprint('d')));
+        assert!(pol.relay_token.is_none());
+    }
+
+    #[test]
+    fn missing_mode_defaults_to_open_and_bad_mode_errors() {
+        let empty = AdmissionFile::default();
+        let pol = resolve_admission(&empty, &overlay(None, &[], &[], None)).unwrap();
+        assert_eq!(pol.registration_mode, Admission::Open);
+        assert!(resolve_admission(&empty, &overlay(Some("nonsense"), &[], &[], None)).is_err());
+    }
+
+    #[test]
+    fn admission_fingerprints_are_normalized_before_policy_evaluation() {
+        let allow = fingerprint('a');
+        let deny = fingerprint('b');
+        let colon_delimited_upper = |value: &str| {
+            value
+                .as_bytes()
+                .chunks(2)
+                .map(|chunk| std::str::from_utf8(chunk).unwrap().to_ascii_uppercase())
+                .collect::<Vec<_>>()
+                .join(":")
+        };
+        let file = AdmissionFile {
+            mode: Some("allowlist".into()),
+            allow: vec![colon_delimited_upper(&allow)],
+            deny: vec![colon_delimited_upper(&deny)],
+            ..Default::default()
+        };
+
+        let policy = resolve_admission(&file, &overlay(None, &[], &[], None)).unwrap();
+        assert!(policy.allow.contains(&allow));
+        assert!(policy.deny.contains(&deny));
+    }
+
+    #[test]
+    fn malformed_admission_fingerprint_fails_closed() {
+        let file = AdmissionFile {
+            deny: vec!["not-a-sha256-fingerprint".into()],
+            ..Default::default()
+        };
+
+        let err = resolve_admission(&file, &overlay(None, &[], &[], None))
+            .expect_err("malformed deny entries must reject the policy");
+        assert!(err.to_string().contains("64 hexadecimal"));
+    }
+
+    #[test]
+    fn unknown_config_key_is_rejected() {
+        // deny_unknown_fields: a typo'd key fails loudly instead of silently
+        // running stale defaults.
+        let bad = "bind = \"0.0.0.0:1\"\n[admission]\nmodee = \"open\"\n";
+        assert!(toml::from_str::<FileConfig>(bad).is_err());
+    }
+}
+
+/// SIGHUP reload plumbing. Startup enforces the fail-closed public-open rule,
+/// but the reload path re-reads the file and swaps the policy live: without the
+/// bind and the CLI opt-in carried into it, an operator could edit a token-gated
+/// or allowlisted config into an open, tokenless one and activate it with a
+/// signal - reaching the exact configuration startup refuses. (The rule itself
+/// is unit-tested in the library; these cover the wiring.)
+#[cfg(all(test, unix))]
+mod reload_guard_tests {
+    use super::*;
+
+    fn write_config(dir: &tempfile::TempDir, body: &str) -> String {
+        let path = dir.path().join("relay.toml");
+        std::fs::write(&path, body).expect("write relay.toml");
+        path.to_string_lossy().into_owned()
+    }
+
+    fn no_overlay() -> AdmissionOverlay {
+        AdmissionOverlay {
+            mode: None,
+            allow: vec![],
+            deny: vec![],
+            relay_token: None,
+        }
+    }
+
+    #[test]
+    fn reload_refuses_to_open_a_public_relay_without_the_opt_in() {
+        let server = RelayServer::new(RelayConfig {
+            registration_mode: Admission::Allowlist,
+            ..RelayConfig::default()
+        });
+        let dir = tempfile::tempdir().expect("tempdir");
+        // The operator rewrites a guarded config into open + tokenless.
+        let path = write_config(&dir, "[admission]\nmode = \"open\"\n");
+
+        let err = reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", false)
+            .expect_err("an unguarded public open policy must not be swapped in");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to reload admission") && msg.contains("--allow-public-open"),
+            "the refusal must name the guard and the way out, got: {msg}"
+        );
+
+        // The same edit WITH the explicit opt-in is accepted: the guard gates the
+        // deliberateness of the change, it does not forbid open public relays.
+        let path = write_config(
+            &dir,
+            "[admission]\nmode = \"open\"\nallow_public_open = true\n",
+        );
+        reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", false)
+            .expect("an explicit opt-in must reload");
+    }
+
+    #[test]
+    fn reload_carries_the_bind_and_cli_opt_in_from_startup() {
+        let server = RelayServer::new(RelayConfig::default());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_config(&dir, "[admission]\nmode = \"open\"\n");
+
+        // A loopback bind is not a public surface: the same file reloads.
+        reload_admission_once(&server, &path, &no_overlay(), "127.0.0.1:8443", false)
+            .expect("a loopback relay is unaffected by the guard");
+        // A public bind with the startup CLI opt-in still reloads: the flag is
+        // carried rather than consumed at startup.
+        reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", true)
+            .expect("--allow-public-open from startup must survive into reloads");
+        // Same file, same public bind, no opt-in: refused.
+        assert!(
+            reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", false).is_err(),
+            "a public bind without the opt-in must be refused"
+        );
+        // A token gates open mode, so this reload is admissible again.
+        let path = write_config(
+            &dir,
+            "[admission]\nmode = \"open\"\nrelay_token = \"a-long-secret\"\n",
+        );
+        reload_admission_once(&server, &path, &no_overlay(), "0.0.0.0:8443", false)
+            .expect("a token-gated open relay is guarded");
+    }
+}

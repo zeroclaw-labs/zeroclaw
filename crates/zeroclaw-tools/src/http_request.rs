@@ -1,4 +1,4 @@
-use crate::helpers::domain_guard;
+use crate::helpers::{domain_guard, response_body};
 use async_trait::async_trait;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
@@ -10,6 +10,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolOutput, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
+use zeroclaw_config::schema::{ProxyConfig, ProxyScope};
+
+const HTTP_REQUEST_PROXY_PINNING_ERROR: &str = "http_request requires direct transport so validated DNS answers remain pinned; set \
+     proxy.scope = \"services\" and omit tool.http_request and tool.* from proxy.services, or disable the proxy; \
+     proxy.scope = \"environment\" is incompatible with pinned HTTP requests";
 
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
@@ -20,6 +25,10 @@ pub struct HttpRequestTool {
     timeout_secs: u64,
     allow_private_hosts: bool,
     allowed_private_hosts: Vec<String>,
+    /// Network-specific NAT64 prefixes this deployment's translator serves.
+    /// Snapshotted at construction like `allowed_domains`; an IPv6 answer
+    /// inside one of them is classified by the IPv4 address it embeds.
+    nat64_prefixes: Vec<domain_guard::Nat64Prefix>,
     config_path: Option<PathBuf>,
     secrets_encrypt: bool,
 }
@@ -46,6 +55,7 @@ impl HttpRequestTool {
         timeout_secs: u64,
         allow_private_hosts: bool,
         allowed_private_hosts: Vec<String>,
+        nat64_prefixes: Vec<String>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             security,
@@ -60,6 +70,10 @@ impl HttpRequestTool {
                 allowed_private_hosts,
                 "http_request.allowed_private_hosts",
             )?,
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
+            )?,
             config_path: None,
             secrets_encrypt: false,
         })
@@ -71,6 +85,7 @@ impl HttpRequestTool {
         timeout_secs: u64,
         allow_private_hosts: bool,
         allowed_private_hosts: Vec<String>,
+        nat64_prefixes: Vec<String>,
         config_path: PathBuf,
         secrets_encrypt: bool,
     ) -> anyhow::Result<Self> {
@@ -86,6 +101,10 @@ impl HttpRequestTool {
             allowed_private_hosts: domain_guard::normalize_allowed_domains(
                 allowed_private_hosts,
                 "http_request.allowed_private_hosts",
+            )?,
+            nat64_prefixes: domain_guard::parse_nat64_prefixes(
+                &nat64_prefixes,
+                "security.nat64_prefixes",
             )?,
             config_path: Some(config_path),
             secrets_encrypt,
@@ -119,11 +138,16 @@ impl HttpRequestTool {
         }
 
         let host = extract_host(url)?;
-        if host
-            .parse::<IpAddr>()
-            .is_ok_and(domain_guard::is_cloud_metadata_ip)
-        {
-            anyhow::bail!("Blocked cloud metadata host: {host}");
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if domain_guard::is_known_cloud_metadata_endpoint(ip) {
+                anyhow::bail!("Blocked cloud metadata host: {host}");
+            }
+            if domain_guard::is_cloud_metadata_ip(ip) {
+                anyhow::bail!(
+                    "Blocked link-local host: {host}; 169.254.0.0/16 is blocked unconditionally \
+                     because cloud metadata services are hosted in that range"
+                );
+            }
         }
         let port = extract_port(url)?;
 
@@ -144,8 +168,19 @@ impl HttpRequestTool {
         let private_resolution_allowed = self.allow_private_hosts
             || domain_guard::host_matches_allowlist(&host, &self.allowed_private_hosts);
 
+        let canonical_url = if host.parse::<IpAddr>().is_ok() {
+            url.to_string()
+        } else {
+            let mut parsed = reqwest::Url::parse(url)
+                .map_err(|e| anyhow::Error::msg(format!("Invalid URL format: {e}")))?;
+            parsed
+                .set_host(Some(&host))
+                .map_err(|_| anyhow::Error::msg("URL contains an invalid host"))?;
+            parsed.to_string()
+        };
+
         Ok(HttpRequestUrlPolicy {
-            url: url.to_string(),
+            url: canonical_url,
             host,
             port,
             private_resolution_allowed,
@@ -182,6 +217,7 @@ impl HttpRequestTool {
                 .iter()
                 .map(|addr| addr.ip())
                 .collect::<Vec<_>>(),
+            &self.nat64_prefixes,
         )?;
 
         Ok(ValidatedHttpRequestTarget {
@@ -352,11 +388,10 @@ impl HttpRequestTool {
             self.timeout_secs
         };
         let builder = reqwest::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(timeout_secs))
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none());
-        let builder =
-            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.http_request");
         let builder = if target.host.parse::<IpAddr>().is_ok() {
             builder
         } else {
@@ -373,21 +408,13 @@ impl HttpRequestTool {
         Ok(request.send().await?)
     }
 
-    fn truncate_response(&self, text: &str) -> String {
-        // 0 means unlimited — no truncation.
-        if self.max_response_size == 0 {
-            return text.to_string();
+    async fn read_response_text(&self, response: reqwest::Response) -> anyhow::Result<String> {
+        let limit = (self.max_response_size != 0).then_some(self.max_response_size);
+        let (mut text, overflowed) = response_body::read_text(response, limit).await?;
+        if overflowed {
+            text.push_str("\n\n... [Response truncated due to size limit] ...");
         }
-        if text.len() > self.max_response_size {
-            let mut truncated = text
-                .chars()
-                .take(self.max_response_size)
-                .collect::<String>();
-            truncated.push_str("\n\n... [Response truncated due to size limit] ...");
-            truncated
-        } else {
-            text.to_string()
-        }
+        Ok(text)
     }
 }
 
@@ -528,6 +555,33 @@ impl Tool for HttpRequestTool {
         // Rate limiting is applied by the RateLimitedTool wrapper at
         // registration time (see zeroclaw-runtime::tools::mod).
 
+        let proxy_config = zeroclaw_config::schema::runtime_proxy_config();
+        if proxy_conflicts_with_dns_pinning(&proxy_config) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"service": "tool.http_request"})),
+                "http_request: configured runtime proxy rejected to preserve validated DNS pin"
+            );
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(HTTP_REQUEST_PROXY_PINNING_ERROR.into()),
+            });
+        }
+
+        let ignored_environment_proxy = zeroclaw_config::schema::environment_proxy_for_url(url);
+        if let Some(variable) = ignored_environment_proxy {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"proxy_variable": variable})),
+                "http_request: environment proxy ignored to preserve validated DNS pin"
+            );
+        }
+
         let target = match self.validate_request_target(url).await {
             Ok(v) => v,
             Err(e) => {
@@ -591,8 +645,8 @@ impl Tool for HttpRequestTool {
                     .join(", ");
 
                 // Get response body with size limit
-                let response_text = match response.text().await {
-                    Ok(text) => self.truncate_response(&text),
+                let response_text = match self.read_response_text(response).await {
+                    Ok(text) => text,
                     Err(e) => format!("[Failed to read response body: {e}]"),
                 };
 
@@ -625,13 +679,26 @@ impl Tool for HttpRequestTool {
                     },
                 })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: ToolOutput::default(),
-                error: Some(format!("HTTP request failed: {e}")),
-            }),
+            Err(e) => {
+                let mut error = format!("HTTP request failed: {e}");
+                if let Some(variable) = ignored_environment_proxy {
+                    error.push_str(&format!(
+                        "; {variable} was intentionally ignored by the DNS-pinned request"
+                    ));
+                }
+                Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(error),
+                })
+            }
         }
     }
+}
+
+fn proxy_conflicts_with_dns_pinning(config: &ProxyConfig) -> bool {
+    (config.enabled && config.scope == ProxyScope::Environment)
+        || (config.has_any_proxy_url() && config.should_apply_to_service("tool.http_request"))
 }
 
 fn extract_host(url: &str) -> anyhow::Result<String> {
@@ -708,11 +775,12 @@ fn validate_resolved_ips_for_ssrf(
     host: &str,
     private_resolution_allowed: bool,
     ips: &[std::net::IpAddr],
+    nat64_prefixes: &[domain_guard::Nat64Prefix],
 ) -> anyhow::Result<()> {
     if private_resolution_allowed {
-        domain_guard::validate_resolved_ips_exclude_metadata(host, ips)
+        domain_guard::validate_resolved_ips_exclude_metadata(host, ips, nat64_prefixes)
     } else {
-        domain_guard::validate_resolved_ips_are_public(host, ips)
+        domain_guard::validate_resolved_ips_are_public(host, ips, nat64_prefixes)
     }
 }
 
@@ -725,8 +793,88 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
     use zeroclaw_config::policy::SecurityPolicy;
 
+    async fn chunked_response(chunks: &[&[u8]]) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let owned_chunks = chunks
+            .iter()
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+
+        zeroclaw_spawn::spawn!(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 1024];
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for chunk in owned_chunks {
+                stream
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&chunk).await.unwrap();
+                stream.write_all(b"\r\n").await.unwrap();
+            }
+            stream.write_all(b"0\r\n\r\n").await.unwrap();
+        });
+
+        reqwest::get(format!("http://{addr}")).await.unwrap()
+    }
+
     fn test_tool(allowed_domains: Vec<&str>) -> HttpRequestTool {
         test_tool_with_private(allowed_domains, false)
+    }
+
+    #[tokio::test]
+    async fn response_limit_truncates_a_chunked_body_during_streaming() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            8,
+            30,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let response = chunked_response(&[b"hello", b" world", b" ignored"]).await;
+
+        let text = tool.read_response_text(response).await.unwrap();
+
+        assert!(text.starts_with("hello wo"));
+        assert!(text.contains("[Response truncated due to size limit]"));
+        assert!(!text.contains("ignored"));
+    }
+
+    #[tokio::test]
+    async fn zero_response_limit_preserves_a_complete_chunked_body() {
+        let tool = HttpRequestTool::new(
+            Arc::new(SecurityPolicy::default()),
+            vec!["example.com".into()],
+            0,
+            30,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let response = chunked_response(&[b"hello", b" world"]).await;
+
+        assert_eq!(
+            tool.read_response_text(response).await.unwrap(),
+            "hello world"
+        );
     }
 
     fn test_tool_with_private(
@@ -741,6 +889,35 @@ mod tests {
         allow_private_hosts: bool,
         allowed_private_hosts: Vec<&str>,
     ) -> HttpRequestTool {
+        test_tool_with_nat64(
+            allowed_domains,
+            allow_private_hosts,
+            allowed_private_hosts,
+            Vec::new(),
+        )
+    }
+
+    fn test_tool_with_nat64(
+        allowed_domains: Vec<&str>,
+        allow_private_hosts: bool,
+        allowed_private_hosts: Vec<&str>,
+        nat64_prefixes: Vec<&str>,
+    ) -> HttpRequestTool {
+        try_test_tool_with_nat64(
+            allowed_domains,
+            allow_private_hosts,
+            allowed_private_hosts,
+            nat64_prefixes,
+        )
+        .unwrap()
+    }
+
+    fn try_test_tool_with_nat64(
+        allowed_domains: Vec<&str>,
+        allow_private_hosts: bool,
+        allowed_private_hosts: Vec<&str>,
+        nat64_prefixes: Vec<&str>,
+    ) -> anyhow::Result<HttpRequestTool> {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -755,8 +932,8 @@ mod tests {
                 .into_iter()
                 .map(String::from)
                 .collect(),
+            nat64_prefixes.into_iter().map(String::from).collect(),
         )
-        .unwrap()
     }
 
     fn test_tool_with_auth_config(config_path: PathBuf, secrets_encrypt: bool) -> HttpRequestTool {
@@ -770,6 +947,7 @@ mod tests {
             1_000_000,
             30,
             false,
+            Vec::new(),
             Vec::new(),
             config_path,
             secrets_encrypt,
@@ -851,6 +1029,7 @@ api_token = "Bearer from-disk"
             1_000_000,
             30,
             false,
+            Vec::new(),
             Vec::new(),
             config_path,
             false,
@@ -958,6 +1137,7 @@ api_token = "{encrypted}"
             30,
             false,
             Vec::new(),
+            Vec::new(),
             config_path,
             true,
         )
@@ -1058,6 +1238,7 @@ api_token = "Bearer from-secret"
             1_000_000,
             5,
             true,
+            Vec::new(),
             Vec::new(),
             config_path,
             false,
@@ -1185,8 +1366,16 @@ api_token = "Bearer from-secret"
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool =
-            HttpRequestTool::new(security, vec![], 1_000_000, 30, false, Vec::new()).unwrap();
+        let tool = HttpRequestTool::new(
+            security,
+            vec![],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -1226,6 +1415,7 @@ api_token = "Bearer from-secret"
             30,
             false,
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
         let result = tool
@@ -1234,62 +1424,6 @@ api_token = "Bearer from-secret"
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
-    }
-
-    #[test]
-    fn truncate_response_within_limit() {
-        let tool = test_tool(vec!["example.com"]);
-        let text = "hello world";
-        assert_eq!(tool.truncate_response(text), "hello world");
-    }
-
-    #[test]
-    fn truncate_response_over_limit() {
-        let tool = HttpRequestTool::new(
-            Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            10,
-            30,
-            false,
-            Vec::new(),
-        )
-        .unwrap();
-        let text = "hello world this is long";
-        let truncated = tool.truncate_response(text);
-        assert!(truncated.len() <= 10 + 60); // limit + message
-        assert!(truncated.contains("[Response truncated"));
-    }
-
-    #[test]
-    fn truncate_response_zero_means_unlimited() {
-        let tool = HttpRequestTool::new(
-            Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            0, // max_response_size = 0 means no limit
-            30,
-            false,
-            Vec::new(),
-        )
-        .unwrap();
-        let text = "a".repeat(10_000_000);
-        assert_eq!(tool.truncate_response(&text), text);
-    }
-
-    #[test]
-    fn truncate_response_nonzero_still_truncates() {
-        let tool = HttpRequestTool::new(
-            Arc::new(SecurityPolicy::default()),
-            vec!["example.com".into()],
-            5,
-            30,
-            false,
-            Vec::new(),
-        )
-        .unwrap();
-        let text = "hello world";
-        let truncated = tool.truncate_response(text);
-        assert!(truncated.starts_with("hello"));
-        assert!(truncated.contains("[Response truncated"));
     }
 
     #[test]
@@ -1387,6 +1521,47 @@ api_token = "Bearer from-secret"
         // The actual Policy::none() enforcement is in execute_request's client builder.
         let tool = test_tool(vec!["example.com"]);
         assert_eq!(tool.name(), "http_request");
+    }
+
+    #[test]
+    fn runtime_proxy_conflicts_with_dns_pinning_only_when_it_applies() {
+        let global_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Zeroclaw,
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&global_proxy));
+        assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("tool.http_request"));
+        assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("tool.*"));
+
+        let environment_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Environment,
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&environment_proxy));
+        assert!(HTTP_REQUEST_PROXY_PINNING_ERROR.contains("environment"));
+
+        let exact_service_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Services,
+            services: vec!["tool.http_request".into()],
+            ..ProxyConfig::default()
+        };
+        assert!(proxy_conflicts_with_dns_pinning(&exact_service_proxy));
+
+        let other_service_proxy = ProxyConfig {
+            enabled: true,
+            http_proxy: Some("http://proxy.example:8080".into()),
+            scope: zeroclaw_config::schema::ProxyScope::Services,
+            services: vec!["provider.openai".into()],
+            ..ProxyConfig::default()
+        };
+        assert!(!proxy_conflicts_with_dns_pinning(&other_service_proxy));
+        assert!(!proxy_conflicts_with_dns_pinning(&ProxyConfig::default()));
     }
 
     #[test]
@@ -1573,6 +1748,34 @@ api_token = "Bearer from-secret"
     }
 
     #[tokio::test]
+    async fn validate_request_target_canonicalizes_trailing_dot_before_dns_pinning() {
+        let tool = test_tool(vec!["example.com"]);
+
+        let target = tool
+            .validate_request_target_with_resolver(
+                "https://api.example.com./v1?x=1",
+                |host, port| {
+                    assert_eq!(host, "api.example.com");
+                    assert_eq!(port, 443);
+                    async {
+                        Ok(vec![SocketAddr::new(
+                            IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+                            443,
+                        )])
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let parsed = reqwest::Url::parse(&target.url).unwrap();
+
+        assert_eq!(target.host, "api.example.com");
+        assert_eq!(parsed.host_str(), Some(target.host.as_str()));
+        assert_eq!(parsed.path(), "/v1");
+        assert_eq!(parsed.query(), Some("x=1"));
+    }
+
+    #[tokio::test]
     async fn validate_request_target_allows_private_resolution_for_private_carveout() {
         let tool =
             test_tool_with_private_allowlist(vec!["example.com"], false, vec!["api.example.com"]);
@@ -1678,7 +1881,7 @@ api_token = "Bearer from-secret"
     #[test]
     fn validate_resolved_private_ip_is_blocked_by_default() {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
-        let err = validate_resolved_ips_for_ssrf("api.example.com", false, &ips)
+        let err = validate_resolved_ips_for_ssrf("api.example.com", false, &ips, &[])
             .unwrap_err()
             .to_string();
 
@@ -1691,7 +1894,7 @@ api_token = "Bearer from-secret"
     #[test]
     fn validate_resolved_private_ip_is_allowed_with_private_carveout() {
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 5))];
-        assert!(validate_resolved_ips_for_ssrf("api.example.com", true, &ips).is_ok());
+        assert!(validate_resolved_ips_for_ssrf("api.example.com", true, &ips, &[]).is_ok());
     }
 
     #[test]
@@ -1699,7 +1902,7 @@ api_token = "Bearer from-secret"
         let ips = [std::net::IpAddr::V4(std::net::Ipv4Addr::new(
             169, 254, 169, 254,
         ))];
-        let err = validate_resolved_ips_for_ssrf("metadata.example.com", true, &ips)
+        let err = validate_resolved_ips_for_ssrf("metadata.example.com", true, &ips, &[])
             .unwrap_err()
             .to_string();
 
@@ -1718,6 +1921,19 @@ api_token = "Bearer from-secret"
             .to_string();
 
         assert!(err.contains("metadata"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn apipa_literal_is_blocked_with_link_local_diagnostic() {
+        let tool = test_tool_with_private(vec!["*"], true);
+        let err = tool
+            .validate_url("http://169.254.12.7/status")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("link-local host"), "unexpected error: {err}");
+        assert!(err.contains("blocked unconditionally"));
+        assert!(!err.contains("cloud metadata host"));
     }
 
     // ── IPv6 end-to-end coverage ──────────────────────────────
@@ -1776,6 +1992,7 @@ api_token = "Bearer from-secret"
             5,         // timeout_secs
             true,      // allow_private_hosts
             Vec::new(),
+            Vec::new(),
         )
         .unwrap();
 
@@ -1797,5 +2014,104 @@ api_token = "Bearer from-secret"
             Ok(Err(_)) => {} // validation/network error — acceptable
             Err(_) => {}    // timeout — IPv6 connectivity may be unavailable
         }
+    }
+
+    /// A globally-classified NAT64 prefix, the shape a real deployment uses.
+    /// The IPv6 documentation range is itself non-global, so a documentation
+    /// prefix would be rejected for an unrelated reason and prove nothing
+    /// about the NAT64 decode.
+    const TEST_NAT64_PREFIX: &str = "2001:67c:2b0:db32:0:1::/96";
+    /// `TEST_NAT64_PREFIX` with 10.0.0.1 embedded per RFC 6052 §2.2.
+    const NAT64_PRIVATE_V4: &str = "2001:67c:2b0:db32:0:1:a00:1";
+    /// `TEST_NAT64_PREFIX` with 169.254.169.254 embedded.
+    const NAT64_METADATA_V4: &str = "2001:67c:2b0:db32:0:1:a9fe:a9fe";
+
+    async fn resolve_target_to(
+        tool: &HttpRequestTool,
+        address: &str,
+    ) -> anyhow::Result<ValidatedHttpRequestTarget> {
+        let ip = address.parse::<IpAddr>().unwrap();
+        tool.validate_request_target_with_resolver(
+            "https://attacker.example.com/",
+            move |_host, port| async move { Ok(vec![SocketAddr::new(ip, port)]) },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_blocks_resolution_to_embedded_private_v4() {
+        let tool = test_tool_with_nat64(vec!["*"], false, vec![], vec![TEST_NAT64_PREFIX]);
+        let err = resolve_target_to(&tool, NAT64_PRIVATE_V4)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-global address 10.0.0.1"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains(TEST_NAT64_PREFIX),
+            "error must name the configured prefix: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_blocks_resolution_to_embedded_metadata_v4() {
+        // The private opt-in never re-opens metadata, so this holds on both
+        // sides of the allow_private_hosts branch.
+        for allow_private in [false, true] {
+            let tool =
+                test_tool_with_nat64(vec!["*"], allow_private, vec![], vec![TEST_NAT64_PREFIX]);
+            let err = resolve_target_to(&tool, NAT64_METADATA_V4)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("cloud metadata address 169.254.169.254"),
+                "allow_private_hosts={allow_private} produced unexpected error: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn nat64_embedded_private_v4_is_reachable_without_a_configured_prefix() {
+        // Honest boundary: nothing in the address marks it as NAT64, so with
+        // no prefix configured the tool dials it. This is exactly the hole
+        // `security.nat64_prefixes` closes.
+        let tool = test_tool_with_nat64(vec!["*"], false, vec![], vec![]);
+        let target = resolve_target_to(&tool, NAT64_PRIVATE_V4).await.unwrap();
+        assert_eq!(target.host, "attacker.example.com");
+    }
+
+    #[tokio::test]
+    async fn configured_nat64_prefix_still_allows_embedded_global_v4() {
+        // 93.184.216.34 embedded under the same prefix; 192.0.2.33 from
+        // RFC 6052's own example is documentation space and non-global, so it
+        // cannot stand in for an accepted destination.
+        let tool = test_tool_with_nat64(vec!["*"], false, vec![], vec![TEST_NAT64_PREFIX]);
+        let target = resolve_target_to(&tool, "2001:67c:2b0:db32:0:1:5db8:d822")
+            .await
+            .unwrap();
+        assert_eq!(target.host, "attacker.example.com");
+    }
+
+    #[test]
+    fn malformed_nat64_prefix_fails_tool_construction() {
+        // Fail closed: a typo must refuse to build the tool rather than
+        // silently leaving the network-specific check disabled.
+        let err = try_test_tool_with_nat64(
+            vec!["example.com"],
+            false,
+            vec![],
+            vec![TEST_NAT64_PREFIX, "2001:db8::/33"],
+        )
+        .err()
+        .expect("malformed nat64 prefix must fail construction")
+        .to_string();
+        assert!(
+            err.contains("security.nat64_prefixes"),
+            "unexpected error: {err}"
+        );
+        assert!(err.contains("2001:db8::/33"), "unexpected error: {err}");
     }
 }

@@ -1,5 +1,7 @@
 //! Per-caller loop behaviour knobsconsolidation).
 
+use zeroclaw_config::schema::StreamReasoningMode;
+
 /// How to handle max-tool-iteration exhaustion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MaxIterationBehavior {
@@ -16,6 +18,10 @@ pub struct LoopKnobs {
     pub dedup_enabled: bool,
     pub max_iteration_behavior: MaxIterationBehavior,
     pub detect_protocol_without_tools: bool,
+    /// Controls whether provider reasoning deltas are reflected into the
+    /// draft/status surface. Raw reasoning is opt-in; the default only emits a
+    /// liveness tick so existing channel progress remains privacy-preserving.
+    pub draft_reasoning: StreamReasoningMode,
 }
 
 impl Default for LoopKnobs {
@@ -24,6 +30,7 @@ impl Default for LoopKnobs {
             dedup_enabled: true,
             max_iteration_behavior: MaxIterationBehavior::GracefulSummary,
             detect_protocol_without_tools: true,
+            draft_reasoning: StreamReasoningMode::Status,
         }
     }
 }

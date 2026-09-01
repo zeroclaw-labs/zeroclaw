@@ -4,11 +4,14 @@
 // Route: /runs/:sop/:runId.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
-import { ArrowLeft, Check, Loader2, X } from 'lucide-react';
+import { ArrowLeft, Check, Loader2, Square, X } from 'lucide-react';
 import {
+  cancelSop,
   decideSop,
+  getRunOverlay,
   getSop,
   getSopGraph,
+  isTerminalRunStatus,
   overlayStateByStep,
   runStatusBadge,
   type Sop,
@@ -29,7 +32,18 @@ export default function RunDetail() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [deciding, setDeciding] = useState(false);
   const [decideError, setDecideError] = useState<string | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
   const { overlay, error: overlayError, setOverlay } = useRunOverlay(sop, runId);
+
+  useEffect(() => {
+    if (
+      overlay &&
+      (overlay.status === 'cancel_requested' || isTerminalRunStatus(overlay.status))
+    ) {
+      setCancelError(null);
+    }
+  }, [overlay]);
 
   useEffect(() => {
     if (!sop) return;
@@ -65,7 +79,43 @@ export default function RunDetail() {
     [sop, runId, setOverlay],
   );
 
+  // Operator Stop: safe cancel, not mid-step interruption. The engine lets the
+  // step already in flight finish and stops the run at the next step
+  // boundary. The refreshed overlay shows the truthful `cancel_requested`
+  // intermediate state while that work drains.
+  const handleCancel = useCallback(() => {
+    if (!sop || !runId) return;
+    setCancelling(true);
+    setCancelError(null);
+    cancelSop(sop, runId)
+      .then((result) => {
+        if (overlay) {
+          setOverlay({
+            ...overlay,
+            status: result.status,
+            waiting: false,
+            paused: false,
+          });
+        }
+        return getRunOverlay(sop, runId).then(setOverlay).catch((e: unknown) => {
+          console.error('run overlay refresh failed after accepted cancellation', e);
+          setCancelError(t('sops.stop_refresh_error'));
+        });
+      })
+      .catch((e: unknown) => {
+        // Localized, generic message for the user; the backend detail goes to
+        // the console rather than leaking raw internals into the page.
+        console.error('cancelSop failed', e);
+        setCancelError(t('sops.stop_error'));
+      })
+      .finally(() => setCancelling(false));
+  }, [sop, runId, overlay, setOverlay]);
+
   const gated = overlay ? overlay.waiting || overlay.paused : false;
+  const stopping = overlay?.status === 'cancel_requested';
+  const stoppable = overlay
+    ? !isTerminalRunStatus(overlay.status) && !stopping
+    : false;
   const error = loadError ?? overlayError;
 
   return (
@@ -103,37 +153,59 @@ export default function RunDetail() {
           >
             {t('run_detail.open_sop')}
           </Link>
-          {gated ? (
+          {gated || stoppable || stopping ? (
             <div className="ml-auto flex items-center gap-2">
-              <span className="text-sm text-status-warning">
-                {t('run_detail.gate_pending')}
-              </span>
-              <button
-                type="button"
-                disabled={deciding}
-                onClick={() => handleDecide(true)}
-                className="inline-flex items-center gap-1 rounded bg-pc-accent px-3 py-1.5 text-sm font-medium text-[#0b1220] hover:opacity-90 disabled:opacity-40"
-              >
-                {deciding ? (
-                  <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
-                ) : (
-                  <Check className="h-4 w-4" aria-hidden />
-                )}
-                {t('sops.approve')}
-              </button>
-              <button
-                type="button"
-                disabled={deciding}
-                onClick={() => handleDecide(false)}
-                className="inline-flex items-center gap-1 rounded border border-pc-border px-3 py-1.5 text-sm text-status-error hover:bg-pc-elevated disabled:opacity-40"
-              >
-                <X className="h-4 w-4" aria-hidden />
-                {t('sops.deny')}
-              </button>
+              {gated ? (
+                <>
+                  <span className="text-sm text-status-warning">
+                    {t('run_detail.gate_pending')}
+                  </span>
+                  <button
+                    type="button"
+                    disabled={deciding}
+                    onClick={() => handleDecide(true)}
+                    className="inline-flex items-center gap-1 rounded bg-pc-accent px-3 py-1.5 text-sm font-medium text-[#0b1220] hover:opacity-90 disabled:opacity-40"
+                  >
+                    {deciding ? (
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                    ) : (
+                      <Check className="h-4 w-4" aria-hidden />
+                    )}
+                    {t('sops.approve')}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={deciding}
+                    onClick={() => handleDecide(false)}
+                    className="inline-flex items-center gap-1 rounded border border-pc-border px-3 py-1.5 text-sm text-status-error hover:bg-pc-elevated disabled:opacity-40"
+                  >
+                    <X className="h-4 w-4" aria-hidden />
+                    {t('sops.deny')}
+                  </button>
+                </>
+              ) : null}
+              {stoppable || stopping ? (
+                <button
+                  type="button"
+                  disabled={cancelling || stopping}
+                  onClick={handleCancel}
+                  className="inline-flex items-center gap-1 rounded border border-status-error/25 bg-status-error/10 px-3 py-1.5 text-sm text-status-error hover:bg-status-error/15 disabled:opacity-40"
+                >
+                  {cancelling || stopping ? (
+                    <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+                  ) : (
+                    <Square className="h-4 w-4" aria-hidden fill="currentColor" />
+                  )}
+                  {stopping ? t('sops.stopping') : t('sops.stop')}
+                </button>
+              ) : null}
             </div>
           ) : null}
           {decideError ? (
             <span className="w-full text-xs text-status-error">{decideError}</span>
+          ) : null}
+          {cancelError ? (
+            <span className="w-full text-xs text-status-error">{cancelError}</span>
           ) : null}
         </Card>
       ) : !error ? (

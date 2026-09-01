@@ -47,7 +47,12 @@ one.
 5. **Register tools.** Surviving tool plugins are wrapped as agent tools and
    appended after the built-ins. Tool dispatch resolves names first-match, so a
    plugin tool that collides with a built-in name is never selected; give plugin
-   tools unique names.
+   tools unique names. Tool and skill plugins are *auto-discovered*, so this
+   enumeration happens only when `[plugins] auto_discover = true` (default
+   `false`, fail-closed): with `enabled = true` but `auto_discover = false`, no
+   plugin tools or skills load, though channels you declare under
+   `[channels.plugin.<alias>]` still activate. The skill loader applies the same
+   `auto_discover` gate.
 
 The signature stage is the one most easily misconfigured, so it is worth
 understanding on its own.
@@ -88,14 +93,13 @@ A manifest declares two separate things, and the distinction matters.
   HTTP egress, configuration, memory. A permission the manifest does not declare
   is a host function the plugin cannot reach.
 
-The host grants permissions narrowly: a permission the manifest does not declare
-is a host function the plugin cannot reach. The HTTP-egress and per-plugin
-configuration boundaries (SSRF-guarded egress that cannot reach loopback,
-private, link-local, or cloud-metadata addresses or redirect into one; config
-injected per-alias so a plugin reads only its own resolved values and never the
-raw process environment or another plugin's secrets) are delivered by the
-companion plugin-hardening work and are documented alongside those changes. This
-page covers the signature-policy boundary.
+The host grants permissions narrowly: a permission the manifest does not
+declare is a host function the plugin cannot reach. Config is resolved from a
+host-issued instance identity, so a plugin cannot select another package or
+binding and never reads the raw process environment. `http_client` gates the
+outbound `wasi:http` surface; the shared SSRF-guarded egress policy remains
+companion plugin-hardening work. This page covers the signature-policy
+boundary.
 
 ## Configuration reference
 
@@ -105,6 +109,10 @@ config surface (zerocode, the gateway, or the CLI):
 ```bash
 # Master switch. Nothing loads while this is false.
 zeroclaw config set plugins.enabled true
+
+# Load auto-discovered tool and skill plugins at runtime (default: false).
+# Without this, `enabled = true` activates only explicitly-declared channels.
+zeroclaw config set plugins.auto_discover true
 
 # Where plugins are discovered (default: ~/.zeroclaw/plugins).
 zeroclaw config set plugins.plugins_dir ~/.zeroclaw/plugins
@@ -117,8 +125,11 @@ zeroclaw config set plugins.security.trusted_publisher_keys '["a1b2c3d4e5f6..."]
 ```
 
 A host meant to load third-party plugins should set `enabled = true`,
-`signature_mode = "strict"`, and list only the publisher keys you trust. A host
-that runs only plugins you build yourself can leave `signature_mode` at its
+`signature_mode = "strict"`, and list only the publisher keys you trust. To load
+auto-discovered tool and skill plugins as well, also set `auto_discover = true`;
+it is `false` by default, so `enabled = true` alone activates only the channels
+you declare under `[channels.plugin.<alias>]` and no plugin tools or skills. A
+host that runs only plugins you build yourself can leave `signature_mode` at its
 `disabled` default during development and tighten it before the host is shared.
 
 ## What a plugin still cannot do
@@ -129,13 +140,20 @@ Even with every permission granted, the sandbox bounds a plugin:
   the filesystem outside its rooted workspace. Network egress is gated by the
   HTTP permission; the SSRF-guarded egress boundary itself is delivered by the
   companion plugin-hardening work.
-- Secret-value isolation at the egress boundary (the host injecting credentials
-  so the plugin learns only that a secret exists, never its value) is part of
-  that same companion work; this PR does not add it.
+- A trusted tool or channel plugin can read a schema-designated secret's
+  plaintext through its scoped `secrets.get` import during an authorized
+  service call. Tools receive access during `execute`. Channels receive
+  `config.get` and `secrets.get` during `configure` and operational calls; reads
+  within one call use one canonical revision, so a same-binding public/secret
+  rotation is available on the next operation. Instantiation and static
+  metadata discovery cannot use either import. The host prevents public config
+  injection and cross-instance selection, but a plaintext-returning import
+  cannot prevent a malicious guest from retaining what it reads. Compliant
+  channel plugins must resolve config and credentials at each point of use.
 - It cannot displace a built-in tool: the built-ins register first and tool
   dispatch resolves names first-match, so a colliding plugin tool is simply
   never selected.
 
-These bounds hold regardless of what the plugin's own code attempts, which is
-what makes it safe to load a plugin you did not write, provided your signature
-policy says you trust whoever published it.
+The sandbox and namespace bounds hold regardless of what plugin code attempts.
+The no-retention rule is instead part of the trusted channel-plugin contract,
+which is why publisher review and signature policy still matter.

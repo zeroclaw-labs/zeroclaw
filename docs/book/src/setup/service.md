@@ -129,6 +129,11 @@ rc-update add zeroclaw default    # start on boot
 
 </div>
 
+OpenRC keeps daemon output in `/var/log/zeroclaw/access.log` and
+`/var/log/zeroclaw/error.log`. Each file retains recent output within an 8 MiB
+bound. Reinstall and restart the service after upgrading so the generated init
+script uses bounded logger processes.
+
 ## macOS: LaunchAgent
 
 `zeroclaw service install` writes `~/Library/LaunchAgents/com.zeroclaw.daemon.plist` and loads it.
@@ -145,7 +150,7 @@ launchctl load ~/Library/LaunchAgents/com.zeroclaw.daemon.plist
 
 </div>
 
-Logs go to `<config-dir>/logs/` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `~/.zeroclaw/logs/`). Homebrew installs write to `$HOMEBREW_PREFIX/var/zeroclaw/logs/` instead.
+Logs go to `<config-dir>/logs/` as `daemon.stdout.log` and `daemon.stderr.log` (for a default install, `~/.zeroclaw/logs/`). Homebrew installs write to `$HOMEBREW_PREFIX/var/zeroclaw/logs/` instead. Each launchd capture file retains recent output within an 8 MiB bound. Reinstall and restart the service after upgrading so the generated LaunchAgent uses bounded capture.
 
 ### Homebrew-managed
 
