@@ -1181,6 +1181,7 @@ const translations: Record<Locale, Record<string, string>> = {
     'sops.cancel': 'Cancel',
     'sops.editor_title': 'Edit SOP',
     'sops.field_name': 'Name',
+    'sops.rename_failed': 'Your changes were saved as "{name}", but renaming it failed:',
     'sops.field_version': 'Version',
     'sops.field_description': 'Description',
     'sops.field_priority': 'Priority',

@@ -1104,6 +1104,13 @@ pub enum SopCommands {
         /// Name of the SOP to delete
         name: String,
     },
+    /// Rename an SOP definition on disk
+    Rename {
+        /// Name the SOP is stored under today
+        from: String,
+        /// Name to move it to (must not already be taken)
+        to: String,
+    },
 }
 
 /// Text output format for `sop graph`.

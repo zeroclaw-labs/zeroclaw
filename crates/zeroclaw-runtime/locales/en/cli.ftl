@@ -519,6 +519,7 @@ cli-sop-loaded-header = Loaded SOPs ({$count}):
 cli-sop-none-to-validate = No SOPs found to validate.
 cli-sop-valid = ✅ {$name} — valid
 cli-sop-deleted = Deleted SOP: {$name}
+cli-sop-renamed = Renamed SOP {$from} to {$to}
 cli-sop-warnings = ⚠️  {$name} — {$count} warning(s):
 cli-sop-all-passed = All SOPs passed validation.
 cli-sop-priority = {"  "}Priority:       {$value}

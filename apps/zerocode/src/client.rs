@@ -150,6 +150,7 @@ pub mod method {
     pub const SOPS_SAVE: &str = "sops/save";
     pub const SOPS_CREATE: &str = "sops/create";
     pub const SOPS_DELETE: &str = "sops/delete";
+    pub const SOPS_RENAME: &str = "sops/rename";
     pub const SOPS_DECIDE: &str = "sops/decide";
     pub const SOPS_WIRE_DRAFT: &str = "sops/wire-draft";
     pub const SOPS_GRAPH_DRAFT: &str = "sops/graph-draft";
@@ -2263,6 +2264,18 @@ impl RpcClient {
     pub async fn sops_create(&self, sop: Value) -> Result<Value> {
         self.call(method::SOPS_CREATE, serde_json::json!({ "sop": sop }))
             .await
+    }
+
+    /// Move a SOP to a new name. Separate from `sops_save`, which persists
+    /// under the submitted SOP's own name and so can only overwrite the SOP it
+    /// was loaded from; the daemon collision-checks the target and moves the
+    /// definition rather than copying it.
+    pub async fn sops_rename(&self, from: &str, to: &str) -> Result<Value> {
+        self.call(
+            method::SOPS_RENAME,
+            serde_json::json!({ "from": from, "to": to }),
+        )
+        .await
     }
 
     pub async fn sops_delete(&self, name: &str) -> Result<Value> {

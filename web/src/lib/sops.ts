@@ -155,6 +155,21 @@ export function saveSop(sop: Sop): Promise<{ saved: string }> {
   });
 }
 
+/// Move a SOP to a new name. Separate from `saveSop` because a save writes to
+/// the path its own payload names, so a name change sent through a save would
+/// create a second SOP rather than move the one being edited. The daemon
+/// collision-checks the target and moves the definition; 409 means the name is
+/// already taken.
+export function renameSop(from: string, to: string): Promise<{ renamed: string; from: string }> {
+  return apiFetch<{ renamed: string; from: string }>(
+    `/api/sops/${encodeURIComponent(from)}/rename`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ to }),
+    },
+  );
+}
+
 export function deleteSop(name: string): Promise<{ deleted: string }> {
   return apiFetch<{ deleted: string }>(`/api/sops/${encodeURIComponent(name)}`, {
     method: 'DELETE',

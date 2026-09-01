@@ -220,6 +220,36 @@ fn num_csv(list: &[u32]) -> String {
         .join(", ")
 }
 
+/// What submitting the editor should do about the SOP's name.
+///
+/// `sops/save` persists under the submitted SOP's own name, so saving a
+/// renamed draft would write a second SOP and leave the original standing.
+/// The move is its own collision-checked call, and the edits have to land on
+/// the SOP they were made against first: moving first would strand a renamed
+/// SOP holding unsaved edits if the save then failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SopSubmitPlan {
+    Create,
+    Save,
+    SaveThenRename { from: String, to: String },
+}
+
+/// Decide the plan from the editor's mode, the name the edit started under,
+/// and the name the draft carries now. Both names arrive already trimmed, the
+/// same form `to_sop_json` persists.
+fn plan_submit(create: bool, original_name: Option<&str>, draft_name: &str) -> SopSubmitPlan {
+    if create {
+        return SopSubmitPlan::Create;
+    }
+    match original_name {
+        Some(original) if original != draft_name => SopSubmitPlan::SaveThenRename {
+            from: original.to_string(),
+            to: draft_name.to_string(),
+        },
+        _ => SopSubmitPlan::Save,
+    }
+}
+
 fn switch_to_text(rules: &[SwitchRule]) -> String {
     rules
         .iter()
@@ -1387,37 +1417,41 @@ impl SopPane {
         }
         let create = ed.create;
         let name = ed.draft.name.trim().to_string();
-        // Identity in edit mode is the name the edit started from. sops/save
-        // persists under the draft's name and overwrites that directory, so a
-        // rename would silently fork (new dir, old left behind) or clobber a
-        // different SOP. Reject renames until an explicit rename flow exists.
-        if let Some(original) = ed.original_name.as_deref()
-            && name != original
-        {
-            self.error = Some(format!(
-                "Renaming an SOP is not supported yet. Set the name back to \
-                 '{original}', or create a new SOP and delete the old one."
-            ));
-            return;
+        let plan = plan_submit(create, ed.original_name.as_deref(), &name);
+        let mut sop = ed.to_sop_json();
+        // A rename saves against the name the edit started under, so the edits
+        // land on the SOP they were made against rather than creating a second
+        // one under the new name.
+        if let SopSubmitPlan::SaveThenRename { from, .. } = &plan {
+            sop["name"] = serde_json::Value::String(from.clone());
         }
-        let sop = ed.to_sop_json();
         let result = if create {
             self.rpc.sops_create(sop).await
         } else {
             self.rpc.sops_save(sop).await
         };
-        match result {
-            Ok(_) => {
-                self.editor = None;
-                self.status = Some(format!("saved {name}"));
-                self.error = None;
-                self.refresh().await;
-                if let Some(i) = self.names.iter().position(|n| n == &name) {
-                    self.list_state.select(Some(i));
-                    self.load_selected_graph().await;
-                }
-            }
-            Err(e) => self.error = Some(e.to_string()),
+        if let Err(e) = result {
+            self.error = Some(e.to_string());
+            return;
+        }
+        if let SopSubmitPlan::SaveThenRename { from, to } = &plan
+            && let Err(e) = self.rpc.sops_rename(from, to).await
+        {
+            // The edits are on disk under the old name. Say so, rather than
+            // reporting a bare failure the author would read as losing them.
+            self.error = Some(format!(
+                "Saved as '{from}', but renaming to '{to}' failed: {e}"
+            ));
+            self.refresh().await;
+            return;
+        }
+        self.editor = None;
+        self.status = Some(format!("saved {name}"));
+        self.error = None;
+        self.refresh().await;
+        if let Some(i) = self.names.iter().position(|n| n == &name) {
+            self.list_state.select(Some(i));
+            self.load_selected_graph().await;
         }
     }
 
@@ -2625,6 +2659,61 @@ mod tests {
             "with no backend `sources` (old/failed response) the picker \
              reconstructs from bound + channel so it still works"
         );
+    }
+}
+
+#[cfg(test)]
+mod submit_plan_tests {
+    use super::{SopSubmitPlan, plan_submit};
+
+    #[test]
+    fn a_new_draft_is_always_a_create() {
+        assert_eq!(plan_submit(true, None, "deploy"), SopSubmitPlan::Create);
+        // Even if something left an original name behind, create mode wins:
+        // the editor is not editing an existing SOP.
+        assert_eq!(
+            plan_submit(true, Some("stale"), "deploy"),
+            SopSubmitPlan::Create
+        );
+    }
+
+    #[test]
+    fn an_unchanged_name_is_a_plain_save() {
+        assert_eq!(
+            plan_submit(false, Some("deploy"), "deploy"),
+            SopSubmitPlan::Save
+        );
+    }
+
+    #[test]
+    fn a_changed_name_saves_against_the_name_the_edit_started_under() {
+        // `from` must be the original. Saving under the draft's new name would
+        // write a second SOP and leave the original standing beside it.
+        assert_eq!(
+            plan_submit(false, Some("deploy"), "deploy-prod"),
+            SopSubmitPlan::SaveThenRename {
+                from: "deploy".to_string(),
+                to: "deploy-prod".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_case_only_change_is_a_rename() {
+        assert_eq!(
+            plan_submit(false, Some("deploy"), "Deploy"),
+            SopSubmitPlan::SaveThenRename {
+                from: "deploy".to_string(),
+                to: "Deploy".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn an_edit_without_an_original_name_stays_a_save() {
+        // Nothing to move to, so the draft's own name is the only identity
+        // there is; save keeps its existing upsert behavior.
+        assert_eq!(plan_submit(false, None, "deploy"), SopSubmitPlan::Save);
     }
 }
 

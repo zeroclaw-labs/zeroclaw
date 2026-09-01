@@ -264,6 +264,11 @@ pub fn load_sop_by_name(
 /// Delete an SOP's directory (manifest, steps, everything). Errors if no
 /// SOP with that name exists.
 pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
+    let _lock = lock_sops_dir(sops_dir)?;
+    delete_sop_unlocked(sops_dir, name)
+}
+
+fn delete_sop_unlocked(sops_dir: &Path, name: &str) -> Result<()> {
     let dir = resolve_sop_dir(sops_dir, name)?;
     if !dir.exists() {
         anyhow::bail!("SOP '{name}' not found");
@@ -275,10 +280,138 @@ pub fn delete_sop(sops_dir: &Path, name: &str) -> Result<()> {
 /// Create a new SOP on disk, refusing to overwrite an existing one. Same
 /// normalization and validation as `save_sop`.
 pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
+    let _lock = lock_sops_dir(sops_dir)?;
+    create_sop_unlocked(sops_dir, sop)
+}
+
+fn create_sop_unlocked(sops_dir: &Path, sop: &Sop) -> Result<()> {
     if resolve_sop_dir(sops_dir, &sop.name)?.exists() {
         anyhow::bail!("SOP '{}' already exists", sop.name);
     }
-    save_sop(sops_dir, sop)
+    save_sop_unlocked(sops_dir, sop)
+}
+
+/// Name of the advisory lock file that serializes authoring writes under a
+/// SOP root. It is a plain file, so the directory scan that loads SOPs (which
+/// only descends into directories holding a `SOP.toml`) never sees it.
+const AUTHORING_LOCK_FILE: &str = ".sop-authoring.lock";
+
+/// How long an authoring call waits for the SOP root before giving up. The
+/// operations under the lock are a handful of filesystem calls, so real
+/// contention clears in milliseconds; the bound exists so a stuck or killed
+/// holder cannot wedge a request thread indefinitely.
+const AUTHORING_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Held for the duration of one authoring mutation. The kernel releases the
+/// advisory lock when the file handle drops, including on process death, so a
+/// crashed writer cannot leave the root permanently locked.
+#[derive(Debug)]
+struct AuthoringLock {
+    _file: std::fs::File,
+}
+
+/// Serialize every write to a SOP root: create, save, delete, and rename.
+///
+/// Each of those is a multi-step read-modify-write over a SOP directory, and
+/// the daemon runs them concurrently. Independent RPC connections each get
+/// their own dispatcher, the gateway serves its authoring routes on the async
+/// runtime, and the CLI is a separate process against the same root. Without a
+/// shared boundary a create can claim a name between rename's collision check
+/// and its move, a save can land between rename's snapshot and its commit and
+/// then be overwritten by that stale snapshot, and a failed rename's rollback
+/// can revert a save that succeeded in the meantime.
+///
+/// `File::lock` is advisory and scoped to the open file description, so a
+/// fresh handle per acquisition serializes threads within one process and
+/// processes against each other, on both Unix and Windows.
+///
+/// Readers are deliberately not covered. Every write under this lock lands
+/// through an atomic file or directory rename, so a concurrent reader sees one
+/// whole revision or the other, never a torn one.
+fn lock_sops_dir(sops_dir: &Path) -> Result<AuthoringLock> {
+    use anyhow::Context as _;
+
+    std::fs::create_dir_all(sops_dir)
+        .with_context(|| format!("creating SOP root {} before locking it", sops_dir.display()))?;
+    let lock_path = sops_dir.join(AUTHORING_LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("opening SOP authoring lock {}", lock_path.display()))?;
+
+    let deadline = std::time::Instant::now() + AUTHORING_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(AuthoringLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "another SOP authoring operation is holding {}; try again",
+                        lock_path.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(anyhow::Error::new(e).context(format!(
+                    "locking SOP authoring root {}",
+                    lock_path.display()
+                )));
+            }
+        }
+    }
+}
+
+/// Resolve `<sops_dir>/<name>` for a SOP that must already exist, refusing
+/// anything that is not a real directory sitting directly in the root.
+///
+/// `resolve_sop_dir` is lexical: it proves the caller passed one path
+/// component, not that the component is what it appears to be. A symlink
+/// planted in the root passes that check and then silently redirects every
+/// subsequent read and write at its target, so an operation that believes it
+/// is editing an in-root SOP would rewrite a manifest outside the root
+/// entirely. Both checks below are no-follow, and the canonical path is
+/// confirmed to stay under the canonical root.
+fn resolve_existing_sop_dir(
+    sops_dir: &Path,
+    name: &str,
+) -> std::result::Result<PathBuf, SopAuthorError> {
+    let dir = resolve_sop_dir(sops_dir, name).map_err(SopAuthorError::Other)?;
+    let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+        return Err(SopAuthorError::NotFound(name.to_string()));
+    };
+    if !meta.is_dir() {
+        return Err(SopAuthorError::Other(anyhow::Error::msg(format!(
+            "SOP '{name}' is not a directory in the SOP root (a symlink or file cannot be \
+             authored through)"
+        ))));
+    }
+    let manifest = dir.join("SOP.toml");
+    match std::fs::symlink_metadata(&manifest) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => {
+            return Err(SopAuthorError::Other(anyhow::Error::msg(format!(
+                "SOP '{name}' has a SOP.toml that is not a regular file"
+            ))));
+        }
+        Err(e) => return Err(SopAuthorError::Io(e.into())),
+    }
+    let (Ok(canonical_dir), Ok(canonical_root)) =
+        (std::fs::canonicalize(&dir), std::fs::canonicalize(sops_dir))
+    else {
+        return Err(SopAuthorError::Other(anyhow::Error::msg(format!(
+            "SOP '{name}' could not be resolved inside the SOP root"
+        ))));
+    };
+    if !canonical_dir.starts_with(&canonical_root) {
+        return Err(SopAuthorError::Other(anyhow::Error::msg(format!(
+            "SOP '{name}' resolves outside the SOP root"
+        ))));
+    }
+    Ok(dir)
 }
 
 /// Typed classification of an authoring failure so transports map it to the
@@ -287,6 +420,9 @@ pub fn create_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
 pub enum SopAuthorError {
     AlreadyExists(String),
     NotFound(String),
+    /// The request was fine; the filesystem was not. Transports map this to a
+    /// server error, never to a client input error.
+    Io(anyhow::Error),
     Other(anyhow::Error),
 }
 
@@ -295,7 +431,7 @@ impl std::fmt::Display for SopAuthorError {
         match self {
             SopAuthorError::AlreadyExists(name) => write!(f, "SOP '{name}' already exists"),
             SopAuthorError::NotFound(name) => write!(f, "SOP '{name}' not found"),
-            SopAuthorError::Other(e) => write!(f, "{e}"),
+            SopAuthorError::Io(e) | SopAuthorError::Other(e) => write!(f, "{e}"),
         }
     }
 }
@@ -304,18 +440,259 @@ impl std::error::Error for SopAuthorError {}
 
 pub fn create_sop_typed(sops_dir: &Path, sop: &Sop) -> std::result::Result<(), SopAuthorError> {
     let dir = resolve_sop_dir(sops_dir, &sop.name).map_err(SopAuthorError::Other)?;
+    let _lock = lock_sops_dir(sops_dir).map_err(SopAuthorError::Io)?;
+    // Re-checked under the lock: the bare check above is only a fast reject,
+    // and the answer is not trustworthy until nothing else can be writing.
     if dir.exists() {
         return Err(SopAuthorError::AlreadyExists(sop.name.clone()));
     }
-    save_sop(sops_dir, sop).map_err(SopAuthorError::Other)
+    save_sop_unlocked(sops_dir, sop).map_err(SopAuthorError::Other)
 }
 
 pub fn delete_sop_typed(sops_dir: &Path, name: &str) -> std::result::Result<(), SopAuthorError> {
     let dir = resolve_sop_dir(sops_dir, name).map_err(SopAuthorError::Other)?;
+    let _lock = lock_sops_dir(sops_dir).map_err(SopAuthorError::Io)?;
     if !dir.exists() {
         return Err(SopAuthorError::NotFound(name.to_string()));
     }
-    std::fs::remove_dir_all(&dir).map_err(|e| SopAuthorError::Other(e.into()))
+    std::fs::remove_dir_all(&dir).map_err(|e| SopAuthorError::Io(e.into()))
+}
+
+/// Rename an existing SOP: move `<sops_dir>/<from>/` to `<sops_dir>/<to>/`
+/// and update the manifest's `[sop] name` so the directory and the name the
+/// runtime loads stay in agreement.
+///
+/// Rename is a pure identity change. Only the `[sop] name` value in
+/// `SOP.toml` is rewritten, keeping that line's own comment and spacing;
+/// steps, triggers, key order, and every other manifest key are left alone,
+/// and `SOP.md` is never touched. That keeps a rename from quietly
+/// materializing defaults (an execution mode the manifest deliberately left
+/// unset, say) the way a load/save round trip would. The one cosmetic change
+/// is quote style: a single-quoted name comes back double-quoted.
+///
+/// One writer at a time. A concurrent `save_sop`, `create_sop_typed`, or
+/// second rename against the same SOP can interleave with the steps below;
+/// the authoring surfaces are a single daemon, and nothing here adds
+/// cross-process locking.
+///
+/// Ordering is what makes this safe against an interrupted rename. The
+/// directory move is a single `rename(2)`, and it goes last:
+///
+/// 1. collision-check `to` and strict-validate the renamed SOP, before
+///    anything on disk moves;
+/// 2. rewrite `[sop] name` in place, via a temp file renamed over the
+///    manifest, so `SOP.toml` is never half-written;
+/// 3. move the directory - the commit point.
+///
+/// The SOP therefore lives in exactly one directory at every instant: there
+/// is no window with two copies (a fork) or zero copies (a loss). An
+/// interruption between steps 2 and 3 leaves one directory whose name lags
+/// its manifest; re-running the same rename finishes the job. If step 3 fails
+/// outright the manifest is rolled back, leaving the SOP exactly as it was
+/// found.
+///
+/// Each step commits through a rename, so a reader and a process killed
+/// mid-rename both see one whole revision. The directory holding each renamed
+/// entry is flushed afterwards, so on Unix the two steps are durable across a
+/// machine crash in the same order they were applied: an interrupted rename
+/// leaves the SOP either wholly moved or wholly not, never both places or
+/// neither. macOS honors the flush for ordering without draining the device
+/// cache, and Windows has no directory-sync primitive, so on those platforms
+/// that last step is the filesystem's to keep.
+///
+/// Errors: `NotFound` if `from` is not an SOP directory, `AlreadyExists` if
+/// anything already occupies `to`, and `Other` for an invalid name (the same
+/// single-path-component check every other authoring helper applies), a SOP
+/// that strict validation rejects, or an I/O failure.
+pub fn rename_sop_typed(
+    sops_dir: &Path,
+    from: &str,
+    to: &str,
+    default_execution_mode: SopExecutionMode,
+) -> std::result::Result<(), SopAuthorError> {
+    let to_dir = resolve_sop_dir(sops_dir, to).map_err(SopAuthorError::Other)?;
+    if from == to {
+        return Err(SopAuthorError::Other(anyhow::Error::msg(format!(
+            "SOP '{from}' is already named '{to}'"
+        ))));
+    }
+    // Everything from here to the move is one transaction. Without the lock a
+    // create could claim `to` after the collision check, or a save could land
+    // between the snapshot and the commit and then be reverted by it.
+    let _lock = lock_sops_dir(sops_dir).map_err(SopAuthorError::Io)?;
+    let from_dir = resolve_existing_sop_dir(sops_dir, from)?;
+    // Collision check under the lock, so the answer still holds at the move.
+    // `same_path` keeps a case-only rename ('Deploy' -> 'deploy') working on
+    // case-insensitive filesystems, where the target reports as occupied by
+    // the source itself.
+    if path_occupied(&to_dir) && !same_path(&from_dir, &to_dir) {
+        return Err(SopAuthorError::AlreadyExists(to.to_string()));
+    }
+
+    // Strict-save validation still applies: a rename cannot put a SOP back on
+    // disk that `save_sop` would have refused to write in the first place.
+    let mut renamed = load_sop(&from_dir, default_execution_mode).map_err(classify_author_error)?;
+    renamed.name = to.to_string();
+    let validation = validate_sop_strict(&renamed);
+    if !validation.is_ok() {
+        return Err(SopAuthorError::Other(anyhow::Error::msg(format!(
+            "SOP rejected: {}",
+            validation.blocking.join("; ")
+        ))));
+    }
+
+    let manifest_path = from_dir.join("SOP.toml");
+    let original =
+        std::fs::read_to_string(&manifest_path).map_err(|e| SopAuthorError::Io(e.into()))?;
+    let updated = manifest_with_name(&original, to).map_err(SopAuthorError::Other)?;
+
+    write_file_atomic(&manifest_path, &updated).map_err(SopAuthorError::Io)?;
+    if let Err(e) = std::fs::rename(&from_dir, &to_dir) {
+        // The move is the commit point; it did not happen, so put the old
+        // name back rather than leaving a directory that disagrees with its
+        // manifest. If even that fails the SOP is left in the mismatched
+        // state, so the caller has to hear about it.
+        let mut msg = format!("failed to move SOP '{from}' to '{to}': {e}");
+        if let Err(rollback) = write_file_atomic(&manifest_path, &original) {
+            msg.push_str(&format!(
+                "; the manifest could not be rolled back and still names '{to}' \
+                 (re-run the rename to finish it): {rollback}"
+            ));
+        }
+        return Err(SopAuthorError::Io(anyhow::Error::msg(msg)));
+    }
+    // The move already happened and is visible, so a failure to flush the SOP
+    // root cannot be reported as a failed rename: the caller would retry an
+    // operation that has in fact completed. Record it instead, because the
+    // only thing lost is the power-loss guarantee.
+    if let Err(e) = sync_dir(sops_dir) {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "error": format!("{e}"),
+                    "from": from,
+                    "to": to,
+                })),
+            "SOP rename committed but the SOP root could not be synchronized"
+        );
+    }
+    Ok(())
+}
+
+/// Split a failure into "the filesystem broke" and "the SOP is wrong", so a
+/// transport can answer a caller with a server error rather than telling them
+/// to fix input that was never the problem. A malformed manifest is the
+/// caller's; an unreadable one is ours.
+fn classify_author_error(e: anyhow::Error) -> SopAuthorError {
+    if e.chain().any(|cause| cause.is::<std::io::Error>()) {
+        SopAuthorError::Io(e)
+    } else {
+        SopAuthorError::Other(e)
+    }
+}
+
+/// Whether anything already occupies `path`, a broken symlink included -
+/// `Path::exists` follows links and reports those as absent, which would let
+/// a rename land on top of one.
+fn path_occupied(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
+}
+
+/// Whether both paths resolve to the same directory on disk. Used to tell a
+/// case-only rename on a case-insensitive filesystem apart from a genuine
+/// collision with a different SOP; anything that fails to canonicalize is
+/// treated as a collision.
+fn same_path(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Rewrite only `[sop] name` in a SOP manifest, preserving every other key,
+/// comment, and ordering decision in the document.
+fn manifest_with_name(manifest_src: &str, new_name: &str) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = manifest_src
+        .parse()
+        .map_err(|e| anyhow::Error::msg(format!("SOP.toml is not valid TOML: {e}")))?;
+    let table = doc
+        .get_mut("sop")
+        .and_then(toml_edit::Item::as_table_like_mut)
+        .ok_or_else(|| anyhow::Error::msg("SOP.toml has no [sop] table"))?;
+    match table
+        .get_mut("name")
+        .and_then(toml_edit::Item::as_value_mut)
+    {
+        // Swap the string in place and put the original decor back, so a
+        // trailing comment on the name line (`name = "x" # note`) and the
+        // surrounding whitespace survive the edit.
+        Some(existing) => {
+            let decor = existing.decor().clone();
+            *existing = toml_edit::Value::from(new_name);
+            *existing.decor_mut() = decor;
+        }
+        None => {
+            table.insert("name", toml_edit::value(new_name));
+        }
+    }
+    Ok(doc.to_string())
+}
+
+/// Replace a file's contents atomically: stage a sibling temp file, flush it
+/// to disk, then rename it over the target. Readers see either the old
+/// contents or the new ones, never a half-written file.
+///
+/// The staging file is created fresh and exclusively under a name nothing can
+/// predict. A fixed name like `.SOP.toml.tmp` would be wrong twice over: two
+/// concurrent writers would share one staging path and could commit each
+/// other's bytes, and a symlink planted at that name would be followed and its
+/// target truncated. The target's permissions carry over, so replacing the
+/// inode cannot widen a deliberately tight manifest mode.
+fn write_file_atomic(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write as _;
+
+    let Some(dir) = path.parent() else {
+        anyhow::bail!("cannot write '{}': no parent directory", path.display());
+    };
+
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.write_all(contents.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    if let Ok(existing) = std::fs::metadata(path) {
+        tmp.as_file().set_permissions(existing.permissions())?;
+    }
+    tmp.persist(path).map_err(|e| anyhow::Error::new(e.error))?;
+    // Flushing the file is only half of it: until the directory entry that
+    // names it is on disk too, a power loss can take the rename back. This is
+    // fatal here because nothing has been committed yet, so failing leaves the
+    // SOP exactly as it was.
+    sync_dir(dir)?;
+    Ok(())
+}
+
+/// Flush a directory's entries so a rename into or out of it survives a
+/// machine crash, not just a process crash.
+///
+/// Unix exposes this as `fsync` on a handle to the directory itself. macOS
+/// honors it for ordering but does not force the device cache to drain the way
+/// `F_FULLFSYNC` would, so the guarantee there is the filesystem's rather than
+/// the hardware's. Windows has no equivalent: a directory handle needs backup
+/// semantics even to open, and `FlushFileBuffers` defines no durability
+/// contract for one, so ordering stays the filesystem's to keep.
+#[cfg(unix)]
+fn sync_dir(dir: &Path) -> Result<()> {
+    use anyhow::Context as _;
+
+    std::fs::File::open(dir)
+        .and_then(|handle| handle.sync_all())
+        .with_context(|| format!("synchronizing directory {}", dir.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_dir: &Path) -> Result<()> {
+    Ok(())
 }
 
 /// Project the live run state for `run_id` onto `sop`'s graph. Errors if
@@ -1177,6 +1554,12 @@ pub fn render_steps(steps: &[SopStep]) -> String {
 /// strict validation finds blocking problems; nothing touches disk on
 /// failure.
 pub fn save_sop(sops_dir: &Path, sop: &Sop) -> Result<()> {
+    let _lock = lock_sops_dir(sops_dir)?;
+    save_sop_unlocked(sops_dir, sop)
+}
+
+/// `save_sop`'s body without the root lock, for callers that already hold it.
+fn save_sop_unlocked(sops_dir: &Path, sop: &Sop) -> Result<()> {
     let mut sop = sop.clone();
     normalize_step_numbers(&mut sop);
     let sop = &sop;
@@ -1676,6 +2059,612 @@ mod tests {
         }
         let escape = dir.path().parent().unwrap().join("escape");
         assert!(!escape.exists(), "no write may land outside the SOP root");
+    }
+
+    /// Every SOP directory under `sops_dir` must be internally consistent: its
+    /// manifest identity matches its directory name, and the steps recorded in
+    /// `SOP.toml` match the ones in `SOP.md`. A directory whose identity
+    /// disagrees with its manifest, or a pair of files from two different
+    /// revisions, is precisely the damage unsynchronized authoring causes.
+    /// Returns the SOP names found, sorted.
+    fn assert_root_consistent(sops_dir: &Path) -> Vec<String> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(sops_dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let dir_name = entry.file_name().to_string_lossy().into_owned();
+            let raw = std::fs::read_to_string(path.join("SOP.toml"))
+                .unwrap_or_else(|e| panic!("{dir_name}: manifest unreadable: {e}"));
+            let manifest: types::SopManifest = toml::from_str(&raw)
+                .unwrap_or_else(|e| panic!("{dir_name}: manifest unparsable: {e}"));
+            assert_eq!(
+                manifest.sop.name, dir_name,
+                "directory name and manifest identity must agree"
+            );
+            if !manifest.steps.is_empty() {
+                let md = std::fs::read_to_string(path.join("SOP.md"))
+                    .unwrap_or_else(|e| panic!("{dir_name}: SOP.md unreadable: {e}"));
+                let md_titles: Vec<String> =
+                    parse_steps(&md).into_iter().map(|s| s.title).collect();
+                let manifest_titles: Vec<String> =
+                    manifest.steps.iter().map(|s| s.title.clone()).collect();
+                assert_eq!(
+                    md_titles, manifest_titles,
+                    "{dir_name}: SOP.toml and SOP.md are from different revisions"
+                );
+            }
+            names.push(dir_name);
+        }
+        names.sort();
+        names
+    }
+
+    fn named_sop(name: &str, step_title: &str) -> Sop {
+        let mut sop = authoring_sop(vec![titled_step(1, step_title)]);
+        sop.name = name.to_string();
+        sop
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_dir_flushes_a_real_directory_and_reports_a_missing_one() {
+        // The rename's durability rests on this, so a silent no-op would be
+        // worse than a failure: it would leave the docs claiming a guarantee
+        // nothing delivers.
+        let dir = tempfile::tempdir().unwrap();
+        sync_dir(dir.path()).expect("an existing directory must synchronize");
+
+        let missing = dir.path().join("not-here");
+        let err = sync_dir(&missing).expect_err("a missing directory must not report success");
+        assert!(err.to_string().contains("synchronizing directory"), "{err}");
+    }
+
+    #[test]
+    fn write_file_atomic_survives_a_read_only_parent_by_failing_not_lying() {
+        // `write_file_atomic` now flushes the parent after persisting. The
+        // staging file lands in the same directory, so a directory that cannot
+        // be written fails before anything is replaced.
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("nested").join("SOP.toml");
+        let err = write_file_atomic(&target, "x = 1\n")
+            .expect_err("writing into a directory that does not exist must fail");
+        assert!(!target.exists(), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_sop_refuses_a_symlinked_source_and_leaves_the_target_untouched() {
+        // A symlink planted in the SOP root passes the lexical single-component
+        // check, and every read and write would then follow it out of the root
+        // while the final move only relocates the link. Rename must refuse the
+        // source outright, before it touches the external manifest.
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        save_sop(outside.path(), &named_sop("external", "Outside step")).unwrap();
+        let external_dir = outside.path().join("external");
+        let external_manifest = external_dir.join("SOP.toml");
+        let before = std::fs::read(&external_manifest).unwrap();
+
+        std::os::unix::fs::symlink(&external_dir, root.path().join("linked")).unwrap();
+
+        let err = rename_sop_typed(
+            root.path(),
+            "linked",
+            "captured",
+            SopExecutionMode::Supervised,
+        )
+        .expect_err("a symlinked source SOP must be refused");
+        assert!(
+            err.to_string().contains("not a directory in the SOP root"),
+            "{err}"
+        );
+
+        assert_eq!(
+            std::fs::read(&external_manifest).unwrap(),
+            before,
+            "the external manifest must be byte-for-byte untouched"
+        );
+        assert!(
+            std::fs::symlink_metadata(root.path().join("linked"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the rejected source must be left exactly where it was"
+        );
+        assert!(!root.path().join("captured").exists());
+    }
+
+    #[test]
+    fn concurrent_create_and_rename_cannot_merge_two_sops() {
+        // Without a shared boundary the create can claim the target between
+        // rename's collision check and its move, after which the move replaces
+        // the empty directory and create writes its files over the moved SOP.
+        for round in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            save_sop(dir.path(), &named_sop("alpha", "Alpha step")).unwrap();
+            let root_a = dir.path().to_path_buf();
+            let root_b = dir.path().to_path_buf();
+
+            let renamer = std::thread::spawn(move || {
+                rename_sop_typed(&root_a, "alpha", "beta", SopExecutionMode::Supervised).is_ok()
+            });
+            let creator = std::thread::spawn(move || {
+                create_sop_typed(&root_b, &named_sop("beta", "Beta step")).is_ok()
+            });
+            let renamed = renamer.join().unwrap();
+            let created = creator.join().unwrap();
+
+            let names = assert_root_consistent(dir.path());
+            assert!(
+                names.contains(&"beta".to_string()),
+                "round {round}: beta must exist whoever won, got {names:?}"
+            );
+            let beta = load_sop_by_name(dir.path(), "beta", SopExecutionMode::Supervised).unwrap();
+            assert!(
+                beta.steps[0].title == "Alpha step" || beta.steps[0].title == "Beta step",
+                "round {round}: beta must be exactly one definition, got {:?}",
+                beta.steps[0].title
+            );
+            if renamed && created {
+                // Both winning means the rename moved alpha to beta and the
+                // create then had to lose, or vice versa. They cannot both
+                // have written beta.
+                panic!("round {round}: create and rename must not both claim 'beta'");
+            }
+            assert!(
+                renamed || created,
+                "round {round}: one of the two operations must succeed"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_save_and_rename_cannot_tear_a_revision() {
+        // Rename snapshots the manifest, then writes it back. A save landing in
+        // between would be reverted by that stale snapshot, leaving the
+        // manifest and SOP.md describing different revisions.
+        for round in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            save_sop(dir.path(), &named_sop("alpha", "V1")).unwrap();
+            let root_a = dir.path().to_path_buf();
+            let root_b = dir.path().to_path_buf();
+
+            let renamer = std::thread::spawn(move || {
+                rename_sop_typed(&root_a, "alpha", "beta", SopExecutionMode::Supervised).is_ok()
+            });
+            let saver =
+                std::thread::spawn(move || save_sop(&root_b, &named_sop("alpha", "V2")).is_ok());
+            let renamed = renamer.join().unwrap();
+            saver.join().unwrap();
+
+            let names = assert_root_consistent(dir.path());
+            assert!(
+                renamed,
+                "round {round}: a save of a different SOP name must not block the rename"
+            );
+            assert!(
+                names.contains(&"beta".to_string()),
+                "round {round}: got {names:?}"
+            );
+            for name in &names {
+                let sop = load_sop_by_name(dir.path(), name, SopExecutionMode::Supervised).unwrap();
+                assert!(
+                    sop.steps[0].title == "V1" || sop.steps[0].title == "V2",
+                    "round {round}: {name} must hold one whole revision, got {:?}",
+                    sop.steps[0].title
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_renames_of_one_sop_leave_a_single_definition() {
+        for round in 0..12 {
+            let dir = tempfile::tempdir().unwrap();
+            save_sop(dir.path(), &named_sop("alpha", "Only step")).unwrap();
+            let root_a = dir.path().to_path_buf();
+            let root_b = dir.path().to_path_buf();
+
+            let to_beta = std::thread::spawn(move || {
+                rename_sop_typed(&root_a, "alpha", "beta", SopExecutionMode::Supervised).is_ok()
+            });
+            let to_gamma = std::thread::spawn(move || {
+                rename_sop_typed(&root_b, "alpha", "gamma", SopExecutionMode::Supervised).is_ok()
+            });
+            let beta_won = to_beta.join().unwrap();
+            let gamma_won = to_gamma.join().unwrap();
+
+            let names = assert_root_consistent(dir.path());
+            assert_eq!(
+                names.len(),
+                1,
+                "round {round}: two renames of one SOP must not fork it, got {names:?}"
+            );
+            assert_ne!(
+                beta_won, gamma_won,
+                "round {round}: exactly one rename may succeed"
+            );
+            assert_eq!(
+                names[0],
+                if beta_won { "beta" } else { "gamma" },
+                "round {round}: the surviving name must be the winner's"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_sop_moves_the_directory_and_rewrites_the_manifest_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sop = authoring_sop(vec![titled_step(1, "First")]);
+        sop.steps[0].body = "Do the thing.".into();
+        save_sop(dir.path(), &sop).unwrap();
+
+        rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .unwrap();
+
+        assert!(
+            !dir.path().join("authoring").exists(),
+            "the directory the SOP was renamed away from must be gone"
+        );
+        let loaded = load_sop_by_name(dir.path(), "renamed", SopExecutionMode::Supervised).unwrap();
+        assert_eq!(loaded.name, "renamed");
+        assert_eq!(loaded.steps, sop.steps);
+
+        // The whole point of the move/delete ordering: one copy, always.
+        let dirs: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap())
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            dirs,
+            vec!["renamed".to_string()],
+            "a rename may leave neither a fork nor a hole"
+        );
+        // The lock file shares the root with the SOPs, so the loader has to
+        // keep ignoring anything that is not a SOP directory.
+        assert_eq!(
+            load_sops_from_directory(dir.path(), SopExecutionMode::Supervised)
+                .into_iter()
+                .map(|s| s.name)
+                .collect::<Vec<_>>(),
+            vec!["renamed".to_string()],
+            "the authoring lock file must never be loaded as a SOP"
+        );
+    }
+
+    #[test]
+    fn rename_sop_changes_only_the_manifest_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        // Make the manifest look like a checked-in one: a comment, and no
+        // `execution_mode` so the SOP inherits the runtime default. A rename
+        // that round-tripped the SOP through load/save would drop the comment
+        // and bake the default in.
+        let manifest_path = dir.path().join("authoring").join("SOP.toml");
+        let hand_authored: String = std::iter::once("# hand-authored, keep me\n".to_string())
+            .chain(
+                std::fs::read_to_string(&manifest_path)
+                    .unwrap()
+                    .lines()
+                    .filter(|line| !line.starts_with("execution_mode"))
+                    .map(|line| format!("{line}\n")),
+            )
+            .collect();
+        std::fs::write(&manifest_path, &hand_authored).unwrap();
+        let md_before =
+            std::fs::read_to_string(dir.path().join("authoring").join("SOP.md")).unwrap();
+
+        rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(dir.path().join("renamed").join("SOP.toml")).unwrap();
+        assert_eq!(
+            after,
+            hand_authored.replace("name = \"authoring\"", "name = \"renamed\""),
+            "the name value is the only byte a rename is allowed to change"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("renamed").join("SOP.md")).unwrap(),
+            md_before,
+            "SOP.md carries no identity, so a rename must not rewrite it"
+        );
+    }
+
+    #[test]
+    fn rename_sop_rejects_a_collision_and_touches_neither_sop() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut alpha = authoring_sop(vec![titled_step(1, "First")]);
+        alpha.name = "alpha".into();
+        save_sop(dir.path(), &alpha).unwrap();
+        let mut beta = authoring_sop(vec![titled_step(1, "Other")]);
+        beta.name = "beta".into();
+        save_sop(dir.path(), &beta).unwrap();
+
+        let alpha_before =
+            std::fs::read_to_string(dir.path().join("alpha").join("SOP.toml")).unwrap();
+        let beta_before =
+            std::fs::read_to_string(dir.path().join("beta").join("SOP.toml")).unwrap();
+
+        let err = rename_sop_typed(dir.path(), "alpha", "beta", SopExecutionMode::Supervised)
+            .expect_err("renaming onto an existing SOP must be refused, not merged");
+        assert!(
+            matches!(&err, SopAuthorError::AlreadyExists(name) if name == "beta"),
+            "{err:?}"
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("alpha").join("SOP.toml")).unwrap(),
+            alpha_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("beta").join("SOP.toml")).unwrap(),
+            beta_before
+        );
+        assert_eq!(
+            load_sop_by_name(dir.path(), "beta", SopExecutionMode::Supervised)
+                .unwrap()
+                .steps[0]
+                .title,
+            "Other",
+            "the SOP that owns the name keeps its own steps"
+        );
+    }
+
+    #[test]
+    fn rename_sop_rejects_path_traversal_in_either_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        let hostile = [
+            "../escape",
+            "..",
+            ".",
+            "/etc/shadow",
+            "a/b",
+            "a\\b",
+            "../../etc/cron.d/evil",
+            "",
+        ];
+        for name in hostile {
+            assert!(
+                rename_sop_typed(dir.path(), "authoring", name, SopExecutionMode::Supervised)
+                    .is_err(),
+                "rename target must reject {name:?}"
+            );
+            assert!(
+                rename_sop_typed(dir.path(), name, "authoring", SopExecutionMode::Supervised)
+                    .is_err(),
+                "rename source must reject {name:?}"
+            );
+        }
+        let escape = dir.path().parent().unwrap().join("escape");
+        assert!(!escape.exists(), "no rename may land outside the SOP root");
+        assert!(
+            load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).is_ok(),
+            "a rejected rename leaves the SOP exactly where it was"
+        );
+    }
+
+    #[test]
+    fn rename_sop_rejects_an_unknown_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = rename_sop_typed(
+            dir.path(),
+            "missing",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .expect_err("renaming a SOP that does not exist must be refused");
+        assert!(
+            matches!(&err, SopAuthorError::NotFound(name) if name == "missing"),
+            "{err:?}"
+        );
+        assert!(!dir.path().join("renamed").exists());
+    }
+
+    #[test]
+    fn rename_sop_rejects_renaming_to_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        let err = rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "authoring",
+            SopExecutionMode::Supervised,
+        )
+        .expect_err("a no-op rename is a caller mistake, not a silent success");
+        assert!(err.to_string().contains("already named"), "{err}");
+        assert!(load_sop_by_name(dir.path(), "authoring", SopExecutionMode::Supervised).is_ok());
+    }
+
+    #[test]
+    fn rename_sop_applies_strict_save_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = titled_step(1, "First");
+        first.routing.next = Some(2);
+        let sop = authoring_sop(vec![first, titled_step(2, "Second")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        // Route step 1 at a step that does not exist: the same blocking
+        // problem that stops `save_sop` writing a SOP in the first place.
+        let md_path = dir.path().join("authoring").join("SOP.md");
+        let broken = std::fs::read_to_string(&md_path)
+            .unwrap()
+            .replace("next: 2", "next: 99");
+        std::fs::write(&md_path, broken).unwrap();
+
+        let err = rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .expect_err("a rename must not smuggle a SOP strict save would reject onto disk");
+        assert!(err.to_string().contains("SOP rejected"), "{err}");
+        assert!(
+            !dir.path().join("renamed").exists(),
+            "nothing moves when validation fails"
+        );
+        assert!(dir.path().join("authoring").exists());
+    }
+
+    #[test]
+    fn rename_sop_keeps_a_trailing_comment_on_the_name_line() {
+        // The name line is the one line a rename edits, so it is the line most
+        // at risk of losing its decoration. Swapping the whole TOML item would
+        // drop the comment; only the string may change.
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        let manifest_path = dir.path().join("authoring").join("SOP.toml");
+        let annotated = std::fs::read_to_string(&manifest_path).unwrap().replace(
+            "name = \"authoring\"",
+            "name = \"authoring\" # operator note, keep me",
+        );
+        std::fs::write(&manifest_path, &annotated).unwrap();
+
+        rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .unwrap();
+
+        let after = std::fs::read_to_string(dir.path().join("renamed").join("SOP.toml")).unwrap();
+        assert!(
+            after.contains("name = \"renamed\" # operator note, keep me"),
+            "the comment on the renamed line must survive: {after}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_sop_preserves_the_manifest_file_mode() {
+        // The manifest is replaced by renaming a fresh file over it, which
+        // would otherwise hand it whatever mode the umask dictates and widen a
+        // deliberately tight one.
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        let manifest_path = dir.path().join("authoring").join("SOP.toml");
+        std::fs::set_permissions(&manifest_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .unwrap();
+
+        let mode = std::fs::metadata(dir.path().join("renamed").join("SOP.toml"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "a rename must not widen the manifest's mode");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_sop_does_not_write_through_a_planted_staging_symlink() {
+        // A predictable staging name (`.SOP.toml.tmp`) would be followed and
+        // its target truncated. Staging under an unpredictable, exclusively
+        // created name means a planted link is simply never opened.
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+
+        let outside = dir.path().join("outside-victim");
+        std::fs::write(&outside, "do not truncate me").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join("authoring/.SOP.toml.tmp")).unwrap();
+
+        rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&outside).unwrap(),
+            "do not truncate me",
+            "the staging write must not follow a planted symlink"
+        );
+        let after = std::fs::read_to_string(dir.path().join("renamed").join("SOP.toml")).unwrap();
+        assert!(after.contains("name = \"renamed\""), "{after}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rename_sop_rolls_back_the_manifest_when_the_move_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let sop = authoring_sop(vec![titled_step(1, "First")]);
+        save_sop(dir.path(), &sop).unwrap();
+        let before =
+            std::fs::read_to_string(dir.path().join("authoring").join("SOP.toml")).unwrap();
+
+        // Deny the move (renaming a directory needs write on its parent) while
+        // leaving the SOP's own directory writable, so the manifest rewrite
+        // lands and only the commit step fails.
+        let root_perms = std::fs::metadata(dir.path()).unwrap().permissions();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        let probe = dir.path().join(".write-probe");
+        if std::fs::File::create(&probe).is_ok() {
+            // Running as root, where the mode bits above are advisory. The
+            // rollback path is unreachable here; leave it to a non-root run.
+            let _ = std::fs::remove_file(&probe);
+            std::fs::set_permissions(dir.path(), root_perms).unwrap();
+            return;
+        }
+        let err = rename_sop_typed(
+            dir.path(),
+            "authoring",
+            "renamed",
+            SopExecutionMode::Supervised,
+        )
+        .expect_err("a move that cannot happen must not report success");
+        std::fs::set_permissions(dir.path(), root_perms).unwrap();
+
+        assert!(
+            matches!(err, SopAuthorError::Io(_)),
+            "a failed move is a filesystem failure, not a bad request: {err:?}"
+        );
+        assert!(err.to_string().contains("failed to move"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("authoring").join("SOP.toml")).unwrap(),
+            before,
+            "the manifest goes back to the name the SOP still answers to on disk"
+        );
+        assert!(!dir.path().join("renamed").exists());
     }
 
     #[test]
