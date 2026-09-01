@@ -120,6 +120,47 @@ Notes:
 - Only set `api_key` / `uri` on `[providers.models.openai.<alias>]` when intentionally targeting a custom OpenAI-compatible gateway or endpoint.
 - If you see `provider streaming failed, falling back to non-streaming chat`, ZeroClaw retries the same request in non-streaming mode. Check `zeroclaw auth status` before changing provider config.
 
+- > ### 🛠️ Visual Config Console
+> Don't want to manually edit TOML?
+>
+> **[Open the ZeroClaw Config Console →](https://YOUR-URL/config-console.html)**
+>
+> Create and edit `config.toml` visually, preview the generated configuration,
+> create backups, and export it directly to your ZeroClaw installation.
+>
+> ## Config Console
+
+ZeroClaw includes a browser-based configuration console for creating and
+editing your `config.toml` without manually editing TOML.
+
+**[Open ZeroClaw Config Console](https://YOUR-URL/zeroclaw-config-ui.html)**
+
+The Config Console can:
+
+- Load an existing `~/.zeroclaw/config.toml`
+- Edit ZeroClaw settings through a visual interface
+- Configure providers, models, agents, channels, tools, memory, cron,
+  security and other subsystems
+- Preview the generated `config.toml` live
+- Create a timestamped backup before replacing the configuration
+- Download the backup and generated configuration
+- Copy the generated TOML directly to the clipboard
+- Validate the generated configuration with `zeroclaw doctor`
+
+### Using it on a Raspberry Pi
+
+1. Open the Config Console in Chromium on the Pi.
+2. Select **`~/.zeroclaw`** when prompted.
+3. Load your existing `config.toml`.
+4. Edit the required settings.
+5. Review the generated TOML.
+6. Export the configuration.
+7. Run:
+
+```bash
+zeroclaw doctor
+sudo systemctl restart zeroclaw
+
 ## Architecture
 
 ```
