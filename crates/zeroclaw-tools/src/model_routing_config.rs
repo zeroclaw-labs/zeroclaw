@@ -59,6 +59,9 @@ impl ModelRoutingConfigTool {
             })?;
         parsed.config_path = self.config.config_path.clone();
         parsed.data_dir = self.config.data_dir.clone();
+        // This value was parsed from the file at `config_path`; it holds
+        // save-over provenance for the guard in `Config::save`.
+        parsed.loaded_from = Some(parsed.config_path.clone());
         Ok(parsed)
     }
 

@@ -2400,7 +2400,7 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
             }
 
             // Re-read into memory so subsequent requests see the migrated state.
-            let new_cfg: zeroclaw_config::schema::Config = match toml::from_str(&new_content) {
+            let mut new_cfg: zeroclaw_config::schema::Config = match toml::from_str(&new_content) {
                 Ok(c) => c,
                 Err(e) => {
                     return error_response(ConfigApiError::new(
@@ -2409,6 +2409,11 @@ pub async fn handle_migrate(State(state): State<AppState>, headers: HeaderMap) -
                     ));
                 }
             };
+            // serde skips the path fields, so restore the concrete path and
+            // record save provenance: this handler just wrote `config_path`,
+            // and the shared value's later full saves must keep save rights.
+            new_cfg.config_path = config_path.clone();
+            new_cfg.loaded_from = Some(config_path.clone());
             *state.config.write() = new_cfg;
 
             axum::Json(MigrateResponse {
