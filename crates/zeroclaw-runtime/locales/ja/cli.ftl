@@ -1003,6 +1003,7 @@ channel-telegram-approval-ack-approved = 承認しました
 channel-telegram-approval-ack-always-approved = 常に承認しました
 channel-telegram-approval-ack-denied = 拒否しました
 channel-telegram-approval-ack-unknown = 不明な操作です
+channel-telegram-approval-ack-already-resolved = 承認はすでに処理済みです
 channel-discord-approval-btn-allow-once = 今回のみ許可
 channel-discord-approval-btn-allow-session = このセッションのみ許可
 channel-discord-approval-btn-allow-always = 常に許可

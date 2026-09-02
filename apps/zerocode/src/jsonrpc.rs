@@ -124,26 +124,33 @@ pub const ACP_PROTOCOL_VERSION: u64 = 1;
 
 type PendingResponder = oneshot::Sender<std::result::Result<Value, JsonRpcError>>;
 
+#[derive(Debug, Default)]
+struct OutboundState {
+    pending: HashMap<String, PendingResponder>,
+    closed_error: Option<JsonRpcError>,
+}
+
 /// Writer + outbound-call tracker shared between the read loop and
 /// the calling tasks. All writes go through `writer_tx` so concurrent
 /// notifications and outbound requests cannot interleave bytes.
 #[derive(Debug)]
 pub struct RpcOutbound {
     writer_tx: mpsc::Sender<String>,
-    pending: std::sync::Mutex<HashMap<String, PendingResponder>>,
+    state: std::sync::Mutex<OutboundState>,
     next_id: AtomicU64,
 }
 
 struct PendingRequestGuard<'a> {
-    pending: &'a std::sync::Mutex<HashMap<String, PendingResponder>>,
+    state: &'a std::sync::Mutex<OutboundState>,
     id: String,
 }
 
 impl Drop for PendingRequestGuard<'_> {
     fn drop(&mut self) {
-        self.pending
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .pending
             .remove(&self.id);
     }
 }
@@ -152,7 +159,7 @@ impl RpcOutbound {
     pub fn new(writer_tx: mpsc::Sender<String>) -> Self {
         Self {
             writer_tx,
-            pending: std::sync::Mutex::new(HashMap::new()),
+            state: std::sync::Mutex::new(OutboundState::default()),
             next_id: AtomicU64::new(0),
         }
     }
@@ -198,11 +205,14 @@ impl RpcOutbound {
         let id = format!("{OUTBOUND_ID_PREFIX}{n}");
         let (tx, rx) = oneshot::channel();
         {
-            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-            pending.insert(id.clone(), tx);
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(error) = &state.closed_error {
+                return Err(error.clone());
+            }
+            state.pending.insert(id.clone(), tx);
         }
         let _pending_guard = PendingRequestGuard {
-            pending: &self.pending,
+            state: &self.state,
             id: id.clone(),
         };
         let req = JsonRpcRequest::new(method, params, Value::String(id));
@@ -239,9 +249,10 @@ impl RpcOutbound {
         error: Option<JsonRpcError>,
     ) {
         let responder = self
-            .pending
+            .state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .pending
             .remove(id_str);
         if let Some(tx) = responder {
             let payload = if let Some(err) = error {
@@ -253,7 +264,31 @@ impl RpcOutbound {
         }
     }
 
+    /// Close request admission and fail every request still awaiting a response
+    /// when the owning transport terminates. Responders are woken after release.
+    pub fn fail_pending(&self, message: &str) {
+        let (responders, error) = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let error = state
+                .closed_error
+                .get_or_insert_with(|| JsonRpcError {
+                    code: error_codes::INTERNAL_ERROR,
+                    message: message.to_string(),
+                    data: None,
+                })
+                .clone();
+            (std::mem::take(&mut state.pending), error)
+        };
+        for (_, responder) in responders {
+            let _ = responder.send(Err(error.clone()));
+        }
+    }
+
     pub fn pending_count(&self) -> usize {
-        self.pending.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .len()
     }
 }

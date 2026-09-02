@@ -68,15 +68,37 @@ macro_rules! keyactions {
             /// Bindings after applying any runtime override for `TAG`;
             /// falls back to the compile-time table when none is active.
             /// Sparse: an un-overridden variant keeps its default chords.
+            ///
+            /// An explicitly bound chord outranks a merely retained default,
+            /// whichever action declares it first. Without that, shipping a new
+            /// default chord would silently take a chord the operator had
+            /// already assigned elsewhere, because dispatch takes the first
+            /// match in declaration order.
+            ///
+            /// The claim is tested with `Chord::same_key`, not `==`: dispatch
+            /// compares platform-normalised modifiers, so on darwin an explicit
+            /// `super+a` and a retained `ctrl+a` are one chord there and two
+            /// here. Raw equality left the shadowed default in the table and
+            /// the operator's own binding lost to it.
             pub fn resolved_bindings() -> Vec<(Chord, $name)> {
                 let Some(over) = super::overrides::lookup(Self::TAG) else {
                     return Self::bindings();
                 };
+                let claimed: Vec<Chord> = Self::variants()
+                    .iter()
+                    .filter_map(|v| over.get(&v.variant_name()))
+                    .flatten()
+                    .cloned()
+                    .collect();
                 let mut out: Vec<(Chord, $name)> = Vec::new();
                 for v in Self::variants() {
                     let chords = match over.get(&v.variant_name()) {
                         Some(cs) => cs.clone(),
-                        None => v.default_chords(),
+                        None => v
+                            .default_chords()
+                            .into_iter()
+                            .filter(|c| !claimed.iter().any(|k| k.same_key(c)))
+                            .collect(),
                     };
                     for c in chords {
                         out.push((c, *v));
@@ -136,8 +158,8 @@ keyactions! {
         ScrollDown              [] => "scroll down",
         PageUp                  [Chord::key(KeyCode::PageUp)] => "page up",
         PageDown                [Chord::key(KeyCode::PageDown)] => "page down",
-        JumpStart               [Chord::char('g')] => "jump to start",
-        JumpEnd                 [Chord::char('G')] => "jump to end",
+        JumpStart               [Chord::char('g'), Chord::with(KeyCode::Home, KeyModifiers::CONTROL)] => "jump to start",
+        JumpEnd                 [Chord::char('G'), Chord::with(KeyCode::End, KeyModifiers::CONTROL)] => "jump to end",
         // Use alt+shift+up/down to avoid macOS Mission Control conflict (ctrl+up/down)
         // and queue navigation conflict (alt+up/down).
         BrowseEnter             [
@@ -335,7 +357,7 @@ keyactions! {
         CursorEnd          [Chord::key(KeyCode::End), Chord::ctrl('e')] => "line end",
         OpenFileBrowser    [Chord::ctrl('a')] => "browse files",
         Backspace          [Chord::key(KeyCode::Backspace)] => "backspace",
-        DeletePreviousWord [Chord::ctrl('w')] => "delete previous word",
+        DeletePreviousWord [Chord::ctrl('w'), Chord::with(KeyCode::Backspace, KeyModifiers::ALT)] => "delete previous word",
         ClearInput         [Chord::ctrl('u')] => "clear input",
         SelectAll          [] => "select all",
         Paste              [Chord::ctrl('v')] => "paste",
@@ -445,6 +467,33 @@ mod tests {
         assert_eq!(
             LogsTabAction::from_chord(&terminal_copy),
             Some(LogsTabAction::CopySelection)
+        );
+    }
+
+    #[test]
+    fn long_transcript_navigation_chords_preserve_plain_input_home_and_end() {
+        let home = KeyEvent::new(KeyCode::Home, KeyModifiers::NONE);
+        let end = KeyEvent::new(KeyCode::End, KeyModifiers::NONE);
+        let ctrl_home = KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL);
+        let ctrl_end = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
+
+        assert_eq!(
+            InputBarAction::from_chord(&home),
+            Some(InputBarAction::CursorStart)
+        );
+        assert_eq!(
+            InputBarAction::from_chord(&end),
+            Some(InputBarAction::CursorEnd)
+        );
+        assert_eq!(InputBarAction::from_chord(&ctrl_home), None);
+        assert_eq!(InputBarAction::from_chord(&ctrl_end), None);
+        assert_eq!(
+            ChatTabAction::from_chord(&ctrl_home),
+            Some(ChatTabAction::JumpStart)
+        );
+        assert_eq!(
+            ChatTabAction::from_chord(&ctrl_end),
+            Some(ChatTabAction::JumpEnd)
         );
     }
 }

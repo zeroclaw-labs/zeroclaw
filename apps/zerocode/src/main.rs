@@ -21,6 +21,7 @@ mod app;
 mod attachment;
 mod chat;
 mod client;
+mod client_crypto;
 mod clipboard;
 mod color_depth;
 mod config;
@@ -30,6 +31,7 @@ mod diff;
 mod display_width;
 mod doctor;
 mod editor;
+mod enroll;
 mod file_explorer;
 mod help;
 mod i18n;
@@ -39,6 +41,7 @@ mod keymap;
 mod logs;
 mod mouse;
 mod quickstart_pane;
+mod relay_proto;
 mod sop_pane;
 mod terminal_backend;
 #[cfg(test)]
@@ -115,12 +118,213 @@ struct Cli {
     /// Required for self-signed certificates. Only used with --connect.
     #[arg(long)]
     tls_skip_verify: bool,
+
+    /// PEM CA certificate to verify the daemon (mutual TLS). Only used with --connect.
+    #[arg(long)]
+    tls_ca_cert: Option<String>,
+
+    /// PEM client certificate to present to the daemon (mutual TLS).
+    #[arg(long, requires = "tls_client_key")]
+    tls_client_cert: Option<String>,
+
+    /// PEM client private key for --tls-client-cert.
+    #[arg(long, requires = "tls_client_cert")]
+    tls_client_key: Option<String>,
+
+    /// Reach the daemon through a nominated relay at this `host:port`
+    /// (instead of connecting to --connect directly). Requires --relay-node.
+    #[arg(long, requires = "relay_node")]
+    relay: Option<String>,
+
+    /// Node-id of the target daemon to request from the relay.
+    #[arg(long, requires = "relay")]
+    relay_node: Option<String>,
+
+    /// PEM CA to trust for the relay's OWN (outer) certificate. Without it the
+    /// built-in public roots are used (for a relay with a public-CA cert).
+    #[arg(long)]
+    relay_ca: Option<String>,
+
+    /// Server name to expect on the relay's outer certificate. Defaults to the
+    /// host portion of --relay.
+    #[arg(long)]
+    relay_host: Option<String>,
+
+    /// Skip verification of the relay's outer certificate (self-signed dev only).
+    #[arg(long)]
+    relay_insecure: bool,
+
+    /// Pin the relay's OUTER leaf certificate to this SHA-256 fingerprint (hex).
+    /// Overrides --relay-ca / public roots. Usually delivered automatically at
+    /// enrollment; pass it to pin a manually configured relay.
+    #[arg(long)]
+    relay_pin: Option<String>,
+
+    /// Trust the relay's outer certificate on first use and remember its pin (for
+    /// a self-hosted relay without enrollment). Opt-in; a known pin takes priority.
+    #[arg(long)]
+    relay_tofu: bool,
+
+    /// PEM client certificate to present to the relay on the OUTER TLS layer
+    /// (outer-mTLS variant), for a relay that requires outer client auth. Separate
+    /// from --tls-client-cert (the inner mTLS to the daemon).
+    #[arg(long, requires = "relay_client_key")]
+    relay_client_cert: Option<String>,
+
+    /// PEM private key for --relay-client-cert.
+    #[arg(long, requires = "relay_client_cert")]
+    relay_client_key: Option<String>,
+
+    /// Enroll for a client certificate before connecting: prompt for the daemon
+    /// pairing code, generate a key + CSR locally, fetch the signed cert, and
+    /// cache it under <config-dir>/tls. The host defaults to --connect's host; the
+    /// port defaults to the daemon's enrollment port (9782).
+    #[arg(long)]
+    enroll: bool,
+
+    /// Host of the daemon enrollment endpoint (defaults to --connect's host).
+    #[arg(long)]
+    enroll_host: Option<String>,
+
+    /// Port of the daemon enrollment endpoint (default 9782).
+    #[arg(long)]
+    enroll_port: Option<u16>,
+}
+
+/// Map an empty path string to `None`.
+fn opt_path(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Which transport leg a live connection is actually using. Tracked so the
+/// re-probe timer knows whether to attempt a migration back to the direct path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveLeg {
+    Local,
+    WssDirect,
+    WssRelay,
+}
+
+/// A WSS route that may have BOTH a directly-reachable daemon address and a
+/// relay. Connecting prefers the direct path and falls back to the relay tunnel;
+/// once on the relay, a background timer re-probes the direct path and migrates
+/// back when it returns.
+pub(crate) struct WssRoute {
+    /// The directly-reachable daemon address (`--connect` / `[wss].uri`). `None`
+    /// in relay-only mode, where the daemon is reached solely through the relay.
+    pub(crate) direct_url: Option<String>,
+    /// Inner WSS URL used over a relay tunnel: the daemon's loopback SAN (the
+    /// inner mTLS terminates at the daemon, the relay only forwards ciphertext).
+    pub(crate) relay_inner_url: String,
+    /// Relay coordinates, when a relay route is available.
+    pub(crate) relay: Option<client::RelayDial>,
+    /// TLS verification + mutual-TLS client identity, shared by both legs.
+    pub(crate) tls: client::ClientTls,
+    /// How many direct attempts before falling back to the relay (min 1).
+    pub(crate) direct_attempts: u32,
+    /// Per-attempt direct-connect timeout, in seconds (min 1).
+    pub(crate) direct_timeout_secs: u64,
+    /// Re-probe cadence while on the relay leg, in seconds (0 disables).
+    pub(crate) reprobe_secs: u64,
+}
+
+impl WssRoute {
+    /// The key under which an insecure (`skip_verify`) route is remembered: the
+    /// direct address when present, else the inner relay URL.
+    fn ack_key(&self) -> String {
+        self.direct_url
+            .clone()
+            .unwrap_or_else(|| self.relay_inner_url.clone())
+    }
+
+    /// Connect preferring the direct path: try the direct address for a bounded
+    /// number of attempts, then fall back to the relay tunnel. A relay-only route
+    /// (no direct address) dials the relay immediately.
+    async fn connect_preferred(
+        &self,
+        prev_id: Option<&str>,
+        prev_sig: Option<&str>,
+    ) -> anyhow::Result<(client::RpcClient, ActiveLeg)> {
+        if let Some(url) = &self.direct_url {
+            let mut last_err: Option<anyhow::Error> = None;
+            for _ in 0..self.direct_attempts.max(1) {
+                let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+                match tokio::time::timeout(
+                    Duration::from_secs(self.direct_timeout_secs.max(1)),
+                    fut,
+                )
+                .await
+                {
+                    Ok(Ok(client)) => return Ok((client, ActiveLeg::WssDirect)),
+                    Ok(Err(e)) => last_err = Some(e),
+                    Err(_) => {
+                        last_err = Some(anyhow::Error::msg(format!(
+                            "direct connect to {url} timed out after {}s",
+                            self.direct_timeout_secs.max(1)
+                        )))
+                    }
+                }
+            }
+            // Direct exhausted: fall back to the relay when one is available.
+            if let Some(relay) = &self.relay {
+                let client = client::RpcClient::connect_wss_via_relay(
+                    &self.relay_inner_url,
+                    prev_id,
+                    prev_sig,
+                    &self.tls,
+                    relay,
+                )
+                .await?;
+                return Ok((client, ActiveLeg::WssRelay));
+            }
+            return Err(last_err
+                .unwrap_or_else(|| anyhow::Error::msg(format!("direct connect to {url} failed"))));
+        }
+
+        // Relay-only route.
+        let relay = self.relay.as_ref().ok_or_else(|| {
+            anyhow::Error::msg("WSS route has neither a direct address nor a relay")
+        })?;
+        let client = client::RpcClient::connect_wss_via_relay(
+            &self.relay_inner_url,
+            prev_id,
+            prev_sig,
+            &self.tls,
+            relay,
+        )
+        .await?;
+        Ok((client, ActiveLeg::WssRelay))
+    }
+
+    /// A single direct-only connect attempt (no relay fallback), used by the
+    /// re-probe timer to migrate back to the direct path. Errors when the route
+    /// has no direct address.
+    pub(crate) async fn connect_direct(
+        &self,
+        prev_id: Option<&str>,
+        prev_sig: Option<&str>,
+    ) -> anyhow::Result<client::RpcClient> {
+        let url = self
+            .direct_url
+            .as_ref()
+            .ok_or_else(|| anyhow::Error::msg("no direct address to re-probe"))?;
+        let fut = client::RpcClient::connect_wss_direct(url, prev_id, prev_sig, &self.tls);
+        match tokio::time::timeout(Duration::from_secs(self.direct_timeout_secs.max(1)), fut).await
+        {
+            Ok(r) => r,
+            Err(_) => Err(anyhow::Error::msg(format!(
+                "direct re-probe to {url} timed out"
+            ))),
+        }
+    }
 }
 
 /// Where zerocode should connect.
 pub(crate) enum ConnectTarget {
     LocalSocket(PathBuf),
-    Wss { url: String, skip_verify: bool },
+    // Boxed: `WssRoute` is much larger than the local-socket variant.
+    Wss(Box<WssRoute>),
 }
 
 impl ConnectTarget {
@@ -128,48 +332,201 @@ impl ConnectTarget {
     pub(crate) fn label(&self) -> String {
         match self {
             Self::LocalSocket(p) => format!("local:{}", p.display()),
-            Self::Wss { url, .. } => url.clone(),
+            Self::Wss(route) => match (&route.direct_url, &route.relay) {
+                (Some(url), Some(r)) => format!("{url} (relay {} fallback)", r.relay_addr),
+                (Some(url), None) => url.clone(),
+                (None, Some(r)) => format!("relay {} -> {}", r.relay_addr, r.node_id),
+                (None, None) => "wss".to_string(),
+            },
         }
     }
 
     pub(crate) fn insecure_tls(&self) -> bool {
-        matches!(
-            self,
-            Self::Wss {
-                skip_verify: true,
-                ..
-            }
-        )
+        matches!(self, Self::Wss(route) if route.tls.skip_verify)
     }
 
     /// Connect to this target, reclaiming a prior TUI identity when
     /// `prev_id`/`prev_sig` are supplied. Single source of truth for the
     /// per-transport connect call — used by initial startup and in-loop
-    /// reconnection alike.
+    /// reconnection alike. Returns the leg the connection actually landed on.
     pub(crate) async fn connect(
         &self,
         prev_id: Option<&str>,
         prev_sig: Option<&str>,
-    ) -> anyhow::Result<client::RpcClient> {
+    ) -> anyhow::Result<(client::RpcClient, ActiveLeg)> {
         match self {
             Self::LocalSocket(socket) => {
-                client::RpcClient::connect(socket, prev_id, prev_sig).await
+                let client = client::RpcClient::connect(socket, prev_id, prev_sig).await?;
+                Ok((client, ActiveLeg::Local))
             }
-            Self::Wss { url, skip_verify } => {
-                client::RpcClient::connect_wss(url, prev_id, prev_sig, *skip_verify).await
-            }
+            Self::Wss(route) => route.connect_preferred(prev_id, prev_sig).await,
         }
     }
 }
 
-fn resolve_wss_target(
-    cli_connect: Option<String>,
-    cli_skip_verify: bool,
+/// In relay mode the inner WSS terminates at the daemon's own loopback listener
+/// (the relay tunnels to it), so the inner server name is always the daemon's
+/// self-SAN `127.0.0.1` and the port is cosmetic. When `--connect` is omitted on
+/// a relay route we default to this so the common case is just `--relay`.
+const DEFAULT_RELAY_INNER_URL: &str = "wss://127.0.0.1:9781";
+
+/// Direct-first fallback defaults (overridable via `[connection.wss]`): try the
+/// direct address this many times, with this per-attempt timeout, before falling
+/// back to the relay; while on the relay, re-probe the direct path this often.
+const DEFAULT_DIRECT_ATTEMPTS: u32 = 2;
+const DEFAULT_DIRECT_TIMEOUT_SECS: u64 = 3;
+const DEFAULT_REPROBE_SECS: u64 = 30;
+
+/// The directly-reachable daemon address: CLI `--connect` overrides `[wss].uri`.
+/// `None` means no direct address is configured (relay-only or local socket).
+fn resolve_direct_url(cli_connect: Option<String>, cfg_wss: &config::WssSection) -> Option<String> {
+    cli_connect.or_else(|| cfg_wss.uri.clone())
+}
+
+/// Server verification is skipped when either the flag or the config asks.
+fn resolve_skip_verify(cli_skip_verify: bool, cfg_wss: &config::WssSection) -> bool {
+    cli_skip_verify || cfg_wss.tls.skip_verify
+}
+
+fn should_enroll_via_relay(cli: &Cli, cfg_wss: &config::WssSection, relay_available: bool) -> bool {
+    relay_available
+        && cli.enroll_host.is_none()
+        && cli.enroll_port.is_none()
+        && (cli.relay.is_some() || (cli.connect.is_none() && cfg_wss.uri.is_none()))
+}
+
+async fn resolve_relay_dial(
+    cli: &Cli,
     cfg_wss: &config::WssSection,
-) -> Option<(String, bool)> {
-    let uri = cli_connect.or_else(|| cfg_wss.uri.clone())?;
-    let skip_verify = cli_skip_verify || cfg_wss.tls.skip_verify;
-    Some((uri, skip_verify))
+    cached_relay: Option<&enroll::RelayProfile>,
+    config_dir: &std::path::Path,
+) -> anyhow::Result<Option<client::RelayDial>> {
+    // Relay coordinates: CLI -> config -> cached enrollment profile.
+    let relay_addr = cli
+        .relay
+        .clone()
+        .or_else(|| cfg_wss.relay_url.clone())
+        .or_else(|| {
+            cached_relay
+                .map(|r| r.relay_url.clone())
+                .filter(|s| !s.is_empty())
+        });
+    let relay_node = cli
+        .relay_node
+        .clone()
+        .or_else(|| cfg_wss.relay_node.clone())
+        .or_else(|| {
+            cached_relay
+                .map(|r| r.node_id.clone())
+                .filter(|s| !s.is_empty())
+        });
+
+    // Relay outer-leaf pin candidates: --relay-pin -> the enrollment-delivered
+    // pin -> a previously TOFU'd pin. The TLS connector ignores these candidates
+    // when --relay-ca is set.
+    let pin_store = config_dir.join("relay").join("relay_pin");
+    let relay_pin = cli
+        .relay_pin
+        .clone()
+        .or_else(|| {
+            cached_relay
+                .map(|r| r.relay_cert_pin.clone())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::fs::read_to_string(&pin_store)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+
+    match (relay_addr, relay_node) {
+        (Some(relay_addr), Some(node_id)) => {
+            // Default the relay's expected cert name to its host:port host.
+            let relay_host = cli.relay_host.clone().unwrap_or_else(|| {
+                relay_addr
+                    .rsplit_once(':')
+                    .map(|(h, _)| h.to_string())
+                    .unwrap_or_else(|| relay_addr.clone())
+            });
+            // Resolve the relay outer-cert trust: explicit trust settings skip
+            // the prompt; otherwise offer interactive trust-on-first-use instead
+            // of a bare UnknownIssuer at connect/enrollment time.
+            let relay_pin =
+                resolve_relay_trust(relay_pin, &relay_addr, &relay_host, cli, &pin_store).await?;
+            Ok(Some(client::RelayDial {
+                relay_addr,
+                relay_host,
+                node_id,
+                relay_ca_path: cli.relay_ca.clone(),
+                relay_insecure: cli.relay_insecure,
+                relay_pin,
+                relay_tofu: cli.relay_tofu,
+                pin_store: Some(pin_store),
+                outer_client_cert: cli.relay_client_cert.clone(),
+                outer_client_key: cli.relay_client_key.clone(),
+            }))
+        }
+        (None, None) => Ok(None),
+        _ => Err(anyhow::Error::msg(
+            "relay routing needs both a relay address and a node-id \
+             (--relay + --relay-node, or wss.relay_url + wss.relay_node)",
+        )),
+    }
+}
+
+/// The credential facts every startup decision reads: the cached enrollment
+/// profile (device id, renewal deadline, relay coordinates) and whether a client
+/// certificate exists at all.
+#[derive(Debug)]
+struct CredentialStartup {
+    profile: Option<enroll::CachedProfile>,
+    certless: bool,
+}
+
+/// Recover an interrupted credential publication, VALIDATE the published
+/// generation, THEN read the credential facts. The order is the contract: a
+/// publication interrupted mid-rename has a new certificate beside an old
+/// profile, so a read taken first reports stale relay coordinates or an absent
+/// certificate that re-runs enrollment. A recovery that cannot reassemble the
+/// generation is fatal here, because every route that follows would otherwise
+/// dial with a mixed certificate/key set.
+///
+/// Validation runs second and covers the case recovery cannot see: a crash whose
+/// marker did not survive, which leaves a mixed set with nothing pointing at it.
+/// It must not run first, because during the marker window the recorded
+/// generation is deliberately the previous one and recovery refreshes it.
+fn recover_then_read_credentials(
+    config_dir: &std::path::Path,
+    cli_client_cert: Option<&str>,
+    cfg_client_cert: &str,
+) -> anyhow::Result<CredentialStartup> {
+    enroll::recover_and_validate(config_dir)?;
+    Ok(CredentialStartup {
+        profile: enroll::cached_profile(config_dir),
+        certless: enroll::is_certless(config_dir, cli_client_cert, cfg_client_cert),
+    })
+}
+
+/// A default client-TLS file under `<config_dir>/tls/<name>`, if it exists, so a
+/// client provisioned the conventional way needs no explicit `--tls-*` flags.
+fn default_tls_path(config_dir: &std::path::Path, name: &str) -> Option<String> {
+    let p = config_dir.join("tls").join(name);
+    p.exists().then(|| p.to_string_lossy().into_owned())
+}
+
+/// Parse the host out of a `--connect` / `[wss].uri` value (`wss://host:port`,
+/// `host:port`, or a bare `host`) for the enrollment endpoint. Naive for IPv6.
+fn enroll_host_from(uri: Option<&str>) -> Option<String> {
+    let uri = uri?.trim();
+    let s = uri
+        .strip_prefix("wss://")
+        // Parsing a scheme prefix off a user-supplied URI, not opening a socket.
+        .or_else(|| uri.strip_prefix("ws://")) // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
+        .unwrap_or(uri);
+    let s = s.split('/').next().unwrap_or(s);
+    let host = s.rsplit_once(':').map(|(h, _)| h).unwrap_or(s);
+    (!host.is_empty()).then(|| host.to_string())
 }
 
 #[tokio::main]
@@ -286,6 +643,93 @@ fn confirm_insecure_tls(url: &str) -> anyhow::Result<InsecureTlsChoice> {
     confirm_insecure_tls_with(stdin.lock(), &mut stderr, url)
 }
 
+/// Operator choice when a relay presents an untrusted OUTER certificate.
+#[derive(Debug, PartialEq, Eq)]
+enum RelayTrustChoice {
+    Trust,
+    Abort,
+}
+
+/// Prompt seam (testable): show the relay's leaf fingerprint and ask whether to
+/// trust + remember it. `reader`/`writer` are injected so the decision logic can
+/// be unit-tested without a real terminal.
+fn confirm_relay_cert_with<R: std::io::BufRead, W: std::io::Write>(
+    mut reader: R,
+    writer: &mut W,
+    relay_addr: &str,
+    fingerprint: &str,
+) -> anyhow::Result<RelayTrustChoice> {
+    writeln!(
+        writer,
+        "\nThe relay at {relay_addr} presented a certificate that is not yet trusted\n\
+         (self-signed or an unknown issuer). Its SHA-256 fingerprint is:\n\n  \
+         {fingerprint}\n\n\
+         Confirm this matches the value the relay operator published, out of band.\n\
+         Trusting it pins this leaf for future runs (under <config-dir>/relay). The\n\
+         relay only forwards encrypted traffic; the inner mutual TLS to the daemon is\n\
+         unaffected either way.\n\
+         [y] trust and remember this relay   [N] abort"
+    )?;
+    write!(writer, "Trust this relay certificate? [y/N] ")?;
+    writer.flush().ok();
+    let mut answer = String::new();
+    reader.read_line(&mut answer)?;
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Ok(RelayTrustChoice::Trust),
+        _ => Ok(RelayTrustChoice::Abort),
+    }
+}
+
+/// Production entry point: lock `stdin`, prompt on `stderr`.
+fn confirm_relay_cert(relay_addr: &str, fingerprint: &str) -> anyhow::Result<RelayTrustChoice> {
+    let stdin = std::io::stdin();
+    let mut stderr = std::io::stderr();
+    confirm_relay_cert_with(stdin.lock(), &mut stderr, relay_addr, fingerprint)
+}
+
+/// Resolve the relay's OUTER-certificate trust. When trust was set explicitly
+/// (`--relay-ca`/`--relay-pin`/`--relay-tofu`/`--relay-insecure`, or a remembered
+/// pin) it is used as-is. Otherwise, rather than failing the connect with a bare
+/// `UnknownIssuer`, fetch the relay leaf, show its fingerprint, and offer to trust
+/// and remember it (interactive only); a non-interactive run gets an actionable
+/// error pointing at the explicit flags.
+async fn resolve_relay_trust(
+    existing_pin: Option<String>,
+    relay_addr: &str,
+    relay_host: &str,
+    cli: &Cli,
+    pin_store: &std::path::Path,
+) -> anyhow::Result<Option<String>> {
+    use std::io::IsTerminal as _;
+    let explicit =
+        cli.relay_ca.is_some() || cli.relay_insecure || cli.relay_tofu || existing_pin.is_some();
+    if explicit {
+        return Ok(existing_pin);
+    }
+    if !std::io::stderr().is_terminal() {
+        return Err(anyhow::Error::msg(format!(
+            "the relay at {relay_addr} presents an untrusted certificate and no relay \
+             trust was configured. Pass --relay-ca <file>, --relay-pin <sha256>, or \
+             --relay-tofu (this run is non-interactive, so it cannot prompt)."
+        )));
+    }
+    let fp = match client::probe_relay_cert_pin(relay_addr, relay_host).await {
+        Ok(fp) => fp,
+        // Probe failed (relay unreachable etc.): let the normal connect surface it.
+        Err(_) => return Ok(existing_pin),
+    };
+    match confirm_relay_cert(relay_addr, &fp)? {
+        RelayTrustChoice::Trust => {
+            client::persist_relay_pin(pin_store, &fp);
+            eprintln!("Trusted the relay; pinned {fp} for future connections.");
+            Ok(Some(fp))
+        }
+        RelayTrustChoice::Abort => Err(anyhow::Error::msg(
+            "relay certificate not trusted; aborting.",
+        )),
+    }
+}
+
 #[cfg(unix)]
 fn prepare_wss_shutdown_signals(
     requires_confirmation: bool,
@@ -369,17 +813,112 @@ async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Enrollment: if a remote (WSS) connection is intended but no client cert is
+    // available, obtain one first (explicitly via --enroll, or automatically on an
+    // interactive --connect). The cert is cached under <config-dir>/tls, so the
+    // target block below picks it up with no --tls-* flags.
+    {
+        use std::io::IsTerminal as _;
+        let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+        let cfg_wss = &loaded_config.connection.wss;
+        // Recovery runs before the first credential read of the process, so no
+        // decision below observes a half-published generation.
+        let credentials = recover_then_read_credentials(
+            &config_dir,
+            cli.tls_client_cert.as_deref(),
+            &cfg_wss.tls.client_cert_path,
+        )?;
+        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay);
+        let relay = resolve_relay_dial(&cli, cfg_wss, cached_relay, &config_dir).await?;
+        let wss_intended = cli.connect.is_some()
+            || cfg_wss.uri.is_some()
+            || cli.relay.is_some()
+            || cfg_wss.relay_url.is_some();
+        let auto = wss_intended
+            && credentials.certless
+            && cli.connect.is_some()
+            && std::io::stderr().is_terminal();
+        if cli.enroll || auto {
+            if should_enroll_via_relay(&cli, cfg_wss, relay.is_some()) {
+                enroll::enroll_via_relay(
+                    relay.as_ref().expect("checked relay.is_some()"),
+                    &config_dir,
+                )
+                .await?;
+            } else {
+                let host = cli
+                    .enroll_host
+                    .clone()
+                    .or_else(|| enroll_host_from(cli.connect.as_deref()))
+                    .or_else(|| enroll_host_from(cfg_wss.uri.as_deref()))
+                    .ok_or_else(|| {
+                        anyhow::Error::msg(
+                            "enrollment needs a host: pass --enroll-host, --connect wss://<host>:<port>, or --relay with --relay-node",
+                        )
+                    })?;
+                let port = cli.enroll_port.unwrap_or(enroll::DEFAULT_ENROLL_PORT);
+                enroll::enroll(&host, port, &config_dir).await?;
+            }
+        }
+    }
+
     let target = {
         let cfg_wss = &loaded_config.connection.wss;
-        if let Some((uri, skip_verify)) =
-            resolve_wss_target(cli.connect.clone(), cli.tls_skip_verify, cfg_wss)
-        {
-            ConnectTarget::Wss {
-                url: uri,
+        let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
+        // The cached enrollment profile supplies the relay coordinates so a bare
+        // `zerocode` after enrollment still reaches the daemon through its relay.
+        // Enrollment above may have published a new generation, so recover and
+        // re-read here too rather than reusing the pre-enrollment facts. A
+        // recovery that cannot reassemble the generation aborts the run instead
+        // of resolving relay coordinates or TLS paths from a mixed set.
+        let credentials = recover_then_read_credentials(
+            &config_dir,
+            cli.tls_client_cert.as_deref(),
+            &cfg_wss.tls.client_cert_path,
+        )?;
+        let cached_relay = credentials.profile.as_ref().map(|p| &p.relay);
+
+        // Direct daemon address (CLI overrides config). `None` => relay-only.
+        let direct_url = resolve_direct_url(cli.connect.clone(), cfg_wss);
+        let skip_verify = resolve_skip_verify(cli.tls_skip_verify, cfg_wss);
+
+        let relay = resolve_relay_dial(&cli, cfg_wss, cached_relay, &config_dir).await?;
+
+        // A WSS route is chosen when a direct address OR a relay is available;
+        // otherwise the local IPC socket.
+        if direct_url.is_some() || relay.is_some() {
+            // Mutual-TLS material: CLI flag -> config -> conventional default path
+            // under <config_dir>/tls, so a provisioned client needs no --tls-* flags.
+            let tls = client::ClientTls {
                 skip_verify,
-            }
+                ca_cert_path: cli
+                    .tls_ca_cert
+                    .clone()
+                    .or_else(|| opt_path(&cfg_wss.tls.ca_cert_path))
+                    .or_else(|| default_tls_path(&config_dir, "ca.crt")),
+                client_cert_path: cli
+                    .tls_client_cert
+                    .clone()
+                    .or_else(|| opt_path(&cfg_wss.tls.client_cert_path))
+                    .or_else(|| default_tls_path(&config_dir, "client.crt")),
+                client_key_path: cli
+                    .tls_client_key
+                    .clone()
+                    .or_else(|| opt_path(&cfg_wss.tls.client_key_path))
+                    .or_else(|| default_tls_path(&config_dir, "client.key")),
+            };
+            ConnectTarget::Wss(Box::new(WssRoute {
+                direct_url,
+                relay_inner_url: DEFAULT_RELAY_INNER_URL.to_string(),
+                relay,
+                tls,
+                direct_attempts: cfg_wss.direct_attempts.unwrap_or(DEFAULT_DIRECT_ATTEMPTS),
+                direct_timeout_secs: cfg_wss
+                    .direct_timeout_secs
+                    .unwrap_or(DEFAULT_DIRECT_TIMEOUT_SECS),
+                reprobe_secs: cfg_wss.reprobe_secs.unwrap_or(DEFAULT_REPROBE_SECS),
+            }))
         } else {
-            let config_dir = client::resolve_config_dir(cli.config_dir.as_deref())?;
             let socket = client::resolve_socket_path(&config_dir)?;
             ConnectTarget::LocalSocket(socket)
         }
@@ -393,7 +932,7 @@ async fn run() -> anyhow::Result<()> {
     // (initial connect failed → we started one). Only an owned ephemeral
     // daemon may be respawned on disconnect, and then exactly once.
     let mut owns_ephemeral = false;
-    let rpc = match &target {
+    let (rpc, initial_leg) = match &target {
         ConnectTarget::LocalSocket(socket) => {
             #[cfg(unix)]
             let shutdown_signals = shutdown_signals.insert(ShutdownSignals::new()?);
@@ -405,7 +944,7 @@ async fn run() -> anyhow::Result<()> {
             #[cfg(not(unix))]
             let initial_connection = client::RpcClient::connect(socket, None, None).await;
 
-            match initial_connection {
+            let client = match initial_connection {
                 Ok(c) => c,
                 Err(e) if is_terminal_connection_error(&e) => return Err(e),
                 Err(_) => {
@@ -435,33 +974,62 @@ async fn run() -> anyhow::Result<()> {
                         }
                     }
                 }
-            }
+            };
+            (client, ActiveLeg::Local)
         }
-        ConnectTarget::Wss { url, skip_verify } => {
+        ConnectTarget::Wss(route) => {
+            let ack_key = route.ack_key();
             let requires_confirmation =
-                *skip_verify && !loaded_config.connection.wss.tls.route_acked(url);
+                route.tls.skip_verify && !loaded_config.connection.wss.tls.route_acked(&ack_key);
             #[cfg(not(unix))]
             if requires_confirmation {
-                apply_insecure_tls_choice(confirm_insecure_tls(url)?, &local_config_dir, url)?;
+                apply_insecure_tls_choice(
+                    confirm_insecure_tls(&ack_key)?,
+                    &local_config_dir,
+                    &ack_key,
+                )?;
             }
             #[cfg(unix)]
-            {
-                let shutdown_signals = shutdown_signals.insert(prepare_wss_shutdown_signals(
-                    requires_confirmation,
-                    &local_config_dir,
-                    url,
-                )?);
-                tokio::select! {
-                    result = client::RpcClient::connect_wss(url, None, None, *skip_verify) => result?,
-                    _ = shutdown_signals.recv() => return Ok(()),
-                }
-            }
+            let shutdown_signals = shutdown_signals.insert(prepare_wss_shutdown_signals(
+                requires_confirmation,
+                &local_config_dir,
+                &ack_key,
+            )?);
+            // Signal-aware like the local leg: `connect_preferred` can spend the
+            // full direct-attempt budget before falling back to the relay, so a
+            // SIGTERM during that window must still exit cleanly.
+            #[cfg(unix)]
+            let connect_result = tokio::select! {
+                result = route.connect_preferred(None, None) => result,
+                _ = shutdown_signals.recv() => return Ok(()),
+            };
             #[cfg(not(unix))]
-            {
-                client::RpcClient::connect_wss(url, None, None, *skip_verify).await?
+            let connect_result = route.connect_preferred(None, None).await;
+
+            match connect_result {
+                Ok(pair) => pair,
+                // A certless client cannot complete the mutually-authenticated WSS
+                // handshake. Give an actionable enroll hint instead of a bare TLS
+                // error (no silent failure for an un-migrated client).
+                Err(e) if route.tls.client_cert_path.is_none() => {
+                    anyhow::bail!(
+                        "could not connect to the daemon's WSS plane ({e:#}). That plane is \
+                         mutually authenticated and this client has no certificate. Enroll first:\n  \
+                         zerocode --enroll --connect <host>:<port>\n(running interactively against \
+                         --connect enrolls automatically)."
+                    );
+                }
+                Err(e) => return Err(e),
             }
         }
     };
+
+    // On the mTLS plane, renew the cached client cert if it is past ~50% of its
+    // TTL (before the terminal is taken over, so any output is visible). No-op
+    // when the client never enrolled here.
+    if matches!(target, ConnectTarget::Wss(_)) {
+        enroll::maybe_renew(&rpc, &local_config_dir).await;
+    }
 
     let mut term = config_manager::init_terminal()?;
     TERMINAL_ACTIVE.store(true, Ordering::Relaxed);
@@ -472,6 +1040,7 @@ async fn run() -> anyhow::Result<()> {
         &target,
         &local_config_dir,
         owns_ephemeral,
+        initial_leg,
         #[cfg(unix)]
         shutdown_signals
             .as_mut()
@@ -494,6 +1063,7 @@ async fn run_until_exit(
     target: &ConnectTarget,
     config_dir: &std::path::Path,
     owns_ephemeral: bool,
+    initial_leg: ActiveLeg,
     #[cfg(unix)] shutdown_signals: &mut ShutdownSignals,
 ) -> anyhow::Result<()> {
     // Shared state that survives a reconnect. Quickstart's Stage 2 writes
@@ -508,7 +1078,7 @@ async fn run_until_exit(
     #[cfg(unix)]
     {
         tokio::select! {
-            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral) => r.map(|_| ()),
+            r = app::run(rpc, term, &label, insecure_tls, reconnect_state, config_dir, target, owns_ephemeral, initial_leg) => r.map(|_| ()),
             _ = shutdown_signals.recv() => Ok(()),
         }
     }
@@ -523,6 +1093,7 @@ async fn run_until_exit(
             config_dir,
             target,
             owns_ephemeral,
+            initial_leg,
         )
         .await
         .map(|_| ())
@@ -1537,8 +2108,8 @@ mod connection_tests {
             uri: Some("wss://config:1".to_string()),
             ..Default::default()
         };
-        let got = resolve_wss_target(Some("wss://flag:2".to_string()), false, &cfg);
-        assert_eq!(got, Some(("wss://flag:2".to_string(), false)));
+        let got = resolve_direct_url(Some("wss://flag:2".to_string()), &cfg);
+        assert_eq!(got.as_deref(), Some("wss://flag:2"));
     }
 
     #[test]
@@ -1547,36 +2118,78 @@ mod connection_tests {
             uri: Some("wss://config:1".to_string()),
             ..Default::default()
         };
-        let got = resolve_wss_target(None, false, &cfg);
-        assert_eq!(got, Some(("wss://config:1".to_string(), false)));
+        let got = resolve_direct_url(None, &cfg);
+        assert_eq!(got.as_deref(), Some("wss://config:1"));
     }
 
     #[test]
-    fn no_uri_anywhere_is_local_socket() {
+    fn no_uri_anywhere_has_no_direct_address() {
+        // With no direct address and no relay, the target resolves to the local
+        // socket; here we assert the direct-address half of that decision.
         let cfg = WssSection::default();
-        assert_eq!(resolve_wss_target(None, false, &cfg), None);
+        assert_eq!(resolve_direct_url(None, &cfg), None);
     }
 
     #[test]
     fn skip_verify_is_flag_or_config() {
-        let mut cfg = WssSection {
-            uri: Some("wss://h:1".to_string()),
+        let mut cfg = WssSection::default();
+        cfg.tls.skip_verify = true;
+        assert!(resolve_skip_verify(false, &cfg));
+        cfg.tls.skip_verify = false;
+        assert!(resolve_skip_verify(true, &cfg)); // flag wins
+        assert!(!resolve_skip_verify(false, &cfg)); // neither
+    }
+
+    #[test]
+    fn relay_only_route_still_chooses_wss() {
+        // A relay configured with no direct address must NOT collapse to the
+        // local socket: the route is WSS-over-relay (direct_url stays None).
+        let cfg = WssSection {
+            relay_url: Some("relay.example:9783".to_string()),
+            relay_node: Some("node-abc".to_string()),
             ..Default::default()
         };
-        cfg.tls.skip_verify = true;
-        assert_eq!(
-            resolve_wss_target(None, false, &cfg),
-            Some(("wss://h:1".to_string(), true))
-        );
-        cfg.tls.skip_verify = false;
-        assert_eq!(
-            resolve_wss_target(None, true, &cfg),
-            Some(("wss://h:1".to_string(), true))
-        );
-        assert_eq!(
-            resolve_wss_target(None, false, &cfg),
-            Some(("wss://h:1".to_string(), false))
-        );
+        assert_eq!(resolve_direct_url(None, &cfg), None);
+        assert!(cfg.relay_url.is_some() && cfg.relay_node.is_some());
+    }
+
+    #[test]
+    fn explicit_relay_enroll_uses_relay_route() {
+        let cli = Cli::parse_from([
+            "zerocode",
+            "--enroll",
+            "--relay",
+            "relay.example:9783",
+            "--relay-node",
+            "node-abc",
+        ]);
+        assert!(should_enroll_via_relay(&cli, &WssSection::default(), true));
+    }
+
+    #[test]
+    fn explicit_enroll_host_keeps_direct_enrollment() {
+        let cli = Cli::parse_from([
+            "zerocode",
+            "--enroll",
+            "--relay",
+            "relay.example:9783",
+            "--relay-node",
+            "node-abc",
+            "--enroll-host",
+            "daemon.example",
+        ]);
+        assert!(!should_enroll_via_relay(&cli, &WssSection::default(), true));
+    }
+
+    #[test]
+    fn relay_only_config_enroll_uses_relay_route() {
+        let cli = Cli::parse_from(["zerocode", "--enroll"]);
+        let cfg = WssSection {
+            relay_url: Some("relay.example:9783".to_string()),
+            relay_node: Some("node-abc".to_string()),
+            ..Default::default()
+        };
+        assert!(should_enroll_via_relay(&cli, &cfg, true));
     }
 
     #[test]
@@ -1638,6 +2251,38 @@ mod confirm_insecure_tls_tests {
     #[test]
     fn confirm_input_yes_returns_once() {
         assert!(matches!(run("yes\n", "wss://example.test:1").0, Once));
+    }
+
+    #[test]
+    fn relay_cert_prompt_y_trusts_and_shows_fingerprint() {
+        let mut output = Vec::new();
+        let choice = confirm_relay_cert_with(
+            Cursor::new("y\n"),
+            &mut output,
+            "relay.example:8443",
+            "abcd1234ef",
+        )
+        .expect("relay prompt must read");
+        assert_eq!(choice, RelayTrustChoice::Trust);
+        let shown = String::from_utf8(output).expect("prompt is UTF-8");
+        assert!(
+            shown.contains("abcd1234ef"),
+            "fingerprint must be shown: {shown}"
+        );
+        assert!(shown.contains("relay.example:8443"));
+    }
+
+    #[test]
+    fn relay_cert_prompt_default_and_no_abort() {
+        let mut out = Vec::new();
+        assert_eq!(
+            confirm_relay_cert_with(Cursor::new("\n"), &mut out, "r:1", "fp").unwrap(),
+            RelayTrustChoice::Abort
+        );
+        assert_eq!(
+            confirm_relay_cert_with(Cursor::new("n\n"), &mut out, "r:1", "fp").unwrap(),
+            RelayTrustChoice::Abort
+        );
     }
 
     #[test]
@@ -1799,5 +2444,153 @@ mod apply_insecure_tls_choice_tests {
             cfg.connection.wss.tls.route_acked(URL),
             "Always must persist the confirmed route alongside unrelated sections"
         );
+    }
+}
+
+#[cfg(test)]
+mod credential_recovery_order_tests {
+    //! Startup-ORDER regressions for [`crate::recover_then_read_credentials`].
+    //!
+    //! An interrupted credential publication cannot be produced by cutting the
+    //! power in a test, so these build the real post-crash state with the
+    //! publication's own steps (`enroll::interrupt_publication_for_test`) and
+    //! then assert what startup reads. Each test first shows what a read taken
+    //! BEFORE recovery would have reported, so the assertions prove the order
+    //! matters rather than restating the recovered state.
+
+    use super::*;
+
+    fn profile_json(relay_url: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "device_id": "dev_1",
+            "not_after": 0,
+            "relay": {
+                "relay_url": relay_url,
+                "node_id": "node-1",
+                "relay_cert_pin": "",
+            },
+        }))
+        .unwrap()
+    }
+
+    fn publish_old_generation(tls: &std::path::Path, relay_url: &str) {
+        std::fs::create_dir_all(tls).unwrap();
+        std::fs::write(tls.join("client.crt"), b"OLD-CERT").unwrap();
+        std::fs::write(tls.join("ca.crt"), b"OLD-CA").unwrap();
+        std::fs::write(tls.join("client.key"), b"OLD-KEY").unwrap();
+        std::fs::write(tls.join("profile.json"), profile_json(relay_url)).unwrap();
+    }
+
+    /// A publication interrupted after its FIRST rename leaves the new
+    /// certificate beside the old profile. Reading before recovery hands the
+    /// connect path the OLD relay coordinates, and pairs a new certificate with
+    /// the old key.
+    #[test]
+    fn a_first_rename_interruption_does_not_yield_stale_relay_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls, "old-relay.invalid:443");
+        let new_profile = profile_json("new-relay.invalid:443");
+        let payloads: [&[u8]; 4] = [b"NEW-CERT", b"NEW-CA", b"NEW-KEY", new_profile.as_bytes()];
+        enroll::interrupt_publication_for_test(dir.path(), payloads, 1).unwrap();
+
+        // What an unordered startup would have read.
+        assert_eq!(
+            enroll::cached_profile(dir.path()).unwrap().relay.relay_url,
+            "old-relay.invalid:443",
+            "the interrupted state must still carry the stale coordinates"
+        );
+
+        let credentials = recover_then_read_credentials(dir.path(), None, "").unwrap();
+
+        assert_eq!(
+            credentials.profile.unwrap().relay.relay_url,
+            "new-relay.invalid:443",
+            "startup must read the recovered generation, not the interrupted one"
+        );
+        assert_eq!(std::fs::read(tls.join("client.key")).unwrap(), b"NEW-KEY");
+        assert!(!credentials.certless);
+    }
+
+    /// A first enrollment interrupted before any rename has no published
+    /// certificate yet. Read before recovery it looks certless, which re-runs
+    /// enrollment and discards the certificate the daemon already issued.
+    #[test]
+    fn an_interrupted_first_enrollment_is_not_reported_as_certless() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_profile = profile_json("new-relay.invalid:443");
+        let payloads: [&[u8]; 4] = [b"NEW-CERT", b"NEW-CA", b"NEW-KEY", new_profile.as_bytes()];
+        enroll::interrupt_publication_for_test(dir.path(), payloads, 0).unwrap();
+
+        // What an unordered startup would have read.
+        assert!(enroll::is_certless(dir.path(), None, ""));
+        assert!(enroll::cached_profile(dir.path()).is_none());
+
+        let credentials = recover_then_read_credentials(dir.path(), None, "").unwrap();
+
+        assert!(
+            !credentials.certless,
+            "recovery must publish the issued certificate before enrollment is considered"
+        );
+        assert_eq!(
+            credentials.profile.unwrap().relay.relay_url,
+            "new-relay.invalid:443"
+        );
+    }
+
+    /// Recovery that cannot reassemble the generation must stop the run, not
+    /// warn and continue into relay resolution and TLS path derivation with a
+    /// mixed set.
+    #[test]
+    fn an_unrecoverable_publication_stops_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls, "old-relay.invalid:443");
+        let new_profile = profile_json("new-relay.invalid:443");
+        let payloads: [&[u8]; 4] = [b"NEW-CERT", b"NEW-CA", b"NEW-KEY", new_profile.as_bytes()];
+        enroll::interrupt_publication_for_test(dir.path(), payloads, 1).unwrap();
+        std::fs::remove_file(tls.join(".client.key.tmp")).unwrap();
+
+        let err = recover_then_read_credentials(dir.path(), None, "").unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("interrupted credential publication"),
+            "got: {err}"
+        );
+        assert!(err.contains("client.key"), "got: {err}");
+        assert!(
+            tls.join(".publish.pending").exists(),
+            "an incomplete generation must keep its marker for the next run"
+        );
+    }
+
+    /// A publication whose marker did not become durable leaves a mixed set with
+    /// nothing on disk pointing at it. Recovery sees no marker and has nothing to
+    /// do, so startup must refuse on the recorded generation instead of dialling
+    /// with a new certificate and the old key.
+    #[test]
+    fn a_mixed_set_without_a_marker_stops_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let tls = dir.path().join("tls");
+        publish_old_generation(&tls, "old-relay.invalid:443");
+        // The first run adopts and records the generation it finds.
+        recover_then_read_credentials(dir.path(), None, "")
+            .expect("a pre-record credential set must still start");
+
+        let new_profile = profile_json("new-relay.invalid:443");
+        let payloads: [&[u8]; 4] = [b"NEW-CERT", b"NEW-CA", b"NEW-KEY", new_profile.as_bytes()];
+        enroll::interrupt_publication_for_test(dir.path(), payloads, 1).unwrap();
+        std::fs::remove_file(tls.join(".publish.pending")).unwrap();
+
+        let err = format!(
+            "{:#}",
+            recover_then_read_credentials(dir.path(), None, "")
+                .expect_err("startup must refuse a mixed credential set")
+        );
+        assert!(
+            err.contains("published credential set is inconsistent"),
+            "got: {err}"
+        );
+        assert!(err.contains("client.crt"), "got: {err}");
     }
 }

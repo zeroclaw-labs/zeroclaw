@@ -1388,19 +1388,34 @@ impl DeviceStoreTrait for RusqliteStore {
                     rusqlite::Error::ToSqlConversionFailure(Box::new(e))
                 }
 
-                // Deserialize KeyPairs from bytes (64 bytes each)
-                let noise_key_bytes: Vec<u8> = row.get("noise_key")?;
-                let identity_key_bytes: Vec<u8> = row.get("identity_key")?;
-                let signed_pre_key_bytes: Vec<u8> = row.get("signed_pre_key")?;
+                fn fixed_blob<const N: usize>(
+                    name: &str,
+                    bytes: Vec<u8>,
+                ) -> Result<[u8; N], rusqlite::Error> {
+                    if bytes.len() != N {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Blob,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("{name} must be {N} bytes, got {}", bytes.len()),
+                            )),
+                        ));
+                    }
 
-                if noise_key_bytes.len() != 64
-                    || identity_key_bytes.len() != 64
-                    || signed_pre_key_bytes.len() != 64
-                {
-                    return Err(rusqlite::Error::InvalidParameterName("key_pair".into()));
+                    let mut value = [0u8; N];
+                    value.copy_from_slice(&bytes);
+                    Ok(value)
                 }
 
                 use wacore::libsignal::protocol::{KeyPair, PrivateKey, PublicKey};
+
+                // Deserialize KeyPairs from fixed-size blobs.
+                let noise_key_bytes: [u8; 64] = fixed_blob("noise_key", row.get("noise_key")?)?;
+                let identity_key_bytes: [u8; 64] =
+                    fixed_blob("identity_key", row.get("identity_key")?)?;
+                let signed_pre_key_bytes: [u8; 64] =
+                    fixed_blob("signed_pre_key", row.get("signed_pre_key")?)?;
 
                 let noise_key = KeyPair::new(
                     PublicKey::from_djb_public_key_bytes(&noise_key_bytes[32..64])
@@ -1423,14 +1438,12 @@ impl DeviceStoreTrait for RusqliteStore {
 
                 let lid_str: Option<String> = row.get("lid")?;
                 let pn_str: Option<String> = row.get("pn")?;
-                let signature_bytes: Vec<u8> = row.get("signed_pre_key_signature")?;
-                let adv_secret_bytes: Vec<u8> = row.get("adv_secret_key")?;
+                let signature = fixed_blob::<64>(
+                    "signed_pre_key_signature",
+                    row.get("signed_pre_key_signature")?,
+                )?;
+                let adv_secret = fixed_blob::<32>("adv_secret_key", row.get("adv_secret_key")?)?;
                 let account_bytes: Option<Vec<u8>> = row.get("account")?;
-
-                let mut signature = [0u8; 64];
-                let mut adv_secret = [0u8; 32];
-                signature.copy_from_slice(&signature_bytes);
-                adv_secret.copy_from_slice(&adv_secret_bytes);
 
                 let account = if let Some(bytes) = account_bytes {
                     Some(
@@ -1505,14 +1518,27 @@ impl DeviceStoreTrait for RusqliteStore {
         name: &str,
         extra_content: Option<&[u8]>,
     ) -> wacore::store::error::Result<()> {
-        // Create a snapshot by copying the database file
         let snapshot_path = format!("{}.snapshot.{}", self.db_path, name);
+        let content_path = format!("{}.extra", snapshot_path);
 
-        to_store_err!(std::fs::copy(&self.db_path, &snapshot_path))?;
+        // Serialize replacement and sidecar creation with the database copy so
+        // concurrent requests cannot pair artifacts from different snapshots.
+        let conn = self.conn.lock();
+        for path in [&snapshot_path, &content_path] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(wacore::store::error::StoreError::Database(Box::new(error)));
+                }
+            }
+        }
+        // VACUUM INTO reads through SQLite, so committed pages still in the
+        // WAL are included in the standalone snapshot.
+        to_store_err!(execute: conn.execute("VACUUM INTO ?1", params![snapshot_path.as_str()]))?;
 
-        // If extra_content is provided, save it alongside
+        // If extra_content is provided, save it alongside.
         if let Some(content) = extra_content {
-            let content_path = format!("{}.extra", snapshot_path);
             to_store_err!(std::fs::write(&content_path, content))?;
         }
 
@@ -1575,6 +1601,99 @@ mod tests {
         device.pn = Some(wacore_binary::jid::Jid::pn("15551234567"));
         DeviceStoreTrait::save(&store, &device).await.unwrap();
         assert!(persisted_device_exists(&path));
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn device_load_rejects_malformed_fixed_blobs_without_unwinding() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let store = RusqliteStore::new(tmp.path()).unwrap();
+        let device = CoreDevice::new();
+
+        DeviceStoreTrait::save(&store, &device).await.unwrap();
+
+        for (column, expected_len) in [
+            ("noise_key", 64),
+            ("identity_key", 64),
+            ("signed_pre_key", 64),
+            ("signed_pre_key_signature", 64),
+            ("adv_secret_key", 32),
+        ] {
+            DeviceStoreTrait::save(&store, &device).await.unwrap();
+            {
+                let conn = store.conn.lock();
+                conn.execute(
+                    &format!("UPDATE device SET {column} = ?1 WHERE id = ?2"),
+                    params![vec![0u8; expected_len - 1], store.device_id],
+                )
+                .unwrap();
+            }
+
+            let result = DeviceStoreTrait::load(&store).await;
+            assert!(
+                matches!(result, Err(wacore::store::error::StoreError::Database(_))),
+                "malformed {column} should return a database error"
+            );
+        }
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    #[tokio::test]
+    async fn snapshot_db_includes_committed_wal_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.db");
+        let store = RusqliteStore::new(&path).unwrap();
+
+        {
+            let conn = store.conn.lock();
+            conn.execute_batch(
+                "PRAGMA wal_autocheckpoint = 0;
+                 CREATE TABLE snapshot_probe (value TEXT NOT NULL);",
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO snapshot_probe (value) VALUES (?1)",
+                params!["wal-only"],
+            )
+            .unwrap();
+        }
+
+        // Copying the main file directly omits the committed row still held
+        // in the live WAL, which is the failure mode this snapshot fixes.
+        let main_only_path = tmp.path().join("main-only.db");
+        std::fs::copy(&path, &main_only_path).unwrap();
+        let main_only = Connection::open(&main_only_path).unwrap();
+        let main_count: i64 = main_only
+            .query_row("SELECT COUNT(*) FROM snapshot_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(main_count, 0);
+
+        DeviceStoreTrait::snapshot_db(&store, "wal", Some(b"extra"))
+            .await
+            .unwrap();
+
+        let snapshot_path = format!("{}.snapshot.wal", path.to_string_lossy());
+        {
+            let snapshot = Connection::open(&snapshot_path).unwrap();
+            let value: String = snapshot
+                .query_row("SELECT value FROM snapshot_probe", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(value, "wal-only");
+        }
+        assert_eq!(
+            std::fs::read(format!("{snapshot_path}.extra")).unwrap(),
+            b"extra"
+        );
+
+        DeviceStoreTrait::snapshot_db(&store, "wal", None)
+            .await
+            .unwrap();
+        assert!(
+            !Path::new(&format!("{snapshot_path}.extra")).exists(),
+            "snapshot without extra content must remove a stale sidecar"
+        );
     }
 
     #[cfg(feature = "whatsapp-web")]

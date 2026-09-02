@@ -1077,7 +1077,7 @@ impl GeminiModelProvider {
     fn build_chat_contents(
         messages: &[ChatMessage],
         tool_instructions: Option<&str>,
-    ) -> (Vec<Content>, Option<Content>) {
+    ) -> anyhow::Result<(Vec<Content>, Option<Content>)> {
         let mut system_parts: Vec<&str> = Vec::new();
         let mut contents: Vec<Content> = Vec::new();
         for msg in messages {
@@ -1097,6 +1097,45 @@ impl GeminiModelProvider {
         if let Some(instructions) = tool_instructions {
             system_parts.push(instructions);
         }
+        // Gemini rejects a request whose last turn is a model turn. History
+        // trims, session restores, and steering continuations can all leave
+        // the history ending on the model's own output. Those model turns are
+        // the context a continuation must see, so they are kept and a final
+        // user continuation turn is appended; a request with no turns at all
+        // falls back to a lone user placeholder, and model-only history has
+        // nothing to anchor a request on and fails explicitly instead of
+        // being silently replaced with a context-free one.
+        match contents.last().map(|c| c.role.as_deref()) {
+            Some(Some("user")) => {}
+            Some(Some("model")) => {
+                if contents.iter().any(|c| c.role.as_deref() == Some("user")) {
+                    contents.push(Content {
+                        role: Some("user".to_string()),
+                        parts: vec![Part::text("[continue]")],
+                    });
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({ "turns": contents.len() })),
+                        "gemini: model-only history cannot anchor a generateContent request"
+                    );
+                    return Err(anyhow::Error::msg(
+                        "gemini: history ends on model turns but contains no user turn; \
+                         refusing to drop the model context or fabricate a context-free request",
+                    ));
+                }
+            }
+            // no turns at all (empty or system-only): a request still needs
+            // one user turn to anchor on
+            _ => {
+                contents.push(Content {
+                    role: Some("user".to_string()),
+                    parts: vec![Part::text("[continue]")],
+                });
+            }
+        }
         let system_instruction = if system_parts.is_empty() {
             None
         } else {
@@ -1105,7 +1144,7 @@ impl GeminiModelProvider {
                 parts: vec![Part::text(system_parts.join("\n\n"))],
             })
         };
-        (contents, system_instruction)
+        Ok((contents, system_instruction))
     }
 
     async fn chat_with_history_full(
@@ -1114,7 +1153,7 @@ impl GeminiModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<(String, Option<TokenUsage>)> {
-        let (contents, system_instruction) = Self::build_chat_contents(messages, None);
+        let (contents, system_instruction) = Self::build_chat_contents(messages, None)?;
         self.send_generate_content(contents, system_instruction, model, temperature)
             .await
     }
@@ -1474,7 +1513,7 @@ impl ModelProvider for GeminiModelProvider {
             None
         };
         let (contents, system_instruction) =
-            Self::build_chat_contents(request.messages, tool_instructions.as_deref());
+            Self::build_chat_contents(request.messages, tool_instructions.as_deref())?;
         let (text, usage) = self
             .send_generate_content(contents, system_instruction, model, temperature)
             .await?;
@@ -2671,11 +2710,11 @@ mod tests {
         let messages = vec![
             ChatMessage::system("You are helpful"),
             ChatMessage::user("Hello [IMAGE:data:image/png;base64,AA==]"),
-            ChatMessage::assistant("I see the image"),
         ];
 
         let (contents, system_instruction) =
-            GeminiModelProvider::build_chat_contents(&messages, None);
+            GeminiModelProvider::build_chat_contents(&messages, None)
+                .expect("user-anchored history must build");
 
         let system_instruction = system_instruction.expect("system prompt should be separated");
         assert_eq!(system_instruction.role, None);
@@ -2683,7 +2722,7 @@ mod tests {
             matches!(&system_instruction.parts[0], Part::Text { text } if text == "You are helpful")
         );
 
-        assert_eq!(contents.len(), 2);
+        assert_eq!(contents.len(), 1);
         assert_eq!(contents[0].role.as_deref(), Some("user"));
         assert!(
             contents[0]
@@ -2691,8 +2730,81 @@ mod tests {
                 .iter()
                 .any(|p| matches!(p, Part::Inline { .. }))
         );
+    }
+
+    #[test]
+    fn chat_contents_preserves_trailing_model_turn_and_appends_user_continuation() {
+        let messages = vec![
+            ChatMessage::system("You are helpful"),
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("I see the image"),
+        ];
+
+        let (contents, _system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, None)
+                .expect("history with a prior user turn must build");
+
+        // the model turn is the context a continuation needs, so it is kept
+        // and the request is anchored with a final user continuation turn
+        assert_eq!(contents.len(), 3, "model turn must be preserved");
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
         assert_eq!(contents[1].role.as_deref(), Some("model"));
-        assert!(matches!(&contents[1].parts[0], Part::Text { text } if text == "I see the image"));
+        assert!(
+            matches!(&contents[1].parts[0], Part::Text { text } if text == "I see the image"),
+            "the assistant context must survive the request build"
+        );
+        assert_eq!(contents[2].role.as_deref(), Some("user"));
+        assert!(matches!(&contents[2].parts[0], Part::Text { text } if text == "[continue]"));
+    }
+
+    #[test]
+    fn chat_contents_model_only_history_fails_explicitly() {
+        let messages = vec![ChatMessage::assistant("I see the image")];
+
+        let result = GeminiModelProvider::build_chat_contents(&messages, None);
+
+        let err = result.expect_err("model-only history must fail instead of losing context");
+        assert!(
+            err.to_string()
+                .contains("history ends on model turns but contains no user turn"),
+            "error should name the anchoring problem, got: {err}"
+        );
+    }
+
+    #[test]
+    fn chat_contents_empty_history_falls_back_to_bare_continue() {
+        let messages = vec![ChatMessage::system("You are helpful")];
+
+        let (contents, _system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, None)
+                .expect("system-only history must build with a bare anchor turn");
+
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0].role.as_deref(), Some("user"));
+        assert!(matches!(&contents[0].parts[0], Part::Text { text } if text == "[continue]"));
+    }
+
+    #[test]
+    fn chat_contents_ending_on_user_turn_is_untouched() {
+        let messages = vec![
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi"),
+            ChatMessage::user("Now continue"),
+        ];
+
+        let (contents, _system_instruction) =
+            GeminiModelProvider::build_chat_contents(&messages, None)
+                .expect("history already ending on a user turn must build");
+
+        assert_eq!(contents.len(), 3, "no synthetic turn may be appended");
+        assert!(
+            !contents.iter().any(|c| {
+                c.parts
+                    .iter()
+                    .any(|p| matches!(p, Part::Text { text } if text == "[continue]"))
+            }),
+            "no [continue] placeholder may appear"
+        );
     }
 
     #[test]
@@ -2703,7 +2815,8 @@ mod tests {
         ];
 
         let (_contents, system_instruction) =
-            GeminiModelProvider::build_chat_contents(&messages, Some("Use tools carefully"));
+            GeminiModelProvider::build_chat_contents(&messages, Some("Use tools carefully"))
+                .expect("user-anchored history must build");
 
         let system_instruction = system_instruction.expect("system prompt should include tools");
         assert!(
@@ -2716,7 +2829,8 @@ mod tests {
         let messages = vec![ChatMessage::user("Hello")];
 
         let (_contents, system_instruction) =
-            GeminiModelProvider::build_chat_contents(&messages, Some("Use tools carefully"));
+            GeminiModelProvider::build_chat_contents(&messages, Some("Use tools carefully"))
+                .expect("user-anchored history must build");
 
         let system_instruction =
             system_instruction.expect("tool instructions should be system prompt");

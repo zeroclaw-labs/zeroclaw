@@ -1002,6 +1002,7 @@ channel-telegram-approval-ack-approved = 已批准
 channel-telegram-approval-ack-always-approved = 已始终批准
 channel-telegram-approval-ack-denied = 已拒绝
 channel-telegram-approval-ack-unknown = 未知操作
+channel-telegram-approval-ack-already-resolved = 审批已被处理
 channel-discord-approval-btn-allow-once = 仅本次允许
 channel-discord-approval-btn-allow-session = 本会话允许
 channel-discord-approval-btn-allow-always = 始终允许
