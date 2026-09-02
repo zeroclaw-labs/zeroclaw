@@ -407,6 +407,38 @@ impl Tool for SkillBuiltinTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let target_name = self.target_tool.name();
+
+        // The turn capability ceiling (e.g. a skill's `blocked_tools_with_image`
+        // on an image turn) removes the raw target tool from the model's
+        // advertised surface, but this wrapper is a distinct, still-callable
+        // tool that delegates straight to that target. Re-check the target
+        // against the ceiling so the block cannot be bypassed by reaching the
+        // tool through the wrapper. This mirrors the delegate/nested-loop
+        // enforcement, keeping the wrapper on the same monotonic ceiling.
+        let ceiling = crate::agent::tool_ceiling::current_tool_ceiling();
+        if ceiling
+            .iter()
+            .any(|excluded| excluded.as_str() == target_name)
+        {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Invoke)
+                    .with_category(::zeroclaw_log::EventCategory::Tool)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "skill_tool": self.tool_name,
+                        "delegates_to": target_name,
+                    })),
+                "skill-scoped elevated tool blocked by the turn capability ceiling"
+            );
+            return Ok(ToolResult::err(format!(
+                "Tool '{target_name}' is excluded on this turn and cannot be reached \
+                 through the '{}' skill tool.",
+                self.tool_name
+            )));
+        }
+
         // Audit: elevated skill tools delegate to a target that may be blocked
         // by SecurityPolicy or hidden from the model. Record every invocation
         // at INFO with the delegation target and the locked scope keys.
@@ -416,7 +448,7 @@ impl Tool for SkillBuiltinTool {
                 .with_category(::zeroclaw_log::EventCategory::Tool)
                 .with_attrs(::serde_json::json!({
                     "skill_tool": self.tool_name,
-                    "delegates_to": self.target_tool.name(),
+                    "delegates_to": target_name,
                     "locked_keys": self.locked_args.keys().collect::<Vec<_>>(),
                 })),
             "skill-scoped elevated tool invoked"
@@ -811,6 +843,99 @@ mod tests {
             HashMap::new(),
         );
         assert_eq!(tool.name(), "my_skill__use_shell");
+    }
+
+    /// A target tool that counts how many times it actually executes, so a
+    /// ceiling regression can prove the block happened before dispatch rather
+    /// than merely inspecting the returned result.
+    struct CountingTargetTool {
+        name: String,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CountingTargetTool {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Tool(::zeroclaw_api::attribution::ToolKind::Plugin)
+        }
+        fn alias(&self) -> &str {
+            &self.name
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingTargetTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "counting target"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(ToolResult::ok("ran"))
+        }
+    }
+
+    /// Regression: a skill-builtin wrapper must not reach a target the turn
+    /// ceiling removed. The wrapper is a distinct, still-callable tool that
+    /// delegates straight to `shell`; on an image turn that excludes `shell`,
+    /// invoking the wrapper must not run `shell`. The control proves the
+    /// wrapper still executes its target when the ceiling is empty, so the
+    /// block is not vacuously passing because the target never ran.
+    #[tokio::test]
+    async fn skill_wrapper_target_blocked_by_turn_ceiling_does_not_execute() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let make_wrapper = || {
+            let target: Arc<dyn Tool> = Arc::new(CountingTargetTool {
+                name: "shell".to_string(),
+                calls: Arc::clone(&calls),
+            });
+            SkillBuiltinTool::new(
+                "my_skill",
+                &sample_builtin_skill_tool(),
+                target,
+                HashMap::new(),
+            )
+        };
+
+        // Restricted: the turn ceiling contains the target name.
+        let blocked = make_wrapper();
+        let res = crate::agent::tool_ceiling::with_tool_ceiling(
+            &["shell".to_string()],
+            blocked.execute(serde_json::json!({})),
+        )
+        .await
+        .expect("wrapper returns a result");
+        assert!(!res.success, "blocked target must yield a failed result");
+        assert!(
+            res.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("excluded"),
+            "error must explain the exclusion; got {:?}",
+            res.error
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the excluded target must not execute through the wrapper"
+        );
+
+        // Unrestricted control: no ceiling, so the wrapper runs the target.
+        let allowed = make_wrapper();
+        let res = allowed
+            .execute(serde_json::json!({}))
+            .await
+            .expect("wrapper returns a result");
+        assert!(res.success, "control must execute the target");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "control proves the target is reachable when unrestricted"
+        );
     }
 
     #[test]
@@ -1234,6 +1359,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: vec![],
+            blocked_tools_with_image: vec![],
         };
         crate::tools::register_skill_tools_with_context(
             &mut registry,

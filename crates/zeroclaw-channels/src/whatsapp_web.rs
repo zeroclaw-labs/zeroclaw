@@ -1678,6 +1678,9 @@ impl WhatsAppWebChannel {
                 explicitly_addressed: false,
                 conversation_scope,
                 references: Vec::new(),
+                // WhatsApp has no registered-skill command surface, so nothing
+                // here resolves a skill identity ahead of the text.
+                invoked_skill: None,
             })
             .await
         {

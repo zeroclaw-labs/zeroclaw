@@ -85,6 +85,15 @@ pub struct Skill {
     pub always: bool,
     #[serde(skip)]
     pub location: Option<PathBuf>,
+    /// When set, sessions using this skill command are automatically routed to this provider.
+    #[serde(skip)]
+    pub provider: Option<String>,
+    /// Natural-language trigger phrases for auto-activation (from SKILL.toml triggers = [...]).
+    #[serde(skip)]
+    pub triggers: Vec<String>,
+    /// Tools blocked when the current user message contains an image attachment.
+    #[serde(skip)]
+    pub blocked_tools_with_image: Vec<String>,
 }
 
 /// Why the audited resolver dropped a candidate skill directory/file.
@@ -343,6 +352,18 @@ struct SkillMeta {
     /// `always = true`.
     #[serde(default)]
     always: bool,
+    #[serde(default)]
+    provider: Option<String>,
+    /// Natural-language trigger phrases; any match activates this skill's provider override.
+    /// Use "__image__" to match any message containing an image attachment.
+    #[serde(default)]
+    triggers: Vec<String>,
+    /// Tools that are forbidden when the current user message contains an image.
+    /// Used to enforce two-turn protocols at the architecture level: e.g. food-logger
+    /// blocks `sparky__sparky_manage_food` on photo turns so auto-logging is
+    /// architecturally impossible, not just prompt-discouraged.
+    #[serde(default)]
+    blocked_tools_with_image: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,6 +576,197 @@ fn dir_stem(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// What a turn presents to skill auto-activation.
+///
+/// The fields are separate because they differ in provenance, and activation
+/// applies *policy* — a provider switch that persists for the sender, and a
+/// tool restriction — so it must not be decided by text that neither the
+/// sender nor the channel authored.
+pub struct ActivationContext<'a> {
+    /// The skill a native channel command resolved to, when the channel
+    /// resolved one.
+    ///
+    /// Channels that register skills as first-class commands know which skill
+    /// was invoked before they render anything, and some render prose rather
+    /// than the `/name` form this matcher would recognize. Passing the
+    /// resolved identity keeps a registered command activating its skill —
+    /// with its provider and image-turn policy — regardless of how the channel
+    /// chose to phrase it.
+    pub invoked_skill: Option<&'a str>,
+    /// Text the sender wrote, captured at admission.
+    ///
+    /// Must be pre-enrichment. Media annotations, transcripts, fetched link
+    /// summaries and similar generated text are model-visible by design, but
+    /// they are not the sender speaking: matching a trigger inside them would
+    /// let a fetched page persist a provider switch for a sender who never
+    /// typed the phrase.
+    pub sender_text: &'a str,
+    /// Whether the turn carries an image, resolved from the typed attachment
+    /// envelope rather than from message text, so a literal `[IMAGE:` string
+    /// cannot impersonate an attachment.
+    ///
+    /// Deliberately permissive: any signal saying "image" counts, because the
+    /// restriction this drives only ever removes capability, and a false
+    /// negative would leave a real photo unrestricted.
+    pub has_image: bool,
+}
+
+/// Match a turn against skill auto-activation rules and return the first
+/// matching skill.
+///
+/// Match priority, highest first:
+/// 1. A native command identity resolved by the channel
+///    ([`ActivationContext::invoked_skill`]), which activates unconditionally.
+/// 2. Slash command typed by the sender: `/skill_name`
+///    (hyphen/underscore-insensitive, optional `@botname` suffix).
+/// 3. Trigger phrases from SKILL.toml `triggers = [...]`, matched
+///    case-insensitively on word boundaries so short triggers like "i had"
+///    cannot fire inside unrelated words.
+/// 4. The `__image__` sentinel trigger, which matches any turn that carries an
+///    image attachment.
+///
+/// Explicit identity (1 and 2) is resolved in a first pass across *all* skills
+/// before any inferred trigger is scanned. This gives an explicit invocation
+/// global precedence: the skill the sender actually named wins even when an
+/// earlier-loaded skill would match the turn's image or a phrase in the rest
+/// of the message. Without this, an earlier `__image__` or phrase candidate
+/// could preempt the resolved native command, handing the sender the wrong
+/// provider route and the wrong image-turn denylist.
+///
+/// The caller must pass the *complete* loaded skill set, not a policy-filtered
+/// subset. A native or slash command can name a skill that declares neither a
+/// provider nor an image-turn denylist; if that skill were filtered out before
+/// this matcher, the explicit identity would miss and the scan would fall
+/// through to some *other* skill's inferred trigger, activating an unrelated
+/// skill's policy. Resolving explicit identity against every loaded skill makes
+/// a policy-free explicit target resolve to itself (activating nothing) instead
+/// of leaking another skill's route or denylist.
+///
+/// Inferred triggers (3 and 4) are then scanned in the order the caller
+/// provides; discovery sorts directory entries lexically, so overlapping
+/// triggers resolve to the lexically-first skill deterministically. Only skills
+/// carrying an activation policy participate in this pass, since an inferred
+/// match on a policy-free skill would do nothing.
+pub fn match_skill_activation<'a>(
+    skills: &'a [Skill],
+    ctx: &ActivationContext<'_>,
+) -> Option<(&'a Skill, ActivationMatch)> {
+    let trimmed = ctx.sender_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let invoked = ctx.invoked_skill.map(normalize_skill_name);
+
+    // First pass: explicit identity, resolved across all skills so it takes
+    // global precedence over any inferred trigger below.
+
+    // 1. The channel already resolved which skill this is.
+    if let Some(invoked) = invoked.as_deref() {
+        for skill in skills {
+            if normalize_skill_name(&skill.name) == invoked {
+                return Some((skill, ActivationMatch::NativeCommand));
+            }
+        }
+    }
+
+    // 2. Slash command typed by the sender: /food_logger or /food-logger.
+    if trimmed.starts_with('/') {
+        let cmd = trimmed
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .strip_prefix('/')
+            .unwrap_or("")
+            .split('@')
+            .next()
+            .unwrap_or("");
+        let norm_cmd = normalize_skill_name(cmd);
+        for skill in skills {
+            if normalize_skill_name(&skill.name) == norm_cmd {
+                return Some((skill, ActivationMatch::SlashCommand));
+            }
+        }
+    }
+
+    // Second pass: inferred triggers, scanned in discovery order so overlapping
+    // triggers resolve to the lexically-first skill deterministically. These
+    // never override the explicit identity resolved above.
+    //
+    // Only skills that carry an activation policy (a provider to switch to or
+    // an image-turn denylist) can be reached by an inferred trigger. Explicit
+    // identity above is matched against every loaded skill so a native or slash
+    // command for a policy-free skill still resolves to that skill and cannot
+    // fall through to a different skill's trigger; but an *inferred* match on a
+    // policy-free skill would activate nothing, so it is skipped here to keep
+    // the deterministic winner among the skills that can actually act.
+    for skill in skills {
+        if skill.provider.is_none() && skill.blocked_tools_with_image.is_empty() {
+            continue;
+        }
+        // 3. Trigger phrases, word-boundary matched. 4. `__image__` sentinel.
+        for trigger in &skill.triggers {
+            if trigger == "__image__" {
+                if ctx.has_image {
+                    return Some((skill, ActivationMatch::ImageSentinel));
+                }
+                continue;
+            }
+            // An empty or whitespace-only trigger would compile to `\b\b`,
+            // which matches a word boundary in essentially every non-empty
+            // message and would auto-switch this skill's provider on every
+            // turn. Ignore it rather than let a malformed manifest do that.
+            if trigger.trim().is_empty() {
+                continue;
+            }
+            let pat = format!(r"\b{}\b", regex::escape(&trigger.to_ascii_lowercase()));
+            if regex::Regex::new(&pat)
+                .map(|re| re.is_match(&lower))
+                .unwrap_or(false)
+            {
+                return Some((skill, ActivationMatch::TriggerPhrase));
+            }
+        }
+    }
+    None
+}
+
+/// Which rule activated a skill.
+///
+/// Callers need this because the rules do not carry equal confidence, and
+/// activation drives two very different consequences. Removing a capability is
+/// safe to over-apply; persisting a provider switch for the sender is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationMatch {
+    /// The channel resolved a registered command to this skill.
+    NativeCommand,
+    /// The sender typed `/skill-name`.
+    SlashCommand,
+    /// The sender's text contained one of the skill's trigger phrases.
+    TriggerPhrase,
+    /// The turn carried an image and the skill declares the `__image__`
+    /// sentinel. The weakest signal of the four: it is not an expression of
+    /// intent at all, and the image verdict behind it is deliberately
+    /// permissive.
+    ImageSentinel,
+}
+
+impl ActivationMatch {
+    /// Whether this match is a deliberate act by the sender or the channel,
+    /// as opposed to an inference from what the turn happened to carry.
+    ///
+    /// Only a deliberate match should persist state beyond the turn.
+    pub fn is_explicit_invocation(self) -> bool {
+        !matches!(self, ActivationMatch::ImageSentinel)
+    }
+}
+
+/// Fold a skill name or command token to the form both are compared in:
+/// lowercase, with hyphens and underscores treated as the same separator.
+fn normalize_skill_name(name: &str) -> String {
+    name.to_ascii_lowercase()
+        .chars()
+        .map(|c| if c == '-' { '_' } else { c })
+        .collect()
+}
+
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
     load_skills_with_open_skills_config(workspace_dir, None, None, None).0
@@ -600,6 +812,46 @@ pub fn load_skills_for_agent(
     load_skills_for_agent_audited(workspace_dir, config, agent_alias).0
 }
 
+/// The skills this agent can load that declare auto-activation behavior
+/// (`provider` or `blocked_tools_with_image`), in loader order. An empty
+/// result means the per-message activation scan has nothing to consider.
+///
+/// This is a materialized view over [`load_skills_for_agent`], resolved on
+/// every call — deliberately **not** memoized behind a separate verdict.
+/// `blocked_tools_with_image` is a capability *restriction*, so the decision
+/// of whether to evaluate it has to reflect what is on disk right now: an
+/// independent memo with its own expiry could answer "no activation skills"
+/// for a skill that already exists, leaving the declared tool callable on the
+/// very image turn it is meant to block.
+///
+/// Freshness therefore rides on the canonical loader's content digest (see
+/// [`cache`]), which re-audits whenever the audited bytes change — including
+/// writes from another process, which no in-process invalidate hook can
+/// observe. The digest walk is the cost of that guarantee; a cache hit still
+/// skips the security audit, the Markdown/TOML parse, and shadow resolution,
+/// which is the expensive part.
+pub fn load_activation_candidates(
+    workspace_dir: &Path,
+    config: &zeroclaw_config::schema::Config,
+    agent_alias: &str,
+) -> Vec<Skill> {
+    load_skills_for_agent(workspace_dir, config, agent_alias)
+        .into_iter()
+        .filter(|s| s.provider.is_some() || !s.blocked_tools_with_image.is_empty())
+        .collect()
+}
+
+/// Origin tag for a pre-bundle skill, mirroring [`super::service`]'s
+/// `derive_origin` discriminators minus the bundle-dir match (a pre-bundle
+/// skill is never bundle-origin). Used to seed the dedup winner map so the
+/// shadow record can name the winner's source.
+///
+/// This is a best-effort, display-only attribution for the shadow badge: the
+/// tag-based heuristic can misclassify a workspace skill whose `tags` happen to
+/// contain `"open-skills"` (or a `plugin:`-prefixed tag). That is acceptable
+/// because the hint never affects which skills load or their precedence — it
+/// only labels the source that already won the dedup. Not an authoritative
+/// origin resolver; use [`super::service`]'s `derive_origin` for that.
 fn origin_hint_of(skill: &Skill) -> &'static str {
     if skill.tags.iter().any(|t| t == "open-skills") {
         "open-skills"
@@ -764,6 +1016,20 @@ pub fn load_skills_from_directory(
     (out.skills, out.dropped)
 }
 
+/// Single ordering seam for skill discovery: collect entry paths in lexical
+/// order. Every loader routes its `read_dir` entries through this so skill
+/// precedence ("first match wins" in activation) is deterministic across
+/// filesystems and restarts — `read_dir` iteration order is explicitly
+/// unspecified, and the winner of an overlapping trigger controls a safety
+/// restriction. Injectable input exists so the regression test can
+/// feed an explicitly shuffled list, which a `read_dir`-based fixture cannot
+/// guarantee (a filesystem may happen to iterate lexically on its own).
+fn lexically_sorted_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = paths.into_iter().collect();
+    paths.sort();
+    paths
+}
+
 fn load_skills_from_directory_uncached(
     skills_dir: &Path,
     allow_scripts: bool,
@@ -778,8 +1044,7 @@ fn load_skills_from_directory_uncached(
         return (skills, dropped);
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in lexically_sorted_paths(entries.flatten().map(|e| e.path())) {
         if !path.is_dir() {
             continue;
         }
@@ -907,8 +1172,7 @@ fn load_open_skills_from_directory_uncached(
         return (skills, dropped);
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in lexically_sorted_paths(entries.flatten().map(|e| e.path())) {
         if !path.is_dir() {
             continue;
         }
@@ -1016,8 +1280,7 @@ fn load_open_skills(repo_dir: &Path, allow_scripts: bool) -> (Vec<Skill>, Vec<Dr
         return (skills, dropped);
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
+    for path in lexically_sorted_paths(entries.flatten().map(|e| e.path())) {
         if !path.is_file() {
             continue;
         }
@@ -1335,6 +1598,9 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         slash_options: manifest.skill.slash_options,
         always: manifest.skill.always,
         location: Some(path.to_path_buf()),
+        provider: manifest.skill.provider,
+        triggers: manifest.skill.triggers,
+        blocked_tools_with_image: manifest.skill.blocked_tools_with_image,
     })
 }
 
@@ -1365,6 +1631,9 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         slash_options: parsed.meta.slash_options,
         always: parsed.meta.always,
         location: Some(path.to_path_buf()),
+        provider: None,
+        triggers: vec![],
+        blocked_tools_with_image: vec![],
     })
 }
 
@@ -1408,6 +1677,9 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         slash_options: parsed.meta.slash_options,
         always: parsed.meta.always,
         location: Some(path.to_path_buf()),
+        provider: None,
+        triggers: vec![],
+        blocked_tools_with_image: vec![],
     }))
 }
 
@@ -3879,6 +4151,16 @@ prompts = ["from-skill-section"]
 mod skill_manifest_tests {
     use super::*;
 
+    /// A turn as a sender wrote it: no native command identity, so activation
+    /// must be earned by the text or the image.
+    fn sender_turn(sender_text: &str, has_image: bool) -> ActivationContext<'_> {
+        ActivationContext {
+            invoked_skill: None,
+            sender_text,
+            has_image,
+        }
+    }
+
     #[test]
     fn parses_valid_skill_manifest() {
         let toml_str = r#"
@@ -3912,6 +4194,336 @@ descriptin = "oops"
         );
     }
 
+    /// The auto-activation fields must parse under `deny_unknown_fields`
+    /// and map through to the loaded `Skill`.
+    #[test]
+    fn accepts_auto_activation_fields_in_skill_block() {
+        let toml_str = r#"
+[skill]
+name = "food-logger"
+description = "y"
+provider = "openai-codex"
+triggers = ["__image__", "log food"]
+blocked_tools_with_image = ["sparky__sparky_manage_food"]
+"#;
+        let manifest: SkillManifest = toml::from_str(toml_str)
+            .expect("manifest with auto-activation fields should parse under deny_unknown_fields");
+        assert_eq!(manifest.skill.provider.as_deref(), Some("openai-codex"));
+        assert_eq!(manifest.skill.triggers, vec!["__image__", "log food"]);
+        assert_eq!(
+            manifest.skill.blocked_tools_with_image,
+            vec!["sparky__sparky_manage_food"]
+        );
+    }
+
+    /// Regression: an empty or whitespace-only trigger must never activate.
+    /// It would otherwise compile to `\b\b` and match nearly every message,
+    /// silently switching the skill's provider on unrelated turns.
+    #[test]
+    fn activation_ignores_empty_and_whitespace_triggers() {
+        let skills = vec![activation_skill("greedy", &["", "   ", "\t"])];
+        assert!(
+            match_skill_activation(&skills, &sender_turn("an ordinary message", false)).is_none(),
+            "empty/whitespace triggers must not match ordinary text"
+        );
+        // A real trigger alongside the empty ones still works.
+        let mixed = vec![activation_skill("mixed", &["", "log food"])];
+        assert!(
+            match_skill_activation(&mixed, &sender_turn("please log food", false)).is_some(),
+            "a valid trigger next to empty ones must still activate"
+        );
+    }
+
+    /// Regression: an explicit native command whose target skill carries no
+    /// activation policy (no provider, no image denylist) must resolve to that
+    /// skill, not fall through to another skill whose trigger the rendered
+    /// input happens to match. Before explicit identity was resolved against
+    /// the full loaded set, the policy-free target was filtered out upstream,
+    /// the identity lookup missed, and the scan reached `other`'s `log food`
+    /// trigger, wrongly applying `other`'s policy.
+    #[test]
+    fn explicit_native_command_to_policy_free_skill_does_not_fall_through() {
+        // `plain` has no provider and no image denylist.
+        let plain = Skill {
+            provider: None,
+            ..activation_skill("plain", &[])
+        };
+        let mut other = activation_skill("other", &["log food"]);
+        other.provider = Some("anthropic-other".to_string());
+
+        // The full loaded set, as the orchestrator now passes it.
+        let skills = vec![plain, other];
+
+        // Native command for `plain`; its rendered input matches `other`'s
+        // trigger.
+        let ctx = ActivationContext {
+            invoked_skill: Some("plain"),
+            sender_text: "log food",
+            has_image: false,
+        };
+        let (skill, m) = match_skill_activation(&skills, &ctx)
+            .expect("explicit native identity must resolve to its own skill");
+        assert_eq!(skill.name, "plain", "must not fall through to `other`");
+        assert_eq!(m, ActivationMatch::NativeCommand);
+
+        // Sanity: without the explicit identity, the same text does activate
+        // `other` through its trigger, proving the collision was real.
+        let inferred = match_skill_activation(&skills, &sender_turn("log food", false));
+        assert_eq!(
+            inferred.map(|(s, _)| s.name.as_str()),
+            Some("other"),
+            "the trigger collision is genuine when no explicit identity is given"
+        );
+    }
+
+    fn activation_skill(name: &str, triggers: &[&str]) -> Skill {
+        Skill {
+            name: name.to_string(),
+            description: String::new(),
+            description_localizations: Default::default(),
+            version: "0.1.0".to_string(),
+            author: None,
+            tags: vec![],
+            tools: vec![],
+            prompts: vec![],
+            slash_options: vec![],
+            location: None,
+            always: false,
+            provider: Some("openai-codex".to_string()),
+            triggers: triggers.iter().map(|s| (*s).to_string()).collect(),
+            blocked_tools_with_image: vec![],
+        }
+    }
+
+    #[test]
+    fn activation_matches_slash_command_with_hyphen_underscore_and_bot_suffix() {
+        let skills = vec![activation_skill("food-logger", &[])];
+        for msg in [
+            "/food_logger",
+            "/food-logger log this",
+            "/food_logger@mybot hi",
+        ] {
+            let hit = match_skill_activation(&skills, &sender_turn(msg, false));
+            assert_eq!(
+                hit.map(|(skill, _)| skill.name.as_str()),
+                Some("food-logger"),
+                "{msg}"
+            );
+        }
+        assert!(match_skill_activation(&skills, &sender_turn("/other", false)).is_none());
+    }
+
+    #[test]
+    fn activation_matches_trigger_on_word_boundary_only() {
+        let skills = vec![activation_skill("food-logger", &["i had"])];
+        assert!(match_skill_activation(&skills, &sender_turn("I had a burger", false)).is_some());
+        // "i had" inside other words must not fire.
+        assert!(
+            match_skill_activation(&skills, &sender_turn("trinidad semihadron", false)).is_none()
+        );
+    }
+
+    #[test]
+    fn activation_matches_image_sentinel_only_with_image() {
+        let skills = vec![activation_skill("food-logger", &["__image__"])];
+        assert!(
+            match_skill_activation(&skills, &sender_turn("[IMAGE:data:...] what is this", true))
+                .is_some()
+        );
+        assert!(match_skill_activation(&skills, &sender_turn("what is this", false)).is_none());
+    }
+
+    #[test]
+    fn activation_returns_none_without_triggers_or_slash() {
+        let skills = vec![activation_skill("food-logger", &[])];
+        assert!(match_skill_activation(&skills, &sender_turn("hello there", false)).is_none());
+        assert!(match_skill_activation(&skills, &sender_turn("hello there", true)).is_none());
+    }
+
+    #[test]
+    fn activation_prefers_first_matching_skill_in_order() {
+        let skills = vec![
+            activation_skill("first", &["log food"]),
+            activation_skill("second", &["log food"]),
+        ];
+        let hit = match_skill_activation(&skills, &sender_turn("please log food now", false));
+        assert_eq!(hit.map(|(skill, _)| skill.name.as_str()), Some("first"));
+    }
+
+    /// Regression: an explicit native command must win over an earlier-loaded
+    /// skill that merely matches the turn's image. Before explicit identity was
+    /// resolved in a global first pass, `alpha`'s `__image__` sentinel returned
+    /// first and the sender received `alpha`'s provider route and image-turn
+    /// denylist instead of the skill the channel actually resolved. The policy
+    /// asserts — not just the name — are the point: a wrong winner here hands
+    /// the turn the wrong capability restriction.
+    #[test]
+    fn explicit_native_command_beats_earlier_image_candidate() {
+        let mut alpha = activation_skill("alpha", &["__image__"]);
+        alpha.provider = Some("anthropic-alpha".to_string());
+        alpha.blocked_tools_with_image = vec!["alpha__unrelated_tool".to_string()];
+
+        let mut food = activation_skill("food-logger", &["__image__"]);
+        food.provider = Some("openai-codex-food".to_string());
+        food.blocked_tools_with_image = vec!["sparky__sparky_analyze_food_image".to_string()];
+
+        // alpha is loaded first, so its `__image__` sentinel is scanned before
+        // food-logger's identity would be reached by a single ordered loop.
+        let skills = vec![alpha, food];
+
+        let ctx = ActivationContext {
+            invoked_skill: Some("food-logger"),
+            sender_text: "log this now",
+            has_image: true,
+        };
+        let (skill, m) =
+            match_skill_activation(&skills, &ctx).expect("explicitly invoked skill must activate");
+        assert_eq!(
+            skill.name, "food-logger",
+            "resolved native identity must win"
+        );
+        assert_eq!(m, ActivationMatch::NativeCommand);
+        assert_eq!(
+            skill.provider.as_deref(),
+            Some("openai-codex-food"),
+            "the winning skill's provider route must be its own"
+        );
+        assert_eq!(
+            skill.blocked_tools_with_image,
+            vec!["sparky__sparky_analyze_food_image".to_string()],
+            "the image-turn denylist must be the invoked skill's policy"
+        );
+    }
+
+    /// Regression: a sender-typed `/food-logger` must win even when an
+    /// earlier-loaded skill's phrase trigger matches the rest of the message.
+    /// Same collision class as the native case, via the slash path.
+    #[test]
+    fn explicit_slash_command_beats_earlier_phrase_candidate() {
+        let mut alpha = activation_skill("alpha", &["log this"]);
+        alpha.provider = Some("anthropic-alpha".to_string());
+
+        let mut food = activation_skill("food-logger", &["__image__"]);
+        food.provider = Some("openai-codex-food".to_string());
+        food.blocked_tools_with_image = vec!["sparky__sparky_analyze_food_image".to_string()];
+
+        let skills = vec![alpha, food];
+
+        // Rest of the message ("log this now") matches alpha's phrase trigger,
+        // but the sender explicitly named food-logger with a slash command.
+        let (skill, m) =
+            match_skill_activation(&skills, &sender_turn("/food-logger log this now", false))
+                .expect("explicit slash command must activate");
+        assert_eq!(
+            skill.name, "food-logger",
+            "explicit slash identity must win"
+        );
+        assert_eq!(m, ActivationMatch::SlashCommand);
+        assert_eq!(skill.provider.as_deref(), Some("openai-codex-food"));
+        assert_eq!(
+            skill.blocked_tools_with_image,
+            vec!["sparky__sparky_analyze_food_image".to_string()]
+        );
+    }
+
+    /// Deterministic regression for the discovery ordering seam: a
+    /// `read_dir`-based fixture cannot force a hostile iteration order (a
+    /// filesystem may return lexical order on its own, letting an unsorted
+    /// loader pass), so the seam is exercised directly with an explicitly
+    /// shuffled input. All three skill loaders route their entries through
+    /// [`lexically_sorted_paths`]; removing the sort fails here every run.
+    #[test]
+    fn lexically_sorted_paths_orders_shuffled_input() {
+        let shuffled: Vec<PathBuf> = [
+            "mango-skill",
+            "zeta-skill",
+            "alpha-skill",
+            "tango-skill",
+            "echo-skill",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let expected: Vec<PathBuf> = [
+            "alpha-skill",
+            "echo-skill",
+            "mango-skill",
+            "tango-skill",
+            "zeta-skill",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(lexically_sorted_paths(shuffled), expected);
+    }
+
+    /// End-to-end loader + matcher coverage for deterministic precedence:
+    /// five on-disk skills share the `__image__` trigger, and the winner must
+    /// be the lexically-first directory. This proves the sorted seam is
+    /// actually wired into discovery and that the matcher honors the loader's
+    /// order; the deterministic anti-regression for the sort itself is
+    /// [`lexically_sorted_paths_orders_shuffled_input`], since `read_dir`
+    /// here may coincidentally iterate lexically on some filesystems.
+    #[test]
+    fn activation_overlapping_triggers_resolve_lexically_via_loader() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        let skills_dir = tmp.path().join("skills");
+        std::fs::create_dir_all(&skills_dir).unwrap();
+
+        // Created in a deliberately scrambled (non-lexical, non-reverse) order.
+        for name in [
+            "mango-skill",
+            "zeta-skill",
+            "alpha-skill",
+            "tango-skill",
+            "echo-skill",
+        ] {
+            let dir = skills_dir.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.toml"),
+                format!(
+                    r#"
+[skill]
+name = "{name}"
+description = "overlapping image trigger"
+provider = "openai-codex"
+triggers = ["__image__"]
+"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let (skills, dropped) = load_skills_from_directory(&skills_dir, false);
+        assert!(dropped.is_empty(), "no drops expected; got: {dropped:?}");
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "alpha-skill",
+                "echo-skill",
+                "mango-skill",
+                "tango-skill",
+                "zeta-skill"
+            ],
+            "loader must return skills in lexical directory order"
+        );
+
+        let hit = match_skill_activation(&skills, &sender_turn("what is this", true));
+        assert_eq!(
+            hit.map(|(skill, _)| skill.name.as_str()),
+            Some("alpha-skill"),
+            "overlapping __image__ trigger must resolve to the lexically-first skill"
+        );
+    }
+
+    /// Positive control for the `SkillMeta` field set × strictness
+    /// intersection: because the `[skill]` block is parsed under
+    /// `#[serde(deny_unknown_fields)]`, every declared field must stay
+    /// explicitly accepted. `prompts` is the newest such field, so it is the
+    /// one most likely to regress into an unknown-field parse error.
     #[test]
     fn accepts_prompts_in_skill_block_with_strictness() {
         let toml_str = r#"
@@ -4198,6 +4810,9 @@ mod prompt_callable_name_tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
 
         let prompt = skills_to_prompt_with_mode(
@@ -4276,6 +4891,9 @@ mod prompt_callable_name_tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
 
         let registered: Vec<String> =
@@ -4344,6 +4962,9 @@ mod prompt_callable_name_tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
 
         let prompt = skills_to_prompt_with_mode(
@@ -4432,6 +5053,71 @@ version = "0.1.0"
         .unwrap();
     }
 
+    /// An out-of-process skill install must be enforced on the
+    /// very next message, with no invalidate hook and no expiry to wait out.
+    ///
+    /// This is the safety property behind removing the old activation-gate
+    /// memo: that memo answered "does this agent declare activation skills?"
+    /// from its own snapshot, so a skill written by another process (the CLI
+    /// `skills install`, a direct directory edit) could be ignored for a full
+    /// TTL — leaving a declared `blocked_tools_with_image` tool callable on
+    /// the image turn it exists to block. `load_activation_candidates`
+    /// resolves from the canonical loader, whose freshness key is a digest of
+    /// the audited bytes, so the write below lands immediately. The test
+    /// deliberately performs NO `cache::invalidate()` after writing: passing
+    /// only because of an invalidate would not prove the out-of-band case.
+    #[test]
+    fn activation_candidates_reflect_out_of_band_install_without_invalidate() {
+        let install_root = TempDir::new().unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let agent_workspace = TempDir::new().unwrap();
+        let agent_alias = "gate-agent";
+
+        write_test_skill(agent_workspace.path(), "plain-skill");
+        let config = make_config_with_agent_workspace(
+            install_root.path(),
+            data_dir.path(),
+            agent_alias,
+            agent_workspace.path().to_path_buf(),
+        );
+
+        // Prime the load cache so the assertion below cannot pass merely
+        // because nothing had been cached yet.
+        assert!(
+            load_activation_candidates(agent_workspace.path(), &config, agent_alias).is_empty(),
+            "a plain skill declares no auto-activation behavior"
+        );
+
+        // Simulate the out-of-process writer: drop a skill on disk and call
+        // NO invalidate hook.
+        let auto_dir = agent_workspace.path().join("skills").join("auto-skill");
+        std::fs::create_dir_all(&auto_dir).unwrap();
+        std::fs::write(
+            auto_dir.join("SKILL.toml"),
+            r#"[skill]
+name = "auto-skill"
+description = "declares auto-activation"
+provider = "openai-codex"
+triggers = ["__image__"]
+blocked_tools_with_image = ["some_tool"]
+"#,
+        )
+        .unwrap();
+
+        let candidates = load_activation_candidates(agent_workspace.path(), &config, agent_alias);
+        assert_eq!(
+            candidates.len(),
+            1,
+            "an out-of-band install must be visible on the next call, with no invalidate"
+        );
+        assert_eq!(candidates[0].name, "auto-skill");
+        assert_eq!(candidates[0].blocked_tools_with_image, vec!["some_tool"]);
+    }
+
+    /// `load_skills_for_agent_from_config_audited` returns the loaded skills
+    /// *and* the audit-dropped candidates, so a caller can surface why a skill
+    /// is missing instead of silently dropping it. One clean + one
+    /// parse-broken workspace skill → 1 loaded + 1 dropped.
     #[test]
     fn load_skills_for_agent_from_config_audited_returns_dropped() {
         let install_root = TempDir::new().unwrap();

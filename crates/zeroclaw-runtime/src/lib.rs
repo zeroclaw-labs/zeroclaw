@@ -1,3 +1,7 @@
+// The tool-calling loop's future is large, and wrapping it in the turn's
+// capability-ceiling scope pushes `Send` resolution past the default depth.
+// Same remedy the matrix-enabled channels crate already uses.
+#![recursion_limit = "256"]
 #![allow(
     clippy::to_string_in_format_args,
     clippy::useless_format,

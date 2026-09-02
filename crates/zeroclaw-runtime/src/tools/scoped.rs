@@ -254,15 +254,24 @@ impl ScopedToolRegistry {
             .cloned()
             .collect();
         let pipeline_tool = config.pipeline.enabled.then(|| {
-            Arc::new(tools::PipelineTool::with_access_policy(
-                config.pipeline.clone(),
-                context_filtered_tool_arcs.clone(),
-                zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
-                    security.allowed_tools.as_deref(),
-                    security.excluded_tools.as_deref(),
-                    caller_allowed,
-                ),
-            )) as Arc<dyn Tool>
+            Arc::new(
+                tools::PipelineTool::with_access_policy(
+                    config.pipeline.clone(),
+                    context_filtered_tool_arcs.clone(),
+                    zeroclaw_tools::tool_search::ToolAccessPolicy::from_security(
+                        security.allowed_tools.as_deref(),
+                        security.excluded_tools.as_deref(),
+                        caller_allowed,
+                    ),
+                )
+                // Enforce the dynamic per-turn ceiling (e.g. a skill's
+                // image-turn denylist) in addition to the static policy above,
+                // so the pipeline cannot be used to reach a tool the turn
+                // removed. Read at validate time on the turn's task.
+                .with_turn_ceiling(std::sync::Arc::new(
+                    crate::agent::tool_ceiling::current_tool_ceiling,
+                )),
+            ) as Arc<dyn Tool>
         });
         if let Some(tool) = pipeline_tool.as_ref() {
             tools_registry.push(Box::new(tools::ArcToolRef(Arc::clone(tool))));
@@ -846,6 +855,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
         let security = Arc::new(SecurityPolicy {
             allowed_tools: Some(vec!["ops__chain".to_string()]),
@@ -1059,6 +1071,9 @@ mod tests {
             slash_options: Vec::new(),
             always: false,
             location: None,
+            provider: None,
+            triggers: Vec::new(),
+            blocked_tools_with_image: Vec::new(),
         };
         let security = Arc::new(SecurityPolicy {
             allowed_tools: Some(vec!["ops__restricted".to_string()]),

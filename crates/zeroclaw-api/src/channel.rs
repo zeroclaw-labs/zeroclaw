@@ -372,6 +372,19 @@ pub struct ChannelMessage {
     /// Inbound email References chain (parent thread); used to build the
     /// reply's References header. Empty for non-email channels.
     pub references: Vec<String>,
+    /// The skill a native channel command resolved to, set ONLY by a channel
+    /// producer that registered skills as first-class commands.
+    ///
+    /// This field creates the fact. A channel that resolves a registered
+    /// command knows the skill identity before it renders anything, but
+    /// `content` is a rendering: some channels phrase the invocation as prose,
+    /// so the identity is not recoverable from the text. Consumers applying
+    /// per-skill policy must read it here rather than re-parsing `content`,
+    /// which also carries sender-authored and enrichment-generated text.
+    ///
+    /// Never round-trips through serde, and never set from user-controlled
+    /// input.
+    pub invoked_skill: Option<String>,
 }
 
 /// Message to send through a channel
