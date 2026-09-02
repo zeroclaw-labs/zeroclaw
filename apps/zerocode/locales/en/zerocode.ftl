@@ -500,6 +500,10 @@ zc-chat-context-menu-copy = Copy
 zc-chat-context-menu-send-now = Send now
 zc-chat-context-menu-edit = Edit
 zc-chat-context-menu-delete = Delete
+zc-chat-tool-show-all = [Show all · { $count } more lines]
+zc-chat-tool-show-less = [Show less]
+zc-chat-tool-display-limited = [Display limited; copy for full content]
+zc-chat-tool-encoded-size = { $count } encoded characters
 
 zc-config-breadcrumb-root = Config
 zc-config-section-detail-hint = { $open } or { $into } to open this section

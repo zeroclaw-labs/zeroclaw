@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -2658,6 +2658,13 @@ impl Chat {
                 return;
             }
 
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+                && mouse.modifiers.is_empty()
+                && (state.toggle_tool_footer_at(col, row) || state.toggle_tool_header_at(col, row))
+            {
+                return;
+            }
+
             if !state.in_browse_mode() {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => state.scroll_up(3),
@@ -3700,82 +3707,289 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &str {
     &s[..end]
 }
 
+fn terminal_safe_tool_text_limited(
+    text: &str,
+    max_bytes: usize,
+    max_lines: usize,
+) -> (String, bool) {
+    let mut safe = String::with_capacity(text.len().min(max_bytes));
+    let mut lines = 1usize;
+    for ch in text.chars() {
+        let piece = match ch {
+            '\n' if lines >= max_lines => return (safe, true),
+            '\n' => {
+                lines += 1;
+                "\n".to_string()
+            }
+            ch if ch.is_control() => ch.escape_default().to_string(),
+            ch => ch.to_string(),
+        };
+        if safe.len().saturating_add(piece.len()) > max_bytes {
+            return (safe, true);
+        }
+        safe.push_str(&piece);
+    }
+    (safe, false)
+}
+
+const FILE_TOOL_PREVIEW_LINES: usize = 6;
+const TOOL_EXPANDED_MAX_BYTES: usize = 8 * 1024;
+const TOOL_EXPANDED_MAX_LINES: usize = 100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ToolDisclosure {
+    Collapsed,
+    Preview,
+    Full,
+}
+
+impl ToolDisclosure {
+    fn is_open(self) -> bool {
+        !matches!(self, Self::Collapsed)
+    }
+}
+
+fn valid_specialized_file_input(name: &str, input: &serde_json::Value) -> bool {
+    if input.get("path").and_then(|value| value.as_str()).is_none() {
+        return false;
+    }
+    match name {
+        "file_edit" => {
+            input
+                .get("old_string")
+                .and_then(|value| value.as_str())
+                .is_some()
+                && input
+                    .get("new_string")
+                    .and_then(|value| value.as_str())
+                    .is_some()
+        }
+        "file_write" => {
+            let has_content = input
+                .get("content")
+                .and_then(|value| value.as_str())
+                .is_some();
+            let valid_encoding = match input.get("encoding") {
+                None => true,
+                Some(serde_json::Value::String(encoding)) => {
+                    encoding == "utf8" || encoding == "base64"
+                }
+                Some(_) => false,
+            };
+            has_content && valid_encoding
+        }
+        _ => false,
+    }
+}
+
+fn default_tool_disclosure(name: &str, input_json: &str) -> ToolDisclosure {
+    let specialized = matches!(name, "file_edit" | "file_write")
+        && serde_json::from_str::<serde_json::Value>(input_json)
+            .is_ok_and(|input| valid_specialized_file_input(name, &input));
+    if specialized {
+        ToolDisclosure::Preview
+    } else {
+        ToolDisclosure::Collapsed
+    }
+}
+
+fn semantic_tool_metadata(input: &serde_json::Value, bulk_fields: &[&str]) -> String {
+    let Some(object) = input.as_object() else {
+        return input.to_string();
+    };
+    let metadata = object
+        .iter()
+        .filter(|(key, _)| !bulk_fields.contains(&key.as_str()))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::Value::Object(metadata).to_string()
+}
+
 fn render_tool_entry(
     lines: &mut Vec<Line<'static>>,
     name: &str,
     input_json: &str,
     result: Option<&str>,
     is_selected: bool,
-) {
+    disclosure: ToolDisclosure,
+) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
         Modifier::empty()
     };
+    let marker = if disclosure.is_open() { "▼" } else { "▶" };
     lines.push(Line::from(vec![Span::styled(
-        format!("[tool: {name}] "),
+        format!("{marker} [tool: {name}] "),
         theme::tool_label_style().add_modifier(sel_mod),
     )]));
 
-    let parsed: Option<serde_json::Value> = match name {
-        "file_edit" | "file_write" => serde_json::from_str(input_json).ok(),
-        _ => None,
+    let preview = |text: &str, max_bytes: usize| {
+        let (compact, limited) = terminal_safe_tool_text_limited(text, max_bytes, 1);
+        if limited {
+            format!("{compact}…")
+        } else {
+            compact
+        }
     };
-
-    let body_start = lines.len();
-    match name {
-        "file_edit" => {
-            let input = parsed.as_ref();
-            let old = input
-                .and_then(|v| v.get("old_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let new = input
-                .and_then(|v| v.get("new_string"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let path = input.and_then(|v| v.get("path")).and_then(|v| v.as_str());
-            let ext = input.and_then(|v| file_ext(v));
-            let start_line = path
-                .and_then(|p| std::fs::read_to_string(p).ok())
-                .and_then(|content| {
-                    content
-                        .find(old)
-                        .map(|idx| content[..idx].bytes().filter(|b| *b == b'\n').count() + 1)
-                })
-                .unwrap_or(1);
-            lines.extend(diff::diff_lines(old, new, ext, start_line));
-        }
-        "file_write" => {
-            let input = parsed.as_ref();
-            let content = input
-                .and_then(|v| v.get("content"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let ext = input.and_then(|v| file_ext(v));
-            lines.extend(diff::write_lines(content, ext));
-        }
-        _ => {
-            let truncated = if input_json.len() > 120 {
-                format!("{}…", truncate_utf8(input_json, 120))
+    let push_text = |lines: &mut Vec<Line<'static>>, label: &str, text: &str| {
+        for (line_idx, text_line) in text.split('\n').enumerate() {
+            let prefix = if line_idx == 0 {
+                format!("  {label}: ")
             } else {
-                input_json.to_string()
+                "    ".to_string()
             };
             lines.push(Line::from(Span::styled(
-                format!("  {truncated}"),
+                format!("{prefix}{text_line}"),
                 theme::dim_style().add_modifier(sel_mod),
             )));
         }
+    };
+
+    let body_start = lines.len();
+    let mut footer = None;
+    let mut display_limited = false;
+    let render_generic_input = |lines: &mut Vec<Line<'static>>| {
+        let (input, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(
+                input_json,
+                TOOL_EXPANDED_MAX_BYTES,
+                TOOL_EXPANDED_MAX_LINES,
+            )
+        } else {
+            (preview(input_json, 120), false)
+        };
+        push_text(lines, "input", &input);
+        limited
+    };
+    match name {
+        "file_edit" => {
+            if disclosure.is_open() {
+                let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+                let valid = parsed
+                    .as_ref()
+                    .filter(|input| valid_specialized_file_input(name, input))
+                    .and_then(|input| {
+                        Some((
+                            input.get("old_string")?.as_str()?,
+                            input.get("new_string")?.as_str()?,
+                        ))
+                    });
+                if let (Some(input), Some((old, new))) = (parsed.as_ref(), valid) {
+                    let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
+                        &semantic_tool_metadata(input, &["old_string", "new_string"]),
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    display_limited |= metadata_limited;
+                    push_text(lines, "input", &metadata);
+                    let (old, old_limited) = terminal_safe_tool_text_limited(
+                        old,
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    let (new, new_limited) = terminal_safe_tool_text_limited(
+                        new,
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    display_limited |= old_limited || new_limited;
+                    let rendered = diff::diff_lines_limited(
+                        &old,
+                        &new,
+                        file_ext(input),
+                        None,
+                        matches!(disclosure, ToolDisclosure::Preview)
+                            .then_some(FILE_TOOL_PREVIEW_LINES),
+                    );
+                    footer = (rendered.total > FILE_TOOL_PREVIEW_LINES).then_some(rendered.omitted);
+                    lines.extend(rendered.lines);
+                } else {
+                    display_limited |= render_generic_input(lines);
+                }
+            }
+        }
+        "file_write" => {
+            if disclosure.is_open() {
+                let parsed = serde_json::from_str::<serde_json::Value>(input_json).ok();
+                let content = parsed
+                    .as_ref()
+                    .filter(|input| valid_specialized_file_input(name, input))
+                    .and_then(|input| input.get("content"))
+                    .and_then(|value| value.as_str());
+                if let (Some(input), Some(content)) = (parsed.as_ref(), content) {
+                    let (metadata, metadata_limited) = terminal_safe_tool_text_limited(
+                        &semantic_tool_metadata(input, &["content"]),
+                        TOOL_EXPANDED_MAX_BYTES,
+                        TOOL_EXPANDED_MAX_LINES,
+                    );
+                    display_limited |= metadata_limited;
+                    push_text(lines, "input", &metadata);
+                    let encoding = input
+                        .get("encoding")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("utf8");
+                    if encoding == "base64" {
+                        push_text(
+                            lines,
+                            "content",
+                            &crate::i18n::t_args(
+                                "zc-chat-tool-encoded-size",
+                                &[("count", &content.len().to_string())],
+                            ),
+                        );
+                    } else {
+                        let (content, limited) = terminal_safe_tool_text_limited(
+                            content,
+                            TOOL_EXPANDED_MAX_BYTES,
+                            TOOL_EXPANDED_MAX_LINES,
+                        );
+                        display_limited |= limited;
+                        let rendered = diff::write_lines_limited(
+                            &content,
+                            file_ext(input),
+                            matches!(disclosure, ToolDisclosure::Preview)
+                                .then_some(FILE_TOOL_PREVIEW_LINES),
+                        );
+                        footer =
+                            (rendered.total > FILE_TOOL_PREVIEW_LINES).then_some(rendered.omitted);
+                        lines.extend(rendered.lines);
+                    }
+                } else {
+                    display_limited |= render_generic_input(lines);
+                }
+            }
+        }
+        _ => display_limited |= render_generic_input(lines),
+    }
+
+    let mut footer_line = None;
+    if let Some(omitted) = footer {
+        let text = if matches!(disclosure, ToolDisclosure::Full) {
+            crate::i18n::t("zc-chat-tool-show-less")
+        } else {
+            crate::i18n::t_args("zc-chat-tool-show-all", &[("count", &omitted.to_string())])
+        };
+        footer_line = Some(lines.len());
+        lines.push(Line::from(Span::styled(
+            format!("  {text}"),
+            theme::tool_label_style().add_modifier(sel_mod),
+        )));
     }
 
     if let Some(res) = result {
-        let truncated = if res.len() > 200 {
-            format!("{}…", truncate_utf8(res, 200))
+        let (result, limited) = if matches!(disclosure, ToolDisclosure::Full) {
+            terminal_safe_tool_text_limited(res, TOOL_EXPANDED_MAX_BYTES, TOOL_EXPANDED_MAX_LINES)
         } else {
-            res.to_string()
+            (preview(res, 200), false)
         };
+        push_text(lines, "result", &result);
+        display_limited |= limited;
+    }
+
+    if display_limited {
         lines.push(Line::from(Span::styled(
-            format!("  → {truncated}"),
+            format!("  {}", crate::i18n::t("zc-chat-tool-display-limited")),
             theme::dim_style().add_modifier(sel_mod),
         )));
     }
@@ -3790,6 +4004,7 @@ fn render_tool_entry(
                 .collect();
         }
     }
+    footer_line
 }
 
 /// Render a single committed entry into `lines`.
@@ -3799,9 +4014,10 @@ fn render_entry_into(
     entry: &ChatEntry,
     is_selected: bool,
     show_thoughts: bool,
+    tool_disclosure: ToolDisclosure,
     width: u16,
     lines: &mut Vec<Line<'static>>,
-) {
+) -> Option<usize> {
     let sel_mod = if is_selected {
         Modifier::REVERSED
     } else {
@@ -3883,15 +4099,17 @@ fn render_entry_into(
             result,
             ..
         } => {
-            render_tool_entry(
+            return render_tool_entry(
                 lines,
                 name.as_ref(),
                 input_json.as_ref(),
                 result.as_deref().map(|s| s as &str),
                 is_selected,
+                tool_disclosure,
             );
         }
     }
+    None
 }
 
 /// Locate the `[Copy]` label within a code-fence bar line. Returns the label's
@@ -4010,6 +4228,37 @@ fn fenced_text(_lang: Option<&str>, body: &str) -> String {
     body.to_string()
 }
 
+fn append_wrapped_hit_rects(
+    regions: &mut Vec<(usize, Rect)>,
+    entry_idx: usize,
+    line: &Line<'static>,
+    screen_start: u16,
+    scroll: u16,
+    body: Rect,
+) {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    for (row_offset, visual_line) in crate::input_bar::wrap_visual_lines(&text, body.width)
+        .iter()
+        .enumerate()
+    {
+        let screen_row = screen_start.saturating_add(row_offset as u16);
+        if screen_row < scroll || screen_row >= scroll.saturating_add(body.height) {
+            continue;
+        }
+        let width = crate::display_width::display_width(&text[visual_line.start..visual_line.end])
+            .min(usize::from(body.width));
+        if width > 0 {
+            regions.push((
+                entry_idx,
+                Rect::new(body.x, body.y + (screen_row - scroll), width as u16, 1),
+            ));
+        }
+    }
+}
 /// Build a `[Copy]` region if its global wrapped row is on-screen.
 fn copy_region(
     global_row: u16,
@@ -4224,7 +4473,11 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
     let body_w = inner_width;
     let body_h = inner_height;
     state.entry_rects.clear();
-    for &(entry_idx, screen_lo, screen_hi, content_width) in &state.cached_screen_ranges {
+    state.tool_header_rects.clear();
+    state.tool_footer_rects.clear();
+    for range_idx in 0..state.cached_screen_ranges.len() {
+        let (entry_idx, screen_lo, screen_hi, content_width) =
+            state.cached_screen_ranges[range_idx];
         let visible_lo = screen_lo.max(scroll);
         let visible_hi = screen_hi.min(scroll + body_h);
         if visible_hi <= visible_lo {
@@ -4240,6 +4493,37 @@ fn render_conversation(f: &mut Frame, state: &mut ChatState, area: Rect) {
             visible_hi - visible_lo,
         );
         state.entry_rects.push((entry_idx, rect));
+
+        if matches!(state.entries.get(entry_idx), Some(ChatEntry::Tool { .. })) {
+            let (_, line_lo, line_hi) = state.cached_line_ranges[range_idx];
+            let header_line = &state.cached_lines[line_lo];
+            append_wrapped_hit_rects(
+                &mut state.tool_header_rects,
+                entry_idx,
+                header_line,
+                screen_lo,
+                scroll,
+                body_area,
+            );
+
+            if let Some(&footer_line) = state.cached_tool_footer_lines.get(&entry_idx)
+                && (line_lo..line_hi).contains(&footer_line)
+            {
+                let rows_before_footer = state.cached_lines[line_lo..footer_line]
+                    .iter()
+                    .map(|line| wrapped_rows(line, inner_width))
+                    .fold(0_u16, u16::saturating_add);
+                let footer_screen_lo = screen_lo.saturating_add(rows_before_footer);
+                append_wrapped_hit_rects(
+                    &mut state.tool_footer_rects,
+                    entry_idx,
+                    &state.cached_lines[footer_line],
+                    footer_screen_lo,
+                    scroll,
+                    body_area,
+                );
+            }
+        }
     }
 
     let body_rect = Rect::new(body_x, body_y, body_w, body_h);
@@ -5517,6 +5801,12 @@ pub struct ChatState {
     transcript_selection: Option<TranscriptSelection>,
     /// Per-entry hit rects from the last draw.
     entry_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Visible tool-header hit rects from the last draw.
+    tool_header_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Visible file-tool footer hit rects from the last draw.
+    tool_footer_rects: Vec<(usize, ratatui::layout::Rect)>,
+    /// Per-tool disclosure overrides; file tools otherwise default to preview.
+    tool_disclosures: BTreeMap<Arc<str>, ToolDisclosure>,
     /// Clickable `[Copy]` labels from the last draw.
     copy_hit_regions: Vec<CopyHitRegion>,
     /// Full code-block targets used by right-click context-menu resolution.
@@ -5543,6 +5833,8 @@ pub struct ChatState {
     /// Per-entry unwrapped-line ranges in `cached_lines` — `(entry_idx,
     /// start, end_exclusive)`. Used by mouse hit-testing.
     cached_line_ranges: Vec<(usize, usize, usize)>,
+    /// Per-entry disclosure footer line indices in `cached_lines`.
+    cached_tool_footer_lines: BTreeMap<usize, usize>,
     /// Per-entry screen-row ranges: `(entry_idx, screen_start, screen_end,
     /// content_width)`. Unlike `cached_line_ranges` (unwrapped line indices),
     /// these account for markdown wrapping so mouse hit-testing (`entry_rects`)
@@ -5647,6 +5939,9 @@ impl ChatState {
             transcript_snapshot: None,
             transcript_selection: None,
             entry_rects: Vec::new(),
+            tool_header_rects: Vec::new(),
+            tool_footer_rects: Vec::new(),
+            tool_disclosures: BTreeMap::new(),
             copy_hit_regions: Vec::new(),
             context_copy_regions: Vec::new(),
             context_menu: None,
@@ -5662,6 +5957,7 @@ impl ChatState {
             cached_lines: Vec::new(),
             cached_row_breaks: Vec::new(),
             cached_line_ranges: Vec::new(),
+            cached_tool_footer_lines: BTreeMap::new(),
             cached_screen_ranges: Vec::new(),
             dirty: LinesDirty::Full,
             cached_entry_count: 0,
@@ -6008,6 +6304,88 @@ impl ChatState {
         }
     }
 
+    fn toggle_tool_header_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(entry_idx) = self
+            .tool_header_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(idx, _)| *idx)
+        else {
+            return false;
+        };
+        let Some(ChatEntry::Tool {
+            tool_call_id,
+            name,
+            input_json,
+            ..
+        }) = self.entries.get(entry_idx)
+        else {
+            return false;
+        };
+        let tool_call_id = Arc::clone(tool_call_id);
+        let current = self
+            .tool_disclosures
+            .get(&tool_call_id)
+            .copied()
+            .unwrap_or_else(|| default_tool_disclosure(name, input_json));
+        let next = match current {
+            ToolDisclosure::Collapsed => match default_tool_disclosure(name, input_json) {
+                ToolDisclosure::Preview => ToolDisclosure::Preview,
+                ToolDisclosure::Collapsed | ToolDisclosure::Full => ToolDisclosure::Full,
+            },
+            ToolDisclosure::Preview | ToolDisclosure::Full => ToolDisclosure::Collapsed,
+        };
+        self.tool_disclosures.insert(tool_call_id, next);
+        self.clear_transcript_selection();
+        self.mark_dirty_full();
+        true
+    }
+
+    fn disclosure_for_entry(&self, entry: &ChatEntry) -> ToolDisclosure {
+        let ChatEntry::Tool {
+            tool_call_id,
+            name,
+            input_json,
+            ..
+        } = entry
+        else {
+            return ToolDisclosure::Collapsed;
+        };
+        self.tool_disclosures
+            .get(tool_call_id)
+            .copied()
+            .unwrap_or_else(|| default_tool_disclosure(name, input_json))
+    }
+
+    fn toggle_tool_footer_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(entry_idx) = self
+            .tool_footer_rects
+            .iter()
+            .find(|(_, rect)| mouse::in_rect(column, row, *rect))
+            .map(|(idx, _)| *idx)
+        else {
+            return false;
+        };
+        let Some(ChatEntry::Tool { tool_call_id, .. }) = self.entries.get(entry_idx) else {
+            return false;
+        };
+        let tool_call_id = Arc::clone(tool_call_id);
+        let current = self
+            .tool_disclosures
+            .get(&tool_call_id)
+            .copied()
+            .unwrap_or(ToolDisclosure::Preview);
+        let next = if matches!(current, ToolDisclosure::Full) {
+            ToolDisclosure::Preview
+        } else {
+            ToolDisclosure::Full
+        };
+        self.tool_disclosures.insert(tool_call_id, next);
+        self.clear_transcript_selection();
+        self.mark_dirty_full();
+        true
+    }
+
     /// Yank a single entry's body text for explicit copy actions.
     fn yank_single_entry(&self, idx: usize) -> String {
         self.entries
@@ -6188,10 +6566,12 @@ impl ChatState {
             for (rel_idx, entry) in self.entries[render_from..].iter().enumerate() {
                 let abs_idx = render_from + rel_idx;
                 let before = new_lines.len();
-                render_entry_into(
+                let disclosure = self.disclosure_for_entry(entry);
+                let footer_line = render_entry_into(
                     entry,
                     self.is_entry_highlighted(abs_idx),
                     show_thoughts,
+                    disclosure,
                     width,
                     &mut new_lines,
                 );
@@ -6199,6 +6579,10 @@ impl ChatState {
                 if after > before {
                     let base = self.cached_lines.len();
                     new_ranges.push((abs_idx, base + before, base + after));
+                }
+                if let Some(footer_line) = footer_line {
+                    self.cached_tool_footer_lines
+                        .insert(abs_idx, self.cached_lines.len() + footer_line);
                 }
             }
             let appended_rows =
@@ -6219,14 +6603,17 @@ impl ChatState {
         // Full rebuild path.
         let mut lines = Vec::new();
         let mut ranges = Vec::new();
+        let mut footer_lines = BTreeMap::new();
         let show_thoughts = self.show_thoughts;
         for (rel_idx, entry) in self.entries[start..].iter().enumerate() {
             let abs_idx = start + rel_idx;
             let before = lines.len();
-            render_entry_into(
+            let disclosure = self.disclosure_for_entry(entry);
+            let footer_line = render_entry_into(
                 entry,
                 self.is_entry_highlighted(abs_idx),
                 show_thoughts,
+                disclosure,
                 width,
                 &mut lines,
             );
@@ -6234,10 +6621,14 @@ impl ChatState {
             if after > before {
                 ranges.push((abs_idx, before, after));
             }
+            if let Some(footer_line) = footer_line {
+                footer_lines.insert(abs_idx, footer_line);
+            }
         }
         self.cached_row_breaks = row_breaks_for_lines(&lines, width);
         self.cached_lines = lines;
         self.cached_line_ranges = ranges;
+        self.cached_tool_footer_lines = footer_lines;
         self.cached_entry_count = total - start;
         self.cached_render_start = start;
         self.dirty = LinesDirty::Clean;
@@ -7353,6 +7744,10 @@ impl ChatState {
         self.cached_lines.clear();
         self.cached_row_breaks.clear();
         self.entry_rects.clear();
+        self.tool_header_rects.clear();
+        self.tool_footer_rects.clear();
+        self.tool_disclosures.clear();
+        self.cached_tool_footer_lines.clear();
         self.copy_hit_regions.clear();
         self.context_copy_regions.clear();
         self.context_menu = None;
@@ -10963,6 +11358,375 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn tool_result_retention_truncates_utf8_safely_and_keeps_marker() {
+        let mut s = state();
+        s.apply_update(SessionUpdate::ToolCall {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-long".to_string(),
+            name: "shell".to_string(),
+            raw_input: serde_json::json!({"command": "long-output"}),
+        });
+        let raw_output = format!("{}éé", "a".repeat(16 * 1024 - 1));
+        s.apply_update(SessionUpdate::ToolResult {
+            session_id: "sess-1".to_string(),
+            tool_call_id: "tc-long".to_string(),
+            raw_output,
+        });
+
+        let ChatEntry::Tool {
+            result: Some(result),
+            ..
+        } = &s.entries()[0]
+        else {
+            panic!("expected retained tool result");
+        };
+        assert!(result.ends_with("…[truncated]"));
+        assert!(result.is_char_boundary(result.len()));
+    }
+
+    fn rendered_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn tool_entry_disclosure_shows_full_retained_content_only_when_expanded() {
+        let input = format!(r#"{{"command":"{}"}}"#, "x".repeat(180));
+        let result = format!(
+            "first line\n{}\n\u{1b}]52;c;payload\u{7}\n…[truncated]",
+            "y".repeat(240)
+        );
+
+        let mut collapsed = Vec::new();
+        render_tool_entry(
+            &mut collapsed,
+            "shell",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed_text = rendered_text(&collapsed);
+        assert!(collapsed_text.starts_with("▶ [tool: shell]"));
+        assert!(collapsed_text.contains("input:"));
+        assert!(collapsed_text.contains("result:"));
+        assert!(!collapsed_text.contains(&input));
+        assert!(!collapsed_text.contains("→"));
+
+        let mut expanded = Vec::new();
+        render_tool_entry(
+            &mut expanded,
+            "shell",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let expanded_text = rendered_text(&expanded);
+        assert!(expanded_text.starts_with("▼ [tool: shell]"));
+        assert!(expanded_text.contains(&input));
+        assert!(expanded_text.contains(&"y".repeat(240)));
+        assert!(!expanded_text.contains('\u{1b}'));
+        assert!(!expanded_text.contains('\u{7}'));
+        assert!(expanded_text.contains("\\u{1b}]52;c;payload\\u{7}"));
+        assert!(expanded_text.contains("…[truncated]"));
+    }
+
+    #[test]
+    fn expanded_tool_display_is_bounded_while_copy_retains_full_content() {
+        let input_tail = "input-tail-must-remain-copyable";
+        let result_tail = "result-tail-must-remain-copyable";
+        let input = format!("{}\n{input_tail}", "input line\n".repeat(500));
+        let result = format!("{}\n{result_tail}", "result line\n".repeat(500));
+        let mut lines = Vec::new();
+
+        render_tool_entry(
+            &mut lines,
+            "shell",
+            &input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+
+        let text = rendered_text(&lines);
+        assert!(lines.len() <= 2 * TOOL_EXPANDED_MAX_LINES + 2);
+        assert!(text.contains("Display limited; copy for full content"));
+        assert!(!text.contains(input_tail));
+        assert!(!text.contains(result_tail));
+
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::from("tc-oversized"),
+            name: Arc::from("shell"),
+            input_json: Arc::from(input),
+            result: Some(Arc::from(result)),
+        };
+        let copied = clipboard_text(&entry);
+        assert!(copied.contains(input_tail));
+        assert!(copied.contains(result_tail));
+    }
+
+    #[test]
+    fn file_tool_preview_is_six_lines_and_full_view_avoids_raw_content_duplication() {
+        let edit_input = serde_json::json!({
+            "path": "/tmp/example.rs",
+            "old_string": "fn old() {}",
+            "new_string": "fn new() {}",
+        })
+        .to_string();
+        let mut collapsed_edit_lines = Vec::new();
+        render_tool_entry(
+            &mut collapsed_edit_lines,
+            "file_edit",
+            &edit_input,
+            Some("done"),
+            false,
+            ToolDisclosure::Collapsed,
+        );
+        let collapsed_edit_text = rendered_text(&collapsed_edit_lines);
+        assert!(collapsed_edit_text.starts_with("▶ [tool: file_edit]"));
+        assert!(!collapsed_edit_text.contains("fn old() {}"));
+        assert!(!collapsed_edit_text.contains("fn new() {}"));
+        assert!(!collapsed_edit_text.contains(&edit_input));
+        assert!(collapsed_edit_text.contains("result: done"));
+
+        let content = (0..10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let write_input = serde_json::json!({
+            "path": "/tmp/example.txt",
+            "content": content,
+        })
+        .to_string();
+        let result = format!("first\n{}", "result".repeat(60));
+        let mut preview_lines = Vec::new();
+        let footer_line = render_tool_entry(
+            &mut preview_lines,
+            "file_write",
+            &write_input,
+            Some(&result),
+            false,
+            ToolDisclosure::Preview,
+        );
+        let preview_text = rendered_text(&preview_lines);
+        let footer_line = footer_line.expect("long preview has a disclosure footer");
+        assert!(preview_text.starts_with("▼ [tool: file_write]"));
+        assert!(preview_text.contains(r#"input: {"path":"/tmp/example.txt"}"#));
+        assert!(preview_text.contains("line 0"));
+        assert!(preview_text.contains("line 5"));
+        assert!(!preview_text.contains("line 6"));
+        assert!(preview_text.contains("4 more lines"));
+        assert!(!preview_text.contains(&write_input));
+        assert!(!preview_text.contains(&result));
+        assert!(
+            preview_lines[footer_line]
+                .to_string()
+                .contains("4 more lines")
+        );
+        assert!(preview_text.find("line 5").unwrap() < preview_text.find("4 more lines").unwrap());
+        assert!(
+            preview_text.find("4 more lines").unwrap()
+                < preview_text.find("result: first").unwrap()
+        );
+
+        let mut full_lines = Vec::new();
+        render_tool_entry(
+            &mut full_lines,
+            "file_write",
+            &write_input,
+            Some(&result),
+            false,
+            ToolDisclosure::Full,
+        );
+        let full_text = rendered_text(&full_lines);
+        assert!(full_text.contains("line 9"));
+        assert!(full_text.contains("first"));
+        assert!(full_text.contains(&"result".repeat(60)));
+        assert!(full_text.contains("[Show less]"));
+        assert!(!full_text.contains(&write_input));
+        assert!(full_text.find("line 9").unwrap() < full_text.find("[Show less]").unwrap());
+        assert!(full_text.find("[Show less]").unwrap() < full_text.find("result: first").unwrap());
+    }
+
+    #[test]
+    fn file_write_base64_and_malformed_inputs_have_safe_fallbacks() {
+        let base64_input = serde_json::json!({
+            "path": "/tmp/example.bin",
+            "content": "A".repeat(4_000),
+            "encoding": "base64",
+        })
+        .to_string();
+        let mut base64_lines = Vec::new();
+        let footer_line = render_tool_entry(
+            &mut base64_lines,
+            "file_write",
+            &base64_input,
+            None,
+            false,
+            ToolDisclosure::Preview,
+        );
+        let base64_text = rendered_text(&base64_lines);
+        assert!(footer_line.is_none());
+        assert!(base64_text.contains(r#""encoding":"base64""#));
+        assert!(base64_text.contains("content: 4000 encoded characters"));
+        assert!(!base64_text.contains(&"A".repeat(200)));
+
+        let malformed = r#"{"path":"/tmp/example.txt""#;
+        let mut malformed_lines = Vec::new();
+        render_tool_entry(
+            &mut malformed_lines,
+            "file_write",
+            malformed,
+            None,
+            false,
+            ToolDisclosure::Preview,
+        );
+        assert!(rendered_text(&malformed_lines).contains(malformed));
+
+        for invalid in [
+            serde_json::json!({"content": "text"}),
+            serde_json::json!({"path": "/tmp/a.txt", "content": "text", "encoding": 3}),
+            serde_json::json!({"path": "/tmp/a.txt", "content": "text", "encoding": "hex"}),
+        ] {
+            let invalid = invalid.to_string();
+            assert_eq!(
+                default_tool_disclosure("file_write", &invalid),
+                ToolDisclosure::Collapsed
+            );
+        }
+        assert_eq!(
+            default_tool_disclosure("file_edit", r#"{"old_string":"a","new_string":"b"}"#),
+            ToolDisclosure::Collapsed
+        );
+    }
+
+    #[test]
+    fn wrapped_tool_hit_regions_exclude_blank_cells_and_respect_scroll() {
+        let label = crate::i18n::t_args("zc-chat-tool-show-all", &[("count", "123")]);
+        let line = Line::from(format!("  {label}"));
+        let body = Rect::new(5, 7, 10, 2);
+        let mut regions = Vec::new();
+        append_wrapped_hit_rects(&mut regions, 4, &line, 4, 5, body);
+
+        assert_eq!(regions.len(), 2, "first wrapped row is scrolled out");
+        assert!(
+            regions
+                .iter()
+                .all(|(entry, rect)| *entry == 4 && rect.height == 1)
+        );
+        assert_eq!(regions[0].1.y, body.y);
+        assert!(regions[0].1.width <= body.width);
+        assert!(regions[1].1.width < body.width);
+        assert!(!mouse::in_rect(
+            body.x + body.width - 1,
+            regions[1].1.y,
+            regions[1].1
+        ));
+    }
+
+    #[test]
+    fn tool_clipboard_keeps_raw_input_and_result() {
+        let entry = ChatEntry::Tool {
+            tool_call_id: Arc::<str>::from("tc-copy"),
+            name: Arc::<str>::from("file_write"),
+            input_json: Arc::<str>::from(r#"{"path":"a.txt","content":"raw"}"#),
+            result: Some(Arc::<str>::from("written")),
+        };
+        let copied = clipboard_text(&entry);
+        assert!(copied.contains(r#""content":"raw""#));
+        assert!(copied.contains("written"));
+    }
+
+    #[tokio::test]
+    async fn file_tool_header_and_footer_clicks_keep_cards_independent() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let (mut chat, _rx) = test_chat();
+        let mut state = state();
+        let content = (0..10)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for (id, path) in [("tc-1", "first.txt"), ("tc-2", "second.txt")] {
+            state.entries.push(ChatEntry::Tool {
+                tool_call_id: Arc::<str>::from(id),
+                name: Arc::<str>::from("file_write"),
+                input_json: Arc::<str>::from(
+                    serde_json::json!({"path": path, "content": content.clone()}).to_string(),
+                ),
+                result: Some(Arc::<str>::from("written")),
+            });
+        }
+        state.mark_dirty_full();
+
+        let area = Rect::new(0, 0, 80, 34);
+        let backend = TestBackend::new(area.width, area.height);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| render(frame, &mut state, area, PaneKind::Chat))
+            .expect("draw chat");
+        let first_footer = state.tool_footer_rects[0].1;
+        chat.phase = ChatPhase::Active(Box::new(state));
+
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first_footer.x + 1,
+                row: first_footer.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.tool_disclosures.get("tc-1"),
+            Some(&ToolDisclosure::Full)
+        );
+        assert!(!state.tool_disclosures.contains_key("tc-2"));
+        assert_eq!(state.dirty, LinesDirty::Full);
+
+        terminal
+            .draw(|frame| render(frame, state, area, PaneKind::Chat))
+            .expect("redraw expanded chat");
+        let first_header = state.tool_header_rects[0].1;
+        chat.handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: first_header.x + 1,
+                row: first_header.y,
+                modifiers: KeyModifiers::NONE,
+            },
+            area,
+        )
+        .await;
+        let ChatPhase::Active(state) = &mut chat.phase else {
+            panic!("expected active chat");
+        };
+        assert_eq!(
+            state.tool_disclosures.get("tc-1"),
+            Some(&ToolDisclosure::Collapsed)
+        );
+        assert!(!state.tool_disclosures.contains_key("tc-2"));
+
+        state.reset_for_session(
+            "sess-2".to_string(),
+            None,
+            crate::todo_tracker::TodoTrackerSettings::default(),
+        );
+        assert!(state.tool_disclosures.is_empty());
+        assert!(state.tool_header_rects.is_empty());
+        assert!(state.tool_footer_rects.is_empty());
     }
 
     #[test]
