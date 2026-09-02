@@ -11,6 +11,15 @@ use zeroclaw_api::plan::PlanEntry;
 use zeroclaw_infra::session_queue::SessionActorQueue;
 use zeroclaw_providers::ModelProvider;
 
+/// Error returned by [`SessionStore::lock_model_provider_update_with_timeout`].
+#[derive(Debug)]
+pub(crate) enum WaitForProviderUpdateError {
+    /// The session no longer exists.
+    SessionNotFound,
+    /// The update lock was not released within the requested timeout.
+    Timeout,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CancelCause {
@@ -72,6 +81,24 @@ pub struct RpcSession {
     /// and pass it to `SessionStore::apply_model_provider` so stale work
     /// cannot mutate a successor installed under the same session ID.
     pub generation: u64,
+    /// Set when this session was published with a provider/resolver binding
+    /// whose config generation is not yet confirmed — today, an ACP
+    /// rehydration that lost the race for `config_write_lock` and was
+    /// therefore excluded from an in-flight refresh transaction's
+    /// `list_ids()` snapshot.
+    ///
+    /// Between insertion and reconciliation the session is live but its
+    /// binding is provisional: dispatch would use the construction-time
+    /// provider while canonical config has already moved on. Consumers that
+    /// must observe one coherent generation (`session/prompt`,
+    /// `session/configure`) await this before proceeding; reconciliation or a
+    /// later ordinary refresh clears it and wakes them only after publishing
+    /// the committed binding.
+    ///
+    /// `None` is the steady state — a session inserted with a confirmed
+    /// binding never carries one, so the common path costs one `Option`
+    /// check.
+    pending_generation: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RpcSession {
@@ -94,7 +121,17 @@ impl RpcSession {
             chat_mode,
             owner_tui_id: None,
             generation: 0,
+            pending_generation: None,
         }
+    }
+
+    /// Mark this session as published with a provisional binding. The
+    /// returned notifier is handed to the reconciliation and refresh paths,
+    /// which call `SessionStore::clear_pending_generation` only after a
+    /// committed binding has been published for this session generation.
+    pub fn with_pending_generation(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.pending_generation = Some(notify);
+        self
     }
 
     /// Bind this session to a TUI owner.
@@ -149,7 +186,15 @@ impl SessionStore {
         }
     }
 
-    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<(), &'static str> {
+    pub async fn insert(&self, id: String, mut session: RpcSession) -> Result<u64, &'static str> {
+        // Replacement is part of the session actor lifecycle. Serialize it
+        // with prompts so a same-ID successor cannot be published midway
+        // through a turn admitted for the predecessor.
+        let _session_guard = self
+            .session_queue
+            .acquire(&id)
+            .await
+            .map_err(|_| "session busy")?;
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
             return Err("session limit reached");
@@ -160,7 +205,7 @@ impl SessionStore {
             .wrapping_add(1);
         session.generation = generation;
         sessions.insert(id, session);
-        Ok(())
+        Ok(generation)
     }
 
     pub async fn get_agent(&self, id: &str) -> Option<Arc<Mutex<Agent>>> {
@@ -205,6 +250,149 @@ impl SessionStore {
     #[cfg(test)]
     pub(crate) fn model_provider_update_waiting(&self) -> Arc<tokio::sync::Notify> {
         Arc::clone(&self.model_provider_update_waiting)
+    }
+
+    /// Await confirmation of a session's provisional binding, waiting at most
+    /// `timeout`.
+    ///
+    /// Returns immediately for the steady state — a session with no pending
+    /// generation, which is every session except one being reconciled after a
+    /// contended ACP rehydration. Otherwise it parks on the notifier the
+    /// reconciliation task will fire, so the caller observes one coherent
+    /// provider/resolver/limits generation instead of dispatching through the
+    /// construction-time binding while canonical config has moved on.
+    ///
+    /// Returns the generation the wait resolved against. Callers holding a
+    /// cached `Agent` must compare it with the generation they captured and
+    /// re-look-up on a mismatch: waiting says nothing about WHICH instance now
+    /// answers to this ID.
+    ///
+    /// Keyed on `(id, generation)`, not `id` alone. A same-ID replacement
+    /// installs its own marker, so an ID-only re-check would observe the
+    /// successor's marker as "still pending" and then park on the predecessor's
+    /// notifier — which nobody fires again, stranding the waiter until timeout
+    /// even though the successor converged. On replacement this returns the new
+    /// generation immediately rather than waiting on an orphaned marker.
+    ///
+    /// A missing session is `Ok(None)`, not an error: absence is the caller's
+    /// own lookup to report, and every call site here already handles it.
+    /// `Err(Timeout)` should surface as a retryable busy error rather than
+    /// proceeding on the provisional binding.
+    pub(crate) async fn await_pending_generation(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Option<u64>, WaitForProviderUpdateError> {
+        let Some((pending, generation)) = self.sessions.lock().await.get(id).and_then(|session| {
+            session
+                .pending_generation
+                .as_ref()
+                .map(|p| (Arc::clone(p), session.generation))
+        }) else {
+            return Ok(None);
+        };
+        // Register interest BEFORE re-checking, so a reconciliation that
+        // completes between the lookup above and the wait below cannot leave
+        // this caller parked on a notifier nobody will fire again.
+        let notified = pending.notified();
+        tokio::pin!(notified);
+        // Re-check keyed on the SAME generation we cloned the marker from.
+        // An ID-only check would see a same-ID replacement's marker as "still
+        // pending" and then park on the predecessor's notifier, which nobody
+        // fires again. On replacement return the new generation immediately.
+        let current = self.sessions.lock().await;
+        match current.get(id) {
+            None => return Ok(None),
+            Some(session) if session.generation != generation => {
+                return Ok(Some(session.generation));
+            }
+            Some(session) if session.pending_generation.is_none() => return Ok(Some(generation)),
+            Some(_) => {}
+        }
+        drop(current);
+        tokio::time::timeout(timeout, notified)
+            .await
+            .map_err(|_| WaitForProviderUpdateError::Timeout)?;
+        // Return the generation we converged on, which may have changed again.
+        Ok(self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| session.generation))
+    }
+
+    /// Confirm a session's binding and wake everyone awaiting it.
+    ///
+    /// Called only after a committed binding is published. Failed repair keeps
+    /// the marker in place so prompt/configure callers cannot observe a mixed
+    /// provider/config generation; a later successful ordinary refresh clears
+    /// it for this exact session generation.
+    pub(crate) async fn clear_pending_generation(&self, id: &str, expected_generation: u64) {
+        let notify = {
+            let mut sessions = self.sessions.lock().await;
+            match sessions.get_mut(id) {
+                Some(session) if session.generation == expected_generation => {
+                    session.pending_generation.take()
+                }
+                None => None,
+                Some(_) => None,
+            }
+        };
+        if let Some(notify) = notify {
+            notify.notify_waiters();
+        }
+    }
+
+    /// Lock the provider generation for a prompt, waiting at most `timeout`.
+    ///
+    /// The caller must hold the returned guard through the turn boundary (and,
+    /// today, through the whole turn). That closes both sides of the ordering
+    /// race: a config transaction that already owns the lock finishes publishing
+    /// its provider/resolver/generation first, while a transaction that starts
+    /// after this call cannot publish a new live config between the prompt's
+    /// generation check and `sync_config_generation()`.
+    ///
+    /// Returns `Err` if the session no longer exists, or if the lock is not
+    /// released within `timeout`.  The caller should surface the timeout as a
+    /// retryable error rather than proceeding with a potentially stale resolver.
+    pub(crate) async fn lock_model_provider_update_with_timeout(
+        &self,
+        id: &str,
+        timeout: std::time::Duration,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, WaitForProviderUpdateError> {
+        let lock = self
+            .sessions
+            .lock()
+            .await
+            .get(id)
+            .map(|session| Arc::clone(&session.model_provider_update))
+            .ok_or(WaitForProviderUpdateError::SessionNotFound)?;
+
+        #[cfg(test)]
+        let acquire = {
+            let waiting = Arc::clone(&self.model_provider_update_waiting);
+            let mut lock = Box::pin(lock.lock_owned());
+            let mut notified = false;
+            std::future::poll_fn(
+                move |cx| match std::future::Future::poll(lock.as_mut(), cx) {
+                    std::task::Poll::Pending => {
+                        if !notified {
+                            waiting.notify_one();
+                            notified = true;
+                        }
+                        std::task::Poll::Pending
+                    }
+                    std::task::Poll::Ready(guard) => std::task::Poll::Ready(guard),
+                },
+            )
+        };
+        #[cfg(not(test))]
+        let acquire = lock.lock_owned();
+
+        tokio::time::timeout(timeout, acquire)
+            .await
+            .map_err(|_| WaitForProviderUpdateError::Timeout)
     }
 
     /// Return the current generation for the session with `id`, or `None` if
@@ -364,12 +552,25 @@ impl SessionStore {
     /// Swap a freshly built `ModelProvider` box (and its name) onto the
     /// session's agent. Called by the dispatcher after it constructs the
     /// box from config, keeping model_provider-build logic out of the store.
+    /// The route resolver is installed in the SAME state transition as the
+    /// provider box: it holds the hint→route table bound to that provider set,
+    /// so leaving the old resolver would resolve routed hints through the
+    /// previous provider while the new box serves the call.
+    /// `config_generation` is the `Arc<Config>` the caller built this provider
+    /// box and resolver FROM. It is published onto the agent in the same state
+    /// transition, so a later explicit `model_switch` rebuilds dispatch from
+    /// that generation rather than the agent's construction-time snapshot, and
+    /// `context_limits_for_route` reports capacity and budget from it too.
+    /// Passing a generation the box was not built from reintroduces the
+    /// mixed-generation split this parameter exists to close.
     ///
-    /// `generation` must match the session's current generation (captured
-    /// before the caller built the provider box). If the session was replaced
-    /// under the same ID — e.g. by `session/new` or ACP rehydration — while
-    /// the provider was being built, the generations won't match and this
-    /// call becomes a no-op (returns `false`).
+    /// `generation` is the orthogonal SESSION-identity fence: it must match the
+    /// session's current generation (captured before the caller built the
+    /// provider box). If the session was replaced under the same ID — e.g. by
+    /// `session/new` or ACP rehydration — while the provider was being built,
+    /// the generations won't match and this call becomes a no-op (returns
+    /// `false`). `config_generation` answers "which config was this built
+    /// from"; `generation` answers "is this still the same session".
     ///
     /// When `temperature` is `Some(v)`, the captured agent's temperature is
     /// set to `v` (which may be `None`, clearing a prior profile temperature).
@@ -383,7 +584,9 @@ impl SessionStore {
         model_provider: Box<dyn ModelProvider>,
         model_provider_name: String,
         model_name: String,
+        model_route_resolver: Arc<zeroclaw_providers::router::ModelRouteResolver>,
         tool_dispatcher: Box<dyn ToolDispatcher>,
+        config_generation: Arc<zeroclaw_config::schema::Config>,
         temperature: Option<Option<f64>>,
     ) -> bool {
         let done = self.wait_test_gate().await;
@@ -405,12 +608,47 @@ impl SessionStore {
         guard.set_model_provider(model_provider);
         guard.set_model_provider_name(model_provider_name);
         guard.set_model_name(model_name);
+        guard.set_model_route_resolver(model_route_resolver);
         guard.set_tool_dispatcher(tool_dispatcher);
+        guard.set_config_generation(config_generation);
         if let Some(t) = temperature {
             guard.set_temperature(t);
         }
         self.signal_test_gate_done(done);
         true
+    }
+
+    /// Rewrite a session's in-memory `model_provider` override to a new
+    /// reference. `SessionOverrides` is transient session state rather than
+    /// config, so a provider alias rename does not reach it through the
+    /// config cascade. Without this migration the override would keep naming
+    /// an alias that no longer exists, and the next resolution would fall
+    /// back to compatibility values or fail while rebuilding the old
+    /// reference. Called from the live-refresh publication step while that
+    /// session's `model_provider_update` guard is held.
+    ///
+    /// `generation` must match the session's current generation (same
+    /// contract as `apply_model_provider`). A same-ID successor inserted
+    /// by `session/new` or ACP rehydration while this refresh was in flight
+    /// would have a different generation, and the migration must be rejected
+    /// for it: the successor never requested an alias rename, and a stale
+    /// refresh must not write its override. Returns `true` when the migration
+    /// applied, `false` when the session was absent or its generation did not
+    /// match.
+    pub async fn migrate_model_provider_override(
+        &self,
+        id: &str,
+        generation: u64,
+        new_ref: String,
+    ) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        match sessions.get_mut(id) {
+            Some(session) if session.generation == generation => {
+                session.overrides.model_provider = Some(new_ref);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub async fn get_overrides(&self, id: &str) -> Option<SessionOverrides> {
@@ -549,7 +787,16 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::SessionRemoved);
             token.cancel();
         }
-        self.sessions.lock().await.remove(id).is_some()
+        let (removed, pending) = self
+            .sessions
+            .lock()
+            .await
+            .remove(id)
+            .map_or((false, None), |session| (true, session.pending_generation));
+        if let Some(notify) = pending {
+            notify.notify_waiters();
+        }
+        removed
     }
 
     pub async fn evict_same_mode_sibling(
@@ -577,10 +824,18 @@ impl SessionStore {
             .map(|(key, _)| key.clone())
             .collect();
         let mut evicted = Vec::with_capacity(victims.len());
+        let mut pending = Vec::new();
         for key in victims {
             if let Some(s) = sessions.remove(&key) {
+                if let Some(notify) = s.pending_generation {
+                    pending.push(notify);
+                }
                 evicted.push((key, s.agent_alias));
             }
+        }
+        drop(sessions);
+        for notify in pending {
+            notify.notify_waiters();
         }
         evicted
     }
@@ -664,7 +919,16 @@ impl SessionStore {
             self.record_cancel_cause(id, CancelCause::AdminKill);
             token.cancel();
         }
-        self.sessions.lock().await.remove(id).is_some()
+        let (removed, pending) = self
+            .sessions
+            .lock()
+            .await
+            .remove(id)
+            .map_or((false, None), |session| (true, session.pending_generation));
+        if let Some(notify) = pending {
+            notify.notify_waiters();
+        }
+        removed
     }
 
     /// Record the cause for an imminent cancel-token fire. Call immediately
@@ -1407,7 +1671,13 @@ mod tests {
                 Box::new(StubProvider),
                 "stale-provider".into(),
                 "stale-model".into(),
+                Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+                    Vec::new(),
+                    "stale-provider".into(),
+                    "stale-model".into(),
+                )),
                 Box::new(NativeToolDispatcher),
+                Arc::new(zeroclaw_config::schema::Config::default()),
                 Some(Some(0.99)),
             )
             .await;
@@ -1432,6 +1702,96 @@ mod tests {
         );
     }
 
+    /// A provider-alias rename refresh must not rewrite the transient
+    /// `model_provider` override of a session that replaced the one it
+    /// captured.
+    ///
+    /// `migrate_model_provider_override` runs BEFORE the generation-checked
+    /// `apply_model_provider` in the publication step. Without its own
+    /// generation check, a stale rename refresh would write the new alias onto
+    /// a same-ID successor (installed by `session/new` or ACP rehydration while
+    /// the refresh was in flight), and the follow-up `apply_model_provider`
+    /// would then correctly reject the stale provider tuple — leaving the
+    /// successor holding an override it never requested, naming an alias its
+    /// provider box was never built from.
+    #[tokio::test]
+    async fn migrate_model_provider_override_rejects_stale_generation() {
+        let store = make_store(4);
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let captured_gen = store.get_generation("s").await.unwrap();
+
+        // Pin an explicit override on the original session, the state a
+        // rename refresh would legitimately migrate.
+        store
+            .set_overrides(
+                "s",
+                SessionOverrides {
+                    model_provider: Some("openai.before".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("override applies to the original session");
+
+        // Replace the session under the same ID, as ACP rehydration does.
+        store
+            .insert(
+                "s".into(),
+                RpcSession::new(make_agent(), "a", ".", crate::rpc::types::ChatMode::Chat),
+            )
+            .await
+            .unwrap();
+        let successor_gen = store.get_generation("s").await.unwrap();
+        assert_ne!(
+            captured_gen, successor_gen,
+            "harness invariant: the replacement must advance the generation, \
+             otherwise this test proves nothing"
+        );
+
+        let migrated = store
+            .migrate_model_provider_override("s", captured_gen, "openai.after".into())
+            .await;
+        assert!(
+            !migrated,
+            "a rename refresh holding the pre-replacement generation must be \
+             rejected rather than writing the successor's override"
+        );
+
+        assert_eq!(
+            store
+                .get_overrides("s")
+                .await
+                .and_then(|o| o.model_provider),
+            None,
+            "the successor must keep its own (unset) override; the stale rename \
+             must not leave it pointing at an alias it never requested"
+        );
+
+        // The same call with the successor's own generation is still accepted,
+        // so the fence rejects staleness rather than disabling migration.
+        let migrated_current = store
+            .migrate_model_provider_override("s", successor_gen, "openai.after".into())
+            .await;
+        assert!(
+            migrated_current,
+            "a refresh that captured the current generation must still migrate"
+        );
+        assert_eq!(
+            store
+                .get_overrides("s")
+                .await
+                .and_then(|o| o.model_provider)
+                .as_deref(),
+            Some("openai.after")
+        );
+    }
+
     #[tokio::test]
     async fn apply_model_provider_applies_temperature_to_captured_agent() {
         let store = make_store(4);
@@ -1451,7 +1811,13 @@ mod tests {
                 Box::new(StubProvider),
                 "new-provider".into(),
                 "new-model".into(),
+                Arc::new(zeroclaw_providers::router::ModelRouteResolver::new(
+                    Vec::new(),
+                    "new-provider".into(),
+                    "new-model".into(),
+                )),
                 Box::new(NativeToolDispatcher),
+                Arc::new(zeroclaw_config::schema::Config::default()),
                 Some(Some(0.42)),
             )
             .await;

@@ -1697,6 +1697,35 @@ impl ReliableModelProvider {
             rate_limit_cooldowns: Mutex::new(HashMap::new()),
         }
     }
+
+    /// Build a provider whose entries mirror `push_pinned_entries`: every entry
+    /// shares ONE `cooldown_key` (the `<family>.<alias>` reference) and differs
+    /// only in its pinned model, exactly as a `fallback_models` list produces.
+    ///
+    /// Exposed for cross-crate regressions that need the same-alias
+    /// pinned-model failover shape; the production builder reaches
+    /// `new_pinned` directly.
+    #[doc(hidden)]
+    pub fn new_pinned_for_test(
+        alias: &str,
+        entries: Vec<(&str, &str, &str, std::sync::Arc<dyn ModelProvider>)>,
+        max_retries: u32,
+        base_backoff_ms: u64,
+    ) -> Self {
+        let model_providers = entries
+            .into_iter()
+            .map(|(cooldown_key, provider_alias, pinned_model, inner)| {
+                ReliableModelProviderEntry::new_pinned(
+                    cooldown_key,
+                    cooldown_key,
+                    provider_alias,
+                    pinned_model,
+                    Box::new(inner),
+                )
+            })
+            .collect();
+        Self::new_with_entries(alias, model_providers, max_retries, base_backoff_ms)
+    }
     /// Set additional API keys for round-robin rotation on rate-limit errors.
     pub fn with_api_keys(mut self, keys: Vec<String>) -> Self {
         self.api_keys = keys;

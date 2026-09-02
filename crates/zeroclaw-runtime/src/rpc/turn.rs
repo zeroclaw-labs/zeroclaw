@@ -160,6 +160,7 @@ fn outcome_from_task_result(
         Ok(StreamedTurnSuccess {
             response,
             new_messages,
+            ..
         }) => Ok(TurnOutcome::Completed {
             text: response,
             messages: new_messages,
