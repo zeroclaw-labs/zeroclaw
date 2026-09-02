@@ -1372,6 +1372,18 @@ impl WhatsAppWebChannel {
         session_revoked.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Clear reaction targets only after an explicit logout. Ordinary
+    /// reconnects keep their eligible targets alive across the reconnect.
+    #[cfg(feature = "whatsapp-web")]
+    async fn clear_reaction_targets_if_revoked(
+        registry: &Arc<ReactionTargetRegistry>,
+        session_revoked: &std::sync::atomic::AtomicBool,
+    ) {
+        if Self::should_purge_session(session_revoked) {
+            registry.lock().await.clear();
+        }
+    }
+
     /// Record a reconnect attempt and return `(attempt_number, exceeded_max)`.
     fn record_retry(retry_count: &std::sync::atomic::AtomicU32) -> (u32, bool) {
         let attempts = retry_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -3166,6 +3178,11 @@ impl Channel for WhatsAppWebChannel {
             drop(bot);
             drop(device);
 
+            // The old client and bot are fully stopped above. Invalidate
+            // account-scoped reaction targets before the next loop can build
+            // a newly paired client; transient reconnects preserve them.
+            Self::clear_reaction_targets_if_revoked(&self.reaction_targets, &session_revoked).await;
+
             if should_reconnect {
                 let (attempts, exceeded) = Self::record_retry(&retry_count);
                 if exceeded {
@@ -3334,7 +3351,7 @@ impl Channel for WhatsAppWebChannel {
         let Some(target) =
             Self::reaction_target(&self.reaction_targets, &deliverable, message_id).await
         else {
-            return Ok(());
+            anyhow::bail!("WhatsApp reaction target is unavailable or expired");
         };
         let Some(remote_jid) = target.key.remote_jid.clone() else {
             return Ok(());
@@ -3373,7 +3390,7 @@ impl Channel for WhatsAppWebChannel {
         let Some(target) =
             Self::reaction_target(&self.reaction_targets, &deliverable, message_id).await
         else {
-            return Ok(());
+            anyhow::bail!("WhatsApp reaction target is unavailable or expired");
         };
         let Some(remote_jid) = target.key.remote_jid.clone() else {
             return Ok(());
@@ -3689,15 +3706,55 @@ mod tests {
                 .is_none(),
                 "{label} must not enter the reaction registry"
             );
-            channel
-                .add_reaction(chat, missing_id, "👍")
-                .await
-                .expect("unsupported reaction must fail closed");
-            channel
-                .remove_reaction(chat, missing_id, "👍")
-                .await
-                .expect("unsupported removal must fail closed");
+            let add_result = channel.add_reaction(chat, missing_id, "👍").await;
+            if missing_id.is_empty() {
+                add_result.expect("empty message id remains a safe no-op");
+            } else {
+                add_result.expect_err("nonempty unsupported reaction must return an error");
+            }
+            let remove_result = channel.remove_reaction(chat, missing_id, "👍").await;
+            if missing_id.is_empty() {
+                remove_result.expect("empty message id remains a safe no-op");
+            } else {
+                remove_result.expect_err("nonempty unsupported removal must return an error");
+            }
         }
+        assert!(sent_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn nonempty_reaction_miss_errors_without_sending() {
+        let chat = "15551234567@s.whatsapp.net";
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel(1);
+        let channel = WhatsAppWebChannel::new(
+            &zeroclaw_config::schema::WhatsAppConfig::default(),
+            "reaction-miss-test",
+            Arc::new(Vec::new),
+            Arc::new(Vec::new),
+        )
+        .with_reaction_send_hook(Arc::new(move |recipient, message| {
+            let sent_tx = sent_tx.clone();
+            Box::pin(async move {
+                sent_tx
+                    .send((recipient, message))
+                    .await
+                    .map_err(|e| anyhow::Error::msg(format!("reaction test hook closed: {e}")))
+            })
+        }));
+
+        assert!(
+            channel
+                .add_reaction(chat, "unknown-reaction-id", "👍")
+                .await
+                .is_err()
+        );
+        assert!(
+            channel
+                .remove_reaction(chat, "unknown-reaction-id", "👍")
+                .await
+                .is_err()
+        );
         assert!(sent_rx.try_recv().is_err());
     }
 
@@ -3729,6 +3786,37 @@ mod tests {
         assert_eq!(targets.len(), MAX_REACTION_TARGETS);
         assert!(
             targets.contains_key(&("1555000@s.whatsapp.net".to_string(), "native-0".to_string(),))
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn explicit_logout_clears_reaction_targets_but_reconnect_preserves_them() {
+        use std::sync::atomic::AtomicBool;
+
+        let registry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+        let chat = "15551234567@s.whatsapp.net";
+        let message_id = "reconnect-reaction-id";
+        let target = WhatsAppWebChannel::inbound_reaction_target(chat, false, false, message_id)
+            .expect("synthetic inbound 1:1 target should be eligible");
+        WhatsAppWebChannel::remember_reaction_target(&registry, target).await;
+
+        let ordinary_reconnect = AtomicBool::new(false);
+        WhatsAppWebChannel::clear_reaction_targets_if_revoked(&registry, &ordinary_reconnect).await;
+        assert!(
+            WhatsAppWebChannel::reaction_target(&registry, chat, message_id)
+                .await
+                .is_some(),
+            "ordinary reconnects preserve eligible reaction targets"
+        );
+
+        let explicit_logout = AtomicBool::new(true);
+        WhatsAppWebChannel::clear_reaction_targets_if_revoked(&registry, &explicit_logout).await;
+        assert!(
+            WhatsAppWebChannel::reaction_target(&registry, chat, message_id)
+                .await
+                .is_none(),
+            "explicit logout clears the channel-owned reaction registry"
         );
     }
 
