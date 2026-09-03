@@ -220,6 +220,9 @@ impl Tool for SendViaTool {
          - `send_via(target: \"discord.main\")` — redirect reply to another channel\n\
          - `send_via(target: \"discord.main\", modality: \"voice\")` — redirect + force modality\n\
          At least one of `target` or `modality` is required when `body` is absent.\n\
+         Modality applies to this turn's final reply. Progress already streamed \
+         earlier in the turn (e.g. Telegram multi_message narration) keeps its \
+         streamed modality and is not retracted.\n\
          \n\
          With `body` (immediate fanout — main reply still goes to originating channel):\n\
          - `send_via(target: \"email.default\", body: \"...\")` — send separate content elsewhere\n\

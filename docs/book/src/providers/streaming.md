@@ -46,6 +46,12 @@ stays correct as channels gain or lose streaming support:
 
 When both the provider and the channel support streaming, the flow is: provider emits `TextDelta` → runtime passes to channel → channel edits the sent message. The edit cadence is bounded by that channel's `draft_update_interval_ms` setting to avoid rate-limiting; defaults vary by channel.
 
+**Multi-message mode differs by channel:** Matrix and Discord split on `\n\n` paragraph boundaries. Telegram `multi_message` sends one message per completed agent text turn (text between tool calls), flushed via `Channel::flush_draft_turn` when the LLM turn ends.
+
+**Outbound policy is per turn.** In `multi_message` mode each completed narration turn crosses outbound policy (the `on_message_sending` hook and leak redaction) exactly once, scoped to that turn rather than to the whole accumulated transcript. This keeps a stateful hook from re-processing an earlier turn when a later one is appended. As a consequence the "narration is delivered before an approval prompt" guarantee holds per delivered turn. A secret that straddles two turn boundaries is still caught before the final reply: each completing narration turn is scanned with a bounded suffix of the **guarded delivered history** as cross-turn context (the history the channel actually received, so a fragment the outbound hook itself created is included and a prior redaction is not re-flagged), so the fragment that completes the split is redacted when that turn crosses outbound policy, not deferred to the fully redacted final reply.
+
+**Partial (edit-in-place) mode ordering.** A tool `Status` update is ordered after any pending narration flush. On channels that edit a single message in place (Matrix and similar), the visible narration can therefore be replaced by the tool status until the next update. The completed final answer is always delivered intact; only the intermediate in-place display may show tool status in place of the preceding narration.
+
 ## Reasoning blocks
 
 `StreamEvent` has no separate `ReasoningDelta` variant. When a provider exposes reasoning during streaming, it uses the `reasoning` field on the `StreamChunk` carried by `TextDelta`; provider and runtime configuration determine whether that content is requested or surfaced. Consumers should follow the `StreamChunk` contract rather than matching a nonexistent event variant.

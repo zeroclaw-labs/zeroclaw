@@ -18,6 +18,13 @@ pub(crate) const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
+/// Shared one-shot acknowledgement slot for [`StreamDelta::FlushBarrier`].
+/// Wrapped in `Arc<Mutex<Option<..>>>` so the enum stays `Clone`; dropping
+/// every clone of the event releases the ack, so a consumer that ignores the
+/// variant can never deadlock the sender.
+pub type FlushBarrierAck =
+    std::sync::Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>;
+
 /// Placeholder text used for newly opened draft messages.
 pub const DRAFT_PLACEHOLDER: &str = "...";
 /// Prefix for liveness-only thinking/reasoning progress.
@@ -98,6 +105,12 @@ pub enum StreamDelta {
     Reasoning(String),
     /// Typed, non-sensitive agent lifecycle progress.
     Lifecycle(ProgressEvent),
+    /// Rendezvous barrier: flush any buffered draft narration for the
+    /// in-flight turn, then ack. Queue FIFO guarantees all prior `Text`
+    /// deltas were consumed first, letting the agent loop ensure narration
+    /// reaches the channel before a direct call (e.g. an approval prompt)
+    /// overtakes it.
+    FlushBarrier(FlushBarrierAck),
 }
 
 impl StreamDelta {
@@ -123,7 +136,11 @@ impl StreamDelta {
                 *success,
                 error.as_deref(),
             )),
-            Self::Text(_) | Self::Status(_) | Self::Reasoning(_) | Self::Lifecycle(_) => None,
+            Self::Text(_)
+            | Self::Status(_)
+            | Self::Reasoning(_)
+            | Self::Lifecycle(_)
+            | Self::FlushBarrier(_) => None,
         }
     }
 }
@@ -133,6 +150,27 @@ impl StreamDelta {
 pub(crate) async fn send_progress(on_delta: Option<&Sender<DraftEvent>>, event: ProgressEvent) {
     if let Some(tx) = on_delta {
         let _ = tx.send(StreamDelta::Lifecycle(event)).await;
+    }
+}
+
+impl StreamDelta {
+    /// Build a flush barrier event plus the receiver that resolves once the
+    /// consumer acks it (or drops the event).
+    pub fn flush_barrier() -> (Self, tokio::sync::oneshot::Receiver<()>) {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        (
+            Self::FlushBarrier(std::sync::Arc::new(std::sync::Mutex::new(Some(ack_tx)))),
+            ack_rx,
+        )
+    }
+
+    /// Fire a barrier ack exactly once across all clones of the event.
+    pub fn ack_flush_barrier(ack: &FlushBarrierAck) {
+        if let Ok(mut slot) = ack.lock()
+            && let Some(tx) = slot.take()
+        {
+            let _ = tx.send(());
+        }
     }
 }
 
@@ -238,6 +276,26 @@ pub(crate) async fn emit_posthoc_turn_chunk(event_tx: Option<&Sender<TurnEvent>>
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn flush_barrier_ack_resolves_receiver() {
+        let (event, rx) = StreamDelta::flush_barrier();
+        if let StreamDelta::FlushBarrier(ack) = &event {
+            StreamDelta::ack_flush_barrier(ack);
+        }
+        assert!(rx.await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn flush_barrier_dropped_event_releases_receiver() {
+        // A consumer that ignores the variant must not deadlock the sender:
+        // dropping the last clone of the event closes the ack channel.
+        let (event, rx) = StreamDelta::flush_barrier();
+        let clone = event.clone();
+        drop(event);
+        drop(clone);
+        assert!(rx.await.is_err());
+    }
 
     fn parsed_call(id: Option<&str>) -> ParsedToolCall {
         ParsedToolCall {
