@@ -398,6 +398,10 @@ pub struct Agent {
     /// at most once per session even though the multimodal pipeline re-walks
     /// the full conversation history on every turn and tool iteration.
     image_cache: zeroclaw_providers::multimodal::LocalImageCache,
+    /// Provider-facing replay quarantine for images rejected by the model API.
+    /// Canonical history remains unchanged so an explicit user retry can send
+    /// the same image again.
+    image_quarantine: crate::agent::turn::ProviderImageQuarantine,
     provider_switch_config: Option<ProviderSwitchConfig>,
     /// Channel name stamped onto observer events to identify the calling surface
     /// (e.g. "agent", "wss", "gateway"). Defaults to "agent" for direct Agent callers.
@@ -994,6 +998,7 @@ impl AgentBuilder {
             agent_alias: self.agent_alias.unwrap_or_default(),
             channel_handles: AgentChannelHandles::default(),
             image_cache: zeroclaw_providers::multimodal::LocalImageCache::new(),
+            image_quarantine: crate::agent::turn::ProviderImageQuarantine::default(),
             provider_switch_config: self.provider_switch_config,
             channel_name: self.channel_name.unwrap_or_else(|| "agent".to_string()),
             #[cfg(test)]
@@ -2579,7 +2584,10 @@ impl Agent {
                     event_tx: None,
                     steering: None,
                     new_messages_out: Some(&mut loop_new_messages),
-                    image_cache: Some(&mut self.image_cache),
+                    image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                        cache: &mut self.image_cache,
+                        quarantine: &mut self.image_quarantine,
+                    }),
                     // Direct embedded Agent::turn call; source/transport/
                     // trust stay placeholders, not yet stamped at the edge.
                     memory: Some(crate::agent::memory_inject::TurnMemory {
@@ -3022,7 +3030,10 @@ impl Agent {
                         event_tx: Some(event_tx.clone()),
                         steering: None,
                         new_messages_out: Some(&mut round_added),
-                        image_cache: Some(&mut self.image_cache),
+                        image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                            cache: &mut self.image_cache,
+                            quarantine: &mut self.image_quarantine,
+                        }),
                         // Direct embedded Agent::turn call; source/transport/
                         // trust stay placeholders, not yet stamped at the edge.
                         memory: Some(crate::agent::memory_inject::TurnMemory {

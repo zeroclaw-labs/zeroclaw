@@ -150,6 +150,13 @@ pub(crate) async fn consume_provider_streaming_response(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
+                if !visible_event_output
+                    && let zeroclaw_api::model_provider::StreamError::ProviderImageInputRejected(
+                        rejection,
+                    ) = &err
+                {
+                    return Err(anyhow::Error::new(rejection.clone()).context(message));
+                }
                 let provider_error = anyhow::Error::msg(message.clone());
                 if visible_event_output {
                     // Persist only what the consumer actually saw
@@ -984,6 +991,55 @@ mod tests {
     /// fallback eligibility: a marker-only delta yields empty stripped text,
     /// which must NOT count as visible output.
     struct MarkerOnlyThenErrorProvider;
+    struct ImageRejectedStreamProvider;
+
+    impl ::zeroclaw_api::attribution::Attributable for ImageRejectedStreamProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "ImageRejectedStreamProvider"
+        }
+    }
+
+    #[async_trait]
+    impl ModelProvider for ImageRejectedStreamProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> Result<String> {
+            anyhow::bail!("unused")
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+            _options: StreamOptions,
+        ) -> BoxStream<'static, StreamResult<StreamEvent>> {
+            Box::pin(futures_util::stream::iter(vec![Err(
+                ::zeroclaw_api::model_provider::StreamError::ProviderImageInputRejected(
+                    ::zeroclaw_api::model_provider::ProviderImageInputRejected::new(
+                        None,
+                        "image input rejected",
+                    ),
+                ),
+            )]))
+        }
+    }
 
     impl ::zeroclaw_api::attribution::Attributable for MarkerOnlyThenErrorProvider {
         fn role(&self) -> ::zeroclaw_api::attribution::Role {
@@ -1107,6 +1163,28 @@ mod tests {
             err.to_string().contains("provider exploded"),
             "the underlying provider error must be surfaced: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn image_rejection_before_visible_output_preserves_typed_cause() {
+        let error = consume_provider_streaming_response(
+            &ImageRejectedStreamProvider,
+            &[ChatMessage::user("[IMAGE:data:image/png;base64,AAAA]")],
+            None,
+            "mock-model",
+            Some(0.0),
+            None,
+            None,
+            None,
+            false,
+            StreamReasoningMode::Status,
+        )
+        .await
+        .expect_err("typed image rejection must surface");
+
+        assert!(error.chain().any(|source| {
+            source.is::<::zeroclaw_api::model_provider::ProviderImageInputRejected>()
+        }));
     }
 
     #[tokio::test]

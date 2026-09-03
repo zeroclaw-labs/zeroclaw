@@ -137,7 +137,7 @@ pub(crate) async fn prepare_messages_for_iteration(
     history: &[ChatMessage],
     multimodal_config: &MultimodalConfig,
     degrade_strip_images: bool,
-    image_cache: Option<&mut multimodal::LocalImageCache>,
+    image_state: Option<&mut super::ToolLoopImageState<'_>>,
 ) -> Result<multimodal::PreparedMessages> {
     // Enforce the universal leading-turn-order invariant before any provider
     // sees the history: strict providers reject a first non-system turn that is
@@ -163,22 +163,28 @@ pub(crate) async fn prepare_messages_for_iteration(
                 content: multimodal::strip_media_markers(&m.content),
             })
             .collect();
-        match image_cache {
-            Some(cache) => {
-                multimodal::prepare_messages_for_provider_cached(
+        match image_state {
+            Some(state) => {
+                multimodal::prepare_messages_for_provider_cached_with_quarantine(
                     &stripped,
                     multimodal_config,
-                    cache,
+                    state.cache,
+                    state.quarantine.as_slice(),
                 )
                 .await
             }
             None => multimodal::prepare_messages_for_provider(&stripped, multimodal_config).await,
         }
     } else {
-        match image_cache {
-            Some(cache) => {
-                multimodal::prepare_messages_for_provider_cached(history, multimodal_config, cache)
-                    .await
+        match image_state {
+            Some(state) => {
+                multimodal::prepare_messages_for_provider_cached_with_quarantine(
+                    history,
+                    multimodal_config,
+                    state.cache,
+                    state.quarantine.as_slice(),
+                )
+                .await
             }
             None => multimodal::prepare_messages_for_provider(history, multimodal_config).await,
         }
@@ -188,6 +194,7 @@ pub(crate) async fn prepare_messages_for_iteration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::turn::{ProviderImageQuarantine, ToolLoopImageState};
 
     #[tokio::test]
     async fn prepare_messages_for_iteration_populates_and_reuses_image_cache() {
@@ -202,17 +209,34 @@ mod tests {
         let cfg = MultimodalConfig::default();
 
         let mut cache = multimodal::LocalImageCache::new();
-        let first = prepare_messages_for_iteration(&history, &cfg, false, Some(&mut cache))
-            .await
-            .unwrap();
+        let mut quarantine = ProviderImageQuarantine::default();
+        let first = prepare_messages_for_iteration(
+            &history,
+            &cfg,
+            false,
+            Some(&mut ToolLoopImageState {
+                cache: &mut cache,
+                quarantine: &mut quarantine,
+            }),
+        )
+        .await
+        .unwrap();
         assert!(first.contains_images);
         assert_eq!(cache.len(), 1, "image cached after the first prep");
 
         // A later iteration/turn re-walks the same history; the cache serves it
         // without growing (no second disk read + encode).
-        let _second = prepare_messages_for_iteration(&history, &cfg, false, Some(&mut cache))
-            .await
-            .unwrap();
+        let _second = prepare_messages_for_iteration(
+            &history,
+            &cfg,
+            false,
+            Some(&mut ToolLoopImageState {
+                cache: &mut cache,
+                quarantine: &mut quarantine,
+            }),
+        )
+        .await
+        .unwrap();
         assert_eq!(cache.len(), 1, "subsequent preps reuse the cached entry");
 
         // The cache-less path (channels/CLI pass None) still resolves images.

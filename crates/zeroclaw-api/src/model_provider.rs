@@ -376,6 +376,27 @@ impl StreamOptions {
 /// Result type for streaming operations.
 pub type StreamResult<T> = std::result::Result<T, StreamError>;
 
+/// Structured error returned when a provider rejects image input in an
+/// otherwise valid request.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("provider rejected image input: {detail}")]
+pub struct ProviderImageInputRejected {
+    /// Optional zero-based image positions in the provider request.
+    /// `None` means the provider did not identify a particular image.
+    pub image_indices: Option<Vec<usize>>,
+    /// Sanitized provider detail suitable for display and source context.
+    pub detail: String,
+}
+
+impl ProviderImageInputRejected {
+    pub fn new(image_indices: Option<Vec<usize>>, detail: impl Into<String>) -> Self {
+        Self {
+            image_indices,
+            detail: detail.into(),
+        }
+    }
+}
+
 /// Errors that can occur during streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum StreamError {
@@ -390,6 +411,9 @@ pub enum StreamError {
 
     #[error("ModelProvider error: {0}")]
     ModelProvider(String),
+
+    #[error(transparent)]
+    ProviderImageInputRejected(#[from] ProviderImageInputRejected),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -1156,5 +1180,25 @@ mod turn_order_tests {
         let mut msgs: Vec<ChatMessage> = vec![];
         ChatMessage::sanitize_leading_turn_order(&mut msgs);
         assert!(msgs.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod provider_image_rejection_tests {
+    use super::{ProviderImageInputRejected, StreamError};
+
+    #[test]
+    fn streaming_rejection_preserves_typed_cause_through_anyhow() {
+        let rejection = ProviderImageInputRejected::new(Some(vec![0, 2]), "sanitized detail");
+        let error = anyhow::Error::new(StreamError::from(rejection.clone()));
+
+        assert!(matches!(
+            error.downcast_ref::<StreamError>(),
+            Some(StreamError::ProviderImageInputRejected(actual)) if actual == &rejection
+        ));
+        assert_eq!(
+            error.to_string(),
+            "provider rejected image input: sanitized detail"
+        );
     }
 }

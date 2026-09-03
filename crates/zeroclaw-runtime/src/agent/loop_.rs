@@ -2181,6 +2181,8 @@ pub async fn run(
             } else {
                 vec![ChatMessage::system(&system_prompt)]
             };
+            let mut image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+            let mut image_quarantine = crate::agent::turn::ProviderImageQuarantine::default();
 
             loop {
                 print!("> ");
@@ -2246,6 +2248,8 @@ pub async fn run(
 
                         history.clear();
                         history.push(ChatMessage::system(&system_prompt));
+                        image_cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+                        image_quarantine = crate::agent::turn::ProviderImageQuarantine::default();
                         // Clear conversation and daily memory
                         let mut cleared = 0;
                         for category in [MemoryCategory::Conversation, MemoryCategory::Daily] {
@@ -2538,7 +2542,10 @@ pub async fn run(
                                     event_tx: None,
                                     steering: None,
                                     new_messages_out: None,
-                                    image_cache: None,
+                                    image_cache: Some(crate::agent::turn::ToolLoopImageState {
+                                        cache: &mut image_cache,
+                                        quarantine: &mut image_quarantine,
+                                    }),
                                     // Origin is threaded from the entry point;
                                     // source/transport/trust stay phase-1
                                     // placeholders until per-transport stamping.
@@ -4523,6 +4530,58 @@ mod tests {
         }
     }
 
+    struct SessionImageProvider {
+        calls: AtomicUsize,
+        requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+    }
+
+    #[async_trait]
+    impl ModelProvider for SessionImageProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                vision: true,
+                ..ProviderCapabilities::default()
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in session image tests");
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<ChatResponse> {
+            self.requests
+                .lock()
+                .expect("requests lock should be valid")
+                .push(request.messages.to_vec());
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(anyhow::Error::new(
+                    zeroclaw_api::model_provider::ProviderImageInputRejected::new(
+                        None,
+                        "image input rejected",
+                    ),
+                ));
+            }
+            Ok(ChatResponse {
+                text: Some("accepted".to_string()),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+    impl_test_model_provider_attribution!(SessionImageProvider);
+
     struct StreamingScriptedModelProvider {
         responses: Arc<Mutex<VecDeque<String>>>,
         stream_calls: Arc<AtomicUsize>,
@@ -5752,6 +5811,117 @@ mod tests {
 
         assert_eq!(result, "vision-ok");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    async fn run_session_image_turn(
+        model_provider: &dyn ModelProvider,
+        history: &mut Vec<ChatMessage>,
+        cache: &mut zeroclaw_providers::multimodal::LocalImageCache,
+        quarantine: &mut crate::agent::turn::ProviderImageQuarantine,
+    ) -> anyhow::Result<String> {
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let tools_registry =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(Vec::new());
+        let observer = NoopObserver;
+        run_tool_call_loop(ToolLoop {
+            parent_agent_alias: None,
+            sop_reassembly: None,
+            exec: ResolvedAgentExecution {
+                model_access: ResolvedModelAccess {
+                    model_provider,
+                    provider_name: "session-image-provider",
+                    model: "mock-model",
+                    temperature: Some(0.0),
+                },
+                tools_registry: &tools_registry,
+                observer: &observer,
+                silent: true,
+                approval: None,
+                multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                config: None,
+                max_tool_iterations: 3,
+                hooks: None,
+                excluded_tools: &[],
+                dedup_exempt_tools: &[],
+                activated_tools: None,
+                model_switch_callback: None,
+                pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                strict_tool_parsing: false,
+                parallel_tools: false,
+                max_tool_result_chars: 0,
+                context_token_budget: 0,
+                receipt_generator: None,
+                knobs: &LoopKnobs::default(),
+            },
+            history,
+            channel_name: "cli",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: Some(crate::agent::turn::ToolLoopImageState { cache, quarantine }),
+            memory: None,
+            ingress: IngressContext::interactive(),
+            agent_alias: None,
+            turn_id: &turn_id,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn persistent_cli_image_rejection_quarantines_replay_until_retry_succeeds() {
+        let image = "data:image/png;base64,iVBORw0KGgo=";
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = SessionImageProvider {
+            calls: AtomicUsize::new(0),
+            requests: Arc::clone(&requests),
+        };
+        let mut history = vec![ChatMessage::user(format!("Inspect [IMAGE:{image}]"))];
+        let mut cache = zeroclaw_providers::multimodal::LocalImageCache::new();
+        let mut quarantine = crate::agent::turn::ProviderImageQuarantine::default();
+
+        run_session_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
+            .await
+            .expect_err("the first image-bearing request is rejected");
+        assert!(history[0].content.contains("[IMAGE:"));
+
+        history.push(ChatMessage::assistant("The provider rejected that image."));
+        history.push(ChatMessage::user("Continue without it"));
+        run_session_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
+            .await
+            .expect("the next ordinary turn omits quarantined history");
+
+        history.push(ChatMessage::user(format!("Try this again [IMAGE:{image}]")));
+        run_session_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
+            .await
+            .expect("an explicit newest-user retry bypasses quarantine");
+
+        history.push(ChatMessage::user("Continue after the successful retry"));
+        run_session_image_turn(&provider, &mut history, &mut cache, &mut quarantine)
+            .await
+            .expect("success clears quarantine for later replay");
+
+        let requests = requests.lock().expect("requests lock should be valid");
+        let image_counts = requests
+            .iter()
+            .map(|messages| zeroclaw_providers::multimodal::count_image_markers(messages))
+            .collect::<Vec<_>>();
+        assert_eq!(image_counts.len(), 4);
+        assert!(
+            image_counts[0] > 0,
+            "initial request must contain the image"
+        );
+        assert_eq!(image_counts[1], 0, "ordinary replay must omit the image");
+        assert!(image_counts[2] > 0, "explicit retry must contain the image");
+        assert!(
+            image_counts[3] > 0,
+            "successful explicit retry must clear quarantine"
+        );
     }
 
     #[tokio::test]
