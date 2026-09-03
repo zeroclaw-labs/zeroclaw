@@ -583,6 +583,14 @@ mod streaming {
         }
     }
 
+    /// Read-only confirmed-delivery offset for a live MultiMessage draft.
+    pub(super) fn multi_sent_so_far(state: &State, key: &DraftKey) -> Option<usize> {
+        match state {
+            State::Multi(drafts) => drafts.get(key).map(|d| d.sent_so_far),
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn multi_contains(state: &State, key: &DraftKey) -> bool {
         matches!(state, State::Multi(drafts) if drafts.contains_key(key))
@@ -4346,7 +4354,7 @@ impl MatrixChannel {
         let key = streaming_key(recipient, message_id)?;
         let delay = Duration::from_millis(self.config.multi_message_delay_ms);
         loop {
-            let (paragraph, thread_anchor) = {
+            let (paragraph, consumed, thread_anchor) = {
                 let mut state = self.streaming_state.write().await;
                 let Some(multi) = streaming::multi_for_update(&mut state, &key) else {
                     return Ok(());
@@ -4360,29 +4368,31 @@ impl MatrixChannel {
                 if text.len() == multi.sent_so_far {
                     return Ok(());
                 }
-                let unsent = &text[multi.sent_so_far..];
+                // Defensive: the counter was derived from earlier frames; if
+                // the accumulated text was rewritten around it, degrade to a
+                // floored boundary instead of panicking mid-character.
+                let unsent = &text[text.floor_char_boundary(multi.sent_so_far)..];
                 let Some(break_at) = streaming::next_paragraph_break(unsent) else {
                     return Ok(());
                 };
                 let paragraph = unsent[..break_at].trim().to_string();
-                multi.sent_so_far += break_at + 2; // +2 for the consumed "\n\n"
-                (paragraph, multi.thread_anchor.clone())
+                (paragraph, break_at + 2, multi.thread_anchor.clone())
             };
             if !paragraph.is_empty() {
                 let mut msg = SendMessage::new(paragraph, recipient);
                 msg.thread_ts = thread_anchor.as_ref().map(|e| e.to_string());
-                if let Err(e) = outbound::send(&self.outbox(client), &msg).await {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "matrix: multi-message paragraph send failed"
-                    );
-                }
+                outbound::send(&self.outbox(client), &msg).await?;
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
+            }
+            // The byte coordinate is a confirmed-delivery coordinate, not an
+            // attempted-send coordinate. Empty paragraphs have no transport
+            // content, so their delimiter can advance immediately; a failed
+            // non-empty send returns above and remains eligible for finalization.
+            let mut state = self.streaming_state.write().await;
+            if let Some(multi) = streaming::multi_for_update(&mut state, &key) {
+                multi.sent_so_far += consumed;
             }
         }
     }
@@ -4514,6 +4524,17 @@ impl Channel for MatrixChannel {
 
     fn multi_message_delay_ms(&self) -> u64 {
         self.config.multi_message_delay_ms
+    }
+
+    async fn multi_message_confirmed_offset(&self, recipient: &str, message_id: &str) -> usize {
+        if !matches!(self.config.stream_mode, MatrixStreamMode::MultiMessage) {
+            return 0;
+        }
+        let Ok(key) = streaming_key(recipient, message_id) else {
+            return 0;
+        };
+        let state = self.streaming_state.read().await;
+        streaming::multi_sent_so_far(&state, &key).unwrap_or(0)
     }
 
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
@@ -4895,7 +4916,12 @@ impl Channel for MatrixChannel {
                     return Ok(());
                 };
                 let remainder = if text.len() > state.sent_so_far {
-                    text[state.sent_so_far..].trim().to_string()
+                    // Floor defensively: the reconciled final text is built to
+                    // preserve the confirmed prefix byte-for-byte, but a stale
+                    // offset must degrade to re-sending a suffix, not panic.
+                    text[text.floor_char_boundary(state.sent_so_far)..]
+                        .trim()
+                        .to_string()
                 } else {
                     String::new()
                 };

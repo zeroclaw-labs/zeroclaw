@@ -377,6 +377,12 @@ impl Channel for PacedChannel {
         self.inner.multi_message_delay_ms()
     }
 
+    async fn multi_message_confirmed_offset(&self, recipient: &str, message_id: &str) -> usize {
+        self.inner
+            .multi_message_confirmed_offset(recipient, message_id)
+            .await
+    }
+
     async fn send_draft(&self, message: &SendMessage) -> Result<Option<String>> {
         // Drafts are streaming UX, not final outbound replies — pacing
         // them would freeze the live preview. Forward unchanged.
@@ -1050,6 +1056,66 @@ mod tests {
 
         assert_eq!(counting.creates.load(Ordering::SeqCst), 1);
         assert_eq!(counting.invites.load(Ordering::SeqCst), 1);
+    }
+
+    /// A multi-message-streaming channel that reports a fixed nonzero
+    /// confirmed-delivery offset, so the test can prove the paced wrapper
+    /// forwards the query instead of falling back to the trait default of 0.
+    struct ConfirmedOffsetChannel {
+        confirmed_offset: usize,
+    }
+
+    impl Attributable for ConfirmedOffsetChannel {
+        fn role(&self) -> Role {
+            Role::Channel(zeroclaw_api::attribution::ChannelKind::Matrix)
+        }
+        fn alias(&self) -> &str {
+            "confirmed-offset"
+        }
+    }
+
+    #[async_trait]
+    impl Channel for ConfirmedOffsetChannel {
+        fn name(&self) -> &str {
+            "confirmed-offset"
+        }
+        async fn send(&self, _message: &SendMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
+            Ok(())
+        }
+        fn supports_multi_message_streaming(&self) -> bool {
+            true
+        }
+        async fn multi_message_confirmed_offset(
+            &self,
+            _recipient: &str,
+            _message_id: &str,
+        ) -> usize {
+            self.confirmed_offset
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_message_confirmed_offset_forwards_to_inner_channel() {
+        let inner: Arc<dyn Channel> = Arc::new(ConfirmedOffsetChannel {
+            confirmed_offset: 42,
+        });
+        let cfg = PacingFixture {
+            interval_secs: 3600,
+            depth: 4,
+        };
+        let paced = PacedChannel::wrap(inner, &cfg);
+
+        assert!(paced.supports_multi_message_streaming());
+        assert_eq!(
+            paced
+                .multi_message_confirmed_offset("alice", "draft-1")
+                .await,
+            42,
+            "paced wrapper must report the inner channel's confirmed offset, not the trait default of 0",
+        );
     }
 
     /// A channel whose `send` blocks until the test releases a gate, so the
