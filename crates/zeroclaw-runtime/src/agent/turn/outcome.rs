@@ -67,6 +67,10 @@ impl std::error::Error for StreamInterruptedAfterOutput {
 pub(crate) struct StreamErrorWithUsage {
     pub(crate) message: String,
     pub(crate) usage: Option<zeroclaw_providers::traits::TokenUsage>,
+    /// The typed failure behind the message, when the provider reported one.
+    /// Exposed as the error source so classification can read the type rather
+    /// than the wording.
+    pub(crate) cause: Option<anyhow::Error>,
 }
 
 impl std::fmt::Display for StreamErrorWithUsage {
@@ -75,7 +79,11 @@ impl std::fmt::Display for StreamErrorWithUsage {
     }
 }
 
-impl std::error::Error for StreamErrorWithUsage {}
+impl std::error::Error for StreamErrorWithUsage {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause.as_ref().map(AsRef::as_ref)
+    }
+}
 
 /// A stream completed without a final response after the provider reported
 /// tool work it had already executed. Replaying the request could repeat those
@@ -159,6 +167,22 @@ fn pre_executed_tools_without_final_response_message(
     }
 }
 
+/// Message key for a refusal category. A closed mapping, so no provider text
+/// can become part of a rendered message.
+fn refusal_category_key(category: zeroclaw_api::model_provider::RefusalCategory) -> &'static str {
+    use zeroclaw_api::model_provider::RefusalCategory;
+    match category {
+        RefusalCategory::Cyber => "cli-agent-error-provider-refused-category-cyber",
+        RefusalCategory::Bio => "cli-agent-error-provider-refused-category-bio",
+        RefusalCategory::ReasoningExtraction => {
+            "cli-agent-error-provider-refused-category-reasoning-extraction"
+        }
+        RefusalCategory::FrontierLlm => "cli-agent-error-provider-refused-category-frontier-llm",
+        RefusalCategory::Unspecified => "cli-agent-error-provider-refused-category-unspecified",
+        RefusalCategory::Other => "cli-agent-error-provider-refused-category-other",
+    }
+}
+
 fn reliable_provider_terminal_failure_message_with_renderer(
     failure: &zeroclaw_providers::ReliableProviderTerminalFailure,
     render: CliStringRenderer,
@@ -183,6 +207,12 @@ fn reliable_provider_terminal_failure_message_with_renderer(
             ),
             None => render("cli-agent-error-provider-authentication", &[]),
         },
+        ReliableProviderTerminalFailureKind::Refused(category) => {
+            // The label is localized first so only ZeroClaw's own words reach
+            // the message; the provider's category text never does.
+            let label = render(refusal_category_key(category), &[]);
+            render("cli-agent-error-provider-refused", &[("category", &label)])
+        }
         ReliableProviderTerminalFailureKind::RateLimited => {
             render("cli-agent-error-provider-rate-limited", &[])
         }
@@ -345,6 +375,48 @@ pub fn is_model_switch_requested(err: &anyhow::Error) -> Option<(String, String)
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn refused_kind_names_the_category_in_english() {
+        use zeroclaw_api::model_provider::RefusalCategory;
+        use zeroclaw_providers::{
+            ReliableProviderTerminalFailure, ReliableProviderTerminalFailureKind,
+        };
+
+        let error = anyhow::Error::new(ReliableProviderTerminalFailure::new(
+            ReliableProviderTerminalFailureKind::Refused(RefusalCategory::Cyber),
+            None,
+            "aggregate".to_string(),
+        ));
+        let rendered = terminal_completion_error_message_in_english(&error, None)
+            .expect("a refusal must render a delivery message");
+        assert!(rendered.contains("cyber safety policy"), "{rendered}");
+        assert!(!rendered.contains("{$"), "{rendered}");
+        assert!(
+            !rendered.contains("aggregate"),
+            "retry diagnostics must stay out of the delivered message: {rendered}"
+        );
+    }
+
+    #[test]
+    fn every_refusal_category_renders_a_distinct_label() {
+        use zeroclaw_api::model_provider::RefusalCategory;
+        let mut labels = std::collections::HashSet::new();
+        for category in [
+            RefusalCategory::Cyber,
+            RefusalCategory::Bio,
+            RefusalCategory::ReasoningExtraction,
+            RefusalCategory::FrontierLlm,
+            RefusalCategory::Unspecified,
+            RefusalCategory::Other,
+        ] {
+            let label =
+                crate::i18n::get_english_cli_string_with_args(refusal_category_key(category), &[]);
+            assert!(!label.is_empty(), "{category:?}");
+            assert!(labels.insert(label.clone()), "duplicate label: {label}");
+        }
+    }
+
     use super::*;
 
     #[test]

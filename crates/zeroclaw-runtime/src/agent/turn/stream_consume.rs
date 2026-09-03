@@ -168,14 +168,30 @@ pub(crate) async fn consume_provider_streaming_response(
                     "model_provider stream emitted an error event"
                 );
                 let message = format!("model_provider stream error: {err}");
-                let provider_error = anyhow::Error::msg(message.clone());
+                // A refusal keeps its type so the reliability layer can tell
+                // a declined request from a transport failure.
+                let refused = matches!(err, zeroclaw_api::model_provider::StreamError::Refusal(_));
+                let provider_error = match err {
+                    zeroclaw_api::model_provider::StreamError::Refusal(category) => {
+                        anyhow::Error::new(zeroclaw_api::model_provider::ProviderRefusal {
+                            category,
+                            usage: outcome.usage.clone(),
+                        })
+                    }
+                    _ => anyhow::Error::msg(message.clone()),
+                };
                 if visible_event_output {
                     // Persist only what the consumer actually saw
                     // (`forwarded_text`), never the raw accumulated text —
                     // that includes guard-withheld protocol fragments and
-                    // suppression-buffered output nobody received.
+                    // suppression-buffered output nobody received. A refusal
+                    // withdraws that output, so nothing is persisted.
                     return Err(StreamInterruptedAfterOutput {
-                        partial_text: forwarded_text,
+                        partial_text: if refused {
+                            String::new()
+                        } else {
+                            forwarded_text
+                        },
                         message,
                         usage: outcome.usage,
                         cause: zeroclaw_providers::ReliableProviderTerminalFailure::from_error(
@@ -187,6 +203,7 @@ pub(crate) async fn consume_provider_streaming_response(
                 return Err(StreamErrorWithUsage {
                     message,
                     usage: outcome.usage,
+                    cause: Some(provider_error),
                 }
                 .into());
             }

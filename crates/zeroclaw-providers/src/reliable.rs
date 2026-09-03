@@ -458,6 +458,13 @@ pub fn transient_error_hint(err: &anyhow::Error) -> Option<&'static str> {
 
 /// Check if an error is non-retryable (client errors that won't resolve with retries).
 pub fn is_non_retryable(err: &anyhow::Error) -> bool {
+    // A safety classifier reached the same decision about the same request,
+    // so asking the same model again only repeats it. The caller still walks
+    // on to the next candidate.
+    if zeroclaw_api::model_provider::is_provider_refusal(err) {
+        return true;
+    }
+
     // Context window errors are NOT non-retryable — they can be recovered
     // by truncating conversation history, so let the retry loop handle them.
     if is_context_window_exceeded(err) {
@@ -701,6 +708,7 @@ struct ProviderErrorDiagnostic {
     phase: &'static str,
     hint: &'static str,
     endpoint: Option<String>,
+    refusal: Option<zeroclaw_api::model_provider::RefusalCategory>,
 }
 
 /// A terminal Reliable failure that can be rendered safely at a user-facing
@@ -708,6 +716,8 @@ struct ProviderErrorDiagnostic {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReliableProviderTerminalFailureKind {
     ContextWindow,
+    /// The provider's safety classifier declined the request.
+    Refused(zeroclaw_api::model_provider::RefusalCategory),
     CredentialsMissing,
     Authentication,
     RateLimited,
@@ -720,6 +730,13 @@ pub enum ReliableProviderTerminalFailureKind {
 }
 
 impl ReliableProviderTerminalFailureKind {
+    fn from_diagnostic(diagnostic: &ProviderErrorDiagnostic) -> Self {
+        if let Some(category) = diagnostic.refusal {
+            return Self::Refused(category);
+        }
+        Self::from_diagnostic_kind(diagnostic.kind)
+    }
+
     fn from_diagnostic_kind(kind: &str) -> Self {
         match kind {
             "context_window" => Self::ContextWindow,
@@ -769,7 +786,7 @@ impl ReliableProviderTerminalFailure {
     pub fn from_error(error: &anyhow::Error) -> Self {
         let diagnostic = provider_error_diagnostic(error);
         Self::new(
-            ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            ReliableProviderTerminalFailureKind::from_diagnostic(&diagnostic),
             diagnostic.endpoint,
             format!(
                 "provider error: kind={}; phase={}; hint={}",
@@ -785,7 +802,7 @@ impl ReliableProviderTerminalFailure {
         terminal_cause: anyhow::Error,
     ) -> Self {
         Self {
-            kind: ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+            kind: ReliableProviderTerminalFailureKind::from_diagnostic(&diagnostic),
             provider: provider
                 .filter(|provider| !provider.is_empty())
                 .map(str::to_owned),
@@ -929,6 +946,7 @@ fn http_status_diagnostic(code: u16, endpoint: Option<String>) -> ProviderErrorD
         phase: "http_response",
         hint,
         endpoint,
+        refusal: None,
     }
 }
 
@@ -968,6 +986,18 @@ fn has_model_not_found_hint(message: &str) -> bool {
 }
 
 fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
+    if let Some(refusal) = err
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<zeroclaw_api::model_provider::ProviderRefusal>())
+    {
+        return ProviderErrorDiagnostic {
+            kind: "refusal",
+            phase: "safety_classifier",
+            hint: "the model declined this request; rephrase it, pick another model, or configure a fallback",
+            endpoint: None,
+            refusal: Some(refusal.category),
+        };
+    }
     let error_detail = compact_error_detail(err);
     let lower = error_detail.to_lowercase();
     let endpoint = err
@@ -992,6 +1022,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "request_validation",
             hint: "reduce context or use a larger-context model",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1001,6 +1032,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "configuration",
             hint: "configure provider credentials",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1010,6 +1042,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "http_response",
             hint: "check provider credentials",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1019,6 +1052,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "http_response",
             hint: "wait, change key/quota, or switch provider",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1033,6 +1067,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
                 phase: "tls_or_connect",
                 hint: "connection reached the host but timed out during connect/TLS; check VPN, firewall, routing, or switch provider",
                 endpoint,
+                refusal: None,
             };
         }
 
@@ -1042,6 +1077,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
                 phase: "request",
                 hint: "provider request timed out; retry or switch provider",
                 endpoint,
+                refusal: None,
             };
         }
 
@@ -1051,6 +1087,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
                 phase: "connect",
                 hint: "could not open provider connection; check network, VPN, or firewall",
                 endpoint,
+                refusal: None,
             };
         }
     }
@@ -1064,6 +1101,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "tls_or_connect",
             hint: "connection reached the host but timed out during connect/TLS; check VPN, firewall, routing, or switch provider",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1073,6 +1111,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "connect",
             hint: "could not open provider connection; check network, VPN, or firewall",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1082,6 +1121,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "request",
             hint: "provider request timed out; retry or switch provider",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1091,6 +1131,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "dns",
             hint: "DNS resolution failed; check network or provider host",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1100,6 +1141,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
             phase: "http_response",
             hint: "check the configured model id for this provider",
             endpoint,
+            refusal: None,
         };
     }
 
@@ -1108,6 +1150,7 @@ fn provider_error_diagnostic(err: &anyhow::Error) -> ProviderErrorDiagnostic {
         phase: "unknown",
         hint: "inspect provider error or switch provider",
         endpoint,
+        refusal: None,
     }
 }
 
@@ -1491,7 +1534,7 @@ fn reliable_terminal_error_with_cause(
     {
         let terminal_failure = anyhow::Error::new(
             ReliableProviderTerminalFailure::new(
-                ReliableProviderTerminalFailureKind::from_diagnostic_kind(diagnostic.kind),
+                ReliableProviderTerminalFailureKind::from_diagnostic(&diagnostic),
                 diagnostic.endpoint,
                 failure_aggregate(&failures),
             )
@@ -1775,6 +1818,7 @@ impl ReliableModelProvider {
             phase: "cooldown",
             hint: "wait for provider cooldown or switch provider",
             endpoint: None,
+            refusal: None,
         };
         push_failure(
             failures,
@@ -6628,6 +6672,7 @@ mod tests {
             phase: "tls_or_connect",
             hint: "check network, VPN, or firewall",
             endpoint: Some("https://api.deepseek.com/chat/completions".to_string()),
+            refusal: None,
         };
         let mut failures = FailureEvents::default();
 
@@ -6719,6 +6764,121 @@ mod tests {
         assert!(!msg.contains("unsupported model: glm-4.7"));
         // Non-retryable errors should not consume retry budget.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct RefusingMock {
+        calls: Arc<AtomicUsize>,
+        category: zeroclaw_api::model_provider::RefusalCategory,
+    }
+
+    #[async_trait]
+    impl ModelProvider for RefusingMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::Error::new(
+                zeroclaw_api::model_provider::ProviderRefusal {
+                    category: self.category,
+                    usage: None,
+                },
+            ))
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RefusingMock {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Provider(
+                zeroclaw_api::attribution::ProviderKind::Model(
+                    zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "refusing"
+        }
+    }
+
+    #[test]
+    fn refusal_is_not_retried_on_the_same_model() {
+        let err = anyhow::Error::new(zeroclaw_api::model_provider::ProviderRefusal {
+            category: zeroclaw_api::model_provider::RefusalCategory::Cyber,
+            usage: None,
+        });
+        assert!(is_non_retryable(&err));
+        assert!(
+            !is_context_window_exceeded(&err),
+            "a refusal must not read as a context overflow"
+        );
+        assert!(
+            !is_auth_error(&err),
+            "a refusal must not read as an auth failure"
+        );
+    }
+
+    #[test]
+    fn refusal_diagnostic_carries_the_category_without_provider_text() {
+        use zeroclaw_api::model_provider::RefusalCategory;
+        let err = anyhow::Error::new(zeroclaw_api::model_provider::ProviderRefusal {
+            category: RefusalCategory::Bio,
+            usage: None,
+        });
+        let diagnostic = provider_error_diagnostic(&err);
+        assert_eq!(diagnostic.kind, "refusal");
+        assert_eq!(diagnostic.phase, "safety_classifier");
+        assert_eq!(diagnostic.refusal, Some(RefusalCategory::Bio));
+        assert_eq!(
+            ReliableProviderTerminalFailureKind::from_diagnostic(&diagnostic),
+            ReliableProviderTerminalFailureKind::Refused(RefusalCategory::Bio)
+        );
+    }
+
+    #[tokio::test]
+    async fn refusal_moves_on_to_the_next_candidate_without_retrying() {
+        use zeroclaw_api::model_provider::RefusalCategory;
+        let refusing_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let reliable = ReliableModelProvider::new(
+            "test",
+            vec![
+                (
+                    "primary".to_string(),
+                    Box::new(RefusingMock {
+                        calls: refusing_calls.clone(),
+                        category: RefusalCategory::Cyber,
+                    }) as Box<dyn ModelProvider>,
+                ),
+                (
+                    "fallback".to_string(),
+                    Box::new(MockModelProvider {
+                        calls: fallback_calls.clone(),
+                        fail_until_attempt: 0,
+                        response: "recovered",
+                        error: "",
+                    }) as Box<dyn ModelProvider>,
+                ),
+            ],
+            3,
+            1,
+        );
+
+        let answer = reliable
+            .chat_with_system(None, "hello", "model", None)
+            .await
+            .expect("the fallback should serve the request");
+
+        assert_eq!(answer, "recovered");
+        assert_eq!(
+            refusing_calls.load(Ordering::SeqCst),
+            1,
+            "a declined request must not be retried on that model"
+        );
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

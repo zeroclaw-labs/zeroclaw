@@ -276,8 +276,7 @@ impl std::error::Error for ProviderRefusal {}
 /// Whether an error chain carries a typed provider refusal.
 #[must_use]
 pub fn is_provider_refusal(err: &anyhow::Error) -> bool {
-    err.chain()
-        .any(|cause| cause.is::<ProviderRefusal>())
+    err.chain().any(|cause| cause.is::<ProviderRefusal>())
 }
 
 impl ChatResponse {
