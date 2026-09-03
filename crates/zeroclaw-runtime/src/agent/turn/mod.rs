@@ -1414,12 +1414,10 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
         // not itself decide Trimmed vs. Floor for the client-visible event:
         // a dropped turn can carry a disproportionate share of the measured
         // population (e.g. a large multimodal attachment), so only the
-        // rebuilt post-hook request re-measured below is authoritative.
-        // Dispatch still proceeds regardless of outcome: an oversized request
-        // that still fits the provider's actual window (this estimate is
-        // conservative) should not be refused client-side, and refusing here
-        // would turn every schema/tool-heavy floor into a hard failure
-        // instead of a best-effort, explicitly-flagged send.
+        // rebuilt post-hook request re-measured below is authoritative. A
+        // genuine floor (no further whole turn can be dropped and the
+        // rebuilt request is still over budget) fails the turn below instead
+        // of dispatching the request it just declared unsatisfiable.
         let mut trim_result = surface_oversized_dispatch_if_needed(
             turn_state.history,
             &mut turn_state.crumb_present,
@@ -1572,6 +1570,15 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     unsatisfiable_floor: genuine_floor.then_some(true),
                 },
             );
+            if genuine_floor {
+                // The rebuilt request is still over budget after dropping
+                // every available whole turn: dispatching it would send the
+                // request this event just declared unsatisfiable. Fail the
+                // turn instead of sending it.
+                return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                    "turn-context-budget-floor-error",
+                )));
+            }
         } else if trim_result.outcome == PreDispatchOutcome::Floor {
             // No droppable whole turn remained at all — the durable history
             // and rebuilt request are identical, so the gate's measured
@@ -1609,6 +1616,12 @@ pub async fn run_tool_call_loop(mut p: ToolLoop<'_>) -> Result<String> {
                     unsatisfiable_floor: Some(true),
                 },
             );
+            // No whole turn was ever droppable, so this is already the
+            // authoritative population: fail the turn instead of dispatching
+            // the request this event just declared unsatisfiable.
+            return Err(anyhow::Error::msg(crate::i18n::get_required_cli_string(
+                "turn-context-budget-floor-error",
+            )));
         }
 
         // Fail closed on the local budget BEFORE announcing the request.

@@ -17342,22 +17342,35 @@ Let me check the result."#;
         };
         let received = Arc::clone(&provider.received);
         let observer = NoopObserver;
+        // The OLDEST turn carries deliberately large content so the durable
+        // history's own raw size dominates the reported-budget trim target
+        // below; a droppable turn must exist and dropping it must matter,
+        // or the post-response enforcement seam under test never fires (see
+        // budget derivation below).
+        let big_first_turn = "x".repeat(4000);
         let mut history = vec![
             ChatMessage::system("system"),
-            ChatMessage::user("first request"),
+            ChatMessage::user(format!("first request {big_first_turn}").as_str()),
             ChatMessage::assistant("first answer"),
             ChatMessage::user("second request"),
             ChatMessage::assistant("second answer"),
         ];
-        // The preflight iteration-0 trim runs against `context_token_budget`, so
-        // the budget must sit ABOVE the durable history's own estimate (else the
-        // preflight trims history to the newest-turn floor before the reported
-        // count is ever seen and the seam under test never fires). The hook grows
-        // the request far above both, and the provider reports input_tokens
-        // proportional to that post-hook population, so enforcement triggers on
-        // the reported count.
+        // The preflight iteration-0 trim AND the pre-dispatch gate both run
+        // against `context_token_budget` before the reported-budget seam
+        // under test ever fires, so the budget must cover the FULL post-hook
+        // population (durable history plus the hook's growth) — otherwise
+        // the pre-dispatch gate fails the turn on a genuine floor before any
+        // request is dispatched. The provider then reports `input_tokens` at
+        // 4x that same post-hook population (`ratio == 4`), so the
+        // reported-budget trim target scales down to `budget / 4`. That
+        // target must still land BELOW the durable history's own raw size
+        // (dominated by `big_first_turn`) after the response, or nothing is
+        // left to trim and the seam under test never fires; the oldest turn
+        // is large enough that this holds with a comfortable margin.
         let retained_estimate = estimate_history_tokens(&history);
-        let budget = retained_estimate + 20;
+        let hook_growth_estimate =
+            estimate_history_tokens(&[ChatMessage::assistant("z".repeat(3000).as_str())]);
+        let budget = retained_estimate + hook_growth_estimate + 20;
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
         let turn_id = uuid::Uuid::new_v4().to_string();
@@ -17938,15 +17951,15 @@ Let me check the result."#;
     }
 
     #[tokio::test]
-    async fn stateful_varying_growth_hook_surfaces_oversized_second_request() {
+    async fn stateful_varying_growth_hook_fails_the_turn_instead_of_dispatching_oversized_request()
+    {
         // A STATEFUL `before_llm_call` hook whose growth varies by iteration:
         // it adds nothing to the first request and a materially large message
         // to the second. The pre-dispatch gate measures the EXACT population
-        // about to be sent at each seam; the second dispatch must therefore
-        // surface the explicit unsatisfiable-floor outcome instead of passing
-        // silently, and the captured provider request must contain the
-        // hook-added content (the gate measured the real request, not a
-        // projection).
+        // about to be sent at each seam; a genuine floor on the second
+        // dispatch must surface the explicit unsatisfiable-floor outcome AND
+        // fail the turn instead of sending the request the gate just
+        // declared unsatisfiable.
         use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
         use crate::hooks::{HookHandler, HookResult, HookRunner};
 
@@ -18104,22 +18117,18 @@ Let me check the result."#;
             }),
         )
         .await
-        .expect("tool loop should succeed");
+        .expect_err("a genuine floor must fail the turn instead of dispatching");
 
         let captured = requests.lock().unwrap().clone();
         assert_eq!(
             captured.len(),
-            2,
-            "two iterations must dispatch two requests"
+            1,
+            "the oversized second request must never reach the provider"
         );
         assert_eq!(hook_calls.load(Ordering::SeqCst), 2);
         assert!(
             !captured[0].iter().any(|content| content.starts_with("yyy")),
             "the first request must not carry the hook growth"
-        );
-        assert!(
-            captured[1].iter().any(|content| content.starts_with("yyy")),
-            "the captured SECOND request must contain the stateful hook's growth"
         );
 
         let mut saw_floor = false;
@@ -18135,7 +18144,114 @@ Let me check the result."#;
         }
         assert!(
             saw_floor,
-            "the oversized second dispatch must emit the explicit floor outcome"
+            "the suppressed oversized dispatch must still emit the explicit floor outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_floor_with_no_droppable_turn_never_dispatches() {
+        // A single oversized turn with nothing older to drop: the
+        // pre-dispatch gate's durable-history trim is a no-op, so the
+        // "no whole turn was ever droppable" branch fires directly. This
+        // must fail the turn before ever calling the provider, not dispatch
+        // the request it just declared unsatisfiable.
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+
+        let provider = RecordingModelProvider::new();
+        let observer = NoopObserver;
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("x".repeat(20_000)),
+        ];
+        let mut crumb_present = false;
+        let tools_registry = crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![]);
+        let (event_tx, mut event_rx) =
+            tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        let prompts = Arc::new(ToolProtocolPrompts::new(
+            "native prompt".to_string(),
+            "text prompt".to_string(),
+        ));
+
+        let err = scope_tool_protocol_prompts(
+            prompts,
+            run_tool_call_loop(ToolLoop {
+                parent_agent_alias: None,
+                sop_reassembly: None,
+                exec: ResolvedAgentExecution {
+                    model_access: ResolvedModelAccess {
+                        model_provider: &provider,
+                        provider_name: "mock-provider",
+                        model: "plain-model",
+                        temperature: Some(0.0),
+                    },
+                    tools_registry: &tools_registry,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &zeroclaw_config::schema::MultimodalConfig::default(),
+                    config: None,
+                    max_tool_iterations: 3,
+                    hooks: None,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    pacing: &zeroclaw_config::schema::PacingConfig::default(),
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    // Small enough that the single existing turn alone
+                    // exceeds it, with no older turn to drop.
+                    context_token_budget: 100,
+                    receipt_generator: None,
+                    knobs: &LoopKnobs::default(),
+                },
+                history: &mut history,
+                history_has_trim_breadcrumb: &mut crumb_present,
+                channel_name: "test",
+                channel_reply_target: None,
+                cancellation_token: None,
+                on_delta: None,
+                shared_budget: None,
+                channel: None,
+                collected_receipts: None,
+                event_tx: Some(event_tx),
+                steering: None,
+                new_messages_out: None,
+                image_cache: None,
+                memory: None,
+                ingress: IngressContext::sub_turn(),
+                agent_alias: None,
+                turn_id: &turn_id,
+            }),
+        )
+        .await
+        .expect_err("a genuine floor with nothing droppable must fail the turn");
+
+        assert!(
+            provider.requests.lock().unwrap().is_empty(),
+            "the provider must never be called once a genuine floor is proven"
+        );
+
+        let mut saw_floor = false;
+        while let Ok(event) = event_rx.try_recv() {
+            if let zeroclaw_api::agent::TurnEvent::HistoryTrimmed {
+                unsatisfiable_floor: Some(true),
+                dropped_messages: 0,
+                ..
+            } = event
+            {
+                saw_floor = true;
+            }
+        }
+        assert!(
+            saw_floor,
+            "the suppressed dispatch must still emit the explicit floor outcome"
+        );
+        assert!(
+            !err.to_string().is_empty(),
+            "the failed turn must carry a non-empty error message"
         );
     }
 
