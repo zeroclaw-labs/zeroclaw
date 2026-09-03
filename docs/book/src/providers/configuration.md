@@ -108,6 +108,30 @@ When `[multimodal] vision_model_provider` names a dotted provider alias, its
 precedence over the alias model; if neither is set, the primary turn model is
 used for backward compatibility.
 
+## Image input limits
+
+`[multimodal]` bounds every image that enters the request pipeline, whatever its
+source: channel attachments, tool outputs that surface a local image path, and
+the web dashboard upload.
+
+```toml
+[multimodal]
+max_image_size_mb = 20   # per image, decoded bytes (default: 20, clamped to 1-20)
+max_images        = 4    # images kept per request (default: 4, clamped to 1-16)
+```
+
+`max_image_size_mb` is measured before base64 encoding, so the encoded payload
+reaching the provider is about a third larger. The 20 MiB ceiling is the lowest
+common per-image or per-request bound across the supported vision APIs, and
+images are buffered whole, so it also bounds gateway memory per upload. Lower
+the value to cap per-turn upload cost.
+
+Providers apply their own limits on top of this setting. Anthropic refuses a
+single image over 10 MB base64-encoded, about 7.5 MiB decoded, and its client
+enforces that regardless of what `max_image_size_mb` allows. Model context cost
+does not track bytes: providers rasterize images and bill by pixel dimensions,
+so a large file and a small one at the same resolution cost roughly the same.
+
 ## Per-family knobs: worked examples
 
 ### Ollama

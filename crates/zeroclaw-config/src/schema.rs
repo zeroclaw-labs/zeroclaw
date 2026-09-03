@@ -6528,6 +6528,18 @@ pub struct MultimodalConfig {
     #[serde(default = "default_multimodal_max_images")]
     pub max_images: usize,
     /// Maximum image payload size in MiB before base64 encoding.
+    ///
+    /// Measured on decoded bytes, so the encoded request payload is about a
+    /// third larger. Applies to every image entering the pipeline: channel
+    /// attachments, tool outputs that surface local image paths, and the web
+    /// dashboard upload. Defaults to the 20 MiB ceiling that
+    /// [`MultimodalConfig::effective_limits`] clamps to, so an ordinary photo
+    /// is accepted without configuration; lower it to bound per-turn upload
+    /// cost or gateway buffering.
+    ///
+    /// Providers apply their own limits on top of this one. Anthropic refuses a
+    /// single image over 10 MB base64-encoded (about 7.5 MiB decoded), enforced
+    /// by its provider client independently of this setting.
     #[serde(default = "default_multimodal_max_image_size_mb")]
     pub max_image_size_mb: usize,
     /// Maximum age of images in conversation turns.
@@ -6562,11 +6574,18 @@ fn default_multimodal_max_images() -> usize {
 }
 
 fn default_multimodal_max_image_size_mb() -> usize {
-    5
+    20
 }
 
 impl MultimodalConfig {
     /// Clamp configured values to safe runtime bounds.
+    ///
+    /// The 20 MiB image ceiling is the lowest common per-image or per-request
+    /// bound across the supported vision APIs (OpenAI accepts about 20 MB per
+    /// image, Gemini 20 MB for an inline request, Anthropic 32 MB per request
+    /// with a tighter per-image limit its own client enforces). Images are
+    /// buffered whole and grow by about a third under base64, so the ceiling
+    /// also bounds gateway memory per upload.
     pub fn effective_limits(&self) -> (usize, usize) {
         let max_images = self.max_images.clamp(1, 16);
         let max_image_size_mb = self.max_image_size_mb.clamp(1, 20);
@@ -26199,6 +26218,33 @@ untrusted_outbound_redact = false
             .or_default()
             .ensure_default_auto_approve();
         config
+    }
+
+    #[test]
+    async fn multimodal_defaults_sit_at_the_effective_ceiling() {
+        // The default is deliberately the clamp ceiling: an operator who never
+        // configures `[multimodal]` should be able to send an ordinary photo.
+        // If either number moves, move it here too rather than incidentally.
+        let cfg = MultimodalConfig::default();
+        assert_eq!(cfg.max_image_size_mb, 20);
+        assert_eq!(cfg.effective_limits(), (4, 20));
+    }
+
+    #[test]
+    async fn multimodal_effective_limits_clamp_out_of_range_values() {
+        let cfg = MultimodalConfig {
+            max_images: 99,
+            max_image_size_mb: 512,
+            ..MultimodalConfig::default()
+        };
+        assert_eq!(cfg.effective_limits(), (16, 20));
+
+        let cfg = MultimodalConfig {
+            max_images: 0,
+            max_image_size_mb: 0,
+            ..MultimodalConfig::default()
+        };
+        assert_eq!(cfg.effective_limits(), (1, 1));
     }
 
     #[test]
