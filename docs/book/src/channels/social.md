@@ -4,6 +4,33 @@ Broadcast / social-feed integrations. These differ from chat channels in two way
 
 > **Build note:** Social channels are **not included** in the lean default build. To use them, build with `--features channels-full` (all channels) or the specific feature flag (e.g. `--features channel-twitter`). Prebuilt binaries do not include these channels by default. See [Channels → Overview](./overview.md) for the full build-options table.
 
+## Twitch
+
+Twitch chat is a thin adapter over IRC. Build it with `--features channel-twitch` or include it through `--features channels-full`; the lean default build does not include it.
+
+{{#config-fields channels.twitch}}
+
+A minimal instance looks like this:
+
+```toml
+[channels.twitch.default]
+enabled = true
+bot_username = "zeroclaw_bot"
+oauth_token = "replace-with-twitch-token"
+channels = ["zeroclaw_channel"]
+mention_only = true
+
+[peer_groups.twitch_default]
+channel = "twitch.default"
+external_peers = ["zeroclaw_user"]
+```
+
+- **Auth:** use a Twitch user access token for the bot account. Create one with the [TMI token generator](https://twitchapps.com/tmi/) or the Twitch CLI, then store it through a protected config surface. ZeroClaw trims the value and adds the required `oauth:` prefix when it is omitted.
+- **Channels:** entries in `channels` may include the leading `#`; ZeroClaw adds it when missing and normalizes channel names to lowercase.
+- **Inbound and outbound:** channel messages are answered in the same channel. `mention_only = true` ignores channel messages that do not mention `bot_username`. If Twitch delivers a non-channel IRC `PRIVMSG` to the bot login, ZeroClaw replies to that sender; the adapter does not configure a separate whisper transport.
+- **Formatting:** Twitch replies use plain text and are split to fit IRC frames. Markdown formatting is not preserved.
+- **Rate limits:** the adapter writes IRC `PRIVMSG` frames directly and has no Twitch-specific rate limiter or HTTP `429` backoff. Keep the agent's posting cadence within Twitch Chat limits and throttle bursty workflows at their source.
+
 ## Bluesky (AT Protocol)
 
 - **Auth:** Bluesky app-password (not your real password). Create one in settings.
@@ -45,4 +72,4 @@ Bots on public social networks attract adversarial input. Two precautions:
 
 ## Rate limits and backoff
 
-All social channels are subject to aggressive rate limits. ZeroClaw's outbound queue uses exponential backoff on 429 responses. If you hit persistent rate-limiting, throttle the agent's posting cadence at the source rather than relying on per-channel streaming knobs (none of these channels expose draft-update intervals; their schema is intentionally minimal).
+All social channels are subject to aggressive rate limits. HTTP-backed social adapters use exponential backoff on `429` responses. Twitch is the IRC-backed exception described above and has no adapter-specific limiter. If you hit persistent rate-limiting, throttle the agent's posting cadence at the source rather than relying on per-channel streaming knobs (none of these channels expose draft-update intervals; their schema is intentionally minimal).
